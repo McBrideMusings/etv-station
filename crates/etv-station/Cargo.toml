@@ -1,0 +1,15 @@
+[package]
+name = "etv-station"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ersatztv-playout = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "etv-station"
+path = "src/main.rs"
