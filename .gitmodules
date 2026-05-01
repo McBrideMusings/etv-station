@@ -1,0 +1,3 @@
+[submodule "etv-next"]
+	path = etv-next
+	url = git@github.com:McBrideMusings/etv-next-private.git
