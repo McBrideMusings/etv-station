@@ -5,3 +5,6 @@
 .serena
 CLAUDE.local.md
 tmp/
+node_modules/
+docs/.vitepress/cache
+docs/.vitepress/dist

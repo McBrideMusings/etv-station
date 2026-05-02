@@ -148,7 +148,15 @@ A `channel.toml` declaring:
 | `rule` | yes | Rule type + rule-specific params. |
 | `items` | yes (for Loop Forever) | Ordered list with metadata. |
 
-A top-level `station.toml` lists the channels and their config paths — mirrors how ETV-next's `lineup.json` lists its channels.
+A top-level `station.toml` lists the channels and their config paths — mirrors how ETV-next's `lineup.json` lists its channels. It also carries the station-wide time zone (see below).
+
+## Time zone
+
+`station.toml` declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.
+
+The configured zone affects **chunk-boundary alignment only**: a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC. The persisted anchor in the `.anchor` sidecar stays in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
+
+Per-channel `tz` override is **not** in v1 — single household, single zone. Adding it later is a strict superset (channel-level overrides station-level) so deferring is safe.
 
 ## Outputs
 
