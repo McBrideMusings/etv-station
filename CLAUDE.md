@@ -17,14 +17,18 @@ See `docs/architecture.md` for the full picture and `docs/PRD.md` for the spec.
 This is a Cargo workspace with a single binary crate (`crates/etv-station`). The `the project task runner` script wraps the common operations:
 
 ```sh
-./tools/dev-run.sh      # cargo run -p etv-station
-cargo test --workspace     # cargo test --workspace
-cargo clippy --workspace -- -D clippy::all      # clippy with -D clippy::all
-cargo +nightly fmt --all      # nightly rustfmt
-bun run docs:dev     # serve VitePress docs on http://localhost:5193
-the deploy task runner    # build linux/amd64 Docker image (provided by docker-unraid archetype)
-the deploy task runner   # build + recreate container on Unraid (env: APP_IMAGE, UNRAID_HOST, UNRAID_USER)
+./tools/dev-run.sh station  # run only the station daemon
+./tools/dev-run.sh etv      # run only ErsatzTV-next against examples/etv-next/
+./tools/dev-run.sh      # run both, prefixed [station]/[etv] (the integration test)
+cargo test --workspace         # cargo test --workspace
+cargo clippy --workspace -- -D clippy::all          # clippy with -D clippy::all
+cargo +nightly fmt --all          # nightly rustfmt
+bun run docs:dev         # serve VitePress docs on http://localhost:5193
+the deploy task runner        # build linux/amd64 Docker image (provided by docker-unraid archetype)
+the deploy task runner       # build + recreate container on Unraid (env: APP_IMAGE, UNRAID_HOST, UNRAID_USER)
 ```
+
+`./tools/dev-run.sh` is the canonical local integration test: it builds both etv-next binaries, starts the station daemon (which writes playout JSON to `examples/output/test/`), starts the ErsatzTV-next HTTP server on `127.0.0.1:8409`, and tees both processes' output with `[station]`/`[etv]` prefixes. Hit `http://127.0.0.1:8409/channel/1.m3u8` for HLS or `/channels.m3u` for the lineup.
 
 Direct cargo commands work fine too. `the task-runner config` is the source of truth — `the project task runner` is generated. Edit `the task-runner config`, then `regenerate via the project task runner`.
 

@@ -10,10 +10,10 @@ Goal: at any moment, every configured channel has playout JSON files on disk who
 
 The 13 v1 issues group into four implicit phases:
 
-- **Foundations** — config parsing, atomic writes, CI ([#2](https://github.com/McBrideMusings/etv-station/issues/2), [#3](https://github.com/McBrideMusings/etv-station/issues/3), [#8](https://github.com/McBrideMusings/etv-station/issues/8)).
-- **Loop Forever happy path** — rule + chunk slicer + anchor + ffprobe cache + startup scan + roll loop ([#1](https://github.com/McBrideMusings/etv-station/issues/1), [#4](https://github.com/McBrideMusings/etv-station/issues/4), [#5](https://github.com/McBrideMusings/etv-station/issues/5), [#9](https://github.com/McBrideMusings/etv-station/issues/9), [#10](https://github.com/McBrideMusings/etv-station/issues/10), [#12](https://github.com/McBrideMusings/etv-station/issues/12)).
+- ✅ **Foundations** — config parsing, atomic writes, sample fixtures (#2, #3, #21).
+- ✅ **Loop Forever happy path** — rule + chunk slicer + anchor + ffprobe cache + startup scan + roll loop (#1, #4, #5, #9, #10, #12). `./tools/dev-run.sh` now boots station + ETV-next together and serves HLS segments end-to-end.
 - **Operational** — reload, retention sweep, structured logging, container ([#6](https://github.com/McBrideMusings/etv-station/issues/6), [#7](https://github.com/McBrideMusings/etv-station/issues/7), [#11](https://github.com/McBrideMusings/etv-station/issues/11), [#13](https://github.com/McBrideMusings/etv-station/issues/13)).
-- **Acceptance** — the 7-day soak run against a live ETV-next instance.
+- **Acceptance** — the 7-day soak run against a live ETV-next instance ([#20](https://github.com/McBrideMusings/etv-station/issues/20)).
 
 ## Next
 

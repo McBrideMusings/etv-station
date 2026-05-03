@@ -1,0 +1,16 @@
+{
+  "server": {
+    "bind_address": "127.0.0.1",
+    "port": 8409
+  },
+  "output": {
+    "folder": "tmp/hls"
+  },
+  "channels": [
+    {
+      "number": "1",
+      "name": "etv-station test",
+      "config": "./channel.json"
+    }
+  ]
+}

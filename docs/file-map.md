@@ -21,8 +21,19 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 
 | Path | What |
 |---|---|
-| `crates/etv-station/` | The daemon binary crate. v1 modules: `config`, `rule`, `roll`, `emit`, `daemon`. |
-| `crates/etv-station/src/main.rs` | Entry point. Currently a stub printing the linked schema version. |
+| `crates/etv-station/` | The daemon binary crate. |
+| `crates/etv-station/src/main.rs` | Binary entry point. Parses CLI flags, inits tracing, loads config, drives `daemon::run`. |
+| `crates/etv-station/src/lib.rs` | Library entry point. Re-exports the modules so integration tests and the binary share one surface. |
+| `crates/etv-station/src/config/` | TOML config parsing: `station`, `channel`, `rule`, `item`, `load`, `validate`. |
+| `crates/etv-station/src/atomic.rs` | `atomic_write_json` — temp file in same dir, fsync, rename. Used by every JSON emission (playout, anchor, durations cache). |
+| `crates/etv-station/src/anchor.rs` | `.anchor` sidecar — persists loop position (UTC instant + `item_ids`) across restarts. Re-anchors when item ids change. |
+| `crates/etv-station/src/duration.rs` | `DurationCache` (`.durations.json` sidecar) keyed by `(path, mtime)`. Probes Local sources via `ffprobe`; Lavfi/Http durations come from config. |
+| `crates/etv-station/src/rule.rs` | `Rule` trait + `LoopForever` impl: `(t - anchor) mod total_loop_duration` walked over cumulative item durations. |
+| `crates/etv-station/src/scan.rs` | Discover existing `{start}_{finish}.json` files in a channel's `output_folder` for startup catch-up. |
+| `crates/etv-station/src/emit.rs` | Chunk slicer + filename formatter. Walks `tz::add_chunk` boundaries and writes one playout file per chunk via `atomic_write_json`. |
+| `crates/etv-station/src/tz.rs` | IANA tz parsing (via `time-tz`) + chunk-boundary helpers that honor DST. |
+| `crates/etv-station/src/daemon.rs` | Per-channel orchestrator: probe durations, anchor, startup catch-up, then `tokio::time::interval` roll loop. Top level handles `Ctrl-C`. |
+| `crates/etv-station/src/errors.rs` | `ConfigError`, `AtomicWriteError`, and the top-level `StationError` runtime enum. |
 
 ## Docs
 
@@ -34,6 +45,22 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `docs/file-map.md` | This page. |
 | `docs/index.md` | VitePress landing. |
 | `docs/.vitepress/config.mts` | VitePress config. |
+
+## Examples
+
+| Path | What |
+|---|---|
+| `examples/station.toml` | Minimal station manifest (`tz = "America/Chicago"`, one channel) used as the default `--config` for the station and as a fixture in `cargo test`. |
+| `examples/channels/lavfi-test.toml` | Loop-Forever channel with three lavfi items — each declares both video and audio in one filter graph so etv-next can transcode without falling back to black/silence. |
+| `examples/etv-next/lineup.json` | Lineup config for the etv-next dev run. Binds `127.0.0.1:8409`, declares one channel referencing `channel.json`, HLS output at `tmp/hls`. |
+| `examples/etv-next/channel.json` | Channel config used by etv-next: points `playout.folder` at `../output/test` so etv-next reads what station writes. videotoolbox hwaccel for macOS dev. |
+| `examples/output/` | Gitignored. Station writes playout JSON files here; etv-next reads from here. |
+
+## Dev tooling
+
+| Path | What |
+|---|---|
+| `tools/dev-run.sh` | Helper for `./tools/dev-run.sh` — builds both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. |
 
 ## Submodule
 

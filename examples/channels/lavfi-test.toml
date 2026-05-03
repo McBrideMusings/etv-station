@@ -1,0 +1,50 @@
+output_folder = "examples/output/test"
+window_days = 1
+chunk_hours = 6
+roll_interval = "60s"
+retention_days = 1
+
+[rule]
+type = "loop_forever"
+
+[[rule.items]]
+id = "bars-30s"
+in_point = "0s"
+out_point = "30s"
+
+[rule.items.source]
+kind = "lavfi"
+params = "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+
+[rule.items.program]
+title = "Color Bars"
+description = "30-second SMPTE-style test pattern with reference tone."
+categories = ["Test"]
+
+[[rule.items]]
+id = "smpte-60s"
+in_point = "0s"
+out_point = "60s"
+
+[rule.items.source]
+kind = "lavfi"
+params = "smptebars=size=1280x720:rate=30 [out0]; sine=frequency=880 [out1]"
+
+[rule.items.program]
+title = "SMPTE Bars"
+description = "Standard SMPTE pattern for one minute with 880 Hz tone."
+categories = ["Test"]
+
+[[rule.items]]
+id = "mandelbrot-90s"
+in_point = "0s"
+out_point = "90s"
+
+[rule.items.source]
+kind = "lavfi"
+params = "mandelbrot=size=1280x720:rate=30 [out0]; sine=frequency=220 [out1]"
+
+[rule.items.program]
+title = "Mandelbrot"
+description = "Animated mandelbrot zoom for 90 seconds with low tone."
+categories = ["Test"]
