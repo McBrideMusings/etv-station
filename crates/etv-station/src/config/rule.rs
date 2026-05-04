@@ -20,4 +20,10 @@ impl RuleConfig {
             RuleConfig::LoopForever { items } => items,
         }
     }
+
+    pub fn items_mut(&mut self) -> &mut Vec<ItemConfig> {
+        match self {
+            RuleConfig::LoopForever { items } => items,
+        }
+    }
 }

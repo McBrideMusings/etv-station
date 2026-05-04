@@ -3,3 +3,7 @@ tz = "America/Chicago"
 [[channels]]
 name = "test"
 path = "channels/lavfi-test.toml"
+
+[[channels]]
+name = "diehard"
+path = "channels/diehard.toml"

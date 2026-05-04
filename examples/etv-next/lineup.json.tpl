@@ -1,7 +1,7 @@
 {
   "server": {
-    "bind_address": "127.0.0.1",
-    "port": 8409
+    "bind_address": "${ETV_BIND_ADDRESS}",
+    "port": ${ETV_PORT}
   },
   "output": {
     "folder": "tmp/hls"
@@ -11,6 +11,11 @@
       "number": "1",
       "name": "etv-station test",
       "config": "./channel.json"
+    },
+    {
+      "number": "2",
+      "name": "Die Hard 24/7",
+      "config": "./channel2.json"
     }
   ]
 }

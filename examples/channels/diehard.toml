@@ -1,0 +1,20 @@
+output_folder = "examples/output/diehard"
+window_days = 1
+chunk_hours = 6
+roll_interval = "60s"
+retention_days = 1
+
+[rule]
+type = "loop_forever"
+
+[[rule.items]]
+id = "diehard-1988"
+
+[rule.items.source]
+kind = "local"
+path = "${ETV_TEST_MEDIA_DIR}/movies/Die Hard (1988) {imdb-tt0095016}/Die.hard.mkv"
+
+[rule.items.program]
+title = "Die Hard"
+description = "Off-duty NYPD detective John McClane fights terrorists holding his wife's office party hostage at Nakatomi Plaza on Christmas Eve."
+categories = ["Movie"]

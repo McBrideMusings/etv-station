@@ -1,6 +1,6 @@
 {
   "playout": {
-    "folder": "../output/test"
+    "folder": "../output/diehard"
   },
   "ffmpeg": {
     "ffmpeg_path": "",
