@@ -4,6 +4,11 @@
 # Ctrl-C stops both. HLS + EPG endpoints listed below.
 set -u
 
+# Job control: each backgrounded subshell becomes its own process-group leader,
+# so the EXIT/INT trap can signal the whole tree (including ffmpeg grandchildren
+# spawned by ersatztv-channel) instead of only the direct children.
+set -m
+
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091
@@ -15,9 +20,24 @@ fi
 : "${ETV_PORT:=8409}"
 export ETV_BIND_ADDRESS ETV_PORT
 
-mkdir -p tmp/hls examples/output/test
+STATION_CONFIG="examples/station.toml"
 
-trap 'jobs -p | xargs -r kill 2>/dev/null' EXIT INT TERM
+# Pre-create every channel's output_folder referenced by the station config so
+# etv-next's startup canonicalize doesn't hard-error on a fresh checkout.
+mkdir -p tmp/hls
+
+station_dir="$(dirname "$STATION_CONFIG")"
+output_folders=()
+while IFS= read -r rel; do
+  channel_file="$station_dir/$rel"
+  folder="$(awk -F '"' '/^output_folder/ {print $2; exit}' "$channel_file")"
+  if [ -n "$folder" ]; then
+    mkdir -p "$folder"
+    output_folders+=("$folder")
+  fi
+done < <(awk -F '"' '/^path/ {print $2}' "$STATION_CONFIG")
+
+trap 'for pid in $(jobs -p); do kill -TERM -- "-$pid" 2>/dev/null; done' EXIT INT TERM
 
 bash "$(dirname "$0")/render-lineup.sh"
 
@@ -31,18 +51,34 @@ EOF
 
 (
   ETV_STATION_TZ="${ETV_STATION_TZ:-UTC}" \
-    cargo run -p etv-station -- --config examples/station.toml 2>&1 \
+    cargo run -p etv-station -- --config "$STATION_CONFIG" 2>&1 \
     | while IFS= read -r l; do printf '[station] %s\n' "$l"; done
 ) &
-
-# Give station a head start so it has playout files before etv-next looks for them.
-sleep 2
 
 # Build both etv-next binaries up-front so the channel subprocess exists when
 # the server's `ChannelSession::spawn` looks for it as a sibling executable.
 echo "[dev] building etv-next binaries..."
 cargo build --manifest-path etv-next/Cargo.toml --bin ersatztv --bin ersatztv-channel 2>&1 \
   | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
+
+# Wait for station to emit its first playout JSON in every channel folder
+# before launching etv-next. Otherwise etv-next's loader spams "unable to find
+# playout JSON file for time …" until station catches up on cold builds.
+if [ "${#output_folders[@]}" -gt 0 ]; then
+  for folder in "${output_folders[@]}"; do
+    echo "[dev] waiting for station to emit first playout JSON in $folder..."
+    deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if compgen -G "$folder/*.json" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.5
+    done
+    if ! compgen -G "$folder/*.json" >/dev/null 2>&1; then
+      echo "[dev] WARNING: timed out waiting for $folder/*.json — launching etv-next anyway" >&2
+    fi
+  done
+fi
 
 (
   etv-next/target/debug/ersatztv examples/etv-next/lineup.json 2>&1 \
