@@ -61,6 +61,9 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | Path | What |
 |---|---|
 | `tools/dev-run.sh` | Helper for `./tools/dev-run.sh` — builds both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. |
+| `tools/kill-dev.sh` | Helper for `./tools/kill-dev.sh` — sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
+| `tools/frame-grab.sh` | Helper for `./tools/frame-grab.sh` — captures one JPEG frame from a live HLS channel via ffmpeg (15 s timeout) and opens it in Preview. `CHANNEL=N` selects the channel (default 1). |
+| `tools/validate-streams.sh` | Helper for `./tools/validate-streams.sh` — HTTP probes, codec check, blackdetect, and log scan across all channels in the lineup. |
 
 ## Agent skills
 

@@ -27,18 +27,21 @@ If the user specified a channel number or name, use it. If not, default to chann
 
 ### 2. Capture the frame
 
-Run ffmpeg to grab one frame. Use a short timeout so it doesn't hang if the stream is down:
+The quickest way is to run the helper script, which handles timeouts and opens the image automatically:
 
 ```
-ffmpeg -y -i http://127.0.0.1:8409/channel/1.m3u8 -frames:v 1 -q:v 2 /tmp/etv-frame-ch1.jpg
+CHANNEL=1 ./tools/frame-grab.sh
+CHANNEL=2 ./tools/frame-grab.sh
 ```
 
-For channel 2:
+To run ffmpeg directly, use `-rw_timeout 15000000` (15 seconds in microseconds) so it fails fast instead of hanging:
+
 ```
-ffmpeg -y -i http://127.0.0.1:8409/channel/2.m3u8 -frames:v 1 -q:v 2 /tmp/etv-frame-ch2.jpg
+ffmpeg -y -rw_timeout 15000000 -i http://127.0.0.1:8409/channel/1.m3u8 -frames:v 1 -q:v 2 /tmp/etv-frame-ch1.jpg
+ffmpeg -y -rw_timeout 15000000 -i http://127.0.0.1:8409/channel/2.m3u8 -frames:v 1 -q:v 2 /tmp/etv-frame-ch2.jpg
 ```
 
-**If ffmpeg hangs or errors:** The HLS stream may not be producing segments yet. Check the dev logs with `read-logs` and report the error.
+**If ffmpeg times out or errors:** The HLS stream may not be producing segments yet. Wait 10–15s after channel start and retry. Check dev logs with `read-logs` if it keeps failing.
 
 **Note:** ffmpeg typically outputs several lines of version/codec info to stderr before the frame. This is normal. A successful grab exits 0 and produces the image file.
 
