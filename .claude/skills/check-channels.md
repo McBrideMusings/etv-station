@@ -47,15 +47,18 @@ cat /tmp/etv-ch2.m3u8
 
 A valid master playlist starts with `#EXTM3U` and contains at least one `#EXT-X-STREAM-INF` line followed by a variant URL. Report what you see.
 
-### 4. Follow one variant URL
+### 4. Fetch the live session playlist
 
-From the master playlist, extract the first variant URL (it will be relative, like `1/index.m3u8`). Fetch it:
+ETV-next serves the live HLS session at `/session/{channel}/live.m3u8`. Fetch it directly:
 
 ```
-curl -s -o /tmp/etv-ch1-variant.m3u8 -w "%{http_code}" http://127.0.0.1:8409/1/index.m3u8
+curl -s -o /tmp/etv-ch1-live.m3u8 -w "%{http_code}" http://127.0.0.1:8409/session/1/live.m3u8
+curl -s -o /tmp/etv-ch2-live.m3u8 -w "%{http_code}" http://127.0.0.1:8409/session/2/live.m3u8
 ```
 
-A valid variant playlist contains `#EXT-X-TARGETDURATION` and at least one `.ts` segment URL. This confirms ffmpeg is actually producing segments.
+**Note:** This endpoint only exists after a client has requested the channel (which triggers the channel session). If you haven't fetched `/channel/1.m3u8` yet (step 2), do that first — it's what starts the session.
+
+A valid live playlist contains `#EXT-X-TARGETDURATION` and at least one `.ts` segment URL. This confirms ffmpeg is actually producing segments.
 
 ## Reporting
 
