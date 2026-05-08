@@ -62,6 +62,15 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 |---|---|
 | `tools/dev-run.sh` | Helper for `./tools/dev-run.sh` — builds both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. |
 
+## Agent skills
+
+| Path | What |
+|---|---|
+| `.claude/skills/check-channels.md` | Skill: curl HLS endpoints and validate master/variant playlists for each channel. |
+| `.claude/skills/check-epg.md` | Skill: fetch `/xmltv.xml`, validate XMLTV structure, cross-check titles against playout JSON on disk. |
+| `.claude/skills/frame-grab.md` | Skill: `ffmpeg` frame capture from a live HLS stream; reads image inline so Claude can see the frame. |
+| `.claude/skills/read-logs.md` | Skill: locate and read the most recent `tmp/<cmd>.*.log` file from an `the project task runner` run. |
+
 ## Submodule
 
 | Path | What |
