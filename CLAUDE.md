@@ -17,9 +17,7 @@ See `docs/architecture.md` for the full picture and `docs/PRD.md` for the spec.
 This is a Cargo workspace with a single binary crate (`crates/etv-station`). The `the project task runner` script wraps the common operations:
 
 ```sh
-./tools/dev-run.sh station  # run only the station daemon
-./tools/dev-run.sh etv      # run only ErsatzTV-next against examples/etv-next/
-./tools/dev-run.sh      # run both, prefixed [station]/[etv] (the integration test)
+./tools/dev-run.sh          # run station daemon + ETV-next together (integration test)
 cargo test --workspace         # cargo test --workspace
 cargo clippy --workspace -- -D clippy::all          # clippy with -D clippy::all
 cargo +nightly fmt --all          # nightly rustfmt
