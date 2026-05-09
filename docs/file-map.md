@@ -48,13 +48,17 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 
 ## Examples
 
-| Path | What |
-|---|---|
-| `examples/station.toml` | Minimal station manifest (`tz = "America/Chicago"`, one channel) used as the default `--config` for the station and as a fixture in `cargo test`. |
-| `examples/channels/lavfi-test.toml` | Loop-Forever channel with three lavfi items — each declares both video and audio in one filter graph so etv-next can transcode without falling back to black/silence. |
-| `examples/etv-next/lineup.json` | Lineup config for the etv-next dev run. Binds `127.0.0.1:8409`, declares one channel referencing `channel.json`, HLS output at `tmp/hls`. |
-| `examples/etv-next/channel.json` | Channel config used by etv-next: points `playout.folder` at `../output/test` so etv-next reads what station writes. videotoolbox hwaccel for macOS dev. |
-| `examples/output/` | Gitignored. Station writes playout JSON files here; etv-next reads from here. |
+Fixture files needed by `cargo test` are tracked; personal/host-specific configs are gitignored.
+
+| Path | Tracked | What |
+|---|---|---|
+| `examples/station.toml` | yes | Minimal station manifest used as `cargo test` fixture and default `--config` for dev runs. |
+| `examples/channels/lavfi-test.toml` | yes | Loop-Forever channel with three lavfi items — used by the `cargo test` fixture. |
+| `examples/channels/diehard.toml` | no | Personal Die Hard channel config; gitignored. |
+| `examples/channels/star-trek.toml` | no | 950-episode Star Trek channel (all 12 series, release order). Built from Sonarr; gitignored. |
+| `examples/etv-next/lineup.json` | no | Generated from env vars at dev-run time; gitignored. |
+| `examples/etv-next/channel.json` | no | Host-specific etv-next channel config; gitignored. |
+| `examples/output/` | no | Station writes playout JSON here during dev; gitignored. |
 
 ## Dev tooling
 

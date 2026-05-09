@@ -9,4 +9,10 @@ node_modules/
 docs/.vitepress/cache
 docs/.vitepress/dist
 examples/etv-next/lineup.json
+examples/etv-next/channel.json
+examples/etv-next/channel2.json
+examples/etv-next/lineup.json.tpl
+examples/output/
+examples/channels/star-trek.toml
+examples/channels/diehard.toml
 .claude/scheduled_tasks.lock
