@@ -57,3 +57,33 @@ Loop Forever is deterministic in `(anchor, items)` — same inputs always produc
 ## Time zones
 
 Configurable station-wide via `tz` in `station.toml` (or `ETV_STATION_TZ` at runtime). Affects chunk-boundary alignment only — the persisted UTC anchor doesn't move. See [PRD §Time zone](/PRD#time-zone).
+
+## v2+ additions (planned, not yet implemented)
+
+The shape of the v2+ work is locked in [PRD §Scope evolution beyond v1](/PRD#scope-evolution-beyond-v1) and phased in [Roadmap §Next](/roadmap#next-three-sequential-phases-of-v2-scope-expansion). Three architectural additions land in order:
+
+### Unified catalog (Phase C)
+
+A normalized in-memory catalog feeds the query language. Two ingesters at v2:
+
+- **Plex** — primary. Pulls show / movie / collection / playlist metadata from a configured Plex Media Server. Kometa-fed dynamic collections are referenceable but not assumed; most channels express ordering in TOML (`[[entries]]` sequencing) rather than relying on Plex playlists, since Kometa can't autogenerate ordered playlists.
+- **Local-FS scan** — narrow purpose: bumpers, commercials, station idents, and errata not in Plex. Walks a configured root with filename + directory metadata + ffprobe.
+
+Sonarr/Radarr ingesters deferred until a concrete Plex gap appears. LAVFI / HTTP / single-path items remain inline-only (declared, not catalogued).
+
+The query language (Phase A picks the off-the-shelf option, candidate: CEL) operates over the normalized catalog. Channel TOML carries live queries; the daemon resolves at boot, snapshots, and refreshes on a configurable interval. Stateless determinism is preserved — the snapshot is the durable item list for the chunk window.
+
+### Graphics overlay cascade (Phase B)
+
+`etv-station` emits overlay configuration in the playout JSON; **etv-next is the actual renderer** in the existing output pipeline. This requires a deliberate `PlayoutItem` schema extension on the etv-next side — the only planned submodule change in v2+.
+
+Cascade: channel default → block override → item override. Declarative primitives (corner watermark, time-interval fade, lower-third text) compose with [Rhai](https://rhai.rs/) scripts for dynamic behavior. Rendering uses [Vello](https://github.com/linebender/vello). Lottie / `velato` is a deferred side project.
+
+### Block / channel composition (Phase C)
+
+The current `[rule] type = "loop_forever"` with `[[rule.items]]` is replaced by:
+
+- **Blocks** — reusable, content-agnostic ordered collections. A block = optional `[program]` defaults + `[[entries]]` (item / query / include).
+- **Channels** — runtime config + `[[rule.blocks]]` composing blocks with `mode` (`all` or `count = N`), `order` (`chronological` or seeded `random`), and structured `filter`.
+
+A migration script translates legacy configs into the new schema.

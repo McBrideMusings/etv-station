@@ -212,6 +212,53 @@ Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffect
 - Distributed mode (multiple `etv-station` instances coordinating via leader election).
 - Public open-source release. The repo is private at v1; once the rule abstraction is stable and one or two non-Loop-Forever rules exist, revisit publishing as "the companion piece to ETV-next."
 
+## Scope evolution beyond v1
+
+v1 is intentionally the smallest useful playout generator: hand-authored item lists, one rule, no library awareness, no overlay graphics. As v1 stabilizes, real-channel building (Star Trek release-order, Dragon Ball franchise-chronological, mixed bumper/movie blocks, etc.) has surfaced three concrete pains that the v1 model can't address:
+
+1. **Authoring verbosity.** Hand-typing 29-episode Star Trek seasons (or 950-episode all-Trek lineups, or hundreds of Dragon Ball entries) with full path + program metadata is unworkable.
+2. **Lack of composition.** A "show" can't be defined once and reused across channels; favorites/subset channels copy-paste.
+3. **Graphics-less output.** Channels look like raw media playback, with no idents/bugs/lower-thirds. ErsatzTV's graphics engine concept is exactly the missing piece.
+
+v2+ work proceeds in **three sequential phases**, each a milestone with focused issues. The order is deliberate — each de-risks the next, and the schema overhaul (the largest piece) comes last so it can integrate the foundations rather than predict them.
+
+### Phase A — Query language evaluation
+
+Live content sourcing requires a query language. ErsatzTV's Lucene variant had documented failure modes (prefix overmatch, no absolute episode numbers across show variants). Per the global off-the-shelf-first rule, we evaluate existing languages — top candidate [CEL](https://cel.dev/) via `cel-rust`, fallback Plex-API pass-through with structured TOML filters — against real-world channel-building cases. The deliverable is a standalone query tester (`crates/etv-query-test`) and a documented language pick. No daemon integration, no schema commit.
+
+### Phase B — Graphics rendering
+
+Inspired by [ErsatzTV's graphics engine](https://ersatztv.org/docs/advanced/graphics-engine/), but authored in a real scripting language ([Rhai](https://rhai.rs/)) rather than YAML. Two tracks:
+
+- **Static.** Hardcoded channel watermark via [Vello](https://github.com/linebender/vello). Establishes overlay rendering inside etv-next's output pipeline and extends `PlayoutItem` with overlay config (etv-next submodule change).
+- **Scripted.** Rhai-driven dynamic behavior — visibility, corner, size, opacity, fade-on-interval, now-playing / up-next text.
+
+Deliverable: a working overlay pipeline with a small declarative + scripted primitive set. Lottie / `velato` integration is a side project, not a blocker.
+
+### Phase C — Schema overhaul
+
+With the language picked and graphics working, redesign the user-facing schema:
+
+- **Block as the unit of reuse.** A block = `[program]` defaults + flat `[[entries]]` list (item / query / include). Blocks are content-agnostic — TV, movies, home movies, bumpers, mixed.
+- **Channels compose blocks** via `[[rule.blocks]]` with `mode` (`all` or `count = N`), `order` (`chronological` or seeded `random`), and `filter` over the resolved item list.
+- **Unified catalog ingestion.** Plex (primary) + local-FS scan (bumpers / commercials / errata) feed a normalized in-memory catalog. Sonarr/Radarr deferred unless a Plex gap appears.
+- **Runtime query resolution.** Channel TOML carries live queries; daemon resolves at boot, snapshots, refreshes on configurable interval. Stateless determinism preserved — the snapshot is the durable item list for the chunk window.
+- **Graphics overlay cascade.** Channel default → block override → item override, declared in the schema and emitted in the playout JSON.
+- **Migration.** One-shot translator script from current `[rule] type = "loop_forever"` configs.
+
+### Non-goal inversions
+
+This phase reverses two v1 non-goals explicitly:
+
+- *"Library management. No NFO scraping, no online metadata providers, no media DB."* — Phase C adds a Plex catalog ingester and an in-memory media DB. The scope is narrower than full library management (no scraping, no editing, read-only catalog) but it crosses the line v1 drew.
+- *"A library importer that reads from Plex/Jellyfin/Sonarr metadata"* (listed as out-of-scope-for-v1) — Phase C makes Plex ingestion a first-class feature of the daemon. [Issue #18](https://github.com/McBrideMusings/etv-station/issues/18), originally framed as an external tool, is superseded.
+
+### Non-goals that stand
+
+- **Encoding decisions** stay etv-next's job. etv-station never invokes ffmpeg for transcoding; only ffprobe for duration.
+- **Real-time control plane** is still deferred — v2+ remains config-file driven with reload signal / file watcher.
+- **Modifying ETV-next** for non-schema reasons. The graphics overlay cascade *does* require an `PlayoutItem` schema extension on the etv-next side; that is a deliberate, planned submodule change, not drift.
+
 ---
 
 ## Decision log
