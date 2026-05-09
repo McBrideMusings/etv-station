@@ -241,8 +241,9 @@ With the language picked and graphics working, redesign the user-facing schema:
 
 - **Block as the unit of reuse.** A block = `[program]` defaults + flat `[[entries]]` list (item / query / include). Blocks are content-agnostic — TV, movies, home movies, bumpers, mixed.
 - **Channels compose blocks** via `[[rule.blocks]]` with `mode` (`all` or `count = N`), `order` (`chronological` or seeded `random`), and `filter` over the resolved item list.
-- **Unified catalog ingestion.** Plex (primary) + local-FS scan (bumpers / commercials / errata) feed a normalized in-memory catalog. Sonarr/Radarr deferred unless a Plex gap appears.
-- **Runtime query resolution.** Channel TOML carries live queries; daemon resolves at boot, snapshots, refreshes on configurable interval. Stateless determinism preserved — the snapshot is the durable item list for the chunk window.
+- **Unified catalog ingestion.** Plex (primary) + local-FS scan (bumpers / commercials / errata) feed a normalized **sqlite catalog** via `rusqlite`. Sonarr/Radarr deferred unless a Plex gap appears.
+- **sqlite cache, not in-memory or JSON.** Tens of thousands of items rules out per-boot rescans (slow API round-trips) and full-file JSON snapshots (full reparse + RAM-resident). sqlite gives indexed lookups, incremental refresh from Plex's `lastUpdated`, WAL-mode concurrency between refresh writer and query reader, and `sqlite3` shell inspection for debugging. Schema is three tables — `items`, `collections` + `collection_items`, `catalog_meta` (per-source sync timestamps) — plus simple up-only migrations.
+- **Runtime query resolution.** Channel TOML carries live queries; daemon translates them into sqlite reads at boot, snapshots the resolved item list for the chunk window. Stateless determinism preserved — the snapshot is the durable list, the catalog itself is the deterministically-rebuildable substrate.
 - **Graphics overlay cascade.** Channel default → block override → item override, declared in the schema and emitted in the playout JSON.
 - **Migration.** One-shot translator script from current `[rule] type = "loop_forever"` configs.
 

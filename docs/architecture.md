@@ -64,14 +64,14 @@ The shape of the v2+ work is locked in [PRD §Scope evolution beyond v1](/PRD#sc
 
 ### Unified catalog (Phase C)
 
-A normalized in-memory catalog feeds the query language. Two ingesters at v2:
+A normalized **sqlite catalog** (via `rusqlite`, WAL mode) feeds the query language. Two ingesters at v2:
 
 - **Plex** — primary. Pulls show / movie / collection / playlist metadata from a configured Plex Media Server. Kometa-fed dynamic collections are referenceable but not assumed; most channels express ordering in TOML (`[[entries]]` sequencing) rather than relying on Plex playlists, since Kometa can't autogenerate ordered playlists.
 - **Local-FS scan** — narrow purpose: bumpers, commercials, station idents, and errata not in Plex. Walks a configured root with filename + directory metadata + ffprobe.
 
 Sonarr/Radarr ingesters deferred until a concrete Plex gap appears. LAVFI / HTTP / single-path items remain inline-only (declared, not catalogued).
 
-The query language (Phase A picks the off-the-shelf option, candidate: CEL) operates over the normalized catalog. Channel TOML carries live queries; the daemon resolves at boot, snapshots, and refreshes on a configurable interval. Stateless determinism is preserved — the snapshot is the durable item list for the chunk window.
+The query language (Phase A picks the off-the-shelf option, candidate: CEL) translates to indexed sqlite reads. Channel TOML carries live queries; the daemon resolves at boot, snapshots the resulting item list for the chunk window, and refreshes the catalog on a per-source interval (24h Plex, 1h local-FS by default). Stateless determinism is preserved — the snapshot is the durable list; the catalog itself is the deterministically-rebuildable substrate. WAL mode means the refresh task can write while query reads stay consistent.
 
 ### Graphics overlay cascade (Phase B)
 
