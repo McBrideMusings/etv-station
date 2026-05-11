@@ -1,0 +1,20 @@
+[package]
+name = "etv-query-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cel = { workspace = true }
+clap = { workspace = true }
+etv-station = { workspace = true }
+glob = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+ureq = { workspace = true }
+
+[[bin]]
+name = "etv-query-test"
+path = "src/main.rs"

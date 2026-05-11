@@ -21,13 +21,16 @@ The v2+ direction extends `etv-station` from a hand-authored Loop Forever genera
 
 Each phase is a milestone with a small, focused set of issues. Phases run sequentially because each de-risks the next.
 
-### Phase A — Query language evaluation
+### ✅ Phase A — Query language evaluation
 
-Pick a query language by validating off-the-shelf candidates against real-world channel-building cases (TOS marathon, multi-Trek, TNG seasons 3-5, mixed-source bumper block, Dragon Ball franchise chronological, Star Trek in-universe order). Working assumption: [CEL](https://cel.dev/) via `cel-rust`. Fallback: Plex-API pass-through with structured TOML filters.
+**Shipped.** CEL (`cel` crate v0.13) validated against all 6 roadmap cases. Key findings:
 
-Per the global "off-the-shelf first" rule (`~/.claude/CLAUDE.md`), we are not designing a custom language.
+- CEL handles the real-world queries cleanly. `title.startsWith(...)`, `season_in(lo, hi)`, `collections.exists(...)`, `icontains(...)` all expressed naturally in 1-2 lines.
+- Plex episode metadata lacks genre tags and per-episode Collection — both require show-level enrichment at ingest time (implemented).
+- Plex `type` field ("movie"/"episode") is too coarse for special libraries; type is now derived from Plex section name or FS directory name.
+- `source`/`type` are orthogonal: source = catalog (plex, fs), type = semantic kind (episode, movie, concert, power_hour, music_video, bumper, …).
 
-Deliverable: a standalone `crates/etv-query-test` binary that connects to Plex, accepts queries in candidate languages, prints normalized item lists. Outcome is a documented language decision, not a schema commit.
+Deliverable: `crates/etv-query-test` — interactive CEL query harness with Plex + FS catalogs, path-key dedup, 1h disk cache, and `./tools/query.sh`.
 
 ### Phase B — Graphics rendering
 

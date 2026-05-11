@@ -6,7 +6,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 
 | Path | What |
 |---|---|
-| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`. Excludes `etv-next/`. |
+| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-query-test`. Excludes `etv-next/`. |
 | `Cargo.lock` | Workspace lockfile. |
 | `task runner` | Generated task runner. **Do not hand-edit** — regenerated from `the task-runner config`. |
 | `the task-runner config` | Source of truth for `the project task runner` commands. Uses the `docker-unraid` archetype. |
@@ -22,6 +22,14 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | Path | What |
 |---|---|
 | `crates/etv-station/` | The daemon binary crate. |
+| `crates/etv-query-test/` | Phase A CEL feasibility harness. Queries Plex + FS catalogs with CEL; see `./tools/query.sh`. |
+| `crates/etv-query-test/src/cel_eval.rs` | CEL compile + per-item eval. Case-insensitive; custom helpers: `season_in`, `icontains`, `in_collection`, `has_category`, `shorter_than`, `longer_than`. |
+| `crates/etv-query-test/src/plex.rs` | Read-only Plex HTTP client: section/show/collection ingestion, show-collection enrichment, path translation, `type_from_section`. |
+| `crates/etv-query-test/src/fs_catalog.rs` | FS scanner: glob + ffprobe, `type_from_path` (dir-name → semantic type), `ETV_FS_ROOTS` config, path-keyed result map. |
+| `crates/etv-query-test/src/normalize.rs` | `NormalizedItem`: unified record shape for both Plex and FS items. `sources: Vec<String>`, `media_type`, all CEL-bound fields. |
+| `crates/etv-query-test/src/cache.rs` | Disk cache for full-section Plex ingest (`target/cache/plex-all.json`, 1 h TTL). |
+| `crates/etv-query-test/cases/` | Six committed CEL fixture cases for Phase A (TOS marathon, multi-Trek, TNG s3-5, bumper-block, Dragon Ball, Trek in-universe). |
+| `crates/etv-query-test/fixtures/bumpers/` | Committed synthetic MP4s (~100 KB) for the bumper-block fixture case. |
 | `crates/etv-station/src/main.rs` | Binary entry point. Parses CLI flags, inits tracing, loads config, drives `daemon::run`. |
 | `crates/etv-station/src/lib.rs` | Library entry point. Re-exports the modules so integration tests and the binary share one surface. |
 | `crates/etv-station/src/config/` | TOML config parsing: `station`, `channel`, `rule`, `item`, `load`, `validate`. |
@@ -68,6 +76,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `tools/kill-dev.sh` | Helper for `./tools/kill-dev.sh` — sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
 | `tools/frame-grab.sh` | Helper for `./tools/frame-grab.sh` — captures one JPEG frame from a live HLS channel via ffmpeg (15 s timeout) and opens it in Preview. `CHANNEL=N` selects the channel (default 1). |
 | `tools/validate-streams.sh` | Helper for `./tools/validate-streams.sh` — HTTP probes, codec check, blackdetect, and log scan across all channels in the lineup. |
+| `tools/query.sh` | Standalone wrapper for `./tools/query.sh` (sources `.env`, then invokes the `etv-query-test` binary). |
 
 ## Agent skills
 

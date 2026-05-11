@@ -1,0 +1,7 @@
+name = "trek-in-universe"
+description = "Star Trek in stardate / in-universe order — relies on the Star Trek Plex Collection on shows"
+source = "TV Shows"
+query = """
+collections.exists(c, c == "Star Trek")
+"""
+order = "year,season,episode"

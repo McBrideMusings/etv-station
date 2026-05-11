@@ -1,0 +1,7 @@
+name = "tos-marathon"
+description = "Star Trek: The Original Series — full series in air order"
+source = "Star Trek"
+query = """
+true
+"""
+order = "season,episode"

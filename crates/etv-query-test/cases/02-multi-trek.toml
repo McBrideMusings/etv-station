@@ -1,0 +1,7 @@
+name = "multi-trek"
+description = "All Star Trek series in the TV library — round-robin candidate pool"
+source = "TV Shows"
+query = """
+collections.exists(c, c == "Star Trek") || title.startsWith("Star Trek")
+"""
+order = "title,season,episode"

@@ -1,0 +1,7 @@
+name = "tng-seasons-3-5"
+description = "Star Trek: TNG seasons 3 through 5 only"
+source = "Star Trek: The Next Generation"
+query = """
+season_in(3, 5)
+"""
+order = "season,episode"

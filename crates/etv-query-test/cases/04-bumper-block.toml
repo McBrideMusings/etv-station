@@ -1,0 +1,7 @@
+name = "bumper-block"
+description = "Short bumpers under 30 seconds from the committed test fixture"
+source = "fs:crates/etv-query-test/fixtures/bumpers"
+query = """
+has_category("bumper") && shorter_than(30.0)
+"""
+order = "runtime_secs"

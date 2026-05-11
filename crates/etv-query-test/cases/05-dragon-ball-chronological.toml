@@ -1,0 +1,7 @@
+name = "dragon-ball-chronological"
+description = "Dragon Ball franchise — every series via title prefix (operators rarely curate a Plex Collection per franchise)"
+source = "TV Shows"
+query = """
+title.startsWith("Dragon Ball")
+"""
+order = "year,season,episode"
