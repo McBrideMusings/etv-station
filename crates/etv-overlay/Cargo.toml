@@ -19,6 +19,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 vello = { workspace = true }
 wgpu = { workspace = true }
+parley = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

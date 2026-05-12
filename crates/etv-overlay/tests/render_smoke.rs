@@ -11,7 +11,7 @@ fn renders_empty_frame_all_transparent() {
             return;
         }
     };
-    let state = OverlayState::from_kind(OverlayKind::Empty);
+    let state = OverlayState::from_layers(vec![OverlayKind::Empty]);
     let frame = renderer.render_frame(&state).expect("render");
     assert_eq!(frame.len(), 64 * 64 * 4);
     // All pixels should be transparent (alpha=0) for an empty scene
@@ -28,12 +28,12 @@ fn renders_watermark_with_visible_box() {
             return;
         }
     };
-    let state = OverlayState::from_kind(OverlayKind::Watermark {
+    let state = OverlayState::from_layers(vec![OverlayKind::Watermark {
         corner: Corner::TopRight,
         margin: 20,
         box_size: 80,
         color: [200, 30, 30, 255],
-    });
+    }]);
     let frame = renderer.render_frame(&state).expect("render");
     assert_eq!(frame.len(), 320 * 240 * 4);
 

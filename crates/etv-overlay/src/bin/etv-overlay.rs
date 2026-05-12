@@ -238,7 +238,7 @@ fn pipe_to_fifo(config: PathBuf, fifo_path: PathBuf, create_fifo: bool) -> anyho
 }
 
 fn build_engine(spec: &OverlaySpec) -> anyhow::Result<RhaiEngine> {
-    let mut engine = RhaiEngine::new(spec.kind.clone());
+    let mut engine = RhaiEngine::new(spec.layers.clone());
     if let Some(script) = &spec.script {
         engine.load_script(script)?;
     }

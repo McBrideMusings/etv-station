@@ -32,7 +32,7 @@ Each phase is a milestone with a small, focused set of issues. Phases run sequen
 
 Deliverable: `crates/etv-query-test` — interactive CEL query harness with Plex + FS catalogs, path-key dedup, 1h disk cache, and `./tools/query.sh`.
 
-### Phase B — Graphics rendering (in flight — spike shipped, text overlays remaining)
+### Phase B — Graphics rendering (in flight — static text shipped, dynamic templating remaining)
 
 Bring the [ErsatzTV graphics-engine](https://ersatztv.org/docs/advanced/graphics-engine/) concept to etv-next, but with logic authored in a real scripting language ([Rhai](https://rhai.rs/)) instead of YAML. Run as two sub-tracks because they go hand in hand but split cleanly:
 

@@ -1,0 +1,13 @@
+width = 320
+height = 240
+framerate = 25
+pixel_format = "rgba8"
+
+[kind]
+type = "text"
+content = "ETV STATION"
+font_family = "Helvetica"
+font_size = 32.0
+color = [255, 80, 80, 255]
+corner = "bottom_left"
+margin = 16

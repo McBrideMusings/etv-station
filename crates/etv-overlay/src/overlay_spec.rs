@@ -10,8 +10,28 @@ pub struct OverlaySpec {
     #[serde(default)]
     pub pixel_format: PixelFormat,
     pub script: Option<PathBuf>,
-    #[serde(default)]
-    pub kind: OverlayKind,
+    /// Layers are rendered bottom-up in declaration order. A single Rhai script
+    /// (if `script` is set) controls visibility/opacity uniformly across all
+    /// layers — per-layer scripts are a future extension.
+    #[serde(default, alias = "kind", deserialize_with = "deserialize_layers")]
+    pub layers: Vec<OverlayKind>,
+}
+
+fn deserialize_layers<'de, D>(deserializer: D) -> Result<Vec<OverlayKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(OverlayKind),
+        Many(Vec<OverlayKind>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(k) => vec![k],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -62,6 +82,23 @@ pub enum OverlayKind {
         #[serde(default = "default_logo_height")]
         height: u32,
     },
+    /// Static single-line text overlay (channel banner, "TEST PATTERN", etc).
+    /// Dynamic content templating (e.g. `{title}` from program metadata) is
+    /// not yet wired — `content` is taken verbatim. See follow-up issue for
+    /// the station→overlay metadata bridge.
+    Text {
+        content: String,
+        #[serde(default = "default_font_family")]
+        font_family: String,
+        #[serde(default = "default_font_size")]
+        font_size: f32,
+        #[serde(default = "default_text_color")]
+        color: [u8; 4],
+        #[serde(default)]
+        corner: Corner,
+        #[serde(default = "default_margin")]
+        margin: u32,
+    },
 }
 
 fn default_margin() -> u32 {
@@ -78,6 +115,18 @@ fn default_color() -> [u8; 4] {
 
 fn default_logo_height() -> u32 {
     96
+}
+
+fn default_font_family() -> String {
+    "system-ui".to_string()
+}
+
+fn default_font_size() -> f32 {
+    48.0
+}
+
+fn default_text_color() -> [u8; 4] {
+    [255, 255, 255, 255]
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -104,8 +153,10 @@ impl OverlaySpec {
         if let Some(script) = spec.script.take() {
             spec.script = Some(resolve_relative(&script, base));
         }
-        if let OverlayKind::Logo { path: logo, .. } = &mut spec.kind {
-            *logo = resolve_relative(logo, base);
+        for layer in &mut spec.layers {
+            if let OverlayKind::Logo { path: logo, .. } = layer {
+                *logo = resolve_relative(logo, base);
+            }
         }
         Ok(spec)
     }
@@ -150,19 +201,120 @@ color = [255, 100, 100, 200]
         assert_eq!(spec.height, 1080);
         assert_eq!(spec.framerate, 30);
         assert_eq!(spec.pixel_format, PixelFormat::Rgba8);
-        match spec.kind {
+        assert_eq!(spec.layers.len(), 1);
+        match &spec.layers[0] {
             OverlayKind::Watermark {
                 corner,
                 margin,
                 box_size,
                 color,
             } => {
-                assert_eq!(corner, Corner::TopRight);
-                assert_eq!(margin, 48);
-                assert_eq!(box_size, 200);
-                assert_eq!(color, [255, 100, 100, 200]);
+                assert_eq!(*corner, Corner::TopRight);
+                assert_eq!(*margin, 48);
+                assert_eq!(*box_size, 200);
+                assert_eq!(*color, [255, 100, 100, 200]);
             }
             _ => panic!("expected watermark kind"),
+        }
+    }
+
+    #[test]
+    fn parses_layers_array() {
+        let toml = r#"
+width = 1280
+height = 720
+framerate = 30
+
+[[layers]]
+type = "logo"
+path = "logo.png"
+corner = "bottom_right"
+margin = 24
+height = 96
+
+[[layers]]
+type = "text"
+content = "PIERCE"
+font_family = "Helvetica"
+font_size = 36.0
+color = [255, 255, 255, 230]
+corner = "bottom_right"
+margin = 132
+"#;
+        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        assert_eq!(spec.layers.len(), 2);
+        assert!(matches!(spec.layers[0], OverlayKind::Logo { .. }));
+        assert!(matches!(spec.layers[1], OverlayKind::Text { .. }));
+    }
+
+    #[test]
+    fn parses_text_overlay() {
+        let toml = r#"
+width = 1280
+height = 720
+framerate = 30
+
+[kind]
+type = "text"
+content = "ETV STATION"
+font_family = "Helvetica"
+font_size = 64.0
+color = [255, 255, 255, 230]
+corner = "bottom_left"
+margin = 40
+"#;
+        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        assert_eq!(spec.layers.len(), 1);
+        match &spec.layers[0] {
+            OverlayKind::Text {
+                content,
+                font_family,
+                font_size,
+                color,
+                corner,
+                margin,
+            } => {
+                assert_eq!(content, "ETV STATION");
+                assert_eq!(font_family, "Helvetica");
+                assert!((*font_size - 64.0).abs() < 1e-4);
+                assert_eq!(*color, [255, 255, 255, 230]);
+                assert_eq!(*corner, Corner::BottomLeft);
+                assert_eq!(*margin, 40);
+            }
+            _ => panic!("expected text kind"),
+        }
+    }
+
+    #[test]
+    fn text_uses_defaults_when_minimal() {
+        let toml = r#"
+width = 640
+height = 360
+framerate = 25
+
+[kind]
+type = "text"
+content = "hi"
+"#;
+        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        assert_eq!(spec.layers.len(), 1);
+        match &spec.layers[0] {
+            OverlayKind::Text {
+                content,
+                font_family,
+                font_size,
+                color,
+                corner,
+                margin,
+            } => {
+                assert_eq!(content, "hi");
+                assert_eq!(font_family, "system-ui");
+                assert!((*font_size - 48.0).abs() < 1e-4);
+                assert_eq!(*color, [255, 255, 255, 255]);
+                assert_eq!(*corner, Corner::TopRight);
+                assert_eq!(*margin, 32);
+            }
+            _ => panic!("expected text kind"),
         }
     }
 
@@ -175,7 +327,7 @@ framerate = 24
 "#;
         let spec = OverlaySpec::from_toml_str(toml).unwrap();
         assert_eq!(spec.pixel_format, PixelFormat::Rgba8);
-        assert!(matches!(spec.kind, OverlayKind::Empty));
+        assert!(spec.layers.is_empty());
     }
 
     #[test]
@@ -186,7 +338,7 @@ framerate = 24
             framerate: 30,
             pixel_format: PixelFormat::Rgba8,
             script: None,
-            kind: OverlayKind::Empty,
+            layers: vec![],
         };
         assert_eq!(spec.frame_byte_len(), 40_000);
     }

@@ -8,15 +8,16 @@ use crate::overlay_spec::OverlayKind;
 pub struct OverlayState {
     pub visible: bool,
     pub opacity: f32,
-    pub kind: OverlayKind,
+    pub layers: Vec<OverlayKind>,
 }
 
 impl OverlayState {
-    pub fn from_kind(kind: OverlayKind) -> Self {
+    pub fn from_layers(layers: Vec<OverlayKind>) -> Self {
+        let any_drawable = layers.iter().any(|k| !matches!(k, OverlayKind::Empty));
         Self {
-            visible: !matches!(kind, OverlayKind::Empty),
+            visible: any_drawable,
             opacity: 1.0,
-            kind,
+            layers,
         }
     }
 }
@@ -24,11 +25,11 @@ impl OverlayState {
 pub struct RhaiEngine {
     engine: Engine,
     ast: Option<AST>,
-    base_kind: OverlayKind,
+    base_layers: Vec<OverlayKind>,
 }
 
 impl RhaiEngine {
-    pub fn new(base_kind: OverlayKind) -> Self {
+    pub fn new(base_layers: Vec<OverlayKind>) -> Self {
         let mut engine = Engine::new();
         // Bound script complexity so a runaway script can't stall the per-frame
         // render loop. 64 nesting / 50k ops is plenty for fade and blink curves
@@ -38,7 +39,7 @@ impl RhaiEngine {
         Self {
             engine,
             ast: None,
-            base_kind,
+            base_layers,
         }
     }
 
@@ -54,7 +55,7 @@ impl RhaiEngine {
     }
 
     pub fn evaluate(&self, time_seconds: f64, frame_index: u64) -> OverlayState {
-        let mut state = OverlayState::from_kind(self.base_kind.clone());
+        let mut state = OverlayState::from_layers(self.base_layers.clone());
         let Some(ast) = self.ast.as_ref() else {
             return state;
         };
@@ -99,7 +100,7 @@ mod tests {
 
     #[test]
     fn empty_engine_returns_base_state() {
-        let engine = RhaiEngine::new(OverlayKind::Empty);
+        let engine = RhaiEngine::new(vec![]);
         let state = engine.evaluate(0.0, 0);
         assert!(!state.visible);
         assert_eq!(state.opacity, 1.0);
@@ -114,12 +115,12 @@ mod tests {
             #{ "visible": true, "opacity": opacity }
             "#,
         );
-        let mut engine = RhaiEngine::new(OverlayKind::Watermark {
+        let mut engine = RhaiEngine::new(vec![OverlayKind::Watermark {
             corner: crate::overlay_spec::Corner::TopRight,
             margin: 32,
             box_size: 160,
             color: [220, 50, 50, 220],
-        });
+        }]);
         engine.load_script(script.path()).unwrap();
 
         let s0 = engine.evaluate(0.0, 0);

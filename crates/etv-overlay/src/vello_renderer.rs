@@ -2,10 +2,14 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use parley::{
+    Alignment, AlignmentOptions, FontContext, FontStack, LayoutContext, PositionedLayoutItem,
+    StyleProperty,
+};
 use vello::kurbo::{Affine, RoundedRect};
 use vello::peniko::{Blob, Color, Fill, Image as PenikoImage, ImageFormat};
 use vello::wgpu;
-use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
+use vello::{AaConfig, AaSupport, Glyph, RenderParams, Renderer, RendererOptions, Scene};
 
 use crate::overlay_spec::{Corner, OverlayKind, PixelFormat};
 use crate::rhai_engine::OverlayState;
@@ -24,6 +28,8 @@ pub struct VelloRenderer {
     padded_bytes_per_row: u32,
     unpadded_bytes_per_row: u32,
     image_cache: HashMap<PathBuf, PenikoImage>,
+    font_context: FontContext,
+    layout_context: LayoutContext<()>,
 }
 
 impl VelloRenderer {
@@ -105,6 +111,8 @@ impl VelloRenderer {
             padded_bytes_per_row,
             unpadded_bytes_per_row,
             image_cache: HashMap::new(),
+            font_context: FontContext::new(),
+            layout_context: LayoutContext::new(),
         })
     }
 
@@ -144,7 +152,19 @@ impl VelloRenderer {
     }
 
     fn build_scene(&mut self, scene: &mut Scene, state: &OverlayState) -> anyhow::Result<()> {
-        match &state.kind {
+        for layer in &state.layers {
+            self.build_layer(scene, layer, state.opacity)?;
+        }
+        Ok(())
+    }
+
+    fn build_layer(
+        &mut self,
+        scene: &mut Scene,
+        layer: &OverlayKind,
+        opacity: f32,
+    ) -> anyhow::Result<()> {
+        match layer {
             OverlayKind::Empty => {}
             OverlayKind::Watermark {
                 corner,
@@ -160,7 +180,7 @@ impl VelloRenderer {
                     (y0 + *box_size as i64) as f64,
                     18.0,
                 );
-                let alpha = (color[3] as f32 / 255.0) * state.opacity;
+                let alpha = (color[3] as f32 / 255.0) * opacity;
                 let fill = Color::from_rgba8(color[0], color[1], color[2], (alpha * 255.0) as u8);
                 scene.fill(Fill::NonZero, Affine::IDENTITY, fill, None, &rect);
             }
@@ -180,11 +200,98 @@ impl VelloRenderer {
                 let scale_y = h / image.height as f64;
                 let transform =
                     Affine::translate((x0, y0)) * Affine::scale_non_uniform(scale_x, scale_y);
-                let image_with_alpha = image.with_alpha(state.opacity);
+                let image_with_alpha = image.with_alpha(opacity);
                 scene.draw_image(&image_with_alpha, transform);
+            }
+            OverlayKind::Text {
+                content,
+                font_family,
+                font_size,
+                color,
+                corner,
+                margin,
+            } => {
+                self.draw_text(
+                    scene,
+                    content,
+                    font_family,
+                    *font_size,
+                    *color,
+                    *corner,
+                    *margin,
+                    opacity,
+                );
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text(
+        &mut self,
+        scene: &mut Scene,
+        content: &str,
+        font_family: &str,
+        font_size: f32,
+        color: [u8; 4],
+        corner: Corner,
+        margin: u32,
+        opacity: f32,
+    ) {
+        if content.is_empty() {
+            return;
+        }
+        let mut builder =
+            self.layout_context
+                .ranged_builder(&mut self.font_context, content, 1.0, true);
+        builder.push_default(StyleProperty::FontStack(FontStack::Source(
+            font_family.into(),
+        )));
+        builder.push_default(StyleProperty::FontSize(font_size));
+        let mut layout = builder.build(content);
+        layout.break_all_lines(None);
+        layout.align(None, Alignment::Start, AlignmentOptions::default());
+
+        let text_w = layout.width() as f64;
+        let text_h = layout.height() as f64;
+        let (x0, y0) = corner_origin_f64(
+            corner,
+            margin as f64,
+            text_w,
+            text_h,
+            self.width,
+            self.height,
+        );
+
+        let alpha = (color[3] as f32 / 255.0) * opacity;
+        let brush = Color::from_rgba8(color[0], color[1], color[2], (alpha * 255.0) as u8);
+
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let run = glyph_run.run();
+                let run_font_size = run.font_size();
+                let glyphs: Vec<Glyph> = glyph_run
+                    .positioned_glyphs()
+                    .map(|g| Glyph {
+                        id: g.id as u32,
+                        x: g.x,
+                        y: g.y,
+                    })
+                    .collect();
+                if glyphs.is_empty() {
+                    continue;
+                }
+                scene
+                    .draw_glyphs(run.font())
+                    .font_size(run_font_size)
+                    .brush(brush)
+                    .transform(Affine::translate((x0, y0)))
+                    .draw(Fill::NonZero, glyphs.into_iter());
+            }
+        }
     }
 
     fn load_or_get_image(&mut self, path: &Path) -> anyhow::Result<&PenikoImage> {
