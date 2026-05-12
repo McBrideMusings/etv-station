@@ -2,6 +2,7 @@
 name = "etv-overlay"
 version = "0.1.0"
 edition = "2024"
+include = ["src/**", "assets/fonts/Inter-Regular.ttf", "assets/fonts/LICENSE.OFL.txt"]
 
 [dependencies]
 anyhow = { workspace = true }

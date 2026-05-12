@@ -11,7 +11,7 @@ use crate::anchor;
 use crate::config::{LoadedChannel, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
-use crate::errors::StationError;
+use crate::errors::{ConfigError, StationError};
 use crate::overlay_supervisor;
 use crate::rule::LoopForever;
 use crate::scan;
@@ -19,14 +19,32 @@ use crate::tz as tzmod;
 
 pub async fn run(station: Station) -> Result<(), StationError> {
     let tz = tzmod::parse(&station.station.tz)?;
+    validate_overlay_configs(&station)?;
     let shutdown = Arc::new(Notify::new());
 
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
-        if let Ok(()) = tokio::signal::ctrl_c().await {
-            tracing::info!("ctrl-c received, shutting down");
-            shutdown_signal.notify_waiters();
+        // `./tools/kill-dev.sh` and most container orchestrators send SIGTERM, not
+        // SIGINT — handle both so the supervisor's shutdown branch always runs
+        // and cleans up the etv-overlay subprocess + its fifo.
+        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to install SIGTERM handler; relying on SIGINT only");
+            })
+            .ok();
+        let sigterm_recv = async {
+            match sigterm {
+                Some(mut s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl-c received, shutting down"),
+            _ = sigterm_recv => tracing::info!("sigterm received, shutting down"),
         }
+        shutdown_signal.notify_waiters();
     });
 
     let mut handles = Vec::new();
@@ -132,6 +150,24 @@ fn build_overlay_context(channel: &LoadedChannel) -> Option<overlay_supervisor::
     })
 }
 
+/// Parse every channel's overlay config up front so a malformed TOML fails the
+/// daemon at startup instead of silently emitting playout JSON without an
+/// overlay spec while the supervisor crash-loops on the same broken file.
+fn validate_overlay_configs(station: &Station) -> Result<(), StationError> {
+    for channel in &station.channels {
+        let Some((overlay_config_path, _)) = resolve_overlay_paths(channel) else {
+            continue;
+        };
+        etv_overlay::overlay_spec::OverlaySpec::from_path(&overlay_config_path).map_err(|e| {
+            ConfigError::Validation {
+                path: overlay_config_path.clone(),
+                message: format!("overlay config for channel '{}': {e}", channel.name),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySpec> {
     let (overlay_config_path, fifo_path) = resolve_overlay_paths(channel)?;
     match etv_overlay::overlay_spec::OverlaySpec::from_path(&overlay_config_path) {
@@ -145,11 +181,13 @@ fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySp
             y: 0,
         }),
         Err(e) => {
-            tracing::warn!(
+            // validate_overlay_configs parsed this at startup, so we only land
+            // here if the file changed between startup and channel init.
+            tracing::error!(
                 channel = %channel.name,
                 error = %e,
                 config = %overlay_config_path.display(),
-                "could not read overlay config; emitting playout without overlay spec",
+                "overlay config re-parse failed after startup validation; emitting playout without overlay spec",
             );
             None
         }

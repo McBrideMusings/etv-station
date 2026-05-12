@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,13 @@ use crate::rhai_engine::OverlayState;
 
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 
+/// Vendored Latin-subset Inter Regular (~68KB, SIL OFL). Registered into the
+/// renderer's FontContext so OverlayKind::Text renders inside slim Linux
+/// deploy containers that ship without a system font stack. See
+/// `assets/fonts/README.md` for provenance.
+const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+const FALLBACK_FONT_FAMILY: &str = "Inter";
+
 pub struct VelloRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -30,6 +37,7 @@ pub struct VelloRenderer {
     image_cache: HashMap<PathBuf, PenikoImage>,
     font_context: FontContext,
     layout_context: LayoutContext<()>,
+    warned_missing_glyphs: HashSet<String>,
 }
 
 impl VelloRenderer {
@@ -99,6 +107,11 @@ impl VelloRenderer {
             mapped_at_creation: false,
         });
 
+        let mut font_context = FontContext::new();
+        font_context
+            .collection
+            .register_fonts(Blob::from(FALLBACK_FONT_BYTES.to_vec()), None);
+
         Ok(Self {
             device,
             queue,
@@ -111,8 +124,9 @@ impl VelloRenderer {
             padded_bytes_per_row,
             unpadded_bytes_per_row,
             image_cache: HashMap::new(),
-            font_context: FontContext::new(),
+            font_context,
             layout_context: LayoutContext::new(),
+            warned_missing_glyphs: HashSet::new(),
         })
     }
 
@@ -241,12 +255,14 @@ impl VelloRenderer {
         if content.is_empty() {
             return;
         }
+        // Append the vendored fallback so anything the configured family
+        // doesn't cover (or any case where the family doesn't exist on the
+        // host, e.g. inside a slim deploy container) still produces glyphs.
+        let stack = format!("{font_family}, {FALLBACK_FONT_FAMILY}");
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, content, 1.0, true);
-        builder.push_default(StyleProperty::FontStack(FontStack::Source(
-            font_family.into(),
-        )));
+        builder.push_default(StyleProperty::FontStack(FontStack::Source(stack.into())));
         builder.push_default(StyleProperty::FontSize(font_size));
         let mut layout = builder.build(content);
         layout.break_all_lines(None);
@@ -266,6 +282,7 @@ impl VelloRenderer {
         let alpha = (color[3] as f32 / 255.0) * opacity;
         let brush = Color::from_rgba8(color[0], color[1], color[2], (alpha * 255.0) as u8);
 
+        let mut total_glyphs = 0usize;
         for line in layout.lines() {
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
@@ -284,6 +301,7 @@ impl VelloRenderer {
                 if glyphs.is_empty() {
                     continue;
                 }
+                total_glyphs += glyphs.len();
                 scene
                     .draw_glyphs(run.font())
                     .font_size(run_font_size)
@@ -291,6 +309,19 @@ impl VelloRenderer {
                     .transform(Affine::translate((x0, y0)))
                     .draw(Fill::NonZero, glyphs.into_iter());
             }
+        }
+
+        // Non-empty content that produced no glyphs means even the bundled
+        // Inter fallback couldn't shape the string — likely a non-Latin
+        // codepoint, since the vendored font is a Latin subset. Log once per
+        // font_family so the operator sees the symptom instead of an
+        // empty-looking overlay.
+        if total_glyphs == 0 && self.warned_missing_glyphs.insert(font_family.to_string()) {
+            tracing::error!(
+                font_family = font_family,
+                content = content,
+                "text overlay produced no glyphs; configured font family is missing on host and vendored fallback could not shape the content (non-Latin?)",
+            );
         }
     }
 

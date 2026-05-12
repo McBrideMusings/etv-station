@@ -29,6 +29,7 @@ use tokio::sync::Notify;
 use tokio::time;
 
 const HEARTBEAT_FILE_NAME: &str = ".heartbeat";
+const READY_FILE_NAME: &str = ".overlay-ready";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct OverlayContext {
@@ -42,6 +43,10 @@ impl OverlayContext {
     #[allow(dead_code)]
     pub fn heartbeat_path(&self) -> PathBuf {
         self.output_folder.join(HEARTBEAT_FILE_NAME)
+    }
+
+    pub fn ready_path(&self) -> PathBuf {
+        self.output_folder.join(READY_FILE_NAME)
     }
 }
 
@@ -100,6 +105,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
     }
 
     let mut child: Option<Child> = None;
+    let mut ready_observed = false;
 
     loop {
         tokio::select! {
@@ -109,6 +115,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                     let _ = c.kill().await;
                 }
                 let _ = std::fs::remove_file(&ctx.fifo_path);
+                let _ = std::fs::remove_file(ctx.ready_path());
                 return;
             }
             _ = time::sleep(POLL_INTERVAL) => {
@@ -121,6 +128,8 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                         "overlay process exited; will respawn",
                     );
                     child = None;
+                    ready_observed = false;
+                    let _ = std::fs::remove_file(ctx.ready_path());
                 }
                 if child.is_none() {
                     if let Err(err) = ensure_fifo(&ctx.fifo_path) {
@@ -131,6 +140,9 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                         );
                         continue;
                     }
+                    // Remove any stale ready marker from a prior run so we
+                    // don't mistake it for the new process being ready.
+                    let _ = std::fs::remove_file(ctx.ready_path());
                     match spawn_overlay(&ctx) {
                         Ok(new_child) => {
                             tracing::info!(
@@ -148,6 +160,12 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                             );
                         }
                     }
+                } else if !ready_observed && ctx.ready_path().exists() {
+                    tracing::info!(
+                        channel = %ctx.channel_name,
+                        "overlay reported ready (first frame written)",
+                    );
+                    ready_observed = true;
                 }
             }
         }
@@ -162,6 +180,8 @@ fn spawn_overlay(ctx: &OverlayContext) -> std::io::Result<Child> {
         .arg(&ctx.overlay_config)
         .arg("--fifo")
         .arg(&ctx.fifo_path)
+        .arg("--ready-file")
+        .arg(ctx.ready_path())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

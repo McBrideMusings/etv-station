@@ -52,6 +52,12 @@ enum Cmd {
         fifo: PathBuf,
         #[arg(long, default_value_t = false)]
         create_fifo: bool,
+        /// Optional path to touch after the first frame has been rendered and
+        /// written to the fifo. The supervisor uses this to detect that the
+        /// renderer is past cold-start (wgpu init, vello pipeline build,
+        /// image cache miss) so callers can avoid sampling torn frames.
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
     },
 }
 
@@ -82,7 +88,8 @@ fn main() -> anyhow::Result<()> {
             config,
             fifo,
             create_fifo,
-        } => pipe_to_fifo(config, fifo, create_fifo),
+            ready_file,
+        } => pipe_to_fifo(config, fifo, create_fifo, ready_file),
     }
 }
 
@@ -202,21 +209,54 @@ fn run_with_ffmpeg(
     Ok(())
 }
 
-fn pipe_to_fifo(config: PathBuf, fifo_path: PathBuf, create_fifo: bool) -> anyhow::Result<()> {
+fn pipe_to_fifo(
+    config: PathBuf,
+    fifo_path: PathBuf,
+    create_fifo: bool,
+    ready_file: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&config)?;
     let mut fifo = if create_fifo {
         FifoWriter::create(fifo_path.clone())?
     } else {
         FifoWriter::attach(fifo_path.clone())
     };
-    fifo.open_for_writing()?;
 
+    // Warm the renderer fully BEFORE opening the fifo. wgpu adapter init,
+    // vello shader compile, and the first image-cache decode all happen in
+    // the first render_frame call. Doing that work while the fifo is closed
+    // guarantees ffmpeg can't read a partial frame during cold-start: nothing
+    // hits the pipe until we have a complete RGBA buffer ready to write.
+    // See https://github.com/McBrideMusings/etv-station/issues/54.
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
     let engine = build_engine(&spec)?;
+    let start = std::time::Instant::now();
+    let first_frame = renderer.render_frame(&engine.evaluate(0.0, 0))?;
+    tracing::info!(
+        warmup_ms = start.elapsed().as_millis() as u64,
+        "renderer warm; opening fifo for first write",
+    );
+
+    fifo.open_for_writing()?;
+    if let Err(e) = fifo.write_frame(&first_frame) {
+        if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
+            tracing::info!("reader disconnected before first frame");
+            return Ok(());
+        }
+        return Err(e.into());
+    }
+    if let Some(path) = ready_file.as_deref()
+        && let Err(e) = touch(path)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to create overlay ready file; continuing",
+        );
+    }
 
     let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
-    let start = std::time::Instant::now();
-    let mut frame_index: u64 = 0;
+    let mut frame_index: u64 = 1;
     loop {
         let time_seconds = start.elapsed().as_secs_f64();
         let state = engine.evaluate(time_seconds, frame_index);
@@ -235,6 +275,14 @@ fn pipe_to_fifo(config: PathBuf, fifo_path: PathBuf, create_fifo: bool) -> anyho
             thread::sleep(target - now);
         }
     }
+}
+
+fn touch(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::create(path)?;
+    Ok(())
 }
 
 fn build_engine(spec: &OverlaySpec) -> anyhow::Result<RhaiEngine> {
