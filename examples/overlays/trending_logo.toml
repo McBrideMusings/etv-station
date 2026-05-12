@@ -1,0 +1,13 @@
+# Trending channel logo — TV-style watermark in the bottom-right corner.
+# Width must match the channel's output resolution.
+width = 1280
+height = 720
+framerate = 30
+pixel_format = "rgba8"
+
+[kind]
+type = "logo"
+path = "../assets/trending-logo.png"
+corner = "bottom_right"
+margin = 24
+height = 96

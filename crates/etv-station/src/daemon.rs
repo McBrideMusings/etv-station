@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
 use time::OffsetDateTime;
 use time_tz::Tz;
 use tokio::select;
@@ -11,6 +12,7 @@ use crate::config::{LoadedChannel, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
 use crate::errors::StationError;
+use crate::overlay_supervisor;
 use crate::rule::LoopForever;
 use crate::scan;
 use crate::tz as tzmod;
@@ -28,10 +30,24 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     });
 
     let mut handles = Vec::new();
+    let mut supervisor_handles = Vec::new();
     let station = Arc::new(station);
     for idx in 0..station.channels.len() {
         let s = station.clone();
         let sd = shutdown.clone();
+        if let Some(ctx) = build_overlay_context(&station.channels[idx]) {
+            let sd_for_sup = sd.clone();
+            let name = station.channels[idx].name.clone();
+            supervisor_handles.push(tokio::spawn(async move {
+                tracing::info!(
+                    channel = %name,
+                    config = %ctx.overlay_config.display(),
+                    fifo = %ctx.fifo_path.display(),
+                    "starting overlay supervisor",
+                );
+                overlay_supervisor::run(ctx, sd_for_sup).await;
+            }));
+        }
         handles.push(tokio::spawn(async move {
             let ch = &s.channels[idx];
             let result = channel_loop(ch, tz, sd).await;
@@ -56,7 +72,88 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         }
     }
 
+    // Ensure overlay supervisors get a shutdown signal even on the error path,
+    // so the join below doesn't hang. Idempotent: ctrl-c may already have
+    // notified.
+    shutdown.notify_waiters();
+    for h in supervisor_handles {
+        if let Err(e) = h.await {
+            tracing::warn!(error = %e, "overlay supervisor task ended with error");
+        }
+    }
+
     first_err.map_or(Ok(()), Err)
+}
+
+async fn wipe_emitted_playout(channel: &LoadedChannel) -> Result<(), StationError> {
+    let files = scan::scan_output_folder(&channel.config.output_folder).await?;
+    let count = files.len();
+    for f in &files {
+        if let Err(source) = tokio::fs::remove_file(&f.path).await
+            && source.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(StationError::Io {
+                path: f.path.clone(),
+                source,
+            });
+        }
+    }
+    if count > 0 {
+        tracing::info!(
+            channel = %channel.name,
+            removed = count,
+            "wiped existing playout JSON on startup; will regenerate from config",
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the (overlay_config_path, fifo_path) pair for a channel, if it has
+/// an overlay configured. Both `build_overlay_context` and
+/// `load_overlay_playout_spec` need the same resolution.
+fn resolve_overlay_paths(channel: &LoadedChannel) -> Option<(PathBuf, PathBuf)> {
+    let cfg = channel.config.overlay.as_ref()?;
+    let overlay_config =
+        overlay_supervisor::resolve_overlay_config(&channel.config_path, &cfg.config);
+    let fifo_path = overlay_supervisor::resolve_fifo_path(
+        &channel.config.output_folder,
+        cfg.fifo_path.as_deref(),
+    );
+    Some((overlay_config, fifo_path))
+}
+
+fn build_overlay_context(channel: &LoadedChannel) -> Option<overlay_supervisor::OverlayContext> {
+    let (overlay_config, fifo_path) = resolve_overlay_paths(channel)?;
+    Some(overlay_supervisor::OverlayContext {
+        channel_name: channel.name.clone(),
+        output_folder: channel.config.output_folder.clone(),
+        overlay_config,
+        fifo_path,
+    })
+}
+
+fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySpec> {
+    let (overlay_config_path, fifo_path) = resolve_overlay_paths(channel)?;
+    match etv_overlay::overlay_spec::OverlaySpec::from_path(&overlay_config_path) {
+        Ok(spec) => Some(PlayoutOverlaySpec {
+            fifo_path: fifo_path.to_string_lossy().into_owned(),
+            pixel_format: String::from(spec.pixel_format.ffmpeg_arg()),
+            width: spec.width,
+            height: spec.height,
+            framerate: spec.framerate,
+            x: 0,
+            y: 0,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                channel = %channel.name,
+                error = %e,
+                config = %overlay_config_path.display(),
+                "could not read overlay config; emitting playout without overlay spec",
+            );
+            None
+        }
+    }
 }
 
 async fn channel_loop(
@@ -109,7 +206,15 @@ async fn channel_loop(
         );
     }
 
-    let rule = LoopForever::new(items, &durations);
+    let overlay_spec = load_overlay_playout_spec(channel);
+    let rule = LoopForever::new(items, &durations).with_overlay(overlay_spec);
+
+    // SHARP EDGE: Wipe every emitted playout JSON on startup and regenerate
+    // from the (possibly updated) channel config. This catches changes to the
+    // overlay spec, item list, or any other field that flows into the JSON.
+    // See https://github.com/McBrideMusings/etv-station/issues/53 for the
+    // proper fix (in-place rewrite or change-detection).
+    wipe_emitted_playout(channel).await?;
 
     // Startup catch-up: emit from max(now, highest_existing_finish) up to now+window_days.
     emit_catch_up(channel, &rule, anchor_state.anchor_utc, tz, "startup").await?;

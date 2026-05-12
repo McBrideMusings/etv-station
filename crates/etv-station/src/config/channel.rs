@@ -22,6 +22,26 @@ pub struct ChannelConfig {
     pub retention_days: u32,
 
     pub rule: RuleConfig,
+
+    /// Optional live overlay. When set, the station daemon supervises an
+    /// `etv-overlay` subprocess that writes RGBA frames to a fifo per
+    /// channel; the emitted playout JSON carries an `overlay` field
+    /// pointing etv-next at that fifo.
+    #[serde(default)]
+    pub overlay: Option<ChannelOverlayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelOverlayConfig {
+    /// Path to the etv-overlay TOML config (relative to the channel config
+    /// directory or absolute). The config supplies width / height / framerate
+    /// and the rendering script.
+    pub config: PathBuf,
+
+    /// Path to the fifo the channel + overlay process share. If omitted,
+    /// defaults to `{output_folder}/overlay.fifo`.
+    #[serde(default)]
+    pub fifo_path: Option<PathBuf>,
 }
 
 fn default_window_days() -> u32 {

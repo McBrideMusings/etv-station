@@ -4,6 +4,9 @@ chunk_hours = 6
 roll_interval = "60s"
 retention_days = 1
 
+[overlay]
+config = "../../crates/etv-overlay/fixtures/channel_watermark.toml"
+
 [rule]
 type = "loop_forever"
 

@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 cel = { workspace = true }
 clap = { workspace = true }
-etv-station = { workspace = true }
 glob = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

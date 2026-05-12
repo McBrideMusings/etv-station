@@ -1,0 +1,11 @@
+width = 320
+height = 240
+framerate = 25
+pixel_format = "rgba8"
+
+[kind]
+type = "watermark"
+corner = "top_right"
+margin = 12
+box_size = 56
+color = [220, 50, 50, 220]

@@ -6,7 +6,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 
 | Path | What |
 |---|---|
-| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-query-test`. Excludes `etv-next/`. |
+| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-query-test`, `crates/etv-overlay`. Excludes `etv-next/`. |
 | `Cargo.lock` | Workspace lockfile. |
 | `task runner` | Generated task runner. **Do not hand-edit** — regenerated from `the task-runner config`. |
 | `the task-runner config` | Source of truth for `the project task runner` commands. Uses the `docker-unraid` archetype. |
@@ -40,8 +40,16 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `crates/etv-station/src/scan.rs` | Discover existing `{start}_{finish}.json` files in a channel's `output_folder` for startup catch-up. |
 | `crates/etv-station/src/emit.rs` | Chunk slicer + filename formatter. Walks `tz::add_chunk` boundaries and writes one playout file per chunk via `atomic_write_json`. |
 | `crates/etv-station/src/tz.rs` | IANA tz parsing (via `time-tz`) + chunk-boundary helpers that honor DST. |
-| `crates/etv-station/src/daemon.rs` | Per-channel orchestrator: probe durations, anchor, startup catch-up, then `tokio::time::interval` roll loop. Top level handles `Ctrl-C`. |
+| `crates/etv-station/src/daemon.rs` | Per-channel orchestrator: probe durations, anchor, startup catch-up, then `tokio::time::interval` roll loop. Top level handles `Ctrl-C`. Also spawns one overlay-supervisor task per channel with `[overlay]` configured and wipes emitted playout JSON on startup (see #53). |
+| `crates/etv-station/src/overlay_supervisor.rs` | Per-channel `etv-overlay` subprocess lifecycle: pre-creates the fifo, eager-spawns the renderer at startup, restarts on death, kills on daemon shutdown. |
 | `crates/etv-station/src/errors.rs` | `ConfigError`, `AtomicWriteError`, and the top-level `StationError` runtime enum. |
+| `crates/etv-overlay/` | Velo Phase B overlay renderer crate. Vello + Rhai + asset loading; standalone binary `etv-overlay`. |
+| `crates/etv-overlay/src/overlay_spec.rs` | TOML config parsing — `OverlaySpec` (size, framerate, pixel_format, script path) + `OverlayKind` enum: `Empty`, `Watermark { corner, margin, box_size, color }`, `Logo { path, corner, margin, height }`. |
+| `crates/etv-overlay/src/vello_renderer.rs` | Headless wgpu + Vello renderer. Writes RGBA8 frames; caches decoded PNGs in a `HashMap`. Handles texture-to-buffer copy with 256-byte row alignment. |
+| `crates/etv-overlay/src/rhai_engine.rs` | Per-frame Rhai script evaluator. Exposes `time` (seconds) and `frame` (index) constants; script returns `#{visible, opacity}` map applied to the rendered scene. |
+| `crates/etv-overlay/src/fifo_writer.rs` | Pre-creates the fifo via `mkfifo`, opens O_RDWR (so neither writer nor reader blocks on the other), writes RGBA frames at the configured framerate. |
+| `crates/etv-overlay/src/bin/etv-overlay.rs` | CLI: `render-still` (single PNG), `run` (input.mp4 + overlay → output.mp4 harness), `pipe` (long-running fifo writer used by the station supervisor). |
+| `crates/etv-overlay/fixtures/` | Watermark + fade TOMLs + Rhai scripts used by tests and `./tools/overlay-test.sh`. |
 
 ## Docs
 
@@ -61,22 +69,33 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | Path | Tracked | What |
 |---|---|---|
 | `examples/station.toml` | yes | Minimal station manifest used as `cargo test` fixture and default `--config` for dev runs. |
-| `examples/channels/lavfi-test.toml` | yes | Loop-Forever channel with three lavfi items — used by the `cargo test` fixture. |
-| `examples/channels/diehard.toml` | no | Personal Die Hard channel config; gitignored. |
+| `examples/channels/lavfi-test.toml` | yes | Loop-Forever channel with three lavfi items — used by the `cargo test` fixture. Has an overlay attached for spike testing. |
+| `examples/channels/diehard.toml` | no | Personal Die Hard channel config; gitignored. Wired to the Pierce overlay for Velo Phase B. |
+| `examples/channels/trending.toml` | no | Personal Project Hail Mary channel; gitignored. Wired to the trending overlay. |
 | `examples/channels/star-trek.toml` | no | 950-episode Star Trek channel (all 12 series, release order). Built from Sonarr; gitignored. |
-| `examples/etv-next/lineup.json` | no | Generated from env vars at dev-run time; gitignored. |
+| `examples/overlays/pierce_logo.toml` | yes | Overlay config: Pierce logo bottom-right of a 1280×720 frame. Used by the diehard channel. |
+| `examples/overlays/trending_logo.toml` | yes | Overlay config: trending logo bottom-right of a 1280×720 frame. Used by the trending channel. |
+| `examples/assets/pierce-logo.png` | yes | Pierce channel logo (icon only, 1000×1000 RGBA). |
+| `examples/assets/trending-logo.png` | yes | Trending channel logo (1200×1200 RGBA, red gradient + white arrow). |
+| `examples/assets/pierce-logo-with-text.png` | yes | Older Pierce logo bundled with text underneath — kept for reference; not used by any channel. |
+| `examples/etv-next/lineup.json` | no | Generated from `lineup.json.tpl` at dev-run time; gitignored. |
+| `examples/etv-next/lineup.json.tpl` | no | Template for the lineup JSON; references channel1/channel2/channel3 configs; gitignored. |
 | `examples/etv-next/channel.json` | no | Host-specific etv-next channel config; gitignored. |
+| `examples/etv-next/channel2.json` | no | etv-next config for the Pierce channel (1280×720 h264 via videotoolbox); gitignored. |
+| `examples/etv-next/channel3.json` | no | etv-next config for the Trending channel; gitignored. |
 | `examples/output/` | no | Station writes playout JSON here during dev; gitignored. |
 
 ## Dev tooling
 
 | Path | What |
 |---|---|
-| `tools/dev-run.sh` | Helper for `./tools/dev-run.sh` — builds both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. |
+| `tools/dev-run.sh` | Helper for `./tools/dev-run.sh` — builds etv-overlay, both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. |
 | `tools/kill-dev.sh` | Helper for `./tools/kill-dev.sh` — sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
 | `tools/frame-grab.sh` | Helper for `./tools/frame-grab.sh` — captures one JPEG frame from a live HLS channel via ffmpeg (15 s timeout) and opens it in Preview. `CHANNEL=N` selects the channel (default 1). |
 | `tools/validate-streams.sh` | Helper for `./tools/validate-streams.sh` — HTTP probes, codec check, blackdetect, and log scan across all channels in the lineup. |
 | `tools/query.sh` | Standalone wrapper for `./tools/query.sh` (sources `.env`, then invokes the `etv-query-test` binary). |
+| `tools/overlay-test.sh` | Helper for `./tools/overlay-test.sh` — runs the etv-overlay pipeline against a bumper fixture and opens the resulting mp4. `FIXTURE=`, `CONFIG=`, `OUTPUT=` override defaults. |
+| `tools/overlay-still.sh` | Helper for `./tools/overlay-still.sh` — renders a single overlay frame to PNG and opens it. `CONFIG=`, `TIME=` override defaults. |
 
 ## Agent skills
 

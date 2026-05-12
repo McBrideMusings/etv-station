@@ -121,6 +121,7 @@ mod tests {
             roll_interval: Duration::from_secs(3600),
             retention_days: 1,
             rule: RuleConfig::LoopForever { items },
+            overlay: None,
         }
     }
 

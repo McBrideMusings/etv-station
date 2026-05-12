@@ -226,7 +226,7 @@ v2+ work proceeds in **three sequential phases**, each a milestone with focused 
 
 Live content sourcing requires a query language. ErsatzTV's Lucene variant had documented failure modes (prefix overmatch, no absolute episode numbers across show variants). Per the global off-the-shelf-first rule, we evaluate existing languages — top candidate [CEL](https://cel.dev/) via `cel-rust`, fallback Plex-API pass-through with structured TOML filters — against real-world channel-building cases. The deliverable is a standalone query tester (`crates/etv-query-test`) and a documented language pick. No daemon integration, no schema commit.
 
-### Phase B — Graphics rendering
+### Phase B — Graphics rendering (spike shipped 2026-05-12; text overlays remaining)
 
 Inspired by [ErsatzTV's graphics engine](https://ersatztv.org/docs/advanced/graphics-engine/), but authored in a real scripting language ([Rhai](https://rhai.rs/)) rather than YAML. Two tracks:
 

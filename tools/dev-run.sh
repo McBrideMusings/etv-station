@@ -39,6 +39,13 @@ done < <(awk -F '"' '/^path/ {print $2}' "$STATION_CONFIG")
 
 trap 'for pid in $(jobs -p); do kill -TERM -- "-$pid" 2>/dev/null; done' EXIT INT TERM
 
+# Pre-build etv-overlay so the station daemon can spawn it as a sibling binary
+# the moment a channel becomes "watched". Without this the supervisor logs a
+# spawn failure on the first few heartbeats.
+echo "[dev] building etv-overlay..."
+cargo build -p etv-overlay 2>&1 \
+  | while IFS= read -r l; do printf '[station] %s\n' "$l"; done
+
 bash "$(dirname "$0")/render-lineup.sh"
 
 cat <<EOF

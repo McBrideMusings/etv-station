@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ersatztv_playout::playout::{PlayoutItem, ProgramMetadata};
+use ersatztv_playout::playout::{OverlaySpec, PlayoutItem, ProgramMetadata};
 use time::OffsetDateTime;
 
 use crate::config::ItemConfig;
@@ -18,6 +18,7 @@ pub struct LoopForever<'a> {
     items: &'a [ItemConfig],
     durations: &'a [Duration],
     total_secs: f64,
+    overlay: Option<OverlaySpec>,
 }
 
 impl<'a> LoopForever<'a> {
@@ -32,7 +33,13 @@ impl<'a> LoopForever<'a> {
             items,
             durations,
             total_secs,
+            overlay: None,
         }
+    }
+
+    pub fn with_overlay(mut self, overlay: Option<OverlaySpec>) -> Self {
+        self.overlay = overlay;
+        self
     }
 }
 
@@ -62,6 +69,7 @@ impl<'a> Rule for LoopForever<'a> {
                 &self.items[idx],
                 item_start_utc,
                 item_finish_utc,
+                self.overlay.as_ref(),
             ));
 
             if item_finish_utc >= to {
@@ -90,6 +98,7 @@ fn build_playout_item(
     item: &ItemConfig,
     start: OffsetDateTime,
     finish: OffsetDateTime,
+    overlay: Option<&OverlaySpec>,
 ) -> PlayoutItem {
     PlayoutItem {
         id: item.id.clone(),
@@ -98,6 +107,7 @@ fn build_playout_item(
         source: Some(item.to_playout_source()),
         tracks: None,
         program: item.program.as_ref().map(clone_program),
+        overlay: overlay.cloned(),
     }
 }
 

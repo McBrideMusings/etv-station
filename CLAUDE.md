@@ -14,16 +14,18 @@ See `docs/architecture.md` for the full picture and `docs/PRD.md` for the spec.
 
 ## Build & run
 
-This is a Cargo workspace with a single binary crate (`crates/etv-station`). The `the project task runner` script wraps the common operations:
+This is a Cargo workspace with three crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer). The `the project task runner` script wraps the common operations:
 
 ```sh
-./tools/dev-run.sh          # run station daemon + ETV-next together (integration test)
-cargo test --workspace         # cargo test --workspace
-cargo clippy --workspace -- -D clippy::all          # clippy with -D clippy::all
-cargo +nightly fmt --all          # nightly rustfmt
-bun run docs:dev         # serve VitePress docs on http://localhost:5193
-the deploy task runner        # build linux/amd64 Docker image (provided by docker-unraid archetype)
-the deploy task runner       # build + recreate container on Unraid (env: APP_IMAGE, UNRAID_HOST, UNRAID_USER)
+./tools/dev-run.sh            # run station daemon + ETV-next together (integration test)
+cargo test --workspace           # cargo test --workspace
+cargo clippy --workspace -- -D clippy::all            # clippy with -D clippy::all
+cargo +nightly fmt --all            # nightly rustfmt
+bun run docs:dev           # serve VitePress docs on http://localhost:5193
+./tools/overlay-test.sh   # render a Vello overlay onto a bumper fixture and open the mp4
+./tools/overlay-still.sh  # render a single overlay frame to PNG and open it
+the deploy task runner          # build linux/amd64 Docker image (provided by docker-unraid archetype)
+the deploy task runner         # build + recreate container on Unraid (env: APP_IMAGE, UNRAID_HOST, UNRAID_USER)
 ```
 
 `./tools/dev-run.sh` is the canonical local integration test: it builds both etv-next binaries, starts the station daemon (which writes playout JSON to `examples/output/test/`), starts the ErsatzTV-next HTTP server on `127.0.0.1:8409`, and tees both processes' output with `[station]`/`[etv]` prefixes. Hit `http://127.0.0.1:8409/channel/1.m3u8` for HLS or `/channels.m3u` for the lineup.

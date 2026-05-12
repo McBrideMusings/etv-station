@@ -7,3 +7,7 @@ path = "channels/lavfi-test.toml"
 [[channels]]
 name = "diehard"
 path = "channels/diehard.toml"
+
+[[channels]]
+name = "trending"
+path = "channels/trending.toml"
