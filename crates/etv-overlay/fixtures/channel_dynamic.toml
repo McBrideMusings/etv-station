@@ -1,0 +1,33 @@
+width = 1280
+height = 720
+framerate = 30
+pixel_format = "rgba8"
+script = "scripts/now_and_next.rhai"
+
+# Layer 0 — channel watermark, always on
+[[layers]]
+type = "watermark"
+corner = "top_right"
+margin = 32
+box_size = 120
+color = [220, 60, 60, 220]
+
+# Layer 1 — "Now playing: {title}" lower-third, gated by Rhai on item_elapsed
+[[layers]]
+type = "text"
+content = "Now playing: ..."
+font_family = "system-ui"
+font_size = 36.0
+color = [255, 255, 255, 230]
+corner = "bottom_left"
+margin = 48
+
+# Layer 2 — "Up next: {next_title}" lower-third, gated by Rhai on item_remaining
+[[layers]]
+type = "text"
+content = "Up next: ..."
+font_family = "system-ui"
+font_size = 28.0
+color = [255, 255, 255, 200]
+corner = "bottom_right"
+margin = 48

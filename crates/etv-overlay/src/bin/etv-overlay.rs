@@ -7,8 +7,10 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use etv_overlay::fifo_writer::{FifoWriter, default_fifo_path};
 use etv_overlay::overlay_spec::OverlaySpec;
+use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
 use etv_overlay::rhai_engine::{OverlayState, RhaiEngine};
 use etv_overlay::vello_renderer::VelloRenderer;
+use time::OffsetDateTime;
 
 #[derive(Parser)]
 #[command(name = "etv-overlay")]
@@ -58,6 +60,13 @@ enum Cmd {
         /// image cache miss) so callers can avoid sampling torn frames.
         #[arg(long)]
         ready_file: Option<PathBuf>,
+        /// Folder containing the station-emitted chunked playout JSON for
+        /// this channel. When set, the per-frame Rhai scope is populated with
+        /// `title` / `next_title` / `item_elapsed` / `item_remaining` for the
+        /// item airing at wallclock now. Without it the context fields are
+        /// empty/-1.0 — scripts that don't reference them still work.
+        #[arg(long)]
+        playout_folder: Option<PathBuf>,
     },
 }
 
@@ -89,7 +98,8 @@ fn main() -> anyhow::Result<()> {
             fifo,
             create_fifo,
             ready_file,
-        } => pipe_to_fifo(config, fifo, create_fifo, ready_file),
+            playout_folder,
+        } => pipe_to_fifo(config, fifo, create_fifo, ready_file, playout_folder),
     }
 }
 
@@ -176,7 +186,7 @@ fn run_with_ffmpeg(
         }
 
         let time_seconds = frame_index as f64 / spec.framerate.max(1) as f64;
-        let state = engine.evaluate(time_seconds, frame_index);
+        let state = engine.evaluate(time_seconds, frame_index, &ProgramContext::unknown());
         let frame = renderer.render_frame(&state)?;
 
         if let Err(e) = fifo.write_frame(&frame) {
@@ -214,6 +224,7 @@ fn pipe_to_fifo(
     fifo_path: PathBuf,
     create_fifo: bool,
     ready_file: Option<PathBuf>,
+    playout_folder: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&config)?;
     let mut fifo = if create_fifo {
@@ -221,6 +232,8 @@ fn pipe_to_fifo(
     } else {
         FifoWriter::attach(fifo_path.clone())
     };
+
+    let mut program_source = playout_folder.map(ProgramContextSource::new);
 
     // Warm the renderer fully BEFORE opening the fifo. wgpu adapter init,
     // vello shader compile, and the first image-cache decode all happen in
@@ -231,7 +244,8 @@ fn pipe_to_fifo(
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
     let engine = build_engine(&spec)?;
     let start = std::time::Instant::now();
-    let first_frame = renderer.render_frame(&engine.evaluate(0.0, 0))?;
+    let initial_ctx = current_context(program_source.as_mut());
+    let first_frame = renderer.render_frame(&engine.evaluate(0.0, 0, &initial_ctx))?;
     tracing::info!(
         warmup_ms = start.elapsed().as_millis() as u64,
         "renderer warm; opening fifo for first write",
@@ -255,11 +269,12 @@ fn pipe_to_fifo(
         );
     }
 
-    let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
+    let framerate = spec.framerate.max(1) as f64;
     let mut frame_index: u64 = 1;
     loop {
         let time_seconds = start.elapsed().as_secs_f64();
-        let state = engine.evaluate(time_seconds, frame_index);
+        let ctx = current_context(program_source.as_mut());
+        let state = engine.evaluate(time_seconds, frame_index, &ctx);
         let frame = renderer.render_frame(&state)?;
         if let Err(e) = fifo.write_frame(&frame) {
             if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
@@ -269,12 +284,31 @@ fn pipe_to_fifo(
             return Err(e.into());
         }
         frame_index += 1;
-        let target = start + frame_period * frame_index as u32;
+        // f64-based offset so a 24/7 daemon doesn't truncate at u32 wrap (~1657 days at 30 fps).
+        let target = start + Duration::from_secs_f64(frame_index as f64 / framerate);
         let now = std::time::Instant::now();
         if target > now {
             thread::sleep(target - now);
         }
     }
+}
+
+/// Resolve the current program context, refreshing the schedule cache if it's
+/// stale. Returns [`ProgramContext::unknown`] when no source is configured
+/// or when the refresh itself errors — a transient schedule problem must not
+/// kill the overlay loop.
+fn current_context(source: Option<&mut ProgramContextSource>) -> ProgramContext {
+    let Some(source) = source else {
+        return ProgramContext::unknown();
+    };
+    if let Err(e) = source.refresh() {
+        tracing::warn!(
+            folder = %source.folder().display(),
+            error = %e,
+            "program_context refresh failed; using last-known schedule",
+        );
+    }
+    source.current_at(OffsetDateTime::now_utc())
 }
 
 fn touch(path: &std::path::Path) -> std::io::Result<()> {
@@ -295,7 +329,7 @@ fn build_engine(spec: &OverlaySpec) -> anyhow::Result<RhaiEngine> {
 
 fn evaluate_state(spec: &OverlaySpec, time: f64, frame_index: u64) -> anyhow::Result<OverlayState> {
     let engine = build_engine(spec)?;
-    Ok(engine.evaluate(time, frame_index))
+    Ok(engine.evaluate(time, frame_index, &ProgramContext::unknown()))
 }
 
 fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<()> {

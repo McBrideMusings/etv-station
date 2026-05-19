@@ -1,0 +1,12 @@
+width = 1280
+height = 720
+framerate = 30
+pixel_format = "rgba8"
+script = "scripts/pulse_watermark.rhai"
+
+[kind]
+type = "watermark"
+corner = "top_right"
+margin = 32
+box_size = 140
+color = [220, 60, 60, 240]

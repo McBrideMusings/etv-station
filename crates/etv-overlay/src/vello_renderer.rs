@@ -12,7 +12,7 @@ use vello::wgpu;
 use vello::{AaConfig, AaSupport, Glyph, RenderParams, Renderer, RendererOptions, Scene};
 
 use crate::overlay_spec::{Corner, OverlayKind, PixelFormat};
-use crate::rhai_engine::OverlayState;
+use crate::rhai_engine::{LayerState, OverlayState};
 
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 
@@ -167,7 +167,11 @@ impl VelloRenderer {
 
     fn build_scene(&mut self, scene: &mut Scene, state: &OverlayState) -> anyhow::Result<()> {
         for layer in &state.layers {
-            self.build_layer(scene, layer, state.opacity)?;
+            if !layer.visible {
+                continue;
+            }
+            let effective_opacity = state.opacity * layer.opacity;
+            self.build_layer(scene, layer, effective_opacity)?;
         }
         Ok(())
     }
@@ -175,10 +179,10 @@ impl VelloRenderer {
     fn build_layer(
         &mut self,
         scene: &mut Scene,
-        layer: &OverlayKind,
+        layer: &LayerState,
         opacity: f32,
     ) -> anyhow::Result<()> {
-        match layer {
+        match &layer.kind {
             OverlayKind::Empty => {}
             OverlayKind::Watermark {
                 corner,

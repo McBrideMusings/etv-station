@@ -11,3 +11,11 @@ path = "channels/diehard.toml"
 [[channels]]
 name = "trending"
 path = "channels/trending.toml"
+
+[[channels]]
+name = "showcase"
+path = "channels/showcase.toml"
+
+[[channels]]
+name = "marquee"
+path = "channels/marquee.toml"

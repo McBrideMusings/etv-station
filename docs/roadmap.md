@@ -32,14 +32,11 @@ Each phase is a milestone with a small, focused set of issues. Phases run sequen
 
 Deliverable: `crates/etv-query-test` — interactive CEL query harness with Plex + FS catalogs, path-key dedup, 1h disk cache, and `./tools/query.sh`.
 
-### Phase B — Graphics rendering (in flight — static text shipped, dynamic templating remaining)
+### ✅ Phase B — Graphics rendering
 
-Bring the [ErsatzTV graphics-engine](https://ersatztv.org/docs/advanced/graphics-engine/) concept to etv-next, but with logic authored in a real scripting language ([Rhai](https://rhai.rs/)) instead of YAML. Run as two sub-tracks because they go hand in hand but split cleanly:
+**Shipped.** Per-channel `etv-overlay` subprocess renders Vello frames to a fifo etv-next composites on. Rhai scripts read the station-emitted chunked playout JSON to template lower-thirds with the current/next item's title and gate visibility on `item_elapsed` / `item_remaining`. Per-layer overrides (visibility, opacity, content, corner) compose with global `visible`/`opacity`. Sample scripts in `crates/etv-overlay/fixtures/scripts/`: `now_playing.rhai`, `up_next.rhai`, `pulse_watermark.rhai`, `corner_rotate.rhai`, `now_and_next.rhai`.
 
-- **Static rendering.** Hardcoded channel watermark in a corner using [Vello](https://github.com/linebender/vello). Proves the rendering pipe integrates with etv-next's output stage. Extends `PlayoutItem` with overlay declarations (etv-next submodule change).
-- **Scripted behavior.** Add Rhai. Watermark with script-controlled visibility / corner / size / opacity. Fade in/out on time interval (the "logo pulses every minute" pattern). Now-playing / up-next text overlays.
-
-Deliverable: working overlay pipeline in a dev channel, with a small set of declarative + scripted overlay primitives.
+Out of scope until Phase C: scripted `size`/`color`, channel/block/item overlay cascade (#48). Lottie / `velato` tracked separately (#50).
 
 ### Phase C — Schema overhaul
 

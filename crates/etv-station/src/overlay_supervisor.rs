@@ -182,6 +182,11 @@ fn spawn_overlay(ctx: &OverlayContext) -> std::io::Result<Child> {
         .arg(&ctx.fifo_path)
         .arg("--ready-file")
         .arg(ctx.ready_path())
+        // Source of truth for "what's airing now" — the overlay reads the
+        // station-emitted chunk JSON to populate the per-frame Rhai context
+        // (title, next_title, item_elapsed, item_remaining).
+        .arg("--playout-folder")
+        .arg(&ctx.output_folder)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

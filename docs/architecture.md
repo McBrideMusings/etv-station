@@ -79,6 +79,39 @@ The query language (Phase A picks the off-the-shelf option, candidate: CEL) tran
 
 Cascade: channel default → block override → item override. Declarative primitives (corner watermark, time-interval fade, lower-third text) compose with [Rhai](https://rhai.rs/) scripts for dynamic behavior. Rendering uses [Vello](https://github.com/linebender/vello). Lottie / `velato` is a deferred side project.
 
+#### Scripted overlays (current implementation)
+
+The `etv-overlay pipe` subprocess (one per channel, supervised by `overlay_supervisor.rs`) renders RGBA frames to a fifo that etv-next reads through its `overlay` filter input. Per frame it evaluates an optional [Rhai](https://rhai.rs/) script whose returned map drives layer visibility, opacity, text content, and corner. Scope exposed to the script:
+
+| Name             | Type    | Source                                          |
+|------------------|---------|-------------------------------------------------|
+| `time`           | float   | process-elapsed seconds (good for fade curves)  |
+| `frame`          | int     | frame index since process start                 |
+| `title`          | string  | currently-airing item's `program.title`         |
+| `sub_title`      | string  | currently-airing item's `program.sub_title`     |
+| `next_title`     | string  | next item's `program.title`                     |
+| `next_sub_title` | string  | next item's `program.sub_title`                 |
+| `item_elapsed`   | float   | seconds since current item's `start` (`-1.0` if unknown) |
+| `item_remaining` | float   | seconds until current item's `finish` (`-1.0` if unknown) |
+
+Schedule access is read-only against the chunked playout JSON the station already writes (`{start}_{finish}.json`). No sidecar files — the supervisor passes `--playout-folder` to the overlay process, which scans on a 1Hz mtime poll and binary-searches per frame.
+
+The script's returned map applies global keys (`visible`, `opacity`) plus an optional `layers` array of per-index overrides:
+
+```rhai
+#{
+  layers: [
+    #{},  // leave layer 0 at TOML defaults
+    #{ visible: item_elapsed >= 0.0 && item_elapsed < 10.0,
+       content: "Now playing: " + title },
+    #{ visible: item_remaining >= 0.0 && item_remaining < 10.0,
+       content: "Up next: " + next_title },
+  ],
+}
+```
+
+Per-layer keys: `visible` (bool), `opacity` (float, composed with global), `content` (string — Text layers only, truncated at 512 chars), `corner` (`"top_left"` | `"top_right"` | `"bottom_left"` | `"bottom_right"`). Sample scripts live in `crates/etv-overlay/fixtures/scripts/`.
+
 ### Block / channel composition (Phase C)
 
 The current `[rule] type = "loop_forever"` with `[[rule.items]]` is replaced by:

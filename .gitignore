@@ -12,9 +12,16 @@ examples/etv-next/lineup.json
 examples/etv-next/channel.json
 examples/etv-next/channel2.json
 examples/etv-next/channel3.json
+examples/etv-next/channel4.json
+examples/etv-next/channel5.json
 examples/etv-next/lineup.json.tpl
 examples/output/
 examples/channels/star-trek.toml
 examples/channels/diehard.toml
 examples/channels/trending.toml
+examples/channels/marquee.toml
+examples/channels/showcase.toml
+examples/overlays/marquee_overlay.toml
+examples/overlays/showcase_overlay.toml
+examples/overlays/scripts/
 .claude/scheduled_tasks.lock

@@ -1,0 +1,12 @@
+width = 1280
+height = 720
+framerate = 30
+pixel_format = "rgba8"
+script = "scripts/corner_rotate.rhai"
+
+[[layers]]
+type = "watermark"
+corner = "top_left"
+margin = 32
+box_size = 120
+color = [60, 180, 220, 220]
