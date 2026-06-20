@@ -1,11 +1,11 @@
 ---
 name: read-logs
-description: Read runtime logs from the last ./tools/dev-run.sh or other command. Use when the user says they ran the app and something didn't work, or when you need to check what happened during the last run.
+description: Read runtime logs from the last dev run or other command. Use when the user says they ran the app and something didn't work, or when you need to check what happened during the last run.
 ---
 
 # Read Logs
 
-Task-runner commands write output to timestamped log files in `tmp/`. The file name pattern is:
+Dev and tooling runs write output to timestamped log files in `tmp/`. The file name pattern is:
 
 ```
 tmp/<command>.<YYYY-MM-DD>_<HHMMSS>.log
@@ -13,7 +13,7 @@ tmp/<command>.<YYYY-MM-DD>_<HHMMSS>.log
 
 Examples:
 - `./tools/dev-run.sh` → `tmp/dev.2026-05-01_133442.log`
-- `the deploy task runner` → `tmp/build.2026-05-01_133442.log`
+- a build → `tmp/build.2026-05-01_133442.log`
 - `cargo test --workspace` → `tmp/test.2026-05-01_133442.log`
 
 Each run produces a new file. Old files are pruned by count (most recent N kept; defaults configured by the generator).
@@ -45,4 +45,4 @@ Read from the **bottom** of the log file (last 80 lines). The user typically qui
 ### What NOT to do
 - Don't read the entire log file upfront if it's large
 - Don't ask the user to paste logs — just read the file
-- Don't run `the deploy task runner` to view logs — use the Read tool directly on the file
+- Don't shell out to tail/view logs — use the Read tool directly on the file

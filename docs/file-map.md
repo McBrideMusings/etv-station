@@ -8,8 +8,6 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 |---|---|
 | `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-query-test`, `crates/etv-overlay`. Excludes `etv-next/`. |
 | `Cargo.lock` | Workspace lockfile. |
-| `task runner` | Generated task runner. **Do not hand-edit** — regenerated from `the task-runner config`. |
-| `the task-runner config` | Source of truth for `the project task runner` commands. Uses the `docker-unraid` archetype. |
 | `package.json` | VitePress devDep + `docs:dev` / `docs:build` scripts. Docs-only; no runtime JS. |
 | `bun.lock` | Bun lockfile for the docs `package.json`. |
 | `rustfmt.toml` | Workspace formatting config. |
@@ -91,13 +89,13 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 
 | Path | What |
 |---|---|
-| `tools/dev-run.sh` | Helper for `./tools/dev-run.sh` — builds etv-overlay, both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. |
-| `tools/kill-dev.sh` | Helper for `./tools/kill-dev.sh` — sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
-| `tools/frame-grab.sh` | Helper for `./tools/frame-grab.sh` — captures one JPEG frame from a live HLS channel via ffmpeg (15 s timeout) and opens it in Preview. `CHANNEL=N` selects the channel (default 1). |
-| `tools/validate-streams.sh` | Helper for `./tools/validate-streams.sh` — HTTP probes, codec check, blackdetect, and log scan across all channels in the lineup. |
-| `tools/query.sh` | Standalone wrapper for `./tools/query.sh` (sources `.env`, then invokes the `etv-query-test` binary). |
-| `tools/overlay-test.sh` | Helper for `./tools/overlay-test.sh` — runs the etv-overlay pipeline against a bumper fixture and opens the resulting mp4. `FIXTURE=`, `CONFIG=`, `OUTPUT=` override defaults. |
-| `tools/overlay-still.sh` | Helper for `./tools/overlay-still.sh` — renders a single overlay frame to PNG and opens it. `CONFIG=`, `TIME=` override defaults. |
+| `tools/dev-run.sh` | Builds etv-overlay, both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. The canonical local integration test. |
+| `tools/kill-dev.sh` | Sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
+| `tools/frame-grab.sh` | Captures one JPEG frame from a live HLS channel via ffmpeg (15 s timeout) and opens it in Preview. `CHANNEL=N` selects the channel (default 1). |
+| `tools/validate-streams.sh` | HTTP probes, codec check, blackdetect, and log scan across all channels in the lineup. Run while a dev integration is active. |
+| `tools/query.sh` | Standalone ad-hoc CEL query wrapper (sources `.env`, then invokes the `etv-query-test` binary). |
+| `tools/overlay-test.sh` | Runs the etv-overlay pipeline against a bumper fixture and opens the resulting mp4. `FIXTURE=`, `CONFIG=`, `OUTPUT=` override defaults. |
+| `tools/overlay-still.sh` | Renders a single overlay frame to PNG and opens it. `CONFIG=`, `TIME=` override defaults. |
 
 ## Agent skills
 
@@ -106,7 +104,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `.claude/skills/check-channels.md` | Skill: curl HLS endpoints and validate master/variant playlists for each channel. |
 | `.claude/skills/check-epg.md` | Skill: fetch `/xmltv.xml`, validate XMLTV structure, cross-check titles against playout JSON on disk. |
 | `.claude/skills/frame-grab.md` | Skill: `ffmpeg` frame capture from a live HLS stream; reads image inline so Claude can see the frame. |
-| `.claude/skills/read-logs.md` | Skill: locate and read the most recent `tmp/<cmd>.*.log` file from an `the project task runner` run. |
+| `.claude/skills/read-logs.md` | Skill: locate and read the most recent `tmp/<cmd>.*.log` file from a dev run. |
 
 ## Submodule
 
@@ -120,7 +118,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 
 | Path | What |
 |---|---|
-| `tmp/run.log` | Tee'd output of the most recent `a tools/ script` invocation. Inspect after a failed run. |
+| `tmp/run.log` | Tee'd output of the most recent dev/tooling invocation. Inspect after a failed run. |
 | `target/` | Cargo build output. Gitignored. |
 | `docs/.vitepress/cache/`, `docs/.vitepress/dist/` | VitePress cache and build output. Gitignored. |
 | `node_modules/` | VitePress install. Gitignored. |
