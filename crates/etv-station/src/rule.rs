@@ -100,16 +100,11 @@ fn build_playout_item(
     finish: OffsetDateTime,
     overlay: Option<&OverlaySpec>,
 ) -> PlayoutItem {
-    PlayoutItem {
-        id: item.id.clone(),
-        start,
-        finish,
-        source: Some(item.to_playout_source()),
-        tracks: None,
-        watermark: None,
-        program: item.program.as_ref().map(clone_program),
-        overlay: overlay.cloned(),
-    }
+    let mut playout_item =
+        PlayoutItem::scheduled(item.id.clone(), start, finish, item.to_playout_source());
+    playout_item.program = item.program.as_ref().map(clone_program);
+    playout_item.overlay = overlay.cloned();
+    playout_item
 }
 
 fn clone_program(p: &ProgramMetadata) -> ProgramMetadata {
