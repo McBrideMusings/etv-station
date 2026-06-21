@@ -46,9 +46,11 @@ impl ItemConfig {
                 path: path.clone(),
                 in_point_ms,
                 out_point_ms,
+                probe_hint: None,
             },
             SourceConfig::Lavfi { params } => PlayoutItemSource::Lavfi {
                 params: params.clone(),
+                probe_hint: None,
             },
             SourceConfig::Http {
                 uri,
@@ -63,6 +65,8 @@ impl ItemConfig {
                 timeout_us: None,
                 reconnect: None,
                 reconnect_delay_max: None,
+                keep_alive: None,
+                probe_hint: None,
             },
         }
     }

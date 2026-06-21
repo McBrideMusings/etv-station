@@ -106,6 +106,7 @@ fn build_playout_item(
         finish,
         source: Some(item.to_playout_source()),
         tracks: None,
+        watermark: None,
         program: item.program.as_ref().map(clone_program),
         overlay: overlay.cloned(),
     }
