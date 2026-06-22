@@ -252,13 +252,7 @@ fn pipe_to_fifo(
     );
 
     fifo.open_for_writing()?;
-    if let Err(e) = fifo.write_frame(&first_frame) {
-        if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
-            tracing::info!("reader disconnected before first frame");
-            return Ok(());
-        }
-        return Err(e.into());
-    }
+    write_frame_resilient(&mut fifo, &first_frame)?;
     if let Some(path) = ready_file.as_deref()
         && let Err(e) = touch(path)
     {
@@ -276,19 +270,32 @@ fn pipe_to_fifo(
         let ctx = current_context(program_source.as_mut());
         let state = engine.evaluate(time_seconds, frame_index, &ctx);
         let frame = renderer.render_frame(&state)?;
-        if let Err(e) = fifo.write_frame(&frame) {
-            if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
-                tracing::info!("reader disconnected");
-                return Ok(());
-            }
-            return Err(e.into());
-        }
+        write_frame_resilient(&mut fifo, &frame)?;
         frame_index += 1;
         // f64-based offset so a 24/7 daemon doesn't truncate at u32 wrap (~1657 days at 30 fps).
         let target = start + Duration::from_secs_f64(frame_index as f64 / framerate);
         let now = std::time::Instant::now();
         if target > now {
             thread::sleep(target - now);
+        }
+    }
+}
+
+/// Write one frame, transparently waiting for the next reader if the current
+/// one has gone away. etv-next spawns a fresh ffmpeg per playout item; when an
+/// item ends our write returns BrokenPipe, so we reopen the fifo (blocking
+/// until the next item's ffmpeg attaches) and write the frame as the first,
+/// frame-aligned frame of that reader's stream. This keeps the overlay process
+/// alive across the whole channel session rather than exiting per item.
+fn write_frame_resilient(fifo: &mut FifoWriter, frame: &[u8]) -> anyhow::Result<()> {
+    loop {
+        match fifo.write_frame(frame) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                tracing::info!("reader disconnected; waiting for next reader to reattach");
+                fifo.reopen()?;
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 }

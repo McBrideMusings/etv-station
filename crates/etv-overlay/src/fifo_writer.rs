@@ -42,18 +42,30 @@ impl FifoWriter {
         if self.file.is_some() {
             return Ok(());
         }
-        // O_RDWR on a fifo lets us open it without blocking on a reader. The
-        // alternative (O_WRONLY) blocks until a reader connects, which would
-        // deadlock against ffmpeg also blocking on opening the fifo for read
-        // until a writer connects. With O_RDWR both sides can open whenever
-        // they like.
+        // Open write-only. O_WRONLY blocks until a reader (the channel's
+        // ffmpeg) opens the fifo, then unblocks — exactly the rendezvous a
+        // fifo is built for, so there is no deadlock with ffmpeg's own
+        // blocking open-for-read. Crucially, a write-only fd means that when
+        // the reader goes away — etv-next spawns a fresh ffmpeg per playout
+        // item — the next write returns BrokenPipe, which lets us reopen() and
+        // start the next reader's stream on a frame boundary. An O_RDWR fd
+        // (the writer also holding a read end) never observes the reader
+        // leaving, so every post-first-item ffmpeg would attach mid-frame and
+        // render a torn, tiled overlay.
         let file = OpenOptions::new()
-            .read(true)
             .write(true)
             .open(&self.path)
             .map_err(|e| anyhow::anyhow!("open fifo {}: {e}", self.path.display()))?;
         self.file = Some(file);
         Ok(())
+    }
+
+    /// Close the current write fd and reopen the fifo, blocking until the next
+    /// reader attaches. Called after a BrokenPipe so the next consumer's
+    /// stream begins on a fresh frame boundary.
+    pub fn reopen(&mut self) -> anyhow::Result<()> {
+        self.file = None;
+        self.open_for_writing()
     }
 
     pub fn write_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
