@@ -92,4 +92,29 @@ fi
     | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 ) &
 
+# Once etv-next is serving the lineup, point IINA at the channel list so the
+# channels + overlays can be eyeballed live. IINA loads the .m3u as a playlist
+# (one entry per channel). Set OPEN_IINA=0 to skip — e.g. for headless
+# validation runs that only curl/ffprobe the endpoints.
+#
+# `open -a IINA <url>` goes through LaunchServices, which routes the open to an
+# already-running IINA instead of starting a second copy — so repeated dev-runs
+# reuse the one instance rather than stacking up duplicate apps (verified: pid
+# stays the same across opens). Do NOT use iina-cli here: it execs the IINA
+# binary directly and forks a fresh instance every time. We don't try to detect
+# what IINA is currently playing — reuse just replaces it with our lineup.
+if [ "${OPEN_IINA:-1}" != "0" ]; then
+  (
+    lineup_url="http://127.0.0.1:${ETV_PORT}/channels.m3u"
+    for _ in $(seq 1 60); do
+      if curl -fsS -o /dev/null --max-time 2 "$lineup_url"; then
+        echo "[dev] opening lineup in IINA (reusing existing instance) -> $lineup_url"
+        open -a IINA "$lineup_url"
+        break
+      fi
+      sleep 1
+    done
+  ) &
+fi
+
 wait

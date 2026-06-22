@@ -1,16 +1,61 @@
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use etv_overlay::fifo_writer::{FifoWriter, default_fifo_path};
+use etv_overlay::fifo_writer::{FifoWriter, OpenOutcome, default_fifo_path};
 use etv_overlay::overlay_spec::OverlaySpec;
 use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
 use etv_overlay::rhai_engine::{OverlayState, RhaiEngine};
 use etv_overlay::vello_renderer::VelloRenderer;
 use time::OffsetDateTime;
+
+/// Set by SIGTERM/SIGINT so the pipe loop — including a wait for the next
+/// reader inside `reopen()` — can exit gracefully. The station daemon sends
+/// SIGTERM to overlay subprocesses on shutdown.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Backoff before reopening the fifo after a reader disconnect, so a reader
+/// that opens then closes rapidly can't spin the reopen loop hot or flood logs.
+const REOPEN_BACKOFF: Duration = Duration::from_millis(100);
+
+extern "C" fn handle_shutdown_signal(_sig: i32) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Install SIGTERM/SIGINT handlers that flip the shutdown flag.
+fn install_shutdown_handlers() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    let action = SigAction::new(
+        SigHandler::Handler(handle_shutdown_signal),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    // SAFETY: the handler only does an atomic store, which is async-signal-safe.
+    unsafe {
+        if let Err(e) = sigaction(Signal::SIGTERM, &action) {
+            tracing::warn!(error = %e, "failed to install SIGTERM handler");
+        }
+        if let Err(e) = sigaction(Signal::SIGINT, &action) {
+            tracing::warn!(error = %e, "failed to install SIGINT handler");
+        }
+    }
+}
+
+/// What happened while writing one frame to the fifo.
+enum FrameWrite {
+    /// Written to the current reader.
+    Written,
+    /// The reader had gone; we reopened for a new reader and wrote the frame as
+    /// the first, frame-aligned frame of its stream. The caller should
+    /// re-anchor pacing so it doesn't burst the buffered wall-clock gap.
+    Reopened,
+    /// Shutdown was requested while waiting for a reader; stop the loop.
+    Shutdown,
+}
 
 #[derive(Parser)]
 #[command(name = "etv-overlay")]
@@ -77,6 +122,8 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("etv_overlay=info,warn")),
         )
         .init();
+
+    install_shutdown_handlers();
 
     let cli = Cli::parse();
     match cli.cmd {
@@ -167,7 +214,9 @@ fn run_with_ffmpeg(
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn ffmpeg: {e}"))?;
 
-    fifo.open_for_writing()?;
+    if matches!(fifo.open_for_writing(&SHUTDOWN)?, OpenOutcome::Shutdown) {
+        return Ok(());
+    }
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
     let engine = build_engine(&spec)?;
 
@@ -251,13 +300,14 @@ fn pipe_to_fifo(
         "renderer warm; opening fifo for first write",
     );
 
-    fifo.open_for_writing()?;
-    if let Err(e) = fifo.write_frame(&first_frame) {
-        if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
-            tracing::info!("reader disconnected before first frame");
-            return Ok(());
-        }
-        return Err(e.into());
+    if matches!(fifo.open_for_writing(&SHUTDOWN)?, OpenOutcome::Shutdown) {
+        return Ok(());
+    }
+    if matches!(
+        write_frame_resilient(&mut fifo, &first_frame, &SHUTDOWN)?,
+        FrameWrite::Shutdown
+    ) {
+        return Ok(());
     }
     if let Some(path) = ready_file.as_deref()
         && let Err(e) = touch(path)
@@ -271,24 +321,77 @@ fn pipe_to_fifo(
 
     let framerate = spec.framerate.max(1) as f64;
     let mut frame_index: u64 = 1;
+    // Pacing is anchored separately from `start` (which drives animation time)
+    // so that a multi-second blocking reopen between playout items doesn't make
+    // the loop dump a burst of unpaced frames at the freshly-attached reader. On
+    // a reopen we re-anchor, resuming at the real frame rate.
+    let mut pace_start = start;
+    let mut paced_frames: u64 = 0;
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            tracing::info!("shutdown requested; stopping overlay pipe");
+            return Ok(());
+        }
         let time_seconds = start.elapsed().as_secs_f64();
         let ctx = current_context(program_source.as_mut());
         let state = engine.evaluate(time_seconds, frame_index, &ctx);
         let frame = renderer.render_frame(&state)?;
-        if let Err(e) = fifo.write_frame(&frame) {
-            if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
-                tracing::info!("reader disconnected");
+        match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN)? {
+            FrameWrite::Written => {}
+            FrameWrite::Reopened => {
+                pace_start = std::time::Instant::now();
+                paced_frames = 0;
+            }
+            FrameWrite::Shutdown => {
+                tracing::info!("shutdown requested; stopping overlay pipe");
                 return Ok(());
             }
-            return Err(e.into());
         }
         frame_index += 1;
+        paced_frames += 1;
         // f64-based offset so a 24/7 daemon doesn't truncate at u32 wrap (~1657 days at 30 fps).
-        let target = start + Duration::from_secs_f64(frame_index as f64 / framerate);
+        let target = pace_start + Duration::from_secs_f64(paced_frames as f64 / framerate);
         let now = std::time::Instant::now();
         if target > now {
             thread::sleep(target - now);
+        }
+    }
+}
+
+/// Write one frame, transparently waiting for the next reader if the current
+/// one has gone away. etv-next spawns a fresh ffmpeg per playout item; when an
+/// item ends our write returns BrokenPipe, so we reopen the fifo (blocking
+/// until the next item's ffmpeg attaches) and write the frame as the first,
+/// frame-aligned frame of that reader's stream. This keeps the overlay process
+/// alive across the whole channel session rather than exiting per item.
+fn write_frame_resilient(
+    fifo: &mut FifoWriter,
+    frame: &[u8],
+    shutdown: &AtomicBool,
+) -> anyhow::Result<FrameWrite> {
+    let mut reopened = false;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(FrameWrite::Shutdown);
+        }
+        match fifo.write_frame(frame) {
+            Ok(()) => {
+                return Ok(if reopened {
+                    FrameWrite::Reopened
+                } else {
+                    FrameWrite::Written
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                tracing::info!("reader disconnected; waiting for next reader to reattach");
+                // Backoff so rapid reader open/close churn can't spin this hot.
+                thread::sleep(REOPEN_BACKOFF);
+                match fifo.reopen(shutdown)? {
+                    OpenOutcome::Opened => reopened = true,
+                    OpenOutcome::Shutdown => return Ok(FrameWrite::Shutdown),
+                }
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 }

@@ -133,7 +133,16 @@ printf 'discovered %d channel(s)\n\n' "${#channel_lines[@]}"
 for entry in "${channel_lines[@]}"; do
   channel="${entry%%$'\t'*}"
   master_url="${entry#*$'\t'}"
-  printf '%s channel %s — %s\n' "$(bold '==>')" "$channel" "$master_url"
+
+  # The /session/ and tmp/hls/ endpoints are keyed on the numeric channel
+  # number from the master URL (/channel/<N>.m3u8), NOT the tvg-id (which is
+  # "ersatztv.N"). Derive it once and use it for every session/log lookup;
+  # $channel (the tvg-id) is only for display.
+  channel_num="${master_url##*/channel/}"
+  channel_num="${channel_num%%.m3u8*}"
+  [[ "$channel_num" =~ ^[0-9]+$ ]] || channel_num="$channel"
+
+  printf '%s channel %s (#%s) — %s\n' "$(bold '==>')" "$channel" "$channel_num" "$master_url"
 
   # Master playlist
   master_body="$(curl -fsS "$master_url" || true)"
@@ -143,7 +152,7 @@ for entry in "${channel_lines[@]}"; do
   pass "master playlist served"
 
   # Wait for live session
-  live_url="$BASE_URL/session/$channel/live.m3u8"
+  live_url="$BASE_URL/session/$channel_num/live.m3u8"
   waited=0
   while ! curl -fsS -o /dev/null "$live_url"; do
     sleep 2
@@ -162,7 +171,7 @@ for entry in "${channel_lines[@]}"; do
   if [ -z "$latest_seg" ]; then
     fail "$channel" "no .ts segment found in live playlist"; echo; continue
   fi
-  seg_url="$BASE_URL/session/$channel/$latest_seg"
+  seg_url="$BASE_URL/session/$channel_num/$latest_seg"
   tmpseg="$(mktemp -t etv-seg.XXXXXX.ts)"
   if ! curl -fsS "$seg_url" -o "$tmpseg"; then
     fail "$channel" "could not fetch segment $latest_seg"
@@ -207,7 +216,7 @@ for entry in "${channel_lines[@]}"; do
 
   # Channel-scoped server-log scan
   if [ -f "$LOG_FILE" ]; then
-    failures_for_ch="$(recent_failures_for_channel "$channel")"
+    failures_for_ch="$(recent_failures_for_channel "$channel_num")"
     if [ -n "$failures_for_ch" ]; then
       count="$(printf '%s\n' "$failures_for_ch" | wc -l | tr -d ' ')"
       latest="$(printf '%s\n' "$failures_for_ch" | tail -1)"
