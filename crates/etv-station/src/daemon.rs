@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
@@ -18,89 +18,183 @@ use crate::scan;
 use crate::tz as tzmod;
 
 pub async fn run(station: Station) -> Result<(), StationError> {
-    let tz = tzmod::parse(&station.station.tz)?;
-    validate_overlay_configs(&station)?;
+    let config_path = station.config_path.clone();
     let shutdown = Arc::new(Notify::new());
+    let reload = Arc::new(Notify::new());
+    spawn_signal_listener(shutdown.clone(), reload.clone());
 
-    let shutdown_signal = shutdown.clone();
+    // Each pass of this loop runs one "generation" of channel + overlay tasks
+    // against the current config. SIGHUP re-reads the config from disk and
+    // starts a fresh generation; SIGTERM/SIGINT stops the current generation
+    // and exits. The first generation runs the config passed in at startup.
+    let mut station = Arc::new(station);
+    loop {
+        let tz = tzmod::parse(&station.station.tz)?;
+        validate_overlay_configs(&station)?;
+
+        let mut handles = Vec::new();
+        let mut supervisor_handles = Vec::new();
+        // One stop signal per spawned task. `notify_one` stores a permit if the
+        // task is not yet parked, so a reload that races a slow generation
+        // startup (duration probing, catch-up emit) is never lost — unlike
+        // `notify_waiters`, which only wakes already-parked waiters.
+        let mut stops: Vec<Arc<Notify>> = Vec::new();
+        for idx in 0..station.channels.len() {
+            if let Some(ctx) = build_overlay_context(&station.channels[idx]) {
+                let stop = Arc::new(Notify::new());
+                stops.push(stop.clone());
+                let name = station.channels[idx].name.clone();
+                supervisor_handles.push(tokio::spawn(async move {
+                    tracing::info!(
+                        channel = %name,
+                        config = %ctx.overlay_config.display(),
+                        fifo = %ctx.fifo_path.display(),
+                        "starting overlay supervisor",
+                    );
+                    overlay_supervisor::run(ctx, stop).await;
+                }));
+            }
+            let s = station.clone();
+            let stop = Arc::new(Notify::new());
+            stops.push(stop.clone());
+            handles.push(tokio::spawn(async move {
+                let ch = &s.channels[idx];
+                let result = channel_loop(ch, tz, stop).await;
+                (ch.name.clone(), result)
+            }));
+        }
+
+        // `run` is the sole waiter on both signals, so `notify_one` (with its
+        // stored permit) makes this wait race-free without an explicit
+        // `enable()`. `biased` makes shutdown win if both are pending.
+        let do_reload = select! {
+            biased;
+            _ = shutdown.notified() => false,
+            _ = reload.notified() => true,
+        };
+
+        // Stop this generation and wait for every task to wind down: channel
+        // loops return Ok on the stop branch; overlay supervisors kill their
+        // subprocess and remove the fifo + ready marker.
+        for stop in &stops {
+            stop.notify_one();
+        }
+
+        let mut first_err: Option<StationError> = None;
+        for h in handles {
+            match h.await {
+                Ok((name, Ok(()))) => {
+                    tracing::info!(channel = %name, "channel loop exited cleanly");
+                }
+                Ok((name, Err(e))) => {
+                    tracing::error!(channel = %name, error = %e, "channel loop failed");
+                    first_err.get_or_insert(e);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "channel task panicked");
+                    first_err.get_or_insert_with(|| StationError::Task(format!("{e}")));
+                }
+            }
+        }
+        for h in supervisor_handles {
+            if let Err(e) = h.await {
+                tracing::warn!(error = %e, "overlay supervisor task ended with error");
+            }
+        }
+
+        // On shutdown, a channel that failed on its own becomes the daemon's
+        // exit error, exactly as before. `channel_loop` only returns `Err` from
+        // its startup section (duration probing, anchor load, catch-up emit);
+        // roll-tick errors inside its loop are logged and retried, never
+        // returned.
+        if !do_reload {
+            return first_err.map_or(Ok(()), Err);
+        }
+        // On reload we do NOT treat that error as fatal. The operator asked for
+        // a fresh config, and the failing channel gets another startup attempt
+        // in the next generation — so a transient probe/media error must not
+        // tear down an otherwise-healthy daemon. The error was already logged
+        // above in the join loop.
+
+        // SIGHUP: re-read the config from disk. A malformed edit keeps the
+        // previous (still-valid) config running instead of killing the daemon.
+        match load_and_validate(&config_path) {
+            Ok(s) => {
+                tracing::info!(config = %config_path.display(), "configuration reloaded");
+                station = Arc::new(s);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    config = %config_path.display(),
+                    "configuration reload failed; keeping previous config running",
+                );
+            }
+        }
+    }
+}
+
+/// Install the signal handlers that drive the daemon: SIGTERM/SIGINT request
+/// shutdown, SIGHUP requests a config reload. Both notify the single waiter in
+/// `run` via `notify_one`, so a signal delivered before `run` parks is not lost.
+fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>) {
+    use tokio::signal::unix::{SignalKind, signal};
+
     tokio::spawn(async move {
-        // `./tools/kill-dev.sh` and most container orchestrators send SIGTERM, not
-        // SIGINT — handle both so the supervisor's shutdown branch always runs
-        // and cleans up the etv-overlay subprocess + its fifo.
-        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        // `./tools/kill-dev.sh` and most container orchestrators send SIGTERM,
+        // not SIGINT — handle both so the generation's stop path always runs and
+        // cleans up the etv-overlay subprocess + its fifo.
+        let mut sigterm = signal(SignalKind::terminate())
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to install SIGTERM handler; relying on SIGINT only");
             })
             .ok();
-        let sigterm_recv = async {
-            match sigterm {
-                Some(mut s) => {
-                    s.recv().await;
+        let mut sighup = signal(SignalKind::hangup())
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to install SIGHUP handler; config reload via signal disabled");
+            })
+            .ok();
+
+        loop {
+            select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("ctrl-c received, shutting down");
+                    shutdown.notify_one();
+                    return;
                 }
-                None => std::future::pending::<()>().await,
+                _ = recv_signal(sigterm.as_mut()) => {
+                    tracing::info!("sigterm received, shutting down");
+                    shutdown.notify_one();
+                    return;
+                }
+                _ = recv_signal(sighup.as_mut()) => {
+                    tracing::info!("sighup received, reloading config");
+                    reload.notify_one();
+                }
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl-c received, shutting down"),
-            _ = sigterm_recv => tracing::info!("sigterm received, shutting down"),
         }
-        shutdown_signal.notify_waiters();
     });
+}
 
-    let mut handles = Vec::new();
-    let mut supervisor_handles = Vec::new();
-    let station = Arc::new(station);
-    for idx in 0..station.channels.len() {
-        let s = station.clone();
-        let sd = shutdown.clone();
-        if let Some(ctx) = build_overlay_context(&station.channels[idx]) {
-            let sd_for_sup = sd.clone();
-            let name = station.channels[idx].name.clone();
-            supervisor_handles.push(tokio::spawn(async move {
-                tracing::info!(
-                    channel = %name,
-                    config = %ctx.overlay_config.display(),
-                    fifo = %ctx.fifo_path.display(),
-                    "starting overlay supervisor",
-                );
-                overlay_supervisor::run(ctx, sd_for_sup).await;
-            }));
+/// Await one delivery of an optional Unix signal. A `None` handler (one that
+/// failed to install) never fires, so the corresponding `select!` arm is inert.
+async fn recv_signal(sig: Option<&mut tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
         }
-        handles.push(tokio::spawn(async move {
-            let ch = &s.channels[idx];
-            let result = channel_loop(ch, tz, sd).await;
-            (ch.name.clone(), result)
-        }));
+        None => std::future::pending::<()>().await,
     }
+}
 
-    let mut first_err: Option<StationError> = None;
-    for h in handles {
-        match h.await {
-            Ok((name, Ok(()))) => {
-                tracing::info!(channel = %name, "channel loop exited cleanly");
-            }
-            Ok((name, Err(e))) => {
-                tracing::error!(channel = %name, error = %e, "channel loop failed");
-                first_err.get_or_insert(e);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "channel task panicked");
-                first_err.get_or_insert_with(|| StationError::Task(format!("{e}")));
-            }
-        }
-    }
-
-    // Ensure overlay supervisors get a shutdown signal even on the error path,
-    // so the join below doesn't hang. Idempotent: ctrl-c may already have
-    // notified.
-    shutdown.notify_waiters();
-    for h in supervisor_handles {
-        if let Err(e) = h.await {
-            tracing::warn!(error = %e, "overlay supervisor task ended with error");
-        }
-    }
-
-    first_err.map_or(Ok(()), Err)
+/// Re-read the station config from disk and run the same checks the initial
+/// startup applies (timezone parse + overlay-spec validation), so a reload only
+/// ever swaps in a config that is known to be runnable.
+fn load_and_validate(config_path: &Path) -> Result<Station, StationError> {
+    let station = crate::config::load(config_path)?;
+    tzmod::parse(&station.station.tz)?;
+    validate_overlay_configs(&station)?;
+    Ok(station)
 }
 
 async fn wipe_emitted_playout(channel: &LoadedChannel) -> Result<(), StationError> {
@@ -339,4 +433,58 @@ fn log_emission(
         to = %to,
         "emitted playout files",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHANNEL_TOML: &str = r#"
+output_folder = "out"
+window_days = 1
+chunk_hours = 6
+roll_interval = "60s"
+retention_days = 1
+
+[rule]
+type = "loop_forever"
+
+[[rule.items]]
+id = "bars-30s"
+in_point = "0s"
+out_point = "30s"
+
+[rule.items.source]
+kind = "lavfi"
+params = "testsrc=size=1280x720:rate=30 [out0]"
+"#;
+
+    /// Write a station.toml (with the given tz) plus a lavfi channel into a
+    /// fresh tempdir and return the dir handle and the station path.
+    fn write_station(tz: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let station =
+            format!("tz = \"{tz}\"\n\n[[channels]]\nname = \"test\"\npath = \"channel.toml\"\n");
+        std::fs::write(dir.path().join("station.toml"), station).unwrap();
+        std::fs::write(dir.path().join("channel.toml"), CHANNEL_TOML).unwrap();
+        let path = dir.path().join("station.toml");
+        (dir, path)
+    }
+
+    #[test]
+    fn load_and_validate_accepts_valid_config() {
+        let (_dir, path) = write_station("America/Chicago");
+        let station = load_and_validate(&path).expect("valid config should load");
+        assert_eq!(station.channels.len(), 1);
+        assert_eq!(station.channels[0].name, "test");
+    }
+
+    #[test]
+    fn load_and_validate_rejects_invalid_timezone() {
+        // A non-empty-but-bogus tz passes `validate_station` and is caught by
+        // the timezone parse in `load_and_validate`. This is the gate that lets
+        // a reload keep the previous config running on a malformed edit.
+        let (_dir, path) = write_station("Totally/Bogus/Zone");
+        assert!(load_and_validate(&path).is_err());
+    }
 }

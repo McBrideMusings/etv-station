@@ -175,10 +175,10 @@ Per-channel `tz` override is **not** in v1 — single household, single zone. Ad
 1. For each channel: delete playout files whose `finish` < (now − `retention_days`).
 2. Render new chunks until `window_days` from now is materialized.
 
-**Config reload** (SIGHUP or file watcher)
-1. Re-read configs.
-2. For each channel where the rule or items changed: rewrite any playout files whose `[start, finish)` overlaps `[now, ∞)`. Past files are immutable.
-3. Determinism (see above) means rewriting in place is safe.
+**Config reload** (SIGHUP)
+1. SIGHUP re-reads `station.toml` and every channel config from disk. SIGTERM/SIGINT shut the daemon down; a file watcher is deferred (v2).
+2. A malformed edit (parse error, unknown timezone, invalid overlay spec) is logged and rejected — the previous, still-valid config keeps running and the daemon does not exit.
+3. On a valid reload the daemon stops every channel's playout + overlay tasks and re-runs them against the new config. Today this reuses the startup path, which wipes all emitted JSON and regenerates the future window for every channel (see [#53](https://github.com/McBrideMusings/etv-station/issues/53)); the targeted in-place rewrite of only the changed channels' future files is the intended end state. Determinism (see above) makes regeneration safe.
 
 **Crash safety**
 Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffected by `etv-station` being down — it keeps playing materialized files until the window expires.
