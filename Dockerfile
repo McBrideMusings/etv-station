@@ -78,10 +78,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
+# Fixed non-root uid/gid for the daemon. It needs no root privileges: it reads
+# config and writes the playout JSON, the duration/anchor sidecars, and the
+# overlay fifo into the bind-mounted output volume. Running as non-root also
+# keeps those files from being created root-owned on the host volume.
+RUN groupadd --system --gid 10001 etv \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home etv
+
 # The daemon resolves the overlay binary next to its own executable
 # (overlay_supervisor::overlay_binary_path), so the two sit side by side.
 COPY --from=builder /build/target/release/etv-station /usr/local/bin/etv-station
 COPY --from=builder /build/target/release/etv-overlay /usr/local/bin/etv-overlay
+
+# Drop to the non-root user for the runtime process. The bind-mounted /config and
+# output volumes must be readable/writable by uid 10001; if the host volume is
+# owned by a different uid, override at run time with `docker run --user
+# <uid>:<gid>` to match it.
+USER etv
 
 # Config and the shared playout volume are bind-mounted at run time. JSON logging
 # is the default so the container runtime captures structured stdout lines.
