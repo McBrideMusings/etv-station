@@ -1,0 +1,29 @@
+# Build artifacts — rebuilt inside the image.
+target/
+etv-next/target/
+
+# VCS and CI metadata.
+.git/
+.gitignore
+.gitmodules
+.github/
+
+# Docs site and its build output.
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+node_modules/
+
+# Local environment and personal task-runner config (gitignored already, but
+# keep them out of the build context regardless).
+.env
+admin.toml
+admin
+
+# Ephemeral / scratch and example fixtures. The build compiles only crates/ +
+# the etv-next submodule; examples/ (sample configs, assets, a nested etv-next
+# copy ~45M) is never referenced at build time.
+tmp/
+examples/
+
+# Editor / OS noise.
+.DS_Store

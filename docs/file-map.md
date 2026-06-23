@@ -12,6 +12,8 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `bun.lock` | Bun lockfile for the docs `package.json`. |
 | `rustfmt.toml` | Workspace formatting config. |
 | `CLAUDE.md` | Repo-level agent guidance: build/run, submodule rules, docs convention. |
+| `Dockerfile` | Multi-stage build: a Rust builder compiles release `etv-station` + `etv-overlay`; a `debian-slim` runtime carries the two binaries plus ffmpeg/ffprobe and a software-Vulkan stack for headless overlay rendering. |
+| `.dockerignore` | Keeps `target/`, `.git/`, docs build output, and scratch out of the Docker build context. |
 | `.env.example` | Template for the deploy-related env vars (`APP_IMAGE`, `UNRAID_HOST`, …). Real `.env` is gitignored. |
 | `LICENSE`, `README.md` | Boilerplate. |
 
