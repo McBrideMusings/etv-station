@@ -74,6 +74,7 @@ pub async fn sweep_retention(folder: &Path, retention_days: u32, now: OffsetDate
         Ok(files) => files,
         Err(e) => {
             tracing::warn!(
+                event = "retention.scan_failed",
                 folder = %folder.display(),
                 error = %e,
                 "retention sweep: scan failed; skipping",
@@ -87,6 +88,7 @@ pub async fn sweep_retention(folder: &Path, retention_days: u32, now: OffsetDate
         match tokio::fs::remove_file(&f.path).await {
             Ok(()) => {
                 tracing::info!(
+                    event = "retention.delete",
                     file = %f.path.display(),
                     finish = %f.finish,
                     "pruned playout file past retention horizon",
@@ -96,6 +98,7 @@ pub async fn sweep_retention(folder: &Path, retention_days: u32, now: OffsetDate
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 tracing::warn!(
+                    event = "retention.delete_failed",
                     file = %f.path.display(),
                     error = %source,
                     "retention sweep: failed to remove file",

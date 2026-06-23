@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(err) => {
-            tracing::error!(error = %err, "failed to start tokio runtime");
+            tracing::error!(event = "runtime.error", error = %err, "failed to start tokio runtime");
             return ExitCode::from(1);
         }
     };
@@ -45,12 +45,13 @@ fn main() -> ExitCode {
         let station = match config::load(&cli.config) {
             Ok(s) => s,
             Err(err) => {
-                tracing::error!(error = %err, "failed to load configuration");
+                tracing::error!(event = "config.error", error = %err, "failed to load configuration");
                 return ExitCode::from(1);
             }
         };
 
         tracing::info!(
+            event = "station.load",
             station_config = %station.config_path.display(),
             tz = %station.station.tz,
             channels = station.channels.len(),
@@ -58,6 +59,7 @@ fn main() -> ExitCode {
         );
         for ch in &station.channels {
             tracing::info!(
+                event = "channel.load",
                 channel = %ch.name,
                 config = %ch.config_path.display(),
                 rule = ch.config.rule.name(),
@@ -73,7 +75,7 @@ fn main() -> ExitCode {
         match daemon::run(station).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                tracing::error!(error = %err, "daemon failed");
+                tracing::error!(event = "daemon.error", error = %err, "daemon failed");
                 ExitCode::from(1)
             }
         }

@@ -97,6 +97,7 @@ pub fn ensure_fifo(path: &Path) -> std::io::Result<()> {
 pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
     if let Err(err) = ensure_fifo(&ctx.fifo_path) {
         tracing::warn!(
+            event = "overlay.fifo_failed",
             channel = %ctx.channel_name,
             error = %err,
             fifo = %ctx.fifo_path.display(),
@@ -111,7 +112,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
         tokio::select! {
             _ = shutdown.notified() => {
                 if let Some(mut c) = child.take() {
-                    tracing::info!(channel = %ctx.channel_name, "shutting down overlay process");
+                    tracing::info!(event = "overlay.shutdown", channel = %ctx.channel_name, "shutting down overlay process");
                     let _ = c.kill().await;
                 }
                 let _ = std::fs::remove_file(&ctx.fifo_path);
@@ -123,6 +124,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                     && let Ok(Some(status)) = c.try_wait()
                 {
                     tracing::warn!(
+                        event = "overlay.exit",
                         channel = %ctx.channel_name,
                         status = %status,
                         "overlay process exited; will respawn",
@@ -134,6 +136,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                 if child.is_none() {
                     if let Err(err) = ensure_fifo(&ctx.fifo_path) {
                         tracing::warn!(
+                            event = "overlay.fifo_failed",
                             channel = %ctx.channel_name,
                             error = %err,
                             "fifo not available; deferring overlay spawn",
@@ -146,6 +149,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                     match spawn_overlay(&ctx) {
                         Ok(new_child) => {
                             tracing::info!(
+                                event = "overlay.spawn",
                                 channel = %ctx.channel_name,
                                 fifo = %ctx.fifo_path.display(),
                                 "spawned overlay process",
@@ -154,6 +158,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                         }
                         Err(err) => {
                             tracing::warn!(
+                                event = "overlay.spawn_failed",
                                 channel = %ctx.channel_name,
                                 error = %err,
                                 "failed to spawn overlay process; will retry next tick",
@@ -162,6 +167,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                     }
                 } else if !ready_observed && ctx.ready_path().exists() {
                     tracing::info!(
+                        event = "overlay.ready",
                         channel = %ctx.channel_name,
                         "overlay reported ready (first frame written)",
                     );

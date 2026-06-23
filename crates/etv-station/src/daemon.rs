@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 use time_tz::Tz;
 use tokio::select;
 use tokio::sync::Notify;
+use tracing::Instrument;
 
 use crate::anchor;
 use crate::config::{LoadedChannel, Station};
@@ -46,6 +47,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
                 let name = station.channels[idx].name.clone();
                 supervisor_handles.push(tokio::spawn(async move {
                     tracing::info!(
+                        event = "overlay.start",
                         channel = %name,
                         config = %ctx.overlay_config.display(),
                         fifo = %ctx.fifo_path.display(),
@@ -57,11 +59,19 @@ pub async fn run(station: Station) -> Result<(), StationError> {
             let s = station.clone();
             let stop = Arc::new(Notify::new());
             stops.push(stop.clone());
-            handles.push(tokio::spawn(async move {
-                let ch = &s.channels[idx];
-                let result = channel_loop(ch, tz, stop).await;
-                (ch.name.clone(), result)
-            }));
+            let channel_name = station.channels[idx].name.clone();
+            // One span per channel wraps the whole channel loop, so every event
+            // it emits (roll ticks, chunk writes, retention deletes) carries the
+            // channel in its span context for correlation.
+            let span = tracing::info_span!("channel", channel = %channel_name);
+            handles.push(tokio::spawn(
+                async move {
+                    let ch = &s.channels[idx];
+                    let result = channel_loop(ch, tz, stop).await;
+                    (ch.name.clone(), result)
+                }
+                .instrument(span),
+            ));
         }
 
         // `run` is the sole waiter on both signals, so `notify_one` (with its
@@ -84,21 +94,21 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         for h in handles {
             match h.await {
                 Ok((name, Ok(()))) => {
-                    tracing::info!(channel = %name, "channel loop exited cleanly");
+                    tracing::info!(event = "channel.exit", channel = %name, "channel loop exited cleanly");
                 }
                 Ok((name, Err(e))) => {
-                    tracing::error!(channel = %name, error = %e, "channel loop failed");
+                    tracing::error!(event = "channel.error", channel = %name, error = %e, "channel loop failed");
                     first_err.get_or_insert(e);
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "channel task panicked");
+                    tracing::error!(event = "channel.panic", error = %e, "channel task panicked");
                     first_err.get_or_insert_with(|| StationError::Task(format!("{e}")));
                 }
             }
         }
         for h in supervisor_handles {
             if let Err(e) = h.await {
-                tracing::warn!(error = %e, "overlay supervisor task ended with error");
+                tracing::warn!(event = "overlay.supervisor_error", error = %e, "overlay supervisor task ended with error");
             }
         }
 
@@ -120,11 +130,12 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         // previous (still-valid) config running instead of killing the daemon.
         match load_and_validate(&config_path) {
             Ok(s) => {
-                tracing::info!(config = %config_path.display(), "configuration reloaded");
+                tracing::info!(event = "config.reload", config = %config_path.display(), "configuration reloaded");
                 station = Arc::new(s);
             }
             Err(e) => {
                 tracing::error!(
+                    event = "config.reload_failed",
                     error = %e,
                     config = %config_path.display(),
                     "configuration reload failed; keeping previous config running",
@@ -146,29 +157,29 @@ fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>) {
         // cleans up the etv-overlay subprocess + its fifo.
         let mut sigterm = signal(SignalKind::terminate())
             .map_err(|e| {
-                tracing::error!(error = %e, "failed to install SIGTERM handler; relying on SIGINT only");
+                tracing::error!(event = "signal.handler_failed", signal = "SIGTERM", error = %e, "failed to install SIGTERM handler; relying on SIGINT only");
             })
             .ok();
         let mut sighup = signal(SignalKind::hangup())
             .map_err(|e| {
-                tracing::error!(error = %e, "failed to install SIGHUP handler; config reload via signal disabled");
+                tracing::error!(event = "signal.handler_failed", signal = "SIGHUP", error = %e, "failed to install SIGHUP handler; config reload via signal disabled");
             })
             .ok();
 
         loop {
             select! {
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("ctrl-c received, shutting down");
+                    tracing::info!(event = "signal.shutdown", signal = "SIGINT", "ctrl-c received, shutting down");
                     shutdown.notify_one();
                     return;
                 }
                 _ = recv_signal(sigterm.as_mut()) => {
-                    tracing::info!("sigterm received, shutting down");
+                    tracing::info!(event = "signal.shutdown", signal = "SIGTERM", "sigterm received, shutting down");
                     shutdown.notify_one();
                     return;
                 }
                 _ = recv_signal(sighup.as_mut()) => {
-                    tracing::info!("sighup received, reloading config");
+                    tracing::info!(event = "signal.reload", signal = "SIGHUP", "sighup received, reloading config");
                     reload.notify_one();
                 }
             }
@@ -212,6 +223,7 @@ async fn wipe_emitted_playout(channel: &LoadedChannel) -> Result<(), StationErro
     }
     if count > 0 {
         tracing::info!(
+            event = "playout.wipe",
             channel = %channel.name,
             removed = count,
             "wiped existing playout JSON on startup; will regenerate from config",
@@ -278,6 +290,7 @@ fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySp
             // validate_overlay_configs parsed this at startup, so we only land
             // here if the file changed between startup and channel init.
             tracing::error!(
+                event = "overlay.spec_error",
                 channel = %channel.name,
                 error = %e,
                 config = %overlay_config_path.display(),
@@ -308,6 +321,7 @@ async fn channel_loop(
     let (durations, stats) = cache.resolve_all(items).await?;
     cache.save(output).await?;
     tracing::info!(
+        event = "durations.resolve",
         channel = %channel.name,
         from_cache = stats.from_cache,
         from_probe = stats.from_probe,
@@ -320,18 +334,21 @@ async fn channel_loop(
     let anchor_state = anchor::load_or_initialize(output, items, now_utc, tz).await?;
     if anchor_state.initialized_now {
         tracing::info!(
+            event = "anchor.init",
             channel = %channel.name,
             anchor = %anchor_state.anchor_utc,
             "anchored at first run",
         );
     } else if anchor_state.re_anchored {
         tracing::warn!(
+            event = "anchor.reanchor",
             channel = %channel.name,
             anchor = %anchor_state.anchor_utc,
             "items changed; re-anchored",
         );
     } else {
         tracing::info!(
+            event = "anchor.load",
             channel = %channel.name,
             anchor = %anchor_state.anchor_utc,
             "loaded anchor",
@@ -358,19 +375,25 @@ async fn channel_loop(
     loop {
         select! {
             _ = shutdown.notified() => {
-                tracing::info!(channel = %channel.name, "shutdown received");
+                tracing::info!(event = "channel.shutdown", channel = %channel.name, "shutdown received");
                 return Ok(());
             }
             _ = interval.tick() => {
-                if let Err(err) =
-                    emit_catch_up(channel, &rule, anchor_state.anchor_utc, tz, "roll").await
-                {
-                    tracing::error!(
-                        channel = %channel.name,
-                        error = %err,
-                        "roll tick failed; will retry next interval",
-                    );
-                }
+                // One span per roll tick; chunk emission opens a sub-span inside
+                // emit_catch_up, so chunk.write events correlate to their tick.
+                let tick = async {
+                    if let Err(err) =
+                        emit_catch_up(channel, &rule, anchor_state.anchor_utc, tz, "roll").await
+                    {
+                        tracing::error!(
+                            event = "roll.error",
+                            channel = %channel.name,
+                            error = %err,
+                            "roll tick failed; will retry next interval",
+                        );
+                    }
+                };
+                tick.instrument(tracing::info_span!("roll_tick")).await;
             }
         }
     }
@@ -393,22 +416,31 @@ async fn emit_catch_up(
 
     if from >= to {
         tracing::info!(
+            event = "chunk.skip",
             channel = %channel.name,
             phase = phase,
             "window already materialized through {to}",
         );
     } else {
-        let written = emit_window(
-            output,
-            rule,
-            anchor_utc,
-            tz,
-            channel.config.chunk_hours,
-            from,
-            to,
-        )
+        // Sub-span for chunk emission, parented by the roll-tick span (or the
+        // channel span on startup). The chunk.write event is logged inside it so
+        // it correlates to its tick via the span list.
+        async {
+            let written = emit_window(
+                output,
+                rule,
+                anchor_utc,
+                tz,
+                channel.config.chunk_hours,
+                from,
+                to,
+            )
+            .await?;
+            log_emission(&channel.name, phase, &written, from, to);
+            Ok::<(), StationError>(())
+        }
+        .instrument(tracing::info_span!("chunk_emit", phase = phase))
         .await?;
-        log_emission(&channel.name, phase, &written, from, to);
     }
 
     // Prune fully-elapsed playout files past the retention horizon. Runs on both
@@ -418,6 +450,7 @@ async fn emit_catch_up(
     let removed = scan::sweep_retention(output, channel.config.retention_days, now).await;
     if removed > 0 {
         tracing::info!(
+            event = "retention.sweep",
             channel = %channel.name,
             phase = phase,
             removed = removed,
@@ -440,6 +473,7 @@ fn log_emission(
     to: OffsetDateTime,
 ) {
     tracing::info!(
+        event = "chunk.write",
         channel = %channel,
         phase = phase,
         files = written.len(),
