@@ -397,20 +397,34 @@ async fn emit_catch_up(
             phase = phase,
             "window already materialized through {to}",
         );
-        return Ok(());
+    } else {
+        let written = emit_window(
+            output,
+            rule,
+            anchor_utc,
+            tz,
+            channel.config.chunk_hours,
+            from,
+            to,
+        )
+        .await?;
+        log_emission(&channel.name, phase, &written, from, to);
     }
 
-    let written = emit_window(
-        output,
-        rule,
-        anchor_utc,
-        tz,
-        channel.config.chunk_hours,
-        from,
-        to,
-    )
-    .await?;
-    log_emission(&channel.name, phase, &written, from, to);
+    // Prune fully-elapsed playout files past the retention horizon. Runs on both
+    // startup and every roll tick, even when nothing new was emitted, so old
+    // chunks don't accumulate as the window advances. Housekeeping-grade: never
+    // fatal, so a failed prune can't tear down the channel on startup.
+    let removed = scan::sweep_retention(output, channel.config.retention_days, now).await;
+    if removed > 0 {
+        tracing::info!(
+            channel = %channel.name,
+            phase = phase,
+            removed = removed,
+            retention_days = channel.config.retention_days,
+            "retention sweep pruned playout files",
+        );
+    }
     Ok(())
 }
 
