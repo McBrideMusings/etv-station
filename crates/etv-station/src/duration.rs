@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -73,7 +73,27 @@ impl DurationCache {
         for item in items {
             durations.push(self.duration_for(item, &mut stats).await?);
         }
+        self.prune_to(items);
         Ok((durations, stats))
+    }
+
+    /// Drop cache entries whose path is no longer referenced by any current
+    /// `Local` item, so the per-channel sidecar doesn't accumulate stale paths
+    /// as items are removed or their source paths change. Marks the cache dirty
+    /// if anything was removed, so the next `save` writes the trimmed sidecar.
+    fn prune_to(&mut self, items: &[ResolvedItem]) {
+        let keep: HashSet<PathBuf> = items
+            .iter()
+            .filter_map(|item| match &item.source {
+                SourceConfig::Local { path } => Some(PathBuf::from(path)),
+                SourceConfig::Lavfi { .. } | SourceConfig::Http { .. } => None,
+            })
+            .collect();
+        let before = self.entries.len();
+        self.entries.retain(|path, _| keep.contains(path));
+        if self.entries.len() != before {
+            self.dirty = true;
+        }
     }
 
     async fn duration_for(
@@ -266,5 +286,53 @@ mod tests {
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
         assert!(matches!(err, StationError::MissingLocalFile { .. }));
+    }
+
+    fn local_item(id: &str, path: &str) -> ResolvedItem {
+        ResolvedItem {
+            id: id.into(),
+            source: SourceConfig::Local { path: path.into() },
+            in_point: None,
+            out_point: None,
+            program: None,
+        }
+    }
+
+    fn seed_entry(cache: &mut DurationCache, path: &str) {
+        cache.entries.insert(
+            PathBuf::from(path),
+            CacheEntry {
+                mtime_secs: 1,
+                duration_secs: 10.0,
+            },
+        );
+    }
+
+    #[test]
+    fn prune_drops_paths_not_in_current_items() {
+        let mut cache = DurationCache::default();
+        seed_entry(&mut cache, "/keep.mkv");
+        seed_entry(&mut cache, "/stale.mkv");
+        cache.dirty = false;
+
+        // Current items reference only /keep.mkv plus a lavfi (no path).
+        let items = vec![local_item("keep", "/keep.mkv"), lavfi_item("bars", 30)];
+        cache.prune_to(&items);
+
+        assert!(cache.entries.contains_key(Path::new("/keep.mkv")));
+        assert!(!cache.entries.contains_key(Path::new("/stale.mkv")));
+        assert!(cache.dirty, "removing a stale entry marks the cache dirty");
+    }
+
+    #[test]
+    fn prune_is_noop_when_nothing_stale() {
+        let mut cache = DurationCache::default();
+        seed_entry(&mut cache, "/keep.mkv");
+        cache.dirty = false;
+
+        cache.prune_to(&[local_item("keep", "/keep.mkv")]);
+
+        assert!(cache.entries.contains_key(Path::new("/keep.mkv")));
+        assert!(!cache.dirty, "no removals leaves the cache clean");
     }
 }

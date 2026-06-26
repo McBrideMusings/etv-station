@@ -36,7 +36,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `crates/etv-station/src/resolve.rs` | Item-only resolver: flattens `[[rule.blocks]]` into an ordered `ResolvedItem` list, applying `duplicates` + `mode` and the `[program]` cascade. Rejects query/include entries, non-`manual` order, and filters as not-yet-implemented (#68/#69). |
 | `crates/etv-station/src/atomic.rs` | `atomic_write_json` — temp file in same dir, fsync, rename. Used by every JSON emission (playout, anchor, durations cache). |
 | `crates/etv-station/src/anchor.rs` | `.anchor` sidecar — persists loop position (UTC instant + `item_ids`) across restarts. Re-anchors when item ids change. |
-| `crates/etv-station/src/duration.rs` | `DurationCache` (`.durations.json` sidecar) keyed by `(path, mtime)`. Probes Local sources via `ffprobe`; Lavfi/Http durations come from config. |
+| `crates/etv-station/src/duration.rs` | `DurationCache` (`.durations.json` sidecar) keyed by `(path, mtime)`. Probes Local sources via `ffprobe`; Lavfi/Http durations come from config. Prunes entries whose path is no longer referenced by the channel's current items so the sidecar doesn't grow unboundedly. |
 | `crates/etv-station/src/rule.rs` | `Rule` trait + `LoopForever` sequencer: loops the resolver's `ResolvedItem` list — `(t - anchor) mod total_loop_duration` walked over cumulative item durations — to fill the chunk window. |
 | `crates/etv-station/src/scan.rs` | Discover existing `{start}_{finish}.json` files in a channel's `output_folder` for startup catch-up. |
 | `crates/etv-station/src/emit.rs` | Chunk slicer + filename formatter. Walks `tz::add_chunk` boundaries and writes one playout file per chunk via `atomic_write_json`. |
