@@ -83,22 +83,35 @@ echo "[dev] building etv-next binaries..."
 cargo build --manifest-path etv-next/Cargo.toml --bin ersatztv --bin ersatztv-channel 2>&1 \
   | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 
-# Wait for station to emit its first playout JSON in every channel folder
-# before launching etv-next. Otherwise etv-next's loader spams "unable to find
-# playout JSON file for time …" until station catches up on cold builds.
-if [ "${#output_folders[@]}" -gt 0 ]; then
-  for folder in "${output_folders[@]}"; do
-    echo "[dev] waiting for station to emit first playout JSON in $folder..."
-    deadline=$((SECONDS + 60))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-      if compgen -G "$folder/*.json" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 0.5
-    done
-    if ! compgen -G "$folder/*.json" >/dev/null 2>&1; then
-      echo "[dev] WARNING: timed out waiting for $folder/*.json — launching etv-next anyway" >&2
+# Wait (up to 60s) for the station to emit its first playout JSON in one channel
+# folder. Otherwise etv-next's loader spams "unable to find playout JSON file
+# for time …" until station catches up on cold builds.
+wait_for_folder() {
+  local folder="$1"
+  local deadline=$((SECONDS + 60))
+  echo "[dev] waiting for station to emit first playout JSON in $folder..."
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if compgen -G "$folder/*.json" >/dev/null 2>&1; then
+      return 0
     fi
+    sleep 0.5
+  done
+  echo "[dev] WARNING: timed out waiting for $folder/*.json — launching etv-next anyway" >&2
+}
+
+# Poll the folders concurrently so the readiness window is max(per-folder), not
+# sum — one slow channel (e.g. a cold ffprobe cache fill) no longer blocks the
+# others. Each poll runs in its own background job; wait on those PIDs
+# specifically, never a bare `wait` (that would also block on the still-running
+# station daemon above).
+if [ "${#output_folders[@]}" -gt 0 ]; then
+  poll_pids=()
+  for folder in "${output_folders[@]}"; do
+    wait_for_folder "$folder" &
+    poll_pids+=("$!")
+  done
+  for pid in "${poll_pids[@]}"; do
+    wait "$pid"
   done
 fi
 
