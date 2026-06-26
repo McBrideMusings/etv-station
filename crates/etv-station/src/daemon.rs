@@ -412,7 +412,14 @@ async fn emit_catch_up(
     let now = OffsetDateTime::now_utc();
     let to = now + window_duration(channel.config.window_days);
     let existing = scan::scan_output_folder(output).await?;
-    let from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+    // Snap `from` to the previous local chunk boundary so the first emitted file
+    // is always a full-size chunk, never a sliver `[now, boundary)`. When
+    // continuing from an existing boundary (the common roll-tick case) this is a
+    // no-op — `chunk_boundary_at_or_before` returns a boundary unchanged. On a
+    // fresh run, or after the window has fully elapsed (highest finish < now,
+    // clamped to now), it lands on the boundary at-or-before now. See #28.
+    let resume = scan::highest_finish(&existing).unwrap_or(now).max(now);
+    let from = crate::tz::chunk_boundary_at_or_before(resume, channel.config.chunk_hours, tz);
 
     if from >= to {
         tracing::info!(

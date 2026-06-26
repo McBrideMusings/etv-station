@@ -44,6 +44,27 @@ pub fn add_chunk(start_utc: OffsetDateTime, chunk_hours: u32, tz: &'static Tz) -
     }
 }
 
+/// The chunk boundary in `tz` at-or-before `now_utc`, on the local-time grid at
+/// multiples of `chunk_hours` (00:00, chunk_hours, 2 * chunk_hours, …). Result
+/// is a UTC instant. Walks `add_chunk` forward from local midnight, so it
+/// inherits the same DST handling as the forward roll. Used to snap a fresh
+/// run's first emit to a full-size chunk instead of a sliver `[now, boundary)`.
+pub fn chunk_boundary_at_or_before(
+    now_utc: OffsetDateTime,
+    chunk_hours: u32,
+    tz: &'static Tz,
+) -> OffsetDateTime {
+    let mut boundary = local_midnight_at_or_before(now_utc, tz);
+    loop {
+        let next = add_chunk(boundary, chunk_hours, tz);
+        if next > now_utc {
+            break;
+        }
+        boundary = next;
+    }
+    boundary
+}
+
 fn to_utc_assume_local(date: Date, time: Time, tz: &'static Tz) -> OffsetDateTime {
     let naive = date.with_time(time).assume_utc();
     let offset = tz.get_offset_primary().to_utc();
@@ -106,5 +127,42 @@ mod tests {
         let midnight = local_midnight_at_or_before(now, chicago);
         // local midnight 2026-04-13 CDT = 05:00 UTC
         assert_eq!(midnight, datetime!(2026-04-13 05:00:00 UTC));
+    }
+
+    #[test]
+    fn chunk_boundary_floors_to_grid_in_utc() {
+        let utc = parse("UTC").unwrap();
+        // 18:43 with 6h chunks → grid is 00/06/12/18 → 18:00.
+        let now = datetime!(2026-04-13 18:43:11 UTC);
+        let b = chunk_boundary_at_or_before(now, 6, utc);
+        assert_eq!(b, datetime!(2026-04-13 18:00:00 UTC));
+    }
+
+    #[test]
+    fn chunk_boundary_is_inclusive_on_boundary() {
+        let utc = parse("UTC").unwrap();
+        // Exactly on a boundary returns that boundary, not the previous one.
+        let now = datetime!(2026-04-13 12:00:00 UTC);
+        let b = chunk_boundary_at_or_before(now, 6, utc);
+        assert_eq!(b, datetime!(2026-04-13 12:00:00 UTC));
+    }
+
+    #[test]
+    fn chunk_boundary_24h_is_local_midnight() {
+        let chicago = parse("America/Chicago").unwrap();
+        // 2026-04-13 18:43 UTC = 13:43 CDT → 24h boundary is local midnight.
+        let now = datetime!(2026-04-13 18:43:00 UTC);
+        let b = chunk_boundary_at_or_before(now, 24, chicago);
+        assert_eq!(b, local_midnight_at_or_before(now, chicago));
+    }
+
+    #[test]
+    fn chunk_boundary_snaps_to_local_grid_in_tz() {
+        let chicago = parse("America/Chicago").unwrap();
+        // 2026-04-13 12:00 UTC = 07:00 CDT; 6h local grid 00/06/12/18 CDT
+        // → 06:00 CDT = 11:00 UTC.
+        let now = datetime!(2026-04-13 12:00:00 UTC);
+        let b = chunk_boundary_at_or_before(now, 6, chicago);
+        assert_eq!(b, datetime!(2026-04-13 11:00:00 UTC));
     }
 }
