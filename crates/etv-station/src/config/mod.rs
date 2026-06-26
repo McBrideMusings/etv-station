@@ -1,12 +1,22 @@
+mod block;
 mod channel;
-mod item;
+mod entry;
+mod filter;
 mod load;
+mod mode;
+mod order;
 mod rule;
+mod source;
 mod station;
 mod validate;
 
+pub use block::{BlockFile, Duplicates};
 pub use channel::{ChannelConfig, ChannelOverlayConfig};
-pub use item::{ItemConfig, SourceConfig};
+pub use entry::{Entry, IncludeEntry, ItemEntry, QueryEntry};
+pub use filter::Filter;
 pub use load::{LoadedChannel, Station, load};
-pub use rule::RuleConfig;
+pub use mode::Mode;
+pub use order::{Dir, FieldSort, Order};
+pub use rule::{BlockInclude, RuleConfig};
+pub use source::SourceConfig;
 pub use station::{ChannelEntry, StationConfig};

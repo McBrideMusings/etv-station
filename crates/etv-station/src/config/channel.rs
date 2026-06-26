@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::rule::RuleConfig;
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
     pub output_folder: PathBuf,
 
@@ -20,6 +21,13 @@ pub struct ChannelConfig {
 
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
+
+    /// Channel-level random seed. Only meaningful when a block uses
+    /// `order = "random"`; unset means a fresh (non-reproducible) shuffle per
+    /// generation, set means a pinned shuffle (#46 locked decision). Omit on
+    /// channels with no random ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 
     pub rule: RuleConfig,
 

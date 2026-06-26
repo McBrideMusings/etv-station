@@ -5,8 +5,8 @@ use time::OffsetDateTime;
 use time_tz::Tz;
 
 use crate::atomic::atomic_write_json;
-use crate::config::ItemConfig;
 use crate::errors::StationError;
+use crate::resolve::ResolvedItem;
 use crate::tz as tzmod;
 
 const SIDECAR_NAME: &str = ".anchor";
@@ -30,7 +30,7 @@ pub struct AnchorState {
 
 pub async fn load_or_initialize(
     output_folder: &Path,
-    items: &[ItemConfig],
+    items: &[ResolvedItem],
     now_utc: OffsetDateTime,
     tz: &'static Tz,
 ) -> Result<AnchorState, StationError> {
@@ -112,8 +112,8 @@ mod tests {
     use tempfile::tempdir;
     use time::macros::datetime;
 
-    fn lavfi(id: &str) -> ItemConfig {
-        ItemConfig {
+    fn lavfi(id: &str) -> ResolvedItem {
+        ResolvedItem {
             id: id.into(),
             source: SourceConfig::Lavfi { params: "x".into() },
             in_point: Some(Duration::ZERO),

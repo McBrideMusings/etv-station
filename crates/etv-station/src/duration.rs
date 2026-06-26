@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::atomic::atomic_write_json;
-use crate::config::{ItemConfig, SourceConfig};
+use crate::config::SourceConfig;
 use crate::errors::StationError;
+use crate::resolve::ResolvedItem;
 
 const SIDECAR_NAME: &str = ".durations.json";
 
@@ -65,7 +66,7 @@ impl DurationCache {
     /// where required. Updates the cache in place; caller must `save` afterward.
     pub async fn resolve_all(
         &mut self,
-        items: &[ItemConfig],
+        items: &[ResolvedItem],
     ) -> Result<(Vec<Duration>, ProbeStats), StationError> {
         let mut durations = Vec::with_capacity(items.len());
         let mut stats = ProbeStats::default();
@@ -77,7 +78,7 @@ impl DurationCache {
 
     async fn duration_for(
         &mut self,
-        item: &ItemConfig,
+        item: &ResolvedItem,
         stats: &mut ProbeStats,
     ) -> Result<Duration, StationError> {
         match &item.source {
@@ -135,7 +136,7 @@ async fn ensure_dir(path: &Path) -> Result<(), StationError> {
         })
 }
 
-fn config_duration(item: &ItemConfig) -> Result<Duration, StationError> {
+fn config_duration(item: &ResolvedItem) -> Result<Duration, StationError> {
     let in_p = item.in_point.unwrap_or_default();
     let out_p = item.out_point.ok_or(StationError::MissingField {
         id: item.id.clone(),
@@ -150,7 +151,7 @@ fn config_duration(item: &ItemConfig) -> Result<Duration, StationError> {
     Ok(out_p - in_p)
 }
 
-fn clamp_to_config(probed: Duration, item: &ItemConfig) -> Duration {
+fn clamp_to_config(probed: Duration, item: &ResolvedItem) -> Duration {
     let in_p = item.in_point.unwrap_or_default();
     let out_p = item.out_point.unwrap_or(probed);
     let bounded_out = out_p.min(probed);
@@ -208,10 +209,11 @@ async fn ffprobe_duration(path: &Path) -> Result<Duration, StationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ItemConfig, SourceConfig};
+    use crate::config::SourceConfig;
+    use crate::resolve::ResolvedItem;
 
-    fn lavfi_item(id: &str, secs: u64) -> ItemConfig {
-        ItemConfig {
+    fn lavfi_item(id: &str, secs: u64) -> ResolvedItem {
+        ResolvedItem {
             id: id.into(),
             source: SourceConfig::Lavfi {
                 params: "testsrc".into(),
@@ -235,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn lavfi_without_out_point_errors() {
         let mut cache = DurationCache::default();
-        let item = ItemConfig {
+        let item = ResolvedItem {
             id: "x".into(),
             source: SourceConfig::Lavfi {
                 params: "testsrc".into(),
@@ -252,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn missing_local_file_errors_loudly() {
         let mut cache = DurationCache::default();
-        let item = ItemConfig {
+        let item = ResolvedItem {
             id: "ghost".into(),
             source: SourceConfig::Local {
                 path: "/no/such/path/zzz.mkv".into(),

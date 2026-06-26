@@ -6,6 +6,7 @@ pub mod duration;
 pub mod emit;
 pub mod errors;
 pub mod overlay_supervisor;
+pub mod resolve;
 pub mod rule;
 pub mod scan;
 pub mod tz;

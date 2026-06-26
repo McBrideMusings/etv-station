@@ -21,6 +21,7 @@ examples/channels/diehard.toml
 examples/channels/trending.toml
 examples/channels/marquee.toml
 examples/channels/showcase.toml
+examples/blocks/diehard.toml
 examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml
 examples/overlays/scripts/

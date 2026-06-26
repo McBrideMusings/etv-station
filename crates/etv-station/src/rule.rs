@@ -3,7 +3,7 @@ use std::time::Duration;
 use ersatztv_playout::playout::{OverlaySpec, PlayoutItem, ProgramMetadata};
 use time::OffsetDateTime;
 
-use crate::config::ItemConfig;
+use crate::resolve::ResolvedItem;
 
 pub trait Rule {
     fn items_covering(
@@ -15,14 +15,14 @@ pub trait Rule {
 }
 
 pub struct LoopForever<'a> {
-    items: &'a [ItemConfig],
+    items: &'a [ResolvedItem],
     durations: &'a [Duration],
     total_secs: f64,
     overlay: Option<OverlaySpec>,
 }
 
 impl<'a> LoopForever<'a> {
-    pub fn new(items: &'a [ItemConfig], durations: &'a [Duration]) -> Self {
+    pub fn new(items: &'a [ResolvedItem], durations: &'a [Duration]) -> Self {
         assert_eq!(
             items.len(),
             durations.len(),
@@ -95,7 +95,7 @@ fn walk_to_offset(durations: &[Duration], offset_secs: f64) -> (usize, f64) {
 }
 
 fn build_playout_item(
-    item: &ItemConfig,
+    item: &ResolvedItem,
     start: OffsetDateTime,
     finish: OffsetDateTime,
     overlay: Option<&OverlaySpec>,
@@ -127,8 +127,8 @@ mod tests {
     use crate::config::SourceConfig;
     use time::macros::datetime;
 
-    fn lavfi(id: &str, secs: u64) -> ItemConfig {
-        ItemConfig {
+    fn lavfi(id: &str, secs: u64) -> ResolvedItem {
+        ResolvedItem {
             id: id.into(),
             source: SourceConfig::Lavfi {
                 params: format!("src={id}"),

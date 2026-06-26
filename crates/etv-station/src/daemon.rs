@@ -315,10 +315,10 @@ async fn channel_loop(
             source,
         })?;
 
-    let items = channel.config.rule.items();
+    let items = crate::resolve::resolve_channel(&channel.config, &channel.config_path)?;
 
     let mut cache = DurationCache::load(output).await?;
-    let (durations, stats) = cache.resolve_all(items).await?;
+    let (durations, stats) = cache.resolve_all(&items).await?;
     cache.save(output).await?;
     tracing::info!(
         event = "durations.resolve",
@@ -331,7 +331,7 @@ async fn channel_loop(
     );
 
     let now_utc = OffsetDateTime::now_utc();
-    let anchor_state = anchor::load_or_initialize(output, items, now_utc, tz).await?;
+    let anchor_state = anchor::load_or_initialize(output, &items, now_utc, tz).await?;
     if anchor_state.initialized_now {
         tracing::info!(
             event = "anchor.init",
@@ -356,7 +356,7 @@ async fn channel_loop(
     }
 
     let overlay_spec = load_overlay_playout_spec(channel);
-    let rule = LoopForever::new(items, &durations).with_overlay(overlay_spec);
+    let rule = LoopForever::new(&items, &durations).with_overlay(overlay_spec);
 
     // SHARP EDGE: Wipe every emitted playout JSON on startup and regenerate
     // from the (possibly updated) channel config. This catches changes to the
@@ -494,15 +494,17 @@ chunk_hours = 6
 roll_interval = "60s"
 retention_days = 1
 
-[rule]
-type = "loop_forever"
+[[rule.blocks]]
+mode = "all"
+order = "manual"
 
-[[rule.items]]
+[[rule.blocks.entries]]
+kind = "item"
 id = "bars-30s"
 in_point = "0s"
 out_point = "30s"
 
-[rule.items.source]
+[rule.blocks.entries.source]
 kind = "lavfi"
 params = "testsrc=size=1280x720:rate=30 [out0]"
 "#;

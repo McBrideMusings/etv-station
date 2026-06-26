@@ -20,6 +20,9 @@ pub enum ConfigError {
 
     #[error("invalid config at {path}: {message}")]
     Validation { path: PathBuf, message: String },
+
+    #[error("unsupported config at {path}: {message}")]
+    Unsupported { path: PathBuf, message: String },
 }
 
 #[derive(Debug, Error)]

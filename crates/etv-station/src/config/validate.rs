@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use super::block::Duplicates;
 use super::channel::ChannelConfig;
-use super::rule::RuleConfig;
+use super::entry::Entry;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
 
@@ -40,6 +41,10 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
     Ok(())
 }
 
+/// Validate a channel after [`super::load`] has resolved every block-include
+/// into normalized inline form (path refs spliced, env vars expanded). The
+/// structural "exactly one of path/inline" check happens during load; this is
+/// the semantic pass over the resolved shape.
 pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(), ConfigError> {
     if channel.window_days == 0 {
         return Err(ConfigError::Validation {
@@ -60,26 +65,43 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         });
     }
 
-    match &channel.rule {
-        RuleConfig::LoopForever { items } => {
-            if items.is_empty() {
-                return Err(ConfigError::Validation {
-                    path: path.to_path_buf(),
-                    message: "loop_forever rule requires at least one item".into(),
-                });
-            }
-            let mut ids = HashSet::new();
-            for item in items {
+    if channel.rule.blocks.is_empty() {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: "channel rule requires at least one block".into(),
+        });
+    }
+
+    for (idx, include) in channel.rule.blocks.iter().enumerate() {
+        let entries = include.entries();
+        if entries.is_empty() {
+            return Err(ConfigError::Validation {
+                path: path.to_path_buf(),
+                message: format!("block #{idx} has no entries"),
+            });
+        }
+
+        // Item ids must be non-empty, and unique within a block unless the
+        // block opted into `duplicates = "keep"`.
+        let mut ids = HashSet::new();
+        for entry in entries {
+            if let Entry::Item(item) = entry {
                 if item.id.trim().is_empty() {
                     return Err(ConfigError::Validation {
                         path: path.to_path_buf(),
-                        message: "item id cannot be empty".into(),
+                        message: format!("block #{idx} has an item with an empty id"),
                     });
+                }
+                if include.duplicates() == Duplicates::Keep {
+                    continue;
                 }
                 if !ids.insert(item.id.clone()) {
                     return Err(ConfigError::Validation {
                         path: path.to_path_buf(),
-                        message: format!("duplicate item id: {}", item.id),
+                        message: format!(
+                            "block #{idx} has duplicate item id {:?} (set duplicates = \"keep\" to allow)",
+                            item.id
+                        ),
                     });
                 }
             }
@@ -92,8 +114,10 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::item::{ItemConfig, SourceConfig};
-    use crate::config::station::ChannelEntry;
+    use crate::config::{
+        BlockInclude, ChannelConfig, ChannelEntry, Entry, ItemEntry, Mode, Order, RuleConfig,
+        SourceConfig, StationConfig,
+    };
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -101,26 +125,39 @@ mod tests {
         PathBuf::from("/tmp/test.toml")
     }
 
-    fn item(id: &str) -> ItemConfig {
-        ItemConfig {
+    fn item_entry(id: &str) -> Entry {
+        Entry::Item(ItemEntry {
             id: id.into(),
             source: SourceConfig::Lavfi {
                 params: "testsrc".into(),
             },
             in_point: None,
-            out_point: None,
+            out_point: Some(Duration::from_secs(30)),
             program: None,
+        })
+    }
+
+    fn inline_block(entries: Vec<Entry>) -> BlockInclude {
+        BlockInclude {
+            block: None,
+            program: None,
+            duplicates: None,
+            entries,
+            mode: Mode::All,
+            order: Order::Manual,
+            filter: None,
         }
     }
 
-    fn channel_with(items: Vec<ItemConfig>) -> ChannelConfig {
+    fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
             output_folder: PathBuf::from("/out"),
             window_days: 1,
             chunk_hours: 24,
             roll_interval: Duration::from_secs(3600),
             retention_days: 1,
-            rule: RuleConfig::LoopForever { items },
+            seed: None,
+            rule: RuleConfig { blocks },
             overlay: None,
         }
     }
@@ -155,20 +192,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_loop_forever_with_no_items() {
+    fn rejects_channel_with_no_blocks() {
         let ch = channel_with(vec![]);
-        assert!(validate_channel(&dummy_path(), &ch).is_err());
+        let err = validate_channel(&dummy_path(), &ch).unwrap_err();
+        assert!(format!("{err}").contains("at least one block"));
     }
 
     #[test]
-    fn rejects_duplicate_item_ids() {
-        let ch = channel_with(vec![item("a"), item("a")]);
-        assert!(validate_channel(&dummy_path(), &ch).is_err());
+    fn rejects_block_with_no_entries() {
+        let ch = channel_with(vec![inline_block(vec![])]);
+        let err = validate_channel(&dummy_path(), &ch).unwrap_err();
+        assert!(format!("{err}").contains("no entries"));
+    }
+
+    #[test]
+    fn rejects_duplicate_item_ids_by_default() {
+        let ch = channel_with(vec![inline_block(vec![item_entry("a"), item_entry("a")])]);
+        let err = validate_channel(&dummy_path(), &ch).unwrap_err();
+        assert!(format!("{err}").contains("duplicate item id"));
+    }
+
+    #[test]
+    fn allows_duplicate_item_ids_with_keep() {
+        let mut block = inline_block(vec![item_entry("a"), item_entry("a")]);
+        block.duplicates = Some(Duplicates::Keep);
+        let ch = channel_with(vec![block]);
+        validate_channel(&dummy_path(), &ch).unwrap();
     }
 
     #[test]
     fn accepts_valid_channel() {
-        let ch = channel_with(vec![item("a"), item("b")]);
+        let ch = channel_with(vec![inline_block(vec![item_entry("a"), item_entry("b")])]);
         validate_channel(&dummy_path(), &ch).unwrap();
     }
 }

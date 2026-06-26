@@ -59,14 +59,15 @@ fn format_for_filename(dt: OffsetDateTime) -> Result<String, StationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ItemConfig, SourceConfig};
+    use crate::config::SourceConfig;
+    use crate::resolve::ResolvedItem;
     use crate::rule::LoopForever;
     use std::time::Duration;
     use tempfile::tempdir;
     use time::macros::datetime;
 
-    fn item(id: &str, secs: u64) -> ItemConfig {
-        ItemConfig {
+    fn item(id: &str, secs: u64) -> ResolvedItem {
+        ResolvedItem {
             id: id.into(),
             source: SourceConfig::Lavfi {
                 params: format!("src={id}"),

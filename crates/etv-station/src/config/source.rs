@@ -1,25 +1,11 @@
 use std::time::Duration;
 
-use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
+use ersatztv_playout::playout::PlayoutItemSource;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ItemConfig {
-    pub id: String,
-
-    pub source: SourceConfig,
-
-    #[serde(default, with = "humantime_serde")]
-    pub in_point: Option<Duration>,
-
-    #[serde(default, with = "humantime_serde")]
-    pub out_point: Option<Duration>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub program: Option<ProgramMetadata>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
+/// A media source for a single item. Mirrors ETV-next's `PlayoutItemSource`
+/// variants; `to_playout_source` performs the conversion.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceConfig {
     Local {
@@ -37,11 +23,15 @@ pub enum SourceConfig {
     },
 }
 
-impl ItemConfig {
-    pub fn to_playout_source(&self) -> PlayoutItemSource {
-        let in_point_ms = self.in_point.map(|d| d.as_millis() as u64);
-        let out_point_ms = self.out_point.map(|d| d.as_millis() as u64);
-        match &self.source {
+impl SourceConfig {
+    pub fn to_playout_source(
+        &self,
+        in_point: Option<Duration>,
+        out_point: Option<Duration>,
+    ) -> PlayoutItemSource {
+        let in_point_ms = in_point.map(|d| d.as_millis() as u64);
+        let out_point_ms = out_point.map(|d| d.as_millis() as u64);
+        match self {
             SourceConfig::Local { path } => {
                 PlayoutItemSource::local(path.clone(), in_point_ms, out_point_ms)
             }

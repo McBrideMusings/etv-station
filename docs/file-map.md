@@ -32,11 +32,12 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `crates/etv-query-test/fixtures/bumpers/` | Committed synthetic MP4s (~100 KB) for the bumper-block fixture case. |
 | `crates/etv-station/src/main.rs` | Binary entry point. Parses CLI flags, inits tracing, loads config, drives `daemon::run`. |
 | `crates/etv-station/src/lib.rs` | Library entry point. Re-exports the modules so integration tests and the binary share one surface. |
-| `crates/etv-station/src/config/` | TOML config parsing: `station`, `channel`, `rule`, `item`, `load`, `validate`. |
+| `crates/etv-station/src/config/` | TOML config parsing (Phase C block/channel/entries schema): `station`, `channel`, `rule` (`[[rule.blocks]]` includes), `block` (`[program]`/`duplicates`/`[[entries]]`), `entry` (kind-tagged item/query/include), `source`, `mode`, `order`, `filter`, `load`, `validate`. |
+| `crates/etv-station/src/resolve.rs` | Item-only resolver: flattens `[[rule.blocks]]` into an ordered `ResolvedItem` list, applying `duplicates` + `mode` and the `[program]` cascade. Rejects query/include entries, non-`manual` order, and filters as not-yet-implemented (#68/#69). |
 | `crates/etv-station/src/atomic.rs` | `atomic_write_json` — temp file in same dir, fsync, rename. Used by every JSON emission (playout, anchor, durations cache). |
 | `crates/etv-station/src/anchor.rs` | `.anchor` sidecar — persists loop position (UTC instant + `item_ids`) across restarts. Re-anchors when item ids change. |
 | `crates/etv-station/src/duration.rs` | `DurationCache` (`.durations.json` sidecar) keyed by `(path, mtime)`. Probes Local sources via `ffprobe`; Lavfi/Http durations come from config. |
-| `crates/etv-station/src/rule.rs` | `Rule` trait + `LoopForever` impl: `(t - anchor) mod total_loop_duration` walked over cumulative item durations. |
+| `crates/etv-station/src/rule.rs` | `Rule` trait + `LoopForever` sequencer: loops the resolver's `ResolvedItem` list — `(t - anchor) mod total_loop_duration` walked over cumulative item durations — to fill the chunk window. |
 | `crates/etv-station/src/scan.rs` | Discover existing `{start}_{finish}.json` files in a channel's `output_folder` for startup catch-up. |
 | `crates/etv-station/src/emit.rs` | Chunk slicer + filename formatter. Walks `tz::add_chunk` boundaries and writes one playout file per chunk via `atomic_write_json`. |
 | `crates/etv-station/src/tz.rs` | IANA tz parsing (via `time-tz`) + chunk-boundary helpers that honor DST. |
@@ -71,8 +72,9 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | Path | Tracked | What |
 |---|---|---|
 | `examples/station.toml` | yes | Minimal station manifest used as `cargo test` fixture and default `--config` for dev runs. |
-| `examples/channels/lavfi-test.toml` | yes | Loop-Forever channel with three lavfi items — used by the `cargo test` fixture. Has an overlay attached for spike testing. |
-| `examples/channels/diehard.toml` | no | Personal Die Hard channel config; gitignored. Wired to the Pierce overlay for Velo Phase B. |
+| `examples/channels/lavfi-test.toml` | yes | Single inline block with three lavfi item entries — used by the `cargo test` fixture. Has an overlay attached for spike testing. |
+| `examples/channels/diehard.toml` | no | Personal Die Hard channel; gitignored. Demonstrates the path form — composes `../blocks/diehard.toml`. Wired to the Pierce overlay. |
+| `examples/blocks/diehard.toml` | no | Reusable block file (the Die Hard item) referenced by `diehard.toml`; demonstrates the `block = "path"` include form. |
 | `examples/channels/trending.toml` | no | Personal Project Hail Mary channel; gitignored. Wired to the trending overlay. |
 | `examples/channels/star-trek.toml` | no | 950-episode Star Trek channel (all 12 series, release order). Built from Sonarr; gitignored. |
 | `examples/overlays/pierce_logo.toml` | yes | Overlay config: Pierce logo bottom-right of a 1280×720 frame. Used by the diehard channel. |
