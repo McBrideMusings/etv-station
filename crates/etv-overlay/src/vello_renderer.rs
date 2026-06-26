@@ -3,8 +3,8 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontStack, LayoutContext, PositionedLayoutItem,
-    StyleProperty,
+    Alignment, AlignmentOptions, FontContext, FontStack, Layout, LayoutContext,
+    PositionedLayoutItem, StyleProperty,
 };
 use vello::kurbo::{Affine, RoundedRect};
 use vello::peniko::{Blob, Color, Fill, Image as PenikoImage, ImageFormat};
@@ -22,6 +22,35 @@ const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 /// `assets/fonts/README.md` for provenance.
 const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
 const FALLBACK_FONT_FAMILY: &str = "Inter";
+
+/// The Parley font stack `draw_text` shapes with: the configured family first,
+/// then the vendored Inter fallback so anything the family doesn't cover (or
+/// any host where the family is missing, e.g. a slim deploy container) still
+/// produces glyphs. The unit tests assert this still appends the fallback, so
+/// a refactor that silently drops it fails the build.
+fn font_stack(font_family: &str) -> String {
+    format!("{font_family}, {FALLBACK_FONT_FAMILY}")
+}
+
+/// Build and line-break a Parley layout for `content`, shaping it with
+/// [`font_stack`]. Shared by [`VelloRenderer::draw_text`] and the unit tests so
+/// both exercise the same `font_stack` + shaping path.
+fn build_text_layout(
+    font_context: &mut FontContext,
+    layout_context: &mut LayoutContext<()>,
+    content: &str,
+    font_family: &str,
+    font_size: f32,
+) -> Layout<()> {
+    let stack = font_stack(font_family);
+    let mut builder = layout_context.ranged_builder(font_context, content, 1.0, true);
+    builder.push_default(StyleProperty::FontStack(FontStack::Source(stack.into())));
+    builder.push_default(StyleProperty::FontSize(font_size));
+    let mut layout = builder.build(content);
+    layout.break_all_lines(None);
+    layout.align(None, Alignment::Start, AlignmentOptions::default());
+    layout
+}
 
 pub struct VelloRenderer {
     device: wgpu::Device,
@@ -259,18 +288,17 @@ impl VelloRenderer {
         if content.is_empty() {
             return;
         }
-        // Append the vendored fallback so anything the configured family
-        // doesn't cover (or any case where the family doesn't exist on the
-        // host, e.g. inside a slim deploy container) still produces glyphs.
-        let stack = format!("{font_family}, {FALLBACK_FONT_FAMILY}");
-        let mut builder =
-            self.layout_context
-                .ranged_builder(&mut self.font_context, content, 1.0, true);
-        builder.push_default(StyleProperty::FontStack(FontStack::Source(stack.into())));
-        builder.push_default(StyleProperty::FontSize(font_size));
-        let mut layout = builder.build(content);
-        layout.break_all_lines(None);
-        layout.align(None, Alignment::Start, AlignmentOptions::default());
+        // `build_text_layout` appends the vendored fallback to the stack so
+        // anything the configured family doesn't cover (or any host where the
+        // family is missing, e.g. a slim deploy container) still produces
+        // glyphs.
+        let layout = build_text_layout(
+            &mut self.font_context,
+            &mut self.layout_context,
+            content,
+            font_family,
+            font_size,
+        );
 
         let text_w = layout.width() as f64;
         let text_h = layout.height() as f64;
@@ -480,6 +508,81 @@ fn align_up(value: u32, alignment: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parley::fontique::{Collection, CollectionOptions};
+
+    /// A `FontContext` with NO system fonts, holding only the vendored Inter —
+    /// mirrors a slim deploy container with no system font stack. Lets the
+    /// fallback tests run host-independently (no system font can satisfy a
+    /// query) and without a GPU.
+    fn fonts_free_context() -> FontContext {
+        let mut fcx = FontContext {
+            collection: Collection::new(CollectionOptions {
+                shared: false,
+                system_fonts: false,
+            }),
+            source_cache: Default::default(),
+        };
+        fcx.collection
+            .register_fonts(Blob::from(FALLBACK_FONT_BYTES.to_vec()), None);
+        fcx
+    }
+
+    /// Directly guards the regression #60 names: a refactor of the text font
+    /// stack that silently drops the vendored Inter fallback fails here.
+    #[test]
+    fn font_stack_appends_vendored_fallback() {
+        let stack = font_stack("Helvetica");
+        assert_eq!(stack, "Helvetica, Inter");
+        assert!(stack.ends_with(FALLBACK_FONT_FAMILY));
+    }
+
+    /// With system fonts disabled (the slim-container case), a text layer whose
+    /// configured `font_family` is absent must still shape glyphs — and they
+    /// must come from the vendored Inter blob, since it is the only font
+    /// present. Proves the bundled font registers and renders Latin text where
+    /// no system fallback exists. Host-independent and GPU-free.
+    #[test]
+    fn missing_family_renders_via_vendored_inter() {
+        let mut fcx = fonts_free_context();
+        let mut lcx: LayoutContext<()> = LayoutContext::new();
+        let layout = build_text_layout(
+            &mut fcx,
+            &mut lcx,
+            "Fallback Glyphs 123",
+            "NoSuchFontFamilyExists12345",
+            32.0,
+        );
+
+        let mut total_glyphs = 0usize;
+        let mut any_run = false;
+        let mut all_vendored = true;
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let n = glyph_run.positioned_glyphs().count();
+                if n == 0 {
+                    continue;
+                }
+                any_run = true;
+                total_glyphs += n;
+                let font_bytes: &[u8] = glyph_run.run().font().data.as_ref();
+                if font_bytes != FALLBACK_FONT_BYTES {
+                    all_vendored = false;
+                }
+            }
+        }
+
+        assert!(
+            total_glyphs > 0,
+            "a missing font_family should still shape glyphs via the vendored fallback",
+        );
+        assert!(
+            any_run && all_vendored,
+            "glyphs must be shaped by the vendored Inter blob, not another font",
+        );
+    }
 
     #[test]
     fn align_up_rounds_to_multiple() {
