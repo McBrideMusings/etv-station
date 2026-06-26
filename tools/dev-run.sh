@@ -37,7 +37,22 @@ while IFS= read -r rel; do
   fi
 done < <(awk -F '"' '/^path/ {print $2}' "$STATION_CONFIG")
 
-trap 'for pid in $(jobs -p); do kill -TERM -- "-$pid" 2>/dev/null; done' EXIT INT TERM
+# Teardown: TERM the whole process tree, then escalate to KILL after a 1s grace
+# for any group (e.g. an ffmpeg child stuck on a flush) that ignored TERM, so a
+# misbehaving child can't leave the script hanging on Ctrl-C. The trap is
+# disarmed on entry so an INT doesn't also re-run this via EXIT (which would
+# double the sleep), and we return early when nothing is running so a clean exit
+# doesn't pause.
+cleanup() {
+  trap - EXIT INT TERM
+  local pids
+  pids=$(jobs -p)
+  [ -z "$pids" ] && return
+  for pid in $pids; do kill -TERM -- "-$pid" 2>/dev/null; done
+  sleep 1
+  for pid in $pids; do kill -KILL -- "-$pid" 2>/dev/null; done
+}
+trap cleanup EXIT INT TERM
 
 # Pre-build etv-overlay so the station daemon can spawn it as a sibling binary
 # the moment a channel becomes "watched". Without this the supervisor logs a
