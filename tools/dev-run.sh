@@ -83,36 +83,40 @@ echo "[dev] building etv-next binaries..."
 cargo build --manifest-path etv-next/Cargo.toml --bin ersatztv --bin ersatztv-channel 2>&1 \
   | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 
-# Wait (up to 60s) for the station to emit its first playout JSON in one channel
-# folder. Otherwise etv-next's loader spams "unable to find playout JSON file
-# for time …" until station catches up on cold builds.
-wait_for_folder() {
-  local folder="$1"
+# Wait (up to 60s) for the station to emit its first playout JSON in every
+# channel folder. Otherwise etv-next's loader spams "unable to find playout JSON
+# file for time …" until station catches up on cold builds.
+#
+# A single foreground loop polls all folders each tick and drops them as they
+# become ready, so the readiness window is max(per-folder), not sum — one slow
+# channel (e.g. a cold ffprobe cache fill) no longer blocks the others. This
+# deliberately avoids backgrounded per-folder jobs: under `set -m` (load-bearing
+# for the teardown trap) each finishing poll emits a job-control "[n]+ Done"
+# notice, cluttering the otherwise-clean prefixed output (#89). The glob is a
+# cheap filesystem check with no per-folder blocking work, so folding the polls
+# into one process costs nothing.
+wait_for_folders() {
   local deadline=$((SECONDS + 60))
-  echo "[dev] waiting for station to emit first playout JSON in $folder..."
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    if compgen -G "$folder/*.json" >/dev/null 2>&1; then
+  local pending=("$@")
+  local still folder
+  echo "[dev] waiting for station to emit first playout JSON in ${#pending[@]} folder(s)..."
+  while [ "${#pending[@]}" -gt 0 ] && [ "$SECONDS" -lt "$deadline" ]; do
+    still=()
+    for folder in "${pending[@]}"; do
+      compgen -G "$folder/*.json" >/dev/null 2>&1 || still+=("$folder")
+    done
+    if [ "${#still[@]}" -eq 0 ]; then
       return 0
     fi
+    pending=("${still[@]}")
     sleep 0.5
   done
-  echo "[dev] WARNING: timed out waiting for $folder/*.json — launching etv-next anyway" >&2
+  [ "${#pending[@]}" -eq 0 ] && return 0
+  echo "[dev] WARNING: timed out waiting for ${pending[*]} — launching etv-next anyway" >&2
 }
 
-# Poll the folders concurrently so the readiness window is max(per-folder), not
-# sum — one slow channel (e.g. a cold ffprobe cache fill) no longer blocks the
-# others. Each poll runs in its own background job; wait on those PIDs
-# specifically, never a bare `wait` (that would also block on the still-running
-# station daemon above).
 if [ "${#output_folders[@]}" -gt 0 ]; then
-  poll_pids=()
-  for folder in "${output_folders[@]}"; do
-    wait_for_folder "$folder" &
-    poll_pids+=("$!")
-  done
-  for pid in "${poll_pids[@]}"; do
-    wait "$pid"
-  done
+  wait_for_folders "${output_folders[@]}"
 fi
 
 (
