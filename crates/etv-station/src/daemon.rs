@@ -144,6 +144,21 @@ async fn run_generation(
             async move {
                 let ch = &s.channels[idx];
                 let result = channel_loop(ch, tz, stop).await;
+                // A channel_loop error is fatal to THIS channel. Task handles
+                // are only joined at shutdown (see below), so without logging
+                // here a startup failure — a failed duration probe, unreadable
+                // media, anchor or emit error — would stay invisible until the
+                // daemon stops: the channel silently emits nothing while the
+                // rest of the daemon reports healthy. Log it at the point of
+                // failure so it is immediately diagnosable.
+                if let Err(err) = &result {
+                    tracing::error!(
+                        event = "channel.failed",
+                        channel = %ch.name,
+                        error = %err,
+                        "channel loop exited with error; this channel will emit no further output until the daemon reloads or restarts",
+                    );
+                }
                 (ch.name.clone(), result)
             }
             .instrument(span),
@@ -170,8 +185,10 @@ async fn run_generation(
             Ok((name, Ok(()))) => {
                 tracing::info!(event = "channel.exit", channel = %name, "channel loop exited cleanly");
             }
-            Ok((name, Err(e))) => {
-                tracing::error!(event = "channel.error", channel = %name, error = %e, "channel loop failed");
+            Ok((_name, Err(e))) => {
+                // Already logged at the point of failure inside the task
+                // (event = "channel.failed"); here we only capture the first
+                // error to surface through the daemon's exit code.
                 first_err.get_or_insert(e);
             }
             Err(e) => {
