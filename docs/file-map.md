@@ -15,7 +15,8 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `Dockerfile` | Multi-stage build: a Rust builder compiles release `etv-station` + `etv-overlay`; a `debian-slim` runtime carries the two binaries plus ffmpeg/ffprobe and a software-Vulkan stack for headless overlay rendering. |
 | `.dockerignore` | Keeps `target/`, `.git/`, docs build output, and scratch out of the Docker build context. |
 | `.env.example` | Template for the deploy-related env vars (`APP_IMAGE`, `UNRAID_HOST`, …). Real `.env` is gitignored. |
-| `LICENSE`, `README.md` | Boilerplate. |
+| `LICENSE` | Boilerplate. |
+| `README.md` | Project intro: tagline, status (what exists vs. planned), clone-with-submodules, build/run commands, docs links. |
 
 ## Source
 
