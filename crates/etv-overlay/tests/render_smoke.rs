@@ -138,13 +138,12 @@ fn renders_metadata_driven_text() {
 /// shipped with the showcase channel does what the docs claim.
 #[test]
 fn showcase_script_phases() {
-    let script_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("examples/overlays/scripts/now_next_cycle.rhai");
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("examples/overlays/scripts/now_next_cycle.rhai");
     if !script_path.exists() {
         eprintln!("skipping: showcase script not at {}", script_path.display());
         return;
@@ -238,11 +237,7 @@ fn per_layer_invisible_layer_does_not_render() {
 
     let dir = tempfile::tempdir().unwrap();
     let script_path = dir.path().join("hide.rhai");
-    std::fs::write(
-        &script_path,
-        r#"#{ layers: [ #{ visible: false } ] }"#,
-    )
-    .unwrap();
+    std::fs::write(&script_path, r#"#{ layers: [ #{ visible: false } ] }"#).unwrap();
 
     let watermark = OverlayKind::Watermark {
         corner: Corner::TopRight,

@@ -318,7 +318,10 @@ mod tests {
         write_chunk(dir.path(), "1_2.json", TWO_ITEM_CHUNK);
         let mut src = ProgramContextSource::new(dir.path().to_path_buf());
         src.refresh().unwrap();
-        assert_eq!(src.current_at(datetime!(2026-04-13 00:05 UTC)).title, "Alpha");
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 00:05 UTC)).title,
+            "Alpha"
+        );
         assert_eq!(src.current_at(datetime!(2026-04-13 02:30 UTC)).title, "");
 
         // Station rolls a new chunk. Adding a file changes the directory's
@@ -334,9 +337,15 @@ mod tests {
         // Force the rate-limiter to consider another check.
         src.last_mtime_check = None;
         src.refresh().unwrap();
-        assert_eq!(src.current_at(datetime!(2026-04-13 02:30 UTC)).title, "Gamma");
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 02:30 UTC)).title,
+            "Gamma"
+        );
         // Original items still resolvable.
-        assert_eq!(src.current_at(datetime!(2026-04-13 00:05 UTC)).title, "Alpha");
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 00:05 UTC)).title,
+            "Alpha"
+        );
     }
 
     #[test]

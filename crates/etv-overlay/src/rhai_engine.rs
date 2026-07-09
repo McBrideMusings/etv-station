@@ -129,7 +129,10 @@ fn apply_script_result(state: &mut OverlayState, map: &rhai::Map) {
     if let Some(opacity) = map.get("opacity").and_then(|v| v.as_float().ok()) {
         state.opacity = (opacity as f32).clamp(0.0, 1.0);
     }
-    if let Some(layers) = map.get("layers").and_then(|v| v.clone().try_cast::<rhai::Array>()) {
+    if let Some(layers) = map
+        .get("layers")
+        .and_then(|v| v.clone().try_cast::<rhai::Array>())
+    {
         for (i, entry) in layers.into_iter().enumerate().take(state.layers.len()) {
             if let Some(layer_map) = entry.try_cast::<rhai::Map>() {
                 apply_layer_override(&mut state.layers[i], &layer_map);
