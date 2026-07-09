@@ -57,98 +57,21 @@ pub async fn run(station: Station) -> Result<(), StationError> {
             },
         };
 
-        let mut handles = Vec::new();
-        let mut supervisor_handles = Vec::new();
-        // One stop signal per spawned task. `notify_one` stores a permit if the
-        // task is not yet parked, so a reload that races a slow generation
-        // startup (duration probing, catch-up emit) is never lost — unlike
-        // `notify_waiters`, which only wakes already-parked waiters.
-        let mut stops: Vec<Arc<Notify>> = Vec::new();
-        for idx in 0..station.channels.len() {
-            if let Some(ctx) = build_overlay_context(&station.channels[idx]) {
-                let stop = Arc::new(Notify::new());
-                stops.push(stop.clone());
-                let name = station.channels[idx].name.clone();
-                supervisor_handles.push(tokio::spawn(async move {
-                    tracing::info!(
-                        event = "overlay.start",
-                        channel = %name,
-                        config = %ctx.overlay_config.display(),
-                        fifo = %ctx.fifo_path.display(),
-                        "starting overlay supervisor",
-                    );
-                    overlay_supervisor::run(ctx, stop).await;
-                }));
-            }
-            let s = station.clone();
-            let stop = Arc::new(Notify::new());
-            stops.push(stop.clone());
-            let channel_name = station.channels[idx].name.clone();
-            // One span per channel wraps the whole channel loop, so every event
-            // it emits (roll ticks, chunk writes, retention deletes) carries the
-            // channel in its span context for correlation.
-            let span = tracing::info_span!("channel", channel = %channel_name);
-            handles.push(tokio::spawn(
-                async move {
-                    let ch = &s.channels[idx];
-                    let result = channel_loop(ch, tz, stop).await;
-                    (ch.name.clone(), result)
-                }
-                .instrument(span),
-            ));
-        }
+        // Spawn the generation, run it until a signal, then tear it down. The
+        // whole generation is joined before we return here, which is what lets
+        // the `station` Arc be swapped safely below (no task still reads it).
+        let (do_reload, first_err) = run_generation(&station, tz, &shutdown, &reload).await;
 
-        // `run` is the sole waiter on both signals, so `notify_one` (with its
-        // stored permit) makes this wait race-free without an explicit
-        // `enable()`. `biased` makes shutdown win if both are pending.
-        let do_reload = select! {
-            biased;
-            _ = shutdown.notified() => false,
-            _ = reload.notified() => true,
-        };
-
-        // Stop this generation and wait for every task to wind down: channel
-        // loops return Ok on the stop branch; overlay supervisors kill their
-        // subprocess and remove the fifo + ready marker.
-        for stop in &stops {
-            stop.notify_one();
-        }
-
-        let mut first_err: Option<StationError> = None;
-        for h in handles {
-            match h.await {
-                Ok((name, Ok(()))) => {
-                    tracing::info!(event = "channel.exit", channel = %name, "channel loop exited cleanly");
-                }
-                Ok((name, Err(e))) => {
-                    tracing::error!(event = "channel.error", channel = %name, error = %e, "channel loop failed");
-                    first_err.get_or_insert(e);
-                }
-                Err(e) => {
-                    tracing::error!(event = "channel.panic", error = %e, "channel task panicked");
-                    first_err.get_or_insert_with(|| StationError::Task(format!("{e}")));
-                }
-            }
-        }
-        for h in supervisor_handles {
-            if let Err(e) = h.await {
-                tracing::warn!(event = "overlay.supervisor_error", error = %e, "overlay supervisor task ended with error");
-            }
-        }
-
-        // On shutdown, a channel that failed on its own becomes the daemon's
-        // exit error, exactly as before. `channel_loop` only returns `Err` from
-        // its startup section (duration probing, anchor load, catch-up emit);
-        // roll-tick errors inside its loop are logged and retried, never
-        // returned.
+        // On shutdown a channel that failed on its own becomes the daemon's exit
+        // error. `channel_loop` only returns `Err` from its startup section
+        // (duration probing, anchor load, catch-up emit); roll-tick errors are
+        // logged and retried, never returned. On reload we do NOT treat that
+        // error as fatal — the failing channel gets another startup attempt next
+        // generation, so a transient probe/media error must not tear down an
+        // otherwise-healthy daemon (it was already logged in `run_generation`).
         if !do_reload {
             return first_err.map_or(Ok(()), Err);
         }
-        // On reload we do NOT treat that error as fatal. The operator asked for
-        // a fresh config, and the failing channel gets another startup attempt
-        // in the next generation — so a transient probe/media error must not
-        // tear down an otherwise-healthy daemon. The error was already logged
-        // above in the join loop.
 
         // SIGHUP: re-read the config from disk. A malformed edit that won't even
         // parse keeps the previous config running. A config that parses but
@@ -170,6 +93,100 @@ pub async fn run(station: Station) -> Result<(), StationError> {
             }
         }
     }
+}
+
+/// Spawn one generation's channel + overlay tasks against `station`, run until a
+/// shutdown or reload signal, then stop every task and join it. Returns
+/// `(do_reload, first_err)`: whether the signal was a reload (vs. shutdown), and
+/// the first channel startup error seen (logged here regardless of which). The
+/// whole generation is joined before returning, so the caller can safely swap
+/// the `station` Arc for the next generation with no task still reading it.
+/// `run` is the sole caller and sole waiter on both signals, so `notify_one`'s
+/// stored permit makes the wait race-free without an explicit `enable()`.
+async fn run_generation(
+    station: &Arc<Station>,
+    tz: &'static Tz,
+    shutdown: &Notify,
+    reload: &Notify,
+) -> (bool, Option<StationError>) {
+    let mut handles = Vec::new();
+    let mut supervisor_handles = Vec::new();
+    // One stop signal per spawned task. `notify_one` stores a permit if the task
+    // is not yet parked, so a reload that races a slow generation startup
+    // (duration probing, catch-up emit) is never lost — unlike `notify_waiters`,
+    // which only wakes already-parked waiters.
+    let mut stops: Vec<Arc<Notify>> = Vec::new();
+    for idx in 0..station.channels.len() {
+        if let Some(ctx) = build_overlay_context(&station.channels[idx]) {
+            let stop = Arc::new(Notify::new());
+            stops.push(stop.clone());
+            let name = station.channels[idx].name.clone();
+            supervisor_handles.push(tokio::spawn(async move {
+                tracing::info!(
+                    event = "overlay.start",
+                    channel = %name,
+                    config = %ctx.overlay_config.display(),
+                    fifo = %ctx.fifo_path.display(),
+                    "starting overlay supervisor",
+                );
+                overlay_supervisor::run(ctx, stop).await;
+            }));
+        }
+        let s = station.clone();
+        let stop = Arc::new(Notify::new());
+        stops.push(stop.clone());
+        let channel_name = station.channels[idx].name.clone();
+        // One span per channel wraps the whole channel loop, so every event it
+        // emits (roll ticks, chunk writes, retention deletes) carries the channel
+        // in its span context for correlation.
+        let span = tracing::info_span!("channel", channel = %channel_name);
+        handles.push(tokio::spawn(
+            async move {
+                let ch = &s.channels[idx];
+                let result = channel_loop(ch, tz, stop).await;
+                (ch.name.clone(), result)
+            }
+            .instrument(span),
+        ));
+    }
+
+    // `biased` makes shutdown win if both signals are pending.
+    let do_reload = select! {
+        biased;
+        _ = shutdown.notified() => false,
+        _ = reload.notified() => true,
+    };
+
+    // Stop this generation and wait for every task to wind down: channel loops
+    // return Ok on the stop branch; overlay supervisors kill their subprocess and
+    // remove the fifo + ready marker.
+    for stop in &stops {
+        stop.notify_one();
+    }
+
+    let mut first_err: Option<StationError> = None;
+    for h in handles {
+        match h.await {
+            Ok((name, Ok(()))) => {
+                tracing::info!(event = "channel.exit", channel = %name, "channel loop exited cleanly");
+            }
+            Ok((name, Err(e))) => {
+                tracing::error!(event = "channel.error", channel = %name, error = %e, "channel loop failed");
+                first_err.get_or_insert(e);
+            }
+            Err(e) => {
+                tracing::error!(event = "channel.panic", error = %e, "channel task panicked");
+                first_err.get_or_insert_with(|| StationError::Task(format!("{e}")));
+            }
+        }
+    }
+    for h in supervisor_handles {
+        if let Err(e) = h.await {
+            tracing::warn!(event = "overlay.supervisor_error", error = %e, "overlay supervisor task ended with error");
+        }
+    }
+
+    (do_reload, first_err)
 }
 
 /// Install the signal handlers that drive the daemon: SIGTERM/SIGINT request
