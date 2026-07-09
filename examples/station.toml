@@ -19,3 +19,7 @@ path = "channels/showcase.toml"
 [[channels]]
 name = "marquee"
 path = "channels/marquee.toml"
+
+[[channels]]
+name = "starwars"
+path = "channels/starwars.toml"
