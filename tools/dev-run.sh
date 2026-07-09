@@ -24,18 +24,22 @@ STATION_CONFIG="examples/station.toml"
 
 mkdir -p tmp/hls
 
-# Collect every channel's output_folder from the station config for the
-# readiness poll below. The station daemon now mkdir -p's these itself at
-# startup (#34), so we no longer pre-create them here — we only need the list.
-station_dir="$(dirname "$STATION_CONFIG")"
+# Ask the station binary for each channel's resolved output_folder, for the
+# readiness poll below. Going through the daemon's own config loader (rather
+# than parsing TOML here) means the folders we poll can never disagree with
+# where the daemon actually writes — nested tables, single-quoted strings, or a
+# reformat can't drift the two apart (#35). `-q` keeps cargo's build chatter off
+# stdout; the daemon build it triggers is needed a moment later anyway. A
+# non-zero exit means the config won't load — the daemon would choke on it too,
+# so fail fast instead of booting a doomed stack.
+if ! folders_output="$(cargo run -q -p etv-station -- --config "$STATION_CONFIG" --list-folders)"; then
+  echo "[dev] station --list-folders failed — station.toml won't load; aborting" >&2
+  exit 1
+fi
 output_folders=()
-while IFS= read -r rel; do
-  channel_file="$station_dir/$rel"
-  folder="$(awk -F '"' '/^output_folder/ {print $2; exit}' "$channel_file")"
-  if [ -n "$folder" ]; then
-    output_folders+=("$folder")
-  fi
-done < <(awk -F '"' '/^path/ {print $2}' "$STATION_CONFIG")
+while IFS= read -r folder; do
+  [ -n "$folder" ] && output_folders+=("$folder")
+done <<< "$folders_output"
 
 # Teardown: TERM the whole process tree, then escalate to KILL after a 1s grace
 # for any group (e.g. an ffmpeg child stuck on a flush) that ignored TERM, so a

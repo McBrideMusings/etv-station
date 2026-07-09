@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
@@ -18,6 +18,13 @@ struct Cli {
     /// Log output format.
     #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
     log_format: LogFormat,
+
+    /// Print each channel's resolved output_folder (one per line) and exit,
+    /// instead of running the daemon. tools/dev-run.sh uses this to discover
+    /// the folders to poll through the daemon's own config loader, so it can
+    /// never disagree with where the daemon actually writes.
+    #[arg(long)]
+    list_folders: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -28,6 +35,13 @@ enum LogFormat {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Query mode: print resolved folders and exit before any tracing/runtime
+    // setup, so stdout carries only the folder list for a caller to capture.
+    if cli.list_folders {
+        return list_folders(&cli.config);
+    }
+
     init_tracing(cli.log_format);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -79,6 +93,25 @@ fn main() -> ExitCode {
             }
         }
     })
+}
+
+/// Load the station config and print each channel's `output_folder` verbatim,
+/// one per line. Prints the value the daemon writes to (used as-is, relative to
+/// the process CWD), so a caller polling these paths watches exactly the daemon's
+/// output. Config-load failure goes to stderr with a non-zero exit.
+fn list_folders(config_path: &Path) -> ExitCode {
+    match config::load(config_path) {
+        Ok(station) => {
+            for ch in &station.channels {
+                println!("{}", ch.config.output_folder.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("failed to load configuration: {err}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn init_tracing(format: LogFormat) {
