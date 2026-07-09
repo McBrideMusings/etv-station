@@ -22,6 +22,9 @@ pub enum OpenOutcome {
     Opened,
     /// The shutdown flag was set before any reader attached.
     Shutdown,
+    /// No reader attached before the caller-supplied idle deadline. The caller
+    /// treats this as "channel no longer watched" and exits.
+    Idle,
 }
 
 pub struct FifoWriter {
@@ -57,7 +60,11 @@ impl FifoWriter {
         &self.path
     }
 
-    pub fn open_for_writing(&mut self, shutdown: &AtomicBool) -> anyhow::Result<OpenOutcome> {
+    pub fn open_for_writing(
+        &mut self,
+        shutdown: &AtomicBool,
+        idle_deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<OpenOutcome> {
         if self.file.is_some() {
             return Ok(OpenOutcome::Opened);
         }
@@ -78,6 +85,12 @@ impl FifoWriter {
         loop {
             if shutdown.load(Ordering::SeqCst) {
                 return Ok(OpenOutcome::Shutdown);
+            }
+            // Give up waiting for a reader once the caller's idle deadline
+            // passes: no reader for that long means the channel is no longer
+            // being watched, so the overlay should exit and free its resources.
+            if idle_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Ok(OpenOutcome::Idle);
             }
             match OpenOptions::new()
                 .write(true)
@@ -105,9 +118,13 @@ impl FifoWriter {
     /// reader. Called after a BrokenPipe so the next consumer's stream begins
     /// on a fresh frame boundary. Returns [`OpenOutcome::Shutdown`] if the
     /// shutdown flag is set while waiting.
-    pub fn reopen(&mut self, shutdown: &AtomicBool) -> anyhow::Result<OpenOutcome> {
+    pub fn reopen(
+        &mut self,
+        shutdown: &AtomicBool,
+        idle_deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<OpenOutcome> {
         self.file = None;
-        self.open_for_writing(shutdown)
+        self.open_for_writing(shutdown, idle_deadline)
     }
 
     pub fn write_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
@@ -186,7 +203,7 @@ mod tests {
         let writer_shutdown = Arc::clone(&shutdown);
         let writer = thread::spawn(move || {
             let mut w = FifoWriter::attach(writer_path);
-            if w.open_for_writing(&writer_shutdown).unwrap() == OpenOutcome::Shutdown {
+            if w.open_for_writing(&writer_shutdown, None).unwrap() == OpenOutcome::Shutdown {
                 return;
             }
             loop {
@@ -196,7 +213,7 @@ mod tests {
                 match w.write_frame(&writer_frame) {
                     Ok(()) => thread::sleep(Duration::from_millis(5)),
                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                        if w.reopen(&writer_shutdown).unwrap() == OpenOutcome::Shutdown {
+                        if w.reopen(&writer_shutdown, None).unwrap() == OpenOutcome::Shutdown {
                             return;
                         }
                     }

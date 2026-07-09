@@ -55,7 +55,20 @@ enum FrameWrite {
     Reopened,
     /// Shutdown was requested while waiting for a reader; stop the loop.
     Shutdown,
+    /// No reader for [`IDLE_TIMEOUT`]; the channel is no longer being watched,
+    /// so the overlay process should exit and free its GPU context.
+    Idle,
 }
+
+/// How long the overlay tolerates having no reader (no ffmpeg attached to the
+/// fifo) before exiting. This is a grace period, NOT the channel-warm window:
+/// etv-next keeps a channel (and its overlay-reading ffmpeg) alive for
+/// `HEARTBEAT_FILE_TIMEOUT` (90s) after the last viewer, and respawns ffmpeg per
+/// playout item — so the overlay sees brief reader gaps at item boundaries even
+/// while watched. The timeout only needs to comfortably exceed the largest such
+/// gap; once the channel actually goes cold (worker exits, ffmpeg gone for
+/// good), the overlay exits this long after and frees its GPU context.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(name = "etv-overlay")]
@@ -214,7 +227,10 @@ fn run_with_ffmpeg(
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn ffmpeg: {e}"))?;
 
-    if matches!(fifo.open_for_writing(&SHUTDOWN)?, OpenOutcome::Shutdown) {
+    if matches!(
+        fifo.open_for_writing(&SHUTDOWN, None)?,
+        OpenOutcome::Shutdown
+    ) {
         return Ok(());
     }
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
@@ -300,14 +316,21 @@ fn pipe_to_fifo(
         "renderer warm; opening fifo for first write",
     );
 
-    if matches!(fifo.open_for_writing(&SHUTDOWN)?, OpenOutcome::Shutdown) {
-        return Ok(());
+    // If no reader attaches within IDLE_TIMEOUT of spawn, the channel isn't
+    // being watched — exit rather than hold an idle GPU context.
+    match fifo.open_for_writing(&SHUTDOWN, Some(start + IDLE_TIMEOUT))? {
+        OpenOutcome::Opened => {}
+        OpenOutcome::Shutdown | OpenOutcome::Idle => return Ok(()),
     }
-    if matches!(
-        write_frame_resilient(&mut fifo, &first_frame, &SHUTDOWN)?,
-        FrameWrite::Shutdown
-    ) {
-        return Ok(());
+    let mut last_activity = std::time::Instant::now();
+    match write_frame_resilient(
+        &mut fifo,
+        &first_frame,
+        &SHUTDOWN,
+        last_activity + IDLE_TIMEOUT,
+    )? {
+        FrameWrite::Written | FrameWrite::Reopened => last_activity = std::time::Instant::now(),
+        FrameWrite::Shutdown | FrameWrite::Idle => return Ok(()),
     }
     if let Some(path) = ready_file.as_deref()
         && let Err(e) = touch(path)
@@ -336,14 +359,21 @@ fn pipe_to_fifo(
         let ctx = current_context(program_source.as_mut());
         let state = engine.evaluate(time_seconds, frame_index, &ctx);
         let frame = renderer.render_frame(&state)?;
-        match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN)? {
-            FrameWrite::Written => {}
+        match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN, last_activity + IDLE_TIMEOUT)? {
+            FrameWrite::Written => last_activity = std::time::Instant::now(),
             FrameWrite::Reopened => {
+                last_activity = std::time::Instant::now();
                 pace_start = std::time::Instant::now();
                 paced_frames = 0;
             }
             FrameWrite::Shutdown => {
                 tracing::info!("shutdown requested; stopping overlay pipe");
+                return Ok(());
+            }
+            FrameWrite::Idle => {
+                tracing::info!(
+                    "no reader for {IDLE_TIMEOUT:?}; channel no longer watched, exiting"
+                );
                 return Ok(());
             }
         }
@@ -368,6 +398,7 @@ fn write_frame_resilient(
     fifo: &mut FifoWriter,
     frame: &[u8],
     shutdown: &AtomicBool,
+    idle_deadline: std::time::Instant,
 ) -> anyhow::Result<FrameWrite> {
     let mut reopened = false;
     loop {
@@ -386,9 +417,10 @@ fn write_frame_resilient(
                 tracing::info!("reader disconnected; waiting for next reader to reattach");
                 // Backoff so rapid reader open/close churn can't spin this hot.
                 thread::sleep(REOPEN_BACKOFF);
-                match fifo.reopen(shutdown)? {
+                match fifo.reopen(shutdown, Some(idle_deadline))? {
                     OpenOutcome::Opened => reopened = true,
                     OpenOutcome::Shutdown => return Ok(FrameWrite::Shutdown),
+                    OpenOutcome::Idle => return Ok(FrameWrite::Idle),
                 }
             }
             Err(e) => return Err(e.into()),
