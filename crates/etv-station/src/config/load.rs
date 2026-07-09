@@ -105,7 +105,7 @@ fn resolve_blocks(config: &mut ChannelConfig, channel_path: &Path) -> Result<(),
             } else {
                 dir.join(&block_rel)
             };
-            let body: BlockFile = read_toml(&block_path)?;
+            let body: BlockFile = read_block_file(&block_path)?;
             include.apply_body(body);
         }
 
@@ -160,6 +160,27 @@ fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigErr
     })
 }
 
+/// Read a referenced block file, picking the deserializer by extension:
+/// `.yaml`/`.yml` parse as YAML (the "by shape" authoring path from #86),
+/// everything else as TOML. Both reuse the same [`BlockFile`] serde type.
+fn read_block_file(path: &Path) -> Result<BlockFile, ConfigError> {
+    let is_yaml = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
+    if !is_yaml {
+        return read_toml(path);
+    }
+    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_norway::from_str(&contents).map_err(|source| ConfigError::ParseYaml {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +229,33 @@ mod tests {
         std::fs::write(
             &channel_path,
             "output_folder = \"/out\"\n\n[[rule.blocks]]\nblock = \"blocks/b.toml\"\nmode = \"all\"\norder = \"manual\"\n",
+        )
+        .unwrap();
+
+        let mut config: ChannelConfig = read_toml(&channel_path).unwrap();
+        resolve_blocks(&mut config, &channel_path).unwrap();
+        let inc = &config.rule.blocks[0];
+        assert!(
+            inc.block.is_none(),
+            "path ref should be cleared after splice"
+        );
+        assert_eq!(inc.entries().len(), 1);
+        assert!(matches!(inc.entries()[0], Entry::Item(_)));
+    }
+
+    #[test]
+    fn resolves_yaml_path_referenced_block() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("blocks")).unwrap();
+        std::fs::write(
+            dir.path().join("blocks/b.yaml"),
+            "entries:\n  - kind: item\n    id: x\n    source:\n      kind: lavfi\n      params: testsrc\n",
+        )
+        .unwrap();
+        let channel_path = dir.path().join("channel.toml");
+        std::fs::write(
+            &channel_path,
+            "output_folder = \"/out\"\n\n[[rule.blocks]]\nblock = \"blocks/b.yaml\"\nmode = \"all\"\norder = \"manual\"\n",
         )
         .unwrap();
 

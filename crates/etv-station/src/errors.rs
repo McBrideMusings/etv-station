@@ -18,6 +18,13 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
+    #[error("failed to parse {path}: {source}")]
+    ParseYaml {
+        path: PathBuf,
+        #[source]
+        source: serde_norway::Error,
+    },
+
     #[error("invalid config at {path}: {message}")]
     Validation { path: PathBuf, message: String },
 

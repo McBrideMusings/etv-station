@@ -77,6 +77,50 @@ params = "testsrc"
     }
 
     #[test]
+    fn parses_block_file_from_yaml() {
+        let yaml = r#"
+duplicates: keep
+program:
+  title: Defaults
+  categories: [Movie]
+entries:
+  - kind: item
+    id: a
+    source:
+      kind: lavfi
+      params: testsrc
+"#;
+        let block: BlockFile = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(block.duplicates, Duplicates::Keep);
+        assert_eq!(block.entries.len(), 1);
+        assert!(matches!(block.entries[0], Entry::Item(_)));
+        assert_eq!(
+            block.program.as_ref().unwrap().title.as_deref(),
+            Some("Defaults")
+        );
+    }
+
+    #[test]
+    fn parses_query_and_include_entries_from_yaml() {
+        // Exercises the internally-tagged `Entry` enum and the `Mode`
+        // deserialize_any visitor (mapping form) through the YAML deserializer.
+        let yaml = r#"
+entries:
+  - kind: query
+    query: "type == 'movie'"
+    order: "release_date:asc"
+  - kind: include
+    block: "../blocks/bumpers.toml"
+    mode:
+      count: 1
+"#;
+        let block: BlockFile = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(block.entries.len(), 2);
+        assert_eq!(block.entries[0].kind_name(), "query");
+        assert_eq!(block.entries[1].kind_name(), "include");
+    }
+
+    #[test]
     fn parses_query_and_include_entries() {
         let toml = r#"
 [[entries]]
