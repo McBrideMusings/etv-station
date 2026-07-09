@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
@@ -29,25 +29,33 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // starts a fresh generation; SIGTERM/SIGINT stops the current generation
     // and exits. The first generation runs the config passed in at startup.
     let mut station = Arc::new(station);
+    // The last config that prepared cleanly. A `prepare_generation` failure on a
+    // reload reverts to this instead of killing a daemon that's streaming fine.
+    // See #90 and docs/adr/0001-reload-generation-revert.md.
+    let mut last_good: Option<Arc<Station>> = None;
     loop {
-        let tz = tzmod::parse(&station.station.tz)?;
-        validate_overlay_configs(&station)?;
-
-        // Create every channel's output_folder up front, before spawning any
-        // channel or overlay task. A fresh prod deploy on empty volumes then has
-        // the folders in place before etv-next's startup canonicalize reads them
-        // (which otherwise hard-errors with PlayoutFolderResolve) and before the
-        // overlay supervisor opens its fifo underneath. Runs each generation, so
-        // a SIGHUP that adds a channel creates its folder too. See #34.
-        for channel in &station.channels {
-            let output = &channel.config.output_folder;
-            tokio::fs::create_dir_all(output)
-                .await
-                .map_err(|source| StationError::Io {
-                    path: output.clone(),
-                    source,
-                })?;
-        }
+        let tz = match prepare_generation(&station).await {
+            Ok(tz) => {
+                last_good = Some(station.clone());
+                tz
+            }
+            // First generation (nothing good yet) → fail loud at startup. A
+            // reload whose config won't prepare reverts to the last-known-good
+            // and re-spawns it. If the config we reverted TO also fails to
+            // prepare (same Arc), the environment is unrecoverable → exit.
+            Err(e) => match &last_good {
+                Some(good) if !Arc::ptr_eq(good, &station) => {
+                    tracing::error!(
+                        event = "config.reload_reverted",
+                        error = %e,
+                        "generation failed to prepare on reload; reverting to last-known-good config",
+                    );
+                    station = good.clone();
+                    continue;
+                }
+                _ => return Err(e),
+            },
+        };
 
         let mut handles = Vec::new();
         let mut supervisor_handles = Vec::new();
@@ -142,9 +150,12 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         // tear down an otherwise-healthy daemon. The error was already logged
         // above in the join loop.
 
-        // SIGHUP: re-read the config from disk. A malformed edit keeps the
-        // previous (still-valid) config running instead of killing the daemon.
-        match load_and_validate(&config_path) {
+        // SIGHUP: re-read the config from disk. A malformed edit that won't even
+        // parse keeps the previous config running. A config that parses but
+        // can't be prepared (bad tz/overlay, uncreatable folder) is caught the
+        // next iteration by `prepare_generation`, which reverts — so the
+        // runnable-check lives in exactly one place.
+        match crate::config::load(&config_path) {
             Ok(s) => {
                 tracing::info!(event = "config.reload", config = %config_path.display(), "configuration reloaded");
                 station = Arc::new(s);
@@ -154,7 +165,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
                     event = "config.reload_failed",
                     error = %e,
                     config = %config_path.display(),
-                    "configuration reload failed; keeping previous config running",
+                    "configuration reload failed to parse; keeping previous config running",
                 );
             }
         }
@@ -214,14 +225,29 @@ async fn recv_signal(sig: Option<&mut tokio::signal::unix::Signal>) {
     }
 }
 
-/// Re-read the station config from disk and run the same checks the initial
-/// startup applies (timezone parse + overlay-spec validation), so a reload only
-/// ever swaps in a config that is known to be runnable.
-fn load_and_validate(config_path: &Path) -> Result<Station, StationError> {
-    let station = crate::config::load(config_path)?;
-    tzmod::parse(&station.station.tz)?;
-    validate_overlay_configs(&station)?;
-    Ok(station)
+/// Run every check and side effect a generation needs before its channel and
+/// overlay tasks spawn: parse the station tz, validate each channel's overlay
+/// spec, and create each channel's `output_folder`. The single home for the "is
+/// this config runnable" gate — `run` calls it once per generation on both the
+/// startup and reload paths, so a check added here can never be silently skipped
+/// on one path (the split that let the #34 mkdir slip past the reload gate; see
+/// #90 and docs/adr/0001-reload-generation-revert.md).
+async fn prepare_generation(station: &Station) -> Result<&'static Tz, StationError> {
+    let tz = tzmod::parse(&station.station.tz)?;
+    validate_overlay_configs(station)?;
+    // Create every channel's output_folder before any task spawns — a fresh
+    // deploy on empty volumes needs it in place before etv-next's canonicalize
+    // reads it and before the overlay supervisor opens its fifo underneath (#34).
+    for channel in &station.channels {
+        let output = &channel.config.output_folder;
+        tokio::fs::create_dir_all(output)
+            .await
+            .map_err(|source| StationError::Io {
+                path: output.clone(),
+                source,
+            })?;
+    }
+    Ok(tz)
 }
 
 async fn wipe_emitted_playout(channel: &LoadedChannel) -> Result<(), StationError> {
@@ -505,8 +531,7 @@ fn log_emission(
 mod tests {
     use super::*;
 
-    const CHANNEL_TOML: &str = r#"
-output_folder = "out"
+    const CHANNEL_BODY: &str = r#"
 window_days = 1
 chunk_hours = 6
 roll_interval = "60s"
@@ -528,31 +553,39 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
 "#;
 
     /// Write a station.toml (with the given tz) plus a lavfi channel into a
-    /// fresh tempdir and return the dir handle and the station path.
+    /// fresh tempdir and return the dir handle and the station path. The
+    /// channel's output_folder points inside the tempdir so `prepare_generation`
+    /// mkdir's there rather than polluting the crate directory.
     fn write_station(tz: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let station =
             format!("tz = \"{tz}\"\n\n[[channels]]\nname = \"test\"\npath = \"channel.toml\"\n");
+        let out = dir.path().join("out");
+        let channel = format!("output_folder = {:?}\n{CHANNEL_BODY}", out.to_string_lossy());
         std::fs::write(dir.path().join("station.toml"), station).unwrap();
-        std::fs::write(dir.path().join("channel.toml"), CHANNEL_TOML).unwrap();
+        std::fs::write(dir.path().join("channel.toml"), channel).unwrap();
         let path = dir.path().join("station.toml");
         (dir, path)
     }
 
-    #[test]
-    fn load_and_validate_accepts_valid_config() {
+    #[tokio::test]
+    async fn prepare_generation_accepts_valid_config() {
         let (_dir, path) = write_station("America/Chicago");
-        let station = load_and_validate(&path).expect("valid config should load");
-        assert_eq!(station.channels.len(), 1);
-        assert_eq!(station.channels[0].name, "test");
+        let station = crate::config::load(&path).expect("valid config should load");
+        prepare_generation(&station)
+            .await
+            .expect("valid config should prepare");
     }
 
-    #[test]
-    fn load_and_validate_rejects_invalid_timezone() {
-        // A non-empty-but-bogus tz passes `validate_station` and is caught by
-        // the timezone parse in `load_and_validate`. This is the gate that lets
-        // a reload keep the previous config running on a malformed edit.
+    #[tokio::test]
+    async fn prepare_generation_rejects_invalid_timezone() {
+        // A non-empty-but-bogus tz passes `config::load`'s `validate_station`
+        // (which only checks non-empty) and is caught by the timezone parse in
+        // `prepare_generation` — the gate that, on reload, reverts to the
+        // previous config instead of running a broken one. tz is parsed before
+        // the mkdir, so this never touches the filesystem.
         let (_dir, path) = write_station("Totally/Bogus/Zone");
-        assert!(load_and_validate(&path).is_err());
+        let station = crate::config::load(&path).expect("bogus tz still parses as config");
+        assert!(prepare_generation(&station).await.is_err());
     }
 }

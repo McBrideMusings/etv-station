@@ -62,6 +62,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `docs/PRD.md` | Product requirements doc — the canonical spec. |
 | `docs/roadmap.md` | Now / Next / Later / Deferred. Direction, not task tracking. |
 | `docs/architecture.md` | Distillation of PRD §Architecture for quick reference. |
+| `docs/adr/` | Architecture Decision Records — why a non-obvious call was made (e.g. `0001-reload-generation-revert.md`). |
 | `docs/file-map.md` | This page. |
 | `docs/index.md` | VitePress landing. |
 | `docs/.vitepress/config.mts` | VitePress config. |
