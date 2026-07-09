@@ -49,14 +49,12 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
     }
 
     // Cross-channel: two channels sharing an output_folder collide on the
-    // `.anchor` and `.durations.json` sidecars, so reject duplicates once every
-    // channel's folder is resolved.
-    let folder_specs: Vec<(&str, &Path, &Path)> = channels
+    // `.anchor` and `.durations.json` sidecars. Compare folders verbatim, the
+    // way the daemon uses them (relative to one CWD), so two channels both
+    // writing `out` are correctly rejected.
+    let folder_specs: Vec<(&str, &Path)> = channels
         .iter()
-        .map(|c| {
-            let dir = c.config_path.parent().unwrap_or_else(|| Path::new("."));
-            (c.name.as_str(), dir, c.config.output_folder.as_path())
-        })
+        .map(|c| (c.name.as_str(), c.config.output_folder.as_path()))
         .collect();
     validate::validate_output_folders(station_path, &folder_specs)?;
 

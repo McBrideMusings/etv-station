@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::block::Duplicates;
 use super::channel::ChannelConfig;
@@ -41,34 +41,34 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
     Ok(())
 }
 
-/// Reject two channels that resolve to the same `output_folder`. A shared folder
+/// Reject two channels that write to the same `output_folder`. A shared folder
 /// silently misbehaves: both channels fight over the `.anchor` sidecar and each
 /// startup prunes the other's `.durations.json` cache, forcing re-probes on
-/// every restart. Each folder is resolved to absolute form against its own
-/// channel config directory before comparing (they may be written relative to
-/// different files) — but deliberately *not* canonicalized, since the folders
-/// need not exist yet at load time.
+/// every restart.
 ///
-/// `channels` is `(name, config_dir, output_folder)` per channel.
+/// Folders are compared exactly as the daemon uses them — verbatim, relative to
+/// the single process CWD (see `daemon::channel_loop`, which uses
+/// `channel.config.output_folder` as-is), NOT resolved against each channel's
+/// own config directory. Two channels that both declare `output_folder = "out"`
+/// therefore collide, because at runtime both write `<cwd>/out` — that shared
+/// runtime target is the collision we must reject, and resolving against
+/// distinct config dirs would wrongly treat them as different.
+///
+/// `channels` is `(name, output_folder)` per channel.
 pub(super) fn validate_output_folders(
     station_path: &Path,
-    channels: &[(&str, &Path, &Path)],
+    channels: &[(&str, &Path)],
 ) -> Result<(), ConfigError> {
-    let mut seen: HashMap<PathBuf, &str> = HashMap::new();
-    for (name, config_dir, output_folder) in channels {
-        let resolved: PathBuf = if output_folder.is_absolute() {
-            output_folder.to_path_buf()
-        } else {
-            config_dir.join(output_folder)
-        };
-        if let Some(prev) = seen.insert(resolved.clone(), name) {
+    let mut seen: HashMap<&Path, &str> = HashMap::new();
+    for (name, output_folder) in channels {
+        if let Some(prev) = seen.insert(output_folder, name) {
             return Err(ConfigError::Validation {
                 path: station_path.to_path_buf(),
                 message: format!(
-                    "channels {:?} and {:?} resolve to the same output_folder {}",
+                    "channels {:?} and {:?} both write to output_folder {}",
                     prev,
                     name,
-                    resolved.display()
+                    output_folder.display()
                 ),
             });
         }
@@ -263,46 +263,27 @@ mod tests {
 
     #[test]
     fn rejects_shared_absolute_output_folder() {
-        let a = Path::new("/etc/a");
-        let b = Path::new("/etc/b");
         let out = Path::new("/srv/out");
-        let err = validate_output_folders(&dummy_path(), &[("a", a, out), ("b", b, out)])
-            .unwrap_err();
+        let err =
+            validate_output_folders(&dummy_path(), &[("a", out), ("b", out)]).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("same output_folder"), "msg = {msg}");
+        assert!(msg.contains("both write to output_folder"), "msg = {msg}");
         assert!(msg.contains("\"a\"") && msg.contains("\"b\""), "msg = {msg}");
     }
 
     #[test]
-    fn rejects_relative_folders_resolving_to_same_path() {
-        // Same config dir + same relative folder → same resolved path.
-        let dir = Path::new("/cfg");
+    fn rejects_identical_relative_output_folder() {
+        // Both channels write the same relative folder → at runtime both land on
+        // `<cwd>/out`, so this is a real collision the daemon can't tolerate.
         let out = Path::new("out");
-        assert!(
-            validate_output_folders(&dummy_path(), &[("a", dir, out), ("b", dir, out)]).is_err()
-        );
-    }
-
-    #[test]
-    fn accepts_same_relative_folder_from_different_dirs() {
-        // Identical relative string, but resolved against different config dirs
-        // → genuinely different folders, so allowed.
-        let out = Path::new("out");
-        validate_output_folders(
-            &dummy_path(),
-            &[("a", Path::new("/cfg/a"), out), ("b", Path::new("/cfg/b"), out)],
-        )
-        .unwrap();
+        assert!(validate_output_folders(&dummy_path(), &[("a", out), ("b", out)]).is_err());
     }
 
     #[test]
     fn accepts_distinct_output_folders() {
         validate_output_folders(
             &dummy_path(),
-            &[
-                ("a", Path::new("/cfg"), Path::new("/srv/a")),
-                ("b", Path::new("/cfg"), Path::new("/srv/b")),
-            ],
+            &[("a", Path::new("/srv/a")), ("b", Path::new("/srv/b"))],
         )
         .unwrap();
     }
