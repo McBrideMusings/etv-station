@@ -33,6 +33,22 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         let tz = tzmod::parse(&station.station.tz)?;
         validate_overlay_configs(&station)?;
 
+        // Create every channel's output_folder up front, before spawning any
+        // channel or overlay task. A fresh prod deploy on empty volumes then has
+        // the folders in place before etv-next's startup canonicalize reads them
+        // (which otherwise hard-errors with PlayoutFolderResolve) and before the
+        // overlay supervisor opens its fifo underneath. Runs each generation, so
+        // a SIGHUP that adds a channel creates its folder too. See #34.
+        for channel in &station.channels {
+            let output = &channel.config.output_folder;
+            tokio::fs::create_dir_all(output)
+                .await
+                .map_err(|source| StationError::Io {
+                    path: output.clone(),
+                    source,
+                })?;
+        }
+
         let mut handles = Vec::new();
         let mut supervisor_handles = Vec::new();
         // One stop signal per spawned task. `notify_one` stores a permit if the
@@ -306,14 +322,9 @@ async fn channel_loop(
     tz: &'static Tz,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
+    // `run` creates every channel's output_folder synchronously before spawning
+    // this task (see #34), so it exists by the time we scan/emit into it here.
     let output = &channel.config.output_folder;
-
-    tokio::fs::create_dir_all(output)
-        .await
-        .map_err(|source| StationError::Io {
-            path: output.clone(),
-            source,
-        })?;
 
     let items = crate::resolve::resolve_channel(&channel.config, &channel.config_path)?;
 
