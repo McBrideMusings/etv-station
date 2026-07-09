@@ -48,6 +48,18 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
         });
     }
 
+    // Cross-channel: two channels sharing an output_folder collide on the
+    // `.anchor` and `.durations.json` sidecars, so reject duplicates once every
+    // channel's folder is resolved.
+    let folder_specs: Vec<(&str, &Path, &Path)> = channels
+        .iter()
+        .map(|c| {
+            let dir = c.config_path.parent().unwrap_or_else(|| Path::new("."));
+            (c.name.as_str(), dir, c.config.output_folder.as_path())
+        })
+        .collect();
+    validate::validate_output_folders(station_path, &folder_specs)?;
+
     Ok(Station {
         config_path: station_path.to_path_buf(),
         station,
