@@ -503,11 +503,13 @@ dependencies = [
 name = "etv-station"
 version = "0.1.0"
 dependencies = [
+ "cel",
  "clap",
  "ersatztv-playout",
  "etv-overlay",
  "humantime-serde",
  "nix",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

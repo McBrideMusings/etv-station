@@ -21,4 +21,7 @@ pub enum CatalogError {
         field: &'static str,
         message: String,
     },
+
+    #[error("invalid query: {0}")]
+    Query(String),
 }

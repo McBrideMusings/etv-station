@@ -18,6 +18,7 @@
 pub mod error;
 pub mod identity;
 pub mod model;
+pub mod query;
 pub mod schema;
 
 use std::path::Path;
@@ -53,8 +54,30 @@ impl Catalog {
 
     fn init(conn: Connection) -> Result<Self, CatalogError> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        query::register_regexp(&conn)?;
         schema::apply(&conn)?;
         Ok(Catalog { conn })
+    }
+
+    /// Resolve a CEL `query` expression to the matching `entry_id`s.
+    ///
+    /// The expression is translated to a SQL `WHERE` over the catalog (#68);
+    /// results come back in `entry_id` order (a stable, deterministic set —
+    /// user-facing ordering is #69's job). An expression that matches nothing
+    /// yields an empty vec, never an error.
+    pub fn resolve_query(&self, cel: &str) -> Result<Vec<String>, CatalogError> {
+        let where_clause = query::translate(cel)?;
+        let sql = format!(
+            "SELECT entry_id FROM entries WHERE {} ORDER BY entry_id",
+            where_clause.sql
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let ids = stmt
+            .query_map(rusqlite::params_from_iter(where_clause.params), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
     }
 
     // ---- writes -----------------------------------------------------------
