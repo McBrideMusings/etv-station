@@ -18,12 +18,16 @@
 pub mod error;
 pub mod identity;
 pub mod model;
+pub mod order;
 pub mod query;
 pub mod schema;
 
 use std::path::Path;
 
+use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::config::Order;
 
 pub use error::CatalogError;
 pub use identity::{canonical_path, derive_entry_id};
@@ -59,6 +63,95 @@ impl Catalog {
         Ok(Catalog { conn })
     }
 
+    /// Order a resolved set of `entry_id`s per an [`Order`] spec (#69).
+    ///
+    /// - `Fields` sorts by the named scalar columns (nulls last, `entry_id`
+    ///   tiebreaker) — a non-sortable field is a config error.
+    /// - `Manual` returns the input (authored) order unchanged.
+    /// - `Random` is a deterministic seeded shuffle (`seed` supplied by the
+    ///   caller; a pinned seed reproduces the order).
+    /// - `Collection` reads `collection_items.position` for `collection_id`
+    ///   (required — the set must be one collection); missing context is an error.
+    /// - `Score` is not yet implemented (a separate plugin issue).
+    ///
+    /// An empty input yields an empty output.
+    pub fn resolve_order(
+        &self,
+        ids: &[String],
+        order: &Order,
+        seed: u64,
+        collection_id: Option<&str>,
+    ) -> Result<Vec<String>, CatalogError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        match order {
+            Order::Manual => Ok(ids.to_vec()),
+            Order::Score => Err(CatalogError::Query(
+                "score order requires the scoring plugin (not yet implemented)".to_string(),
+            )),
+            Order::Random => {
+                let mut shuffled = ids.to_vec();
+                // Sort first so the result depends only on the set + seed.
+                shuffled.sort();
+                order::seeded_shuffle(&mut shuffled, seed);
+                Ok(shuffled)
+            }
+            Order::Collection => {
+                let collection_id = collection_id.ok_or_else(|| {
+                    CatalogError::Query(
+                        "collection order needs a single-collection context".to_string(),
+                    )
+                })?;
+                let placeholders = vec!["?"; ids.len()].join(", ");
+                let sql = format!(
+                    "SELECT ci.entry_id FROM collection_items ci \
+                     WHERE ci.collection_id = ? AND ci.entry_id IN ({placeholders}) \
+                     ORDER BY ci.position, ci.entry_id"
+                );
+                let mut params: Vec<Value> = Vec::with_capacity(ids.len() + 1);
+                params.push(Value::Text(collection_id.to_string()));
+                params.extend(ids.iter().map(|s| Value::Text(s.clone())));
+                let ordered = self.ordered_ids(&sql, params)?;
+                // #69: `collection` order is valid only when the whole resolved
+                // set belongs to the collection. A member missing from it would
+                // otherwise silently truncate the playlist — that's a config
+                // error, not a shorter list.
+                let distinct: std::collections::HashSet<&str> =
+                    ids.iter().map(String::as_str).collect();
+                if ordered.len() < distinct.len() {
+                    return Err(CatalogError::Query(format!(
+                        "collection order: {} of {} resolved entries are not members of \
+                         collection {collection_id:?}",
+                        distinct.len() - ordered.len(),
+                        distinct.len(),
+                    )));
+                }
+                Ok(ordered)
+            }
+            Order::Fields(terms) => {
+                let clause = order::order_by_clause(terms)?;
+                let placeholders = vec!["?"; ids.len()].join(", ");
+                let sql = format!(
+                    "SELECT entry_id FROM entries WHERE entry_id IN ({placeholders}) ORDER BY {clause}"
+                );
+                let params: Vec<Value> = ids.iter().map(|s| Value::Text(s.clone())).collect();
+                self.ordered_ids(&sql, params)
+            }
+        }
+    }
+
+    /// Run an ordering query and collect the `entry_id` column.
+    fn ordered_ids(&self, sql: &str, params: Vec<Value>) -> Result<Vec<String>, CatalogError> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let ids = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Resolve a CEL `query` expression to the matching `entry_id`s.
     ///
     /// The expression is translated to a SQL `WHERE` over the catalog (#68);
@@ -71,13 +164,7 @@ impl Catalog {
             "SELECT entry_id FROM entries WHERE {} ORDER BY entry_id",
             where_clause.sql
         );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let ids = stmt
-            .query_map(rusqlite::params_from_iter(where_clause.params), |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ids)
+        self.ordered_ids(&sql, where_clause.params)
     }
 
     // ---- writes -----------------------------------------------------------
