@@ -386,7 +386,10 @@ async fn channel_loop(
     // this task (see #34), so it exists by the time we scan/emit into it here.
     let output = &channel.config.output_folder;
 
-    let items = crate::resolve::resolve_channel(&channel.config, &channel.config_path)?;
+    // The station-wide catalog is not yet opened by the daemon (#71 follow-up);
+    // until then only inline-item, `manual`-order channels resolve. Query
+    // entries and non-`manual` order error clearly via `resolve_channel`.
+    let items = crate::resolve::resolve_channel(&channel.config, &channel.config_path, None)?;
 
     let mut cache = DurationCache::load(output).await?;
     let (durations, stats) = cache.resolve_all(&items).await?;

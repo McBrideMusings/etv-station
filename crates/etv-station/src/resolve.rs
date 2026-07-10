@@ -1,25 +1,33 @@
 //! Resolve a channel's block composition into a flat, ordered item list.
 //!
-//! This is the **item-only** resolver for Phase C (#46): it flattens
-//! `[[rule.blocks]]` into concrete [`ResolvedItem`]s, applies each block's
-//! `duplicates` policy and `mode`, and merges block-level `[program]` defaults
-//! into items. Everything that needs the catalog or sequencing engines is
-//! rejected with a clear `unsupported` error rather than silently ignored:
+//! The Phase C resolve pipeline (#71): for each `[[rule.blocks]]` it
+//! **resolves entries → applies `duplicates` → applies `order` → (mode)**,
+//! producing the flat [`ResolvedItem`] list the window-filling sequencer
+//! ([`crate::rule::LoopForever`]) loops across the chunk window. Collapse runs
+//! *before* order, so which duplicate survives is deterministic regardless of a
+//! `random` shuffle.
 //!
-//! - `query` entries → query field set + CEL→SQL resolution (#68)
-//! - `include` entries and any non-`manual` order → resolution engine (#69)
-//! - a non-empty `filter` → resolution engine (#69)
+//! `query` entries resolve against the [`Catalog`] (#68 CEL→SQL) and each
+//! resolved `entry_id` becomes a `ResolvedItem`; `order` is applied by the
+//! order engine (#69). A channel with no query entries and `manual` order needs
+//! no catalog, so `catalog` is optional.
 //!
-//! The flat list it returns feeds the existing window-filling sequencer
-//! ([`crate::rule::LoopForever`]), which loops it across the chunk window.
+//! Still rejected with a clear `unsupported` error (later issues): `include`
+//! entries, a non-empty block `filter`, and a block `fallback` (its schema is a
+//! follow-up). The catalog is not yet opened by the daemon — until that lands,
+//! query entries / non-`manual` order only resolve when a catalog is supplied
+//! (tests), and error at runtime.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
 use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
+use crate::catalog::Catalog;
 use crate::config::{
-    BlockInclude, ChannelConfig, Duplicates, Entry, ItemEntry, Mode, Order, SourceConfig,
+    BlockInclude, ChannelConfig, Duplicates, Entry, ItemEntry, Mode, Order, QueryEntry,
+    SourceConfig,
 };
 use crate::errors::ConfigError;
 
@@ -43,14 +51,22 @@ impl ResolvedItem {
 }
 
 /// Flatten a channel's blocks into an ordered item list. `path` is the channel
-/// config path, used only for error messages.
+/// config path, used only for error messages. `catalog` resolves `query`
+/// entries and non-`manual` order; it may be `None` for a channel that is
+/// entirely inline items in `manual` order.
 pub fn resolve_channel(
     config: &ChannelConfig,
     path: &Path,
+    catalog: Option<&Catalog>,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
+    // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
+    // one draws fresh entropy so an unseeded `random` block reshuffles each
+    // generation (#46 "unset = fresh per generation").
+    let seed = config.seed.unwrap_or_else(fresh_seed);
+
     let mut out = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
-        let block_items = resolve_block(include, idx, path)?;
+        let block_items = resolve_block(include, idx, path, catalog, seed)?;
         out.extend(block_items);
     }
 
@@ -67,34 +83,45 @@ fn resolve_block(
     include: &BlockInclude,
     idx: usize,
     path: &Path,
+    catalog: Option<&Catalog>,
+    seed: u64,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
         message,
     };
 
-    // Honesty gates: features whose runtime lives in later Phase C issues.
-    if include.order != Order::Manual {
-        return Err(unsupported(format!(
-            "block #{idx}: order other than \"manual\" is not implemented yet (#69)"
-        )));
-    }
+    // Honesty gates for features whose runtime lives in later Phase C issues.
     if include.filter.as_ref().is_some_and(|f| !f.is_empty()) {
         return Err(unsupported(format!(
             "block #{idx}: [filter] resolution is not implemented yet (#69)"
         )));
     }
+    // `collection` order needs the block to know which collection its set came
+    // from — that context isn't wired into resolution yet (#71 follow-up), so a
+    // block-level collection sort would otherwise fail deep in the order engine.
+    if include.order == Order::Collection {
+        return Err(unsupported(format!(
+            "block #{idx}: order = \"collection\" is not wired yet (needs block collection context)"
+        )));
+    }
 
     let defaults = include.program();
 
+    // 1. Resolve entries to a flat item list (authored order).
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
             Entry::Item(item) => items.push(resolve_item(item, defaults)),
-            Entry::Query(_) => {
-                return Err(unsupported(format!(
-                    "block #{idx}: query entries are not implemented yet (#68)"
-                )));
+            Entry::Query(query) => {
+                let cat = catalog.ok_or_else(|| {
+                    unsupported(format!(
+                        "block #{idx}: a query entry needs the catalog, which is not available"
+                    ))
+                })?;
+                let resolved = resolve_query(cat, query, defaults, seed)
+                    .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                items.extend(resolved);
             }
             Entry::Include(_) => {
                 return Err(unsupported(format!(
@@ -104,15 +131,163 @@ fn resolve_block(
         }
     }
 
+    // 2. Duplicates — collapse (default) runs BEFORE order so which occurrence
+    //    survives is deterministic even under a `random` shuffle.
     if matches!(include.duplicates(), Duplicates::Collapse) {
         collapse_duplicates(&mut items);
     }
 
+    // 3. Order the block's resolved list. `manual` keeps authored order and
+    //    needs no catalog; every other order goes through the #69 engine.
+    if include.order != Order::Manual {
+        let cat = catalog.ok_or_else(|| {
+            unsupported(format!(
+                "block #{idx}: order {:?} needs the catalog, which is not available",
+                include.order
+            ))
+        })?;
+        items = apply_order(cat, items, &include.order, seed)
+            .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+    }
+
+    // 4. Mode — `count` truncates after ordering.
     if let Mode::Count(n) = include.mode {
         items.truncate(n);
     }
 
     Ok(items)
+}
+
+/// Resolve a `query` entry against the catalog: run the CEL query, apply the
+/// entry's own optional `order` (#46 per-entry order), then turn each resolved
+/// `entry_id` into a [`ResolvedItem`].
+fn resolve_query(
+    catalog: &Catalog,
+    query: &QueryEntry,
+    defaults: Option<&ProgramMetadata>,
+    seed: u64,
+) -> Result<Vec<ResolvedItem>, String> {
+    let mut ids = catalog
+        .resolve_query(&query.query)
+        .map_err(|e| e.to_string())?;
+    if let Some(order) = &query.order {
+        ids = catalog
+            .resolve_order(&ids, order, seed, None)
+            .map_err(|e| e.to_string())?;
+    }
+    ids.iter()
+        .map(|id| catalog_item(catalog, id, defaults))
+        .collect()
+}
+
+/// Order a resolved item list via the #69 engine and reorder the items to match.
+fn apply_order(
+    catalog: &Catalog,
+    items: Vec<ResolvedItem>,
+    order: &Order,
+    seed: u64,
+) -> Result<Vec<ResolvedItem>, String> {
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let ordered = catalog
+        .resolve_order(&ids, order, seed, None)
+        .map_err(|e| e.to_string())?;
+    Ok(reorder_to(items, &ordered))
+}
+
+/// A fresh, non-reproducible seed for an unseeded `random` order — derived from
+/// the wall clock so each generation shuffles differently (#46).
+fn fresh_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Reorder `items` to follow `ordered_ids`, then append any items the ordering
+/// didn't rank — in authored order — so nothing is lost. The order engine only
+/// ranks catalog-backed entries (a field/collection sort is a `SELECT` over
+/// `entries`), so an inline item or a `keep` duplicate that the SQL round-trip
+/// omits is emitted after the ranked set rather than dropped. Duplicate ids are
+/// matched by position via per-id index queues, preserving their relative order.
+fn reorder_to(items: Vec<ResolvedItem>, ordered_ids: &[String]) -> Vec<ResolvedItem> {
+    let mut indices_by_id: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (i, item) in items.iter().enumerate() {
+        indices_by_id
+            .entry(item.id.as_str())
+            .or_default()
+            .push_back(i);
+    }
+
+    let mut order: Vec<usize> = Vec::with_capacity(items.len());
+    let mut taken = vec![false; items.len()];
+    for id in ordered_ids {
+        if let Some(queue) = indices_by_id.get_mut(id.as_str())
+            && let Some(i) = queue.pop_front()
+        {
+            order.push(i);
+            taken[i] = true;
+        }
+    }
+    // Append everything the ordering didn't consume, in authored order.
+    for (i, is_taken) in taken.iter().enumerate() {
+        if !is_taken {
+            order.push(i);
+        }
+    }
+
+    // Rebuild in `order`. `ResolvedItem` isn't `Clone`, so move each out of an
+    // `Option` slot exactly once.
+    let mut slots: Vec<Option<ResolvedItem>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each index visited once"))
+        .collect()
+}
+
+/// Build a [`ResolvedItem`] from a catalog `entry_id`: its playback source (the
+/// preferred `entry_sources` row) plus program metadata from the entry columns,
+/// cascaded under the block `[program]` defaults.
+fn catalog_item(
+    catalog: &Catalog,
+    entry_id: &str,
+    defaults: Option<&ProgramMetadata>,
+) -> Result<ResolvedItem, String> {
+    let entry = catalog
+        .entry(entry_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("resolved entry {entry_id} vanished from the catalog"))?;
+    let sources = catalog.sources_for(entry_id).map_err(|e| e.to_string())?;
+    // Prefer a local-filesystem source (a real path the player can open);
+    // fall back to the first provenance row. Source-specific playback (e.g. a
+    // Plex streaming URL) is deferred to the ingester that defines it.
+    let source = sources
+        .iter()
+        .find(|s| s.source == crate::catalog::Source::LocalFs)
+        .or_else(|| sources.first())
+        .ok_or_else(|| format!("entry {entry_id} has no playback source"))?;
+    // Catalog columns are i64; ProgramMetadata uses u32. Out-of-range values
+    // (negative / overflow) drop to None rather than wrap.
+    let as_u32 = |v: Option<i64>| v.and_then(|n| u32::try_from(n).ok());
+    let program = ProgramMetadata {
+        title: Some(entry.title.clone()),
+        sub_title: None,
+        description: None,
+        season: as_u32(entry.season),
+        episode: as_u32(entry.episode),
+        categories: None,
+        content_rating: entry.content_rating.clone(),
+        artwork_url: None,
+        year: as_u32(entry.year),
+    };
+    Ok(ResolvedItem {
+        id: entry.entry_id.clone(),
+        source: SourceConfig::Local {
+            path: source.playback_path.clone(),
+        },
+        in_point: None,
+        out_point: None,
+        program: merge_program(Some(&program), defaults),
+    })
 }
 
 fn resolve_item(item: &ItemEntry, defaults: Option<&ProgramMetadata>) -> ResolvedItem {
@@ -157,7 +332,7 @@ fn merge_program(
 
 /// First-occurrence-wins dedup by item id, in place.
 fn collapse_duplicates(items: &mut Vec<ResolvedItem>) {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     items.retain(|item| seen.insert(item.id.clone()));
 }
 
@@ -213,7 +388,7 @@ mod tests {
             Entry::Item(item_entry("a")),
             Entry::Item(item_entry("b")),
         ]);
-        let items = resolve_channel(&channel(vec![inc]), path()).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -222,7 +397,7 @@ mod tests {
     fn concatenates_blocks() {
         let a = include_with(vec![Entry::Item(item_entry("a"))]);
         let b = include_with(vec![Entry::Item(item_entry("b"))]);
-        let items = resolve_channel(&channel(vec![a, b]), path()).unwrap();
+        let items = resolve_channel(&channel(vec![a, b]), path(), None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -234,7 +409,7 @@ mod tests {
             Entry::Item(item_entry("a")),
             Entry::Item(item_entry("b")),
         ]);
-        let items = resolve_channel(&channel(vec![inc]), path()).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -246,7 +421,7 @@ mod tests {
             Entry::Item(item_entry("a")),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
-        let items = resolve_channel(&channel(vec![inc]), path()).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -258,7 +433,7 @@ mod tests {
             Entry::Item(item_entry("c")),
         ]);
         inc.mode = Mode::Count(2);
-        let items = resolve_channel(&channel(vec![inc]), path()).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -277,7 +452,7 @@ mod tests {
             artwork_url: None,
             year: None,
         });
-        let items = resolve_channel(&channel(vec![inc]), path()).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
         let p = items[0].program.as_ref().unwrap();
         assert_eq!(p.title.as_deref(), Some("Default Title"));
         assert_eq!(p.categories.as_ref().unwrap(), &vec!["Movie".to_string()]);
@@ -309,7 +484,7 @@ mod tests {
             artwork_url: None,
             year: None,
         });
-        let items = resolve_channel(&channel(vec![inc]), path()).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
         let p = items[0].program.as_ref().unwrap();
         // item title wins; block category fills the gap.
         assert_eq!(p.title.as_deref(), Some("Specific"));
@@ -317,27 +492,168 @@ mod tests {
     }
 
     #[test]
-    fn rejects_query_entry() {
+    fn query_entry_without_catalog_errors() {
         use crate::config::QueryEntry;
         let inc = include_with(vec![Entry::Query(QueryEntry {
-            query: "type == 'movie'".into(),
+            query: "item.type == \"movie\"".into(),
             order: None,
         })]);
-        let err = resolve_channel(&channel(vec![inc]), path()).unwrap_err();
-        assert!(format!("{err}").contains("#68"), "err = {err}");
+        let err = resolve_channel(&channel(vec![inc]), path(), None).unwrap_err();
+        assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
 
     #[test]
-    fn rejects_non_manual_order() {
+    fn non_manual_order_without_catalog_errors() {
         let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
         inc.order = Order::Random;
-        let err = resolve_channel(&channel(vec![inc]), path()).unwrap_err();
-        assert!(format!("{err}").contains("#69"), "err = {err}");
+        let err = resolve_channel(&channel(vec![inc]), path(), None).unwrap_err();
+        assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
 
     #[test]
     fn rejects_empty_channel() {
-        let err = resolve_channel(&channel(vec![]), path()).unwrap_err();
+        let err = resolve_channel(&channel(vec![]), path(), None).unwrap_err();
         assert!(format!("{err}").contains("zero items"), "err = {err}");
+    }
+
+    // ---- catalog-backed pipeline (#71) ------------------------------------
+
+    use crate::catalog::{Catalog, Entry as CatEntry, EntrySource, Source};
+    use crate::config::QueryEntry;
+
+    fn seeded_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        for (id, title, year) in [
+            ("imdb:tt0120737", "The Fellowship of the Ring", 2001),
+            ("imdb:tt0167261", "The Two Towers", 2002),
+            ("imdb:tt0167260", "The Return of the King", 2003),
+        ] {
+            let mut e = CatEntry::new(id, "movie", title, Source::Plex);
+            e.year = Some(year);
+            e.release_date = Some(format!("{year}-12-15"));
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/lotr/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        }
+        c
+    }
+
+    fn query_block(query: &str, order: Order) -> BlockInclude {
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: query.into(),
+            order: None,
+        })]);
+        inc.order = order;
+        inc
+    }
+
+    #[test]
+    fn query_resolves_and_orders_by_release_date() {
+        let cat = seeded_catalog();
+        let inc = query_block(
+            "item.title.contains(\"Ring\") || item.title.contains(\"Tower\") || item.title.contains(\"King\")",
+            Order::parse("release_date:asc").unwrap(),
+        );
+        let items = resolve_channel(&channel(vec![inc]), path(), Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0120737", "imdb:tt0167261", "imdb:tt0167260"]
+        );
+        // Program metadata + playback path came from the catalog.
+        assert_eq!(items[0].program.as_ref().unwrap().year, Some(2001));
+        match &items[0].source {
+            SourceConfig::Local { path } => assert!(path.ends_with("tt0120737.mkv")),
+            other => panic!("expected local source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_order_keeps_non_catalog_items_after_the_sorted_set() {
+        let cat = seeded_catalog();
+        // A block mixing an inline lavfi item (not in the catalog) with a query,
+        // sorted by release_date. The inline item can't be ranked — it must
+        // survive, appended after the ranked query results, never dropped.
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("bumper")),
+            Entry::Query(QueryEntry {
+                query: "item.year >= 2001".into(),
+                order: None,
+            }),
+        ]);
+        inc.order = Order::parse("release_date:asc").unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "imdb:tt0120737",
+                "imdb:tt0167261",
+                "imdb:tt0167260",
+                "bumper"
+            ]
+        );
+    }
+
+    #[test]
+    fn block_collection_order_errors_clearly() {
+        let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        inc.order = Order::Collection;
+        let err = resolve_channel(&channel(vec![inc]), path(), None).unwrap_err();
+        assert!(format!("{err}").contains("collection"), "err = {err}");
+    }
+
+    #[test]
+    fn collapse_runs_before_order_deterministic_under_random() {
+        // Two blocks would collapse cross-block; here one block with a dup id.
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+        ]);
+        inc.order = Order::Random;
+        let cat = seeded_catalog();
+        let mut cfg = channel(vec![inc]);
+        cfg.seed = Some(7);
+        let first = resolve_channel(&cfg, path(), Some(&cat)).unwrap();
+        let second = resolve_channel(&cfg, path(), Some(&cat)).unwrap();
+        let ids1: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
+        let ids2: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
+        // Collapsed to unique ids, and the seeded shuffle is reproducible.
+        assert_eq!(ids1.len(), 2);
+        assert_eq!(ids1, ids2);
+    }
+
+    #[test]
+    fn keep_with_manual_preserves_duplicate_items() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn per_entry_query_order_is_applied() {
+        let cat = seeded_catalog();
+        // Block is manual; the query entry carries its own descending order.
+        let inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.year >= 2001".into(),
+            order: Some(Order::parse("release_date:desc").unwrap()),
+        })]);
+        let items = resolve_channel(&channel(vec![inc]), path(), Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0167260", "imdb:tt0167261", "imdb:tt0120737"]
+        );
     }
 }
