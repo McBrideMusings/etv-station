@@ -1,0 +1,15 @@
+tz: "America/Chicago"
+
+channels:
+  - name: test
+    path: channels/lavfi-test.yaml
+  - name: diehard
+    path: channels/diehard.toml
+  - name: trending
+    path: channels/trending.toml
+  - name: showcase
+    path: channels/showcase.toml
+  - name: marquee
+    path: channels/marquee.toml
+  - name: starwars
+    path: channels/starwars.toml

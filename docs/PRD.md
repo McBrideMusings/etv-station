@@ -148,11 +148,11 @@ A `channel.toml` declaring:
 | `rule` | yes | Rule type + rule-specific params. |
 | `items` | yes (for Loop Forever) | Ordered list with metadata. |
 
-A top-level `station.toml` lists the channels and their config paths — mirrors how ETV-next's `lineup.json` lists its channels. It also carries the station-wide time zone (see below).
+A top-level station file (`station.toml` or `station.yaml`) lists the channels and their config paths — mirrors how ETV-next's `lineup.json` lists its channels. It also carries the station-wide time zone (see below).
 
 ## Time zone
 
-`station.toml` declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.
+The station file declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.
 
 The configured zone affects **chunk-boundary alignment only**: a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC. The persisted anchor in the `.anchor` sidecar stays in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
 
@@ -166,7 +166,7 @@ Per-channel `tz` override is **not** in v1 — single household, single zone. Ad
 ## Behavior over time
 
 **Startup**
-1. Read `station.toml` + each channel config.
+1. Read the station file + each channel config.
 2. For each channel: scan `output_folder/` for existing playout files; compute the latest `finish` already materialized.
 3. If less than `window_days` is materialized: render new chunks forward until full.
 4. Compute the next roll tick.
@@ -176,7 +176,7 @@ Per-channel `tz` override is **not** in v1 — single household, single zone. Ad
 2. Render new chunks until `window_days` from now is materialized.
 
 **Config reload** (SIGHUP)
-1. SIGHUP re-reads `station.toml` and every channel config from disk. SIGTERM/SIGINT shut the daemon down; a file watcher is deferred (v2).
+1. SIGHUP re-reads the station file and every channel config from disk. SIGTERM/SIGINT shut the daemon down; a file watcher is deferred (v2).
 2. A malformed edit (parse error, unknown timezone, invalid overlay spec) is logged and rejected — the previous, still-valid config keeps running and the daemon does not exit.
 3. On a valid reload the daemon stops every channel's playout + overlay tasks and re-runs them against the new config. Today this reuses the startup path, which wipes all emitted JSON and regenerates the future window for every channel (see [#53](https://github.com/McBrideMusings/etv-station/issues/53)); the targeted in-place rewrite of only the changed channels' future files is the intended end state. Determinism (see above) makes regeneration safe.
 
@@ -240,7 +240,7 @@ Deliverable: a working overlay pipeline with a small declarative + scripted prim
 With the language picked and graphics working, redesign the user-facing schema:
 
 - **Block as the unit of reuse.** A block = `[program]` defaults + flat `[[entries]]` list (item / query / include). Blocks are content-agnostic — TV, movies, home movies, bumpers, mixed.
-- **Authoring format is by shape.** Config-shaped files (`station`, `channel` rules) are TOML. Path-referenced *block files* — the hand-ordered entry lists — may be authored in either TOML or YAML, selected by file extension: `.yaml`/`.yml` parse as YAML, anything else as TOML. Same serde types either way (no schema difference). Inline entries inside a channel's `[[rule.blocks]]` stay TOML with the channel file.
+- **Authoring format is by extension.** Every config file — `station`, `channel`, and path-referenced *block files* — may be authored in either TOML or YAML, selected by file extension: `.yaml`/`.yml` parse as YAML, anything else as TOML. Same serde types either way (no schema difference), so a station and its channels and blocks can all be one format. Inline entries inside a channel's `[[rule.blocks]]` stay in whatever format the channel file uses.
 - **Channels compose blocks** via `[[rule.blocks]]` with `mode` (`all` or `count = N`), `order` (`chronological` or seeded `random`), and `filter` over the resolved item list.
 - **Unified catalog ingestion.** Plex (primary) + local-FS scan (bumpers / commercials / errata) feed a normalized **sqlite catalog** via `rusqlite`. Sonarr/Radarr deferred unless a Plex gap appears.
 - **sqlite cache, not in-memory or JSON.** Tens of thousands of items rules out per-boot rescans (slow API round-trips) and full-file JSON snapshots (full reparse + RAM-resident). sqlite gives indexed lookups, incremental refresh from Plex's `lastUpdated`, WAL-mode concurrency between refresh writer and query reader, and `sqlite3` shell inspection for debugging. Schema is three tables — `items`, `collections` + `collection_items`, `catalog_meta` (per-source sync timestamps) — plus simple up-only migrations.

@@ -11,7 +11,7 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
     if station.channels.is_empty() {
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
-            message: "station.toml must declare at least one channel".into(),
+            message: "station config must declare at least one channel".into(),
         });
     }
 

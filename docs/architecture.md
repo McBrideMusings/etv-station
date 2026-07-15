@@ -56,7 +56,7 @@ Loop Forever is deterministic in `(anchor, items)` — same inputs always produc
 
 ## Time zones
 
-Configurable station-wide via `tz` in `station.toml` (or `ETV_STATION_TZ` at runtime). Affects chunk-boundary alignment only — the persisted UTC anchor doesn't move. See [PRD §Time zone](/PRD#time-zone).
+Configurable station-wide via `tz` in the station config (or `ETV_STATION_TZ` at runtime). Affects chunk-boundary alignment only — the persisted UTC anchor doesn't move. See [PRD §Time zone](/PRD#time-zone).
 
 ## v2+ additions (planned, not yet implemented)
 

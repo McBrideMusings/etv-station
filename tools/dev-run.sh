@@ -20,7 +20,7 @@ fi
 : "${ETV_PORT:=8409}"
 export ETV_BIND_ADDRESS ETV_PORT
 
-STATION_CONFIG="examples/station.toml"
+STATION_CONFIG="examples/station.yaml"
 
 mkdir -p tmp/hls
 
@@ -33,7 +33,7 @@ mkdir -p tmp/hls
 # non-zero exit means the config won't load — the daemon would choke on it too,
 # so fail fast instead of booting a doomed stack.
 if ! folders_output="$(cargo run -q -p etv-station -- --config "$STATION_CONFIG" --list-folders)"; then
-  echo "[dev] station --list-folders failed — station.toml won't load; aborting" >&2
+  echo "[dev] station --list-folders failed — $STATION_CONFIG won't load; aborting" >&2
   exit 1
 fi
 output_folders=()

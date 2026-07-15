@@ -23,7 +23,9 @@ examples/channels/trending.toml
 examples/channels/marquee.toml
 examples/channels/showcase.toml
 examples/channels/starwars.toml
-examples/blocks/diehard.toml
+examples/blocks/diehard.yaml
+examples/blocks/lotr.yaml
+examples/blocks/star-trek.yaml
 examples/blocks/starwars-timeline.yaml
 examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml

@@ -23,7 +23,7 @@ pub struct LoadedChannel {
 }
 
 pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
-    let station: StationConfig = read_toml(station_path)?;
+    let station: StationConfig = read_config_file(station_path)?;
     validate::validate_station(station_path, &station)?;
 
     let base = station_path
@@ -38,7 +38,7 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
         } else {
             base.join(&entry.path)
         };
-        let mut config: ChannelConfig = read_toml(&channel_path)?;
+        let mut config: ChannelConfig = read_config_file(&channel_path)?;
         resolve_blocks(&mut config, &channel_path)?;
         validate::validate_channel(&channel_path, &config)?;
         channels.push(LoadedChannel {
@@ -105,7 +105,7 @@ fn resolve_blocks(config: &mut ChannelConfig, channel_path: &Path) -> Result<(),
             } else {
                 dir.join(&block_rel)
             };
-            let body: BlockFile = read_block_file(&block_path)?;
+            let body: BlockFile = read_config_file(&block_path)?;
             include.apply_body(body);
         }
 
@@ -149,36 +149,38 @@ fn expand_env(input: &str, ctx: &Path) -> Result<String, ConfigError> {
     Ok(out)
 }
 
-fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })
+/// Read and deserialize a single channel config file, picking TOML or YAML by
+/// extension. Raw parse only — does not splice block references or expand
+/// `${VAR}` in item sources (that happens inside [`load`]). Useful for tests and
+/// tools that resolve one channel against a catalog directly.
+pub fn read_channel(path: &Path) -> Result<ChannelConfig, ConfigError> {
+    read_config_file(path)
 }
 
-/// Read a referenced block file, picking the deserializer by extension:
-/// `.yaml`/`.yml` parse as YAML (the "by shape" authoring path from #86),
-/// everything else as TOML. Both reuse the same [`BlockFile`] serde type.
-fn read_block_file(path: &Path) -> Result<BlockFile, ConfigError> {
+/// Read any config file — station, channel, or block — picking the deserializer
+/// by extension: `.yaml`/`.yml` parse as YAML (`serde_norway`), everything else
+/// as TOML. The station, channel, and block serde types are format-agnostic, so
+/// the same file authored in either format produces identical output.
+fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
     let is_yaml = path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
-    if !is_yaml {
-        return read_toml(path);
-    }
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    serde_norway::from_str(&contents).map_err(|source| ConfigError::ParseYaml {
-        path: path.to_path_buf(),
-        source,
-    })
+    if is_yaml {
+        serde_norway::from_str(&contents).map_err(|source| ConfigError::ParseYaml {
+            path: path.to_path_buf(),
+            source,
+        })
+    } else {
+        toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -188,7 +190,7 @@ mod tests {
 
     fn examples_station() -> PathBuf {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        manifest_dir.join("../../examples/station.toml")
+        manifest_dir.join("../../examples/station.yaml")
     }
 
     #[test]
@@ -200,7 +202,7 @@ mod tests {
             std::env::set_var("ETV_TEST_MEDIA_DIR", "/tmp/etv-test-media");
         }
         let path = examples_station();
-        let loaded = load(&path).expect("examples/station.toml should load");
+        let loaded = load(&path).expect("examples/station.yaml should load");
         let ch = loaded
             .channels
             .iter()
@@ -232,7 +234,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut config: ChannelConfig = read_toml(&channel_path).unwrap();
+        let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
         resolve_blocks(&mut config, &channel_path).unwrap();
         let inc = &config.rule.blocks[0];
         assert!(
@@ -259,13 +261,30 @@ mod tests {
         )
         .unwrap();
 
-        let mut config: ChannelConfig = read_toml(&channel_path).unwrap();
+        let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
         resolve_blocks(&mut config, &channel_path).unwrap();
         let inc = &config.rule.blocks[0];
         assert!(
             inc.block.is_none(),
             "path ref should be cleared after splice"
         );
+        assert_eq!(inc.entries().len(), 1);
+        assert!(matches!(inc.entries()[0], Entry::Item(_)));
+    }
+
+    #[test]
+    fn loads_yaml_channel_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel_path = dir.path().join("channel.yaml");
+        std::fs::write(
+            &channel_path,
+            "output_folder: /out\nroll_interval: 60s\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
+        )
+        .unwrap();
+
+        let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
+        resolve_blocks(&mut config, &channel_path).unwrap();
+        let inc = &config.rule.blocks[0];
         assert_eq!(inc.entries().len(), 1);
         assert!(matches!(inc.entries()[0], Entry::Item(_)));
     }

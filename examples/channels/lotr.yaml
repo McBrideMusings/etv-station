@@ -1,27 +1,26 @@
-output_folder = "examples/output/lotr"
-window_days = 1
-chunk_hours = 6
-roll_interval = "60s"
-retention_days = 1
-
 # Sample S2 — The Lord of the Rings, theatrical release order.
 #
 # A *query* channel: instead of listing items, it resolves a CEL query against
 # the catalog (#68) and plays the results oldest-first by release date (#69),
 # with the `entry_id` tiebreaker making the order deterministic.
 #
-# Not registered in examples/station.toml: a query channel needs a populated
+# Not registered in examples/station.yaml: a query channel needs a populated
 # catalog and the daemon-side catalog wiring (#96) to run in a dev-run. Its
 # resolution is proven by the `lotr_sample` acceptance test, which resolves this
 # exact file against a fixture catalog.
-[[rule.blocks]]
-mode = "all"
-order = "release_date:asc"
+output_folder: "examples/output/lotr"
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
 
-[rule.blocks.program]
-title = "The Lord of the Rings"
-categories = ["Movie", "Fantasy"]
-
-[[rule.blocks.entries]]
-kind = "query"
-query = 'item.title.contains("Lord of the Rings")'
+rule:
+  blocks:
+    - mode: "all"
+      order: "release_date:asc"
+      program:
+        title: "The Lord of the Rings"
+        categories: ["Movie", "Fantasy"]
+      entries:
+        - kind: query
+          query: 'item.title.contains("Lord of the Rings")'

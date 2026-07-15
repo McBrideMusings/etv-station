@@ -29,6 +29,7 @@ export default defineConfig({
       { text: 'PRD', link: '/PRD' },
       { text: 'Roadmap', link: '/roadmap' },
       { text: 'Architecture', link: '/architecture' },
+      { text: 'Schema', link: '/schema' },
       { text: 'File map', link: '/file-map' },
     ],
     sidebar: [
@@ -38,6 +39,7 @@ export default defineConfig({
           { text: 'Product spec (PRD)', link: '/PRD' },
           { text: 'Roadmap', link: '/roadmap' },
           { text: 'Architecture', link: '/architecture' },
+          { text: 'Config schema', link: '/schema' },
           { text: 'File map', link: '/file-map' },
         ],
       },
@@ -53,6 +55,6 @@ export default defineConfig({
   },
   vite: {
     plugins: [tailscaleNetwork()],
-    server: { host: '0.0.0.0', port: 5193 },
+    server: { host: '0.0.0.0', port: 5193, allowedHosts: true },
   },
 })

@@ -1,4 +1,4 @@
-//! Acceptance test for Sample S2 (#76): the committed `examples/channels/lotr.toml`
+//! Acceptance test for Sample S2 (#76): the committed `examples/channels/lotr.yaml`
 //! query channel resolves the LOTR films and plays them oldest-first by release
 //! date, deterministically. Proves the query (#68) + order (#69) + resolve
 //! pipeline (#71) path end-to-end against a fixture catalog — no live Plex.
@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
-use etv_station::config::ChannelConfig;
+use etv_station::config::{ChannelConfig, read_channel};
 use etv_station::resolve::resolve_channel;
 
 /// Seed the three theatrical LOTR films. Titles carry the franchise prefix (as
@@ -49,13 +49,12 @@ fn lotr_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/lotr.toml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/lotr.yaml")
 }
 
 #[test]
 fn lotr_sample_resolves_in_release_order() {
-    let toml = std::fs::read_to_string(sample_path()).expect("read lotr.toml");
-    let config: ChannelConfig = toml::from_str(&toml).expect("parse lotr.toml");
+    let config: ChannelConfig = read_channel(&sample_path()).expect("load lotr sample");
 
     let cat = lotr_catalog();
     let items = resolve_channel(&config, &sample_path(), Some(&cat)).expect("resolve");
@@ -76,8 +75,7 @@ fn lotr_sample_resolves_in_release_order() {
 
 #[test]
 fn lotr_sample_order_is_deterministic() {
-    let toml = std::fs::read_to_string(sample_path()).unwrap();
-    let config: ChannelConfig = toml::from_str(&toml).unwrap();
+    let config: ChannelConfig = read_channel(&sample_path()).unwrap();
     let cat = lotr_catalog();
 
     let first = resolve_channel(&config, &sample_path(), Some(&cat)).unwrap();
@@ -121,8 +119,7 @@ fn lotr_sample_breaks_ties_by_entry_id_and_sorts_nulls_last() {
     );
     seed("lotr:null", "The Lord of the Rings: Null", None);
 
-    let toml = std::fs::read_to_string(sample_path()).unwrap();
-    let config: ChannelConfig = toml::from_str(&toml).unwrap();
+    let config: ChannelConfig = read_channel(&sample_path()).unwrap();
     let items = resolve_channel(&config, &sample_path(), Some(&cat)).unwrap();
     let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
     // Tie broken by entry_id ascending (alpha < bravo); null release date last.

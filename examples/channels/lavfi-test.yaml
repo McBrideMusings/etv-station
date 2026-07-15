@@ -1,0 +1,49 @@
+output_folder: "examples/output/test"
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+
+overlay:
+  config: "../../crates/etv-overlay/fixtures/channel_watermark.toml"
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "manual"
+      entries:
+        - kind: item
+          id: bars-30s
+          in_point: "0s"
+          out_point: "30s"
+          source:
+            kind: lavfi
+            params: "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+          program:
+            title: "Color Bars"
+            description: "30-second SMPTE-style test pattern with reference tone."
+            categories: ["Test"]
+
+        - kind: item
+          id: smpte-60s
+          in_point: "0s"
+          out_point: "60s"
+          source:
+            kind: lavfi
+            params: "smptebars=size=1280x720:rate=30 [out0]; sine=frequency=880 [out1]"
+          program:
+            title: "SMPTE Bars"
+            description: "Standard SMPTE pattern for one minute with 880 Hz tone."
+            categories: ["Test"]
+
+        - kind: item
+          id: mandelbrot-90s
+          in_point: "0s"
+          out_point: "90s"
+          source:
+            kind: lavfi
+            params: "mandelbrot=size=1280x720:rate=30 [out0]; sine=frequency=220 [out1]"
+          program:
+            title: "Mandelbrot"
+            description: "Animated mandelbrot zoom for 90 seconds with low tone."
+            categories: ["Test"]

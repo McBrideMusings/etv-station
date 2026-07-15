@@ -14,7 +14,7 @@ pub use block::{BlockFile, Duplicates};
 pub use channel::{ChannelConfig, ChannelOverlayConfig};
 pub use entry::{Entry, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
-pub use load::{LoadedChannel, Station, load};
+pub use load::{LoadedChannel, Station, load, read_channel};
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};
 pub use rule::{BlockInclude, RuleConfig};

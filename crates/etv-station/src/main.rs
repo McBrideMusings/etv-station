@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
     about = "Playout JSON generator daemon for ErsatzTV-next"
 )]
 struct Cli {
-    /// Path to the top-level station.toml.
+    /// Path to the top-level station config (TOML or YAML, by extension).
     #[arg(short, long)]
     config: PathBuf,
 
