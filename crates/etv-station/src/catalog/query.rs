@@ -32,16 +32,28 @@ pub struct WhereClause {
 /// Register the `regexp(pattern, text)` function sqlite's `X REGEXP Y` syntax
 /// dispatches to (`X REGEXP Y` ⇒ `regexp(Y, X)`), backing the `matches`
 /// operator. Called once per connection on catalog open.
+///
+/// The compiled pattern is memoised via sqlite's per-argument auxiliary data
+/// ([`Context::set_aux`]): a `matches()` predicate binds one constant pattern
+/// and evaluates it against every candidate row, so without caching the
+/// `Regex` would recompile on each row of a large catalog. Aux data is keyed to
+/// the (constant) pattern argument, so the compile happens once per query.
 pub fn register_regexp(conn: &Connection) -> Result<(), CatalogError> {
     conn.create_scalar_function(
         "regexp",
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let pattern = ctx.get::<String>(0)?;
+            let re = match ctx.get_aux::<regex::Regex>(0)? {
+                Some(re) => re,
+                None => {
+                    let pattern = ctx.get::<String>(0)?;
+                    let compiled = regex::Regex::new(&pattern)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    ctx.set_aux::<regex::Regex>(0, compiled)?
+                }
+            };
             let text = ctx.get::<String>(1)?;
-            let re = regex::Regex::new(&pattern)
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
             Ok(re.is_match(&text))
         },
     )?;
@@ -509,6 +521,26 @@ mod tests {
             .resolve_query(r#"item.title.matches("^The Two")"#)
             .unwrap();
         assert_eq!(got, vec!["imdb:tt0167261"]);
+    }
+
+    #[test]
+    fn matches_reuses_compiled_pattern_across_rows() {
+        let c = seeded();
+        // One `matches()` pattern evaluated against every candidate row. The
+        // compiled Regex is cached via sqlite aux data, but the observable
+        // result must be exactly the rows the pattern matches.
+        let got = c.resolve_query(r#"item.title.matches("^The")"#).unwrap();
+        assert_eq!(got, vec!["imdb:tt0120737", "imdb:tt0167261"]);
+    }
+
+    #[test]
+    fn invalid_regex_surfaces_as_error() {
+        let c = seeded();
+        // A malformed pattern must fail the query, not silently match nothing.
+        let e = c
+            .resolve_query(r#"item.title.matches("(unclosed")"#)
+            .unwrap_err();
+        assert!(!e.to_string().is_empty(), "expected a compile error");
     }
 
     #[test]
