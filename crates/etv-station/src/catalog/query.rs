@@ -143,17 +143,26 @@ fn operator_predicate(
     }
 }
 
-/// A scalar comparison: `item.<field> <op> <literal>`.
+/// A scalar comparison: `item.<field> <op> <literal>`. The field may be on
+/// either side — `2002 <= item.year` is as valid CEL as `item.year >= 2002` —
+/// so we locate the `item.<field>` operand and, when it's on the right, mirror
+/// the operator (`<=` on the right reads as `>=` on the left) before building
+/// the SQL.
 fn comparison(
     func: &str,
     lhs: &IdedExpr,
     rhs: &IdedExpr,
     params: &mut Vec<Value>,
 ) -> Result<String, CatalogError> {
-    let field_name = field_of(lhs)?;
+    let (field_name, literal, field_on_right) = field_and_literal(lhs, rhs)?;
     let kind = FieldKind::resolve(&field_name)
         .ok_or_else(|| err(format!("unknown query field item.{field_name}")))?;
 
+    let func = if field_on_right {
+        mirror_comparison(func)
+    } else {
+        func
+    };
     let op = match func {
         "_==_" => "=",
         "_!=_" => "<>",
@@ -171,17 +180,17 @@ fn comparison(
                     "operator {op} needs a numeric field; item.{field_name} is text"
                 )));
             }
-            params.push(literal_text(rhs)?);
+            params.push(literal_text(literal)?);
             Ok(format!("entries.{col} {op} ?"))
         }
         FieldKind::Num(col) => {
-            params.push(literal_int(rhs)?);
+            params.push(literal_int(literal)?);
             Ok(format!("entries.{col} {op} ?"))
         }
         // `item.source == "plex"` is the one comparison allowed on a
         // membership field — it reads as "has a source of".
         FieldKind::Source if op == "=" => {
-            params.push(literal_text(rhs)?);
+            params.push(literal_text(literal)?);
             Ok(source_exists())
         }
         _ => Err(err(format!(
@@ -321,6 +330,36 @@ fn collection_exists(value: &IdedExpr, params: &mut Vec<Value>) -> Result<String
 fn source_exists() -> String {
     "EXISTS (SELECT 1 FROM entry_sources s WHERE s.entry_id = entries.entry_id AND s.source = ?)"
         .to_string()
+}
+
+/// Given the two operands of a comparison, find the `item.<field>` one and
+/// return its field name, the *other* (literal) operand, and whether the field
+/// was on the right. A comparison must have exactly one field operand; if
+/// neither side is `item.<field>`, the standard `field_of` error is returned.
+fn field_and_literal<'a>(
+    lhs: &'a IdedExpr,
+    rhs: &'a IdedExpr,
+) -> Result<(String, &'a IdedExpr, bool), CatalogError> {
+    match field_of(lhs) {
+        Ok(field) => Ok((field, rhs, false)),
+        Err(lhs_err) => match field_of(rhs) {
+            Ok(field) => Ok((field, lhs, true)),
+            Err(_) => Err(lhs_err),
+        },
+    }
+}
+
+/// Mirror a directional comparison operator so a field found on the right-hand
+/// side reads correctly once rewritten as `field <op> literal`. Symmetric
+/// operators (`==`, `!=`) are returned unchanged.
+fn mirror_comparison(func: &str) -> &str {
+    match func {
+        "_>=_" => "_<=_",
+        "_<=_" => "_>=_",
+        "_>_" => "_<_",
+        "_<_" => "_>_",
+        other => other,
+    }
 }
 
 /// Extract the field name from an `item.<field>` selection.
@@ -509,5 +548,40 @@ mod tests {
         let c = seeded();
         let got = c.resolve_query(r#"item.source == "plex""#).unwrap();
         assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn numeric_comparison_with_field_on_right() {
+        let c = seeded();
+        // `2002 <= item.year` must resolve identically to `item.year >= 2002`.
+        let got = c.resolve_query("2002 <= item.year").unwrap();
+        assert_eq!(got, vec!["imdb:tt0167261", "imdb:tt0325980"]);
+    }
+
+    #[test]
+    fn strict_comparison_field_on_right_mirrors_operator() {
+        let c = seeded();
+        // `2002 > item.year` reads as `item.year < 2002` — only the 2001 film.
+        let got = c.resolve_query("2002 > item.year").unwrap();
+        assert_eq!(got, vec!["imdb:tt0120737"]);
+    }
+
+    #[test]
+    fn equality_field_on_right() {
+        let c = seeded();
+        // `==` is symmetric; the field-on-right path must still resolve it.
+        let got = c.resolve_query(r#""plex" == item.source"#).unwrap();
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn comparison_with_no_field_operand_is_an_error() {
+        let c = seeded();
+        // Neither side is `item.<field>` — the standard access error stands.
+        let e = c.resolve_query("2001 == 2002").unwrap_err();
+        assert!(
+            e.to_string().contains("item.<field>"),
+            "expected field-access error, got {e}"
+        );
     }
 }
