@@ -17,16 +17,13 @@ examples/etv-next/channel5.json
 examples/etv-next/channel6.json
 examples/etv-next/lineup.json.tpl
 examples/output/
-examples/channels/star-trek.toml
-examples/channels/diehard.toml
-examples/channels/trending.toml
-examples/channels/marquee.toml
-examples/channels/showcase.toml
-examples/channels/starwars.toml
-examples/blocks/diehard.yaml
-examples/blocks/lotr.yaml
-examples/blocks/star-trek.yaml
-examples/blocks/starwars-timeline.yaml
+# Personal example configs: track only the committed sample fixtures and
+# ignore everything else, so renaming or adding a personal file can't silently
+# leak it into the repo (an exact-name ignore breaks the moment the file moves).
+examples/channels/*
+!examples/channels/lavfi-test.yaml
+!examples/channels/lotr.yaml
+examples/blocks/
 examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml
 examples/overlays/scripts/
