@@ -140,7 +140,7 @@ A `channel.toml` declaring:
 
 | Field | Required | Description |
 |---|---|---|
-| `output_folder` | yes | Where `etv-next` reads playout files for this channel. |
+| `name` | no, default: config file stem | Channel identity override — drives the log label, overlay handshake, and output folder leaf. No path separators. |
 | `window_days` | no, default 30 | How far into the future to materialize. |
 | `chunk_hours` | no, default 24 | Each playout JSON file's `[start, finish)` span. |
 | `roll_interval` | no, default `1h` | How often to extend the window forward. |
@@ -148,7 +148,9 @@ A `channel.toml` declaring:
 | `rule` | yes | Rule type + rule-specific params. |
 | `items` | yes (for Loop Forever) | Ordered list with metadata. |
 
-A top-level station file (`station.toml` or `station.yaml`) lists the channels and their config paths — mirrors how ETV-next's `lineup.json` lists its channels. It also carries the station-wide time zone (see below).
+A channel does **not** declare its own output folder. The daemon derives it as `{output_base}/{identity}`, where `output_base` is a station-level field and `identity` is the channel's `name` (above) or, unset, its config file stem. ETV-next still reads playout files from that same folder, configured on its own side.
+
+A top-level station file (`station.toml` or `station.yaml`) declares `output_base` and lists the channel configs — mirrors how ETV-next's `lineup.json` lists its channels. It also carries the station-wide time zone (see below). Each `channels` entry is a literal path or a glob (e.g. `channels/*.yaml`) resolved relative to the station file; a glob expands to every match. The `ETV_STATION_OUTPUT_BASE` environment variable overrides `output_base` at runtime (the Docker-friendly knob), the same way `ETV_STATION_TZ` overrides `tz`.
 
 ## Time zone
 

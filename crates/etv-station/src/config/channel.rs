@@ -8,7 +8,13 @@ use super::rule::RuleConfig;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
-    pub output_folder: PathBuf,
+    /// Optional channel identity override. When unset, the channel's identity
+    /// is its config file's stem (e.g. `diehard.yaml` -> `diehard`). The
+    /// identity drives the log label, the overlay handshake name, and the
+    /// output folder leaf under the station's `output_base`. Must not contain
+    /// path separators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 
     #[serde(default = "default_window_days")]
     pub window_days: u32,

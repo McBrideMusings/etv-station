@@ -19,4 +19,4 @@ pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};
 pub use rule::{BlockInclude, RuleConfig};
 pub use source::SourceConfig;
-pub use station::{ChannelEntry, StationConfig};
+pub use station::StationConfig;

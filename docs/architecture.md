@@ -21,6 +21,7 @@ Quick reference. The full rationale lives in [PRD §Architecture](/PRD#architect
 - **etv-station** has read/write on the playout volume. Computes "what plays when," writes JSON.
 - **etv-next** has read-only on the same volume. Loads the JSON file whose `[start, finish)` covers "now," produces HLS + XMLTV.
 - Coupling is exactly two things: the playout JSON schema (pinned via the `etv-next` submodule + Rust path-dep) and the directory layout convention.
+- The directory layout is single-sourced from the station config: each channel's output folder is derived as `{output_base}/{identity}` (see [schema](/schema#station-file)), and `tools/render-etv-next.py` generates ETV-next's `lineup.json` + `channelN.json` from that same config — so ETV-next reads exactly where the station writes, with no folder path authored twice.
 
 ## Why a submodule
 

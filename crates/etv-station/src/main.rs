@@ -77,7 +77,7 @@ fn main() -> ExitCode {
                 channel = %ch.name,
                 config = %ch.config_path.display(),
                 blocks = ch.config.rule.blocks.len(),
-                output_folder = %ch.config.output_folder.display(),
+                output_folder = %ch.output_folder.display(),
                 window_days = ch.config.window_days,
                 chunk_hours = ch.config.chunk_hours,
                 roll_interval_secs = ch.config.roll_interval.as_secs(),
@@ -103,7 +103,7 @@ fn list_folders(config_path: &Path) -> ExitCode {
     match config::load(config_path) {
         Ok(station) => {
             for ch in &station.channels {
-                println!("{}", ch.config.output_folder.display());
+                println!("{}", ch.output_folder.display());
             }
             ExitCode::SUCCESS
         }

@@ -226,18 +226,26 @@ Top-level registry. Source: `config/station.rs`.
 ```yaml
 # station.yaml
 tz: "America/Chicago"          # IANA time zone; default "UTC"
+output_base: examples/output   # base dir every channel writes under
 
-channels:
-  - name: starwars
-    path: channels/starwars.yaml
-  - name: diehard
-    path: channels/diehard.yaml
+channels:                      # literal paths or globs, relative to this file
+  - channels/starwars.yaml
+  - channels/diehard.yaml
+  - channels/*.yaml            # a glob works too — expands to every match
 ```
 
 | Field | Required | Type / default |
 |---|---|---|
-| `tz` | no — default `UTC` | IANA time zone string |
-| `channels` | **yes** | list of `{ name, path }` |
+| `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
+| `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
+| `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
+
+Each entry in `channels` is resolved relative to the station file's directory. A
+glob expands to every matching file (matching nothing is an error); a literal
+path is taken as-is. Files matched by more than one entry appear once. A
+channel's **output folder is derived** — `{output_base}/{identity}`, where
+`identity` is the channel's `name` override (below) or, if unset, its config
+file's stem (e.g. `diehard.yaml` → `diehard`).
 
 ## Channel file
 
@@ -246,7 +254,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 
 | Field | Required | Type / default |
 |---|---|---|
-| `output_folder` | **yes** | path — where playout JSON is written |
+| `name` | no — default: config file stem | string — channel identity override; drives the log label, overlay handshake, and output folder leaf. Must not contain path separators. |
 | `window_days` | no — default `30` | int |
 | `chunk_hours` | no — default `24` | int |
 | `roll_interval` | no — default `"3600s"` | duration |
@@ -265,8 +273,8 @@ fields are rejected.
 **Reference form** — body lives in a separate file:
 
 ```yaml
-# channels/starwars.yaml
-output_folder: "examples/output/starwars"
+# channels/starwars.yaml — no output_folder; identity is the file stem "starwars",
+# so it writes to {output_base}/starwars
 
 rule:
   blocks:
@@ -278,8 +286,7 @@ rule:
 **Inline form** — body lives in the channel file:
 
 ```yaml
-# channels/lotr.yaml
-output_folder: "examples/output/lotr"
+# channels/lotr.yaml — identity "lotr" from the file stem
 
 rule:
   blocks:

@@ -507,6 +507,7 @@ dependencies = [
  "clap",
  "ersatztv-playout",
  "etv-overlay",
+ "glob",
  "humantime-serde",
  "nix",
  "regex",

@@ -367,7 +367,7 @@ mod tests {
 
     fn channel(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
-            output_folder: "/out".into(),
+            name: None,
             window_days: 1,
             chunk_hours: 24,
             roll_interval: Duration::from_secs(3600),

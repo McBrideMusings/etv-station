@@ -1,15 +1,16 @@
 tz: "America/Chicago"
 
+# Base directory every channel writes under. Each channel's output folder is
+# {output_base}/{identity}, where identity is the channel's `name` override or
+# its config file stem. Used verbatim relative to the process CWD.
+output_base: examples/output
+
+# Each entry is a literal path or a glob (e.g. `channels/*.yaml`), resolved
+# relative to this file's directory. A glob expands to every match.
 channels:
-  - name: test
-    path: channels/lavfi-test.yaml
-  - name: diehard
-    path: channels/diehard.toml
-  - name: trending
-    path: channels/trending.toml
-  - name: showcase
-    path: channels/showcase.toml
-  - name: marquee
-    path: channels/marquee.toml
-  - name: starwars
-    path: channels/starwars.toml
+  - channels/lavfi-test.yaml
+  - channels/diehard.yaml
+  - channels/trending.yaml
+  - channels/showcase.yaml
+  - channels/marquee.yaml
+  - channels/starwars.yaml

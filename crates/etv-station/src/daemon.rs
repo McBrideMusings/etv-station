@@ -273,7 +273,7 @@ async fn prepare_generation(station: &Station) -> Result<&'static Tz, StationErr
     // deploy on empty volumes needs it in place before etv-next's canonicalize
     // reads it and before the overlay supervisor opens its fifo underneath (#34).
     for channel in &station.channels {
-        let output = &channel.config.output_folder;
+        let output = &channel.output_folder;
         tokio::fs::create_dir_all(output)
             .await
             .map_err(|source| StationError::Io {
@@ -285,7 +285,7 @@ async fn prepare_generation(station: &Station) -> Result<&'static Tz, StationErr
 }
 
 async fn wipe_emitted_playout(channel: &LoadedChannel) -> Result<(), StationError> {
-    let files = scan::scan_output_folder(&channel.config.output_folder).await?;
+    let files = scan::scan_output_folder(&channel.output_folder).await?;
     let count = files.len();
     for f in &files {
         if let Err(source) = tokio::fs::remove_file(&f.path).await
@@ -315,10 +315,8 @@ fn resolve_overlay_paths(channel: &LoadedChannel) -> Option<(PathBuf, PathBuf)> 
     let cfg = channel.config.overlay.as_ref()?;
     let overlay_config =
         overlay_supervisor::resolve_overlay_config(&channel.config_path, &cfg.config);
-    let fifo_path = overlay_supervisor::resolve_fifo_path(
-        &channel.config.output_folder,
-        cfg.fifo_path.as_deref(),
-    );
+    let fifo_path =
+        overlay_supervisor::resolve_fifo_path(&channel.output_folder, cfg.fifo_path.as_deref());
     Some((overlay_config, fifo_path))
 }
 
@@ -326,7 +324,7 @@ fn build_overlay_context(channel: &LoadedChannel) -> Option<overlay_supervisor::
     let (overlay_config, fifo_path) = resolve_overlay_paths(channel)?;
     Some(overlay_supervisor::OverlayContext {
         channel_name: channel.name.clone(),
-        output_folder: channel.config.output_folder.clone(),
+        output_folder: channel.output_folder.clone(),
         overlay_config,
         fifo_path,
     })
@@ -384,7 +382,7 @@ async fn channel_loop(
 ) -> Result<(), StationError> {
     // `run` creates every channel's output_folder synchronously before spawning
     // this task (see #34), so it exists by the time we scan/emit into it here.
-    let output = &channel.config.output_folder;
+    let output = &channel.output_folder;
 
     // The station-wide catalog is not yet opened by the daemon (#71 follow-up);
     // until then only inline-item, `manual`-order channels resolve. Query
@@ -482,7 +480,7 @@ async fn emit_catch_up(
     tz: &'static Tz,
     phase: &'static str,
 ) -> Result<(), StationError> {
-    let output = &channel.config.output_folder;
+    let output = &channel.output_folder;
     let now = OffsetDateTime::now_utc();
     let to = now + window_duration(channel.config.window_days);
     let existing = scan::scan_output_folder(output).await?;
@@ -595,12 +593,16 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
     /// mkdir's there rather than polluting the crate directory.
     fn write_station(tz: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let station =
-            format!("tz = \"{tz}\"\n\n[[channels]]\nname = \"test\"\npath = \"channel.toml\"\n");
-        let out = dir.path().join("out");
-        let channel = format!("output_folder = {:?}\n{CHANNEL_BODY}", out.to_string_lossy());
+        let out_base = dir.path().join("out");
+        let station = format!(
+            "tz = {:?}\noutput_base = {:?}\nchannels = [\"channel.toml\"]\n",
+            tz,
+            out_base.to_string_lossy(),
+        );
+        // No output_folder — the channel's identity is its file stem
+        // ("channel"), so it writes to {out_base}/channel inside the tempdir.
         std::fs::write(dir.path().join("station.toml"), station).unwrap();
-        std::fs::write(dir.path().join("channel.toml"), channel).unwrap();
+        std::fs::write(dir.path().join("channel.toml"), CHANNEL_BODY).unwrap();
         let path = dir.path().join("station.toml");
         (dir, path)
     }

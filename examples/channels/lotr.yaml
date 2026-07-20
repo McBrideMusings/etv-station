@@ -8,7 +8,6 @@
 # catalog and the daemon-side catalog wiring (#96) to run in a dev-run. Its
 # resolution is proven by the `lotr_sample` acceptance test, which resolves this
 # exact file against a fixture catalog.
-output_folder: "examples/output/lotr"
 window_days: 1
 chunk_hours: 6
 roll_interval: "60s"

@@ -1,0 +1,16 @@
+{
+  "_comment": "Optional ETV-next presentation overrides, keyed by channel identity (the station channel's name/file-stem). Copy to presentation.json (gitignored) to customize. `name` sets the lineup display name (defaults to the identity). `config` is a partial deep-merged onto normalization.default.json for that one channel.",
+  "diehard": {
+    "name": "Pierce"
+  },
+  "starwars": {
+    "name": "Star Wars",
+    "config": {
+      "normalization": {
+        "video": {
+          "accel": "vaapi"
+        }
+      }
+    }
+  }
+}

@@ -8,6 +8,7 @@ cel = { workspace = true }
 clap = { workspace = true }
 ersatztv-playout = { workspace = true }
 etv-overlay = { workspace = true }
+glob = { workspace = true }
 humantime-serde = { workspace = true }
 nix = { workspace = true }
 regex = { workspace = true }

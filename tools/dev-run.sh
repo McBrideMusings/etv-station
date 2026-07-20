@@ -65,7 +65,12 @@ echo "[dev] building etv-overlay..."
 cargo build -p etv-overlay 2>&1 \
   | while IFS= read -r l; do printf '[station] %s\n' "$l"; done
 
-bash "$(dirname "$0")/render-lineup.sh"
+# Generate ETV-next's lineup.json + channelN.json from the station config, so the
+# playout folders it reads are derived from where the station writes (never
+# hand-authored to match). The station binary was just built by --list-folders
+# above, so this reuses it.
+STATION_CONFIG="$STATION_CONFIG" python3 "$(dirname "$0")/render-etv-next.py" \
+  | while IFS= read -r l; do printf '[dev] %s\n' "$l"; done
 
 cat <<EOF
 [dev] streams will appear at (point your IPTV app at the .m3u lineup):
