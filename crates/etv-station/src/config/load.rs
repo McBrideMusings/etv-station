@@ -150,15 +150,26 @@ fn expand_channel_patterns(
             // Deterministic order regardless of filesystem enumeration order.
             found.sort();
             for path in found {
-                if seen.insert(path.clone()) {
+                if seen.insert(dedup_key(&path)) {
                     out.push(path);
                 }
             }
-        } else if seen.insert(resolved.clone()) {
+        } else if seen.insert(dedup_key(&resolved)) {
             out.push(resolved);
         }
     }
     Ok(out)
+}
+
+/// Lexical dedup key: drop `.` (current-dir) components so a literal
+/// `./channels/a.yaml` and the glob match `channels/a.yaml` compare equal and
+/// dedup, rather than slipping through to collide later in
+/// [`validate::validate_output_folders`]. Purely textual — no filesystem access,
+/// so it works for not-yet-existing literal paths.
+fn dedup_key(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
 }
 
 /// Derive a channel's identity: the config's `name` override if set, else the
@@ -190,6 +201,15 @@ fn resolve_identity(
         return Err(ConfigError::Validation {
             path: station_path.to_path_buf(),
             message: format!("channel name {identity:?} may not contain path separators"),
+        });
+    }
+    // A newline (or other control char) in the identity becomes a folder leaf
+    // that `--list-folders` prints one-per-line, so render-etv-next.py would
+    // split one channel into two and misalign every channel number after it.
+    if identity.chars().any(char::is_control) {
+        return Err(ConfigError::Validation {
+            path: station_path.to_path_buf(),
+            message: format!("channel name {identity:?} may not contain control characters"),
         });
     }
     Ok(identity)
@@ -489,6 +509,21 @@ mod tests {
     }
 
     #[test]
+    fn dot_prefixed_literal_dedups_against_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_channels(dir.path(), &["a.yaml", "b.yaml"]);
+        let station = dir.path().join("station.yaml");
+        // The `./` prefix must not defeat dedup against the glob's match.
+        let got = expand_channel_patterns(
+            &station,
+            dir.path(),
+            &["./channels/a.yaml".into(), "channels/*.yaml".into()],
+        )
+        .unwrap();
+        assert_eq!(file_names(&got), ["a.yaml", "b.yaml"]);
+    }
+
+    #[test]
     fn glob_matching_nothing_errors() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("channels")).unwrap();
@@ -566,5 +601,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("path separators"));
+    }
+
+    #[test]
+    fn identity_rejects_control_chars() {
+        let cfg = parse_channel(&format!("name: \"foo\\nbar\"\n{MINIMAL_RULE}"));
+        let err = resolve_identity(
+            Path::new("/s/station.yaml"),
+            Path::new("/s/channels/c.yaml"),
+            &cfg,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("control characters"));
     }
 }

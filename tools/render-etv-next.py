@@ -55,10 +55,13 @@ def list_folders(station_config):
     else:
         cmd = ["cargo", "run", "-q", "-p", "etv-station", "--"]
     cmd += ["--config", str(station_config), "--list-folders"]
-    out = subprocess.run(
-        cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout
-    return [line for line in out.splitlines() if line.strip()]
+    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        # Surface the station's own diagnostic instead of a bare
+        # CalledProcessError — the stderr is where the real config error lives.
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        sys.exit(f"[render-etv-next] station --list-folders failed:\n{detail}")
+    return [line for line in result.stdout.splitlines() if line.strip()]
 
 
 def deep_merge(base, override):
@@ -74,12 +77,19 @@ def deep_merge(base, override):
 
 def main():
     bind = env("ETV_BIND_ADDRESS", "0.0.0.0")
-    port = int(env("ETV_PORT", "8409"))
+    port_str = env("ETV_PORT", "8409")
+    try:
+        port = int(port_str)
+    except ValueError:
+        sys.exit(f"[render-etv-next] ETV_PORT must be an integer, got {port_str!r}")
     hls_output = env("ETV_HLS_OUTPUT", "tmp/hls")
     station_config = env("STATION_CONFIG", "examples/station.yaml")
     out_dir = REPO_ROOT / env("ETV_NEXT_DIR", "examples/etv-next")
 
-    default_body = json.loads((out_dir / "normalization.default.json").read_text())
+    default_path = out_dir / "normalization.default.json"
+    if not default_path.exists():
+        sys.exit(f"[render-etv-next] missing {default_path}")
+    default_body = json.loads(default_path.read_text())
 
     presentation_path = out_dir / "presentation.json"
     presentation = {}
@@ -108,8 +118,11 @@ def main():
         # passes through unchanged.
         playout_folder = str((REPO_ROOT / folder).resolve())
 
-        body = deep_merge(default_body, overrides.get("config", {}))
-        channel = {"playout": {"folder": playout_folder}, **body}
+        channel = deep_merge(default_body, overrides.get("config", {}))
+        # The station owns playout.folder — inject it AFTER the merge so a
+        # `playout` key in the default body or a presentation override can never
+        # clobber the derived folder (it may still carry other playout.* keys).
+        channel.setdefault("playout", {})["folder"] = playout_folder
         (out_dir / f"channel{i}.json").write_text(json.dumps(channel, indent=2) + "\n")
 
         lineup_channels.append(
