@@ -12,7 +12,6 @@
 //! media; [`ingest_roots`] is the filesystem front door that globs + probes and
 //! then calls it.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use time::OffsetDateTime;
@@ -100,7 +99,7 @@ pub fn ingest_files(
     // from a prior ingest, or FS rows from a prior scan). Built once; within this
     // pass, deterministic `fs:` derivation keeps same-file duplicates coherent
     // even though they aren't in this map yet.
-    let index = canonical_index(catalog, &roots)?;
+    let index = super::canonical_index(catalog, &roots)?;
     let now = OffsetDateTime::now_utc().format(&Rfc3339).ok();
 
     let mut stats = FsIngestStats::default();
@@ -142,30 +141,6 @@ pub fn ingest_files(
         stats.sources_written += 1;
     }
     Ok(stats)
-}
-
-/// Build a canonical-path → `entry_id` index from every existing provenance row,
-/// canonicalising each stored `playback_path` the same way an incoming file is.
-fn canonical_index(
-    catalog: &Catalog,
-    roots: &[&str],
-) -> Result<HashMap<String, String>, CatalogError> {
-    let mut index: HashMap<String, String> = HashMap::new();
-    for source in catalog.all_sources()? {
-        let canonical = canonical_path(&source.playback_path, roots);
-        // Prefer the stronger identity: a canonical path that resolves to both a
-        // `fs:` entry (a prior FS scan) and a foreign one (Plex/GUID) should
-        // inherit the foreign id, so the file merges onto the richer record
-        // rather than staying split. Keep an existing non-`fs:` mapping; let a
-        // non-`fs:` id replace an `fs:` one; ignore the row otherwise.
-        match index.get(&canonical) {
-            Some(existing) if !existing.starts_with("fs:") => {}
-            _ => {
-                index.insert(canonical, source.entry_id);
-            }
-        }
-    }
-    Ok(index)
 }
 
 /// The file's stem as its title (`station-bumper-01.mp4` → `station-bumper-01`).
@@ -258,7 +233,12 @@ mod tests {
         assert!(ids.iter().all(|id| id.starts_with("fs:")));
 
         // Metadata: type from dir, title from stem, duration in ms.
-        let bumper_id = &canonical_index(&cat, &["/data/media"]).unwrap()["bumpers/station-01.mkv"];
+        let sources = cat.all_sources().unwrap();
+        let bumper = sources
+            .iter()
+            .find(|s| s.playback_path.ends_with("station-01.mkv"))
+            .unwrap();
+        let bumper_id = &bumper.entry_id;
         let e = cat.entry(bumper_id).unwrap().unwrap();
         assert_eq!(e.kind, "bumper");
         assert_eq!(e.title, "station-01");

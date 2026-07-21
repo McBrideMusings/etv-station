@@ -299,6 +299,24 @@ impl Catalog {
         Ok(row)
     }
 
+    /// The `entry_id` an external GUID resolves to, if any — the GUID-first half
+    /// of ingest identity: every source sharing a GUID collapses onto one entry.
+    pub fn entry_id_for_external_id(
+        &self,
+        namespace: ExternalNs,
+        value: &str,
+    ) -> Result<Option<String>, CatalogError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT entry_id FROM entry_external_ids WHERE namespace = ?1 AND value = ?2",
+                params![namespace.as_str(), value],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Every entry id, ascending — a stable enumeration for callers that scan.
     pub fn all_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])
