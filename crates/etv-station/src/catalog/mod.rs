@@ -17,6 +17,7 @@
 
 pub mod error;
 pub mod identity;
+pub mod ingest;
 pub mod model;
 pub mod order;
 pub mod query;
@@ -309,31 +310,18 @@ impl Catalog {
             "SELECT source, source_id, entry_id, playback_path, last_seen
              FROM entry_sources WHERE entry_id = ?1 ORDER BY source, source_id",
         )?;
-        let rows = stmt
-            .query_map(params![entry_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(source, source_id, entry_id, playback_path, last_seen)| {
-                Ok(EntrySource {
-                    source: source.parse().map_err(|m| CatalogError::BadRow {
-                        field: "source",
-                        message: m,
-                    })?,
-                    source_id,
-                    entry_id,
-                    playback_path,
-                    last_seen,
-                })
-            })
-            .collect()
+        collect_sources(&mut stmt, params![entry_id])
+    }
+
+    /// Every provenance row across all entries, ordered by source then id — the
+    /// enumeration an ingester scans to build a canonical-path → `entry_id` index
+    /// for path-match inherit.
+    pub fn all_sources(&self) -> Result<Vec<EntrySource>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, source_id, entry_id, playback_path, last_seen
+             FROM entry_sources ORDER BY source, source_id",
+        )?;
+        collect_sources(&mut stmt, [])
     }
 
     /// Tag values for an entry within a namespace, ascending.
@@ -366,6 +354,41 @@ impl Catalog {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(out)
     }
+}
+
+/// Run a prepared `entry_sources` query (columns in the canonical `source,
+/// source_id, entry_id, playback_path, last_seen` order) and map the result set
+/// into typed [`EntrySource`] rows. Rows are collected before parsing so the
+/// `source` discriminator's parse error can surface as a [`CatalogError`].
+fn collect_sources(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> Result<Vec<EntrySource>, CatalogError> {
+    let rows = stmt
+        .query_map(params, |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(source, source_id, entry_id, playback_path, last_seen)| {
+            Ok(EntrySource {
+                source: source.parse().map_err(|m| CatalogError::BadRow {
+                    field: "source",
+                    message: m,
+                })?,
+                source_id,
+                entry_id,
+                playback_path,
+                last_seen,
+            })
+        })
+        .collect()
 }
 
 /// Column list for `entries`, in the order [`row_to_entry`] reads.
