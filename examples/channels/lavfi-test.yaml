@@ -13,7 +13,6 @@ rule:
       order: "manual"
       entries:
         - kind: item
-          id: bars-30s
           in_point: "0s"
           out_point: "30s"
           source:
@@ -25,7 +24,6 @@ rule:
             categories: ["Test"]
 
         - kind: item
-          id: smpte-60s
           in_point: "0s"
           out_point: "60s"
           source:
@@ -37,7 +35,6 @@ rule:
             categories: ["Test"]
 
         - kind: item
-          id: mandelbrot-90s
           in_point: "0s"
           out_point: "90s"
           source:

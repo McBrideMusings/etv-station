@@ -20,6 +20,15 @@ pub struct StationConfig {
     /// config's directory. Globs expand to every matching file; a literal path
     /// that doesn't exist is an error, and a glob matching nothing is an error.
     pub channels: Vec<String>,
+
+    /// Media mount roots, in the daemon's filesystem view. Used to canonicalise
+    /// a local item's path when deriving its identity (see
+    /// [`crate::catalog::identity::canonical_path`]) so the same file collapses
+    /// to one identity regardless of which mount root it is reached under. May
+    /// be empty — an empty list only skips root-stripping, leaving identity as a
+    /// hash of the separator-normalised full path.
+    #[serde(default)]
+    pub source_roots: Vec<String>,
 }
 
 fn default_tz() -> String {

@@ -57,7 +57,7 @@ fn lotr_sample_resolves_in_release_order() {
     let config: ChannelConfig = read_channel(&sample_path()).expect("load lotr sample");
 
     let cat = lotr_catalog();
-    let items = resolve_channel(&config, &sample_path(), Some(&cat)).expect("resolve");
+    let items = resolve_channel(&config, &sample_path(), &[], Some(&cat)).expect("resolve");
 
     let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
     assert_eq!(
@@ -78,8 +78,8 @@ fn lotr_sample_order_is_deterministic() {
     let config: ChannelConfig = read_channel(&sample_path()).unwrap();
     let cat = lotr_catalog();
 
-    let first = resolve_channel(&config, &sample_path(), Some(&cat)).unwrap();
-    let second = resolve_channel(&config, &sample_path(), Some(&cat)).unwrap();
+    let first = resolve_channel(&config, &sample_path(), &[], Some(&cat)).unwrap();
+    let second = resolve_channel(&config, &sample_path(), &[], Some(&cat)).unwrap();
     let ids1: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
     let ids2: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
     assert_eq!(ids1, ids2);
@@ -120,7 +120,7 @@ fn lotr_sample_breaks_ties_by_entry_id_and_sorts_nulls_last() {
     seed("lotr:null", "The Lord of the Rings: Null", None);
 
     let config: ChannelConfig = read_channel(&sample_path()).unwrap();
-    let items = resolve_channel(&config, &sample_path(), Some(&cat)).unwrap();
+    let items = resolve_channel(&config, &sample_path(), &[], Some(&cat)).unwrap();
     let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
     // Tie broken by entry_id ascending (alpha < bravo); null release date last.
     assert_eq!(ids, vec!["lotr:alpha", "lotr:bravo", "lotr:null"]);

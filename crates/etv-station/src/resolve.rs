@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, canonical_path, derive_entry_id};
 use crate::config::{
     BlockInclude, ChannelConfig, Duplicates, Entry, ItemEntry, Mode, Order, QueryEntry,
     SourceConfig,
@@ -57,6 +57,7 @@ impl ResolvedItem {
 pub fn resolve_channel(
     config: &ChannelConfig,
     path: &Path,
+    source_roots: &[String],
     catalog: Option<&Catalog>,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
@@ -66,7 +67,7 @@ pub fn resolve_channel(
 
     let mut out = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
-        let block_items = resolve_block(include, idx, path, catalog, seed)?;
+        let block_items = resolve_block(include, idx, path, source_roots, catalog, seed)?;
         out.extend(block_items);
     }
 
@@ -83,6 +84,7 @@ fn resolve_block(
     include: &BlockInclude,
     idx: usize,
     path: &Path,
+    source_roots: &[String],
     catalog: Option<&Catalog>,
     seed: u64,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
@@ -112,7 +114,7 @@ fn resolve_block(
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
-            Entry::Item(item) => items.push(resolve_item(item, defaults)),
+            Entry::Item(item) => items.push(resolve_item(item, defaults, source_roots)),
             Entry::Query(query) => {
                 let cat = catalog.ok_or_else(|| {
                     unsupported(format!(
@@ -290,13 +292,34 @@ fn catalog_item(
     })
 }
 
-fn resolve_item(item: &ItemEntry, defaults: Option<&ProgramMetadata>) -> ResolvedItem {
+fn resolve_item(
+    item: &ItemEntry,
+    defaults: Option<&ProgramMetadata>,
+    source_roots: &[String],
+) -> ResolvedItem {
     ResolvedItem {
-        id: item.id.clone(),
+        id: derive_item_id(&item.source, source_roots),
         source: item.source.clone(),
         in_point: item.in_point,
         out_point: item.out_point,
         program: merge_program(item.program.as_ref(), defaults),
+    }
+}
+
+/// Derive a stable, namespaced identity for an inline item from its source —
+/// items never carry an authored id. A local file hashes its canonical path
+/// (root-stripped so the same file under two mount roots is one identity),
+/// producing the same `fs:` identity a filesystem ingester would; a generated
+/// or remote source keys on its defining field. The result feeds within-block
+/// duplicate collapse and the regeneration anchor, so it must be deterministic.
+fn derive_item_id(source: &SourceConfig, source_roots: &[String]) -> String {
+    match source {
+        SourceConfig::Local { path } => {
+            let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
+            derive_entry_id(&[], &canonical_path(path, &roots))
+        }
+        SourceConfig::Lavfi { params } => format!("lavfi:{params}"),
+        SourceConfig::Http { uri, .. } => format!("http:{uri}"),
     }
 }
 
@@ -341,12 +364,21 @@ mod tests {
     use super::*;
     use crate::config::{ChannelConfig, RuleConfig};
 
+    /// A lavfi test item. Its derived id is `lavfi:{id}` (see `derive_item_id`),
+    /// so distinct `id`s stay distinct and equal ones collapse.
     fn item_entry(id: &str) -> ItemEntry {
         ItemEntry {
-            id: id.into(),
-            source: SourceConfig::Lavfi {
-                params: format!("src={id}"),
-            },
+            source: SourceConfig::Lavfi { params: id.into() },
+            in_point: None,
+            out_point: Some(Duration::from_secs(30)),
+            program: None,
+        }
+    }
+
+    /// A local-file test item (no authored id — identity derives from the path).
+    fn local_entry(path: &str) -> ItemEntry {
+        ItemEntry {
+            source: SourceConfig::Local { path: path.into() },
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
             program: None,
@@ -388,18 +420,18 @@ mod tests {
             Entry::Item(item_entry("a")),
             Entry::Item(item_entry("b")),
         ]);
-        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(ids, vec!["lavfi:a", "lavfi:b"]);
     }
 
     #[test]
     fn concatenates_blocks() {
         let a = include_with(vec![Entry::Item(item_entry("a"))]);
         let b = include_with(vec![Entry::Item(item_entry("b"))]);
-        let items = resolve_channel(&channel(vec![a, b]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![a, b]), path(), &[], None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(ids, vec!["lavfi:a", "lavfi:b"]);
     }
 
     #[test]
@@ -409,9 +441,64 @@ mod tests {
             Entry::Item(item_entry("a")),
             Entry::Item(item_entry("b")),
         ]);
-        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(ids, vec!["lavfi:a", "lavfi:b"]);
+    }
+
+    #[test]
+    fn manual_items_with_same_path_collapse_by_derived_id() {
+        // No authored id: two entries pointing at the same file derive the same
+        // `fs:` identity and collapse under the default `collapse` policy; a
+        // different file keeps its own identity.
+        let inc = include_with(vec![
+            Entry::Item(local_entry("/media/friends/s01e01.mkv")),
+            Entry::Item(local_entry("/media/friends/s01e01.mkv")),
+            Entry::Item(local_entry("/media/friends/s01e02.mkv")),
+        ]);
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.id.starts_with("fs:")));
+        assert_ne!(items[0].id, items[1].id);
+    }
+
+    #[test]
+    fn source_roots_canonicalise_local_identity_across_mounts() {
+        // The same file reached under two configured mount roots derives one
+        // identity, so the cross-mount duplicate collapses.
+        let roots = vec!["/mnt/media".to_string(), "/Volumes/media".to_string()];
+        let inc = include_with(vec![
+            Entry::Item(local_entry("/mnt/media/friends/s01e01.mkv")),
+            Entry::Item(local_entry("/Volumes/media/friends/s01e01.mkv")),
+        ]);
+        let items = resolve_channel(&channel(vec![inc]), path(), &roots, None).unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn lavfi_and_http_ids_derive_from_their_defining_field() {
+        let lavfi = ItemEntry {
+            source: SourceConfig::Lavfi {
+                params: "testsrc".into(),
+            },
+            in_point: None,
+            out_point: Some(Duration::from_secs(5)),
+            program: None,
+        };
+        let http = ItemEntry {
+            source: SourceConfig::Http {
+                uri: "https://ex/y.mkv".into(),
+                headers: None,
+                user_agent: None,
+            },
+            in_point: None,
+            out_point: Some(Duration::from_secs(5)),
+            program: None,
+        };
+        let inc = include_with(vec![Entry::Item(lavfi), Entry::Item(http)]);
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["lavfi:testsrc", "http:https://ex/y.mkv"]);
     }
 
     #[test]
@@ -421,7 +508,7 @@ mod tests {
             Entry::Item(item_entry("a")),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
-        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -433,9 +520,9 @@ mod tests {
             Entry::Item(item_entry("c")),
         ]);
         inc.mode = Mode::Count(2);
-        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(ids, vec!["lavfi:a", "lavfi:b"]);
     }
 
     #[test]
@@ -452,7 +539,7 @@ mod tests {
             artwork_url: None,
             year: None,
         });
-        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         let p = items[0].program.as_ref().unwrap();
         assert_eq!(p.title.as_deref(), Some("Default Title"));
         assert_eq!(p.categories.as_ref().unwrap(), &vec!["Movie".to_string()]);
@@ -484,7 +571,7 @@ mod tests {
             artwork_url: None,
             year: None,
         });
-        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         let p = items[0].program.as_ref().unwrap();
         // item title wins; block category fills the gap.
         assert_eq!(p.title.as_deref(), Some("Specific"));
@@ -498,7 +585,7 @@ mod tests {
             query: "item.type == \"movie\"".into(),
             order: None,
         })]);
-        let err = resolve_channel(&channel(vec![inc]), path(), None).unwrap_err();
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap_err();
         assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
 
@@ -506,13 +593,13 @@ mod tests {
     fn non_manual_order_without_catalog_errors() {
         let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
         inc.order = Order::Random;
-        let err = resolve_channel(&channel(vec![inc]), path(), None).unwrap_err();
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap_err();
         assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
 
     #[test]
     fn rejects_empty_channel() {
-        let err = resolve_channel(&channel(vec![]), path(), None).unwrap_err();
+        let err = resolve_channel(&channel(vec![]), path(), &[], None).unwrap_err();
         assert!(format!("{err}").contains("zero items"), "err = {err}");
     }
 
@@ -560,7 +647,7 @@ mod tests {
             "item.title.contains(\"Ring\") || item.title.contains(\"Tower\") || item.title.contains(\"King\")",
             Order::parse("release_date:asc").unwrap(),
         );
-        let items = resolve_channel(&channel(vec![inc]), path(), Some(&cat)).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -588,7 +675,7 @@ mod tests {
             }),
         ]);
         inc.order = Order::parse("release_date:asc").unwrap();
-        let items = resolve_channel(&channel(vec![inc]), path(), Some(&cat)).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -596,7 +683,7 @@ mod tests {
                 "imdb:tt0120737",
                 "imdb:tt0167261",
                 "imdb:tt0167260",
-                "bumper"
+                "lavfi:bumper"
             ]
         );
     }
@@ -605,7 +692,7 @@ mod tests {
     fn block_collection_order_errors_clearly() {
         let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
         inc.order = Order::Collection;
-        let err = resolve_channel(&channel(vec![inc]), path(), None).unwrap_err();
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap_err();
         assert!(format!("{err}").contains("collection"), "err = {err}");
     }
 
@@ -621,8 +708,8 @@ mod tests {
         let cat = seeded_catalog();
         let mut cfg = channel(vec![inc]);
         cfg.seed = Some(7);
-        let first = resolve_channel(&cfg, path(), Some(&cat)).unwrap();
-        let second = resolve_channel(&cfg, path(), Some(&cat)).unwrap();
+        let first = resolve_channel(&cfg, path(), &[], Some(&cat)).unwrap();
+        let second = resolve_channel(&cfg, path(), &[], Some(&cat)).unwrap();
         let ids1: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
         let ids2: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
         // Collapsed to unique ids, and the seeded shuffle is reproducible.
@@ -637,7 +724,7 @@ mod tests {
             Entry::Item(item_entry("a")),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
-        let items = resolve_channel(&channel(vec![inc]), path(), None).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -649,7 +736,7 @@ mod tests {
             query: "item.year >= 2001".into(),
             order: Some(Order::parse("release_date:desc").unwrap()),
         })]);
-        let items = resolve_channel(&channel(vec![inc]), path(), Some(&cat)).unwrap();
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
             ids,

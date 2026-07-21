@@ -568,6 +568,7 @@ mod tests {
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec!["channels/a.yaml".into()],
+            source_roots: vec![],
         }
     }
 

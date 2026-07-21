@@ -15,7 +15,6 @@ use super::source::SourceConfig;
 /// ```toml
 /// [[entries]]
 /// kind = "item"
-/// id = "diehard-1988"
 /// [entries.source]
 /// kind = "local"
 /// path = "/media/diehard.mkv"
@@ -39,11 +38,15 @@ impl Entry {
     }
 }
 
-/// A single concrete media item with an explicit source.
+/// A single concrete media item with an explicit source. Identity is derived
+/// from the source at resolution time (see [`crate::resolve`]) — never authored
+/// — so two inline items resolving to the same file collapse within a block.
+/// (Collapsing a manual item against a catalog *query* result for the same
+/// physical file additionally needs the ingester to assign it the same id —
+/// #92/#96 — since a GUID-carrying catalog entry derives `imdb:`/`tmdb:`, not
+/// the manual item's path-hash `fs:` id.)
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ItemEntry {
-    pub id: String,
-
     pub source: SourceConfig,
 
     #[serde(default, with = "humantime_serde")]

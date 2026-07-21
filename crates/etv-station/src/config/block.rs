@@ -47,7 +47,6 @@ categories = ["Movie"]
 
 [[entries]]
 kind = "item"
-id = "a"
 [entries.source]
 kind = "lavfi"
 params = "testsrc"
@@ -67,7 +66,6 @@ params = "testsrc"
         let toml = r#"
 [[entries]]
 kind = "item"
-id = "a"
 [entries.source]
 kind = "lavfi"
 params = "testsrc"
@@ -85,7 +83,6 @@ program:
   categories: [Movie]
 entries:
   - kind: item
-    id: a
     source:
       kind: lavfi
       params: testsrc

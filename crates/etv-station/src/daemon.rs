@@ -143,7 +143,7 @@ async fn run_generation(
         handles.push(tokio::spawn(
             async move {
                 let ch = &s.channels[idx];
-                let result = channel_loop(ch, tz, stop).await;
+                let result = channel_loop(ch, tz, &s.station.source_roots, stop).await;
                 // A channel_loop error is fatal to THIS channel. Task handles
                 // are only joined at shutdown (see below), so without logging
                 // here a startup failure — a failed duration probe, unreadable
@@ -378,6 +378,7 @@ fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySp
 async fn channel_loop(
     channel: &LoadedChannel,
     tz: &'static Tz,
+    source_roots: &[String],
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
     // `run` creates every channel's output_folder synchronously before spawning
@@ -387,7 +388,8 @@ async fn channel_loop(
     // The station-wide catalog is not yet opened by the daemon (#71 follow-up);
     // until then only inline-item, `manual`-order channels resolve. Query
     // entries and non-`manual` order error clearly via `resolve_channel`.
-    let items = crate::resolve::resolve_channel(&channel.config, &channel.config_path, None)?;
+    let items =
+        crate::resolve::resolve_channel(&channel.config, &channel.config_path, source_roots, None)?;
 
     let mut cache = DurationCache::load(output).await?;
     let (durations, stats) = cache.resolve_all(&items).await?;
@@ -578,7 +580,6 @@ order = "manual"
 
 [[rule.blocks.entries]]
 kind = "item"
-id = "bars-30s"
 in_point = "0s"
 out_point = "30s"
 

@@ -41,7 +41,6 @@ program:
 
 entries:
   - kind: item
-    id: a-new-hope
     source:
       kind: local
       path: "${ETV_TEST_MEDIA_DIR}/movies/Star Wars (1977) {imdb-tt0076759}/Star.Wars.1977.mkv"
@@ -61,15 +60,21 @@ Every entry is tagged by a `kind` field. Three kinds. Source: `config/entry.rs`.
 
 | Field | Required | Type |
 |---|---|---|
-| `id` | **yes** | string (stable identifier, used for dedupe + order tiebreak) |
 | `source` | **yes** | [`Source`](#source) |
 | `in_point` | no | duration — trim start (`"90s"`, `"1m30s"`) |
 | `out_point` | no | duration — trim end |
 | `program` | no | [`ProgramMetadata`](#programmetadata) — overrides block defaults for this item |
 
+Identity is **derived from the `source`, never authored** — a local file from a
+canonical hash of its path (root-stripped via the station `source_roots`), a
+`lavfi`/`http` source from its defining field. That derived id drives within-block
+duplicate collapse and the regeneration anchor, so two inline items pointing at
+the same file collapse to one. (Collapsing a manual item against a catalog
+`query` result for that same file is future work — it needs the catalog ingester
+to assign the file a matching id.) There is no `id` field to set.
+
 ```yaml
 - kind: item
-  id: diehard-1988
   source:
     kind: local
     path: "${ETV_TEST_MEDIA_DIR}/movies/Die Hard (1988) {imdb-tt0095016}/Die.hard.mkv"
@@ -212,11 +217,14 @@ filter:
 
 ### Duplicates
 
-Block-level dedupe policy (by entry `id`). Source: `config/block.rs`.
+Block-level dedupe policy, keyed on each item's **derived** source identity (see
+[`kind: item`](#kind-item-an-authored-file)) — so two entries resolving to the
+same physical file collapse regardless of how they entered the block. Source:
+`config/block.rs`.
 
 | Value | Meaning |
 |---|---|
-| `collapse` *(default)* | drop repeat ids |
+| `collapse` *(default)* | drop repeats of the same derived identity |
 | `keep` | keep every occurrence |
 
 ## Station file
@@ -232,6 +240,9 @@ channels:                      # literal paths or globs, relative to this file
   - channels/starwars.yaml
   - channels/diehard.yaml
   - channels/*.yaml            # a glob works too — expands to every match
+
+source_roots:                  # optional — media mount roots, daemon's view
+  - /data/media
 ```
 
 | Field | Required | Type / default |
@@ -239,6 +250,7 @@ channels:                      # literal paths or globs, relative to this file
 | `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
+| `source_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts is one identity. Empty just skips root-stripping. |
 
 Each entry in `channels` is resolved relative to the station file's directory. A
 glob expands to every matching file (matching nothing is an error); a literal

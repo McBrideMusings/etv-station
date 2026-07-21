@@ -1,9 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
-use super::block::Duplicates;
 use super::channel::ChannelConfig;
-use super::entry::Entry;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
 
@@ -114,32 +112,10 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
                 message: format!("block #{idx} has no entries"),
             });
         }
-
-        // Item ids must be non-empty, and unique within a block unless the
-        // block opted into `duplicates = "keep"`.
-        let mut ids = HashSet::new();
-        for entry in entries {
-            if let Entry::Item(item) = entry {
-                if item.id.trim().is_empty() {
-                    return Err(ConfigError::Validation {
-                        path: path.to_path_buf(),
-                        message: format!("block #{idx} has an item with an empty id"),
-                    });
-                }
-                if include.duplicates() == Duplicates::Keep {
-                    continue;
-                }
-                if !ids.insert(item.id.clone()) {
-                    return Err(ConfigError::Validation {
-                        path: path.to_path_buf(),
-                        message: format!(
-                            "block #{idx} has duplicate item id {:?} (set duplicates = \"keep\" to allow)",
-                            item.id
-                        ),
-                    });
-                }
-            }
-        }
+        // Item identity is derived from the source at resolution time, not
+        // authored — so there is no id to validate here. Within-block duplicates
+        // (two entries resolving to the same file) collapse in `resolve`, they
+        // are not a config error. `duplicates = "keep"` opts out of the collapse.
     }
 
     Ok(())
@@ -161,9 +137,8 @@ mod tests {
 
     fn item_entry(id: &str) -> Entry {
         Entry::Item(ItemEntry {
-            id: id.into(),
             source: SourceConfig::Lavfi {
-                params: "testsrc".into(),
+                params: format!("src={id}"),
             },
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
@@ -202,6 +177,7 @@ mod tests {
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec![],
+            source_roots: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         let msg = format!("{err}");
@@ -214,6 +190,7 @@ mod tests {
             tz: "UTC".into(),
             output_base: PathBuf::new(),
             channels: vec!["channels/a.yaml".into()],
+            source_roots: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
@@ -225,6 +202,7 @@ mod tests {
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec!["  ".into()],
+            source_roots: vec![],
         };
         assert!(validate_station(&dummy_path(), &s).is_err());
     }
@@ -241,21 +219,6 @@ mod tests {
         let ch = channel_with(vec![inline_block(vec![])]);
         let err = validate_channel(&dummy_path(), &ch).unwrap_err();
         assert!(format!("{err}").contains("no entries"));
-    }
-
-    #[test]
-    fn rejects_duplicate_item_ids_by_default() {
-        let ch = channel_with(vec![inline_block(vec![item_entry("a"), item_entry("a")])]);
-        let err = validate_channel(&dummy_path(), &ch).unwrap_err();
-        assert!(format!("{err}").contains("duplicate item id"));
-    }
-
-    #[test]
-    fn allows_duplicate_item_ids_with_keep() {
-        let mut block = inline_block(vec![item_entry("a"), item_entry("a")]);
-        block.duplicates = Some(Duplicates::Keep);
-        let ch = channel_with(vec![block]);
-        validate_channel(&dummy_path(), &ch).unwrap();
     }
 
     #[test]
