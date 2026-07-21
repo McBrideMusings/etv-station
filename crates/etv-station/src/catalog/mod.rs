@@ -170,6 +170,22 @@ impl Catalog {
 
     // ---- writes -----------------------------------------------------------
 
+    /// Run `f` inside a single transaction: commit on `Ok`, roll back on `Err`
+    /// (the `Transaction` rolls back when dropped without a commit). Ingesters
+    /// wrap their write pass in this so a mid-pass failure leaves the catalog
+    /// untouched rather than partially written — a truncated catalog would make
+    /// query channels silently emit an incomplete set.
+    pub(crate) fn in_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&Self) -> Result<T, E>,
+        E: From<CatalogError>,
+    {
+        let tx = self.conn.unchecked_transaction().map_err(CatalogError::from)?;
+        let out = f(self)?;
+        tx.commit().map_err(CatalogError::from)?;
+        Ok(out)
+    }
+
     /// Insert or replace a logical entry by `entry_id`.
     pub fn upsert_entry(&self, e: &Entry) -> Result<(), CatalogError> {
         self.conn.execute(

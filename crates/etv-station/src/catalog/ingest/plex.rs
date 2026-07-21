@@ -160,7 +160,9 @@ pub fn ingest_from_env(
 ) -> Result<PlexIngestStats, PlexIngestError> {
     let client = PlexClient::from_env()?;
     let items = client.fetch_all()?;
-    ingest_items(catalog, &items, source_roots)
+    // One transaction for the whole write pass — a mid-ingest failure rolls back
+    // rather than leaving a partial catalog.
+    catalog.in_transaction(|c| ingest_items(c, &items, source_roots))
 }
 
 /// Resolve the entry an item should attach to, if any: a GUID the catalog

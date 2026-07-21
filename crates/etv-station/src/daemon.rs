@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +35,10 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // so it survives reloads (#96). A catalog-free station keeps working: query /
     // non-`manual` channels just error in `resolve_channel` as before.
     let catalog = open_and_ingest_catalog(&station).await?;
+    // What the catalog was opened against — the catalog is opened once and NOT
+    // reopened on reload (#96), so a later reload that changes these diverges.
+    let opened_catalog_path = station.station.catalog_path.clone();
+    let opened_source_roots = station.station.source_roots.clone();
     // The last config that prepared cleanly. A `prepare_generation` failure on a
     // reload reverts to this instead of killing a daemon that's streaming fine.
     // See #90 and docs/adr/0001-reload-generation-revert.md.
@@ -86,6 +91,15 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         // runnable-check lives in exactly one place.
         match crate::config::load(&config_path) {
             Ok(s) => {
+                if catalog.is_some()
+                    && (s.station.catalog_path != opened_catalog_path
+                        || s.station.source_roots != opened_source_roots)
+                {
+                    tracing::warn!(
+                        event = "config.reload_catalog_divergent",
+                        "reload changes catalog_path/source_roots, but the catalog is opened once at startup and is not reopened; the running catalog and its path index still reflect the config it was opened with — restart to apply",
+                    );
+                }
                 tracing::info!(event = "config.reload", config = %config_path.display(), "configuration reloaded");
                 station = Arc::new(s);
             }
@@ -108,9 +122,19 @@ pub async fn run(station: Station) -> Result<(), StationError> {
 /// ingest failure is logged and the daemon continues with whatever was written —
 /// a Plex outage or a bad media root shouldn't take playout down. Delta sync,
 /// the refresh TTL, and a manual re-ingest trigger are follow-ups (#91/#96).
+/// The station catalog shared into every channel task: the `Catalog` behind a
+/// `Mutex` (it is `Send` but `!Sync`, and only ever locked for a synchronous
+/// resolve) plus the canonical-path → `entry_id` index built **once** after
+/// ingest (the catalog is immutable afterwards), so channels don't each rebuild
+/// it under the lock.
+struct SharedCatalog {
+    catalog: Mutex<Catalog>,
+    path_index: HashMap<String, String>,
+}
+
 async fn open_and_ingest_catalog(
     station: &Station,
-) -> Result<Option<Arc<Mutex<Catalog>>>, StationError> {
+) -> Result<Option<Arc<SharedCatalog>>, StationError> {
     let Some(path) = station
         .station
         .catalog_path
@@ -120,7 +144,7 @@ async fn open_and_ingest_catalog(
         return Ok(None);
     };
 
-    let catalog = Catalog::open(path)?;
+    let mut catalog = Catalog::open(path)?;
     let source_roots = &station.station.source_roots;
 
     // Local filesystem: scan the media roots (identity is canonicalised against
@@ -137,9 +161,20 @@ async fn open_and_ingest_catalog(
     }
 
     // Plex: only when both env vars are set — an unconfigured Plex is normal, not
-    // an error.
+    // an error. The client is blocking (`ureq`), so run it on a blocking thread
+    // (moving the catalog in and back out) rather than stalling the async
+    // runtime. `spawn_blocking` works on any runtime flavor, unlike
+    // `block_in_place`.
     if std::env::var_os("PLEX_URL").is_some() && std::env::var_os("PLEX_TOKEN").is_some() {
-        match crate::catalog::ingest::plex::ingest_from_env(&catalog, source_roots) {
+        let roots = source_roots.clone();
+        let (returned, plex) = tokio::task::spawn_blocking(move || {
+            let result = crate::catalog::ingest::plex::ingest_from_env(&catalog, &roots);
+            (catalog, result)
+        })
+        .await
+        .expect("plex ingest task panicked");
+        catalog = returned;
+        match plex {
             Ok(stats) => tracing::info!(
                 event = "catalog.ingest.plex",
                 entries = stats.entries_written,
@@ -150,7 +185,14 @@ async fn open_and_ingest_catalog(
         }
     }
 
-    Ok(Some(Arc::new(Mutex::new(catalog))))
+    // Build the path-match index once, now that the catalog is fully ingested.
+    let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
+    let path_index = crate::catalog::ingest::canonical_index(&catalog, &roots)?;
+
+    Ok(Some(Arc::new(SharedCatalog {
+        catalog: Mutex::new(catalog),
+        path_index,
+    })))
 }
 
 /// Spawn one generation's channel + overlay tasks against `station`, run until a
@@ -164,7 +206,7 @@ async fn open_and_ingest_catalog(
 async fn run_generation(
     station: &Arc<Station>,
     tz: &'static Tz,
-    catalog: Option<&Arc<Mutex<Catalog>>>,
+    catalog: Option<&Arc<SharedCatalog>>,
     shutdown: &Notify,
     reload: &Notify,
 ) -> (bool, Option<StationError>) {
@@ -440,7 +482,7 @@ async fn channel_loop(
     channel: &LoadedChannel,
     tz: &'static Tz,
     source_roots: &[String],
-    catalog: Option<&Mutex<Catalog>>,
+    catalog: Option<&SharedCatalog>,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
     // `run` creates every channel's output_folder synchronously before spawning
@@ -459,12 +501,14 @@ async fn channel_loop(
         // shared), so the guarded data is still valid if another channel task
         // panicked while resolving. Asserting here instead would cascade one
         // panic into every channel — and, since the catalog outlives reloads,
-        // into every future generation too.
-        let guard = catalog.map(|mutex| mutex.lock().unwrap_or_else(|e| e.into_inner()));
+        // into every future generation too. The pre-built `path_index` needs no
+        // lock (immutable after ingest).
+        let guard = catalog.map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
         crate::resolve::resolve_channel(
             &channel.config,
             &channel.config_path,
             source_roots,
+            catalog.map(|sc| &sc.path_index),
             guard.as_deref(),
         )?
     };
@@ -705,6 +749,14 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
 
     #[tokio::test]
     async fn catalog_opens_and_ingests_when_path_set() {
+        // Hermetic: ignore any ambient Plex creds (the dev shell exports them) so
+        // this never makes a real network call. Only `open_and_ingest_catalog`
+        // reads these, and `catalog_disabled_when_no_path` returns before it does,
+        // so clearing them here can't affect another test.
+        unsafe {
+            std::env::remove_var("PLEX_URL");
+            std::env::remove_var("PLEX_TOKEN");
+        }
         let dir = tempfile::tempdir().unwrap();
         let out_base = dir.path().join("out");
         let db = dir.path().join("catalog.db");

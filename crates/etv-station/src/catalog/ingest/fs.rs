@@ -81,7 +81,9 @@ pub async fn ingest_roots(
         let secs = ffprobe_seconds(&path).await;
         probed.push((path, secs));
     }
-    ingest_files(catalog, &probed, source_roots)
+    // All writes in one transaction: a failure part-way rolls back, never
+    // leaving a half-scanned catalog.
+    catalog.in_transaction(|c| ingest_files(c, &probed, source_roots))
 }
 
 /// Write catalog rows for already-probed files. Pure over the catalog (no
