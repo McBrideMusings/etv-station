@@ -243,6 +243,8 @@ channels:                      # literal paths or globs, relative to this file
 
 source_roots:                  # optional — media mount roots, daemon's view
   - /data/media
+
+catalog_path: /var/lib/etv-station/catalog.db   # optional — enables query channels
 ```
 
 | Field | Required | Type / default |
@@ -251,6 +253,7 @@ source_roots:                  # optional — media mount roots, daemon's view
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
 | `source_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts is one identity. Empty just skips root-stripping. |
+| `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
 
 Each entry in `channels` is resolved relative to the station file's directory. A
 glob expands to every matching file (matching nothing is an error); a literal

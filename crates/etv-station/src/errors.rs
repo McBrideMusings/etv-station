@@ -53,6 +53,9 @@ pub enum StationError {
     #[error(transparent)]
     AtomicWrite(#[from] AtomicWriteError),
 
+    #[error("catalog error: {0}")]
+    Catalog(#[from] crate::catalog::CatalogError),
+
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,

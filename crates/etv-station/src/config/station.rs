@@ -26,9 +26,18 @@ pub struct StationConfig {
     /// [`crate::catalog::identity::canonical_path`]) so the same file collapses
     /// to one identity regardless of which mount root it is reached under. May
     /// be empty — an empty list only skips root-stripping, leaving identity as a
-    /// hash of the separator-normalised full path.
+    /// hash of the separator-normalised full path. The daemon also scans these
+    /// roots to populate the catalog when `catalog_path` is set.
     #[serde(default)]
     pub source_roots: Vec<String>,
+
+    /// Path to the sqlite catalog the daemon opens and ingests at startup, so
+    /// `query` entries and non-`manual` order resolve and manual items path-match
+    /// onto catalog identities. Unset (or blank) keeps the catalog-free behavior:
+    /// only inline-item, `manual`-order channels resolve. `ETV_STATION_CATALOG`
+    /// overrides at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_path: Option<String>,
 }
 
 fn default_tz() -> String {

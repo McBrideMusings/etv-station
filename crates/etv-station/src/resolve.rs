@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
+use crate::catalog::ingest::canonical_index;
 use crate::catalog::{Catalog, canonical_path, derive_entry_id};
 use crate::config::{
     BlockInclude, ChannelConfig, Duplicates, Entry, ItemEntry, Mode, Order, QueryEntry,
@@ -65,9 +66,22 @@ pub fn resolve_channel(
     // generation (#46 "unset = fresh per generation").
     let seed = config.seed.unwrap_or_else(fresh_seed);
 
+    // Canonical-path → entry_id over the catalog, built once. A manual `local`
+    // item whose path is in the catalog inherits that entry_id, so it collapses
+    // against a `query` result for the same physical file (manual∩query dedup).
+    let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
+    let path_index = catalog
+        .map(|cat| canonical_index(cat, &roots))
+        .transpose()
+        .map_err(|e| ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!("building the catalog path index failed: {e}"),
+        })?;
+
     let mut out = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
-        let block_items = resolve_block(include, idx, path, source_roots, catalog, seed)?;
+        let block_items =
+            resolve_block(include, idx, path, source_roots, path_index.as_ref(), catalog, seed)?;
         out.extend(block_items);
     }
 
@@ -80,11 +94,13 @@ pub fn resolve_channel(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_block(
     include: &BlockInclude,
     idx: usize,
     path: &Path,
     source_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
     seed: u64,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
@@ -114,7 +130,9 @@ fn resolve_block(
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
-            Entry::Item(item) => items.push(resolve_item(item, defaults, source_roots)),
+            Entry::Item(item) => {
+                items.push(resolve_item(item, defaults, source_roots, path_index))
+            }
             Entry::Query(query) => {
                 let cat = catalog.ok_or_else(|| {
                     unsupported(format!(
@@ -296,9 +314,10 @@ fn resolve_item(
     item: &ItemEntry,
     defaults: Option<&ProgramMetadata>,
     source_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
 ) -> ResolvedItem {
     ResolvedItem {
-        id: derive_item_id(&item.source, source_roots),
+        id: derive_item_id(&item.source, source_roots, path_index),
         source: item.source.clone(),
         in_point: item.in_point,
         out_point: item.out_point,
@@ -307,16 +326,27 @@ fn resolve_item(
 }
 
 /// Derive a stable, namespaced identity for an inline item from its source —
-/// items never carry an authored id. A local file hashes its canonical path
-/// (root-stripped so the same file under two mount roots is one identity),
-/// producing the same `fs:` identity a filesystem ingester would; a generated
-/// or remote source keys on its defining field. The result feeds within-block
-/// duplicate collapse and the regeneration anchor, so it must be deterministic.
-fn derive_item_id(source: &SourceConfig, source_roots: &[String]) -> String {
+/// items never carry an authored id. A local file canonicalises its path
+/// (root-stripped so the same file under two mount roots is one identity) and,
+/// when a catalog `path_index` is present, **inherits the catalog's `entry_id`
+/// for that file** — so a manual item and a `query` result for the same physical
+/// file share an identity and collapse. With no catalog it falls back to the
+/// same `fs:` path hash a filesystem ingester would mint. A generated or remote
+/// source keys on its defining field. The result feeds within-block duplicate
+/// collapse and the regeneration anchor, so it must be deterministic.
+fn derive_item_id(
+    source: &SourceConfig,
+    source_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
+) -> String {
     match source {
         SourceConfig::Local { path } => {
             let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
-            derive_entry_id(&[], &canonical_path(path, &roots))
+            let canonical = canonical_path(path, &roots);
+            path_index
+                .and_then(|idx| idx.get(&canonical))
+                .cloned()
+                .unwrap_or_else(|| derive_entry_id(&[], &canonical))
         }
         SourceConfig::Lavfi { params } => format!("lavfi:{params}"),
         SourceConfig::Http { uri, .. } => format!("http:{uri}"),
@@ -726,6 +756,26 @@ mod tests {
         inc.duplicates = Some(Duplicates::Keep);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None).unwrap();
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn manual_local_item_collapses_with_a_query_for_the_same_file() {
+        // The payoff of catalog-aware identity: a block holds a manual `local`
+        // item pointing at a library file AND a query that returns that same
+        // file. The manual item inherits the catalog entry_id, so the two
+        // collapse to one under the default policy — three films, not four.
+        let cat = seeded_catalog();
+        let inc = include_with(vec![
+            Entry::Item(local_entry("/media/lotr/imdb:tt0120737.mkv")),
+            Entry::Query(QueryEntry {
+                query: "item.year >= 2001".into(),
+                order: None,
+            }),
+        ]);
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(items.len(), 3);
+        assert!(ids.contains(&"imdb:tt0120737"));
     }
 
     #[test]

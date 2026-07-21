@@ -34,6 +34,7 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
         &mut station,
         std::env::var("ETV_STATION_TZ").ok(),
         std::env::var("ETV_STATION_OUTPUT_BASE").ok(),
+        std::env::var("ETV_STATION_CATALOG").ok(),
     );
     validate::validate_station(station_path, &station)?;
 
@@ -87,6 +88,7 @@ fn apply_env_overrides(
     station: &mut StationConfig,
     tz: Option<String>,
     output_base: Option<String>,
+    catalog_path: Option<String>,
 ) {
     if let Some(tz) = tz
         && !tz.trim().is_empty()
@@ -97,6 +99,11 @@ fn apply_env_overrides(
         && !base.trim().is_empty()
     {
         station.output_base = PathBuf::from(base);
+    }
+    if let Some(path) = catalog_path
+        && !path.trim().is_empty()
+    {
+        station.catalog_path = Some(path);
     }
 }
 
@@ -569,6 +576,7 @@ mod tests {
             output_base: PathBuf::from("out"),
             channels: vec!["channels/a.yaml".into()],
             source_roots: vec![],
+            catalog_path: None,
         }
     }
 
@@ -579,17 +587,20 @@ mod tests {
             &mut s,
             Some("America/Chicago".into()),
             Some("/shared/playout".into()),
+            Some("/var/lib/etv/catalog.db".into()),
         );
         assert_eq!(s.tz, "America/Chicago");
         assert_eq!(s.output_base, PathBuf::from("/shared/playout"));
+        assert_eq!(s.catalog_path.as_deref(), Some("/var/lib/etv/catalog.db"));
     }
 
     #[test]
     fn env_overrides_ignore_absent_and_blank() {
         let mut s = station_config();
-        apply_env_overrides(&mut s, None, Some("   ".into()));
+        apply_env_overrides(&mut s, None, Some("   ".into()), Some("  ".into()));
         assert_eq!(s.tz, "UTC");
         assert_eq!(s.output_base, PathBuf::from("out"));
+        assert_eq!(s.catalog_path, None);
     }
 
     #[test]

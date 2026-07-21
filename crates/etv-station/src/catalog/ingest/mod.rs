@@ -20,7 +20,7 @@ use super::{Catalog, CatalogError};
 /// When one canonical path resolves to multiple entries — a stale `fs:` entry
 /// from an early FS scan plus a Plex/GUID entry — the **stronger** (non-`fs:`)
 /// id wins, so the file merges onto the richer record rather than staying split.
-pub(super) fn canonical_index(
+pub(crate) fn canonical_index(
     catalog: &Catalog,
     roots: &[&str],
 ) -> Result<HashMap<String, String>, CatalogError> {

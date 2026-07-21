@@ -74,6 +74,8 @@ Sonarr/Radarr ingesters deferred until a concrete Plex gap appears. LAVFI / HTTP
 
 The query language (Phase A picks the off-the-shelf option, candidate: CEL) translates to indexed sqlite reads. Channel TOML carries live queries; the daemon resolves at boot, snapshots the resulting item list for the chunk window, and refreshes the catalog on a per-source interval (24h Plex, 1h local-FS by default). Stateless determinism is preserved — the snapshot is the durable list; the catalog itself is the deterministically-rebuildable substrate. WAL mode means the refresh task can write while query reads stay consistent.
 
+**Wiring status (#96).** The daemon opens the catalog once at startup when the station config sets `catalog_path`, runs a full ingest pass (local-FS over `source_roots`; Plex when `PLEX_URL`/`PLEX_TOKEN` are set — a missing/failing source is logged, never fatal), and shares the open handle (`Arc<Mutex<Catalog>>`) into each channel task, which locks it only for the synchronous resolve. A catalog-free station (no `catalog_path`) still runs — `query` / non-`manual` channels just error at resolve. Beyond identity, this is what lets a manual `local` item **inherit** the catalog's `entry_id` for its file, so it collapses against a `query` returning the same physical file. Per-source refresh intervals, delta sync, and a manual re-ingest trigger are still follow-ups (#91/#96); today it's a startup full ingest.
+
 ### Graphics overlay cascade (Phase B)
 
 `etv-station` emits overlay configuration in the playout JSON; **etv-next is the actual renderer** in the existing output pipeline. This requires a deliberate `PlayoutItem` schema extension on the etv-next side — the only planned submodule change in v2+.

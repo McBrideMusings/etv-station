@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
 use time::OffsetDateTime;
@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use tracing::Instrument;
 
 use crate::anchor;
+use crate::catalog::Catalog;
 use crate::config::{LoadedChannel, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
@@ -29,6 +30,10 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // starts a fresh generation; SIGTERM/SIGINT stops the current generation
     // and exits. The first generation runs the config passed in at startup.
     let mut station = Arc::new(station);
+    // Open + populate the station-wide catalog once, before the first generation,
+    // so it survives reloads (#96). A catalog-free station keeps working: query /
+    // non-`manual` channels just error in `resolve_channel` as before.
+    let catalog = open_and_ingest_catalog(&station).await?;
     // The last config that prepared cleanly. A `prepare_generation` failure on a
     // reload reverts to this instead of killing a daemon that's streaming fine.
     // See #90 and docs/adr/0001-reload-generation-revert.md.
@@ -60,7 +65,8 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         // Spawn the generation, run it until a signal, then tear it down. The
         // whole generation is joined before we return here, which is what lets
         // the `station` Arc be swapped safely below (no task still reads it).
-        let (do_reload, first_err) = run_generation(&station, tz, &shutdown, &reload).await;
+        let (do_reload, first_err) =
+            run_generation(&station, tz, catalog.as_ref(), &shutdown, &reload).await;
 
         // On shutdown a channel that failed on its own becomes the daemon's exit
         // error. `channel_loop` only returns `Err` from its startup section
@@ -95,6 +101,58 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     }
 }
 
+/// Open the station catalog (if `catalog_path` is set) and populate it with a
+/// full ingest pass at startup, returning a shareable handle for the channel
+/// tasks. `None` → the station is catalog-free and only inline `manual` channels
+/// resolve. Opening is fatal (a broken db must not be silently ignored); an
+/// ingest failure is logged and the daemon continues with whatever was written —
+/// a Plex outage or a bad media root shouldn't take playout down. Delta sync,
+/// the refresh TTL, and a manual re-ingest trigger are follow-ups (#91/#96).
+async fn open_and_ingest_catalog(
+    station: &Station,
+) -> Result<Option<Arc<Mutex<Catalog>>>, StationError> {
+    let Some(path) = station
+        .station
+        .catalog_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let catalog = Catalog::open(path)?;
+    let source_roots = &station.station.source_roots;
+
+    // Local filesystem: scan the media roots (identity is canonicalised against
+    // the same roots).
+    let fs_roots: Vec<PathBuf> = source_roots.iter().map(PathBuf::from).collect();
+    match crate::catalog::ingest::fs::ingest_roots(&catalog, &fs_roots, source_roots).await {
+        Ok(stats) => tracing::info!(
+            event = "catalog.ingest.fs",
+            entries = stats.entries_written,
+            sources = stats.sources_written,
+            "local-fs catalog ingest complete",
+        ),
+        Err(e) => tracing::error!(event = "catalog.ingest.fs_failed", error = %e, "local-fs catalog ingest failed; continuing"),
+    }
+
+    // Plex: only when both env vars are set — an unconfigured Plex is normal, not
+    // an error.
+    if std::env::var_os("PLEX_URL").is_some() && std::env::var_os("PLEX_TOKEN").is_some() {
+        match crate::catalog::ingest::plex::ingest_from_env(&catalog, source_roots) {
+            Ok(stats) => tracing::info!(
+                event = "catalog.ingest.plex",
+                entries = stats.entries_written,
+                sources = stats.sources_written,
+                "plex catalog ingest complete",
+            ),
+            Err(e) => tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing"),
+        }
+    }
+
+    Ok(Some(Arc::new(Mutex::new(catalog))))
+}
+
 /// Spawn one generation's channel + overlay tasks against `station`, run until a
 /// shutdown or reload signal, then stop every task and join it. Returns
 /// `(do_reload, first_err)`: whether the signal was a reload (vs. shutdown), and
@@ -106,6 +164,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
 async fn run_generation(
     station: &Arc<Station>,
     tz: &'static Tz,
+    catalog: Option<&Arc<Mutex<Catalog>>>,
     shutdown: &Notify,
     reload: &Notify,
 ) -> (bool, Option<StationError>) {
@@ -133,6 +192,7 @@ async fn run_generation(
             }));
         }
         let s = station.clone();
+        let cat = catalog.cloned();
         let stop = Arc::new(Notify::new());
         stops.push(stop.clone());
         let channel_name = station.channels[idx].name.clone();
@@ -143,7 +203,8 @@ async fn run_generation(
         handles.push(tokio::spawn(
             async move {
                 let ch = &s.channels[idx];
-                let result = channel_loop(ch, tz, &s.station.source_roots, stop).await;
+                let result =
+                    channel_loop(ch, tz, &s.station.source_roots, cat.as_deref(), stop).await;
                 // A channel_loop error is fatal to THIS channel. Task handles
                 // are only joined at shutdown (see below), so without logging
                 // here a startup failure — a failed duration probe, unreadable
@@ -379,17 +440,34 @@ async fn channel_loop(
     channel: &LoadedChannel,
     tz: &'static Tz,
     source_roots: &[String],
+    catalog: Option<&Mutex<Catalog>>,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
     // `run` creates every channel's output_folder synchronously before spawning
     // this task (see #34), so it exists by the time we scan/emit into it here.
     let output = &channel.output_folder;
 
-    // The station-wide catalog is not yet opened by the daemon (#71 follow-up);
-    // until then only inline-item, `manual`-order channels resolve. Query
-    // entries and non-`manual` order error clearly via `resolve_channel`.
-    let items =
-        crate::resolve::resolve_channel(&channel.config, &channel.config_path, source_roots, None)?;
+    // Resolve this channel's items. With a catalog, `query` entries and
+    // non-`manual` order resolve and manual items path-match onto catalog
+    // identities; without one, only inline-item `manual` channels resolve (others
+    // error clearly in `resolve_channel`). The lock is held only across the
+    // synchronous resolve — never an await — so `std::sync::Mutex` is fine. The
+    // guard lives inside this block, so it is dropped before the first await below.
+    let items = {
+        // Recover from a poisoned lock rather than panicking: nothing is ever
+        // written through this mutex (the catalog is fully ingested before it is
+        // shared), so the guarded data is still valid if another channel task
+        // panicked while resolving. Asserting here instead would cascade one
+        // panic into every channel — and, since the catalog outlives reloads,
+        // into every future generation too.
+        let guard = catalog.map(|mutex| mutex.lock().unwrap_or_else(|e| e.into_inner()));
+        crate::resolve::resolve_channel(
+            &channel.config,
+            &channel.config_path,
+            source_roots,
+            guard.as_deref(),
+        )?
+    };
 
     let mut cache = DurationCache::load(output).await?;
     let (durations, stats) = cache.resolve_all(&items).await?;
@@ -615,6 +693,35 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         prepare_generation(&station)
             .await
             .expect("valid config should prepare");
+    }
+
+    #[tokio::test]
+    async fn catalog_disabled_when_no_path() {
+        // A station without `catalog_path` stays catalog-free — today's behavior.
+        let (_dir, path) = write_station("UTC");
+        let station = crate::config::load(&path).unwrap();
+        assert!(open_and_ingest_catalog(&station).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_opens_and_ingests_when_path_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_base = dir.path().join("out");
+        let db = dir.path().join("catalog.db");
+        let station_toml = format!(
+            "tz = \"UTC\"\noutput_base = {:?}\ncatalog_path = {:?}\nchannels = [\"channel.toml\"]\n",
+            out_base.to_string_lossy(),
+            db.to_string_lossy(),
+        );
+        std::fs::write(dir.path().join("station.toml"), station_toml).unwrap();
+        std::fs::write(dir.path().join("channel.toml"), CHANNEL_BODY).unwrap();
+        let station = crate::config::load(&dir.path().join("station.toml")).unwrap();
+
+        // No source_roots + no Plex env → a clean, empty ingest that still opens
+        // the db and returns a shareable handle.
+        let catalog = open_and_ingest_catalog(&station).await.unwrap();
+        assert!(catalog.is_some());
+        assert!(db.exists());
     }
 
     #[tokio::test]

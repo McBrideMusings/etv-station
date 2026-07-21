@@ -178,6 +178,7 @@ mod tests {
             output_base: PathBuf::from("out"),
             channels: vec![],
             source_roots: vec![],
+            catalog_path: None,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         let msg = format!("{err}");
@@ -191,6 +192,7 @@ mod tests {
             output_base: PathBuf::new(),
             channels: vec!["channels/a.yaml".into()],
             source_roots: vec![],
+            catalog_path: None,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
@@ -203,6 +205,7 @@ mod tests {
             output_base: PathBuf::from("out"),
             channels: vec!["  ".into()],
             source_roots: vec![],
+            catalog_path: None,
         };
         assert!(validate_station(&dummy_path(), &s).is_err());
     }
