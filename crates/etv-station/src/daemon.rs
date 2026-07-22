@@ -897,6 +897,12 @@ async fn pattern_catch_up(
         // the same walk `Sequential` just emitted: items laid end to end from
         // `from`, which is why the whole generation is emitted rather than
         // clamped — a row must correspond to something actually on disk.
+        //
+        // `written_at` is read per generation rather than reusing the tick's
+        // `now`: a catch-up can chain many generations, and stamping them all
+        // with the moment the tick began would misreport when each was
+        // actually scheduled.
+        let written_at = OffsetDateTime::now_utc();
         let mut airing = from;
         let records: Vec<crate::history::PlayRecord> = items
             .iter()
@@ -908,7 +914,7 @@ async fn pattern_catch_up(
                     entry_id: item.id.clone(),
                     show_id: show_ids.get(&item.id).cloned(),
                     start,
-                    played_at: now,
+                    played_at: written_at,
                 }
             })
             .collect();
