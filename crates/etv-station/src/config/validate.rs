@@ -119,6 +119,20 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
             message: format!("block #{idx}: {message}"),
         };
 
+        // Checked before the pattern/entries split: `[constraints]` applies to
+        // either kind of block, so this must not sit on one branch only.
+        // An explicit `no_repeat_within = 0` reads as "on" but constrains
+        // nothing. Reject it so the author writes the gap they meant, or omits
+        // the field.
+        if include.constraints().no_repeat_within == Some(0) {
+            return Err(ConfigError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "block #{idx}: no_repeat_within must be > 0 (omit it to leave the block unconstrained)"
+                ),
+            });
+        }
+
         if include.is_pattern() {
             validate_pattern_block(include, &mut pool_names, &bad)?;
             continue;
@@ -134,18 +148,6 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // authored — so there is no id to validate here. Within-block duplicates
         // (two entries resolving to the same file) collapse in `resolve`, they
         // are not a config error. `duplicates = "keep"` opts out of the collapse.
-
-        // An explicit `no_repeat_within = 0` reads as "on" but constrains
-        // nothing. Reject it so the author writes the gap they meant, or omits
-        // the field.
-        if include.constraints().no_repeat_within == Some(0) {
-            return Err(ConfigError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "block #{idx}: no_repeat_within must be > 0 (omit it to leave the block unconstrained)"
-                ),
-            });
-        }
     }
 
     Ok(())
