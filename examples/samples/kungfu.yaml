@@ -1,0 +1,86 @@
+# Sample S10 — Kung Fu Theater: a shuffled pile with a Jackie Chan cadence.
+#
+# Mostly a shuffled pile of martial-arts films, with a Jackie Chan film injected
+# every fifth slot — and never the same film twice in a row, including across a
+# window seam.
+#
+# What this exercises that no other sample does:
+#   - `item.cast.contains(...)` — filtering by performer, from Plex `Role` tags
+#   - `[constraints] no_repeat_within` — the post-order adjacency pass (#73)
+#   - two pools that are **disjoint by construction** rather than by policy
+#
+# Disjoint by construction. Both pools require the Martial Arts genre; `pile`
+# then excludes Jackie Chan and `jackie` requires him, so no film can be drawn
+# from both — the two sets cannot overlap however the catalog changes. That is
+# deliberate: the pattern draws each step from a named pool and does nothing to
+# stop two pools sharing a film, so keeping them apart is the expression's job,
+# not the scheduler's. Write the negation and it holds; leave it out and a
+# Jackie Chan film would also sit in the pile, showing up in both the 4-slot run
+# and the 1-slot injection.
+#
+# Why `no_repeat_within` and not `duplicates`. They answer different questions.
+# `duplicates` is identity over the whole resolved list — it would collapse a
+# film to a single appearance for the entire window, which is not wanted here:
+# a 30-film pile SHOULD come round again. `no_repeat_within: 1` is identity over
+# *adjacent positions* only — play everything as often as the pile dictates,
+# just never twice in a row. A pattern block forces `duplicates: keep` for
+# exactly this reason, so repeats survive to reach the adjacency pass.
+#
+# The seam. The channel is materialized forward one generation at a time, so the
+# first film of a new generation airs immediately after the last film of the
+# previous one. The adjacency pass reads that boundary out of the play-history
+# ledger (`.history`), which is what keeps the constraint true across it rather
+# than only within one generation's list.
+#
+# Lives in examples/samples/, not examples/channels/, so the dev station never
+# registers it: a query channel needs a populated catalog + the daemon-side
+# catalog wiring (#96) to run live. Its resolution is proven by the
+# `kungfu_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+# no seed → a fresh shuffle each generation
+
+rule:
+  blocks:
+    - mode: "all"
+      program:
+        title: "Kung Fu Theater"
+        categories: ["Movie"]
+
+      # Never the same film back-to-back, wherever in the pattern the two
+      # occurrences land — and across the generation seam too.
+      constraints:
+        no_repeat_within: 1
+
+      pools:
+        # The pile: every martial-arts film that is NOT a Jackie Chan picture.
+        # Reshuffled each generation, so the run order stays fresh.
+        - name: pile
+          expr: 'item.genres.contains("Martial Arts") && !item.cast.contains("Jackie Chan")'
+          order: "random"
+          select: round_robin
+
+        # The cadence: Jackie Chan martial-arts films. Each is its own series
+        # of one (a movie has no `show_id`), so round-robin here simply plays
+        # them in the shuffled order and starts over at the end.
+        #
+        # The genre term is not redundant with the pile's. Cast alone would
+        # qualify every Jackie Chan picture in the library — including the
+        # comedies and the Hollywood buddy films — and drop them into a channel
+        # called Kung Fu Theater. Both pools have to say what KIND of film this
+        # channel plays; only the Jackie Chan term differs between them.
+        - name: jackie
+          expr: 'item.genres.contains("Martial Arts") && item.cast.contains("Jackie Chan")'
+          order: "random"
+          select: round_robin
+
+      # Four from the pile, then one Jackie Chan film. Repeated to fill the
+      # window — `cycles` is left unset, so it defaults to enough passes for the
+      # largest pool to play through once.
+      pattern:
+        - pool: pile
+          take: 4
+        - pool: jackie
+          take: 1

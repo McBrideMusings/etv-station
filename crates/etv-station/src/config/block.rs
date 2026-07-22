@@ -1,6 +1,7 @@
 use ersatztv_playout::playout::ProgramMetadata;
 use serde::{Deserialize, Serialize};
 
+use super::constraints::Constraints;
 use super::entry::Entry;
 use super::pool::{PatternStep, Pool};
 
@@ -34,6 +35,11 @@ pub struct BlockFile {
     /// said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duplicates: Option<Duplicates>,
+
+    /// Post-order adjacency constraints (#73). `None` leaves the block
+    /// unconstrained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<Constraints>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<Entry>,

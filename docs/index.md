@@ -19,8 +19,8 @@ hero:
 features:
   - title: Filesystem-only contract
     details: Writes playout JSON to a shared volume; ETV-next reads it. No IPC, no shared schema fork, no network coupling.
-  - title: Plug-in sequencing rules
-    details: v1 ships Loop Forever. The rule trait is designed for recurring grids, shuffle, hybrid, and live-event injection in v2+.
+  - title: Composable sequencing
+    details: Blocks of entries or pool/pattern interleaves resolve into one ordered list per generation, materialized forward. Recurring grids and live-event injection follow in v2+.
   - title: Schema-locked to ETV-next
     details: Depends on ETV-next's `ersatztv-playout` Rust crate via a git submodule. Schema drift becomes a compile-time question, not a runtime surprise.
 ---

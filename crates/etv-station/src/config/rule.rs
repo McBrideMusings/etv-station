@@ -4,6 +4,7 @@ use ersatztv_playout::playout::ProgramMetadata;
 use serde::{Deserialize, Serialize};
 
 use super::block::{BlockFile, Duplicates};
+use super::constraints::Constraints;
 use super::entry::Entry;
 use super::filter::Filter;
 use super::mode::Mode;
@@ -41,6 +42,11 @@ pub struct BlockInclude {
     /// [`Duplicates`] default (`collapse`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duplicates: Option<Duplicates>,
+
+    /// Inline form: post-order adjacency constraints (#73). `None` resolves to
+    /// the [`Constraints`] default (unconstrained).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<Constraints>,
 
     /// Inline form: the flat entries list (empty in path form until resolved).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -95,6 +101,11 @@ impl BlockInclude {
         self.duplicates.unwrap_or_default()
     }
 
+    /// The effective adjacency constraints (defaulting to unconstrained).
+    pub fn constraints(&self) -> Constraints {
+        self.constraints.clone().unwrap_or_default()
+    }
+
     /// Whether this block interleaves pools via a pattern rather than playing a
     /// flat `entries` list. True as soon as either pattern field is present, so
     /// a half-specified block (pools without pattern) reaches validation and
@@ -109,6 +120,7 @@ impl BlockInclude {
     pub(super) fn apply_body(&mut self, body: BlockFile) {
         self.program = body.program;
         self.duplicates = body.duplicates;
+        self.constraints = body.constraints;
         self.entries = body.entries;
         self.pools = body.pools;
         self.pattern = body.pattern;

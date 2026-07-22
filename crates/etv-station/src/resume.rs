@@ -11,8 +11,7 @@
 //! **Where each series left off is not here** — that is the play-history
 //! ledger's job (#70, [`crate::history`]), and the cursor is a projection of
 //! it. This sidecar holds only what the ledger cannot express: whose turn the
-//! rotation is on, which series have dropped out, and the checkpoints that make
-//! a rewind possible. Keeping the position in exactly one place is the point;
+//! rotation is on, and the checkpoints that make a rewind possible. Keeping the position in exactly one place is the point;
 //! two stores of "where are we" is the drift #70 exists to prevent.
 //!
 //! Pool names are unique per channel (enforced in config validation), so the
@@ -76,12 +75,6 @@ pub struct PoolResume {
     /// first series of the freshly-resolved set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
-
-    /// Series that have run out under `wrap = "drop"`. They stay out of the
-    /// rotation until new content puts them back in the resolved set — a key
-    /// listed here that no longer resolves is simply ignored.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dropped: Vec<String>,
 }
 
 fn current_version() -> u32 {
@@ -148,6 +141,10 @@ impl ResumeMap {
 pub struct GenerationState {
     pub resume: ResumeMap,
     pub cursor: BTreeMap<String, String>,
+    /// The most recently aired entry ids, oldest first — the adjacency seam the
+    /// `no_repeat_within` pass reads so it does not repeat across a generation
+    /// boundary (#73). Projected from the same ledger as `cursor`.
+    pub tail: Vec<String>,
 }
 
 impl GenerationState {
@@ -232,7 +229,6 @@ mod tests {
         let mut map = ResumeMap::new();
         let shows = PoolResume {
             next: Some("show:invincible".into()),
-            dropped: vec!["show:cancelled".into()],
         };
         map.pools.insert("shows".into(), shows);
         map
@@ -255,7 +251,6 @@ mod tests {
         assert_eq!(map, sample());
         let pool = map.pool("shows").unwrap();
         assert_eq!(pool.next.as_deref(), Some("show:invincible"));
-        assert_eq!(pool.dropped, vec!["show:cancelled".to_string()]);
     }
 
     #[tokio::test]
@@ -294,7 +289,6 @@ mod tests {
     fn pools_with(next_show: &str) -> BTreeMap<String, PoolResume> {
         let pool = PoolResume {
             next: Some(next_show.into()),
-            dropped: Vec::new(),
         };
         BTreeMap::from([("shows".to_string(), pool)])
     }

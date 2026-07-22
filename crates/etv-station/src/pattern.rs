@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog::Catalog;
-use crate::config::{Advance, OnShort, PatternStep, Pool, Rotate, Select, Wrap};
+use crate::config::{Advance, OnShort, PatternStep, Pool, Rotate, Select};
 use crate::resume::{GenerationState, PoolResume};
 
 /// Upper bound on an explicitly-authored `cycles`. A derived count needs no cap
@@ -51,9 +51,6 @@ struct Series {
     ids: Vec<String>,
     /// Index of the next item to play.
     cursor: usize,
-    /// Ran out under `wrap = "drop"`; out of the rotation until new content
-    /// puts it back in the resolved set.
-    dropped: bool,
 }
 
 impl Series {
@@ -72,60 +69,41 @@ struct PoolRuntime<'a> {
 }
 
 impl PoolRuntime<'_> {
-    fn live(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.series.len()).filter(|&i| !self.series[i].dropped)
-    }
-
+    /// A pool is dry only when it resolved to nothing at all — an expression
+    /// that matched no item, or a catalog with none. Playing a series to its end
+    /// never empties a pool: the series loops. Television does not run out.
     fn is_dry(&self) -> bool {
-        self.live().next().is_none()
+        self.series.is_empty()
     }
 
-    /// The next live series at or after `from`, scanning circularly. `None` when
-    /// every series has dropped.
-    fn live_at_or_after(&self, from: usize) -> Option<usize> {
+    /// The series at `i`, wrapping. `None` only when the pool resolved empty —
+    /// every series is always in the rotation, so there is nothing to skip past.
+    fn series_at(&self, i: usize) -> Option<usize> {
         let n = self.series.len();
-        (0..n)
-            .map(|off| (from + off) % n)
-            .find(|&i| !self.series[i].dropped)
+        (n > 0).then(|| i % n)
     }
 
-    fn live_after(&self, si: usize) -> Option<usize> {
-        if self.series.is_empty() {
-            return None;
-        }
-        self.live_at_or_after((si + 1) % self.series.len())
+    fn series_after(&self, si: usize) -> Option<usize> {
+        self.series_at(si + 1)
     }
 
     /// Which series serves next, honouring `select`.
     fn pick(&self, roll: &RollKey, nonce: u64) -> Option<usize> {
-        if self.series.is_empty() {
-            return None;
-        }
         match self.cfg.select {
-            Select::RoundRobin => self.live_at_or_after(self.rotation),
-            Select::Random => {
-                let live: Vec<usize> = self.live().collect();
-                if live.is_empty() {
-                    return None;
-                }
-                Some(live[(roll.u64_at(nonce) as usize) % live.len()])
-            }
+            Select::RoundRobin => self.series_at(self.rotation),
+            Select::Random => self.series_at(roll.u64_at(nonce) as usize),
         }
     }
 
-    /// Take up to `want` items from `si`, advancing its cursor and applying
-    /// `wrap` if it runs off the end. Returns the ids taken.
+    /// Take up to `want` items from `si`, advancing its cursor. A series that
+    /// runs off its end restarts from the top — the only behaviour there is.
     fn take_from(&mut self, si: usize, want: usize) -> Vec<String> {
-        let wrap = self.cfg.wrap;
         let s = &mut self.series[si];
         let n = want.min(s.remaining());
         let out = s.ids[s.cursor..s.cursor + n].to_vec();
         s.cursor += n;
         if s.cursor >= s.ids.len() {
-            match wrap {
-                Wrap::Loop => s.cursor = 0,
-                Wrap::Drop => s.dropped = true,
-            }
+            s.cursor = 0;
         }
         out
     }
@@ -180,11 +158,8 @@ impl PoolRuntime<'_> {
             }
             // Short: someone else has to fill the rest.
             current = match self.cfg.on_short {
-                OnShort::Next => self.live_after(si),
-                // A dropped series can't be looped back to — fall through to
-                // the next one rather than silently emitting nothing.
-                OnShort::Wrap if !self.series[si].dropped => Some(si),
-                OnShort::Wrap => self.live_after(si),
+                OnShort::Next => self.series_after(si),
+                OnShort::Wrap => Some(si),
                 OnShort::Short => None,
             };
         }
@@ -197,7 +172,7 @@ impl PoolRuntime<'_> {
         {
             let served_all = contributed.get(&si).copied().unwrap_or(0) >= take;
             self.rotation = if served_all {
-                self.live_after(si).unwrap_or(si)
+                self.series_after(si).unwrap_or(si)
             } else {
                 si
             };
@@ -216,16 +191,10 @@ impl PoolRuntime<'_> {
             // draws afresh every visit.
             next: match self.cfg.select {
                 Select::RoundRobin => self
-                    .live_at_or_after(self.rotation)
+                    .series_at(self.rotation)
                     .map(|i| self.series[i].key.clone()),
                 Select::Random => None,
             },
-            dropped: self
-                .series
-                .iter()
-                .filter(|s| s.dropped)
-                .map(|s| s.key.clone())
-                .collect(),
         }
     }
 }
@@ -398,7 +367,6 @@ fn resolve_pool<'a>(
                     key,
                     ids: vec![id],
                     cursor: 0,
-                    dropped: false,
                 });
             }
         }
@@ -421,17 +389,9 @@ fn resolve_pool<'a>(
                 && let Some(pos) = s.ids.iter().position(|id| id == last)
             {
                 s.cursor = pos + 1;
-                if s.cursor >= s.ids.len() && cfg.wrap == Wrap::Loop {
+                if s.cursor >= s.ids.len() {
                     s.cursor = 0;
                 }
-            }
-            // A series recorded as dropped stays out — unless new content has
-            // arrived, which `wrap = "drop"` defines as the way back in.
-            if cfg.wrap == Wrap::Drop
-                && prev.is_some_and(|p| p.dropped.contains(&s.key))
-                && s.cursor >= s.ids.len()
-            {
-                s.dropped = true;
             }
         }
         if let Some(next) = prev.and_then(|p| p.next.as_ref())
@@ -497,7 +457,6 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
-            wrap: Wrap::Loop,
             on_short: OnShort::Next,
         }
     }
@@ -510,7 +469,6 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
-            wrap: Wrap::Loop,
             on_short: OnShort::Next,
         }
     }
@@ -549,7 +507,15 @@ mod tests {
             let key = show_ids.get(id).cloned().unwrap_or_else(|| id.clone());
             cursor.insert(key, id.clone());
         }
-        (ids, GenerationState { resume, cursor })
+        let tail = ids.clone();
+        (
+            ids,
+            GenerationState {
+                resume,
+                cursor,
+                tail,
+            },
+        )
     }
 
     /// The headline acceptance criterion: `{movies take=1}, {shows take=3}`
@@ -688,13 +654,13 @@ mod tests {
             "shows".into(),
             PoolResume {
                 next: Some("show:inv".into()),
-                ..Default::default()
             },
         );
         // The ledger remembers an airing whose entry has since left the
         // catalog — the id no longer resolves to anything in got's series.
         let state = GenerationState {
             resume,
+            tail: Vec::new(),
             cursor: BTreeMap::from([
                 ("show:got".to_string(), "got-e99-deleted".to_string()),
                 ("show:inv".to_string(), "inv-e2".to_string()),
@@ -725,32 +691,32 @@ mod tests {
         );
     }
 
-    /// `wrap = "drop"` takes an exhausted show out of the rotation while the
-    /// longer show keeps going, then skips the step once the pool is empty.
+    /// A pool never runs out: once every series has played to its end they all
+    /// start over, and the channel keeps broadcasting. There is no state in
+    /// which a step emits nothing because its content was consumed.
     #[test]
-    fn wrap_drop_removes_an_exhausted_show_then_the_pool() {
+    fn a_pool_played_past_its_end_starts_over_rather_than_running_dry() {
         let mut p = shows_pool();
-        p.wrap = Wrap::Drop;
         p.on_short = OnShort::Short;
-        let (ids, resume) = build_with(
+        let (ids, _) = build_with(
             vec![p],
             vec![step("shows", 3)],
             Some(6),
             &GenerationState::empty(),
             0,
         );
-        // got: e1-3, e4-6 then dropped. inv: e1-3 then dropped. Once both are
-        // out the pool is dry and the remaining cycles emit nothing.
+        // got has 6 episodes, inv has 3. Six visits of 3 fill every slot:
+        // both shows loop back to their own start instead of dropping out.
+        assert_eq!(ids.len(), 18, "every visit must be filled: {ids:?}");
         assert_eq!(
-            ids,
-            vec![
+            &ids[0..9],
+            &[
                 "got-e1", "got-e2", "got-e3", "inv-e1", "inv-e2", "inv-e3", "got-e4", "got-e5",
-                "got-e6",
+                "got-e6"
             ]
         );
-        let pool = resume.resume.pool("shows").unwrap();
-        assert!(pool.dropped.contains(&"show:got".to_string()));
-        assert!(pool.dropped.contains(&"show:inv".to_string()));
+        // The seventh visit is got's turn again and it restarts from e1.
+        assert_eq!(&ids[12..15], &["got-e1", "got-e2", "got-e3"]);
     }
 
     /// `on_short = "next"` keeps the visit whole: the slots the current show
@@ -759,7 +725,6 @@ mod tests {
     #[test]
     fn on_short_next_fills_from_the_following_show_and_continues_it() {
         let mut p = shows_pool();
-        p.wrap = Wrap::Drop;
         p.on_short = OnShort::Next;
         let (ids, _) = build_with(
             vec![p],
@@ -819,7 +784,6 @@ mod tests {
     fn on_short_short_emits_a_shorter_visit() {
         let mut p = shows_pool();
         p.expr = "item.show == \"inv\"".into();
-        p.wrap = Wrap::Drop;
         p.on_short = OnShort::Short;
         let (ids, _) = build_with(
             vec![p],

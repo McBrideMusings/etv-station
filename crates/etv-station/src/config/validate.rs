@@ -44,9 +44,9 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
 }
 
 /// Reject two channels that write to the same `output_folder`. A shared folder
-/// silently misbehaves: both channels fight over the `.anchor` sidecar and each
-/// startup prunes the other's `.durations.json` cache, forcing re-probes on
-/// every restart.
+/// silently misbehaves: both channels fight over the `.resume` and `.history`
+/// sidecars and each startup prunes the other's `.durations.json` cache,
+/// forcing re-probes on every restart.
 ///
 /// Folders are compared exactly as the daemon uses them — verbatim, relative to
 /// the single process CWD (see `daemon::channel_loop`, which uses
@@ -119,6 +119,10 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
             message: format!("block #{idx}: {message}"),
         };
 
+        // Checked before the pattern/entries split: `[constraints]` applies to
+        // either kind of block, so this must not sit on one branch only.
+        validate_constraints(include, &bad)?;
+
         if include.is_pattern() {
             validate_pattern_block(include, &mut pool_names, &bad)?;
             continue;
@@ -134,6 +138,53 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // authored — so there is no id to validate here. Within-block duplicates
         // (two entries resolving to the same file) collapse in `resolve`, they
         // are not a config error. `duplicates = "keep"` opts out of the collapse.
+    }
+
+    Ok(())
+}
+
+/// Semantic checks for a block's `[constraints]` (#73), for either block kind.
+///
+/// Every refusal here is the same shape: a constraint the config states but that
+/// would not actually constrain anything. Silently doing nothing is the failure
+/// mode worth preventing — the author reads the file, sees a rule, and believes
+/// it holds.
+fn validate_constraints(
+    include: &BlockInclude,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let c = include.constraints();
+
+    // An explicit `0` reads as "on" but spaces nothing apart.
+    if c.no_repeat_within == Some(0) {
+        return Err(bad(
+            "no_repeat_within must be > 0 (omit it to leave the block unconstrained)".into(),
+        ));
+    }
+    if c.separate_min_gap == Some(0) {
+        return Err(bad(
+            "separate_min_gap must be > 0 (omit separate_by to leave the block unconstrained)"
+                .into(),
+        ));
+    }
+
+    // A gap with no field to separate on. Accepting it would silently ignore a
+    // line the author clearly meant to do something.
+    if c.separate_min_gap.is_some() && c.separate_by.is_none() {
+        return Err(bad(
+            "separate_min_gap needs separate_by to say which field to separate on".into(),
+        ));
+    }
+
+    // A field that isn't multi-valued has nothing to intersect, so separating on
+    // it would quietly never fire.
+    if let Some(field) = &c.separate_by
+        && crate::catalog::TagNs::from_query_field(field).is_none()
+    {
+        return Err(bad(format!(
+            "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
+            crate::catalog::TagNs::QUERY_FIELDS.join(", ")
+        )));
     }
 
     Ok(())
@@ -233,7 +284,7 @@ mod tests {
     use super::*;
     use crate::config::{
         Advance, BlockInclude, ChannelConfig, Entry, ItemEntry, Mode, OnShort, Order, PatternStep,
-        Pool, Rotate, RuleConfig, Select, SourceConfig, StationConfig, Wrap,
+        Pool, Rotate, RuleConfig, Select, SourceConfig, StationConfig,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -258,6 +309,7 @@ mod tests {
             block: None,
             program: None,
             duplicates: None,
+            constraints: None,
             entries,
             pools: Vec::new(),
             pattern: Vec::new(),
@@ -276,7 +328,6 @@ mod tests {
             select: Select::default(),
             rotate: Rotate::default(),
             advance: Advance::default(),
-            wrap: Wrap::default(),
             on_short: OnShort::default(),
         }
     }
@@ -304,6 +355,7 @@ mod tests {
             roll_interval: Duration::from_secs(3600),
             retention_days: 1,
             seed: None,
+            anchor: None,
             rule: RuleConfig { blocks },
             overlay: None,
         }
@@ -360,6 +412,119 @@ mod tests {
         let ch = channel_with(vec![inline_block(vec![])]);
         let err = validate_channel(&dummy_path(), &ch).unwrap_err();
         assert!(format!("{err}").contains("no entries"));
+    }
+
+    #[test]
+    fn rejects_zero_no_repeat_within() {
+        let mut block = inline_block(vec![item_entry("a")]);
+        block.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(0),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        assert!(format!("{err}").contains("no_repeat_within must be > 0"));
+    }
+
+    fn with_constraints(c: crate::config::Constraints) -> ChannelConfig {
+        let mut block = inline_block(vec![item_entry("a"), item_entry("b")]);
+        block.constraints = Some(c);
+        channel_with(vec![block])
+    }
+
+    #[test]
+    fn rejects_a_zero_separate_min_gap() {
+        let err = validate_channel(
+            &dummy_path(),
+            &with_constraints(crate::config::Constraints {
+                no_repeat_within: None,
+                separate_by: Some("cast".into()),
+                separate_min_gap: Some(0),
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("separate_min_gap must be > 0"),
+            "msg = {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_separate_min_gap_with_no_field() {
+        // A gap with nothing to separate on would be silently ignored — which
+        // is exactly the failure the author could not see from the file.
+        let err = validate_channel(
+            &dummy_path(),
+            &with_constraints(crate::config::Constraints {
+                no_repeat_within: None,
+                separate_by: None,
+                separate_min_gap: Some(2),
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("needs separate_by"),
+            "msg = {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_separating_on_a_field_that_is_not_multi_valued() {
+        // `title` is a single string, so intersecting it would never fire.
+        let err = validate_channel(
+            &dummy_path(),
+            &with_constraints(crate::config::Constraints {
+                no_repeat_within: None,
+                separate_by: Some("title".into()),
+                separate_min_gap: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("not a multi-valued field"),
+            "msg = {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_separate_by_on_a_multi_valued_field() {
+        validate_channel(
+            &dummy_path(),
+            &with_constraints(crate::config::Constraints {
+                no_repeat_within: Some(1),
+                separate_by: Some("cast".into()),
+                separate_min_gap: Some(3),
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn adjacency_reach_is_the_widest_gap_across_blocks() {
+        let mut a = inline_block(vec![item_entry("a")]);
+        a.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(2),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        let mut b = inline_block(vec![item_entry("b")]);
+        b.constraints = Some(crate::config::Constraints {
+            no_repeat_within: None,
+            separate_by: Some("cast".into()),
+            separate_min_gap: Some(5),
+        });
+        assert_eq!(channel_with(vec![a, b]).adjacency_reach(), 5);
+    }
+
+    #[test]
+    fn accepts_a_positive_no_repeat_within() {
+        let mut block = inline_block(vec![item_entry("a"), item_entry("b")]);
+        block.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(1),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap();
     }
 
     #[test]

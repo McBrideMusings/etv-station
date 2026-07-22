@@ -2,10 +2,12 @@
 //!
 //! The Phase C resolve pipeline (#71): for each `[[rule.blocks]]` it
 //! **resolves entries → applies `duplicates` → applies `order` → (mode)**,
-//! producing the flat [`ResolvedItem`] list the window-filling sequencer
-//! ([`crate::rule::LoopForever`]) loops across the chunk window. Collapse runs
+//! producing the flat [`ResolvedItem`] list the sequencer
+//! ([`crate::rule::Sequential`]) lays across the chunk window. Collapse runs
 //! *before* order, so which duplicate survives is deterministic regardless of a
-//! `random` shuffle.
+//! `random` shuffle. The blocks concatenate, then the adjacency constraint pass
+//! ([`crate::constrain`], #73) runs once over the whole list, reaching back
+//! across the generation seam via the play-history ledger.
 //!
 //! `query` entries resolve against the [`Catalog`] (#68 CEL→SQL) and each
 //! resolved `entry_id` becomes a `ResolvedItem`; `order` is applied by the
@@ -27,11 +29,12 @@ use std::time::Duration;
 
 use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
-use crate::catalog::{Catalog, canonical_path, derive_entry_id};
+use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
     BlockInclude, ChannelConfig, CollectionEntry, Duplicates, Entry, ItemEntry, Mode, Order,
     QueryEntry, SourceConfig,
 };
+use crate::constrain::{ItemKeys, Limits};
 use crate::errors::ConfigError;
 use crate::resume::{GenerationState, ResumeMap};
 
@@ -110,6 +113,13 @@ pub fn resolve_channel_with_resume(
     // `query` result for the same physical file (manual∩query dedup).
     let mut out = Vec::new();
     let mut resume_out = ResumeMap::new();
+    // Each item carries its own block's adjacency limits, so the constraint
+    // pass runs once over the concatenated list and still covers block joins —
+    // which a per-block pass would leave open.
+    let mut limits: Vec<Limits> = Vec::new();
+    // The field each block separates on, if any. Kept per block because two
+    // blocks may separate on different fields.
+    let mut separate_fields: Vec<Option<String>> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
         let block_items = resolve_block(
             include,
@@ -122,26 +132,133 @@ pub fn resolve_channel_with_resume(
             state,
             &mut resume_out,
         )?;
+        let c = include.constraints();
+        limits.resize(
+            limits.len() + block_items.len(),
+            Limits {
+                no_repeat: c.no_repeat_gap(),
+                separate: c.separate_gap(),
+            },
+        );
+        separate_fields.resize(
+            separate_fields.len() + block_items.len(),
+            c.separate_by.clone(),
+        );
         out.extend(block_items);
     }
 
     if out.is_empty() {
-        // A pattern channel whose pools have all dropped out (`wrap = "drop"`,
-        // every series exhausted) has legitimately reached the end of its
-        // content. That is a runtime state, not a broken config, and reporting
-        // it as an error would make the daemon log the same failure on every
-        // roll tick forever. It is only a config error when nothing has *ever*
-        // played — an empty `resume_in` — which is the real "bad expr / empty
-        // catalog" case.
-        if config.is_pattern() && !state.is_fresh() {
-            return Ok((out, resume_out));
-        }
+        // Nothing resolved. A channel can no longer reach this by *playing* its
+        // way through its content — every series loops — so an empty list means
+        // the resolved set itself is empty: an expression that matches nothing,
+        // or a catalog that holds nothing. That is a broken config, always, and
+        // it is reported as one.
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
             message: "channel resolved to zero items".into(),
         });
     }
+
+    // 5. Adjacency constraints — runs last, after every block has ordered its
+    //    own list, so it reorders a settled sequence rather than fighting the
+    //    order engine.
+    if crate::constrain::any_constrained(&limits) {
+        let keys = adjacency_keys(
+            &out.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            &separate_fields,
+            catalog,
+            path,
+        )?;
+        // The aired tail carries the same field values, looked up the same way,
+        // so a seam comparison means what a within-list one means. The
+        // previous generation's own blocks are gone, so every tail item is read
+        // under this channel's first separating field.
+        let tail_field = separate_fields.iter().flatten().next().cloned();
+        let preceding = adjacency_keys(
+            &state.tail,
+            &vec![tail_field; state.tail.len()],
+            catalog,
+            path,
+        )?;
+
+        let result = crate::constrain::order_constrained(&keys, &limits, &preceding);
+        if result.unresolved > 0 {
+            // The set cannot satisfy what the config asks — an all-one-title
+            // pool, or a cast too interlinked to separate. Generation completes
+            // either way; say so, or a channel quietly failing its constraint
+            // looks exactly like one honouring it.
+            tracing::warn!(
+                event = "constraints.unsatisfied",
+                channel = %path.display(),
+                violations = result.unresolved,
+                items = out.len(),
+                "adjacency constraints could not be fully satisfied; airing the closest arrangement found",
+            );
+        }
+        out = permute(out, &result.order);
+    }
+
     Ok((out, resume_out))
+}
+
+/// Build the per-item keys the adjacency pass compares: the `entry_id`, plus
+/// the values of whatever field that item's block separates on.
+///
+/// The field values come from the catalog's tags, read with the same vocabulary
+/// an expression uses — `separate_by: "cast"` reads exactly what `item.cast`
+/// reads. An item with no values for the field simply never triggers the
+/// separation, which is why a catalog-free channel can still use
+/// `no_repeat_within`.
+fn adjacency_keys(
+    ids: &[String],
+    separate_fields: &[Option<String>],
+    catalog: Option<&Catalog>,
+    path: &Path,
+) -> Result<Vec<ItemKeys>, ConfigError> {
+    ids.iter()
+        .zip(separate_fields.iter())
+        .map(|(id, field)| {
+            let Some(field) = field else {
+                return Ok(ItemKeys::new(id.clone()));
+            };
+            let ns = TagNs::from_query_field(field).ok_or_else(|| ConfigError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
+                    TagNs::QUERY_FIELDS.join(", ")
+                ),
+            })?;
+            let Some(cat) = catalog else {
+                return Err(ConfigError::Unsupported {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "separate_by = {field:?} needs the catalog, which is not available"
+                    ),
+                });
+            };
+            Ok(ItemKeys {
+                id: id.clone(),
+                group: cat.tags_for(id, ns).map_err(|e| ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("reading {field:?} for {id}: {e}"),
+                })?,
+            })
+        })
+        .collect()
+}
+
+/// Reorder `items` by `perm` (a permutation of `0..items.len()`).
+/// [`ResolvedItem`] is not `Clone`, so items are moved out of slots rather than
+/// copied.
+fn permute(items: Vec<ResolvedItem>, perm: &[usize]) -> Vec<ResolvedItem> {
+    let mut slots: Vec<Option<ResolvedItem>> = items.into_iter().map(Some).collect();
+    perm.iter()
+        .map(|&i| {
+            slots[i]
+                .take()
+                .expect("a permutation visits each index exactly once")
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -559,6 +676,7 @@ mod tests {
             block: None,
             program: None,
             duplicates: None,
+            constraints: None,
             entries,
             pools: Vec::new(),
             pattern: Vec::new(),
@@ -577,6 +695,7 @@ mod tests {
             roll_interval: Duration::from_secs(3600),
             retention_days: 1,
             seed: None,
+            anchor: None,
             rule: RuleConfig { blocks },
             overlay: None,
         }
@@ -604,6 +723,140 @@ mod tests {
         let items = resolve_channel(&channel(vec![a, b]), path(), &[], None, None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["lavfi:a", "lavfi:b"]);
+    }
+
+    /// `no_repeat_within` only has repeats to work on when they survive to the
+    /// pass, so these use `duplicates = "keep"` or cross-block repeats — the two
+    /// ways an id legitimately appears twice in a resolved channel.
+    fn constrained(mut inc: BlockInclude, n: usize) -> BlockInclude {
+        inc.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(n),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        inc
+    }
+
+    fn resolved_ids(blocks: Vec<BlockInclude>) -> Vec<String> {
+        resolve_channel(&channel(blocks), path(), &[], None, None)
+            .unwrap()
+            .iter()
+            .map(|i| i.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn no_repeat_within_separates_back_to_back_repeats() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+            Entry::Item(item_entry("c")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained(inc, 1)]);
+        assert_eq!(ids.len(), 4);
+        for i in 0..ids.len() {
+            assert_ne!(ids[i], ids[(i + 1) % ids.len()], "{ids:?}");
+        }
+    }
+
+    #[test]
+    fn no_repeat_within_holds_across_a_block_join() {
+        // `collapse` is block-scoped, so the same title in two blocks survives
+        // into the concatenated list — and the channel-level pass is what keeps
+        // the join from playing it twice in a row.
+        let a = include_with(vec![
+            Entry::Item(item_entry("x")),
+            Entry::Item(item_entry("a")),
+        ]);
+        let b = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("y")),
+        ]);
+        let ids = resolved_ids(vec![constrained(a, 1), constrained(b, 1)]);
+        assert_eq!(ids.len(), 4);
+        for i in 0..ids.len() {
+            assert_ne!(ids[i], ids[(i + 1) % ids.len()], "{ids:?}");
+        }
+    }
+
+    /// The seam is the *generation* boundary, not the list's own ends:
+    /// `Sequential` plays this list once and lays the next one after it, so the
+    /// head is constrained against what already aired.
+    #[test]
+    fn no_repeat_within_holds_across_the_generation_seam() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+            Entry::Item(item_entry("c")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let state = crate::resume::GenerationState {
+            tail: vec!["lavfi:a".to_string()],
+            ..Default::default()
+        };
+        let (items, _) = resolve_channel_with_resume(
+            &channel(vec![constrained(inc, 1)]),
+            path(),
+            &[],
+            None,
+            None,
+            &state,
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_ne!(
+            ids[0], "lavfi:a",
+            "repeated the previously-aired item across the seam: {ids:?}"
+        );
+    }
+
+    /// The list's own head and tail are NOT adjacent — nothing replays it end
+    /// to end — so an already-legal list must come back untouched.
+    #[test]
+    fn the_lists_own_ends_are_left_alone() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+            Entry::Item(item_entry("c")),
+            Entry::Item(item_entry("a")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained(inc, 1)]);
+        assert_eq!(
+            ids,
+            vec!["lavfi:a", "lavfi:b", "lavfi:c", "lavfi:a"],
+            "a legal list was reordered"
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_constraint_completes_rather_than_hanging() {
+        // One title, "no two in a row": impossible. Generation must finish with
+        // every item intact and accept the violation.
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained(inc, 1)]);
+        assert_eq!(ids, vec!["lavfi:a"; 3]);
+    }
+
+    #[test]
+    fn unconstrained_channel_keeps_its_resolved_order() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        assert_eq!(
+            resolved_ids(vec![inc]),
+            vec!["lavfi:a", "lavfi:a", "lavfi:b"]
+        );
     }
 
     #[test]
@@ -1076,7 +1329,7 @@ mod tests {
     }
 
     fn interleave_block(advance: crate::config::Advance) -> BlockInclude {
-        use crate::config::{OnShort, PatternStep, Pool, Rotate, Select, Wrap};
+        use crate::config::{OnShort, PatternStep, Pool, Rotate, Select};
         let mut inc = include_with(vec![]);
         inc.pools = vec![
             Pool {
@@ -1086,7 +1339,6 @@ mod tests {
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
                 advance,
-                wrap: Wrap::Loop,
                 on_short: OnShort::Next,
             },
             Pool {
@@ -1096,7 +1348,6 @@ mod tests {
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
                 advance,
-                wrap: Wrap::Loop,
                 on_short: OnShort::Next,
             },
         ];
@@ -1149,6 +1400,7 @@ mod tests {
         crate::resume::GenerationState {
             resume,
             cursor: ledger.series_cursor(),
+            tail: ledger.tail(crate::constrain::DEFAULT_SEAM_TAIL),
         }
     }
 
@@ -1377,20 +1629,14 @@ mod tests {
         assert!(next.is_empty());
     }
 
-    /// A pattern channel that has played everything under `wrap = "drop"` is
-    /// exhausted, not misconfigured: it resolves to an empty list rather than
-    /// erroring, so the daemon can idle instead of failing every roll tick.
-    /// A channel that has *never* played anything still errors — that is the
-    /// genuine "bad expr / empty catalog" case.
+    /// A pattern channel that has played all the way through its content keeps
+    /// broadcasting: the next window resolves a full list, not an empty one.
+    /// There is no exhausted state to fall into.
     #[test]
-    fn an_exhausted_pattern_channel_resolves_empty_instead_of_erroring() {
-        use crate::config::Wrap;
+    fn a_pattern_channel_keeps_resolving_after_playing_everything() {
         let cat = interleave_catalog();
         let mut inc = interleave_block(crate::config::Advance::Resume);
-        for pool in &mut inc.pools {
-            pool.wrap = Wrap::Drop;
-        }
-        inc.cycles = Some(20); // long enough to drain everything
+        inc.cycles = Some(20); // long enough to run past every series' end
         let cfg = channel(vec![inc]);
 
         let (played, next) = resolve_channel_with_resume(
@@ -1404,11 +1650,14 @@ mod tests {
         .unwrap();
         assert!(!played.is_empty());
 
-        // Second window: every series has dropped, so there is nothing left.
+        // Second window, after everything has aired at least once: still full.
         let state = advance_state(&cat, &GenerationState::empty(), next, &played);
         let (items, _) =
             resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
-        assert!(items.is_empty(), "an exhausted channel resolves to nothing");
+        assert!(
+            !items.is_empty(),
+            "a channel that played everything must keep going, not run dry"
+        );
     }
 
     #[test]

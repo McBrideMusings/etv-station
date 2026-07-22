@@ -15,7 +15,7 @@ Therefore anyone running ETV-next must produce playout JSON externally. The bund
 ## Goals
 
 1. **Continuously feed ETV-next.** At any moment, every configured channel has playout JSON files on disk whose `[start, finish)` window contains "now" and extends N days into the future.
-2. **Plug-in sequencing rules.** A channel is defined by a rule type plus parameters. v1 ships with **Loop Forever**. Architecture supports adding more rules without rewriting the core.
+2. **Composable sequencing.** A channel is defined by blocks — flat entry lists or pool/pattern interleaves — resolved into one ordered list per generation. Architecture supports adding composition primitives without rewriting the core.
 3. **Embed program metadata.** Items carry title / description / season / episode / categories / rating / artwork — written into the `program` block of each playout item so ETV-next's XMLTV is populated.
 4. **Stay decoupled from ETV-next.** Filesystem-only contract. No IPC, no shared process, no schema fork. ETV-next's `schema/playout.json` is the boundary.
 5. **Track ETV-next's schema without drifting.** Achieved by depending on ETV-next's `ersatztv-playout` Rust crate at the source level, via a git submodule (see Architecture below).
@@ -106,24 +106,21 @@ volumes:
 
 Key properties:
 - `etv-station` has read/write on the playout volume; `etv-next` has read-only. Lock-free producer/consumer; the OS guarantees atomicity for `rename(2)`.
-- Either container can restart independently. ETV-next keeps serving from already-materialized files; etv-station picks up where it left off using the persisted anchor.
+- Either container can restart independently. ETV-next keeps serving from already-materialized files; etv-station picks up after the last thing it wrote.
 - Neither container has any knowledge of the other's existence at the protocol level. The only coupling is the playout JSON schema and the directory layout convention.
 
-## Sequencing rules
+## Emission model
 
-A channel config picks one rule. v1 implements one; the rule trait is designed for later additions.
+Every channel materializes **forward**. Each generation resolves the channel, lays the resulting sequence end-to-end after the last thing already written, and records the seam. The emitted chunk JSON is the durable timeline.
 
-### Loop Forever (v1, only rule shipped)
+There is **one** model, not one per rule. An earlier design had a separate "Loop Forever" rule that resolved a list once and replayed it from a persisted `.anchor` for any `t` via `(t - anchor) mod total_loop_duration`. It was removed: a channel whose list never changes resolves the same list every generation, and those laid end-to-end *are* the loop, so looping needs no rule of its own. Keeping it also cost correctness in two places — a list that advances between generations (any pool with `advance = "resume"`) re-anchored and restarted its schedule on every change, and an unseeded `order = "random"` channel resolved exactly once per process, replaying one shuffle until the daemon restarted rather than reshuffling per pass.
 
-**Inputs**
-- Ordered list of items, each with: source spec (path / URL / lavfi), optional in/out points, optional track selections, full program metadata.
-- Anchor timestamp — the wall-clock instant `items[0]` is considered to "start". Defaults to first run; persisted across restarts.
+**Running out is not a state.** A series that reaches its last item starts over. Nothing retires a series or a pool, because a television channel does not stop broadcasting when it reaches the end of its library. Resolving to zero items therefore always means the resolved *set* is empty — an expression that matches nothing, an empty catalog — which is a config error and is reported as one.
 
-**Behavior**
-Items concatenate end-to-end, looping when exhausted. For any future timestamp `t`, the active item is determined by `(t - anchor) mod total_loop_duration`, then walking the cumulative item durations.
+**Joining mid-list.** A channel may set `anchor` to an instant it is treated as having been broadcasting since. It affects only the first generation of a channel with nothing written yet: rather than starting at item 0, the channel joins its list where elapsed time since the anchor says it should be, so a newly-added channel feels like it has been running all along. After that the written timeline carries the phase — the anchor is a starting position, not a repeating origin.
 
 **Determinism**
-Given the same `(anchor, items)`, the program emits identical playout JSON every time. This matters for: regeneration after config edits, multi-instance setups, debugging.
+Generation is a pure function of `(catalog, config, resume_in)`: the same three inputs always produce the same items and the same `resume_out`. This is what makes regeneration after a config edit safe.
 
 ### Pattern interleave (Phase C)
 
@@ -138,28 +135,27 @@ A block declares named **pools** and a repeating **pattern** instead of a flat `
 | `select` | `round_robin` | *Which* series serves next — `round_robin` or `random` |
 | `rotate` | `visit` | *When* the series changes — `visit` (take N consecutive from one series) or `slot` (a new series every item) |
 | `advance` | `restart` | `restart` replays from the top; `resume` continues from the resume map |
-| `wrap` | `loop` | At exhaustion: `loop` restarts, `drop` leaves the rotation until new content appears |
 | `on_short` | `next` | Who fills slots the current series can't supply — `next`, `wrap`, or `short` |
 
 A pattern step is `{pool, take, chance}`. `chance` (default `1.0`) makes a step fire probabilistically — the "occasionally binge" knob. The roll is keyed on `(seed, cycle, step)`, so a pinned `seed` reproduces the whole skip/fire sequence, and a skipped step consumes no cursor.
 
-A series is keyed by the catalog `show_id`; an item without one — a movie — is its own series of one, which is why a movie pool needs no special case. `cycles` defaults to enough passes for the largest pool to drain once.
+A series is keyed by the catalog `show_id`; an item without one — a movie — is its own series of one, which is why a movie pool needs no special case. `cycles` defaults to enough passes for the largest pool to play through once.
 
-### Generation model for pattern channels
+A series that reaches its last item starts over. That is the only behaviour there is — there is no setting that retires a series or a pool, because a television channel does not stop broadcasting when it reaches the end of its library.
 
-A pattern channel cannot use the anchor-and-loop model: a pool with `advance = "resume"` produces a different item list every generation by design, and `.anchor` re-anchors whenever the list changes, so an anchored loop would restart the schedule on every roll tick.
+### Generation model
 
-Instead these channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
+Channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
 
 Two files carry that state, and they hold different things. The **play-history ledger** (`.history`) is one JSONL line per scheduled airing — `entry_id`, `show_id`, the scheduled `start`, and when the row was written. It is a dumb record: no taste logic, no TTL, no relevance. Where each series left off is a **projection** of it ("the last airing per `show_id`"), so there is exactly one place that knows a show's position and nothing to drift out of sync. A future taste scorer reads the same lines the other way — all of them, with timestamps. One structure, two read shapes.
 
 Positions are therefore recorded as the **last-played `entry_id`**, never an index: the resolved set churns, and an index would silently mean something else after any change. An id that has vanished restarts its own series and no other, and a show that leaves the resolved set entirely and later returns resumes where it stopped, because the ledger is never pruned to the current set. A torn line is skipped rather than failing the channel.
 
-The `.resume` sidecar holds only what the ledger cannot express: which series is next in each pool's rotation, which have dropped out, and the checkpoints below. A missing or corrupt one starts every pool from the top rather than failing the channel.
+The `.resume` sidecar holds only what the ledger cannot express: which series is next in each pool's rotation, and the checkpoints below. A missing or corrupt one starts every pool from the top rather than failing the channel.
 
 It also carries **checkpoints**: the pool state entering each generation that has not started airing. On startup the channel rewinds to the earliest of them, deletes the emitted files from that instant forward, and regenerates them from the current config — so a config or overlay edit reaches a pattern channel without waiting for its whole written window to play out, and without losing or repeating an item. Aired and currently-airing chunks are never touched.
 
-A pattern channel whose pools have all dropped out under `wrap = "drop"` is **exhausted**, not misconfigured: it resolves to an empty list, logs that it has nothing left to schedule, and idles until new content appears. Resolving to nothing when nothing has *ever* played is still a config error.
+There is no exhausted state. A channel cannot play its way to an empty list, because every series loops — so resolving to zero items always means the resolved *set* is empty (an expression that matches nothing, an empty catalog), which is a config error and is reported as one.
 
 Both halves of the generation model are now in place: the resume map (#72) and the play-history ledger (#70). What remains open is what reads the ledger the *other* way — the taste scorers of #74 and #82.
 
@@ -184,7 +180,7 @@ A `channel.toml` declaring:
 | `roll_interval` | no, default `1h` | How often to extend the window forward. |
 | `retention_days` | no, default 7 | Past playout files older than this get deleted. |
 | `rule` | yes | Rule type + rule-specific params. |
-| `items` | yes (for Loop Forever) | Ordered list with metadata. |
+| `items` | yes (for an entries block) | Ordered list with metadata. |
 
 A channel does **not** declare its own output folder. The daemon derives it as `{output_base}/{identity}`, where `output_base` is a station-level field and `identity` is the channel's `name` (above) or, unset, its config file stem. ETV-next still reads playout files from that same folder, configured on its own side.
 
@@ -194,7 +190,7 @@ A top-level station file (`station.toml` or `station.yaml`) declares `output_bas
 
 The station file declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.
 
-The configured zone affects **chunk-boundary alignment only**: a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC. The persisted anchor in the `.anchor` sidecar stays in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
+The configured zone affects **chunk-boundary alignment only**: a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC. Persisted timestamps in the sidecars stay in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
 
 Per-channel `tz` override is **not** in v1 — single household, single zone. Adding it later is a strict superset (channel-level overrides station-level) so deferring is safe.
 
@@ -228,15 +224,15 @@ Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffect
 | # | Question | Current answer |
 |---|---|---|
 | 1 | Daemon vs. cron-invoked one-shot? | Daemon. Roll cadence + reload watcher both want a long-lived process. |
-| 2 | Anchor persistence | Sidecar JSON file per channel (`<output_folder>/.anchor`). |
-| 3 | Source-media duration probing | `ffprobe` at config-load time; cache durations in the anchor sidecar. Re-probe on file mtime change. |
+| 2 | Scheduling-state persistence | Sidecar files per channel: `.resume` (rotation + checkpoints) and `.history` (the play ledger). |
+| 3 | Source-media duration probing | `ffprobe` at config-load time; cache durations in the `.durations.json` sidecar. Re-probe on file mtime change. |
 | 4 | What if an item file is missing at probe time? | Fail loudly at config load (don't silently substitute). v1 is explicit about its inputs. |
 | 5 | Logging/observability | stdout structured logs (JSON lines). Container runtime captures them. No metrics endpoint v1. |
 | 6 | What if `etv-next-private` updates `ersatztv-playout` in a breaking way? | Compile-time error on submodule bump. PR cycle on `etv-station` to absorb the change. Considered a feature. |
 
 ## Verification (v1 acceptance)
 
-- One channel configured with Loop Forever, 4 items totaling ~9 hours.
+- One channel configured with a single entries block, 4 items totaling ~9 hours.
 - `etv-station` and `etv-next` running continuously for 7 days as two containers sharing the playout volume.
 - At every probe (hourly): ETV-next's `/channel/1.m3u8` returns valid HLS, `/xmltv.xml` includes correctly populated `<programme>` entries for the next ≥7 days, and ETV-next's logs contain zero `unable to find playout JSON file for time …` errors.
 - Stopping `etv-station` mid-run: ETV-next continues serving until the materialized window expires; the failure mode is graceful degradation (back to synthetic black + silence after the window's end), not an immediate outage.
@@ -283,6 +279,9 @@ With the language picked and graphics working, redesign the user-facing schema:
 - **Authoring format is by extension.** Every config file — `station`, `channel`, and path-referenced *block files* — may be authored in either TOML or YAML, selected by file extension: `.yaml`/`.yml` parse as YAML, anything else as TOML. Same serde types either way (no schema difference), so a station and its channels and blocks can all be one format. Inline entries inside a channel's `[[rule.blocks]]` stay in whatever format the channel file uses.
 - **Channels compose blocks** via `[[rule.blocks]]` with `mode` (`all` or `count = N`), `order` (`manual`, seeded `random`, or a compound `field:dir` sort), and `filter` over the resolved item list.
 - **Order is only what the items themselves determine.** A collection's hand-authored sequence is not an `order` value: `collection_items.position` belongs to the (collection, item) pair, so a flattened item list can no longer say which collection's positions to read. That sequence rides on a `collection` entry, which emits its members already ordered. Collections-as-a-set stays a `query` entry (`item.collections.contains(...)`) — one stored structure, two read paths. A relevance `score` failed the same test — it needed a plugin the item list can't reach — and is unspecified until there is a concrete source for it.
+- **Adjacency constraints.** A block's `[constraints]` table carries two spacing rules. `no_repeat_within = N` is identity: the same item may not recur within N positions (`1` = never back-to-back). `separate_by = "<field>"` with `separate_min_gap = N` is property: two items sharing **any** value of a multi-valued catalog field may not sit within N positions, so `separate_by: "cast"` spreads out films sharing a performer. The field vocabulary is the one expressions use, so `separate_by: "cast"` reads what `item.cast` reads.
+
+  Blocks resolve and order independently, then one pass runs over the whole concatenated channel list, so a conflict straddling a block join is caught too. The list reaches back across the generation seam via the play-history ledger, so a constraint holds between generations and not only inside one; how much history is carried is derived from the widest gap the config asks for. When the set offers no arrangement that satisfies everything (one title with "no two in a row", a cast too interlinked to separate), the remaining violations are accepted and generation completes rather than hanging — and are logged, so a channel quietly failing its constraint is distinguishable from one honouring it.
 - **Unified catalog ingestion.** Plex (primary) + local-FS scan (bumpers / commercials / errata) feed a normalized **sqlite catalog** via `rusqlite`. Sonarr/Radarr deferred unless a Plex gap appears.
 - **sqlite cache, not in-memory or JSON.** Tens of thousands of items rules out per-boot rescans (slow API round-trips) and full-file JSON snapshots (full reparse + RAM-resident). sqlite gives indexed lookups, incremental refresh from Plex's `lastUpdated`, WAL-mode concurrency between refresh writer and query reader, and `sqlite3` shell inspection for debugging. Schema is three tables — `items`, `collections` + `collection_items`, `catalog_meta` (per-source sync timestamps) — plus simple up-only migrations.
 - **Runtime query resolution.** Channel TOML carries live queries; daemon translates them into sqlite reads at boot, snapshots the resolved item list for the chunk window. Stateless determinism preserved — the snapshot is the durable list, the catalog itself is the deterministically-rebuildable substrate.

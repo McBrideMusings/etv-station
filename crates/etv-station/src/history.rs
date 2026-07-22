@@ -112,6 +112,18 @@ impl Ledger {
         self.records.extend(records);
     }
 
+    /// The most recently aired entry ids, oldest first, at most `n` of them.
+    ///
+    /// This is the adjacency seam (#73): the last id here airs immediately
+    /// before the first item of the next generation, so the constraint pass
+    /// reads it to avoid repeating across the boundary.
+    pub fn tail(&self, n: usize) -> Vec<String> {
+        self.records[self.records.len().saturating_sub(n)..]
+            .iter()
+            .map(|r| r.entry_id.clone())
+            .collect()
+    }
+
     /// What each series played last — the resume cursor, projected.
     ///
     /// Records are appended in schedule order and a rewind truncates rather

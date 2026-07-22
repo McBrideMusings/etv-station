@@ -1,5 +1,6 @@
 mod block;
 mod channel;
+mod constraints;
 mod entry;
 mod filter;
 mod load;
@@ -13,12 +14,13 @@ mod validate;
 
 pub use block::{BlockFile, Duplicates};
 pub use channel::{ChannelConfig, ChannelOverlayConfig};
+pub use constraints::Constraints;
 pub use entry::{CollectionEntry, Entry, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
 pub use load::{LoadedChannel, Station, load, read_channel};
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};
-pub use pool::{Advance, OnShort, PatternStep, Pool, Rotate, Select, Wrap};
+pub use pool::{Advance, OnShort, PatternStep, Pool, Rotate, Select};
 pub use rule::{BlockInclude, RuleConfig};
 pub use source::SourceConfig;
 pub use station::StationConfig;

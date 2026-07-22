@@ -120,6 +120,38 @@ impl TagNs {
             TagNs::FsDir => "fs_dir",
         }
     }
+
+    /// The tag namespace an *expression* field name reads, e.g. `"cast"` for
+    /// `item.cast`. `None` for a field that is not multi-valued (or not a field
+    /// at all), which is what makes `separate_by` reject `"title"` up front
+    /// rather than separating on nothing.
+    ///
+    /// Deliberately the same vocabulary as the CEL field map in
+    /// [`super::query`] — `separate_by: "cast"` has to mean the values
+    /// `item.cast` reads, or the config says one thing and does another.
+    pub fn from_query_field(name: &str) -> Option<Self> {
+        Some(match name {
+            "genres" => TagNs::Genre,
+            "labels" => TagNs::Label,
+            "cast" => TagNs::Cast,
+            "directors" => TagNs::Director,
+            "writers" => TagNs::Writer,
+            "producers" => TagNs::Producer,
+            "countries" => TagNs::Country,
+            _ => return None,
+        })
+    }
+
+    /// Every field name [`Self::from_query_field`] accepts, for error messages.
+    pub const QUERY_FIELDS: [&'static str; 7] = [
+        "genres",
+        "labels",
+        "cast",
+        "directors",
+        "writers",
+        "producers",
+        "countries",
+    ];
 }
 
 impl fmt::Display for TagNs {

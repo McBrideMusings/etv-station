@@ -59,4 +59,4 @@ Work lives in [GitHub Issues](https://github.com/McBrideMusings/etv-station/issu
 
 ## Time zone
 
-The station runs in a configurable IANA time zone (`tz` in the station config, overridable via `ETV_STATION_TZ` env var). The persisted anchor is UTC; tz only affects chunk-boundary alignment so chunks roll on local midnight. See `docs/PRD.md` §Time zone.
+The station runs in a configurable IANA time zone (`tz` in the station config, overridable via `ETV_STATION_TZ` env var). Persisted timestamps are UTC; tz only affects chunk-boundary alignment so chunks roll on local midnight. See `docs/PRD.md` §Time zone.

@@ -11,7 +11,6 @@
 #   - `pools` + `pattern` instead of a flat `entries` list (#72)
 #   - `advance: resume` reading the per-`show_id` resume map
 #   - `select: round_robin` rotating across several shows in one pool
-#   - `wrap: loop` per pool, so a 24/7 channel never runs dry
 #   - the window-continuation generation model — stateful-feeling progression
 #     with **no live cursor**, just a resume map handed across window seams
 #
@@ -46,7 +45,6 @@ rule:
           order: "title:asc"
           select: round_robin
           advance: resume
-          wrap: loop
 
         # Every trending episode, in broadcast order within each show. The
         # shows take turns; each keeps its own place regardless of whose turn
@@ -58,7 +56,6 @@ rule:
           select: round_robin
           rotate: visit
           advance: resume
-          wrap: loop
           on_short: next
 
       # One movie, then a three-episode run of whichever show is up. Repeated

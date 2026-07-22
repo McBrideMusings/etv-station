@@ -5,8 +5,8 @@
 //!
 //! Proves the deepest part of the Phase C schema: pools + pattern, the
 //! per-`show_id` resume map under `advance = "resume"`, `select = "round_robin"`
-//! rotating across shows of different lengths, `wrap = "loop"` keeping the
-//! channel from running dry, and the window-continuation generation model —
+//! rotating across shows of different lengths, a series that reaches its end
+//! starting over rather than running dry, and the window-continuation model —
 //! stateful-feeling progression with **no live cursor**, only a resume map
 //! carried across the seam.
 
@@ -129,6 +129,7 @@ fn advance_state(
     GenerationState {
         resume,
         cursor: ledger.series_cursor(),
+        tail: ledger.tail(etv_station::constrain::DEFAULT_SEAM_TAIL),
     }
 }
 
@@ -301,8 +302,9 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
     );
 }
 
-/// Acceptance criterion 3, second half: `wrap = "loop"` restarts the shorter
-/// show so the channel never runs dry, while the longer show is still going.
+/// Acceptance criterion 3, second half: the shorter show reaches its end and
+/// starts over so the channel never runs dry, while the longer show is still
+/// going.
 #[test]
 fn trending_mix_sample_loops_the_shorter_show_without_disturbing_the_longer() {
     let cat = trending_catalog();

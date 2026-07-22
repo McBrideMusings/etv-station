@@ -14,87 +14,17 @@ pub trait Rule {
     ) -> Vec<PlayoutItem>;
 }
 
-pub struct LoopForever<'a> {
-    items: &'a [ResolvedItem],
-    durations: &'a [Duration],
-    total_secs: f64,
-    overlay: Option<OverlaySpec>,
-}
-
-impl<'a> LoopForever<'a> {
-    pub fn new(items: &'a [ResolvedItem], durations: &'a [Duration]) -> Self {
-        assert_eq!(
-            items.len(),
-            durations.len(),
-            "items/durations length mismatch"
-        );
-        let total_secs: f64 = durations.iter().map(|d| d.as_secs_f64()).sum();
-        Self {
-            items,
-            durations,
-            total_secs,
-            overlay: None,
-        }
-    }
-
-    pub fn with_overlay(mut self, overlay: Option<OverlaySpec>) -> Self {
-        self.overlay = overlay;
-        self
-    }
-}
-
-impl<'a> Rule for LoopForever<'a> {
-    fn items_covering(
-        &self,
-        anchor_utc: OffsetDateTime,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> Vec<PlayoutItem> {
-        if self.items.is_empty() || self.total_secs == 0.0 || to <= from {
-            return Vec::new();
-        }
-
-        let from_offset_secs = (from - anchor_utc).as_seconds_f64();
-        let elapsed_in_loop = from_offset_secs.rem_euclid(self.total_secs);
-
-        let (mut idx, start_in_item) = walk_to_offset(self.durations, elapsed_in_loop);
-        let mut item_start_utc = from - time::Duration::seconds_f64(start_in_item);
-
-        let mut out = Vec::new();
-        loop {
-            let dur = self.durations[idx];
-            let item_finish_utc = item_start_utc + time::Duration::seconds_f64(dur.as_secs_f64());
-
-            out.push(build_playout_item(
-                &self.items[idx],
-                item_start_utc,
-                item_finish_utc,
-                self.overlay.as_ref(),
-            ));
-
-            if item_finish_utc >= to {
-                break;
-            }
-            item_start_utc = item_finish_utc;
-            idx = (idx + 1) % self.items.len();
-        }
-        out
-    }
-}
-
-/// Play a resolved list **once**, end to end, from a given start — the emission
-/// model a pattern channel needs (#72).
+/// Play a resolved list once, end to end, from a given start.
 ///
-/// [`LoopForever`] repeats a fixed list forever from a stable anchor, which is
-/// exactly right when the list never changes. A pattern channel's list *does*
-/// change every generation, because its pools advance; re-anchoring a looping
-/// list on every change would restart the schedule each time. So a pattern
-/// channel materializes **forward** instead: each generation covers the span
-/// after the last one, the already-written chunk JSON is the durable timeline,
-/// and the `.resume` sidecar carries only where the next span picks up.
+/// This is the only emission model. Each generation covers the span after the
+/// last one, the already-written chunk JSON is the durable timeline, and the
+/// `.resume` sidecar carries only where the next span picks up. A channel whose
+/// list never changes resolves the same list every generation, and those laid
+/// end-to-end are the loop — so looping needs no separate rule.
 ///
-/// `anchor_utc` is therefore read as "where this sequence starts", not as a
-/// repeating phase origin, and the sequence simply ends when the items run out.
+/// `start_utc` is where this sequence begins, not a repeating phase origin: the
+/// sequence ends when the items run out, and the next generation continues
+/// after it.
 pub struct Sequential<'a> {
     items: &'a [ResolvedItem],
     durations: &'a [Duration],
@@ -164,16 +94,38 @@ impl Rule for Sequential<'_> {
     }
 }
 
-fn walk_to_offset(durations: &[Duration], offset_secs: f64) -> (usize, f64) {
-    let mut remaining = offset_secs;
+/// Where a channel that had been playing `durations` on repeat since `anchor`
+/// would stand at `now`: how many whole items to skip, and how far into the next
+/// one it is.
+///
+/// This is the one thing the removed anchor-and-loop model could express that
+/// forward materialization cannot derive on its own — "the station has been
+/// broadcasting since 2020", so a fresh channel joins mid-list rather than at
+/// item 0. It is a *starting phase* only: applied to the first generation, after
+/// which the written timeline carries the phase forward.
+///
+/// An anchor in the future, or a zero-length list, yields `(0, ZERO)` — start at
+/// the top, which is what a channel with no history should do.
+pub fn phase_at(
+    anchor: OffsetDateTime,
+    now: OffsetDateTime,
+    durations: &[Duration],
+) -> (usize, time::Duration) {
+    let total: f64 = durations.iter().map(|d| d.as_secs_f64()).sum();
+    if total <= 0.0 || now <= anchor {
+        return (0, time::Duration::ZERO);
+    }
+
+    let mut remaining = (now - anchor).as_seconds_f64().rem_euclid(total);
     for (i, d) in durations.iter().enumerate() {
         let secs = d.as_secs_f64();
         if remaining < secs {
-            return (i, remaining);
+            return (i, time::Duration::seconds_f64(remaining));
         }
         remaining -= secs;
     }
-    (0, 0.0)
+    // Floating-point drift landed us exactly at the end; that is the top again.
+    (0, time::Duration::ZERO)
 }
 
 fn build_playout_item(
@@ -225,7 +177,7 @@ mod tests {
     fn empty_window_yields_nothing() {
         let items = vec![lavfi("a", 30)];
         let durs = vec![Duration::from_secs(30)];
-        let rule = LoopForever::new(&items, &durs);
+        let rule = Sequential::new(&items, &durs);
         let t = datetime!(2026-04-13 00:00 UTC);
         assert!(rule.items_covering(t, t, t).is_empty());
     }
@@ -234,30 +186,88 @@ mod tests {
     fn covers_a_single_item_window() {
         let items = vec![lavfi("a", 60), lavfi("b", 60)];
         let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
-        let rule = LoopForever::new(&items, &durs);
-        let anchor = datetime!(2026-04-13 00:00 UTC);
-        let from = datetime!(2026-04-13 00:00 UTC);
-        let to = datetime!(2026-04-13 00:00:30 UTC);
-        let result = rule.items_covering(anchor, from, to);
+        let rule = Sequential::new(&items, &durs);
+        let start = datetime!(2026-04-13 00:00 UTC);
+        let result = rule.items_covering(start, start, datetime!(2026-04-13 00:00:30 UTC));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "a");
-        assert_eq!(result[0].start, from);
+        assert_eq!(result[0].start, start);
         assert_eq!(result[0].finish, datetime!(2026-04-13 00:01 UTC));
     }
 
+    /// The same list resolved again and laid after the first is the loop: no
+    /// separate looping rule is needed to keep a fixed-list channel on air.
     #[test]
-    fn loops_across_window() {
+    fn consecutive_generations_of_one_list_are_a_loop() {
         let items = vec![lavfi("a", 60), lavfi("b", 60)];
         let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
-        let rule = LoopForever::new(&items, &durs);
+        let rule = Sequential::new(&items, &durs);
+        let mut ids = Vec::new();
+        let mut start = datetime!(2026-04-13 00:00 UTC);
+        for _ in 0..3 {
+            let pass = rule.items_covering(start, start, start + rule.total_duration());
+            start += rule.total_duration();
+            ids.extend(pass.into_iter().map(|i| i.id));
+        }
+        assert_eq!(ids, vec!["a", "b", "a", "b", "a", "b"]);
+    }
+
+    // ---- phase_at (joining mid-list from a past anchor) ---------------------
+
+    #[test]
+    fn phase_at_starts_at_the_top_without_elapsed_time() {
+        let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
+        let t = datetime!(2026-04-13 00:00 UTC);
+        assert_eq!(phase_at(t, t, &durs), (0, time::Duration::ZERO));
+    }
+
+    #[test]
+    fn phase_at_lands_partway_into_an_item() {
+        let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
         let anchor = datetime!(2026-04-13 00:00 UTC);
-        let from = anchor;
-        let to = datetime!(2026-04-13 00:05 UTC);
-        let result = rule.items_covering(anchor, from, to);
-        // 5 minutes / 1 minute per item = 5 items, alternating a/b
-        assert_eq!(result.len(), 5);
-        let ids: Vec<&str> = result.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b", "a", "b", "a"]);
+        // 90s in: item 1, 30s deep.
+        let got = phase_at(anchor, datetime!(2026-04-13 00:01:30 UTC), &durs);
+        assert_eq!(got, (1, time::Duration::seconds(30)));
+    }
+
+    #[test]
+    fn phase_at_wraps_around_the_list() {
+        let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
+        let anchor = datetime!(2026-04-13 00:00 UTC);
+        // 2h30m is 75 whole loops plus 30s — back to item 0, 30s deep.
+        let got = phase_at(anchor, datetime!(2026-04-13 02:30:30 UTC), &durs);
+        assert_eq!(got, (0, time::Duration::seconds(30)));
+    }
+
+    /// The point of the whole thing: a channel anchored years ago does not
+    /// start at item 0.
+    #[test]
+    fn phase_at_joins_mid_list_for_a_long_past_anchor() {
+        let durs = vec![
+            Duration::from_secs(1800),
+            Duration::from_secs(1800),
+            Duration::from_secs(1800),
+        ];
+        let got = phase_at(
+            datetime!(2020-01-01 00:00 UTC),
+            datetime!(2026-04-13 01:15 UTC),
+            &durs,
+        );
+        assert!(got.0 < 3, "index must be inside the list, got {got:?}");
+    }
+
+    #[test]
+    fn phase_at_ignores_a_future_anchor_and_an_empty_list() {
+        let durs = vec![Duration::from_secs(60)];
+        let now = datetime!(2026-04-13 00:00 UTC);
+        assert_eq!(
+            phase_at(datetime!(2030-01-01 00:00 UTC), now, &durs),
+            (0, time::Duration::ZERO)
+        );
+        assert_eq!(
+            phase_at(datetime!(2020-01-01 00:00 UTC), now, &[]),
+            (0, time::Duration::ZERO)
+        );
     }
 
     #[test]
@@ -268,12 +278,11 @@ mod tests {
             Duration::from_secs(45),
             Duration::from_secs(90),
         ];
-        let anchor = datetime!(2026-04-13 00:00 UTC);
-        let from = datetime!(2026-04-13 02:00 UTC);
+        let start = datetime!(2026-04-13 00:00 UTC);
         let to = datetime!(2026-04-13 03:30 UTC);
 
-        let r1 = LoopForever::new(&items, &durs).items_covering(anchor, from, to);
-        let r2 = LoopForever::new(&items, &durs).items_covering(anchor, from, to);
+        let r1 = Sequential::new(&items, &durs).items_covering(start, start, to);
+        let r2 = Sequential::new(&items, &durs).items_covering(start, start, to);
 
         let j1 = serde_json::to_vec(&r1).unwrap();
         let j2 = serde_json::to_vec(&r2).unwrap();
@@ -345,7 +354,7 @@ mod tests {
     fn first_item_can_start_before_window() {
         let items = vec![lavfi("a", 60), lavfi("b", 60)];
         let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
-        let rule = LoopForever::new(&items, &durs);
+        let rule = Sequential::new(&items, &durs);
         let anchor = datetime!(2026-04-13 00:00 UTC);
         // ask for window starting 30s into item 'a'
         let from = datetime!(2026-04-13 00:00:30 UTC);

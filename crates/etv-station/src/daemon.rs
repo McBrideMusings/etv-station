@@ -9,14 +9,12 @@ use tokio::select;
 use tokio::sync::Notify;
 use tracing::Instrument;
 
-use crate::anchor;
 use crate::catalog::Catalog;
 use crate::config::{LoadedChannel, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
 use crate::errors::{ConfigError, StationError};
 use crate::overlay_supervisor;
-use crate::rule::LoopForever;
 use crate::scan;
 use crate::tz as tzmod;
 
@@ -75,7 +73,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
 
         // On shutdown a channel that failed on its own becomes the daemon's exit
         // error. `channel_loop` only returns `Err` from its startup section
-        // (duration probing, anchor load, catch-up emit); roll-tick errors are
+        // (duration probing, sidecar load, catch-up emit); roll-tick errors are
         // logged and retried, never returned. On reload we do NOT treat that
         // error as fatal — the failing channel gets another startup attempt next
         // generation, so a transient probe/media error must not tear down an
@@ -254,7 +252,7 @@ async fn run_generation(
                 // A channel_loop error is fatal to THIS channel. Task handles
                 // are only joined at shutdown (see below), so without logging
                 // here a startup failure — a failed duration probe, unreadable
-                // media, anchor or emit error — would stay invisible until the
+                // media, sidecar or emit error — would stay invisible until the
                 // daemon stops: the channel silently emits nothing while the
                 // rest of the daemon reports healthy. Log it at the point of
                 // failure so it is immediately diagnosable.
@@ -391,30 +389,6 @@ async fn prepare_generation(station: &Station) -> Result<&'static Tz, StationErr
     Ok(tz)
 }
 
-async fn wipe_emitted_playout(channel: &LoadedChannel) -> Result<(), StationError> {
-    let files = scan::scan_output_folder(&channel.output_folder).await?;
-    let count = files.len();
-    for f in &files {
-        if let Err(source) = tokio::fs::remove_file(&f.path).await
-            && source.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(StationError::Io {
-                path: f.path.clone(),
-                source,
-            });
-        }
-    }
-    if count > 0 {
-        tracing::info!(
-            event = "playout.wipe",
-            channel = %channel.name,
-            removed = count,
-            "wiped existing playout JSON on startup; will regenerate from config",
-        );
-    }
-    Ok(())
-}
-
 /// Resolve the (overlay_config_path, fifo_path) pair for a channel, if it has
 /// an overlay configured. Both `build_overlay_context` and
 /// `load_overlay_playout_spec` need the same resolution.
@@ -489,121 +463,7 @@ async fn channel_loop(
     catalog: Option<&SharedCatalog>,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
-    // `run` creates every channel's output_folder synchronously before spawning
-    // this task (see #34), so it exists by the time we scan/emit into it here.
-    let output = &channel.output_folder;
-
-    // A pattern channel advances its pools every generation, so its resolved
-    // list is different each time and the loop-a-fixed-list-from-an-anchor
-    // model doesn't apply. It runs its own emission loop instead (#72).
-    if channel.config.is_pattern() {
-        return pattern_channel_loop(channel, tz, source_roots, catalog, shutdown).await;
-    }
-
-    // Resolve this channel's items. With a catalog, `query` entries and
-    // non-`manual` order resolve and manual items path-match onto catalog
-    // identities; without one, only inline-item `manual` channels resolve (others
-    // error clearly in `resolve_channel`). The lock is held only across the
-    // synchronous resolve — never an await — so `std::sync::Mutex` is fine. The
-    // guard lives inside this block, so it is dropped before the first await below.
-    let items = {
-        // Recover from a poisoned lock rather than panicking: nothing is ever
-        // written through this mutex (the catalog is fully ingested before it is
-        // shared), so the guarded data is still valid if another channel task
-        // panicked while resolving. Asserting here instead would cascade one
-        // panic into every channel — and, since the catalog outlives reloads,
-        // into every future generation too. The pre-built `path_index` needs no
-        // lock (immutable after ingest).
-        let guard = catalog.map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
-        crate::resolve::resolve_channel(
-            &channel.config,
-            &channel.config_path,
-            source_roots,
-            catalog.map(|sc| &sc.path_index),
-            guard.as_deref(),
-        )?
-    };
-
-    let mut cache = DurationCache::load(output).await?;
-    let (durations, stats) = cache.resolve_all(&items).await?;
-    cache.save(output).await?;
-    tracing::info!(
-        event = "durations.resolve",
-        channel = %channel.name,
-        from_cache = stats.from_cache,
-        from_probe = stats.from_probe,
-        from_config = stats.from_config,
-        items = items.len(),
-        "resolved item durations",
-    );
-
-    let now_utc = OffsetDateTime::now_utc();
-    let anchor_state = anchor::load_or_initialize(output, &items, now_utc, tz).await?;
-    if anchor_state.initialized_now {
-        tracing::info!(
-            event = "anchor.init",
-            channel = %channel.name,
-            anchor = %anchor_state.anchor_utc,
-            "anchored at first run",
-        );
-    } else if anchor_state.re_anchored {
-        tracing::warn!(
-            event = "anchor.reanchor",
-            channel = %channel.name,
-            anchor = %anchor_state.anchor_utc,
-            "items changed; re-anchored",
-        );
-    } else {
-        tracing::info!(
-            event = "anchor.load",
-            channel = %channel.name,
-            anchor = %anchor_state.anchor_utc,
-            "loaded anchor",
-        );
-    }
-
-    let overlay_spec = load_overlay_playout_spec(channel);
-    let rule = LoopForever::new(&items, &durations).with_overlay(overlay_spec);
-
-    // SHARP EDGE: Wipe every emitted playout JSON on startup and regenerate
-    // from the (possibly updated) channel config. This catches changes to the
-    // overlay spec, item list, or any other field that flows into the JSON.
-    // See https://github.com/McBrideMusings/etv-station/issues/53 for the
-    // proper fix (in-place rewrite or change-detection).
-    wipe_emitted_playout(channel).await?;
-
-    // Startup catch-up: emit from max(now, highest_existing_finish) up to now+window_days.
-    emit_catch_up(channel, &rule, anchor_state.anchor_utc, tz, "startup").await?;
-
-    let mut interval = tokio::time::interval(channel.config.roll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval.tick().await; // consume immediate tick
-
-    loop {
-        select! {
-            _ = shutdown.notified() => {
-                tracing::info!(event = "channel.shutdown", channel = %channel.name, "shutdown received");
-                return Ok(());
-            }
-            _ = interval.tick() => {
-                // One span per roll tick; chunk emission opens a sub-span inside
-                // emit_catch_up, so chunk.write events correlate to their tick.
-                let tick = async {
-                    if let Err(err) =
-                        emit_catch_up(channel, &rule, anchor_state.anchor_utc, tz, "roll").await
-                    {
-                        tracing::error!(
-                            event = "roll.error",
-                            channel = %channel.name,
-                            error = %err,
-                            "roll tick failed; will retry next interval",
-                        );
-                    }
-                };
-                tick.instrument(tracing::info_span!("roll_tick")).await;
-            }
-        }
-    }
+    forward_channel_loop(channel, tz, source_roots, catalog, shutdown).await
 }
 
 /// Bound on how many generations one catch-up will chain before giving up, so
@@ -633,22 +493,28 @@ async fn wipe_playout_from(
     Ok(removed)
 }
 
-/// The emission loop for a pattern channel (#72): **materialize forward**.
+/// The emission loop for every channel: **materialize forward**.
 ///
-/// The looping model can't work here. `LoopForever` repeats one fixed list from
-/// a stable anchor, and `.anchor` re-anchors whenever the item list changes —
-/// but a pool with `advance = "resume"` produces a *different* list every
-/// generation by design, so an anchored loop would restart the schedule on
-/// every roll tick.
+/// Each pass resolves the channel, lays the resulting sequence end-to-end after
+/// the last thing already written, and stores where it got to. The emitted
+/// chunk JSON is the durable timeline; the `.resume` sidecar holds only the
+/// seam. Nothing already written is ever rewritten — the past is a record, not
+/// a rendering of the current config — so config edits arrive through the
+/// checkpoint rewind below rather than a wholesale wipe (#53).
 ///
-/// So the emitted chunk JSON becomes the durable timeline instead. Each pass
-/// resolves from the stored resume map, lays the resulting sequence end-to-end
-/// after the last thing already written, and stores where it got to. Nothing
-/// already written is ever rewritten — which is also why this path skips the
-/// startup wipe that `LoopForever` channels use to pick up config changes
-/// (#53): for a forward-materialized channel the past is a record, not a
-/// rendering of the current config.
-async fn pattern_channel_loop(
+/// This replaced an anchor-and-loop model that resolved one list at startup and
+/// repeated it forever off an `.anchor` sidecar. That model could not express a
+/// channel whose list changes between generations: a pool with
+/// `advance = "resume"` produces a different list by design, and `.anchor`
+/// re-anchored on every change, restarting the schedule. It also could not
+/// deliver what an unseeded `order = "random"` channel advertises — resolving
+/// once per process meant one shuffle replayed until the daemon restarted,
+/// never a fresh one per pass.
+///
+/// Nothing was lost by dropping it. A channel whose list happens never to change
+/// resolves the same list every generation, and those laid end-to-end *are* the
+/// loop. So there is one emission model rather than two.
+async fn forward_channel_loop(
     channel: &LoadedChannel,
     tz: &'static Tz,
     source_roots: &[String],
@@ -700,10 +566,8 @@ async fn pattern_channel_loop(
     // Startup: throw away the future this channel had already written and
     // generate it again from the config as it stands now.
     //
-    // A `LoopForever` channel gets this from `wipe_emitted_playout` — its whole
-    // output is a pure function of (anchor, items), so wiping and re-emitting
-    // is free. A pattern channel can't wipe wholesale: its output depends on
-    // where the pools had advanced to, and that state is gone once consumed.
+    // A wholesale wipe is not available: the output depends on where the pools
+    // had advanced to, and that state is gone once consumed.
     // The checkpoint trail is what makes the same thing possible here — rewind
     // the pools to the start of the earliest unaired generation, drop exactly
     // the files from that instant on, and regenerate. What has already aired,
@@ -791,6 +655,9 @@ async fn pattern_catch_up(
     // timeline stays gapless across the seam.
     let existing = scan::scan_output_folder(output).await?;
     let mut from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+    // Only the first generation of a channel with nothing written yet joins its
+    // list mid-way from a past `anchor`; see the phase calculation below.
+    let mut first_generation = existing.is_empty();
 
     let mut generations = 0;
     while from < target {
@@ -817,6 +684,7 @@ async fn pattern_catch_up(
         let state = crate::resume::GenerationState {
             resume: resume.clone(),
             cursor: ledger.series_cursor(),
+            tail: ledger.tail(channel.config.adjacency_reach()),
         };
 
         let (items, resume_out, show_ids) = {
@@ -840,26 +708,41 @@ async fn pattern_catch_up(
             (items, resume_out, show_ids)
         };
 
-        if items.is_empty() {
-            // Every pool has dropped out — the channel has played all the
-            // content it had. Not an error (see `resolve_channel_with_resume`):
-            // say so once per catch-up and stop, rather than failing every
-            // roll tick forever.
-            tracing::info!(
-                event = "pattern.exhausted",
-                channel = %channel.name,
-                phase = phase,
-                covered_through = %from,
-                "every pool has run out under wrap = \"drop\"; nothing further to schedule until new content appears",
-            );
-            resume.checkpoints.pop();
-            break;
-        }
+        // No "the channel ran out" branch: every series loops, so a pattern
+        // channel cannot play itself empty. An empty resolve means an empty
+        // *set*, which `resolve_channel_with_resume` has already raised as the
+        // config error it is.
 
         let (durations, _) = cache.resolve_all(&items).await?;
-        let rule = crate::rule::Sequential::new(&items, &durations)
+
+        // A channel with an `anchor` in the past joins its list where elapsed
+        // time says it should be, rather than at item 0 — "this station has been
+        // broadcasting since 2020". Only on the very first generation: after
+        // that the written timeline is the phase, and re-deriving it would fight
+        // the resume map. Skipped items aren't lost, just not aired this pass —
+        // the next generation resolves the list afresh.
+        let (items_slice, durations_slice, seq_start) =
+            match channel.config.anchor.filter(|_| first_generation) {
+                Some(anchor) => {
+                    let (skip, into_item) = crate::rule::phase_at(anchor, from, &durations);
+                    if skip > 0 || !into_item.is_zero() {
+                        tracing::info!(
+                            event = "anchor.join",
+                            channel = %channel.name,
+                            anchor = %anchor,
+                            skipped_items = skip,
+                            "joined the sequence mid-list from the configured anchor",
+                        );
+                    }
+                    (&items[skip..], &durations[skip..], from - into_item)
+                }
+                None => (&items[..], &durations[..], from),
+            };
+        first_generation = false;
+
+        let rule = crate::rule::Sequential::new(items_slice, durations_slice)
             .with_overlay(overlay_spec.as_ref().map(clone_overlay_spec));
-        let span = rule.total_duration();
+        let span = rule.total_duration() - (from - seq_start);
         if span <= time::Duration::ZERO {
             // Zero wall-clock length would never advance `from`. Stop rather
             // than spin, and say so — silently emitting nothing would look
@@ -884,7 +767,7 @@ async fn pattern_catch_up(
         let written = emit_window(
             output,
             &rule,
-            from,
+            seq_start,
             tz,
             channel.config.chunk_hours,
             from,
@@ -968,75 +851,6 @@ fn clone_overlay_spec(spec: &PlayoutOverlaySpec) -> PlayoutOverlaySpec {
         x: spec.x,
         y: spec.y,
     }
-}
-
-/// Emit any chunks needed to bring the channel's output folder up through
-/// `now + window_days`. Skips emission if everything is already materialized.
-async fn emit_catch_up(
-    channel: &LoadedChannel,
-    rule: &LoopForever<'_>,
-    anchor_utc: OffsetDateTime,
-    tz: &'static Tz,
-    phase: &'static str,
-) -> Result<(), StationError> {
-    let output = &channel.output_folder;
-    let now = OffsetDateTime::now_utc();
-    let to = now + window_duration(channel.config.window_days);
-    let existing = scan::scan_output_folder(output).await?;
-    // Snap `from` to the previous local chunk boundary so the first emitted file
-    // is always a full-size chunk, never a sliver `[now, boundary)`. When
-    // continuing from an existing boundary (the common roll-tick case) this is a
-    // no-op — `chunk_boundary_at_or_before` returns a boundary unchanged. On a
-    // fresh run, or after the window has fully elapsed (highest finish < now,
-    // clamped to now), it lands on the boundary at-or-before now. See #28.
-    let resume = scan::highest_finish(&existing).unwrap_or(now).max(now);
-    let from = crate::tz::chunk_boundary_at_or_before(resume, channel.config.chunk_hours, tz);
-
-    if from >= to {
-        tracing::info!(
-            event = "chunk.skip",
-            channel = %channel.name,
-            phase = phase,
-            "window already materialized through {to}",
-        );
-    } else {
-        // Sub-span for chunk emission, parented by the roll-tick span (or the
-        // channel span on startup). The chunk.write event is logged inside it so
-        // it correlates to its tick via the span list.
-        async {
-            let written = emit_window(
-                output,
-                rule,
-                anchor_utc,
-                tz,
-                channel.config.chunk_hours,
-                from,
-                to,
-            )
-            .await?;
-            log_emission(&channel.name, phase, &written, from, to);
-            Ok::<(), StationError>(())
-        }
-        .instrument(tracing::info_span!("chunk_emit", phase = phase))
-        .await?;
-    }
-
-    // Prune fully-elapsed playout files past the retention horizon. Runs on both
-    // startup and every roll tick, even when nothing new was emitted, so old
-    // chunks don't accumulate as the window advances. Housekeeping-grade: never
-    // fatal, so a failed prune can't tear down the channel on startup.
-    let removed = scan::sweep_retention(output, channel.config.retention_days, now).await;
-    if removed > 0 {
-        tracing::info!(
-            event = "retention.sweep",
-            channel = %channel.name,
-            phase = phase,
-            removed = removed,
-            retention_days = channel.config.retention_days,
-            "retention sweep pruned playout files",
-        );
-    }
-    Ok(())
 }
 
 fn window_duration(window_days: u32) -> time::Duration {

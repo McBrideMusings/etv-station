@@ -49,18 +49,6 @@ pub enum Advance {
     Resume,
 }
 
-/// What happens to a series when it runs past its last item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Wrap {
-    /// Restart from the beginning — keeps a 24/7 channel from running dry.
-    #[default]
-    Loop,
-    /// Leave the rotation until new content appears. When every series in a
-    /// pool has dropped, the pool's pattern steps are skipped.
-    Drop,
-}
-
 /// How a visit fills slots the current series can't supply. Only meaningful
 /// with `rotate = "visit"`, where one visit draws `take` items from one series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -103,9 +91,6 @@ pub struct Pool {
 
     #[serde(default)]
     pub advance: Advance,
-
-    #[serde(default)]
-    pub wrap: Wrap,
 
     #[serde(default)]
     pub on_short: OnShort,
@@ -152,7 +137,6 @@ expr: 'item.type == "episode"'
         assert_eq!(pool.select, Select::RoundRobin);
         assert_eq!(pool.rotate, Rotate::Visit);
         assert_eq!(pool.advance, Advance::Restart);
-        assert_eq!(pool.wrap, Wrap::Loop);
         assert_eq!(pool.on_short, OnShort::Next);
     }
 
@@ -165,14 +149,12 @@ order: "season:asc,episode:asc"
 select: random
 rotate: slot
 advance: resume
-wrap: drop
 on_short: short
 "#;
         let pool: Pool = serde_norway::from_str(yaml).unwrap();
         assert_eq!(pool.select, Select::Random);
         assert_eq!(pool.rotate, Rotate::Slot);
         assert_eq!(pool.advance, Advance::Resume);
-        assert_eq!(pool.wrap, Wrap::Drop);
         assert_eq!(pool.on_short, OnShort::Short);
         match pool.order.as_ref().unwrap() {
             Order::Fields(terms) => {
