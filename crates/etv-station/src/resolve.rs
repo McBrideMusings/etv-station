@@ -78,6 +78,7 @@ pub fn resolve_channel(
         path_index,
         catalog,
         &GenerationState::empty(),
+        &crate::score::ScoreInputs::default(),
     )?;
     Ok(items)
 }
@@ -100,6 +101,7 @@ pub fn resolve_channel_with_resume(
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
     state: &GenerationState,
+    scoring: &crate::score::ScoreInputs,
 ) -> Result<(Vec<ResolvedItem>, ResumeMap), ConfigError> {
     // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
     // one draws fresh entropy so an unseeded `random` block reshuffles each
@@ -126,6 +128,7 @@ pub fn resolve_channel_with_resume(
             catalog,
             seed,
             state,
+            scoring,
             &mut resume_out,
         )?;
         gaps.resize(
@@ -183,6 +186,7 @@ fn resolve_block(
     catalog: Option<&Catalog>,
     seed: u64,
     state: &GenerationState,
+    scoring: &crate::score::ScoreInputs,
     resume_out: &mut ResumeMap,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
@@ -210,6 +214,13 @@ fn resolve_block(
                 "block #{idx}: a pattern block needs the catalog, which is not available"
             ))
         })?;
+        // A `plugin:` path means what it means relative to the channel config
+        // file, exactly like a `block:` include — not relative to wherever the
+        // daemon was launched.
+        let score_env = crate::score::ScoreEnv {
+            inputs: scoring,
+            base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
+        };
         let (ids, pools) = crate::pattern::build(
             cat,
             &include.pools,
@@ -217,6 +228,7 @@ fn resolve_block(
             include.cycles,
             state,
             seed,
+            score_env,
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(pools);
@@ -601,6 +613,7 @@ mod tests {
 
     fn channel(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            scoring: None,
             name: None,
             window_days: 1,
             chunk_hours: 24,
@@ -712,6 +725,7 @@ mod tests {
             None,
             None,
             &state,
+            &Default::default(),
         )
         .unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -1312,7 +1326,6 @@ mod tests {
             resume,
             cursor: ledger.series_cursor(),
             tail: ledger.tail(crate::constrain::SEAM_TAIL),
-            ..Default::default()
         }
     }
 
@@ -1330,6 +1343,7 @@ mod tests {
             None,
             Some(&cat),
             &GenerationState::empty(),
+            &Default::default(),
         )
         .unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -1365,6 +1379,7 @@ mod tests {
             None,
             Some(&cat),
             &GenerationState::empty(),
+            &Default::default(),
         )
         .unwrap();
         let first_ids: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
@@ -1374,8 +1389,16 @@ mod tests {
         );
 
         let next = advance_state(&cat, &GenerationState::empty(), next, &first);
-        let (second, _) =
-            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &next).unwrap();
+        let (second, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &next,
+            &Default::default(),
+        )
+        .unwrap();
         let second_ids: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
         // got continues at e3 (it never restarts because inv is shorter), inv
         // wraps, and the movies pool continues its own rotation.
@@ -1398,14 +1421,31 @@ mod tests {
             None,
             Some(&cat),
             &GenerationState::empty(),
+            &Default::default(),
         )
         .unwrap();
         let state = advance_state(&cat, &GenerationState::empty(), next, &first);
 
-        let (a, ra) =
-            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
-        let (b, rb) =
-            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let (a, ra) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &state,
+            &Default::default(),
+        )
+        .unwrap();
+        let (b, rb) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &state,
+            &Default::default(),
+        )
+        .unwrap();
         let ids_a: Vec<&str> = a.iter().map(|i| i.id.as_str()).collect();
         let ids_b: Vec<&str> = b.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids_a, ids_b);
@@ -1432,6 +1472,7 @@ mod tests {
             None,
             Some(&cat),
             &GenerationState::empty(),
+            &Default::default(),
         )
         .unwrap();
         let state = advance_state(&cat, &GenerationState::empty(), next, &first);
@@ -1446,9 +1487,16 @@ mod tests {
             }
         }
         let narrowed_cfg = channel(vec![narrowed]);
-        let (away, next_away) =
-            resolve_channel_with_resume(&narrowed_cfg, path(), &[], None, Some(&cat), &state)
-                .unwrap();
+        let (away, next_away) = resolve_channel_with_resume(
+            &narrowed_cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &state,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(
             !away.iter().any(|i| i.id.starts_with("got-")),
             "GoT is out of the set for this window"
@@ -1456,8 +1504,16 @@ mod tests {
         let state = advance_state(&cat, &state, next_away, &away);
 
         // It comes back. It must continue at e3, not restart at e1.
-        let (back, _) =
-            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let (back, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &state,
+            &Default::default(),
+        )
+        .unwrap();
         let first_got = back
             .iter()
             .map(|i| i.id.as_str())
@@ -1486,6 +1542,7 @@ mod tests {
             None,
             Some(&cat),
             &GenerationState::empty(),
+            &Default::default(),
         )
         .unwrap();
 
@@ -1536,6 +1593,7 @@ mod tests {
             None,
             None,
             &GenerationState::empty(),
+            &Default::default(),
         )
         .unwrap();
         assert!(next.is_empty());
@@ -1558,14 +1616,23 @@ mod tests {
             None,
             Some(&cat),
             &GenerationState::empty(),
+            &Default::default(),
         )
         .unwrap();
         assert!(!played.is_empty());
 
         // Second window, after everything has aired at least once: still full.
         let state = advance_state(&cat, &GenerationState::empty(), next, &played);
-        let (items, _) =
-            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let (items, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &state,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(
             !items.is_empty(),
             "a channel that played everything must keep going, not run dry"

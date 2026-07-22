@@ -77,6 +77,20 @@ pub struct ScoreInputs {
     pub now: i64,
 }
 
+impl ScoreInputs {
+    /// A const-constructible empty set of inputs — no history, no airings, no
+    /// target. `Default` cannot be used in a const context, and tests that
+    /// exercise pools which never reach a plugin still have to name something.
+    pub const fn new_empty() -> Self {
+        Self {
+            target_count: 0,
+            history: Vec::new(),
+            recent: Vec::new(),
+            now: 0,
+        }
+    }
+}
+
 /// The tag namespaces exposed to a plugin, each as an array under its own key.
 const EXPOSED_TAGS: &[(&str, TagNs)] = &[
     ("genres", TagNs::Genre),
@@ -87,6 +101,29 @@ const EXPOSED_TAGS: &[(&str, TagNs)] = &[
     ("producers", TagNs::Producer),
     ("countries", TagNs::Country),
 ];
+
+/// A scorer plugin's inputs plus the directory its path is relative to.
+///
+/// `base_dir` is the channel config file's directory, matching how a `block:`
+/// include resolves: a config's paths mean what they mean relative to the file
+/// they are written in, not to wherever the daemon happens to be launched from.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreEnv<'a> {
+    pub inputs: &'a ScoreInputs,
+    pub base_dir: &'a Path,
+}
+
+impl ScoreEnv<'_> {
+    /// Where a `plugin:` path actually lives. An absolute path is used as
+    /// written; a relative one hangs off the channel config's directory.
+    pub fn resolve_path(&self, plugin: &Path) -> std::path::PathBuf {
+        if plugin.is_absolute() {
+            plugin.to_path_buf()
+        } else {
+            self.base_dir.join(plugin)
+        }
+    }
+}
 
 /// Run `script_path` against the catalog and return the `entry_id`s it picked,
 /// in the order it picked them.

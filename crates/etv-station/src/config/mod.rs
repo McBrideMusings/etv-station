@@ -13,7 +13,7 @@ mod station;
 mod validate;
 
 pub use block::{BlockFile, Duplicates};
-pub use channel::{ChannelConfig, ChannelOverlayConfig};
+pub use channel::{ChannelConfig, ChannelOverlayConfig, ScoringConfig};
 pub use constraints::Constraints;
 pub use entry::{CollectionEntry, Entry, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;

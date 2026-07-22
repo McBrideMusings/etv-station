@@ -365,6 +365,7 @@ mod tests {
 
     fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            scoring: None,
             name: None,
             window_days: 1,
             chunk_hours: 24,

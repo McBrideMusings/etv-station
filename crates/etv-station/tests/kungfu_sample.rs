@@ -120,7 +120,6 @@ fn advance_state(
         resume,
         cursor: ledger.series_cursor(),
         tail: ledger.tail(etv_station::constrain::SEAM_TAIL),
-        ..Default::default()
     }
 }
 
@@ -237,14 +236,23 @@ fn kungfu_sample_holds_no_repeat_across_the_generation_seam() {
         None,
         Some(&cat),
         &GenerationState::empty(),
+        &Default::default(),
     )
     .unwrap();
     let first_ids = ids(&first);
 
     // Second generation, handed the ledger the first one wrote.
     let state = advance_state(&cat, &GenerationState::empty(), resume, &first);
-    let (second, _) =
-        resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &state).unwrap();
+    let (second, _) = resolve_channel_with_resume(
+        &cfg,
+        &sample_path(),
+        &[],
+        None,
+        Some(&cat),
+        &state,
+        &Default::default(),
+    )
+    .unwrap();
     let second_ids = ids(&second);
 
     assert!(
@@ -268,9 +276,16 @@ fn kungfu_sample_keeps_broadcasting_after_playing_everything() {
     let cfg = config();
     let mut state = GenerationState::empty();
     for pass in 0..5 {
-        let (items, resume) =
-            resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &state)
-                .unwrap();
+        let (items, resume) = resolve_channel_with_resume(
+            &cfg,
+            &sample_path(),
+            &[],
+            None,
+            Some(&cat),
+            &state,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(!items.is_empty(), "generation {pass} resolved to nothing");
         state = advance_state(&cat, &state, resume, &items);
     }

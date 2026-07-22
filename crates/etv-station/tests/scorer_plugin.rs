@@ -62,6 +62,7 @@ fn write_plugin(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
 fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
     ChannelConfig {
         name: None,
+        scoring: None,
         window_days: 1,
         chunk_hours: 6,
         roll_interval: std::time::Duration::from_secs(60),
@@ -100,13 +101,17 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
 }
 
 fn resolve_with(cfg: &ChannelConfig, cat: &Catalog, inputs: ScoreInputs) -> Vec<String> {
-    let state = GenerationState {
-        scoring: inputs,
-        ..Default::default()
-    };
-    let (items, _) =
-        resolve_channel_with_resume(cfg, Path::new("foryou.yaml"), &[], None, Some(cat), &state)
-            .unwrap();
+    let state = GenerationState::default();
+    let (items, _) = resolve_channel_with_resume(
+        cfg,
+        Path::new("foryou.yaml"),
+        &[],
+        None,
+        Some(cat),
+        &state,
+        &inputs,
+    )
+    .unwrap();
     items.into_iter().map(|i| i.id).collect()
 }
 
@@ -295,6 +300,47 @@ fn the_committed_example_plugin_runs() {
     );
 }
 
+/// A relative `plugin:` path means what it means relative to the channel config
+/// file, not to the daemon's working directory. Without this, a config that
+/// works when launched from the repo root breaks under systemd or Docker, and
+/// the failure is a file-not-found at generation time on a live channel.
+#[test]
+fn a_relative_plugin_path_resolves_against_the_channel_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins = dir.path().join("plugins");
+    std::fs::create_dir(&plugins).unwrap();
+    std::fs::write(
+        plugins.join("pick-one.rhai"),
+        r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { ["mov-a"] }
+"#,
+    )
+    .unwrap();
+
+    // The pool names the path the way a config author would — relative, and
+    // relative to the channel file, which lives one level above `plugins/`.
+    let mut cfg = plugin_channel(Path::new("plugins/pick-one.rhai"), 1, 1);
+    cfg.rule.blocks[0].pools[0].plugin = Some(PathBuf::from("plugins/pick-one.rhai"));
+
+    let state = GenerationState::default();
+    let (items, _) = resolve_channel_with_resume(
+        &cfg,
+        &dir.path().join("foryou.yaml"),
+        &[],
+        None,
+        Some(&catalog()),
+        &state,
+        &ScoreInputs::default(),
+    )
+    .expect("a relative plugin path must resolve against the channel config's directory");
+
+    assert_eq!(
+        items.into_iter().map(|i| i.id).collect::<Vec<_>>(),
+        vec!["mov-a"]
+    );
+}
+
 /// The station refuses a plugin that picks nothing rather than quietly emitting
 /// a short channel.
 #[test]
@@ -313,6 +359,7 @@ fn a_plugin_that_picks_nothing_is_an_error() {
         None,
         Some(&catalog()),
         &state,
+        &Default::default(),
     )
     .unwrap_err();
     assert!(err.to_string().contains("picked nothing"), "got {err}");

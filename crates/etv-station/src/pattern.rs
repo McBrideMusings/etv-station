@@ -252,10 +252,11 @@ pub fn build(
     cycles: Option<usize>,
     state: &GenerationState,
     seed: u64,
+    score_env: crate::score::ScoreEnv<'_>,
 ) -> Result<(Vec<String>, BTreeMap<String, PoolResume>), String> {
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
     for cfg in pools {
-        runtimes.push(resolve_pool(catalog, cfg, state)?);
+        runtimes.push(resolve_pool(catalog, cfg, state, score_env)?);
     }
 
     let mut by_name: HashMap<&str, usize> = HashMap::new();
@@ -337,6 +338,7 @@ fn resolve_pool<'a>(
     catalog: &Catalog,
     cfg: &'a Pool,
     state: &GenerationState,
+    score_env: crate::score::ScoreEnv<'_>,
 ) -> Result<PoolRuntime<'a>, String> {
     // A pool draws its items from a CEL expression or from a scorer plugin,
     // never both (validated at load). A plugin returns its set already ranked —
@@ -354,8 +356,11 @@ fn resolve_pool<'a>(
             }
             ids
         }
-        (None, Some(plugin)) => crate::score::run(catalog, plugin, &state.scoring)
-            .map_err(|m| format!("pool {:?}: {m}", cfg.name))?,
+        (None, Some(plugin)) => {
+            let path = score_env.resolve_path(plugin);
+            crate::score::run(catalog, &path, score_env.inputs)
+                .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
+        }
         // Both, or neither, is rejected at load; a pool that reaches here in
         // either state is a validation gap, not a config the user can hit.
         _ => {
@@ -492,6 +497,16 @@ mod tests {
         }
     }
 
+    /// No pool in these tests draws from a plugin, so the inputs are empty and
+    /// the base dir never gets read — it only has to exist.
+    fn test_env() -> crate::score::ScoreEnv<'static> {
+        const EMPTY: &crate::score::ScoreInputs = &crate::score::ScoreInputs::new_empty();
+        crate::score::ScoreEnv {
+            inputs: EMPTY,
+            base_dir: std::path::Path::new("."),
+        }
+    }
+
     fn step(pool: &str, take: usize) -> PatternStep {
         PatternStep {
             pool: pool.into(),
@@ -512,8 +527,8 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = catalog();
-        let (ids, pool_state) =
-            build(&cat, &pools, &pattern, cycles, state_in, seed).expect("pattern builds");
+        let (ids, pool_state) = build(&cat, &pools, &pattern, cycles, state_in, seed, test_env())
+            .expect("pattern builds");
 
         let mut resume = ResumeMap::new();
         resume.pools = pool_state;
@@ -533,7 +548,6 @@ mod tests {
                 resume,
                 cursor,
                 tail,
-                ..Default::default()
             },
         )
     }
@@ -685,7 +699,6 @@ mod tests {
                 ("show:got".to_string(), "got-e99-deleted".to_string()),
                 ("show:inv".to_string(), "inv-e2".to_string()),
             ]),
-            ..Default::default()
         };
 
         let (ids, _) = build_with(vec![p], vec![step("shows", 2)], Some(2), &state, 0);
@@ -952,6 +965,7 @@ mod tests {
             Some(1),
             &GenerationState::empty(),
             0,
+            test_env(),
         )
         .unwrap_err();
         assert!(err.contains("unknown pool"), "err = {err}");
@@ -967,6 +981,7 @@ mod tests {
             Some(MAX_CYCLES + 1),
             &GenerationState::empty(),
             0,
+            test_env(),
         )
         .unwrap_err();
         assert!(err.contains("maximum"), "err = {err}");
@@ -986,6 +1001,7 @@ mod tests {
             None,
             &GenerationState::empty(),
             0,
+            test_env(),
         )
         .unwrap();
         assert!(ids.is_empty());

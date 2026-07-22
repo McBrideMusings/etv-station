@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 use tracing::Instrument;
 
 use crate::catalog::Catalog;
-use crate::config::{LoadedChannel, Station};
+use crate::config::{ChannelConfig, LoadedChannel, ScoringConfig, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
 use crate::errors::{ConfigError, StationError};
@@ -633,26 +633,28 @@ async fn forward_channel_loop(
 
 /// Generate and emit forward until the window through `now + window_days` is
 /// covered, chaining one generation into the next through the resume map.
-/// How much of the recently-aired tail a scorer plugin sees. Deeper than the
-/// adjacency seam, which only needs the last few items: a scorer suppressing
-/// repeats wants a window, not a neighbour.
-const RECENT_AIRED: usize = 200;
-
-/// Nominal item length used only to turn a generation's span into an item
-/// count. Deliberately crude — the number is a hint to a scorer plugin about
-/// how much to return, and overshooting costs nothing because the pattern
-/// simply never reaches the tail of an over-long list.
-const NOMINAL_ITEM_SECS: i64 = 1800;
-
 /// Hint a scorer plugin about how many items this generation needs.
 ///
+/// Sized to **one chunk**, not to the whole remaining window. A generation lays
+/// the plugin's returned list end-to-end, so a hint covering a 30-day window
+/// would push a single generation to materialize the entire month in one pass.
+/// Near the end of the window the remaining span is smaller than a chunk, and
+/// that smaller span wins.
+///
 /// Clamped at both ends: at least one item, so a nearly-covered window still
-/// asks for something rather than handing a plugin a target of zero; and
-/// capped, so a long window cannot ask a plugin to rank the entire library.
-fn target_count(from: OffsetDateTime, target: OffsetDateTime) -> usize {
+/// asks for something rather than handing a plugin a target of zero, and capped
+/// so no configuration can ask a plugin to rank an entire library.
+fn target_count(config: &ChannelConfig, from: OffsetDateTime, target: OffsetDateTime) -> usize {
     const MAX: i64 = 500;
-    let span = (target - from).whole_seconds().max(0);
-    span.div_euclid(NOMINAL_ITEM_SECS).clamp(1, MAX) as usize
+    let per_item = config
+        .scoring
+        .as_ref()
+        .map(|s| s.nominal_item_secs)
+        .unwrap_or_else(|| ScoringConfig::default().nominal_item_secs)
+        .max(1) as i64;
+    let chunk = i64::from(config.chunk_hours) * 3600;
+    let remaining = (target - from).whole_seconds().max(0);
+    remaining.min(chunk).div_euclid(per_item).clamp(1, MAX) as usize
 }
 
 /// Returns the map to carry into the next tick.
@@ -697,6 +699,15 @@ async fn pattern_catch_up(
         None => Vec::new(),
     };
 
+    // How deep a recently-aired tail this channel's scorer sees. Read once —
+    // it cannot change inside a tick.
+    let recent_depth = channel
+        .config
+        .scoring
+        .as_ref()
+        .map(|s| s.recent_depth)
+        .unwrap_or_else(|| ScoringConfig::default().recent_depth);
+
     let mut generations = 0;
     while from < target {
         if generations >= MAX_GENERATIONS_PER_TICK {
@@ -723,12 +734,16 @@ async fn pattern_catch_up(
             resume: resume.clone(),
             cursor: ledger.series_cursor(),
             tail: ledger.tail(crate::constrain::SEAM_TAIL),
-            scoring: crate::score::ScoreInputs {
-                target_count: target_count(from, target),
-                history: history.clone(),
-                recent: ledger.tail(RECENT_AIRED),
-                now: now.unix_timestamp(),
-            },
+        };
+
+        // Sized to one chunk, not to the whole remaining window: the generation
+        // lays whatever the plugin returns end-to-end, so asking for a month's
+        // worth would make a single generation try to cover the month.
+        let scoring = crate::score::ScoreInputs {
+            target_count: target_count(&channel.config, from, target),
+            history: history.clone(),
+            recent: ledger.tail(recent_depth),
+            now: now.unix_timestamp(),
         };
 
         let (items, resume_out, show_ids) = {
@@ -740,6 +755,7 @@ async fn pattern_catch_up(
                 catalog.map(|sc| &sc.path_index),
                 guard.as_deref(),
                 &state,
+                &scoring,
             )?;
             // The ledger needs each airing's show, and only the catalog knows
             // it. One query for the whole generation, under the lock we already

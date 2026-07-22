@@ -130,7 +130,6 @@ fn advance_state(
         resume,
         cursor: ledger.series_cursor(),
         tail: ledger.tail(etv_station::constrain::SEAM_TAIL),
-        ..Default::default()
     }
 }
 
@@ -229,6 +228,7 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
         None,
         Some(&cat),
         &GenerationState::empty(),
+        &Default::default(),
     )
     .expect("first window");
     let first_ids = ids(&first);
@@ -270,9 +270,16 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
     );
 
     // Window 2 is generated from that projection — no live cursor anywhere.
-    let (second, _) =
-        resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &state)
-            .expect("second window");
+    let (second, _) = resolve_channel_with_resume(
+        &cfg,
+        &sample_path(),
+        &[],
+        None,
+        Some(&cat),
+        &state,
+        &Default::default(),
+    )
+    .expect("second window");
     let second_ids = ids(&second);
 
     // GoT picks up exactly after where it stopped, rather than restarting.
@@ -318,11 +325,20 @@ fn trending_mix_sample_loops_the_shorter_show_without_disturbing_the_longer() {
         None,
         Some(&cat),
         &GenerationState::empty(),
+        &Default::default(),
     )
     .unwrap();
     let state = advance_state(&cat, &GenerationState::empty(), next, &first);
-    let (second, _) =
-        resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &state).unwrap();
+    let (second, _) = resolve_channel_with_resume(
+        &cfg,
+        &sample_path(),
+        &[],
+        None,
+        Some(&cat),
+        &state,
+        &Default::default(),
+    )
+    .unwrap();
 
     let inv: Vec<u32> = ids(&first)
         .iter()

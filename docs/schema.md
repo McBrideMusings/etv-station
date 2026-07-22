@@ -403,6 +403,21 @@ back an ordered list, so swapping one script for another changes nothing in
 etv-station. Why this rides on `expr` rather than on `order` is
 [ADR 0002](./adr/0002-scorer-plugin-replaces-a-pool-expr.md).
 
+A `plugin:` path is relative to the **channel config file's** directory, the
+same as a `block:` include — never to wherever the daemon was launched from.
+Absolute paths are used as written.
+
+Two knobs sit on the channel, under `scoring:`, both optional:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. |
+| `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
+
+`target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
+window — a generation lays the returned list end-to-end, so a hint covering 30
+days would push a single generation to materialize the whole month at once.
+
 Watch history comes from Tautulli, configured by the `TAUTULLI_URL` and
 `TAUTULLI_API_KEY` environment variables and never by tracked config. When
 either is unset or Tautulli is unreachable, `ctx.history` arrives empty and the

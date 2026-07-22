@@ -145,13 +145,6 @@ pub struct GenerationState {
     /// `no_repeat_within` pass reads so it does not repeat across a generation
     /// boundary (#73). Projected from the same ledger as `cursor`.
     pub tail: Vec<String>,
-    /// What a scorer plugin is handed besides the catalog (#74): the watch
-    /// history fetched for this tick, how many items the generation needs, and
-    /// the clock. Rides here because this struct is already threaded to exactly
-    /// the point a pool resolves, and because it keeps generation a pure
-    /// function of its inputs — a plugin reads the clock that was passed in,
-    /// never the wall clock, so the same state reproduces the same schedule.
-    pub scoring: crate::score::ScoreInputs,
 }
 
 impl GenerationState {
