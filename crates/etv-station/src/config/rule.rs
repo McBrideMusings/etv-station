@@ -103,7 +103,7 @@ impl BlockInclude {
 
     /// The effective adjacency constraints (defaulting to unconstrained).
     pub fn constraints(&self) -> Constraints {
-        self.constraints.unwrap_or_default()
+        self.constraints.clone().unwrap_or_default()
     }
 
     /// Whether this block interleaves pools via a pattern rather than playing a

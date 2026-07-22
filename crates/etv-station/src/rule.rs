@@ -94,6 +94,40 @@ impl Rule for Sequential<'_> {
     }
 }
 
+/// Where a channel that had been playing `durations` on repeat since `anchor`
+/// would stand at `now`: how many whole items to skip, and how far into the next
+/// one it is.
+///
+/// This is the one thing the removed anchor-and-loop model could express that
+/// forward materialization cannot derive on its own — "the station has been
+/// broadcasting since 2020", so a fresh channel joins mid-list rather than at
+/// item 0. It is a *starting phase* only: applied to the first generation, after
+/// which the written timeline carries the phase forward.
+///
+/// An anchor in the future, or a zero-length list, yields `(0, ZERO)` — start at
+/// the top, which is what a channel with no history should do.
+pub fn phase_at(
+    anchor: OffsetDateTime,
+    now: OffsetDateTime,
+    durations: &[Duration],
+) -> (usize, time::Duration) {
+    let total: f64 = durations.iter().map(|d| d.as_secs_f64()).sum();
+    if total <= 0.0 || now <= anchor {
+        return (0, time::Duration::ZERO);
+    }
+
+    let mut remaining = (now - anchor).as_seconds_f64().rem_euclid(total);
+    for (i, d) in durations.iter().enumerate() {
+        let secs = d.as_secs_f64();
+        if remaining < secs {
+            return (i, time::Duration::seconds_f64(remaining));
+        }
+        remaining -= secs;
+    }
+    // Floating-point drift landed us exactly at the end; that is the top again.
+    (0, time::Duration::ZERO)
+}
+
 fn build_playout_item(
     item: &ResolvedItem,
     start: OffsetDateTime,
@@ -176,6 +210,64 @@ mod tests {
             ids.extend(pass.into_iter().map(|i| i.id));
         }
         assert_eq!(ids, vec!["a", "b", "a", "b", "a", "b"]);
+    }
+
+    // ---- phase_at (joining mid-list from a past anchor) ---------------------
+
+    #[test]
+    fn phase_at_starts_at_the_top_without_elapsed_time() {
+        let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
+        let t = datetime!(2026-04-13 00:00 UTC);
+        assert_eq!(phase_at(t, t, &durs), (0, time::Duration::ZERO));
+    }
+
+    #[test]
+    fn phase_at_lands_partway_into_an_item() {
+        let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
+        let anchor = datetime!(2026-04-13 00:00 UTC);
+        // 90s in: item 1, 30s deep.
+        let got = phase_at(anchor, datetime!(2026-04-13 00:01:30 UTC), &durs);
+        assert_eq!(got, (1, time::Duration::seconds(30)));
+    }
+
+    #[test]
+    fn phase_at_wraps_around_the_list() {
+        let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
+        let anchor = datetime!(2026-04-13 00:00 UTC);
+        // 2h30m is 75 whole loops plus 30s — back to item 0, 30s deep.
+        let got = phase_at(anchor, datetime!(2026-04-13 02:30:30 UTC), &durs);
+        assert_eq!(got, (0, time::Duration::seconds(30)));
+    }
+
+    /// The point of the whole thing: a channel anchored years ago does not
+    /// start at item 0.
+    #[test]
+    fn phase_at_joins_mid_list_for_a_long_past_anchor() {
+        let durs = vec![
+            Duration::from_secs(1800),
+            Duration::from_secs(1800),
+            Duration::from_secs(1800),
+        ];
+        let got = phase_at(
+            datetime!(2020-01-01 00:00 UTC),
+            datetime!(2026-04-13 01:15 UTC),
+            &durs,
+        );
+        assert!(got.0 < 3, "index must be inside the list, got {got:?}");
+    }
+
+    #[test]
+    fn phase_at_ignores_a_future_anchor_and_an_empty_list() {
+        let durs = vec![Duration::from_secs(60)];
+        let now = datetime!(2026-04-13 00:00 UTC);
+        assert_eq!(
+            phase_at(datetime!(2030-01-01 00:00 UTC), now, &durs),
+            (0, time::Duration::ZERO)
+        );
+        assert_eq!(
+            phase_at(datetime!(2020-01-01 00:00 UTC), now, &[]),
+            (0, time::Duration::ZERO)
+        );
     }
 
     #[test]

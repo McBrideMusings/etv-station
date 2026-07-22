@@ -655,6 +655,9 @@ async fn pattern_catch_up(
     // timeline stays gapless across the seam.
     let existing = scan::scan_output_folder(output).await?;
     let mut from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+    // Only the first generation of a channel with nothing written yet joins its
+    // list mid-way from a past `anchor`; see the phase calculation below.
+    let mut first_generation = existing.is_empty();
 
     let mut generations = 0;
     while from < target {
@@ -681,7 +684,7 @@ async fn pattern_catch_up(
         let state = crate::resume::GenerationState {
             resume: resume.clone(),
             cursor: ledger.series_cursor(),
-            tail: ledger.tail(crate::constrain::SEAM_TAIL),
+            tail: ledger.tail(channel.config.adjacency_reach()),
         };
 
         let (items, resume_out, show_ids) = {
@@ -711,9 +714,35 @@ async fn pattern_catch_up(
         // config error it is.
 
         let (durations, _) = cache.resolve_all(&items).await?;
-        let rule = crate::rule::Sequential::new(&items, &durations)
+
+        // A channel with an `anchor` in the past joins its list where elapsed
+        // time says it should be, rather than at item 0 — "this station has been
+        // broadcasting since 2020". Only on the very first generation: after
+        // that the written timeline is the phase, and re-deriving it would fight
+        // the resume map. Skipped items aren't lost, just not aired this pass —
+        // the next generation resolves the list afresh.
+        let (items_slice, durations_slice, seq_start) =
+            match channel.config.anchor.filter(|_| first_generation) {
+                Some(anchor) => {
+                    let (skip, into_item) = crate::rule::phase_at(anchor, from, &durations);
+                    if skip > 0 || !into_item.is_zero() {
+                        tracing::info!(
+                            event = "anchor.join",
+                            channel = %channel.name,
+                            anchor = %anchor,
+                            skipped_items = skip,
+                            "joined the sequence mid-list from the configured anchor",
+                        );
+                    }
+                    (&items[skip..], &durations[skip..], from - into_item)
+                }
+                None => (&items[..], &durations[..], from),
+            };
+        first_generation = false;
+
+        let rule = crate::rule::Sequential::new(items_slice, durations_slice)
             .with_overlay(overlay_spec.as_ref().map(clone_overlay_spec));
-        let span = rule.total_duration();
+        let span = rule.total_duration() - (from - seq_start);
         if span <= time::Duration::ZERO {
             // Zero wall-clock length would never advance `from`. Stop rather
             // than spin, and say so — silently emitting nothing would look
@@ -738,7 +767,7 @@ async fn pattern_catch_up(
         let written = emit_window(
             output,
             &rule,
-            from,
+            seq_start,
             tz,
             channel.config.chunk_hours,
             from,

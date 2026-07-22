@@ -29,11 +29,12 @@ use std::time::Duration;
 
 use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
-use crate::catalog::{Catalog, canonical_path, derive_entry_id};
+use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
     BlockInclude, ChannelConfig, CollectionEntry, Duplicates, Entry, ItemEntry, Mode, Order,
     QueryEntry, SourceConfig,
 };
+use crate::constrain::{ItemKeys, Limits};
 use crate::errors::ConfigError;
 use crate::resume::{GenerationState, ResumeMap};
 
@@ -112,10 +113,13 @@ pub fn resolve_channel_with_resume(
     // `query` result for the same physical file (manual∩query dedup).
     let mut out = Vec::new();
     let mut resume_out = ResumeMap::new();
-    // Each item carries its own block's `no_repeat_within` (0 = unconstrained),
-    // so the constraint pass runs once over the concatenated list and still
-    // covers block joins — which a per-block pass would leave open.
-    let mut gaps: Vec<usize> = Vec::new();
+    // Each item carries its own block's adjacency limits, so the constraint
+    // pass runs once over the concatenated list and still covers block joins —
+    // which a per-block pass would leave open.
+    let mut limits: Vec<Limits> = Vec::new();
+    // The field each block separates on, if any. Kept per block because two
+    // blocks may separate on different fields.
+    let mut separate_fields: Vec<Option<String>> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
         let block_items = resolve_block(
             include,
@@ -128,9 +132,17 @@ pub fn resolve_channel_with_resume(
             state,
             &mut resume_out,
         )?;
-        gaps.resize(
-            gaps.len() + block_items.len(),
-            include.constraints().no_repeat_gap(),
+        let c = include.constraints();
+        limits.resize(
+            limits.len() + block_items.len(),
+            Limits {
+                no_repeat: c.no_repeat_gap(),
+                separate: c.separate_gap(),
+            },
+        );
+        separate_fields.resize(
+            separate_fields.len() + block_items.len(),
+            c.separate_by.clone(),
         );
         out.extend(block_items);
     }
@@ -150,13 +162,89 @@ pub fn resolve_channel_with_resume(
     // 5. Adjacency constraints — runs last, after every block has ordered its
     //    own list, so it reorders a settled sequence rather than fighting the
     //    order engine.
-    if gaps.iter().any(|&g| g > 0) {
-        let ids: Vec<String> = out.iter().map(|item| item.id.clone()).collect();
-        let perm = crate::constrain::order_no_repeat(&ids, &gaps, &state.tail);
-        out = permute(out, &perm);
+    if crate::constrain::any_constrained(&limits) {
+        let keys = adjacency_keys(
+            &out.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            &separate_fields,
+            catalog,
+            path,
+        )?;
+        // The aired tail carries the same field values, looked up the same way,
+        // so a seam comparison means what a within-list one means. The
+        // previous generation's own blocks are gone, so every tail item is read
+        // under this channel's first separating field.
+        let tail_field = separate_fields.iter().flatten().next().cloned();
+        let preceding = adjacency_keys(
+            &state.tail,
+            &vec![tail_field; state.tail.len()],
+            catalog,
+            path,
+        )?;
+
+        let result = crate::constrain::order_constrained(&keys, &limits, &preceding);
+        if result.unresolved > 0 {
+            // The set cannot satisfy what the config asks — an all-one-title
+            // pool, or a cast too interlinked to separate. Generation completes
+            // either way; say so, or a channel quietly failing its constraint
+            // looks exactly like one honouring it.
+            tracing::warn!(
+                event = "constraints.unsatisfied",
+                channel = %path.display(),
+                violations = result.unresolved,
+                items = out.len(),
+                "adjacency constraints could not be fully satisfied; airing the closest arrangement found",
+            );
+        }
+        out = permute(out, &result.order);
     }
 
     Ok((out, resume_out))
+}
+
+/// Build the per-item keys the adjacency pass compares: the `entry_id`, plus
+/// the values of whatever field that item's block separates on.
+///
+/// The field values come from the catalog's tags, read with the same vocabulary
+/// an expression uses — `separate_by: "cast"` reads exactly what `item.cast`
+/// reads. An item with no values for the field simply never triggers the
+/// separation, which is why a catalog-free channel can still use
+/// `no_repeat_within`.
+fn adjacency_keys(
+    ids: &[String],
+    separate_fields: &[Option<String>],
+    catalog: Option<&Catalog>,
+    path: &Path,
+) -> Result<Vec<ItemKeys>, ConfigError> {
+    ids.iter()
+        .zip(separate_fields.iter())
+        .map(|(id, field)| {
+            let Some(field) = field else {
+                return Ok(ItemKeys::new(id.clone()));
+            };
+            let ns = TagNs::from_query_field(field).ok_or_else(|| ConfigError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
+                    TagNs::QUERY_FIELDS.join(", ")
+                ),
+            })?;
+            let Some(cat) = catalog else {
+                return Err(ConfigError::Unsupported {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "separate_by = {field:?} needs the catalog, which is not available"
+                    ),
+                });
+            };
+            Ok(ItemKeys {
+                id: id.clone(),
+                group: cat.tags_for(id, ns).map_err(|e| ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("reading {field:?} for {id}: {e}"),
+                })?,
+            })
+        })
+        .collect()
 }
 
 /// Reorder `items` by `perm` (a permutation of `0..items.len()`).
@@ -607,6 +695,7 @@ mod tests {
             roll_interval: Duration::from_secs(3600),
             retention_days: 1,
             seed: None,
+            anchor: None,
             rule: RuleConfig { blocks },
             overlay: None,
         }
@@ -642,6 +731,8 @@ mod tests {
     fn constrained(mut inc: BlockInclude, n: usize) -> BlockInclude {
         inc.constraints = Some(crate::config::Constraints {
             no_repeat_within: Some(n),
+            separate_by: None,
+            separate_min_gap: None,
         });
         inc
     }
@@ -1309,7 +1400,7 @@ mod tests {
         crate::resume::GenerationState {
             resume,
             cursor: ledger.series_cursor(),
-            tail: ledger.tail(crate::constrain::SEAM_TAIL),
+            tail: ledger.tail(crate::constrain::DEFAULT_SEAM_TAIL),
         }
     }
 

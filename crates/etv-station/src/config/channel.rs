@@ -35,6 +35,22 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
 
+    /// An instant this channel is treated as having been broadcasting since.
+    /// Only affects the **first** generation of a channel with nothing written
+    /// yet: instead of starting at item 0, it joins its list where elapsed time
+    /// since the anchor says it should be, so a newly-added channel feels like
+    /// it has been running all along rather than beginning at the top.
+    ///
+    /// After that first generation the written timeline carries the phase, and
+    /// the anchor is not consulted again — it is a starting position, not a
+    /// repeating phase origin. Unset means start at the top.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub anchor: Option<time::OffsetDateTime>,
+
     pub rule: RuleConfig,
 
     /// Optional live overlay. When set, the station daemon supervises an
@@ -46,12 +62,26 @@ pub struct ChannelConfig {
 }
 
 impl ChannelConfig {
-    /// Whether any block interleaves pools via a pattern (#72). A pattern
-    /// channel's resolved list advances every generation, so it materializes
-    /// forward from a `.resume` sidecar instead of looping a fixed list from
-    /// the `.anchor` — see [`crate::rule::Sequential`].
+    /// Whether any block interleaves pools via a pattern (#72).
     pub fn is_pattern(&self) -> bool {
         self.rule.blocks.iter().any(|b| b.is_pattern())
+    }
+
+    /// How far back this channel's widest adjacency constraint reaches, in
+    /// positions — how much aired history the constraint pass needs to enforce
+    /// it across a generation seam (#73). `0` when nothing is constrained.
+    ///
+    /// Derived rather than a fixed cap: a constraint the config declares has to
+    /// hold at the seam too, and truncating the history to some constant would
+    /// make a wide `separate_min_gap` hold inside a generation and quietly lapse
+    /// between two.
+    pub fn adjacency_reach(&self) -> usize {
+        self.rule
+            .blocks
+            .iter()
+            .map(|b| b.constraints().reach())
+            .max()
+            .unwrap_or(0)
     }
 }
 
