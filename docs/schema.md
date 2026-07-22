@@ -206,13 +206,16 @@ A string. Source: `config/order.rs`.
 |---|---|
 | `manual` *(default)* | keep authored order |
 | `random` | shuffle (seeded by the channel `seed`) |
-| `score` | by relevance score — **not implemented**, see #108 |
 | `field:dir,...` | sort by one or more fields; `dir` is `asc` or `desc` |
 
-Every value is computable from the items being ordered. A collection's authored
-sequence is not, so there is no `collection` value — it lives on
-[`kind: collection`](#kind-collection-play-a-catalog-collection-in-its-authored-order)
-instead.
+Every value is computable from the items being ordered. Two former values were
+not, and are rejected by name at load rather than silently read as a field sort:
+
+- `collection` (#107) — a collection's authored sequence belongs to the
+  (collection, item) pair, so it lives on
+  [`kind: collection`](#kind-collection-play-a-catalog-collection-in-its-authored-order).
+- `score` (#108) — needed a scoring plugin. Scoring is unspecified; if a score
+  ever lands as a per-item column, sort on it directly (`score:desc`).
 
 A bare field name defaults to ascending. Examples: `release_date:asc`,
 `season:asc,episode:asc`, `year:desc`. Invalid directions are rejected at load.

@@ -71,13 +71,12 @@ impl Catalog {
     /// - `Manual` returns the input (authored) order unchanged.
     /// - `Random` is a deterministic seeded shuffle (`seed` supplied by the
     ///   caller; a pinned seed reproduces the order).
-    /// - `Score` is not yet implemented (a separate plugin issue).
     ///
-    /// Every case here is a function of the ids themselves. Collection order is
-    /// deliberately absent: it depends on *which* collection the set came from,
-    /// which a flat id list cannot carry, so it is read at the entry that names
-    /// the collection ([`Self::collection_members`]) rather than sorted here
-    /// (#107).
+    /// Every case here is a function of the ids themselves — that is the whole
+    /// contract. Two orders that were not are deliberately absent: collection
+    /// order depends on *which* collection the set came from, so it is read at
+    /// the entry that names it ([`Self::collection_members`], #107); score
+    /// order depended on a plugin nothing here can reach (#108).
     ///
     /// An empty input yields an empty output.
     pub fn resolve_order(
@@ -91,9 +90,6 @@ impl Catalog {
         }
         match order {
             Order::Manual => Ok(ids.to_vec()),
-            Order::Score => Err(CatalogError::Query(
-                "score order requires the scoring plugin (not yet implemented)".to_string(),
-            )),
             Order::Random => {
                 let mut shuffled = ids.to_vec();
                 // Sort first so the result depends only on the set + seed.

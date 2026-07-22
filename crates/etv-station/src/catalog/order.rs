@@ -12,10 +12,11 @@
 //! - Nulls sort last regardless of direction.
 //! - `manual` preserves the authored (input) order; `random` is a seeded
 //!   shuffle.
-//! - A collection's authored sequence is *not* an order here (#107). It belongs
-//!   to the (collection, item) pair, not to the item, so a flat set of ids can't
-//!   say which collection's positions to read; it is emitted already-ordered by
-//!   the `collection` entry via `Catalog::collection_members`.
+//! - Every order is a function of the ids handed in. Two that weren't are gone:
+//!   a collection's authored sequence (#107), which belongs to the
+//!   (collection, item) pair and is emitted already-ordered by the `collection`
+//!   entry via `Catalog::collection_members`; and `score` (#108), which needed
+//!   a scoring plugin the id list cannot reach.
 
 use crate::config::{Dir, FieldSort};
 
@@ -250,13 +251,6 @@ mod tests {
         let (c, ids) = seeded();
         let e = c.resolve_order(&ids, &ord("genres:asc"), 0).unwrap_err();
         assert!(e.to_string().contains("not a sortable scalar field"));
-    }
-
-    #[test]
-    fn score_order_is_unsupported() {
-        let (c, ids) = seeded();
-        let e = c.resolve_order(&ids, &Order::Score, 0).unwrap_err();
-        assert!(e.to_string().contains("score"));
     }
 
     #[test]
