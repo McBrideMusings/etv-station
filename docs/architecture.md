@@ -55,6 +55,8 @@ Because ETV-next is Rust and the submodule + path-dep approach is essentially fr
 
 Loop Forever is deterministic in `(anchor, items)` — same inputs always produce the same output. This is what makes config reload safe: re-rendering a future-window file in place is idempotent. Past files are immutable; only the unmaterialized window is touched on reload.
 
+A **pattern** channel (#72) is deterministic in `(catalog, config, resume_in)` instead. Its item list advances every generation by design, so an anchored loop would restart the schedule each time the list changed. These channels materialize forward: each generation writes the span after the last one and records the seam in a `.resume` sidecar, so the emitted chunk JSON is the durable timeline rather than a re-derivable rendering. That also means a pattern channel skips the startup wipe — for it, the past is a record, not a view of the current config.
+
 ## Time zones
 
 Configurable station-wide via `tz` in the station config (or `ETV_STATION_TZ` at runtime). Affects chunk-boundary alignment only — the persisted UTC anchor doesn't move. See [PRD §Time zone](/PRD#time-zone).

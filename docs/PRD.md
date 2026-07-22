@@ -125,6 +125,36 @@ Items concatenate end-to-end, looping when exhausted. For any future timestamp `
 **Determinism**
 Given the same `(anchor, items)`, the program emits identical playout JSON every time. This matters for: regeneration after config edits, multi-instance setups, debugging.
 
+### Pattern interleave (Phase C)
+
+A block declares named **pools** and a repeating **pattern** instead of a flat `entries` list — "1 movie, then 3 episodes, repeat", drawing each step from a different resolved set while every series progresses independently. A block is one or the other; a pattern block that also carries a block-level `order` or `duplicates: collapse` is rejected at load, because either would silently undo the interleave.
+
+**Pool knobs** — every default is the stateless, least-surprising one, so a pool naming only `expr` behaves like a `query` entry.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `expr` | — | CEL query, as on a `query` entry |
+| `order` | query order | Internal sort; also fixes the series rotation order |
+| `select` | `round_robin` | *Which* series serves next — `round_robin` or `random` |
+| `rotate` | `visit` | *When* the series changes — `visit` (take N consecutive from one series) or `slot` (a new series every item) |
+| `advance` | `restart` | `restart` replays from the top; `resume` continues from the resume map |
+| `wrap` | `loop` | At exhaustion: `loop` restarts, `drop` leaves the rotation until new content appears |
+| `on_short` | `next` | Who fills slots the current series can't supply — `next`, `wrap`, or `short` |
+
+A pattern step is `{pool, take, chance}`. `chance` (default `1.0`) makes a step fire probabilistically — the "occasionally binge" knob. The roll is keyed on `(seed, cycle, step)`, so a pinned `seed` reproduces the whole skip/fire sequence, and a skipped step consumes no cursor.
+
+A series is keyed by the catalog `show_id`; an item without one — a movie — is its own series of one, which is why a movie pool needs no special case. `cycles` defaults to enough passes for the largest pool to drain once.
+
+### Generation model for pattern channels
+
+A pattern channel cannot use the anchor-and-loop model: a pool with `advance = "resume"` produces a different item list every generation by design, and `.anchor` re-anchors whenever the list changes, so an anchored loop would restart the schedule on every roll tick.
+
+Instead these channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
+
+The sidecar records, per pool, the **last-played `entry_id`** per series plus which series is next — never an index, because the resolved set churns and an index would silently mean something else after any change. An id that has vanished restarts its own series and no other. A missing or corrupt sidecar starts every pool from the top rather than failing the channel.
+
+The play-history ledger — the other half of the generation model — is still open (#70). This ships the resume map only.
+
 ### Future rules (designed for, not implemented)
 
 - **Recurring grid** — "Tue 8pm = X; Wed 9pm = Y; otherwise fall through to a base loop."

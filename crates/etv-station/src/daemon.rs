@@ -157,7 +157,9 @@ async fn open_and_ingest_catalog(
             sources = stats.sources_written,
             "local-fs catalog ingest complete",
         ),
-        Err(e) => tracing::error!(event = "catalog.ingest.fs_failed", error = %e, "local-fs catalog ingest failed; continuing"),
+        Err(e) => {
+            tracing::error!(event = "catalog.ingest.fs_failed", error = %e, "local-fs catalog ingest failed; continuing")
+        }
     }
 
     // Plex: only when both env vars are set — an unconfigured Plex is normal, not
@@ -181,7 +183,9 @@ async fn open_and_ingest_catalog(
                 sources = stats.sources_written,
                 "plex catalog ingest complete",
             ),
-            Err(e) => tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing"),
+            Err(e) => {
+                tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing")
+            }
         }
     }
 
@@ -489,6 +493,13 @@ async fn channel_loop(
     // this task (see #34), so it exists by the time we scan/emit into it here.
     let output = &channel.output_folder;
 
+    // A pattern channel advances its pools every generation, so its resolved
+    // list is different each time and the loop-a-fixed-list-from-an-anchor
+    // model doesn't apply. It runs its own emission loop instead (#72).
+    if channel.config.is_pattern() {
+        return pattern_channel_loop(channel, tz, source_roots, catalog, shutdown).await;
+    }
+
     // Resolve this channel's items. With a catalog, `query` entries and
     // non-`manual` order resolve and manual items path-match onto catalog
     // identities; without one, only inline-item `manual` channels resolve (others
@@ -592,6 +603,215 @@ async fn channel_loop(
                 tick.instrument(tracing::info_span!("roll_tick")).await;
             }
         }
+    }
+}
+
+/// Bound on how many generations one catch-up will chain before giving up, so
+/// a pathological config (a sequence with no wall-clock length) can't spin.
+const MAX_GENERATIONS_PER_TICK: usize = 512;
+
+/// The emission loop for a pattern channel (#72): **materialize forward**.
+///
+/// The looping model can't work here. `LoopForever` repeats one fixed list from
+/// a stable anchor, and `.anchor` re-anchors whenever the item list changes —
+/// but a pool with `advance = "resume"` produces a *different* list every
+/// generation by design, so an anchored loop would restart the schedule on
+/// every roll tick.
+///
+/// So the emitted chunk JSON becomes the durable timeline instead. Each pass
+/// resolves from the stored resume map, lays the resulting sequence end-to-end
+/// after the last thing already written, and stores where it got to. Nothing
+/// already written is ever rewritten — which is also why this path skips the
+/// startup wipe that `LoopForever` channels use to pick up config changes
+/// (#53): for a forward-materialized channel the past is a record, not a
+/// rendering of the current config.
+async fn pattern_channel_loop(
+    channel: &LoadedChannel,
+    tz: &'static Tz,
+    source_roots: &[String],
+    catalog: Option<&SharedCatalog>,
+    shutdown: Arc<Notify>,
+) -> Result<(), StationError> {
+    let (resume, how) = crate::resume::load(&channel.output_folder).await?;
+    match &how {
+        crate::resume::ResumeLoad::Fresh => tracing::info!(
+            event = "resume.init",
+            channel = %channel.name,
+            "no resume sidecar; starting every pool from the top",
+        ),
+        crate::resume::ResumeLoad::Loaded => tracing::info!(
+            event = "resume.load",
+            channel = %channel.name,
+            pools = resume.pools.len(),
+            "loaded resume map",
+        ),
+        crate::resume::ResumeLoad::Discarded(reason) => tracing::warn!(
+            event = "resume.discard",
+            channel = %channel.name,
+            reason = %reason,
+            "resume sidecar unusable; starting every pool from the top",
+        ),
+    }
+    let mut resume = resume;
+
+    resume = pattern_catch_up(channel, tz, source_roots, catalog, resume, "startup").await?;
+
+    let mut interval = tokio::time::interval(channel.config.roll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await; // consume immediate tick
+
+    loop {
+        select! {
+            _ = shutdown.notified() => {
+                tracing::info!(event = "channel.shutdown", channel = %channel.name, "shutdown received");
+                return Ok(());
+            }
+            _ = interval.tick() => {
+                let tick = async {
+                    match pattern_catch_up(channel, tz, source_roots, catalog, resume.clone(), "roll").await {
+                        Ok(next) => resume = next,
+                        Err(err) => tracing::error!(
+                            event = "roll.error",
+                            channel = %channel.name,
+                            error = %err,
+                            "roll tick failed; will retry next interval",
+                        ),
+                    }
+                };
+                tick.instrument(tracing::info_span!("roll_tick")).await;
+            }
+        }
+    }
+}
+
+/// Generate and emit forward until the window through `now + window_days` is
+/// covered, chaining one generation into the next through the resume map.
+/// Returns the map to carry into the next tick.
+async fn pattern_catch_up(
+    channel: &LoadedChannel,
+    tz: &'static Tz,
+    source_roots: &[String],
+    catalog: Option<&SharedCatalog>,
+    mut resume: crate::resume::ResumeMap,
+    phase: &'static str,
+) -> Result<crate::resume::ResumeMap, StationError> {
+    let output = &channel.output_folder;
+    let now = OffsetDateTime::now_utc();
+    let target = now + window_duration(channel.config.window_days);
+    let overlay_spec = load_overlay_playout_spec(channel);
+    let mut cache = DurationCache::load(output).await?;
+
+    // Pick up exactly where the written record ends. Unlike the looping path
+    // this is deliberately NOT snapped to a chunk boundary: a forward-
+    // materialized channel continues from the last item's finish, so the
+    // timeline stays gapless across the seam.
+    let existing = scan::scan_output_folder(output).await?;
+    let mut from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+
+    let mut generations = 0;
+    while from < target {
+        if generations >= MAX_GENERATIONS_PER_TICK {
+            tracing::warn!(
+                event = "pattern.generation_cap",
+                channel = %channel.name,
+                phase = phase,
+                generations = generations,
+                covered_through = %from,
+                target = %target,
+                "hit the per-tick generation cap; the window is only covered this far and will extend on the next roll tick",
+            );
+            break;
+        }
+
+        let (items, resume_out) = {
+            let guard = catalog.map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::resolve::resolve_channel_with_resume(
+                &channel.config,
+                &channel.config_path,
+                source_roots,
+                catalog.map(|sc| &sc.path_index),
+                guard.as_deref(),
+                &resume,
+            )?
+        };
+
+        let (durations, _) = cache.resolve_all(&items).await?;
+        let rule = crate::rule::Sequential::new(&items, &durations)
+            .with_overlay(overlay_spec.as_ref().map(clone_overlay_spec));
+        let span = rule.total_duration();
+        if span <= time::Duration::ZERO {
+            // Zero wall-clock length would never advance `from`. Stop rather
+            // than spin, and say so — silently emitting nothing would look
+            // exactly like a healthy idle channel.
+            tracing::error!(
+                event = "pattern.zero_length",
+                channel = %channel.name,
+                phase = phase,
+                items = items.len(),
+                "generation produced no playable duration; nothing further can be emitted",
+            );
+            break;
+        }
+
+        // Emit the generation *whole*, even when it reaches past the target.
+        // Clamping to the target would drop the sequence's tail while the
+        // resume map still recorded those items as played, skipping them
+        // permanently. Overshooting the window by less than one generation
+        // costs nothing; a hole in the schedule is unrecoverable.
+        let to = from + span;
+        let written = emit_window(
+            output,
+            &rule,
+            from,
+            tz,
+            channel.config.chunk_hours,
+            from,
+            to,
+        )
+        .await?;
+        log_emission(&channel.name, phase, &written, from, to);
+
+        resume = resume_out;
+        crate::resume::save(output, &resume).await?;
+        from += span;
+        generations += 1;
+    }
+
+    if generations == 0 {
+        tracing::info!(
+            event = "chunk.skip",
+            channel = %channel.name,
+            phase = phase,
+            "window already materialized through {target}",
+        );
+    }
+    cache.save(output).await?;
+
+    let removed = scan::sweep_retention(output, channel.config.retention_days, now).await;
+    if removed > 0 {
+        tracing::info!(
+            event = "retention.sweep",
+            channel = %channel.name,
+            phase = phase,
+            removed = removed,
+            retention_days = channel.config.retention_days,
+            "retention sweep pruned playout files",
+        );
+    }
+    Ok(resume)
+}
+
+/// `OverlaySpec` (an ETV-next type) is not `Clone`, and each generation in a
+/// catch-up builds its own rule.
+fn clone_overlay_spec(spec: &PlayoutOverlaySpec) -> PlayoutOverlaySpec {
+    PlayoutOverlaySpec {
+        fifo_path: spec.fifo_path.clone(),
+        pixel_format: spec.pixel_format.clone(),
+        width: spec.width,
+        height: spec.height,
+        framerate: spec.framerate,
+        x: spec.x,
+        y: spec.y,
     }
 }
 
