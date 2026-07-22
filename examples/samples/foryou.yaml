@@ -1,0 +1,80 @@
+# Sample S8 — For You: a taste-scored channel driven by a plugin (#82).
+#
+# Two movies, then a three-episode run of one show, repeated — but *what* plays
+# is not a query anyone wrote. A scorer plugin picks it, ranking the library by
+# what the server has actually been watching lately and suppressing whatever
+# this channel just aired.
+#
+# What this exercises that no other sample does:
+#   - `plugin` on a pool instead of `expr` (#74) — the plugin runs its own
+#     catalog queries, ranks what it finds, and returns the ordered set
+#   - the station computing no taste score of its own: it supplies the catalog,
+#     the pooled watch history, the recently-aired tail, and a target count,
+#     and takes back nothing but entry_ids in order
+#   - a plugin pool composing with `pattern` / `take` / `advance: resume`
+#     exactly as a CEL pool does
+#
+# Two pools, one plugin. `movies` and `shows` name the same `taste-engine.rhai`;
+# the script's own `sources()` splits the library by type, and each pool draws
+# the half it wants. `advance: resume` on `shows` means a show the plugin keeps
+# surfacing continues through its episodes across days rather than restarting.
+#
+# Server-wide, not per-user. The watch history handed to the plugin is pooled
+# across every Tautulli user with no user dimension — this Plex server has 20
+# accounts and several are shared by more than one real person, so "alice's
+# taste" is not a thing the data can support. A single-user variant is #112;
+# on-screen attribution of who is watching is #113.
+#
+# Short window on purpose. `window_days: 1` with `chunk_hours: 6` means the
+# plugin re-runs before much of the schedule is written, so the ranking is at
+# most hours stale when it airs. A 30-day window would rank once and air the
+# result a month later, against watch history a month out of date.
+#
+# Lives in examples/samples/, not examples/channels/, so the dev station never
+# registers it: it needs a populated catalog, the daemon-side catalog wiring
+# (#96), and a reachable Tautulli. Its resolution is proven by the
+# `foryou_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+
+# How far back the plugin's replay suppression can see, and the item length used
+# to size how much it is asked for. Both are this channel's taste rather than
+# the daemon's, which is why they are per-channel.
+scoring:
+  recent_depth: 200
+  nominal_item_secs: 5400
+
+rule:
+  blocks:
+    - mode: "all"
+      program:
+        title: "For You"
+      pools:
+        # Movies the plugin thinks are worth surfacing right now. No `order` —
+        # the plugin returns its set already ranked, and re-sorting it would
+        # discard the ranking it exists to produce.
+        - name: movies
+          plugin: "../plugins/taste-engine.rhai"
+          select: round_robin
+          advance: restart
+
+        # Episodes, ranked the same way. `advance: resume` is what makes a show
+        # the plugin keeps surfacing progress over days instead of replaying its
+        # first three episodes every generation — the resume point is keyed on
+        # `show_id`, so a show that drops out of the ranking and returns later
+        # picks up where it left off.
+        - name: shows
+          plugin: "../plugins/taste-engine.rhai"
+          select: round_robin
+          rotate: visit
+          advance: resume
+          on_short: next
+
+      # Two movies, then three episodes of whichever show is up.
+      pattern:
+        - pool: movies
+          take: 2
+        - pool: shows
+          take: 3

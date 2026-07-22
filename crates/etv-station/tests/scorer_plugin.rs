@@ -287,7 +287,7 @@ fn the_committed_example_plugin_runs() {
         recent: vec!["mov-d".into()],
         now: 900_000 + 3600,
     };
-    let picked = etv_station::score::run(&cat, &path, &inputs).unwrap();
+    let picked = etv_station::score::run(&cat, &path, &inputs, "movies").unwrap();
 
     assert!(
         !picked.contains(&"mov-d".to_string()),

@@ -358,7 +358,7 @@ fn resolve_pool<'a>(
         }
         (None, Some(plugin)) => {
             let path = score_env.resolve_path(plugin);
-            crate::score::run(catalog, &path, score_env.inputs)
+            crate::score::run(catalog, &path, score_env.inputs, &cfg.name)
                 .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
         }
         // Both, or neither, is rejected at load; a pool that reaches here in

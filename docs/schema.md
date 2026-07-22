@@ -214,8 +214,10 @@ not, and are rejected by name at load rather than silently read as a field sort:
 - `collection` (#107) — a collection's authored sequence belongs to the
   (collection, item) pair, so it lives on
   [`kind: collection`](#kind-collection-play-a-catalog-collection-in-its-authored-order).
-- `score` (#108) — needed a scoring plugin. Scoring is unspecified; if a score
-  ever lands as a per-item column, sort on it directly (`score:desc`).
+- `score` (#108) — needed a scoring plugin. Scoring landed instead as
+  [a pool's `plugin`](#pool-plugin--items-chosen-by-a-scorer-script) (#74):
+  picking the candidates and ranking them turned out to be the same judgment,
+  so it replaces a pool's `expr`, not its `order`.
 
 A bare field name defaults to ascending. Examples: `release_date:asc`,
 `season:asc,episode:asc`, `year:desc`. Invalid directions are rejected at load.
@@ -393,7 +395,9 @@ fn pick(ctx) { … }
 ```
 
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
-`entries` plus genres / cast / labels / … as arrays), `ctx.target_count` (how
+`entries` plus genres / cast / labels / … as arrays), `ctx.pool` (the name of
+the pool asking, so one script can serve several pools of a channel — a
+`movies` pool and a `shows` pool ranked by the same taste), `ctx.target_count` (how
 many items the generation needs), `ctx.history` (recent server-wide watch
 events, `#{entry_id, watched_at}`), `ctx.recent` (what this channel aired most
 recently, oldest first), and `ctx.now` (unix seconds at generation time).
@@ -434,6 +438,8 @@ The committed samples under `examples/` are authored in YAML:
 | Test channel (three lavfi items) | `examples/channels/lavfi-test.yaml` |
 | The Lord of the Rings (query channel) | `examples/samples/lotr.yaml` |
 | Trending Mix (pools + pattern interleave) | `examples/samples/trending-mix.yaml` |
+| For You (taste-scored via a plugin) | `examples/samples/foryou.yaml` |
+| Worked example scorer plugin | `examples/plugins/taste-engine.rhai` |
 | Star Wars timeline block (8 items, manual order) | `examples/blocks/starwars-timeline.yaml` |
 | Die Hard block (1 item) | `examples/blocks/diehard.yaml` |
 

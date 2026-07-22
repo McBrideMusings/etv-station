@@ -12,6 +12,8 @@
 // ctx carries:
 //   ctx.sets.<name>   the items each source matched (every catalog column,
 //                     plus genres / cast / labels / … as arrays)
+//   ctx.pool          the name of the pool asking — one script can serve
+//                     several pools of the same channel
 //   ctx.target_count  how many items this generation needs
 //   ctx.history       [#{entry_id, watched_at}] recent server-wide watches
 //   ctx.recent        entry_ids this channel aired most recently, oldest first
@@ -38,13 +40,23 @@ fn sources() {
 }
 
 fn pick(ctx) {
+    // One script serves several pools of the same channel, so the pool asking
+    // decides which half of the library it gets. A pool named anything else
+    // gets everything, which is the sensible default for a single-pool channel.
+    let wanted = if ctx.pool == "movies" { ["movies"] }
+                 else if ctx.pool == "shows" { ["episodes"] }
+                 else { ctx.sets.keys() };
+
     let scored = [];
-    for name in ctx.sets.keys() {
+    for name in wanted {
         for item in ctx.sets[name] {
             // Kept as two statements: an object literal whose value is itself a
             // call trips Rhai's expression-complexity limit.
             let s = score_item(item, ctx);
-            scored.push(#{ id: item.entry_id, score: s });
+            // `aired` is kept alongside the score so the all-suppressed
+            // fallback below can rank by staleness without recomputing it.
+            let a = index_of_recent(ctx.recent, item.entry_id);
+            scored.push(#{ id: item.entry_id, score: s, aired: a });
         }
     }
 
@@ -62,6 +74,24 @@ fn pick(ctx) {
     let out = [];
     for row in scored {
         if row.score > 0.0 { out.push(row.id); }
+    }
+
+    // Everything was suppressed — a library small enough that the replay window
+    // covers all of it. Falling through with nothing would fail the generation,
+    // so play the stalest thing instead: suppression is a preference, not a
+    // reason to take the channel off the air. Ranked by how long ago each
+    // aired, longest-ago first.
+    if out.is_empty() {
+        let stale = [];
+        for row in scored { stale.push(row); }
+        stale.sort(|a, b| {
+            if a.aired < b.aired { -1 }
+            else if a.aired > b.aired { 1 }
+            else if a.id < b.id { -1 }
+            else if a.id > b.id { 1 }
+            else { 0 }
+        });
+        for row in stale { out.push(row.id); }
     }
 
     // Ask for a little more than the generation needs, so a pattern that draws

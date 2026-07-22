@@ -25,6 +25,7 @@
 //! // Returns entry_ids, most-wanted first.
 //! fn pick(ctx) {
 //!     // ctx.sets.movies   — array of item maps, one per match
+//!     // ctx.pool          — the name of the pool asking
 //!     // ctx.target_count  — how many items the generation needs
 //!     // ctx.history       — recent server-wide watch events
 //!     // ctx.recent        — entry_ids this channel aired most recently
@@ -137,6 +138,7 @@ pub fn run(
     catalog: &Catalog,
     script_path: &Path,
     inputs: &ScoreInputs,
+    pool_name: &str,
 ) -> Result<Vec<String>, String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
@@ -185,6 +187,11 @@ pub fn run(
 
     let mut ctx = Map::new();
     ctx.insert("sets".into(), Dynamic::from_map(sets));
+    // Which pool is asking. One script commonly serves several pools of the
+    // same channel — a "movies" pool and a "shows" pool ranked by the same
+    // taste — and without this the script cannot tell them apart, so both
+    // would get the same list.
+    ctx.insert("pool".into(), pool_name.to_string().into());
     ctx.insert("target_count".into(), (inputs.target_count as i64).into());
     ctx.insert("now".into(), inputs.now.into());
     ctx.insert(
@@ -340,7 +347,7 @@ fn pick(ctx) {
 }
 "#,
         );
-        let got = run(&catalog(), &p, &ScoreInputs::default()).unwrap();
+        let got = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap();
         assert_eq!(got, vec!["m2", "m1"]);
     }
 
@@ -363,7 +370,7 @@ fn pick(ctx) {
 "#,
         );
         assert_eq!(
-            run(&catalog(), &p, &ScoreInputs::default()).unwrap(),
+            run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap(),
             ["m1"]
         );
     }
@@ -390,7 +397,7 @@ fn pick(ctx) {
             recent: vec!["m1".into()],
             ..Default::default()
         };
-        assert_eq!(run(&catalog(), &p, &inputs).unwrap(), ["m2"]);
+        assert_eq!(run(&catalog(), &p, &inputs, "test").unwrap(), ["m2"]);
     }
 
     #[test]
@@ -400,7 +407,7 @@ fn pick(ctx) {
             &dir,
             "fn sources() { #{ broken: `item.nope == 1` } }\nfn pick(ctx) { [] }\n",
         );
-        let e = run(&catalog(), &p, &ScoreInputs::default()).unwrap_err();
+        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
         assert!(e.contains("broken"), "got {e}");
     }
 
@@ -408,7 +415,7 @@ fn pick(ctx) {
     fn an_empty_pick_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [] }\n");
-        let e = run(&catalog(), &p, &ScoreInputs::default()).unwrap_err();
+        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
         assert!(e.contains("picked nothing"), "got {e}");
     }
 
@@ -419,7 +426,7 @@ fn pick(ctx) {
             &dir,
             "fn sources() { #{} }\nfn pick(ctx) { [\"m1\", \"m1\"] }\n",
         );
-        let e = run(&catalog(), &p, &ScoreInputs::default()).unwrap_err();
+        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
         assert!(e.contains("more than once"), "got {e}");
     }
 
@@ -427,7 +434,7 @@ fn pick(ctx) {
     fn a_missing_pick_function_names_the_plugin() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn sources() { #{} }\n");
-        let e = run(&catalog(), &p, &ScoreInputs::default()).unwrap_err();
+        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
         assert!(e.contains("pick()"), "got {e}");
     }
 }
