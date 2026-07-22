@@ -13,16 +13,20 @@
 //! the thin HTTP front door that reads `PLEX_URL`/`PLEX_TOKEN`, fetches, and
 //! calls it.
 //!
-//! Out of scope for this slice (tracked on #91): collections / playlists (need
-//! the ordered-children fetch), delta sync via `lastUpdated`, and the refresh
-//! TTL / manual trigger — all land with the catalog-into-daemon wiring (#96).
+//! [`ingest_collections`] is the parallel pure core for Plex collections:
+//! `collections` + ordered `collection_items`, with each member's ratingKey
+//! resolved back to its `entry_id` via the `plex` provenance row.
+//!
+//! Out of scope (tracked separately): playlists, delta sync via `lastUpdated`,
+//! and the refresh TTL / manual trigger — all land with the catalog-into-daemon
+//! wiring (#96).
 
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::catalog::identity::{canonical_path, derive_entry_id};
-use crate::catalog::model::{Entry, EntrySource, ExternalNs, Source, TagNs};
+use crate::catalog::model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
 use crate::catalog::{Catalog, CatalogError};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -179,6 +183,69 @@ pub fn ingest_items(
     Ok(stats)
 }
 
+/// One Plex collection with its ordered member ratingKeys, normalised out of the
+/// API shape. Produced by [`PlexClient::fetch_collections`]; consumed by
+/// [`ingest_collections`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCollection {
+    /// Plex collection `ratingKey` — the `collection_id`.
+    pub collection_id: String,
+    pub name: String,
+    /// Member ratingKeys in Plex's authored order.
+    pub member_rating_keys: Vec<String>,
+}
+
+/// What one collection ingest pass touched.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CollectionIngestStats {
+    pub collections_written: usize,
+    pub members_written: usize,
+    /// Members whose ratingKey resolved to no catalog entry (not ingested, or
+    /// FS-only) — skipped, never recorded as members.
+    pub members_unresolved: usize,
+}
+
+/// Write `collections` + `collection_items` for already-parsed Plex collections.
+/// Pure over the catalog, so tests exercise membership + ordering directly.
+///
+/// Membership is Plex-only and references `entry_id` (locked #47 option B): each
+/// member's ratingKey is resolved to its entry via the `plex` provenance row; a
+/// ratingKey with no catalog entry (un-ingested, or FS-only) is skipped. Position
+/// is the member's rank in Plex's authored order among the members that resolve
+/// (contiguous, 0-based); the `Collection` order read sorts by it.
+pub fn ingest_collections(
+    catalog: &Catalog,
+    collections: &[ParsedCollection],
+) -> Result<CollectionIngestStats, PlexIngestError> {
+    let mut stats = CollectionIngestStats::default();
+    for coll in collections {
+        catalog.upsert_collection(&Collection {
+            collection_id: coll.collection_id.clone(),
+            name: coll.name.clone(),
+            source: Source::Plex,
+        })?;
+        stats.collections_written += 1;
+
+        let mut position = 0i64;
+        let mut seen = std::collections::HashSet::new();
+        for rating_key in &coll.member_rating_keys {
+            match catalog.entry_id_for_source(Source::Plex, rating_key)? {
+                // A deduped item can surface as two member ratingKeys on one
+                // entry (e.g. 4K + 1080p files); record it once so `position`
+                // stays contiguous and the count matches the rows written.
+                Some(entry_id) if seen.insert(entry_id.clone()) => {
+                    catalog.add_collection_item(&coll.collection_id, &entry_id, position)?;
+                    position += 1;
+                    stats.members_written += 1;
+                }
+                Some(_) => {}
+                None => stats.members_unresolved += 1,
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// Fetch every library's movies + episodes from Plex and ingest them.
 /// `source_roots` canonicalise paths for identity/path-match.
 ///
@@ -190,9 +257,15 @@ pub fn ingest_from_env(
 ) -> Result<PlexIngestStats, PlexIngestError> {
     let client = PlexClient::from_env()?;
     let items = client.fetch_all()?;
+    let collections = client.fetch_collections()?;
     // One transaction for the whole write pass — a mid-ingest failure rolls back
-    // rather than leaving a partial catalog.
-    catalog.in_transaction(|c| ingest_items(c, &items, source_roots))
+    // rather than leaving a partial catalog. Entries are written before
+    // collections so member ratingKeys resolve to their entry ids.
+    catalog.in_transaction(|c| {
+        let stats = ingest_items(c, &items, source_roots)?;
+        ingest_collections(c, &collections)?;
+        Ok(stats)
+    })
 }
 
 /// Resolve the entry an item should attach to, if any: a GUID the catalog
@@ -367,6 +440,40 @@ impl PlexClient {
             }
         }
         Ok(items)
+    }
+
+    /// Every collection across all library sections, with members in Plex's
+    /// authored order. One request per section for its collection list, then one
+    /// per collection for its ordered children.
+    fn fetch_collections(&self) -> Result<Vec<ParsedCollection>, PlexIngestError> {
+        let sections: SectionListResp = self.get("/library/sections", &[])?;
+        let mut out = Vec::new();
+        for section in &sections.media_container.directory {
+            let Some(id) = section.key.as_deref() else {
+                continue;
+            };
+            let endpoint = format!("/library/sections/{id}/collections");
+            let resp: MediaContainerResp = self.get(&endpoint, &[])?;
+            for c in &resp.media_container.metadata {
+                let Some(collection_id) = c.rating_key.clone() else {
+                    continue;
+                };
+                let members_ep = format!("/library/metadata/{collection_id}/children");
+                let members: MediaContainerResp = self.get(&members_ep, &[])?;
+                let member_rating_keys = members
+                    .media_container
+                    .metadata
+                    .iter()
+                    .filter_map(|m| m.rating_key.clone())
+                    .collect();
+                out.push(ParsedCollection {
+                    collection_id,
+                    name: c.title.clone().unwrap_or_default(),
+                    member_rating_keys,
+                });
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -756,6 +863,82 @@ mod tests {
             cat.resolve_query("item.absolute_episode == 154").unwrap(),
             vec!["imdb:tt-ae".to_string()]
         );
+    }
+
+    #[test]
+    fn ingest_collections_records_ordered_membership() {
+        let cat = Catalog::open_in_memory().unwrap();
+        // Two ingested movies (their `plex` provenance source_id is the ratingKey).
+        let a = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        let b = movie("rk-b", "/data/media/m/b.mkv", &[(ExternalNs::Imdb, "tt-b")]);
+        ingest_items(&cat, &[a, b], &["/data/media".into()]).unwrap();
+
+        // The collection lists b before a, then a member never ingested.
+        let coll = ParsedCollection {
+            collection_id: "coll-1".into(),
+            name: "Halloween Marathon".into(),
+            member_rating_keys: vec!["rk-b".into(), "rk-a".into(), "rk-missing".into()],
+        };
+        let stats = ingest_collections(&cat, std::slice::from_ref(&coll)).unwrap();
+        assert_eq!(stats.collections_written, 1);
+        assert_eq!(stats.members_written, 2);
+        assert_eq!(stats.members_unresolved, 1);
+
+        // Read back in authored order (b, a); the unresolved ratingKey is absent,
+        // not a positional gap.
+        assert_eq!(
+            cat.collection_members("coll-1").unwrap(),
+            vec!["imdb:tt-b".to_string(), "imdb:tt-a".to_string()]
+        );
+        // Membership is queryable by collection name via the CEL→SQL surface.
+        assert_eq!(
+            cat.resolve_query(r#"item.collections.contains("Halloween Marathon")"#).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ingest_collections_counts_a_deduped_member_once() {
+        let cat = Catalog::open_in_memory().unwrap();
+        // Two Plex files (4K + 1080p) share one GUID → one entry, two `plex`
+        // provenance rows (two ratingKeys).
+        let dupes = [
+            movie("rk-4k", "/data/media/m/a-4k.mkv", &[(ExternalNs::Imdb, "tt-a")]),
+            movie("rk-hd", "/data/media/m/a-hd.mkv", &[(ExternalNs::Imdb, "tt-a")]),
+        ];
+        ingest_items(&cat, &dupes, &["/data/media".into()]).unwrap();
+        let b = movie("rk-b", "/data/media/m/b.mkv", &[(ExternalNs::Imdb, "tt-b")]);
+        ingest_items(&cat, std::slice::from_ref(&b), &["/data/media".into()]).unwrap();
+
+        // The collection lists both ratingKeys of the one entry, then another.
+        let coll = ParsedCollection {
+            collection_id: "coll-1".into(),
+            name: "C".into(),
+            member_rating_keys: vec!["rk-4k".into(), "rk-hd".into(), "rk-b".into()],
+        };
+        let stats = ingest_collections(&cat, &[coll]).unwrap();
+        // The deduped entry counts once; positions stay contiguous (a=0, b=1).
+        assert_eq!(stats.members_written, 2);
+        assert_eq!(
+            cat.collection_members("coll-1").unwrap(),
+            vec!["imdb:tt-a".to_string(), "imdb:tt-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn ingest_collections_is_idempotent() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let a = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        ingest_items(&cat, std::slice::from_ref(&a), &["/data/media".into()]).unwrap();
+        let coll = ParsedCollection {
+            collection_id: "coll-1".into(),
+            name: "C".into(),
+            member_rating_keys: vec!["rk-a".into()],
+        };
+        ingest_collections(&cat, std::slice::from_ref(&coll)).unwrap();
+        // A second pass must not duplicate the membership row.
+        ingest_collections(&cat, &[coll]).unwrap();
+        assert_eq!(cat.collection_members("coll-1").unwrap(), vec!["imdb:tt-a".to_string()]);
     }
 
     #[test]

@@ -333,6 +333,25 @@ impl Catalog {
         Ok(row)
     }
 
+    /// The `entry_id` a `(source, source_id)` provenance row resolves to, if any.
+    /// Used to map a Plex `ratingKey` back to its catalog entry — e.g. resolving
+    /// a collection's members to entry ids.
+    pub fn entry_id_for_source(
+        &self,
+        source: Source,
+        source_id: &str,
+    ) -> Result<Option<String>, CatalogError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT entry_id FROM entry_sources WHERE source = ?1 AND source_id = ?2",
+                params![source.as_str(), source_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Every entry id, ascending — a stable enumeration for callers that scan.
     pub fn all_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])
