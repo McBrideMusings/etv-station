@@ -9,6 +9,7 @@ use super::entry::Entry;
 use super::filter::Filter;
 use super::mode::Mode;
 use super::order::Order;
+use super::pool::{PatternStep, Pool};
 
 /// A channel's sequencing rule: an ordered list of block-includes that compose
 /// into the channel's playout. Replaces the v1 `loop_forever` rule (#46).
@@ -51,6 +52,22 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<Entry>,
 
+    /// Pattern form: the named resolved sets this block interleaves (#72).
+    /// Mutually exclusive with `entries` — a block is either an entries block
+    /// or a pattern block, enforced in validation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<Pool>,
+
+    /// Pattern form: the repeating template walked to fill the window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pattern: Vec<PatternStep>,
+
+    /// Pattern form: how many times to walk the pattern. Unset derives it —
+    /// enough cycles for the largest pool to drain once (see
+    /// [`crate::pattern`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycles: Option<usize>,
+
     #[serde(default)]
     pub mode: Mode,
 
@@ -73,8 +90,14 @@ impl BlockInclude {
         self.program.as_ref()
     }
 
-    /// The effective duplicate policy (defaulting to `collapse`).
+    /// The effective duplicate policy. An entries block defaults to `collapse`;
+    /// a pattern block is always `keep`, because collapse would delete every
+    /// repeat a looping pool deliberately produces (validation rejects an
+    /// explicit `collapse` on a pattern block rather than silently overriding).
     pub fn duplicates(&self) -> Duplicates {
+        if self.is_pattern() {
+            return Duplicates::Keep;
+        }
         self.duplicates.unwrap_or_default()
     }
 
@@ -83,14 +106,25 @@ impl BlockInclude {
         self.constraints.unwrap_or_default()
     }
 
+    /// Whether this block interleaves pools via a pattern rather than playing a
+    /// flat `entries` list. True as soon as either pattern field is present, so
+    /// a half-specified block (pools without pattern) reaches validation and
+    /// gets a clear error instead of being read as an empty entries block.
+    pub fn is_pattern(&self) -> bool {
+        !self.pools.is_empty() || !self.pattern.is_empty()
+    }
+
     /// Splice a loaded block-file body into this include's inline fields and
     /// clear the path reference. Called by `load` after reading a path-form
     /// block file.
     pub(super) fn apply_body(&mut self, body: BlockFile) {
         self.program = body.program;
-        self.duplicates = Some(body.duplicates);
+        self.duplicates = body.duplicates;
         self.constraints = body.constraints;
         self.entries = body.entries;
+        self.pools = body.pools;
+        self.pattern = body.pattern;
+        self.cycles = body.cycles;
         self.block = None;
     }
 }

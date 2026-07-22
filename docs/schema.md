@@ -54,7 +54,7 @@ expanded from the environment at load time.
 
 ## Entry
 
-Every entry is tagged by a `kind` field. Three kinds. Source: `config/entry.rs`.
+Every entry is tagged by a `kind` field. Four kinds. Source: `config/entry.rs`.
 
 ### `kind: item` — an authored file
 
@@ -103,6 +103,32 @@ catalog and expands to the matching items.
 A string comparison treats a missing value as the empty string, so a film with
 no `edition` counts as theatrical: `item.edition != "Extended Edition"` matches
 it, and `item.edition == ""` selects exactly the no-edition items.
+
+### `kind: collection` — play a catalog collection in its authored order
+
+Emits every member of one collection in the sequence hand-arranged in the source
+app (`collection_items.position`). Re-ordering is a drag plus a re-ingest; the
+config does not change.
+
+| Field | Required | Type |
+|---|---|---|
+| `name` | **yes** | the collection's name as its source names it |
+
+```yaml
+- kind: collection
+  name: "Halloween Marathon"
+```
+
+There is no `order` here, and no `order: "collection"` anywhere. A collection's
+sequence belongs to the (collection, item) pair, not to the items, so once a
+block flattens its entries into a set of ids nothing can say which collection's
+positions to read. The entry emits an already-ordered run instead, which the
+block's default `manual` order preserves.
+
+The entry must name exactly one collection: an ambiguous name and an empty
+collection are both config errors. For membership *without* the order — a
+collection as a set to filter or shuffle — use a `query` entry with
+`item.collections.contains("…")`. One stored structure, two read paths.
 
 ### `kind: include` — pull in another block file
 
@@ -180,9 +206,16 @@ A string. Source: `config/order.rs`.
 |---|---|
 | `manual` *(default)* | keep authored order |
 | `random` | shuffle (seeded by the channel `seed`) |
-| `collection` | catalog collection order |
-| `score` | by relevance score |
 | `field:dir,...` | sort by one or more fields; `dir` is `asc` or `desc` |
+
+Every value is computable from the items being ordered. Two former values were
+not, and are rejected by name at load rather than silently read as a field sort:
+
+- `collection` (#107) — a collection's authored sequence belongs to the
+  (collection, item) pair, so it lives on
+  [`kind: collection`](#kind-collection-play-a-catalog-collection-in-its-authored-order).
+- `score` (#108) — needed a scoring plugin. Scoring is unspecified; if a score
+  ever lands as a per-item column, sort on it directly (`score:desc`).
 
 A bare field name defaults to ascending. Examples: `release_date:asc`,
 `season:asc,episode:asc`, `year:desc`. Invalid directions are rejected at load.
@@ -333,7 +366,8 @@ The committed samples under `examples/` are authored in YAML:
 |---|---|
 | Station manifest | `examples/station.yaml` |
 | Test channel (three lavfi items) | `examples/channels/lavfi-test.yaml` |
-| The Lord of the Rings (query channel) | `examples/channels/lotr.yaml` |
+| The Lord of the Rings (query channel) | `examples/samples/lotr.yaml` |
+| Trending Mix (pools + pattern interleave) | `examples/samples/trending-mix.yaml` |
 | Star Wars timeline block (8 items, manual order) | `examples/blocks/starwars-timeline.yaml` |
 | Die Hard block (1 item) | `examples/blocks/diehard.yaml` |
 

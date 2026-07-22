@@ -14,8 +14,9 @@
 #               'item.labels.contains("Disney")'
 # The `studio_brand_sample` acceptance test proves all three query forms.
 #
-# Not registered in examples/station.yaml: a query channel needs a populated
-# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# Lives in examples/samples/, not examples/channels/, so the dev station never
+# registers it: a query channel needs a populated catalog + the daemon-side
+# catalog wiring (#96) to run live. Its resolution is
 # proven by the `studio_brand_sample` acceptance test.
 window_days: 1
 chunk_hours: 6

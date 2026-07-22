@@ -125,6 +125,45 @@ Items concatenate end-to-end, looping when exhausted. For any future timestamp `
 **Determinism**
 Given the same `(anchor, items)`, the program emits identical playout JSON every time. This matters for: regeneration after config edits, multi-instance setups, debugging.
 
+### Pattern interleave (Phase C)
+
+A block declares named **pools** and a repeating **pattern** instead of a flat `entries` list — "1 movie, then 3 episodes, repeat", drawing each step from a different resolved set while every series progresses independently. A block is one or the other; a pattern block that also carries a block-level `order` or `duplicates: collapse` is rejected at load, because either would silently undo the interleave.
+
+**Pool knobs** — every default is the stateless, least-surprising one, so a pool naming only `expr` behaves like a `query` entry.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `expr` | — | CEL query, as on a `query` entry |
+| `order` | query order | Internal sort; also fixes the series rotation order |
+| `select` | `round_robin` | *Which* series serves next — `round_robin` or `random` |
+| `rotate` | `visit` | *When* the series changes — `visit` (take N consecutive from one series) or `slot` (a new series every item) |
+| `advance` | `restart` | `restart` replays from the top; `resume` continues from the resume map |
+| `on_short` | `next` | Who fills slots the current series can't supply — `next`, `wrap`, or `short` |
+
+A pattern step is `{pool, take, chance}`. `chance` (default `1.0`) makes a step fire probabilistically — the "occasionally binge" knob. The roll is keyed on `(seed, cycle, step)`, so a pinned `seed` reproduces the whole skip/fire sequence, and a skipped step consumes no cursor.
+
+A series is keyed by the catalog `show_id`; an item without one — a movie — is its own series of one, which is why a movie pool needs no special case. `cycles` defaults to enough passes for the largest pool to play through once.
+
+A series that reaches its last item starts over. That is the only behaviour there is — there is no setting that retires a series or a pool, because a television channel does not stop broadcasting when it reaches the end of its library.
+
+### Generation model for pattern channels
+
+A pattern channel cannot use the anchor-and-loop model: a pool with `advance = "resume"` produces a different item list every generation by design, and `.anchor` re-anchors whenever the list changes, so an anchored loop would restart the schedule on every roll tick.
+
+Instead these channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
+
+Two files carry that state, and they hold different things. The **play-history ledger** (`.history`) is one JSONL line per scheduled airing — `entry_id`, `show_id`, the scheduled `start`, and when the row was written. It is a dumb record: no taste logic, no TTL, no relevance. Where each series left off is a **projection** of it ("the last airing per `show_id`"), so there is exactly one place that knows a show's position and nothing to drift out of sync. A future taste scorer reads the same lines the other way — all of them, with timestamps. One structure, two read shapes.
+
+Positions are therefore recorded as the **last-played `entry_id`**, never an index: the resolved set churns, and an index would silently mean something else after any change. An id that has vanished restarts its own series and no other, and a show that leaves the resolved set entirely and later returns resumes where it stopped, because the ledger is never pruned to the current set. A torn line is skipped rather than failing the channel.
+
+The `.resume` sidecar holds only what the ledger cannot express: which series is next in each pool's rotation, and the checkpoints below. A missing or corrupt one starts every pool from the top rather than failing the channel.
+
+It also carries **checkpoints**: the pool state entering each generation that has not started airing. On startup the channel rewinds to the earliest of them, deletes the emitted files from that instant forward, and regenerates them from the current config — so a config or overlay edit reaches a pattern channel without waiting for its whole written window to play out, and without losing or repeating an item. Aired and currently-airing chunks are never touched.
+
+There is no exhausted state. A channel cannot play its way to an empty list, because every series loops — so resolving to zero items always means the resolved *set* is empty (an expression that matches nothing, an empty catalog), which is a config error and is reported as one.
+
+Both halves of the generation model are now in place: the resume map (#72) and the play-history ledger (#70). What remains open is what reads the ledger the *other* way — the taste scorers of #74 and #82.
+
 ### Future rules (designed for, not implemented)
 
 - **Recurring grid** — "Tue 8pm = X; Wed 9pm = Y; otherwise fall through to a base loop."
@@ -241,10 +280,11 @@ Deliverable: a working overlay pipeline with a small declarative + scripted prim
 
 With the language picked and graphics working, redesign the user-facing schema:
 
-- **Block as the unit of reuse.** A block = `[program]` defaults + flat `[[entries]]` list (item / query / include). Blocks are content-agnostic — TV, movies, home movies, bumpers, mixed.
+- **Block as the unit of reuse.** A block = `[program]` defaults + flat `[[entries]]` list (item / query / collection / include). Blocks are content-agnostic — TV, movies, home movies, bumpers, mixed.
 - **Authoring format is by extension.** Every config file — `station`, `channel`, and path-referenced *block files* — may be authored in either TOML or YAML, selected by file extension: `.yaml`/`.yml` parse as YAML, anything else as TOML. Same serde types either way (no schema difference), so a station and its channels and blocks can all be one format. Inline entries inside a channel's `[[rule.blocks]]` stay in whatever format the channel file uses.
-- **Channels compose blocks** via `[[rule.blocks]]` with `mode` (`all` or `count = N`), `order` (`chronological` or seeded `random`), and `filter` over the resolved item list.
-- **Adjacency constraints.** A block's `[constraints]` table carries `no_repeat_within = N`: the same item may not recur within N positions (`1` = never back-to-back). Blocks resolve and order independently, then one pass runs over the whole concatenated channel list, so a repeat straddling a block join is caught too. The list is treated as circular — Loop Forever replays it end to end, so its tail genuinely airs before its head. When the set offers no alternative (one title, "no two in a row"), the violation is accepted and generation completes rather than hanging. The richer property-level form — `separate_by = "cast"` with `separate_min_gap`, meaning no two adjacent films share a performer — is proposed, not v1.
+- **Channels compose blocks** via `[[rule.blocks]]` with `mode` (`all` or `count = N`), `order` (`manual`, seeded `random`, or a compound `field:dir` sort), and `filter` over the resolved item list.
+- **Order is only what the items themselves determine.** A collection's hand-authored sequence is not an `order` value: `collection_items.position` belongs to the (collection, item) pair, so a flattened item list can no longer say which collection's positions to read. That sequence rides on a `collection` entry, which emits its members already ordered. Collections-as-a-set stays a `query` entry (`item.collections.contains(...)`) — one stored structure, two read paths. A relevance `score` failed the same test — it needed a plugin the item list can't reach — and is unspecified until there is a concrete source for it.
+- **Adjacency constraints.** A block's `[constraints]` table carries `no_repeat_within = N`: the same item may not recur within N positions (`1` = never back-to-back). Blocks resolve and order independently, then one pass runs over the whole concatenated channel list, so a repeat straddling a block join is caught too. When the set offers no alternative (one title, "no two in a row"), the violation is accepted and generation completes rather than hanging. The richer property-level form — `separate_by = "cast"` with `separate_min_gap`, meaning no two adjacent films share a performer — is proposed, not v1.
 - **Unified catalog ingestion.** Plex (primary) + local-FS scan (bumpers / commercials / errata) feed a normalized **sqlite catalog** via `rusqlite`. Sonarr/Radarr deferred unless a Plex gap appears.
 - **sqlite cache, not in-memory or JSON.** Tens of thousands of items rules out per-boot rescans (slow API round-trips) and full-file JSON snapshots (full reparse + RAM-resident). sqlite gives indexed lookups, incremental refresh from Plex's `lastUpdated`, WAL-mode concurrency between refresh writer and query reader, and `sqlite3` shell inspection for debugging. Schema is three tables — `items`, `collections` + `collection_items`, `catalog_meta` (per-source sync timestamps) — plus simple up-only migrations.
 - **Runtime query resolution.** Channel TOML carries live queries; daemon translates them into sqlite reads at boot, snapshots the resolved item list for the chunk window. Stateless determinism preserved — the snapshot is the durable list, the catalog itself is the deterministically-rebuildable substrate.

@@ -8,8 +8,9 @@
 # shuffle. Contrast with Sample S6 (Marathon), which reads the SAME collection
 # structure for its authored `position` (collections-as-order).
 #
-# Not registered in examples/station.yaml: a query channel needs a populated
-# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# Lives in examples/samples/, not examples/channels/, so the dev station never
+# registers it: a query channel needs a populated catalog + the daemon-side
+# catalog wiring (#96) to run live. Its resolution is
 # proven by the `trending_shuffle_sample` acceptance test.
 window_days: 1
 chunk_hours: 6

@@ -43,7 +43,9 @@ Out of scope until Phase C: scripted `size`/`color`, channel/block/item overlay 
 With the query language picked and graphics rendering working, redesign the channel/block/entries schema and integrate everything:
 
 - New TOML (or YAML) schema with blocks, channels, `[[entries]]`, includes, modes (`all` / `count`), filters, channel-seeded random order.
-- Adjacency constraints — `[constraints] no_repeat_within = N`, enforced circularly over the whole channel list (#73). The property-level `separate_by` / `separate_min_gap` form is deferred; so is reading the previous window's last aired item out of a play-history ledger, which waits on the generation model (#70).
+- Pools + pattern interleave ([#72](https://github.com/McBrideMusings/etv-station/issues/72), shipped) — "1 movie, then 3 episodes, repeat" across independently-progressing series, with a `.resume` sidecar carrying progression across window seams. Ships the resume-map half of the generation model.
+- Generation model ([#70](https://github.com/McBrideMusings/etv-station/issues/70), shipped) — the play-history ledger: one `.history` line per scheduled airing, with the per-series resume cursor as a projection of it rather than a second store.
+- Adjacency constraints — `[constraints] no_repeat_within = N` over the whole channel list (#73). The property-level `separate_by` / `separate_min_gap` form is deferred.
 - Plex catalog ingester + local-FS catalog ingester (bumpers / commercials / errata).
 - Runtime query resolution with snapshot-at-boot and configurable refresh interval.
 - Graphics overlay cascade: channel default → block override → item override.

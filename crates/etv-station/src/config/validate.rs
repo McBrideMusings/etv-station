@@ -1,9 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use super::block::Duplicates;
 use super::channel::ChannelConfig;
+use super::order::Order;
+use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
+use crate::pattern::MAX_CYCLES;
 
 pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(), ConfigError> {
     if station.channels.is_empty() {
@@ -104,9 +108,23 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         });
     }
 
+    // Pool names key the `.resume` sidecar, so they must be unique across the
+    // whole channel — that is what lets the sidecar survive blocks being
+    // reordered without a block index in the key.
+    let mut pool_names: HashSet<&str> = HashSet::new();
+
     for (idx, include) in channel.rule.blocks.iter().enumerate() {
-        let entries = include.entries();
-        if entries.is_empty() {
+        let bad = |message: String| ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!("block #{idx}: {message}"),
+        };
+
+        if include.is_pattern() {
+            validate_pattern_block(include, &mut pool_names, &bad)?;
+            continue;
+        }
+
+        if include.entries().is_empty() {
             return Err(ConfigError::Validation {
                 path: path.to_path_buf(),
                 message: format!("block #{idx} has no entries"),
@@ -133,12 +151,101 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     Ok(())
 }
 
+/// Semantic checks for a pools + pattern block (#72).
+///
+/// The refusals here all guard the same thing: a pattern block whose *other*
+/// fields quietly contradict the pattern. A block-level `order` would re-sort
+/// the interleave the pattern just built, and `duplicates = "collapse"` would
+/// delete every repeat a looping pool deliberately produces. Both are rejected
+/// at load with the conflict named, rather than accepted and ignored — a config
+/// that says `order: random` and doesn't shuffle is a lie the author can't see
+/// from the file.
+fn validate_pattern_block<'a>(
+    include: &'a BlockInclude,
+    pool_names: &mut HashSet<&'a str>,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    if !include.entries().is_empty() {
+        return Err(bad(
+            "a block is either an `entries` block or a `pools` + `pattern` block, not both".into(),
+        ));
+    }
+    if include.pools.is_empty() {
+        return Err(bad("`pattern` needs at least one `pools` entry".into()));
+    }
+    if include.pattern.is_empty() {
+        return Err(bad("`pools` needs a `pattern` to draw from them".into()));
+    }
+    if include.order != Order::Manual {
+        return Err(bad(format!(
+            "order {:?} conflicts with `pattern` — the pattern IS the ordering; \
+             sort inside a pool with its own `order` instead",
+            include.order
+        )));
+    }
+    if include.duplicates == Some(Duplicates::Collapse) {
+        return Err(bad(
+            "duplicates = \"collapse\" conflicts with `pattern` — collapse would delete \
+             the repeats a looping pool produces; a pattern block is always \"keep\""
+                .into(),
+        ));
+    }
+    if let Some(n) = include.cycles {
+        if n == 0 {
+            return Err(bad("cycles must be > 0".into()));
+        }
+        if n > MAX_CYCLES {
+            return Err(bad(format!(
+                "cycles = {n} exceeds the maximum of {MAX_CYCLES}"
+            )));
+        }
+    }
+
+    let mut local: HashSet<&str> = HashSet::new();
+    for pool in &include.pools {
+        if pool.name.trim().is_empty() {
+            return Err(bad("a pool has an empty name".into()));
+        }
+        if pool.expr.trim().is_empty() {
+            return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
+        }
+        if !pool_names.insert(pool.name.as_str()) {
+            return Err(bad(format!(
+                "pool name {:?} is already used by another block in this channel; \
+                 pool names key the .resume sidecar and must be unique per channel",
+                pool.name
+            )));
+        }
+        local.insert(pool.name.as_str());
+    }
+
+    for (step_idx, step) in include.pattern.iter().enumerate() {
+        if !local.contains(step.pool.as_str()) {
+            return Err(bad(format!(
+                "pattern step #{step_idx} names pool {:?}, which this block does not declare",
+                step.pool
+            )));
+        }
+        if step.take == 0 {
+            return Err(bad(format!("pattern step #{step_idx} has take = 0")));
+        }
+        if !(0.0..=1.0).contains(&step.chance) {
+            return Err(bad(format!(
+                "pattern step #{step_idx} has chance = {}, outside 0.0–1.0",
+                step.chance
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        BlockInclude, ChannelConfig, Entry, ItemEntry, Mode, Order, RuleConfig, SourceConfig,
-        StationConfig,
+        Advance, BlockInclude, ChannelConfig, Entry, ItemEntry, Mode, OnShort, Order, PatternStep,
+        Pool, Rotate, RuleConfig, Select, SourceConfig, StationConfig,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -165,10 +272,40 @@ mod tests {
             duplicates: None,
             constraints: None,
             entries,
+            pools: Vec::new(),
+            pattern: Vec::new(),
+            cycles: None,
             mode: Mode::All,
             order: Order::Manual,
             filter: None,
         }
+    }
+
+    fn pool(name: &str) -> Pool {
+        Pool {
+            name: name.into(),
+            expr: format!("item.type == \"{name}\""),
+            order: None,
+            select: Select::default(),
+            rotate: Rotate::default(),
+            advance: Advance::default(),
+            on_short: OnShort::default(),
+        }
+    }
+
+    fn step(pool: &str, take: usize) -> PatternStep {
+        PatternStep {
+            pool: pool.into(),
+            take,
+            chance: 1.0,
+        }
+    }
+
+    fn pattern_block(pools: Vec<Pool>, pattern: Vec<PatternStep>) -> BlockInclude {
+        let mut b = inline_block(vec![]);
+        b.pools = pools;
+        b.pattern = pattern;
+        b
     }
 
     fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
@@ -260,6 +397,113 @@ mod tests {
     fn accepts_valid_channel() {
         let ch = channel_with(vec![inline_block(vec![item_entry("a"), item_entry("b")])]);
         validate_channel(&dummy_path(), &ch).unwrap();
+    }
+
+    // ---- pattern blocks (#72) ---------------------------------------------
+
+    #[test]
+    fn accepts_a_pattern_block() {
+        let b = pattern_block(
+            vec![pool("movies"), pool("shows")],
+            vec![step("movies", 1), step("shows", 3)],
+        );
+        validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_block_that_is_both_entries_and_pattern() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.entries = vec![item_entry("a")];
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("not both"), "err = {err}");
+    }
+
+    #[test]
+    fn rejects_pools_without_a_pattern() {
+        let b = pattern_block(vec![pool("movies")], vec![]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("pattern"), "err = {err}");
+    }
+
+    #[test]
+    fn rejects_a_pattern_without_pools() {
+        let b = pattern_block(vec![], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("pools"), "err = {err}");
+    }
+
+    #[test]
+    fn rejects_a_step_naming_an_undeclared_pool() {
+        let b = pattern_block(vec![pool("movies")], vec![step("shows", 3)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("does not declare"), "err = {err}");
+    }
+
+    #[test]
+    fn rejects_block_order_on_a_pattern_block() {
+        // The pattern IS the ordering — a block-level sort would silently
+        // un-pattern the block.
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.order = Order::Random;
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("conflicts with `pattern`"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_collapse_on_a_pattern_block() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.duplicates = Some(Duplicates::Collapse);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("collapse"), "err = {err}");
+    }
+
+    #[test]
+    fn a_pattern_block_reports_keep_regardless_of_the_unset_default() {
+        let b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        assert_eq!(b.duplicates(), Duplicates::Keep);
+        // An entries block still defaults to collapse.
+        assert_eq!(
+            inline_block(vec![item_entry("a")]).duplicates(),
+            Duplicates::Collapse
+        );
+    }
+
+    #[test]
+    fn rejects_take_zero_and_out_of_range_chance() {
+        let b = pattern_block(vec![pool("movies")], vec![step("movies", 0)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("take = 0"), "err = {err}");
+
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.pattern[0].chance = 1.5;
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("chance"), "err = {err}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_pool_name_across_blocks() {
+        // Pool names key the .resume sidecar, so a channel-wide collision would
+        // make two pools share one cursor.
+        let a = pattern_block(vec![pool("shows")], vec![step("shows", 1)]);
+        let b = pattern_block(vec![pool("shows")], vec![step("shows", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![a, b])).unwrap_err();
+        assert!(format!("{err}").contains("already used"), "err = {err}");
+    }
+
+    #[test]
+    fn rejects_cycles_out_of_range() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.cycles = Some(0);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("cycles"), "err = {err}");
+
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.cycles = Some(MAX_CYCLES + 1);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("maximum"), "err = {err}");
     }
 
     #[test]

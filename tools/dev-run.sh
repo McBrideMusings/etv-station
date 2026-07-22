@@ -9,6 +9,18 @@ set -u
 # spawned by ersatztv-channel) instead of only the direct children.
 set -m
 
+# The etv-next submodule supplies the `ersatztv-playout` crate every build here
+# depends on. A fresh clone or a new git worktree has the directory but not the
+# contents, and cargo's failure ("failed to read etv-next/crates/.../Cargo.toml")
+# says nothing about submodules — so check it explicitly and fix it in place.
+if [ ! -f etv-next/crates/ersatztv-playout/Cargo.toml ]; then
+  echo "[dev] etv-next submodule is not checked out; running git submodule update --init --recursive"
+  if ! git submodule update --init --recursive; then
+    echo "[dev] submodule checkout failed; cannot build without etv-next" >&2
+    exit 1
+  fi
+fi
+
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091

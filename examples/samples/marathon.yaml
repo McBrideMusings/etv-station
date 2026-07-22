@@ -1,0 +1,32 @@
+# Sample S6 — Marathon: play a Plex collection in its authored order, then loop.
+#
+# A *collection* channel that treats a Plex collection as an ORDER, not a set:
+# it emits every member of "Halloween Marathon" in the sequence hand-arranged in
+# Plex (`collection_items.position`), start to finish, then loops. Re-ordering
+# the marathon is a drag-sort in Plex plus a re-ingest — this file never changes.
+#
+# Note what is NOT here: there is no `order` key. A collection's authored
+# sequence belongs to the (collection, item) pair, not to the items, so it
+# cannot survive being flattened into a set of ids and handed to a sort. The
+# entry that names the collection emits an already-ordered run instead, and the
+# block's default `manual` order leaves it alone. Contrast with Sample S5
+# (Trending), which reads the SAME collection structure for membership only via
+# a `query` entry, and then shuffles it (collections-as-set).
+#
+# Not registered in examples/station.yaml: a catalog-backed channel needs a
+# populated catalog + the daemon-side catalog wiring (#96) to run live. Its
+# resolution is proven by the `marathon_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      program:
+        title: "Halloween Marathon"
+        categories: ["Movie"]
+      entries:
+        - kind: collection
+          name: "Halloween Marathon"

@@ -352,8 +352,9 @@ mod tests {
 
     #[test]
     fn loads_example_fixture() {
-        // The diehard example references ${ETV_TEST_MEDIA_DIR}; set a placeholder
-        // so the env-expansion step in `load` succeeds in test environments.
+        // An example channel may reference ${ETV_TEST_MEDIA_DIR}; set a
+        // placeholder so the env-expansion step in `load` succeeds in test
+        // environments.
         // SAFETY: single-threaded test; value is local in scope.
         unsafe {
             std::env::set_var("ETV_TEST_MEDIA_DIR", "/tmp/etv-test-media");

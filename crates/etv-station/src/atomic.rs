@@ -11,8 +11,13 @@ pub async fn atomic_write_json<T>(path: &Path, value: &T) -> Result<(), AtomicWr
 where
     T: Serialize,
 {
-    let bytes = serde_json::to_vec_pretty(value)?;
+    atomic_write_bytes(path, &serde_json::to_vec_pretty(value)?).await
+}
 
+/// Write raw bytes through the same temp-file-then-rename path
+/// [`atomic_write_json`] uses, for content that is already encoded — the
+/// play-history ledger (#70) is newline-delimited JSON, not one JSON value.
+pub async fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -27,7 +32,7 @@ where
         pid = std::process::id(),
     ));
 
-    if let Err(source) = write_and_sync(&temp, &bytes).await {
+    if let Err(source) = write_and_sync(&temp, bytes).await {
         let _ = fs::remove_file(&temp).await;
         return Err(AtomicWriteError::Io { path: temp, source });
     }

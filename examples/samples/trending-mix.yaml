@@ -1,0 +1,68 @@
+# Sample S7 — Trending Mix: 1 movie + 3 episodes, interleaved across days.
+#
+# The deepest interleave sample. From a single "Trending" collection holding
+# both movies and shows, weave a TV-style channel: one trending movie, then
+# three episodes of a trending show, repeat. Shows round-robin (GoT, then
+# Invincible, …) and each advances through its own episodes over days; movies
+# cycle. Series of wildly different lengths progress **independently** — there
+# is no requirement that they finish evenly, or together.
+#
+# What this exercises that no other sample does:
+#   - `pools` + `pattern` instead of a flat `entries` list (#72)
+#   - `advance: resume` reading the per-`show_id` resume map
+#   - `select: round_robin` rotating across several shows in one pool
+#   - the window-continuation generation model — stateful-feeling progression
+#     with **no live cursor**, just a resume map handed across window seams
+#
+# Two pools, one collection. `movies` and `shows` query the same "Trending"
+# collection and split it by `type`, which is why one curated list can drive
+# both halves of the pattern. Each item with no `show_id` — every movie — is
+# its own series of one, so `movies` needs no special configuration: rotating
+# through one-item series is simply playing the movies in order.
+#
+# `order` on the `shows` pool does double duty: it sorts each show's episodes
+# into broadcast order AND fixes the rotation order of the shows themselves
+# (series rotate in order of first appearance in the ordered set).
+#
+# Lives in examples/samples/, not examples/channels/, so the dev station never
+# registers it: a query channel needs a populated catalog + the daemon-side
+# catalog wiring (#96) to run live. Its resolution is proven by the
+# `trending_mix_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      program:
+        title: "Trending Mix"
+      pools:
+        # Every trending movie, alphabetical, cycling forever.
+        - name: movies
+          expr: 'item.collections.contains("Trending") && item.type == "movie"'
+          order: "title:asc"
+          select: round_robin
+          advance: resume
+
+        # Every trending episode, in broadcast order within each show. The
+        # shows take turns; each keeps its own place regardless of whose turn
+        # it is, and a show that reaches its finale starts over rather than
+        # dropping out.
+        - name: shows
+          expr: 'item.collections.contains("Trending") && item.type == "episode"'
+          order: "season:asc,episode:asc"
+          select: round_robin
+          rotate: visit
+          advance: resume
+          on_short: next
+
+      # One movie, then a three-episode run of whichever show is up. Repeated
+      # to fill the window — `cycles` is left unset, so it defaults to enough
+      # passes for the largest pool to drain once.
+      pattern:
+        - pool: movies
+          take: 1
+        - pool: shows
+          take: 3

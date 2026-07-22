@@ -45,6 +45,16 @@ pub struct ChannelConfig {
     pub overlay: Option<ChannelOverlayConfig>,
 }
 
+impl ChannelConfig {
+    /// Whether any block interleaves pools via a pattern (#72). A pattern
+    /// channel's resolved list advances every generation, so it materializes
+    /// forward from a `.resume` sidecar instead of looping a fixed list from
+    /// the `.anchor` — see [`crate::rule::Sequential`].
+    pub fn is_pattern(&self) -> bool {
+        self.rule.blocks.iter().any(|b| b.is_pattern())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelOverlayConfig {
     /// Path to the etv-overlay TOML config (relative to the channel config

@@ -299,7 +299,9 @@ fn method_predicate(
                 )));
             };
             params.push(literal_like(arg)?);
-            Ok(format!("COALESCE(entries.{col}, '') LIKE ? || '%' ESCAPE '\\'"))
+            Ok(format!(
+                "COALESCE(entries.{col}, '') LIKE ? || '%' ESCAPE '\\'"
+            ))
         }
         "matches" => {
             let FieldKind::Str(col) = kind else {
@@ -644,7 +646,8 @@ mod tests {
 
         // `!=` INCLUDES the NULL (theatrical) row — the whole point of #103.
         assert_eq!(
-            c.resolve_query(r#"item.edition != "Extended Edition""#).unwrap(),
+            c.resolve_query(r#"item.edition != "Extended Edition""#)
+                .unwrap(),
             vec!["m:theat".to_string()],
         );
         // `== ""` matches the NULL row.
@@ -654,12 +657,14 @@ mod tests {
         );
         // `==` on a real value still excludes NULL.
         assert_eq!(
-            c.resolve_query(r#"item.edition == "Extended Edition""#).unwrap(),
+            c.resolve_query(r#"item.edition == "Extended Edition""#)
+                .unwrap(),
             vec!["m:ext".to_string()],
         );
         // `in` treats NULL as "": excluded unless the list contains "".
         assert_eq!(
-            c.resolve_query(r#"item.edition in ["Extended Edition"]"#).unwrap(),
+            c.resolve_query(r#"item.edition in ["Extended Edition"]"#)
+                .unwrap(),
             vec!["m:ext".to_string()],
         );
         let mut both = c
@@ -672,11 +677,13 @@ mod tests {
         // consistent with `!=`: a positive match excludes the NULL row, but its
         // negation includes it (same as `!=`), and `contains("")` matches all.
         assert_eq!(
-            c.resolve_query(r#"item.edition.startsWith("Extended")"#).unwrap(),
+            c.resolve_query(r#"item.edition.startsWith("Extended")"#)
+                .unwrap(),
             vec!["m:ext".to_string()],
         );
         assert_eq!(
-            c.resolve_query(r#"!item.edition.startsWith("Extended")"#).unwrap(),
+            c.resolve_query(r#"!item.edition.startsWith("Extended")"#)
+                .unwrap(),
             vec!["m:theat".to_string()],
         );
         let mut all = c.resolve_query(r#"item.edition.contains("")"#).unwrap();

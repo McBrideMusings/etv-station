@@ -14,7 +14,15 @@ See `docs/architecture.md` for the full picture and `docs/PRD.md` for the spec.
 
 ## Build & run
 
-This is a Cargo workspace with three crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer). The common operations:
+This is a Cargo workspace with three crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer).
+
+**A fresh clone or a new git worktree must check out the submodule first** — the `ersatztv-playout` crate every build depends on lives in `etv-next/`, and without it cargo fails with an unreadable-`Cargo.toml` error that never mentions submodules:
+
+```sh
+git submodule update --init --recursive
+```
+
+The common operations:
 
 ```sh
 ./tools/dev-run.sh                       # run station daemon + ETV-next together (integration test)

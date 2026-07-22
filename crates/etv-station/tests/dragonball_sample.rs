@@ -1,4 +1,4 @@
-//! Acceptance test for Sample S4 (#78): the committed `examples/channels/dragonball.yaml`
+//! Acceptance test for Sample S4 (#78): the committed `examples/samples/dragonball.yaml`
 //! manual block weaves query episode-ranges — each ordered by `absolute_episode`
 //! — around an inline movie, playing entries in authored order. Proves the
 //! hardest authored-order case: a `manual` block with per-entry query order
@@ -18,7 +18,12 @@ fn dragonball_catalog() -> Catalog {
     let cat = Catalog::open_in_memory().unwrap();
     for abs in [3, 1, 2, 13, 12, 15, 14, 28] {
         let id = format!("db:{abs}");
-        let mut e = Entry::new(&id, "episode", format!("Dragon Ball Ep {abs}"), Source::Plex);
+        let mut e = Entry::new(
+            &id,
+            "episode",
+            format!("Dragon Ball Ep {abs}"),
+            Source::Plex,
+        );
         e.show = Some("Dragon Ball".to_string());
         e.absolute_episode = Some(abs);
         cat.upsert_entry(&e).unwrap();
@@ -35,7 +40,7 @@ fn dragonball_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/dragonball.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/dragonball.yaml")
 }
 
 #[test]
@@ -49,7 +54,10 @@ fn dragonball_sample_weaves_ranges_and_movie_in_authored_order() {
     // id derived from its path), then entry 2 (eps 14–28, absolute_episode:asc).
     // The block is `manual`, so the entries stay in authored order while each
     // query entry sorts its own resolved episodes.
-    assert_eq!(&ids[..5], ["db:1", "db:2", "db:3", "db:12", "db:13"].as_slice());
+    assert_eq!(
+        &ids[..5],
+        ["db:1", "db:2", "db:3", "db:12", "db:13"].as_slice()
+    );
     assert!(
         ids[5].starts_with("fs:"),
         "the movie must sit between the two arcs, got {}",

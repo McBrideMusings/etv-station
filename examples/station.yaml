@@ -7,10 +7,16 @@ output_base: examples/output
 
 # Each entry is a literal path or a glob (e.g. `channels/*.yaml`), resolved
 # relative to this file's directory. A glob expands to every match.
+#
+# Deliberately a glob, not a list of filenames. Most of `channels/` is
+# gitignored (personal configs), so a committed list naming those files fails
+# to load in a fresh clone — the file it points at simply isn't there. A glob
+# always matches what is actually present: the one committed runnable channel
+# in a clean checkout, plus whatever personal channels a working copy adds.
+#
+# The worked sample channels are NOT here — they live in `examples/samples/`
+# and are exercised by their acceptance tests. Most are query channels that
+# need a populated catalog, so registering them with a catalog-free dev station
+# would fail every one of them at startup.
 channels:
-  - channels/lavfi-test.yaml
-  - channels/diehard.yaml
-  - channels/trending.yaml
-  - channels/showcase.yaml
-  - channels/marquee.yaml
-  - channels/starwars.yaml
+  - channels/*.yaml

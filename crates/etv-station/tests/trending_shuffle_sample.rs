@@ -1,5 +1,5 @@
 //! Acceptance test for Sample S5 (#79): the committed
-//! `examples/channels/trending-shuffle.yaml` query channel resolves every member
+//! `examples/samples/trending-shuffle.yaml` query channel resolves every member
 //! of the "Trending" collection (membership EXISTS, position ignored), excludes
 //! non-members, and shuffles — a fresh shuffle when unseeded, a reproducible one
 //! when a `seed` is pinned. Proves collections-as-set + the resolve→collapse→
@@ -37,7 +37,8 @@ fn trending_catalog() -> Catalog {
     };
     for (pos, id) in ["m-a", "m-b", "m-c", "m-d"].iter().enumerate() {
         seed_movie(id);
-        cat.add_collection_item("coll-trending", id, pos as i64).unwrap();
+        cat.add_collection_item("coll-trending", id, pos as i64)
+            .unwrap();
     }
     // A movie that is NOT in the collection — must never resolve.
     seed_movie("m-out");
@@ -45,7 +46,7 @@ fn trending_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/trending-shuffle.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/trending-shuffle.yaml")
 }
 
 /// Every member of the collection plays; the non-member is excluded. Order is
@@ -78,5 +79,9 @@ fn trending_shuffle_sample_is_reproducible_with_a_pinned_seed() {
 
     let mut sorted = ids1.clone();
     sorted.sort_unstable();
-    assert_eq!(sorted, ["m-a", "m-b", "m-c", "m-d"], "shuffle is a permutation of all members");
+    assert_eq!(
+        sorted,
+        ["m-a", "m-b", "m-c", "m-d"],
+        "shuffle is a permutation of all members"
+    );
 }

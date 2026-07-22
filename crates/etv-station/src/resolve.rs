@@ -10,8 +10,11 @@
 //!
 //! `query` entries resolve against the [`Catalog`] (#68 CEL→SQL) and each
 //! resolved `entry_id` becomes a `ResolvedItem`; `order` is applied by the
-//! order engine (#69). A channel with no query entries and `manual` order needs
-//! no catalog, so `catalog` is optional.
+//! order engine (#69). `collection` entries also resolve against the catalog
+//! but arrive *already ordered* — their sequence is the collection's stored
+//! `position`, so the order step leaves them alone (#107). A channel with no
+//! catalog-backed entries and `manual` order needs no catalog, so `catalog` is
+//! optional.
 //!
 //! Still rejected with a clear `unsupported` error (later issues): `include`
 //! entries, a non-empty block `filter`, and a block `fallback` (its schema is a
@@ -27,10 +30,11 @@ use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
 use crate::catalog::{Catalog, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, Duplicates, Entry, ItemEntry, Mode, Order, QueryEntry,
-    SourceConfig,
+    BlockInclude, ChannelConfig, CollectionEntry, Duplicates, Entry, ItemEntry, Mode, Order,
+    QueryEntry, SourceConfig,
 };
 use crate::errors::ConfigError;
+use crate::resume::{GenerationState, ResumeMap};
 
 /// A concrete, ordered item ready for duration probing and sequencing. Produced
 /// by [`resolve_channel`] — the post-resolution counterpart to the on-disk
@@ -55,6 +59,10 @@ impl ResolvedItem {
 /// config path, used only for error messages. `catalog` resolves `query`
 /// entries and non-`manual` order; it may be `None` for a channel that is
 /// entirely inline items in `manual` order.
+///
+/// This is the stateless entry point: pattern pools declaring
+/// `advance = "resume"` start from the top. Use [`resolve_channel_with_resume`]
+/// to continue a channel across a window seam.
 pub fn resolve_channel(
     config: &ChannelConfig,
     path: &Path,
@@ -62,6 +70,36 @@ pub fn resolve_channel(
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
+    let (items, _) = resolve_channel_with_resume(
+        config,
+        path,
+        source_roots,
+        path_index,
+        catalog,
+        &GenerationState::empty(),
+    )?;
+    Ok(items)
+}
+
+/// [`resolve_channel`], plus the resume map that carries a pattern channel's
+/// progression across a window seam (#72).
+///
+/// Generation is a pure function of `(catalog, config, resume_in)`: the same
+/// three inputs always produce the same items and the same `resume_out`. There
+/// is no live cursor anywhere — a pool that wants to continue rather than
+/// replay reads where it left off from `resume_in` and reports where it got to
+/// in the returned map, which the daemon persists to the `.resume` sidecar.
+///
+/// A channel with no pattern block ignores `resume_in` and returns an empty
+/// map, so the resume sidecar only ever appears for channels that need it.
+pub fn resolve_channel_with_resume(
+    config: &ChannelConfig,
+    path: &Path,
+    source_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
+    catalog: Option<&Catalog>,
+    state: &GenerationState,
+) -> Result<(Vec<ResolvedItem>, ResumeMap), ConfigError> {
     // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
     // one draws fresh entropy so an unseeded `random` block reshuffles each
     // generation (#46 "unset = fresh per generation").
@@ -72,13 +110,23 @@ pub fn resolve_channel(
     // whose path is in it inherits that entry_id, so it collapses against a
     // `query` result for the same physical file (manual∩query dedup).
     let mut out = Vec::new();
+    let mut resume_out = ResumeMap::new();
     // Each item carries its own block's `no_repeat_within` (0 = unconstrained),
     // so the constraint pass runs once over the concatenated list and still
     // covers block joins — which a per-block pass would leave open.
     let mut gaps: Vec<usize> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
-        let block_items =
-            resolve_block(include, idx, path, source_roots, path_index, catalog, seed)?;
+        let block_items = resolve_block(
+            include,
+            idx,
+            path,
+            source_roots,
+            path_index,
+            catalog,
+            seed,
+            state,
+            &mut resume_out,
+        )?;
         gaps.resize(
             gaps.len() + block_items.len(),
             include.constraints().no_repeat_gap(),
@@ -87,6 +135,11 @@ pub fn resolve_channel(
     }
 
     if out.is_empty() {
+        // Nothing resolved. A channel can no longer reach this by *playing* its
+        // way through its content — every series loops — so an empty list means
+        // the resolved set itself is empty: an expression that matches nothing,
+        // or a catalog that holds nothing. That is a broken config, always, and
+        // it is reported as one.
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
             message: "channel resolved to zero items".into(),
@@ -102,7 +155,7 @@ pub fn resolve_channel(
         out = permute(out, &perm);
     }
 
-    Ok(out)
+    Ok((out, resume_out))
 }
 
 /// Reorder `items` by `perm` (a permutation of `0..items.len()`).
@@ -128,6 +181,8 @@ fn resolve_block(
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
     seed: u64,
+    state: &GenerationState,
+    resume_out: &mut ResumeMap,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
@@ -140,16 +195,41 @@ fn resolve_block(
             "block #{idx}: [filter] resolution is not implemented yet (#69)"
         )));
     }
-    // `collection` order needs the block to know which collection its set came
-    // from — that context isn't wired into resolution yet (#71 follow-up), so a
-    // block-level collection sort would otherwise fail deep in the order engine.
-    if include.order == Order::Collection {
-        return Err(unsupported(format!(
-            "block #{idx}: order = \"collection\" is not wired yet (needs block collection context)"
-        )));
-    }
 
     let defaults = include.program();
+
+    // A pattern block builds its list by interleaving pools instead of playing
+    // a flat entries list, so it takes its own path: the pattern IS the
+    // ordering and the repeats are deliberate, which is why validation rejects
+    // a block-level `order` or an explicit `collapse` here rather than letting
+    // either quietly undo the interleave.
+    if include.is_pattern() {
+        let cat = catalog.ok_or_else(|| {
+            unsupported(format!(
+                "block #{idx}: a pattern block needs the catalog, which is not available"
+            ))
+        })?;
+        let (ids, pools) = crate::pattern::build(
+            cat,
+            &include.pools,
+            &include.pattern,
+            include.cycles,
+            state,
+            seed,
+        )
+        .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+        resume_out.pools.extend(pools);
+
+        let mut items: Vec<ResolvedItem> = ids
+            .iter()
+            .map(|id| catalog_item(cat, id, defaults))
+            .collect::<Result<_, _>>()
+            .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?;
+        if let Mode::Count(n) = include.mode {
+            items.truncate(n);
+        }
+        return Ok(items);
+    }
 
     // 1. Resolve entries to a flat item list (authored order).
     let mut items: Vec<ResolvedItem> = Vec::new();
@@ -163,6 +243,16 @@ fn resolve_block(
                     ))
                 })?;
                 let resolved = resolve_query(cat, query, defaults, seed)
+                    .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                items.extend(resolved);
+            }
+            Entry::Collection(collection) => {
+                let cat = catalog.ok_or_else(|| {
+                    unsupported(format!(
+                        "block #{idx}: a collection entry needs the catalog, which is not available"
+                    ))
+                })?;
+                let resolved = resolve_collection(cat, collection, defaults)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                 items.extend(resolved);
             }
@@ -215,10 +305,64 @@ fn resolve_query(
         .map_err(|e| e.to_string())?;
     if let Some(order) = &query.order {
         ids = catalog
-            .resolve_order(&ids, order, seed, None)
+            .resolve_order(&ids, order, seed)
             .map_err(|e| e.to_string())?;
     }
     ids.iter()
+        .map(|id| catalog_item(catalog, id, defaults))
+        .collect()
+}
+
+/// Resolve a `collection` entry: look the collection up by name and emit its
+/// members in stored `collection_items.position` order.
+///
+/// No ordering step is involved — the run arrives ordered out of the catalog,
+/// and the block's default `manual` order preserves it. That is the whole point
+/// of collection being an entry kind rather than an `order` value (#107): the
+/// authored sequence never has to survive a round-trip through a flat id set.
+fn resolve_collection(
+    catalog: &Catalog,
+    entry: &CollectionEntry,
+    defaults: Option<&ProgramMetadata>,
+) -> Result<Vec<ResolvedItem>, String> {
+    let mut ids = catalog
+        .collection_ids_by_name(&entry.name)
+        .map_err(|e| e.to_string())?;
+    let collection_id = match ids.len() {
+        1 => ids.remove(0),
+        0 => {
+            return Err(format!(
+                "no collection named {:?} in the catalog",
+                entry.name
+            ));
+        }
+        n => {
+            // Names are not unique, and the catalog stores no finer qualifier
+            // than `source` (which every collection shares today, since only
+            // Plex ingest writes them). So name the offending ids rather than
+            // pretend a filter could pick between them.
+            return Err(format!(
+                "{n} collections are named {:?} — a collection entry must name exactly one \
+                 (conflicting ids: {}); rename one in the source and re-ingest",
+                entry.name,
+                ids.join(", ")
+            ));
+        }
+    };
+    let members = catalog
+        .collection_members(&collection_id)
+        .map_err(|e| e.to_string())?;
+    // Naming a collection asserts it has content — unlike a query, which is a
+    // filter and may legitimately match nothing. An empty one would otherwise
+    // vanish from the channel silently.
+    if members.is_empty() {
+        return Err(format!(
+            "collection {:?} ({collection_id}) has no members",
+            entry.name
+        ));
+    }
+    members
+        .iter()
         .map(|id| catalog_item(catalog, id, defaults))
         .collect()
 }
@@ -232,7 +376,7 @@ fn apply_order(
 ) -> Result<Vec<ResolvedItem>, String> {
     let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
     let ordered = catalog
-        .resolve_order(&ids, order, seed, None)
+        .resolve_order(&ids, order, seed)
         .map_err(|e| e.to_string())?;
     Ok(reorder_to(items, &ordered))
 }
@@ -445,6 +589,9 @@ mod tests {
             duplicates: None,
             constraints: None,
             entries,
+            pools: Vec::new(),
+            pattern: Vec::new(),
+            cycles: None,
             mode: Mode::All,
             order: Order::Manual,
             filter: None,
@@ -757,7 +904,9 @@ mod tests {
     // ---- catalog-backed pipeline (#71) ------------------------------------
 
     use crate::catalog::ingest::canonical_index;
-    use crate::catalog::{Catalog, Entry as CatEntry, EntrySource, Source};
+    use crate::catalog::{
+        Catalog, Collection as CatCollection, Entry as CatEntry, EntrySource, Source,
+    };
     use crate::config::QueryEntry;
 
     fn seeded_catalog() -> Catalog {
@@ -840,12 +989,127 @@ mod tests {
         );
     }
 
+    // ---- collection entries (#107) ----------------------------------------
+
+    /// The seeded catalog plus a "Halloween Marathon" collection whose authored
+    /// positions deliberately contradict both release order and `entry_id`
+    /// order, so a passing test can only be reading `position`.
+    fn catalog_with_marathon() -> Catalog {
+        let c = seeded_catalog();
+        c.upsert_collection(&CatCollection {
+            collection_id: "plex:coll:1".into(),
+            name: "Halloween Marathon".into(),
+            source: Source::Plex,
+        })
+        .unwrap();
+        c.add_collection_item("plex:coll:1", "imdb:tt0167260", 0)
+            .unwrap(); // Return of the King first
+        c.add_collection_item("plex:coll:1", "imdb:tt0120737", 1)
+            .unwrap(); // then Fellowship
+        c.add_collection_item("plex:coll:1", "imdb:tt0167261", 2)
+            .unwrap(); // then Two Towers
+        c
+    }
+
+    fn collection_block(name: &str) -> BlockInclude {
+        include_with(vec![Entry::Collection(CollectionEntry {
+            name: name.into(),
+        })])
+    }
+
     #[test]
-    fn block_collection_order_errors_clearly() {
-        let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
-        inc.order = Order::Collection;
+    fn collection_entry_plays_members_in_authored_position_order() {
+        let cat = catalog_with_marathon();
+        let inc = collection_block("Halloween Marathon");
+        // Block order is left at its `manual` default — the run is already
+        // ordered, and nothing re-sorts it.
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0167260", "imdb:tt0120737", "imdb:tt0167261"]
+        );
+        // Catalog-backed like a query result: metadata and playback path resolved.
+        assert_eq!(items[0].program.as_ref().unwrap().year, Some(2003));
+        match &items[0].source {
+            SourceConfig::Local { path } => assert!(path.ends_with("tt0167260.mkv")),
+            other => panic!("expected local source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_entry_composes_with_other_entries_in_authored_order() {
+        // A bumper, then the marathon. The block stays `manual`, so the bumper
+        // leads and the collection's internal order survives intact.
+        let cat = catalog_with_marathon();
+        let inc = include_with(vec![
+            Entry::Item(item_entry("bumper")),
+            Entry::Collection(CollectionEntry {
+                name: "Halloween Marathon".into(),
+            }),
+        ]);
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "lavfi:bumper",
+                "imdb:tt0167260",
+                "imdb:tt0120737",
+                "imdb:tt0167261"
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_collection_name_errors() {
+        let cat = catalog_with_marathon();
+        let inc = collection_block("Nonesuch");
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(
+            format!("{err}").contains("no collection named"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_collection_name_errors() {
+        // Two sources each define a collection of the same name — the entry
+        // names one collection, so this is a config error, not a merge.
+        let cat = catalog_with_marathon();
+        cat.upsert_collection(&CatCollection {
+            collection_id: "plex:coll:2".into(),
+            name: "Halloween Marathon".into(),
+            source: Source::Plex,
+        })
+        .unwrap();
+        let inc = collection_block("Halloween Marathon");
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(
+            format!("{err}").contains("must name exactly one"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn empty_collection_errors_rather_than_vanishing() {
+        let cat = catalog_with_marathon();
+        cat.upsert_collection(&CatCollection {
+            collection_id: "plex:coll:empty".into(),
+            name: "Empty Shelf".into(),
+            source: Source::Plex,
+        })
+        .unwrap();
+        let inc = collection_block("Empty Shelf");
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("has no members"), "err = {err}");
+    }
+
+    #[test]
+    fn collection_entry_without_catalog_errors() {
+        let inc = collection_block("Halloween Marathon");
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap_err();
-        assert!(format!("{err}").contains("collection"), "err = {err}");
+        assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
 
     #[test]
@@ -900,6 +1164,401 @@ mod tests {
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(items.len(), 3);
         assert!(ids.contains(&"imdb:tt0120737"));
+    }
+
+    // ---- pattern blocks (#72) ---------------------------------------------
+
+    /// A catalog with two shows of different lengths and two movies — enough to
+    /// prove the interleave and the independent progression end to end.
+    fn interleave_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        let add = |id: &str, kind: &str, show: Option<(&str, i64)>| {
+            let mut e = CatEntry::new(id, kind, format!("Title {id}"), Source::Plex);
+            if let Some((show_id, episode)) = show {
+                e.show_id = Some(show_id.into());
+                e.show = Some(show_id.trim_start_matches("show:").to_string());
+                e.season = Some(1);
+                e.episode = Some(episode);
+            }
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        };
+        add("mov-1", "movie", None);
+        add("mov-2", "movie", None);
+        for n in 1..=4 {
+            add(&format!("got-e{n}"), "episode", Some(("show:got", n)));
+        }
+        for n in 1..=2 {
+            add(&format!("inv-e{n}"), "episode", Some(("show:inv", n)));
+        }
+        c
+    }
+
+    fn interleave_block(advance: crate::config::Advance) -> BlockInclude {
+        use crate::config::{OnShort, PatternStep, Pool, Rotate, Select};
+        let mut inc = include_with(vec![]);
+        inc.pools = vec![
+            Pool {
+                name: "movies".into(),
+                expr: "item.type == \"movie\"".into(),
+                order: Some(Order::parse("title:asc").unwrap()),
+                select: Select::RoundRobin,
+                rotate: Rotate::Visit,
+                advance,
+                on_short: OnShort::Next,
+            },
+            Pool {
+                name: "shows".into(),
+                expr: "item.type == \"episode\"".into(),
+                order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+                select: Select::RoundRobin,
+                rotate: Rotate::Visit,
+                advance,
+                on_short: OnShort::Next,
+            },
+        ];
+        inc.pattern = vec![
+            PatternStep {
+                pool: "movies".into(),
+                take: 1,
+                chance: 1.0,
+            },
+            PatternStep {
+                pool: "shows".into(),
+                take: 2,
+                chance: 1.0,
+            },
+        ];
+        inc.cycles = Some(2);
+        inc
+    }
+
+    /// Project the state a following window would be handed, exactly as the
+    /// daemon does: the pools' rotation from this resolve, and the per-series
+    /// cursor read back out of the play-history ledger the airings were
+    /// recorded in (#70).
+    fn advance_state(
+        cat: &Catalog,
+        prev: &crate::resume::GenerationState,
+        resume: ResumeMap,
+        items: &[ResolvedItem],
+    ) -> crate::resume::GenerationState {
+        use crate::history::{Ledger, PlayRecord};
+        use time::OffsetDateTime;
+
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let show_ids = cat.show_ids_for(&ids).unwrap();
+        let mut ledger = Ledger::new();
+        // Seed with whatever the previous windows had already recorded, so the
+        // projection sees the channel's whole history and not just this window.
+        ledger.extend(prev.cursor.iter().map(|(key, entry_id)| PlayRecord {
+            entry_id: entry_id.clone(),
+            show_id: Some(key.clone()),
+            start: OffsetDateTime::UNIX_EPOCH,
+            played_at: OffsetDateTime::UNIX_EPOCH,
+        }));
+        ledger.extend(ids.iter().map(|id| PlayRecord {
+            entry_id: id.clone(),
+            show_id: show_ids.get(id).cloned(),
+            start: OffsetDateTime::UNIX_EPOCH,
+            played_at: OffsetDateTime::UNIX_EPOCH,
+        }));
+        crate::resume::GenerationState {
+            resume,
+            cursor: ledger.series_cursor(),
+        }
+    }
+
+    /// The whole pipeline through the public entry point: a pattern block
+    /// resolves to the interleaved list, with catalog metadata and playback
+    /// paths attached exactly as a query entry gets them.
+    #[test]
+    fn pattern_block_resolves_through_the_channel() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
+        let (items, resume) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["mov-1", "got-e1", "got-e2", "mov-2", "inv-e1", "inv-e2"]
+        );
+        // Catalog-backed like any other resolved item.
+        assert_eq!(items[1].program.as_ref().unwrap().episode, Some(1));
+        match &items[0].source {
+            SourceConfig::Local { path } => assert!(path.ends_with("mov-1.mkv")),
+            other => panic!("expected local source, got {other:?}"),
+        }
+        // Both pools reported their rotation, keyed by pool name; where each
+        // series stopped lives in the ledger, not here.
+        assert!(resume.pool("movies").is_some());
+        assert!(resume.pool("shows").is_some());
+        let next = advance_state(&cat, &GenerationState::empty(), resume, &items);
+        assert_eq!(next.cursor.get("show:got").unwrap(), "got-e2");
+    }
+
+    /// Window continuation with no live cursor: window 2 is generated from
+    /// window 1's `resume_out` and each show picks up where it left off.
+    #[test]
+    fn resume_carries_progression_across_a_window_seam() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+
+        let (first, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            first_ids,
+            vec!["mov-1", "got-e1", "got-e2", "mov-2", "inv-e1", "inv-e2"]
+        );
+
+        let next = advance_state(&cat, &GenerationState::empty(), next, &first);
+        let (second, _) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &next).unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
+        // got continues at e3 (it never restarts because inv is shorter), inv
+        // wraps, and the movies pool continues its own rotation.
+        assert_eq!(
+            second_ids,
+            vec!["mov-1", "got-e3", "got-e4", "mov-2", "inv-e1", "inv-e2"]
+        );
+    }
+
+    /// The same three inputs always produce the same two outputs — the property
+    /// the whole no-live-cursor model rests on.
+    #[test]
+    fn generation_is_a_pure_function_of_catalog_config_and_resume() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+        let (first, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let state = advance_state(&cat, &GenerationState::empty(), next, &first);
+
+        let (a, ra) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let (b, rb) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let ids_a: Vec<&str> = a.iter().map(|i| i.id.as_str()).collect();
+        let ids_b: Vec<&str> = b.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(ra, rb);
+    }
+
+    /// #70 acceptance: a show that leaves the resolved set and comes back
+    /// resumes from its stored position, not from its first episode.
+    ///
+    /// This is exactly what a churning "Trending" list does. The ledger is
+    /// keyed by `show_id` and is never pruned to the current set, so a show's
+    /// position outlives its absence — which is why the cursor could not be a
+    /// per-generation index.
+    #[test]
+    fn a_show_that_leaves_and_returns_resumes_where_it_stopped() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+
+        // Window 1 airs both shows; GoT reaches e2.
+        let (first, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let state = advance_state(&cat, &GenerationState::empty(), next, &first);
+        assert_eq!(state.cursor.get("show:got").unwrap(), "got-e2");
+
+        // GoT drops out of the resolved set entirely for a while — the pool's
+        // expr no longer matches it. Its ledger entries stay.
+        let mut narrowed = interleave_block(crate::config::Advance::Resume);
+        for pool in &mut narrowed.pools {
+            if pool.name == "shows" {
+                pool.expr = "item.show == \"inv\"".into();
+            }
+        }
+        let narrowed_cfg = channel(vec![narrowed]);
+        let (away, next_away) =
+            resolve_channel_with_resume(&narrowed_cfg, path(), &[], None, Some(&cat), &state)
+                .unwrap();
+        assert!(
+            !away.iter().any(|i| i.id.starts_with("got-")),
+            "GoT is out of the set for this window"
+        );
+        let state = advance_state(&cat, &state, next_away, &away);
+
+        // It comes back. It must continue at e3, not restart at e1.
+        let (back, _) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let first_got = back
+            .iter()
+            .map(|i| i.id.as_str())
+            .find(|id| id.starts_with("got-"))
+            .expect("GoT returns to the set");
+        assert_eq!(
+            first_got, "got-e3",
+            "a returning show resumes from its stored position, not S1E1"
+        );
+    }
+
+    /// #70 acceptance: one ledger row per scheduled airing — no more, no fewer.
+    /// The row count is what makes the cursor's projection correct, so a
+    /// duplicate or a dropped row is a scheduling bug, not a bookkeeping one.
+    #[test]
+    fn every_scheduled_airing_records_exactly_one_row() {
+        use crate::history::{Ledger, PlayRecord};
+        use time::OffsetDateTime;
+
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
+        let (items, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let show_ids = cat.show_ids_for(&ids).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.extend(ids.iter().enumerate().map(|(i, id)| PlayRecord {
+            entry_id: id.clone(),
+            show_id: show_ids.get(id).cloned(),
+            start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
+            played_at: OffsetDateTime::UNIX_EPOCH,
+        }));
+
+        assert_eq!(
+            ledger.len(),
+            items.len(),
+            "one row per airing — the generation aired {} items",
+            items.len()
+        );
+        // A repeat under `wrap = "loop"` is a genuine second airing and gets
+        // its own row; the cursor still resolves to the latest one.
+        let cursor = ledger.series_cursor();
+        assert_eq!(cursor.get("show:got").unwrap(), "got-e2");
+    }
+
+    /// The stateless entry point stays stateless: `resolve_channel` never
+    /// consults a resume map, so a `resume` pool replays from the top.
+    #[test]
+    fn resolve_channel_ignores_resume_state() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+        let first = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
+        let second = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
+        let ids1: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
+        let ids2: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids1, ids2);
+    }
+
+    /// A channel with no pattern block never grows a resume map, so the sidecar
+    /// only ever appears for channels that need it.
+    #[test]
+    fn an_entries_channel_produces_an_empty_resume_map() {
+        let inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        let (_, next) = resolve_channel_with_resume(
+            &channel(vec![inc]),
+            path(),
+            &[],
+            None,
+            None,
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        assert!(next.is_empty());
+    }
+
+    /// A pattern channel that has played all the way through its content keeps
+    /// broadcasting: the next window resolves a full list, not an empty one.
+    /// There is no exhausted state to fall into.
+    #[test]
+    fn a_pattern_channel_keeps_resolving_after_playing_everything() {
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Resume);
+        inc.cycles = Some(20); // long enough to run past every series' end
+        let cfg = channel(vec![inc]);
+
+        let (played, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        assert!(!played.is_empty());
+
+        // Second window, after everything has aired at least once: still full.
+        let state = advance_state(&cat, &GenerationState::empty(), next, &played);
+        let (items, _) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        assert!(
+            !items.is_empty(),
+            "a channel that played everything must keep going, not run dry"
+        );
+    }
+
+    #[test]
+    fn a_pattern_channel_that_never_played_still_errors_on_zero_items() {
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Resume);
+        for pool in &mut inc.pools {
+            pool.expr = "item.type == \"nonesuch\"".into();
+        }
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("zero items"), "err = {err}");
+    }
+
+    #[test]
+    fn pattern_block_without_catalog_errors() {
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
+        let err = resolve_channel(&cfg, path(), &[], None, None).unwrap_err();
+        assert!(format!("{err}").contains("catalog"), "err = {err}");
+    }
+
+    /// `mode = "count"` still truncates a pattern block's interleaved list.
+    #[test]
+    fn count_mode_truncates_a_pattern_block() {
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Restart);
+        inc.mode = Mode::Count(3);
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["mov-1", "got-e1", "got-e2"]);
     }
 
     #[test]

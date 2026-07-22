@@ -24,6 +24,7 @@ use super::source::SourceConfig;
 pub enum Entry {
     Item(ItemEntry),
     Query(QueryEntry),
+    Collection(CollectionEntry),
     Include(IncludeEntry),
 }
 
@@ -33,6 +34,7 @@ impl Entry {
         match self {
             Entry::Item(_) => "item",
             Entry::Query(_) => "query",
+            Entry::Collection(_) => "collection",
             Entry::Include(_) => "include",
         }
     }
@@ -70,6 +72,26 @@ pub struct QueryEntry {
     /// an internal order for its many resolved items (#46 locked decision).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Order>,
+}
+
+/// A whole catalog collection, emitted in its stored `collection_items.position`
+/// order — the sequence hand-authored in the source app (#107). Reordering is a
+/// drag in Plex plus a re-ingest; the config never changes.
+///
+/// The order rides here, on the entry that names the collection, rather than on
+/// the block's `order`, because `position` is a property of the (collection,
+/// item) pair: the same film sits at a different position in every collection
+/// holding it. Once entries have flattened into a set of ids, the collection is
+/// no longer knowable, which is why there is no `order = "collection"`.
+///
+/// Membership *without* the order is the other read path over the same table: a
+/// `query` entry with `item.collections.contains("…")`, which yields an
+/// unordered set the block's `order` is then free to sort.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CollectionEntry {
+    /// The collection's name as its source names it (e.g. the Plex collection
+    /// title). Resolved to a `collection_id` at generation time.
+    pub name: String,
 }
 
 /// Include another block, with its own cursor; play-through then advance

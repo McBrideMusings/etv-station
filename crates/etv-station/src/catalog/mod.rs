@@ -71,9 +71,12 @@ impl Catalog {
     /// - `Manual` returns the input (authored) order unchanged.
     /// - `Random` is a deterministic seeded shuffle (`seed` supplied by the
     ///   caller; a pinned seed reproduces the order).
-    /// - `Collection` reads `collection_items.position` for `collection_id`
-    ///   (required — the set must be one collection); missing context is an error.
-    /// - `Score` is not yet implemented (a separate plugin issue).
+    ///
+    /// Every case here is a function of the ids themselves — that is the whole
+    /// contract. Two orders that were not are deliberately absent: collection
+    /// order depends on *which* collection the set came from, so it is read at
+    /// the entry that names it ([`Self::collection_members`], #107); score
+    /// order depended on a plugin nothing here can reach (#108).
     ///
     /// An empty input yields an empty output.
     pub fn resolve_order(
@@ -81,54 +84,18 @@ impl Catalog {
         ids: &[String],
         order: &Order,
         seed: u64,
-        collection_id: Option<&str>,
     ) -> Result<Vec<String>, CatalogError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         match order {
             Order::Manual => Ok(ids.to_vec()),
-            Order::Score => Err(CatalogError::Query(
-                "score order requires the scoring plugin (not yet implemented)".to_string(),
-            )),
             Order::Random => {
                 let mut shuffled = ids.to_vec();
                 // Sort first so the result depends only on the set + seed.
                 shuffled.sort();
                 order::seeded_shuffle(&mut shuffled, seed);
                 Ok(shuffled)
-            }
-            Order::Collection => {
-                let collection_id = collection_id.ok_or_else(|| {
-                    CatalogError::Query(
-                        "collection order needs a single-collection context".to_string(),
-                    )
-                })?;
-                let placeholders = vec!["?"; ids.len()].join(", ");
-                let sql = format!(
-                    "SELECT ci.entry_id FROM collection_items ci \
-                     WHERE ci.collection_id = ? AND ci.entry_id IN ({placeholders}) \
-                     ORDER BY ci.position, ci.entry_id"
-                );
-                let mut params: Vec<Value> = Vec::with_capacity(ids.len() + 1);
-                params.push(Value::Text(collection_id.to_string()));
-                params.extend(ids.iter().map(|s| Value::Text(s.clone())));
-                let ordered = self.ordered_ids(&sql, params)?;
-                // #69: `collection` order is valid only when the whole resolved
-                // set belongs to the collection. A member missing from it would
-                // otherwise silently truncate the playlist — that's a config
-                // error, not a shorter list.
-                let distinct: std::collections::HashSet<&str> =
-                    ids.iter().map(String::as_str).collect();
-                if ordered.len() < distinct.len() {
-                    return Err(CatalogError::Query(format!(
-                        "collection order: {} of {} resolved entries are not members of \
-                         collection {collection_id:?}",
-                        distinct.len() - ordered.len(),
-                        distinct.len(),
-                    )));
-                }
-                Ok(ordered)
             }
             Order::Fields(terms) => {
                 let clause = order::order_by_clause(terms)?;
@@ -180,7 +147,10 @@ impl Catalog {
         F: FnOnce(&Self) -> Result<T, E>,
         E: From<CatalogError>,
     {
-        let tx = self.conn.unchecked_transaction().map_err(CatalogError::from)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(CatalogError::from)?;
         let out = f(self)?;
         tx.commit().map_err(CatalogError::from)?;
         Ok(out)
@@ -352,6 +322,45 @@ impl Catalog {
         Ok(row)
     }
 
+    /// The `show_id` of each requested entry, in one round trip.
+    ///
+    /// The pattern engine (#72) needs nothing from an entry but its `show_id`,
+    /// for every item of every pool, on every generation — and a catch-up runs
+    /// many generations in a row. Fetching whole rows one id at a time turns
+    /// that into a query per item; this is the same answer in a single
+    /// statement. Ids absent from the catalog, and entries with no `show_id`,
+    /// are simply missing from the returned map.
+    pub fn show_ids_for(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, CatalogError> {
+        let mut out = std::collections::HashMap::new();
+        if entry_ids.is_empty() {
+            return Ok(out);
+        }
+        // Chunked so a large pool can't exceed sqlite's variable limit (999 by
+        // default). Well under it, and still one query per ~500 items instead
+        // of one per item.
+        for chunk in entry_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT entry_id, show_id FROM entries \
+                 WHERE show_id IS NOT NULL AND entry_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, show_id) = row?;
+                out.insert(id, show_id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every entry id, ascending — a stable enumeration for callers that scan.
     pub fn all_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])
@@ -392,6 +401,16 @@ impl Catalog {
             "SELECT entry_id FROM collection_items WHERE collection_id = ?1
              ORDER BY position, entry_id",
             params![collection_id],
+        )
+    }
+
+    /// Collection ids carrying `name`, ascending. A name is not unique — two
+    /// sources can each define a "Halloween Marathon" — so this returns every
+    /// match and leaves "missing" and "ambiguous" for the caller to phrase.
+    pub fn collection_ids_by_name(&self, name: &str) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT collection_id FROM collections WHERE name = ?1 ORDER BY collection_id",
+            params![name],
         )
     }
 
@@ -676,5 +695,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entry_id, "imdb:tt1375666");
+    }
+
+    #[test]
+    fn show_ids_for_returns_only_entries_that_have_one() {
+        let c = cat();
+        let mut ep = Entry::new("ep1", "episode", "Winter Is Coming", Source::Plex);
+        ep.show_id = Some("show:got".into());
+        c.upsert_entry(&ep).unwrap();
+        let mut ep2 = Entry::new("ep2", "episode", "The Kingsroad", Source::Plex);
+        ep2.show_id = Some("show:got".into());
+        c.upsert_entry(&ep2).unwrap();
+        // A movie has no show_id, and "missing" isn't in the catalog at all.
+        c.upsert_entry(&Entry::new("mov1", "movie", "Inception", Source::Plex))
+            .unwrap();
+
+        let ids = vec![
+            "ep1".to_string(),
+            "ep2".to_string(),
+            "mov1".to_string(),
+            "missing".to_string(),
+        ];
+        let map = c.show_ids_for(&ids).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("ep1").unwrap(), "show:got");
+        assert_eq!(map.get("ep2").unwrap(), "show:got");
+        assert!(!map.contains_key("mov1"), "a movie has no show_id");
+        assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn show_ids_for_handles_an_empty_request_and_large_batches() {
+        let c = cat();
+        assert!(c.show_ids_for(&[]).unwrap().is_empty());
+
+        // Past the 500-id chunk boundary, so the chunking loop is exercised
+        // rather than assumed.
+        let mut ids = Vec::new();
+        for n in 0..1200 {
+            let id = format!("ep{n}");
+            let mut e = Entry::new(&id, "episode", format!("Episode {n}"), Source::Plex);
+            e.show_id = Some(format!("show:{}", n % 3));
+            c.upsert_entry(&e).unwrap();
+            ids.push(id);
+        }
+        let map = c.show_ids_for(&ids).unwrap();
+        assert_eq!(map.len(), 1200);
+        assert_eq!(map.get("ep1199").unwrap(), "show:2");
     }
 }

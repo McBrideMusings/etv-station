@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::constraints::Constraints;
 use super::entry::Entry;
+use super::pool::{PatternStep, Pool};
 
 /// Within-block duplicate policy (#46 locked decision). Block-scoped:
 /// cross-block repeats are always allowed.
@@ -17,24 +18,40 @@ pub enum Duplicates {
 }
 
 /// The body of a block: optional `[program]` metadata defaults, a `duplicates`
-/// policy, and the flat `[[entries]]` list. This is the on-disk shape of a
-/// referenced block *file*; the same fields appear inline on a channel's
-/// `[[rule.blocks]]` entry (see [`super::rule::BlockInclude`]).
+/// policy, and **either** the flat `[[entries]]` list **or** the `pools` +
+/// `pattern` interleave (#72). This is the on-disk shape of a referenced block
+/// *file*; the same fields appear inline on a channel's `[[rule.blocks]]` entry
+/// (see [`super::rule::BlockInclude`]).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BlockFile {
     /// Program-metadata defaults applied to items that omit their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<ProgramMetadata>,
 
-    #[serde(default)]
-    pub duplicates: Duplicates,
+    /// `None` means unset — an entries block then resolves to the [`Duplicates`]
+    /// default (`collapse`) while a pattern block forces `keep`. Splicing the
+    /// literal `None` through (rather than defaulting here) is what lets
+    /// validation tell "the author wrote `collapse`" apart from "the author
+    /// said nothing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicates: Option<Duplicates>,
 
     /// Post-order adjacency constraints (#73). `None` leaves the block
     /// unconstrained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraints: Option<Constraints>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<Entry>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<Pool>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pattern: Vec<PatternStep>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycles: Option<usize>,
 }
 
 #[cfg(test)]
@@ -58,7 +75,7 @@ kind = "lavfi"
 params = "testsrc"
 "#;
         let block: BlockFile = toml::from_str(toml).unwrap();
-        assert_eq!(block.duplicates, Duplicates::Keep);
+        assert_eq!(block.duplicates, Some(Duplicates::Keep));
         assert_eq!(block.entries.len(), 1);
         assert!(matches!(block.entries[0], Entry::Item(_)));
         assert_eq!(
@@ -77,7 +94,34 @@ kind = "lavfi"
 params = "testsrc"
 "#;
         let block: BlockFile = toml::from_str(toml).unwrap();
-        assert_eq!(block.duplicates, Duplicates::Collapse);
+        // Unset on disk stays unset; `BlockInclude::duplicates()` applies the
+        // per-block-kind default.
+        assert_eq!(block.duplicates, None);
+    }
+
+    #[test]
+    fn parses_a_pattern_block_file() {
+        let yaml = r#"
+pools:
+  - name: movies
+    expr: 'item.type == "movie"'
+  - name: shows
+    expr: 'item.type == "episode"'
+    order: "season:asc,episode:asc"
+    advance: resume
+pattern:
+  - pool: movies
+    take: 1
+  - pool: shows
+    take: 3
+"#;
+        let block: BlockFile = serde_norway::from_str(yaml).unwrap();
+        assert!(block.entries.is_empty());
+        assert_eq!(block.pools.len(), 2);
+        assert_eq!(block.pattern.len(), 2);
+        assert_eq!(block.pattern[1].pool, "shows");
+        assert_eq!(block.pattern[1].take, 3);
+        assert_eq!(block.cycles, None);
     }
 
     #[test]
@@ -94,7 +138,7 @@ entries:
       params: testsrc
 "#;
         let block: BlockFile = serde_norway::from_str(yaml).unwrap();
-        assert_eq!(block.duplicates, Duplicates::Keep);
+        assert_eq!(block.duplicates, Some(Duplicates::Keep));
         assert_eq!(block.entries.len(), 1);
         assert!(matches!(block.entries[0], Entry::Item(_)));
         assert_eq!(
