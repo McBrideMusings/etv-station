@@ -1,5 +1,6 @@
 mod block;
 mod channel;
+mod constraints;
 mod entry;
 mod filter;
 mod load;
@@ -12,6 +13,7 @@ mod validate;
 
 pub use block::{BlockFile, Duplicates};
 pub use channel::{ChannelConfig, ChannelOverlayConfig};
+pub use constraints::Constraints;
 pub use entry::{Entry, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
 pub use load::{LoadedChannel, Station, load, read_channel};

@@ -43,6 +43,7 @@ Out of scope until Phase C: scripted `size`/`color`, channel/block/item overlay 
 With the query language picked and graphics rendering working, redesign the channel/block/entries schema and integrate everything:
 
 - New TOML (or YAML) schema with blocks, channels, `[[entries]]`, includes, modes (`all` / `count`), filters, channel-seeded random order.
+- Adjacency constraints — `[constraints] no_repeat_within = N`, enforced circularly over the whole channel list (#73). The property-level `separate_by` / `separate_min_gap` form is deferred; so is reading the previous window's last aired item out of a play-history ledger, which waits on the generation model (#70).
 - Plex catalog ingester + local-FS catalog ingester (bumpers / commercials / errata).
 - Runtime query resolution with snapshot-at-boot and configurable refresh interval.
 - Graphics overlay cascade: channel default → block override → item override.

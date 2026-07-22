@@ -1,6 +1,7 @@
 use ersatztv_playout::playout::ProgramMetadata;
 use serde::{Deserialize, Serialize};
 
+use super::constraints::Constraints;
 use super::entry::Entry;
 
 /// Within-block duplicate policy (#46 locked decision). Block-scoped:
@@ -27,6 +28,11 @@ pub struct BlockFile {
 
     #[serde(default)]
     pub duplicates: Duplicates,
+
+    /// Post-order adjacency constraints (#73). `None` leaves the block
+    /// unconstrained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<Constraints>,
 
     pub entries: Vec<Entry>,
 }

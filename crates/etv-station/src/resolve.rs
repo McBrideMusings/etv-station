@@ -5,7 +5,8 @@
 //! producing the flat [`ResolvedItem`] list the window-filling sequencer
 //! ([`crate::rule::LoopForever`]) loops across the chunk window. Collapse runs
 //! *before* order, so which duplicate survives is deterministic regardless of a
-//! `random` shuffle.
+//! `random` shuffle. The blocks concatenate, then the adjacency constraint pass
+//! ([`crate::constrain`], #73) runs once over the whole list.
 //!
 //! `query` entries resolve against the [`Catalog`] (#68 CEL→SQL) and each
 //! resolved `entry_id` becomes a `ResolvedItem`; `order` is applied by the
@@ -71,9 +72,17 @@ pub fn resolve_channel(
     // whose path is in it inherits that entry_id, so it collapses against a
     // `query` result for the same physical file (manual∩query dedup).
     let mut out = Vec::new();
+    // Each item carries its own block's `no_repeat_within` (0 = unconstrained),
+    // so the constraint pass runs once over the concatenated list and still
+    // covers block joins — which a per-block pass would leave open.
+    let mut gaps: Vec<usize> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
         let block_items =
             resolve_block(include, idx, path, source_roots, path_index, catalog, seed)?;
+        gaps.resize(
+            gaps.len() + block_items.len(),
+            include.constraints().no_repeat_gap(),
+        );
         out.extend(block_items);
     }
 
@@ -83,7 +92,31 @@ pub fn resolve_channel(
             message: "channel resolved to zero items".into(),
         });
     }
+
+    // 5. Adjacency constraints — runs last, after every block has ordered its
+    //    own list, so it reorders a settled sequence rather than fighting the
+    //    order engine.
+    if gaps.iter().any(|&g| g > 0) {
+        let ids: Vec<String> = out.iter().map(|item| item.id.clone()).collect();
+        let perm = crate::constrain::order_no_repeat(&ids, &gaps);
+        out = permute(out, &perm);
+    }
+
     Ok(out)
+}
+
+/// Reorder `items` by `perm` (a permutation of `0..items.len()`).
+/// [`ResolvedItem`] is not `Clone`, so items are moved out of slots rather than
+/// copied.
+fn permute(items: Vec<ResolvedItem>, perm: &[usize]) -> Vec<ResolvedItem> {
+    let mut slots: Vec<Option<ResolvedItem>> = items.into_iter().map(Some).collect();
+    perm.iter()
+        .map(|&i| {
+            slots[i]
+                .take()
+                .expect("a permutation visits each index exactly once")
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,9 +155,7 @@ fn resolve_block(
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
-            Entry::Item(item) => {
-                items.push(resolve_item(item, defaults, source_roots, path_index))
-            }
+            Entry::Item(item) => items.push(resolve_item(item, defaults, source_roots, path_index)),
             Entry::Query(query) => {
                 let cat = catalog.ok_or_else(|| {
                     unsupported(format!(
@@ -412,6 +443,7 @@ mod tests {
             block: None,
             program: None,
             duplicates: None,
+            constraints: None,
             entries,
             mode: Mode::All,
             order: Order::Manual,
@@ -454,6 +486,103 @@ mod tests {
         let items = resolve_channel(&channel(vec![a, b]), path(), &[], None, None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["lavfi:a", "lavfi:b"]);
+    }
+
+    /// `no_repeat_within` only has repeats to work on when they survive to the
+    /// pass, so these use `duplicates = "keep"` or cross-block repeats — the two
+    /// ways an id legitimately appears twice in a resolved channel.
+    fn constrained(mut inc: BlockInclude, n: usize) -> BlockInclude {
+        inc.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(n),
+        });
+        inc
+    }
+
+    fn resolved_ids(blocks: Vec<BlockInclude>) -> Vec<String> {
+        resolve_channel(&channel(blocks), path(), &[], None, None)
+            .unwrap()
+            .iter()
+            .map(|i| i.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn no_repeat_within_separates_back_to_back_repeats() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+            Entry::Item(item_entry("c")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained(inc, 1)]);
+        assert_eq!(ids.len(), 4);
+        for i in 0..ids.len() {
+            assert_ne!(ids[i], ids[(i + 1) % ids.len()], "{ids:?}");
+        }
+    }
+
+    #[test]
+    fn no_repeat_within_holds_across_a_block_join() {
+        // `collapse` is block-scoped, so the same title in two blocks survives
+        // into the concatenated list — and the channel-level pass is what keeps
+        // the join from playing it twice in a row.
+        let a = include_with(vec![
+            Entry::Item(item_entry("x")),
+            Entry::Item(item_entry("a")),
+        ]);
+        let b = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("y")),
+        ]);
+        let ids = resolved_ids(vec![constrained(a, 1), constrained(b, 1)]);
+        assert_eq!(ids.len(), 4);
+        for i in 0..ids.len() {
+            assert_ne!(ids[i], ids[(i + 1) % ids.len()], "{ids:?}");
+        }
+    }
+
+    #[test]
+    fn no_repeat_within_holds_across_the_loop_wrap() {
+        // Linearly `a b c a` is legal, but LoopForever replays the list end to
+        // end, so its tail `a` airs immediately before its head `a`.
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+            Entry::Item(item_entry("c")),
+            Entry::Item(item_entry("a")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained(inc, 1)]);
+        assert_ne!(ids[ids.len() - 1], ids[0], "wrap seam repeats: {ids:?}");
+    }
+
+    #[test]
+    fn unsatisfiable_constraint_completes_rather_than_hanging() {
+        // One title, "no two in a row": impossible. Generation must finish with
+        // every item intact and accept the violation.
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained(inc, 1)]);
+        assert_eq!(ids, vec!["lavfi:a"; 3]);
+    }
+
+    #[test]
+    fn unconstrained_channel_keeps_its_resolved_order() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        assert_eq!(
+            resolved_ids(vec![inc]),
+            vec!["lavfi:a", "lavfi:a", "lavfi:b"]
+        );
     }
 
     #[test]

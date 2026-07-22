@@ -4,6 +4,7 @@ use ersatztv_playout::playout::ProgramMetadata;
 use serde::{Deserialize, Serialize};
 
 use super::block::{BlockFile, Duplicates};
+use super::constraints::Constraints;
 use super::entry::Entry;
 use super::filter::Filter;
 use super::mode::Mode;
@@ -41,6 +42,11 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duplicates: Option<Duplicates>,
 
+    /// Inline form: post-order adjacency constraints (#73). `None` resolves to
+    /// the [`Constraints`] default (unconstrained).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<Constraints>,
+
     /// Inline form: the flat entries list (empty in path form until resolved).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<Entry>,
@@ -72,12 +78,18 @@ impl BlockInclude {
         self.duplicates.unwrap_or_default()
     }
 
+    /// The effective adjacency constraints (defaulting to unconstrained).
+    pub fn constraints(&self) -> Constraints {
+        self.constraints.unwrap_or_default()
+    }
+
     /// Splice a loaded block-file body into this include's inline fields and
     /// clear the path reference. Called by `load` after reading a path-form
     /// block file.
     pub(super) fn apply_body(&mut self, body: BlockFile) {
         self.program = body.program;
         self.duplicates = Some(body.duplicates);
+        self.constraints = body.constraints;
         self.entries = body.entries;
         self.block = None;
     }

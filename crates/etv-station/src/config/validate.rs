@@ -116,6 +116,18 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // authored — so there is no id to validate here. Within-block duplicates
         // (two entries resolving to the same file) collapse in `resolve`, they
         // are not a config error. `duplicates = "keep"` opts out of the collapse.
+
+        // An explicit `no_repeat_within = 0` reads as "on" but constrains
+        // nothing. Reject it so the author writes the gap they meant, or omits
+        // the field.
+        if include.constraints().no_repeat_within == Some(0) {
+            return Err(ConfigError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "block #{idx}: no_repeat_within must be > 0 (omit it to leave the block unconstrained)"
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -151,6 +163,7 @@ mod tests {
             block: None,
             program: None,
             duplicates: None,
+            constraints: None,
             entries,
             mode: Mode::All,
             order: Order::Manual,
@@ -222,6 +235,25 @@ mod tests {
         let ch = channel_with(vec![inline_block(vec![])]);
         let err = validate_channel(&dummy_path(), &ch).unwrap_err();
         assert!(format!("{err}").contains("no entries"));
+    }
+
+    #[test]
+    fn rejects_zero_no_repeat_within() {
+        let mut block = inline_block(vec![item_entry("a")]);
+        block.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(0),
+        });
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        assert!(format!("{err}").contains("no_repeat_within must be > 0"));
+    }
+
+    #[test]
+    fn accepts_a_positive_no_repeat_within() {
+        let mut block = inline_block(vec![item_entry("a"), item_entry("b")]);
+        block.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(1),
+        });
+        validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap();
     }
 
     #[test]
