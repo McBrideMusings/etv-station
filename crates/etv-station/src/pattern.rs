@@ -76,30 +76,22 @@ impl PoolRuntime<'_> {
         self.series.is_empty()
     }
 
-    /// The series at or after `from`, scanning circularly.
-    fn series_at_or_after(&self, from: usize) -> Option<usize> {
+    /// The series at `i`, wrapping. `None` only when the pool resolved empty —
+    /// every series is always in the rotation, so there is nothing to skip past.
+    fn series_at(&self, i: usize) -> Option<usize> {
         let n = self.series.len();
-        if n == 0 {
-            return None;
-        }
-        Some(from % n)
+        (n > 0).then(|| i % n)
     }
 
     fn series_after(&self, si: usize) -> Option<usize> {
-        if self.series.is_empty() {
-            return None;
-        }
-        self.series_at_or_after((si + 1) % self.series.len())
+        self.series_at(si + 1)
     }
 
     /// Which series serves next, honouring `select`.
     fn pick(&self, roll: &RollKey, nonce: u64) -> Option<usize> {
-        if self.series.is_empty() {
-            return None;
-        }
         match self.cfg.select {
-            Select::RoundRobin => self.series_at_or_after(self.rotation),
-            Select::Random => Some((roll.u64_at(nonce) as usize) % self.series.len()),
+            Select::RoundRobin => self.series_at(self.rotation),
+            Select::Random => self.series_at(roll.u64_at(nonce) as usize),
         }
     }
 
@@ -199,7 +191,7 @@ impl PoolRuntime<'_> {
             // draws afresh every visit.
             next: match self.cfg.select {
                 Select::RoundRobin => self
-                    .series_at_or_after(self.rotation)
+                    .series_at(self.rotation)
                     .map(|i| self.series[i].key.clone()),
                 Select::Random => None,
             },

@@ -44,9 +44,9 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
 }
 
 /// Reject two channels that write to the same `output_folder`. A shared folder
-/// silently misbehaves: both channels fight over the `.anchor` sidecar and each
-/// startup prunes the other's `.durations.json` cache, forcing re-probes on
-/// every restart.
+/// silently misbehaves: both channels fight over the `.resume` and `.history`
+/// sidecars and each startup prunes the other's `.durations.json` cache,
+/// forcing re-probes on every restart.
 ///
 /// Folders are compared exactly as the daemon uses them — verbatim, relative to
 /// the single process CWD (see `daemon::channel_loop`, which uses
@@ -121,16 +121,31 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
 
         // Checked before the pattern/entries split: `[constraints]` applies to
         // either kind of block, so this must not sit on one branch only.
-        // An explicit `no_repeat_within = 0` reads as "on" but constrains
-        // nothing. Reject it so the author writes the gap they meant, or omits
-        // the field.
-        if include.constraints().no_repeat_within == Some(0) {
-            return Err(ConfigError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "block #{idx}: no_repeat_within must be > 0 (omit it to leave the block unconstrained)"
-                ),
-            });
+        match include.constraints().no_repeat_within {
+            // An explicit `0` reads as "on" but constrains nothing. Reject it
+            // so the author writes the gap they meant, or omits the field.
+            Some(0) => {
+                return Err(ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "block #{idx}: no_repeat_within must be > 0 (omit it to leave the block unconstrained)"
+                    ),
+                });
+            }
+            // The seam is checked against the last `SEAM_TAIL` aired ids, so a
+            // wider gap could not be enforced across a generation boundary —
+            // it would hold inside a list and quietly lapse at the seam. Reject
+            // rather than under-enforce something the config says is on.
+            Some(n) if n > crate::constrain::SEAM_TAIL => {
+                return Err(ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "block #{idx}: no_repeat_within = {n} exceeds the {} recently-aired items carried across a generation seam, so it could not be enforced there",
+                        crate::constrain::SEAM_TAIL
+                    ),
+                });
+            }
+            _ => {}
         }
 
         if include.is_pattern() {
@@ -384,6 +399,18 @@ mod tests {
         });
         let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
         assert!(format!("{err}").contains("no_repeat_within must be > 0"));
+    }
+
+    #[test]
+    fn rejects_a_no_repeat_within_wider_than_the_seam_tail() {
+        // Silently under-enforcing at the seam is worse than refusing the
+        // config: the constraint would hold inside a list and lapse between.
+        let mut block = inline_block(vec![item_entry("a")]);
+        block.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(crate::constrain::SEAM_TAIL + 1),
+        });
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        assert!(format!("{err}").contains("generation seam"), "msg = {err}");
     }
 
     #[test]
