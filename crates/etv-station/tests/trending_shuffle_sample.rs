@@ -37,7 +37,8 @@ fn trending_catalog() -> Catalog {
     };
     for (pos, id) in ["m-a", "m-b", "m-c", "m-d"].iter().enumerate() {
         seed_movie(id);
-        cat.add_collection_item("coll-trending", id, pos as i64).unwrap();
+        cat.add_collection_item("coll-trending", id, pos as i64)
+            .unwrap();
     }
     // A movie that is NOT in the collection — must never resolve.
     seed_movie("m-out");
@@ -78,5 +79,9 @@ fn trending_shuffle_sample_is_reproducible_with_a_pinned_seed() {
 
     let mut sorted = ids1.clone();
     sorted.sort_unstable();
-    assert_eq!(sorted, ["m-a", "m-b", "m-c", "m-d"], "shuffle is a permutation of all members");
+    assert_eq!(
+        sorted,
+        ["m-a", "m-b", "m-c", "m-d"],
+        "shuffle is a permutation of all members"
+    );
 }

@@ -151,7 +151,10 @@ impl Catalog {
         F: FnOnce(&Self) -> Result<T, E>,
         E: From<CatalogError>,
     {
-        let tx = self.conn.unchecked_transaction().map_err(CatalogError::from)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(CatalogError::from)?;
         let out = f(self)?;
         tx.commit().map_err(CatalogError::from)?;
         Ok(out)

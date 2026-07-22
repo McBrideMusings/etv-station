@@ -132,22 +132,42 @@ pub fn ingest_items(
         let mut entry = Entry::new(
             &entry_id,
             non_empty(&item.kind).unwrap_or("video"),
-            merged(non_empty(&item.title), existing.as_ref().map(|e| e.title.clone())).unwrap_or_default(),
+            merged(
+                non_empty(&item.title),
+                existing.as_ref().map(|e| e.title.clone()),
+            )
+            .unwrap_or_default(),
             Source::Plex,
         );
-        entry.show = or_existing(item.show.clone(), existing.as_ref().and_then(|e| e.show.clone()));
-        entry.season = item.season.or_else(|| existing.as_ref().and_then(|e| e.season));
-        entry.episode = item.episode.or_else(|| existing.as_ref().and_then(|e| e.episode));
-        entry.absolute_episode =
-            item.absolute_episode.or_else(|| existing.as_ref().and_then(|e| e.absolute_episode));
+        entry.show = or_existing(
+            item.show.clone(),
+            existing.as_ref().and_then(|e| e.show.clone()),
+        );
+        entry.season = item
+            .season
+            .or_else(|| existing.as_ref().and_then(|e| e.season));
+        entry.episode = item
+            .episode
+            .or_else(|| existing.as_ref().and_then(|e| e.episode));
+        entry.absolute_episode = item
+            .absolute_episode
+            .or_else(|| existing.as_ref().and_then(|e| e.absolute_episode));
         entry.year = item.year.or_else(|| existing.as_ref().and_then(|e| e.year));
         entry.content_rating = or_existing(
             item.content_rating.clone(),
             existing.as_ref().and_then(|e| e.content_rating.clone()),
         );
-        entry.edition = or_existing(item.edition.clone(), existing.as_ref().and_then(|e| e.edition.clone()));
-        entry.studio = or_existing(item.studio.clone(), existing.as_ref().and_then(|e| e.studio.clone()));
-        entry.duration_ms = item.duration_ms.or_else(|| existing.as_ref().and_then(|e| e.duration_ms));
+        entry.edition = or_existing(
+            item.edition.clone(),
+            existing.as_ref().and_then(|e| e.edition.clone()),
+        );
+        entry.studio = or_existing(
+            item.studio.clone(),
+            existing.as_ref().and_then(|e| e.studio.clone()),
+        );
+        entry.duration_ms = item
+            .duration_ms
+            .or_else(|| existing.as_ref().and_then(|e| e.duration_ms));
         catalog.upsert_entry(&entry)?;
         stats.entries_written += 1;
 
@@ -320,7 +340,11 @@ fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
 /// the file path. Returns `None` for a record with no playable file part.
 fn to_plex_item(m: &PlexMetadata, translate: impl Fn(&str) -> String) -> Option<PlexItem> {
     let raw_path = m.media.first()?.part.first()?.file.as_deref()?;
-    let external_ids = m.guid.iter().filter_map(|g| g.id.as_deref().and_then(parse_guid)).collect();
+    let external_ids = m
+        .guid
+        .iter()
+        .filter_map(|g| g.id.as_deref().and_then(parse_guid))
+        .collect();
     let kind = m.kind.clone().unwrap_or_else(|| "video".into());
     // Season/episode belong to episodes; a movie carrying a stray `index` must
     // not land `episode = Some(n)`.
@@ -339,7 +363,11 @@ fn to_plex_item(m: &PlexMetadata, translate: impl Fn(&str) -> String) -> Option<
         content_rating: m.content_rating.clone(),
         // Absent/blank `editionTitle` means theatrical — normalise to `None` so
         // the merge never overwrites an existing edition with an empty string.
-        edition: m.edition_title.as_deref().and_then(non_empty).map(str::to_string),
+        edition: m
+            .edition_title
+            .as_deref()
+            .and_then(non_empty)
+            .map(str::to_string),
         studio: m.studio.as_deref().and_then(non_empty).map(str::to_string),
         // Plex `duration` is already milliseconds.
         duration_ms: m.duration,
@@ -590,7 +618,10 @@ mod tests {
     fn movie(rating_key: &str, path: &str, guids: &[(ExternalNs, &str)]) -> PlexItem {
         PlexItem {
             rating_key: rating_key.into(),
-            external_ids: guids.iter().map(|(ns, v)| (*ns, (*v).to_string())).collect(),
+            external_ids: guids
+                .iter()
+                .map(|(ns, v)| (*ns, (*v).to_string()))
+                .collect(),
             playback_path: path.into(),
             kind: "movie".into(),
             title: "A Movie".into(),
@@ -615,10 +646,22 @@ mod tests {
 
     #[test]
     fn parse_guid_recognises_known_schemes() {
-        assert_eq!(parse_guid("imdb://tt0095016"), Some((ExternalNs::Imdb, "tt0095016".into())));
-        assert_eq!(parse_guid("tmdb://562"), Some((ExternalNs::Tmdb, "562".into())));
-        assert_eq!(parse_guid("tvdb://12345"), Some((ExternalNs::Tvdb, "12345".into())));
-        assert_eq!(parse_guid("plex://movie/abc"), Some((ExternalNs::Plex, "movie/abc".into())));
+        assert_eq!(
+            parse_guid("imdb://tt0095016"),
+            Some((ExternalNs::Imdb, "tt0095016".into()))
+        );
+        assert_eq!(
+            parse_guid("tmdb://562"),
+            Some((ExternalNs::Tmdb, "562".into()))
+        );
+        assert_eq!(
+            parse_guid("tvdb://12345"),
+            Some((ExternalNs::Tvdb, "12345".into()))
+        );
+        assert_eq!(
+            parse_guid("plex://movie/abc"),
+            Some((ExternalNs::Plex, "movie/abc".into()))
+        );
         assert_eq!(parse_guid("nonsense://x"), None);
         assert_eq!(parse_guid("imdb://"), None);
         assert_eq!(parse_guid("garbage"), None);
@@ -636,13 +679,19 @@ mod tests {
         let stats = ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
         assert_eq!(stats.entries_written, 1);
         assert_eq!(stats.inherited, 0);
-        assert_eq!(cat.all_entry_ids().unwrap(), vec!["imdb:tt0095016".to_string()]);
+        assert_eq!(
+            cat.all_entry_ids().unwrap(),
+            vec!["imdb:tt0095016".to_string()]
+        );
 
         let e = cat.entry("imdb:tt0095016").unwrap().unwrap();
         assert_eq!(e.kind, "movie");
         assert_eq!(e.year, Some(1988));
         assert_eq!(e.duration_ms, Some(7_920_000));
-        assert_eq!(cat.tags_for("imdb:tt0095016", TagNs::Genre).unwrap(), vec!["Action".to_string()]);
+        assert_eq!(
+            cat.tags_for("imdb:tt0095016", TagNs::Genre).unwrap(),
+            vec!["Action".to_string()]
+        );
         // Provenance row is the plex ratingKey.
         let sources = cat.sources_for("imdb:tt0095016").unwrap();
         assert_eq!(sources.len(), 1);
@@ -665,7 +714,10 @@ mod tests {
         // under a different mount root) with a local_fs provenance row.
         crate::catalog::ingest::fs::ingest_files(
             &cat,
-            &[(std::path::PathBuf::from("/mnt/media/movies/Die Hard.mkv"), Some(120.0))],
+            &[(
+                std::path::PathBuf::from("/mnt/media/movies/Die Hard.mkv"),
+                Some(120.0),
+            )],
             &["/mnt/media".into(), "/data/media".into()],
         )
         .unwrap();
@@ -678,7 +730,8 @@ mod tests {
             "/data/media/movies/Die Hard.mkv",
             &[(ExternalNs::Imdb, "tt0095016")],
         );
-        let stats = ingest_items(&cat, &[item], &["/mnt/media".into(), "/data/media".into()]).unwrap();
+        let stats =
+            ingest_items(&cat, &[item], &["/mnt/media".into(), "/data/media".into()]).unwrap();
 
         // One entry (the inherited fs: id), two provenance rows, imdb reachable,
         // and Plex upgraded the sparse title.
@@ -688,7 +741,10 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert!(sources.iter().any(|s| s.source == Source::Plex));
         assert!(sources.iter().any(|s| s.source == Source::LocalFs));
-        assert_eq!(cat.resolve_query("item.title == \"A Movie\"").unwrap(), vec![fs_id]);
+        assert_eq!(
+            cat.resolve_query("item.title == \"A Movie\"").unwrap(),
+            vec![fs_id]
+        );
     }
 
     #[test]
@@ -708,7 +764,10 @@ mod tests {
         assert_eq!(item.playback_path, "/data/media/Movies/Die Hard.mkv");
         assert_eq!(
             item.external_ids,
-            vec![(ExternalNs::Imdb, "tt0095016".into()), (ExternalNs::Tmdb, "562".into())]
+            vec![
+                (ExternalNs::Imdb, "tt0095016".into()),
+                (ExternalNs::Tmdb, "562".into())
+            ]
         );
         assert_eq!(item.rating_key, "12345");
         assert_eq!(item.duration_ms, Some(7_920_000));
@@ -750,7 +809,11 @@ mod tests {
     #[test]
     fn ingest_writes_edition_and_studio_queryable() {
         let cat = Catalog::open_in_memory().unwrap();
-        let mut item = movie("plex-e", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-e")]);
+        let mut item = movie(
+            "plex-e",
+            "/data/media/m/x.mkv",
+            &[(ExternalNs::Imdb, "tt-e")],
+        );
         item.edition = Some("Extended Edition".into());
         item.studio = Some("New Line Cinema".into());
         ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
@@ -760,11 +823,13 @@ mod tests {
         assert_eq!(e.studio.as_deref(), Some("New Line Cinema"));
         // Both promoted columns are queryable via the CEL→SQL surface.
         assert_eq!(
-            cat.resolve_query(r#"item.studio == "New Line Cinema""#).unwrap(),
+            cat.resolve_query(r#"item.studio == "New Line Cinema""#)
+                .unwrap(),
             vec!["imdb:tt-e".to_string()]
         );
         assert_eq!(
-            cat.resolve_query(r#"item.edition == "Extended Edition""#).unwrap(),
+            cat.resolve_query(r#"item.edition == "Extended Edition""#)
+                .unwrap(),
             vec!["imdb:tt-e".to_string()]
         );
     }
@@ -796,22 +861,37 @@ mod tests {
     #[test]
     fn ingest_writes_crew_cast_and_label_tags_queryable() {
         let cat = Catalog::open_in_memory().unwrap();
-        let mut item = movie("plex-t", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-t")]);
+        let mut item = movie(
+            "plex-t",
+            "/data/media/m/x.mkv",
+            &[(ExternalNs::Imdb, "tt-t")],
+        );
         item.cast = vec!["Jackie Chan".into()];
         item.directors = vec!["Stanley Tong".into()];
         item.labels = vec!["Kung Fu".into()];
         ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
 
-        assert_eq!(cat.tags_for("imdb:tt-t", TagNs::Cast).unwrap(), vec!["Jackie Chan".to_string()]);
-        assert_eq!(cat.tags_for("imdb:tt-t", TagNs::Director).unwrap(), vec!["Stanley Tong".to_string()]);
-        assert_eq!(cat.tags_for("imdb:tt-t", TagNs::Label).unwrap(), vec!["Kung Fu".to_string()]);
+        assert_eq!(
+            cat.tags_for("imdb:tt-t", TagNs::Cast).unwrap(),
+            vec!["Jackie Chan".to_string()]
+        );
+        assert_eq!(
+            cat.tags_for("imdb:tt-t", TagNs::Director).unwrap(),
+            vec!["Stanley Tong".to_string()]
+        );
+        assert_eq!(
+            cat.tags_for("imdb:tt-t", TagNs::Label).unwrap(),
+            vec!["Kung Fu".to_string()]
+        );
         // Reachable through the CEL→SQL surface: dedicated fields and generic `tags`.
         assert_eq!(
-            cat.resolve_query(r#"item.cast.contains("Jackie Chan")"#).unwrap(),
+            cat.resolve_query(r#"item.cast.contains("Jackie Chan")"#)
+                .unwrap(),
             vec!["imdb:tt-t".to_string()]
         );
         assert_eq!(
-            cat.resolve_query(r#"item.labels.contains("Kung Fu")"#).unwrap(),
+            cat.resolve_query(r#"item.labels.contains("Kung Fu")"#)
+                .unwrap(),
             vec!["imdb:tt-t".to_string()]
         );
     }
@@ -854,11 +934,18 @@ mod tests {
     #[test]
     fn ingest_writes_absolute_episode_queryable() {
         let cat = Catalog::open_in_memory().unwrap();
-        let mut item = movie("plex-ae", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-ae")]);
+        let mut item = movie(
+            "plex-ae",
+            "/data/media/m/x.mkv",
+            &[(ExternalNs::Imdb, "tt-ae")],
+        );
         item.absolute_episode = Some(154);
         ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
 
-        assert_eq!(cat.entry("imdb:tt-ae").unwrap().unwrap().absolute_episode, Some(154));
+        assert_eq!(
+            cat.entry("imdb:tt-ae").unwrap().unwrap().absolute_episode,
+            Some(154)
+        );
         assert_eq!(
             cat.resolve_query("item.absolute_episode == 154").unwrap(),
             vec!["imdb:tt-ae".to_string()]
@@ -892,7 +979,9 @@ mod tests {
         );
         // Membership is queryable by collection name via the CEL→SQL surface.
         assert_eq!(
-            cat.resolve_query(r#"item.collections.contains("Halloween Marathon")"#).unwrap().len(),
+            cat.resolve_query(r#"item.collections.contains("Halloween Marathon")"#)
+                .unwrap()
+                .len(),
             2
         );
     }
@@ -903,8 +992,16 @@ mod tests {
         // Two Plex files (4K + 1080p) share one GUID → one entry, two `plex`
         // provenance rows (two ratingKeys).
         let dupes = [
-            movie("rk-4k", "/data/media/m/a-4k.mkv", &[(ExternalNs::Imdb, "tt-a")]),
-            movie("rk-hd", "/data/media/m/a-hd.mkv", &[(ExternalNs::Imdb, "tt-a")]),
+            movie(
+                "rk-4k",
+                "/data/media/m/a-4k.mkv",
+                &[(ExternalNs::Imdb, "tt-a")],
+            ),
+            movie(
+                "rk-hd",
+                "/data/media/m/a-hd.mkv",
+                &[(ExternalNs::Imdb, "tt-a")],
+            ),
         ];
         ingest_items(&cat, &dupes, &["/data/media".into()]).unwrap();
         let b = movie("rk-b", "/data/media/m/b.mkv", &[(ExternalNs::Imdb, "tt-b")]);
@@ -938,7 +1035,10 @@ mod tests {
         ingest_collections(&cat, std::slice::from_ref(&coll)).unwrap();
         // A second pass must not duplicate the membership row.
         ingest_collections(&cat, &[coll]).unwrap();
-        assert_eq!(cat.collection_members("coll-1").unwrap(), vec!["imdb:tt-a".to_string()]);
+        assert_eq!(
+            cat.collection_members("coll-1").unwrap(),
+            vec!["imdb:tt-a".to_string()]
+        );
     }
 
     #[test]
@@ -951,7 +1051,11 @@ mod tests {
     #[test]
     fn rescans_are_idempotent() {
         let cat = Catalog::open_in_memory().unwrap();
-        let item = movie("plex-1", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt1")]);
+        let item = movie(
+            "plex-1",
+            "/data/media/m/x.mkv",
+            &[(ExternalNs::Imdb, "tt1")],
+        );
         let roots = ["/data/media".to_string()];
         ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
         let stats = ingest_items(&cat, &[item], &roots).unwrap();
@@ -967,14 +1071,26 @@ mod tests {
         // external-id row stable (not flipped between them).
         let cat = Catalog::open_in_memory().unwrap();
         let items = [
-            movie("plex-4k", "/data/media/movies/DieHard-4k.mkv", &[(ExternalNs::Imdb, "tt0095016")]),
-            movie("plex-hd", "/data/media/movies/DieHard-1080.mkv", &[(ExternalNs::Imdb, "tt0095016")]),
+            movie(
+                "plex-4k",
+                "/data/media/movies/DieHard-4k.mkv",
+                &[(ExternalNs::Imdb, "tt0095016")],
+            ),
+            movie(
+                "plex-hd",
+                "/data/media/movies/DieHard-1080.mkv",
+                &[(ExternalNs::Imdb, "tt0095016")],
+            ),
         ];
         ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
-        assert_eq!(cat.all_entry_ids().unwrap(), vec!["imdb:tt0095016".to_string()]);
+        assert_eq!(
+            cat.all_entry_ids().unwrap(),
+            vec!["imdb:tt0095016".to_string()]
+        );
         assert_eq!(cat.sources_for("imdb:tt0095016").unwrap().len(), 2);
         assert_eq!(
-            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt0095016").unwrap(),
+            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt0095016")
+                .unwrap(),
             Some("imdb:tt0095016".to_string())
         );
     }
@@ -1013,7 +1129,10 @@ mod tests {
             path_to: "/data/media".into(),
             agent: ureq::AgentBuilder::new().build(),
         };
-        assert_eq!(client.translate("/media/Movies/A.mkv"), "/data/media/Movies/A.mkv");
+        assert_eq!(
+            client.translate("/media/Movies/A.mkv"),
+            "/data/media/Movies/A.mkv"
+        );
         assert_eq!(client.translate("/media"), "/data/media");
         // Sibling prefix must NOT be remapped.
         assert_eq!(client.translate("/mediabackup/x.mkv"), "/mediabackup/x.mkv");

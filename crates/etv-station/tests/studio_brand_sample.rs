@@ -78,12 +78,16 @@ fn disney_label_spans_substudios_where_studio_string_fails() {
     // A single `studio` string can't capture the brand — no film's studio IS
     // "Disney" (they're Pixar / Marvel / Lucasfilm).
     assert!(
-        cat.resolve_query(r#"item.studio == "Disney""#).unwrap().is_empty(),
+        cat.resolve_query(r#"item.studio == "Disney""#)
+            .unwrap()
+            .is_empty(),
         "no film's studio column is literally \"Disney\"",
     );
 
     // The user-applied Label unifies them.
-    let mut disney = cat.resolve_query(r#"item.labels.contains("Disney")"#).unwrap();
+    let mut disney = cat
+        .resolve_query(r#"item.labels.contains("Disney")"#)
+        .unwrap();
     disney.sort();
     assert_eq!(disney, ["dis:ironman", "dis:starwars", "dis:toystory"]);
 }
@@ -97,7 +101,9 @@ fn a24_label_is_queryable() {
         vec!["a24:ex".to_string()],
     );
     // Both operators on the promoted `studio` column resolve too.
-    let non_ghibli = cat.resolve_query(r#"item.studio != "Studio Ghibli""#).unwrap();
+    let non_ghibli = cat
+        .resolve_query(r#"item.studio != "Studio Ghibli""#)
+        .unwrap();
     assert!(non_ghibli.contains(&"a24:ex".to_string()));
     assert!(!non_ghibli.contains(&"ghibli:totoro".to_string()));
 }

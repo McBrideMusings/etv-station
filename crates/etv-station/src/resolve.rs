@@ -117,9 +117,7 @@ fn resolve_block(
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
-            Entry::Item(item) => {
-                items.push(resolve_item(item, defaults, source_roots, path_index))
-            }
+            Entry::Item(item) => items.push(resolve_item(item, defaults, source_roots, path_index)),
             Entry::Query(query) => {
                 let cat = catalog.ok_or_else(|| {
                     unsupported(format!(

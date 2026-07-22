@@ -72,7 +72,10 @@ fn marathon_sample_plays_the_collection_in_authored_position_order() {
 
     let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
     let expected: Vec<&str> = AUTHORED.iter().map(|(id, _)| *id).collect();
-    assert_eq!(ids, expected, "members must play in collection_items.position order");
+    assert_eq!(
+        ids, expected,
+        "members must play in collection_items.position order"
+    );
 }
 
 /// The non-member never appears — the entry emits the collection, not the
