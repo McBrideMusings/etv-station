@@ -1,0 +1,27 @@
+# Sample S3 — The Lord of the Rings, theatrical cuts only (edition exclusion).
+#
+# The same LOTR query as Sample S2, but excluding the Extended Editions via the
+# promoted `item.edition` column. A theatrical film has NO edition (NULL), and
+# under the NULL-as-default rule (#103) a NULL string reads as "", so
+# `item.edition != "Extended Edition"` *includes* theatrical cuts and drops only
+# the extended ones — which a title-substring hack (`!title.contains("Extended")`)
+# can't do reliably. Plays oldest-first by release date.
+#
+# Not registered in examples/station.yaml: a query channel needs a populated
+# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# proven by the `lotr_theatrical_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "release_date:asc"
+      program:
+        title: "The Lord of the Rings — Theatrical"
+        categories: ["Movie", "Fantasy"]
+      entries:
+        - kind: query
+          query: 'item.title.contains("Lord of the Rings") && item.edition != "Extended Edition"'
