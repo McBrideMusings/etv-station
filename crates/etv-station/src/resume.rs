@@ -8,12 +8,12 @@
 //! is recomputed, so the map stays tiny and a corrupt or missing one costs at
 //! most a restart from the top.
 //!
-//! Series positions are stored as the **last-played `entry_id`**, never an
-//! index: the resolved set churns (a trending list gains and loses shows, new
-//! episodes are ingested) and an index silently means something different after
-//! any such change, which is exactly the corruption #70 rules out. Resolution
-//! looks the id up in the freshly-ordered series and continues after it; an id
-//! that has vanished from the catalog restarts that series, and only that one.
+//! **Where each series left off is not here** — that is the play-history
+//! ledger's job (#70, [`crate::history`]), and the cursor is a projection of
+//! it. This sidecar holds only what the ledger cannot express: whose turn the
+//! rotation is on, which series have dropped out, and the checkpoints that make
+//! a rewind possible. Keeping the position in exactly one place is the point;
+//! two stores of "where are we" is the drift #70 exists to prevent.
 //!
 //! Pool names are unique per channel (enforced in config validation), so the
 //! map keys on the pool name alone and survives blocks being reordered.
@@ -77,13 +77,6 @@ pub struct PoolResume {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
 
-    /// series key → last-played `entry_id`. The series key is the catalog
-    /// `show_id` for an episode; for an item with no `show_id` (a movie) it is
-    /// the item's own `entry_id`, so a movie pool is a rotation of one-item
-    /// series and needs no special case.
-    #[serde(default)]
-    pub cursor: BTreeMap<String, String>,
-
     /// Series that have run out under `wrap = "drop"`. They stay out of the
     /// rotation until new content puts them back in the resolved set — a key
     /// listed here that no longer resolves is simply ignored.
@@ -142,6 +135,31 @@ impl ResumeMap {
         // checkpoints are re-recorded as it goes.
         self.checkpoints.clear();
         Some(earliest.start)
+    }
+}
+
+/// Everything one generation is handed about where the channel stands.
+///
+/// Two inputs from two places, deliberately: `resume` is this sidecar (rotation
+/// and drop state), and `cursor` is projected from the play-history ledger
+/// (`series_key -> last-played entry_id`). Bundling them keeps the resolver's
+/// signature honest about needing both without implying they are one store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenerationState {
+    pub resume: ResumeMap,
+    pub cursor: BTreeMap<String, String>,
+}
+
+impl GenerationState {
+    /// The empty state — every pool starts from the top.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Whether anything has ever played on this channel. Used to tell a pattern
+    /// channel that has run out of content apart from one that never had any.
+    pub fn is_fresh(&self) -> bool {
+        self.resume.is_empty() && self.cursor.is_empty()
     }
 }
 
@@ -212,14 +230,10 @@ mod tests {
 
     fn sample() -> ResumeMap {
         let mut map = ResumeMap::new();
-        let mut shows = PoolResume {
+        let shows = PoolResume {
             next: Some("show:invincible".into()),
-            ..Default::default()
+            dropped: vec!["show:cancelled".into()],
         };
-        shows.cursor.insert("show:got".into(), "plex:ep-1-3".into());
-        shows
-            .cursor
-            .insert("show:invincible".into(), "plex:ep-2-6".into());
         map.pools.insert("shows".into(), shows);
         map
     }
@@ -241,7 +255,7 @@ mod tests {
         assert_eq!(map, sample());
         let pool = map.pool("shows").unwrap();
         assert_eq!(pool.next.as_deref(), Some("show:invincible"));
-        assert_eq!(pool.cursor.get("show:got").unwrap(), "plex:ep-1-3");
+        assert_eq!(pool.dropped, vec!["show:cancelled".to_string()]);
     }
 
     #[tokio::test]
@@ -275,9 +289,13 @@ mod tests {
         datetime!(2026-04-13 00:00 UTC) + time::Duration::hours(hour as i64)
     }
 
-    fn pools_with(cursor_id: &str) -> BTreeMap<String, PoolResume> {
-        let mut pool = PoolResume::default();
-        pool.cursor.insert("show:got".into(), cursor_id.into());
+    /// A distinguishable pool state — the rotation position is what this
+    /// sidecar actually stores, so checkpoints are told apart by it.
+    fn pools_with(next_show: &str) -> BTreeMap<String, PoolResume> {
+        let pool = PoolResume {
+            next: Some(next_show.into()),
+            dropped: Vec::new(),
+        };
         BTreeMap::from([("shows".to_string(), pool)])
     }
 

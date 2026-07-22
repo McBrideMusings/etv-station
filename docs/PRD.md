@@ -151,13 +151,17 @@ A pattern channel cannot use the anchor-and-loop model: a pool with `advance = "
 
 Instead these channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
 
-The sidecar records, per pool, the **last-played `entry_id`** per series plus which series is next — never an index, because the resolved set churns and an index would silently mean something else after any change. An id that has vanished restarts its own series and no other. A missing or corrupt sidecar starts every pool from the top rather than failing the channel.
+Two files carry that state, and they hold different things. The **play-history ledger** (`.history`) is one JSONL line per scheduled airing — `entry_id`, `show_id`, the scheduled `start`, and when the row was written. It is a dumb record: no taste logic, no TTL, no relevance. Where each series left off is a **projection** of it ("the last airing per `show_id`"), so there is exactly one place that knows a show's position and nothing to drift out of sync. A future taste scorer reads the same lines the other way — all of them, with timestamps. One structure, two read shapes.
+
+Positions are therefore recorded as the **last-played `entry_id`**, never an index: the resolved set churns, and an index would silently mean something else after any change. An id that has vanished restarts its own series and no other, and a show that leaves the resolved set entirely and later returns resumes where it stopped, because the ledger is never pruned to the current set. A torn line is skipped rather than failing the channel.
+
+The `.resume` sidecar holds only what the ledger cannot express: which series is next in each pool's rotation, which have dropped out, and the checkpoints below. A missing or corrupt one starts every pool from the top rather than failing the channel.
 
 It also carries **checkpoints**: the pool state entering each generation that has not started airing. On startup the channel rewinds to the earliest of them, deletes the emitted files from that instant forward, and regenerates them from the current config — so a config or overlay edit reaches a pattern channel without waiting for its whole written window to play out, and without losing or repeating an item. Aired and currently-airing chunks are never touched.
 
 A pattern channel whose pools have all dropped out under `wrap = "drop"` is **exhausted**, not misconfigured: it resolves to an empty list, logs that it has nothing left to schedule, and idles until new content appears. Resolving to nothing when nothing has *ever* played is still a config error.
 
-The play-history ledger — the other half of the generation model — is still open (#70). This ships the resume map only.
+Both halves of the generation model are now in place: the resume map (#72) and the play-history ledger (#70). What remains open is what reads the ledger the *other* way — the taste scorers of #74 and #82.
 
 ### Future rules (designed for, not implemented)
 

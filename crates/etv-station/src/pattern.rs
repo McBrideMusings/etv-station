@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog::Catalog;
 use crate::config::{Advance, OnShort, PatternStep, Pool, Rotate, Select, Wrap};
-use crate::resume::{PoolResume, ResumeMap};
+use crate::resume::{GenerationState, PoolResume};
 
 /// Upper bound on an explicitly-authored `cycles`. A derived count needs no cap
 /// — it is bounded by the pools' own sizes.
@@ -207,18 +207,10 @@ impl PoolRuntime<'_> {
 
     /// This pool's state to persist for the next window.
     fn to_resume(&self) -> PoolResume {
-        let mut cursor = BTreeMap::new();
-        for s in &self.series {
-            // The cursor points at what plays *next*; the map stores what played
-            // *last*, so a set that grows or re-sorts still resolves correctly.
-            // A series sitting at index 0 has nothing behind it — either it has
-            // not started or it just wrapped — and is simply left out.
-            if s.cursor > 0
-                && let Some(id) = s.ids.get(s.cursor - 1)
-            {
-                cursor.insert(s.key.clone(), id.clone());
-            }
-        }
+        // Where each series left off is NOT recorded here — the play-history
+        // ledger already holds it, and the cursor this pool resumed from was a
+        // projection of that. Writing it a second time would be the duplicate
+        // store #70 exists to remove.
         PoolResume {
             // Only a round-robin pool has a meaningful "next": a random pool
             // draws afresh every visit.
@@ -228,7 +220,6 @@ impl PoolRuntime<'_> {
                     .map(|i| self.series[i].key.clone()),
                 Select::Random => None,
             },
-            cursor,
             dropped: self
                 .series
                 .iter()
@@ -280,20 +271,22 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// Resolve the pools and walk the pattern, returning the interleaved `entry_id`
 /// list and the resume state to persist for the next window.
 ///
-/// `resume_in` is consulted only by pools declaring `advance = "resume"`; a
+/// `state` is consulted only by pools declaring `advance = "resume"`; a
 /// `restart` pool ignores it entirely and replays from the top, which is what
-/// makes the stateless default genuinely stateless.
+/// makes the stateless default genuinely stateless. Its two halves come from
+/// two places on purpose: the rotation from the `.resume` sidecar, and each
+/// series' position from the play-history ledger (#70).
 pub fn build(
     catalog: &Catalog,
     pools: &[Pool],
     pattern: &[PatternStep],
     cycles: Option<usize>,
-    resume_in: &ResumeMap,
+    state: &GenerationState,
     seed: u64,
 ) -> Result<(Vec<String>, BTreeMap<String, PoolResume>), String> {
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
     for cfg in pools {
-        runtimes.push(resolve_pool(catalog, cfg, resume_in)?);
+        runtimes.push(resolve_pool(catalog, cfg, state)?);
     }
 
     let mut by_name: HashMap<&str, usize> = HashMap::new();
@@ -374,7 +367,7 @@ fn derive_cycles(
 fn resolve_pool<'a>(
     catalog: &Catalog,
     cfg: &'a Pool,
-    resume_in: &ResumeMap,
+    state: &GenerationState,
 ) -> Result<PoolRuntime<'a>, String> {
     let mut ids = catalog
         .resolve_query(&cfg.expr)
@@ -417,14 +410,14 @@ fn resolve_pool<'a>(
         rotation: 0,
     };
 
-    if cfg.advance == Advance::Resume
-        && let Some(prev) = resume_in.pool(&cfg.name)
-    {
+    if cfg.advance == Advance::Resume {
+        let prev = state.resume.pool(&cfg.name);
         for s in &mut rt.series {
-            // Continue *after* the last-played id. An id that has vanished from
-            // this series — deleted, re-identified, or filtered out — restarts
-            // that series and only that series.
-            if let Some(last) = prev.cursor.get(&s.key)
+            // Continue *after* the last-played id, read from the play-history
+            // ledger's projection (#70) rather than a cursor of our own. An id
+            // that has vanished from this series — deleted, re-identified, or
+            // filtered out — restarts that series and only that series.
+            if let Some(last) = state.cursor.get(&s.key)
                 && let Some(pos) = s.ids.iter().position(|id| id == last)
             {
                 s.cursor = pos + 1;
@@ -434,11 +427,14 @@ fn resolve_pool<'a>(
             }
             // A series recorded as dropped stays out — unless new content has
             // arrived, which `wrap = "drop"` defines as the way back in.
-            if cfg.wrap == Wrap::Drop && prev.dropped.contains(&s.key) {
-                s.dropped = s.cursor >= s.ids.len();
+            if cfg.wrap == Wrap::Drop
+                && prev.is_some_and(|p| p.dropped.contains(&s.key))
+                && s.cursor >= s.ids.len()
+            {
+                s.dropped = true;
             }
         }
-        if let Some(next) = &prev.next
+        if let Some(next) = prev.and_then(|p| p.next.as_ref())
             && let Some(pos) = rt.series.iter().position(|s| &s.key == next)
         {
             rt.rotation = pos;
@@ -453,6 +449,7 @@ mod tests {
     use super::*;
     use crate::catalog::{Entry as CatEntry, EntrySource, Source};
     use crate::config::Order;
+    use crate::resume::{PoolResume, ResumeMap};
 
     /// Two shows of deliberately different lengths plus three movies — the
     /// shape #81 (Sample S7) exercises: series that must each progress
@@ -526,19 +523,33 @@ mod tests {
         }
     }
 
+    /// Build once, returning the ids and the state a following window would be
+    /// handed: the pools' rotation from the resolver, and the cursor projected
+    /// from the airings just produced — which is what the daemon does with the
+    /// play-history ledger (#70).
     fn build_with(
         pools: Vec<Pool>,
         pattern: Vec<PatternStep>,
         cycles: Option<usize>,
-        resume_in: &ResumeMap,
+        state_in: &GenerationState,
         seed: u64,
-    ) -> (Vec<String>, ResumeMap) {
+    ) -> (Vec<String>, GenerationState) {
         let cat = catalog();
-        let (ids, pools) =
-            build(&cat, &pools, &pattern, cycles, resume_in, seed).expect("pattern builds");
-        let mut map = ResumeMap::new();
-        map.pools = pools;
-        (ids, map)
+        let (ids, pool_state) =
+            build(&cat, &pools, &pattern, cycles, state_in, seed).expect("pattern builds");
+
+        let mut resume = ResumeMap::new();
+        resume.pools = pool_state;
+
+        // Replay the airings into the cursor exactly as the ledger's projection
+        // would: last entry wins per series key.
+        let mut cursor = state_in.cursor.clone();
+        let show_ids = cat.show_ids_for(&ids).unwrap();
+        for id in &ids {
+            let key = show_ids.get(id).cloned().unwrap_or_else(|| id.clone());
+            cursor.insert(key, id.clone());
+        }
+        (ids, GenerationState { resume, cursor })
     }
 
     /// The headline acceptance criterion: `{movies take=1}, {shows take=3}`
@@ -549,7 +560,7 @@ mod tests {
             vec![movies_pool(), shows_pool()],
             vec![step("movies", 1), step("shows", 3)],
             Some(3),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(
@@ -571,7 +582,7 @@ mod tests {
             vec![movies_pool()],
             vec![step("movies", 1)],
             Some(5),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3", "mov-1", "mov-2"]);
@@ -586,7 +597,7 @@ mod tests {
             vec![movies_pool(), shows_pool()],
             vec![step("movies", 1), step("shows", 3)],
             None,
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(ids.len(), 12);
@@ -617,7 +628,7 @@ mod tests {
             pools(),
             vec![step("movies", 1), step("shows", 3)],
             Some(2),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(
@@ -653,7 +664,7 @@ mod tests {
             vec![shows_pool()],
             vec![step("shows", 3)],
             Some(1),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         let (again, _) = build_with(
@@ -673,16 +684,24 @@ mod tests {
         let mut p = shows_pool();
         p.advance = Advance::Resume;
         let mut resume = ResumeMap::new();
-        let mut pool = PoolResume {
-            next: Some("show:inv".into()),
-            ..Default::default()
+        resume.pools.insert(
+            "shows".into(),
+            PoolResume {
+                next: Some("show:inv".into()),
+                ..Default::default()
+            },
+        );
+        // The ledger remembers an airing whose entry has since left the
+        // catalog — the id no longer resolves to anything in got's series.
+        let state = GenerationState {
+            resume,
+            cursor: BTreeMap::from([
+                ("show:got".to_string(), "got-e99-deleted".to_string()),
+                ("show:inv".to_string(), "inv-e2".to_string()),
+            ]),
         };
-        pool.cursor
-            .insert("show:got".into(), "got-e99-deleted".into());
-        pool.cursor.insert("show:inv".into(), "inv-e2".into());
-        resume.pools.insert("shows".into(), pool);
 
-        let (ids, _) = build_with(vec![p], vec![step("shows", 2)], Some(2), &resume, 0);
+        let (ids, _) = build_with(vec![p], vec![step("shows", 2)], Some(2), &state, 0);
         // inv continues after e2; got — its cursor gone — starts over at e1.
         assert_eq!(ids, vec!["inv-e3", "got-e1", "got-e2", "got-e3"]);
     }
@@ -696,7 +715,7 @@ mod tests {
             vec![p],
             vec![step("shows", 2)],
             Some(3),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         // 3 episodes, drawn 2 at a time, looping: e1 e2 | e3 e1 | e2 e3.
@@ -717,7 +736,7 @@ mod tests {
             vec![p],
             vec![step("shows", 3)],
             Some(6),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         // got: e1-3, e4-6 then dropped. inv: e1-3 then dropped. Once both are
@@ -729,7 +748,7 @@ mod tests {
                 "got-e6",
             ]
         );
-        let pool = resume.pool("shows").unwrap();
+        let pool = resume.resume.pool("shows").unwrap();
         assert!(pool.dropped.contains(&"show:got".to_string()));
         assert!(pool.dropped.contains(&"show:inv".to_string()));
     }
@@ -746,7 +765,7 @@ mod tests {
             vec![p],
             vec![step("shows", 4)],
             Some(2),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         // got has 6: e1-4, then e5,e6 + 2 filled from inv. inv then continues
@@ -770,7 +789,7 @@ mod tests {
             vec![p],
             vec![step("shows", 4)],
             Some(1),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(ids, vec!["inv-e1", "inv-e2", "inv-e3", "inv-e1"]);
@@ -788,7 +807,7 @@ mod tests {
             vec![p],
             vec![step("shows", 10)],
             Some(1),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(ids.len(), 10, "a wrap-filled visit must still emit `take`");
@@ -806,7 +825,7 @@ mod tests {
             vec![p],
             vec![step("shows", 4)],
             Some(1),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(ids, vec!["inv-e1", "inv-e2", "inv-e3"]);
@@ -821,7 +840,7 @@ mod tests {
             vec![p],
             vec![step("shows", 4)],
             Some(1),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         );
         assert_eq!(ids, vec!["got-e1", "inv-e1", "got-e2", "inv-e2"]);
@@ -845,7 +864,7 @@ mod tests {
             vec![pool()],
             vec![step("shows", 3)],
             Some(2),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             7,
         );
         let (second, _) = build_with(vec![pool()], vec![step("shows", 3)], Some(2), &resume, 7);
@@ -878,14 +897,14 @@ mod tests {
             vec![pool()],
             vec![step("shows", 2)],
             Some(4),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             42,
         );
         let (b, _) = build_with(
             vec![pool()],
             vec![step("shows", 2)],
             Some(4),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             42,
         );
         assert_eq!(a, b);
@@ -909,14 +928,14 @@ mod tests {
             vec![movies_pool(), shows_pool()],
             pattern(),
             Some(10),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             99,
         );
         let (b, rb) = build_with(
             vec![movies_pool(), shows_pool()],
             pattern(),
             Some(10),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             99,
         );
         assert_eq!(a, b, "a pinned seed must reproduce the skip/fire sequence");
@@ -946,7 +965,7 @@ mod tests {
             &[movies_pool()],
             &[step("shows", 1)],
             Some(1),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         )
         .unwrap_err();
@@ -961,7 +980,7 @@ mod tests {
             &[movies_pool()],
             &[step("movies", 1)],
             Some(MAX_CYCLES + 1),
-            &ResumeMap::new(),
+            &GenerationState::empty(),
             0,
         )
         .unwrap_err();
@@ -975,7 +994,15 @@ mod tests {
         let mut p = movies_pool();
         p.expr = "item.type == \"nonesuch\"".into();
         let cat = catalog();
-        let (ids, _) = build(&cat, &[p], &[step("movies", 1)], None, &ResumeMap::new(), 0).unwrap();
+        let (ids, _) = build(
+            &cat,
+            &[p],
+            &[step("movies", 1)],
+            None,
+            &GenerationState::empty(),
+            0,
+        )
+        .unwrap();
         assert!(ids.is_empty());
     }
 }

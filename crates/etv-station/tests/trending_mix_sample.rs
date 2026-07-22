@@ -14,8 +14,10 @@ use std::path::Path;
 
 use etv_station::catalog::{Catalog, Collection, Entry, EntrySource, Source};
 use etv_station::config::{ChannelConfig, read_channel};
+use etv_station::history::{Ledger, PlayRecord};
 use etv_station::resolve::{resolve_channel, resolve_channel_with_resume};
-use etv_station::resume::ResumeMap;
+use etv_station::resume::{GenerationState, ResumeMap};
+use time::OffsetDateTime;
 
 /// A "Trending" collection holding two movies and two shows of deliberately
 /// unequal length — Game of Thrones with 8 episodes, Invincible with 3 — plus a
@@ -97,6 +99,37 @@ fn trending_catalog() -> Catalog {
         Some(("show:other", 1, 1)),
     );
     cat
+}
+
+/// Project the state the next window is handed, exactly as the daemon does:
+/// the pools' rotation from this resolve, plus the per-series cursor read back
+/// out of the play-history ledger these airings were recorded in (#70). The
+/// cursor is never carried directly — it only ever comes from the ledger.
+fn advance_state(
+    cat: &Catalog,
+    prev: &GenerationState,
+    resume: ResumeMap,
+    items: &[etv_station::resolve::ResolvedItem],
+) -> GenerationState {
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let show_ids = cat.show_ids_for(&ids).unwrap();
+    let mut ledger = Ledger::new();
+    ledger.extend(prev.cursor.iter().map(|(key, entry_id)| PlayRecord {
+        entry_id: entry_id.clone(),
+        show_id: Some(key.clone()),
+        start: OffsetDateTime::UNIX_EPOCH,
+        played_at: OffsetDateTime::UNIX_EPOCH,
+    }));
+    ledger.extend(ids.iter().map(|id| PlayRecord {
+        entry_id: id.clone(),
+        show_id: show_ids.get(id).cloned(),
+        start: OffsetDateTime::UNIX_EPOCH,
+        played_at: OffsetDateTime::UNIX_EPOCH,
+    }));
+    GenerationState {
+        resume,
+        cursor: ledger.series_cursor(),
+    }
 }
 
 fn sample_path() -> std::path::PathBuf {
@@ -187,13 +220,13 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
     let cat = trending_catalog();
     let cfg = config();
 
-    let (first, resume) = resolve_channel_with_resume(
+    let (first, next) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],
         None,
         Some(&cat),
-        &ResumeMap::new(),
+        &GenerationState::empty(),
     )
     .expect("first window");
     let first_ids = ids(&first);
@@ -211,31 +244,32 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
         got_first.len()
     );
 
-    // The resume map records where each show stopped, keyed by show_id — GoT
-    // mid-season, and the rotation position so the next window resumes with the
-    // right show. (A show that landed exactly on a wrap sits at position 0 and
-    // needs no cursor entry: "start from the beginning" is the absence of one.
-    // Invincible's continuation is asserted by the wrap test below.)
-    let pool = resume
+    // The sidecar records the rotation — whose turn is next — and nothing about
+    // where any series stopped.
+    let pool = next
         .pool("shows")
         .expect("the shows pool reports resume state");
-    let got_cursor = pool
-        .cursor
-        .get("show:got")
-        .expect("GoT must have its own resume point, keyed by show_id");
-    assert_eq!(
-        got_cursor,
-        got_first.last().unwrap().as_str(),
-        "the cursor stores the last-played episode id"
-    );
     assert!(
         pool.next.is_some(),
         "round-robin must record whose turn is next"
     );
 
-    // Window 2 is generated from window 1's resume_out — no live cursor.
+    // Where each show stopped comes from the play-history ledger, keyed by
+    // show_id — one record, projected, rather than a second copy in the sidecar.
+    let state = advance_state(&cat, &GenerationState::empty(), next, &first);
+    assert_eq!(
+        state.cursor.get("show:got").unwrap(),
+        got_first.last().unwrap().as_str(),
+        "the ledger's projection is GoT's last-played episode"
+    );
+    assert!(
+        state.cursor.contains_key("show:inv"),
+        "Invincible has its own entry, independent of GoT's"
+    );
+
+    // Window 2 is generated from that projection — no live cursor anywhere.
     let (second, _) =
-        resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &resume)
+        resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &state)
             .expect("second window");
     let second_ids = ids(&second);
 
@@ -274,17 +308,18 @@ fn trending_mix_sample_loops_the_shorter_show_without_disturbing_the_longer() {
     let cat = trending_catalog();
     let cfg = config();
 
-    let (first, resume) = resolve_channel_with_resume(
+    let (first, next) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],
         None,
         Some(&cat),
-        &ResumeMap::new(),
+        &GenerationState::empty(),
     )
     .unwrap();
+    let state = advance_state(&cat, &GenerationState::empty(), next, &first);
     let (second, _) =
-        resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &resume).unwrap();
+        resolve_channel_with_resume(&cfg, &sample_path(), &[], None, Some(&cat), &state).unwrap();
 
     let inv: Vec<u32> = ids(&first)
         .iter()

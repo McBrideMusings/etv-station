@@ -677,6 +677,26 @@ async fn pattern_channel_loop(
     }
     let mut resume = resume;
 
+    // The play-history ledger (#70) — the single record of what this channel
+    // has aired, and the thing each series' resume position is derived from.
+    // Loaded once here and carried across every tick, so a catch-up chaining
+    // many generations never re-reads it.
+    let (mut ledger, skipped) = crate::history::load(&channel.output_folder).await?;
+    if skipped > 0 {
+        tracing::warn!(
+            event = "history.partial",
+            channel = %channel.name,
+            skipped = skipped,
+            "skipped unparseable play-history lines; affected series resume from an earlier position",
+        );
+    }
+    tracing::info!(
+        event = "history.load",
+        channel = %channel.name,
+        airings = ledger.len(),
+        "loaded play history",
+    );
+
     // Startup: throw away the future this channel had already written and
     // generate it again from the config as it stands now.
     //
@@ -693,16 +713,31 @@ async fn pattern_channel_loop(
     let now = OffsetDateTime::now_utc();
     if let Some(regen_from) = resume.rewind_to_unaired(now) {
         let removed = wipe_playout_from(channel, regen_from).await?;
+        // Those airings are no longer scheduled, so they are no longer history.
+        // Because the resume position is a projection of the ledger, dropping
+        // them is also what rewinds each series — the two cannot disagree.
+        ledger.truncate_from(regen_from);
+        crate::history::save(&channel.output_folder, &mut ledger).await?;
         tracing::info!(
             event = "resume.rewind",
             channel = %channel.name,
             from = %regen_from,
             removed = removed,
+            airings = ledger.len(),
             "rewound to the earliest unaired generation; regenerating it from the current config",
         );
     }
 
-    resume = pattern_catch_up(channel, tz, source_roots, catalog, resume, "startup").await?;
+    resume = pattern_catch_up(
+        channel,
+        tz,
+        source_roots,
+        catalog,
+        resume,
+        &mut ledger,
+        "startup",
+    )
+    .await?;
 
     let mut interval = tokio::time::interval(channel.config.roll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -716,7 +751,7 @@ async fn pattern_channel_loop(
             }
             _ = interval.tick() => {
                 let tick = async {
-                    match pattern_catch_up(channel, tz, source_roots, catalog, resume.clone(), "roll").await {
+                    match pattern_catch_up(channel, tz, source_roots, catalog, resume.clone(), &mut ledger, "roll").await {
                         Ok(next) => resume = next,
                         Err(err) => tracing::error!(
                             event = "roll.error",
@@ -741,6 +776,7 @@ async fn pattern_catch_up(
     source_roots: &[String],
     catalog: Option<&SharedCatalog>,
     mut resume: crate::resume::ResumeMap,
+    ledger: &mut crate::history::Ledger,
     phase: &'static str,
 ) -> Result<crate::resume::ResumeMap, StationError> {
     let output = &channel.output_folder;
@@ -776,16 +812,32 @@ async fn pattern_catch_up(
         // still in the future.
         resume.checkpoint(from);
 
-        let (items, resume_out) = {
+        // Where each series left off comes from the ledger, not from a cursor
+        // of the sidecar's own (#70): one record, projected on demand.
+        let state = crate::resume::GenerationState {
+            resume: resume.clone(),
+            cursor: ledger.series_cursor(),
+        };
+
+        let (items, resume_out, show_ids) = {
             let guard = catalog.map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
-            crate::resolve::resolve_channel_with_resume(
+            let (items, resume_out) = crate::resolve::resolve_channel_with_resume(
                 &channel.config,
                 &channel.config_path,
                 source_roots,
                 catalog.map(|sc| &sc.path_index),
                 guard.as_deref(),
-                &resume,
-            )?
+                &state,
+            )?;
+            // The ledger needs each airing's show, and only the catalog knows
+            // it. One query for the whole generation, under the lock we already
+            // hold.
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            let show_ids = match guard.as_deref() {
+                Some(cat) => cat.show_ids_for(&ids)?,
+                None => HashMap::new(),
+            };
+            (items, resume_out, show_ids)
         };
 
         if items.is_empty() {
@@ -840,6 +892,28 @@ async fn pattern_catch_up(
         )
         .await?;
         log_emission(&channel.name, phase, &written, from, to);
+
+        // One ledger row per scheduled airing, in schedule order. The times are
+        // the same walk `Sequential` just emitted: items laid end to end from
+        // `from`, which is why the whole generation is emitted rather than
+        // clamped — a row must correspond to something actually on disk.
+        let mut airing = from;
+        let records: Vec<crate::history::PlayRecord> = items
+            .iter()
+            .zip(durations.iter())
+            .map(|(item, dur)| {
+                let start = airing;
+                airing += time::Duration::seconds_f64(dur.as_secs_f64());
+                crate::history::PlayRecord {
+                    entry_id: item.id.clone(),
+                    show_id: show_ids.get(&item.id).cloned(),
+                    start,
+                    played_at: now,
+                }
+            })
+            .collect();
+        ledger.extend(records);
+        crate::history::save(output, ledger).await?;
 
         // `resume_out` carries only pool state; the checkpoint trail is the
         // daemon's, so it rides across rather than being replaced.
