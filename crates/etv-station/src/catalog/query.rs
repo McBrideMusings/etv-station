@@ -193,7 +193,10 @@ fn comparison(
                 )));
             }
             params.push(literal_text(literal)?);
-            Ok(format!("entries.{col} {op} ?"))
+            // NULL-as-default (#103): a NULL string column reads as "" so `!= x`
+            // includes rows with no value (CEL "unset string field = default")
+            // and `== ""` matches them. Applies to every promoted string field.
+            Ok(format!("COALESCE(entries.{col}, '') {op} ?"))
         }
         FieldKind::Num(col) => {
             params.push(literal_int(literal)?);
@@ -229,18 +232,20 @@ fn in_list(
         // `x in []` is always false — a valid, matchless predicate.
         return Ok("0".to_string());
     }
-    let col = match kind {
+    let (col, coalesce) = match kind {
         FieldKind::Str(col) => {
             for el in &list.elements {
                 params.push(literal_text(el)?);
             }
-            col
+            // NULL-as-default (#103): a NULL string reads as "", matching `in`
+            // only when the list contains "" — consistent with `==`/`!=`.
+            (col, true)
         }
         FieldKind::Num(col) => {
             for el in &list.elements {
                 params.push(literal_int(el)?);
             }
-            col
+            (col, false)
         }
         _ => {
             return Err(err(format!(
@@ -249,7 +254,12 @@ fn in_list(
         }
     };
     let placeholders = vec!["?"; list.elements.len()].join(", ");
-    Ok(format!("entries.{col} IN ({placeholders})"))
+    let lhs = if coalesce {
+        format!("COALESCE(entries.{col}, '')")
+    } else {
+        format!("entries.{col}")
+    };
+    Ok(format!("{lhs} IN ({placeholders})"))
 }
 
 /// `item.<field>.contains|startsWith|matches(<literal>)`.
@@ -272,7 +282,9 @@ fn method_predicate(
                 params.push(literal_like(arg)?);
                 // Substring match — e.g. `item.title.contains("X")` → title LIKE %X%.
                 // `%`/`_` in the value are escaped so they match literally.
-                Ok(format!("entries.{col} LIKE '%' || ? || '%' ESCAPE '\\'"))
+                Ok(format!(
+                    "COALESCE(entries.{col}, '') LIKE '%' || ? || '%' ESCAPE '\\'"
+                ))
             }
             FieldKind::Tag(ns) => tag_exists(ns, arg, params),
             FieldKind::Collection => collection_exists(arg, params),
@@ -287,7 +299,7 @@ fn method_predicate(
                 )));
             };
             params.push(literal_like(arg)?);
-            Ok(format!("entries.{col} LIKE ? || '%' ESCAPE '\\'"))
+            Ok(format!("COALESCE(entries.{col}, '') LIKE ? || '%' ESCAPE '\\'"))
         }
         "matches" => {
             let FieldKind::Str(col) = kind else {
@@ -296,7 +308,7 @@ fn method_predicate(
                 )));
             };
             params.push(literal_text(arg)?);
-            Ok(format!("entries.{col} REGEXP ?"))
+            Ok(format!("COALESCE(entries.{col}, '') REGEXP ?"))
         }
         other => Err(err(format!("unsupported method .{other}() in query"))),
     }
@@ -615,5 +627,60 @@ mod tests {
             e.to_string().contains("item.<field>"),
             "expected field-access error, got {e}"
         );
+    }
+
+    /// NULL-as-default (#103): a NULL string column reads as "", so `!=` includes
+    /// no-value rows (the theatrical-edition case for Sample S3) and `== ""`
+    /// matches them, while `==`/`in` on a real value still exclude NULL.
+    #[test]
+    fn null_string_reads_as_empty_for_comparisons() {
+        let c = Catalog::open_in_memory().unwrap();
+        let mut ext = Entry::new("m:ext", "movie", "Film (Extended)", Source::Plex);
+        ext.edition = Some("Extended Edition".into());
+        c.upsert_entry(&ext).unwrap();
+        // Theatrical: `edition` defaults to None (NULL).
+        c.upsert_entry(&Entry::new("m:theat", "movie", "Film", Source::Plex))
+            .unwrap();
+
+        // `!=` INCLUDES the NULL (theatrical) row — the whole point of #103.
+        assert_eq!(
+            c.resolve_query(r#"item.edition != "Extended Edition""#).unwrap(),
+            vec!["m:theat".to_string()],
+        );
+        // `== ""` matches the NULL row.
+        assert_eq!(
+            c.resolve_query(r#"item.edition == """#).unwrap(),
+            vec!["m:theat".to_string()],
+        );
+        // `==` on a real value still excludes NULL.
+        assert_eq!(
+            c.resolve_query(r#"item.edition == "Extended Edition""#).unwrap(),
+            vec!["m:ext".to_string()],
+        );
+        // `in` treats NULL as "": excluded unless the list contains "".
+        assert_eq!(
+            c.resolve_query(r#"item.edition in ["Extended Edition"]"#).unwrap(),
+            vec!["m:ext".to_string()],
+        );
+        let mut both = c
+            .resolve_query(r#"item.edition in ["Extended Edition", ""]"#)
+            .unwrap();
+        both.sort();
+        assert_eq!(both, vec!["m:ext".to_string(), "m:theat".to_string()]);
+
+        // String METHODS read NULL as "" too, so `startsWith`/`contains` stay
+        // consistent with `!=`: a positive match excludes the NULL row, but its
+        // negation includes it (same as `!=`), and `contains("")` matches all.
+        assert_eq!(
+            c.resolve_query(r#"item.edition.startsWith("Extended")"#).unwrap(),
+            vec!["m:ext".to_string()],
+        );
+        assert_eq!(
+            c.resolve_query(r#"!item.edition.startsWith("Extended")"#).unwrap(),
+            vec!["m:theat".to_string()],
+        );
+        let mut all = c.resolve_query(r#"item.edition.contains("")"#).unwrap();
+        all.sort();
+        assert_eq!(all, vec!["m:ext".to_string(), "m:theat".to_string()]);
     }
 }

@@ -100,6 +100,10 @@ catalog and expands to the matching items.
   order: "release_date:asc"
 ```
 
+A string comparison treats a missing value as the empty string, so a film with
+no `edition` counts as theatrical: `item.edition != "Extended Edition"` matches
+it, and `item.edition == ""` selects exactly the no-edition items.
+
 ### `kind: include` — pull in another block file
 
 | Field | Required | Type / default |
