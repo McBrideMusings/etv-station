@@ -252,10 +252,21 @@ pub fn build(
     cycles: Option<usize>,
     state: &GenerationState,
     seed: u64,
+    score_env: crate::score::ScoreEnv<'_>,
 ) -> Result<(Vec<String>, BTreeMap<String, PoolResume>), String> {
+    // One cache for the whole generation: pools pointed at the same script
+    // share its compiled AST and its resolved query sets instead of each
+    // re-running every query the script declares.
+    let mut score_cache = crate::score::ScoreCache::default();
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
     for cfg in pools {
-        runtimes.push(resolve_pool(catalog, cfg, state)?);
+        runtimes.push(resolve_pool(
+            catalog,
+            cfg,
+            state,
+            score_env,
+            &mut score_cache,
+        )?);
     }
 
     let mut by_name: HashMap<&str, usize> = HashMap::new();
@@ -337,17 +348,39 @@ fn resolve_pool<'a>(
     catalog: &Catalog,
     cfg: &'a Pool,
     state: &GenerationState,
+    score_env: crate::score::ScoreEnv<'_>,
+    score_cache: &mut crate::score::ScoreCache,
 ) -> Result<PoolRuntime<'a>, String> {
-    let mut ids = catalog
-        .resolve_query(&cfg.expr)
-        .map_err(|e| e.to_string())?;
-    if let Some(order) = &cfg.order {
-        // Seed 0: a pool's internal `order` is its own stable sort. A shuffled
-        // pool is `select = "random"`, which is seeded per visit.
-        ids = catalog
-            .resolve_order(&ids, order, 0)
-            .map_err(|e| e.to_string())?;
-    }
+    // A pool draws its items from a CEL expression or from a scorer plugin,
+    // never both (validated at load). A plugin returns its set already ranked —
+    // gathering and ranking are the same judgment for a taste algorithm — so
+    // the `order` step below applies only to the expression case (ADR 0002).
+    let ids = match (&cfg.expr, &cfg.plugin) {
+        (Some(expr), None) => {
+            let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
+            if let Some(order) = &cfg.order {
+                // Seed 0: a pool's internal `order` is its own stable sort. A
+                // shuffled pool is `select = "random"`, seeded per visit.
+                ids = catalog
+                    .resolve_order(&ids, order, 0)
+                    .map_err(|e| e.to_string())?;
+            }
+            ids
+        }
+        (None, Some(plugin)) => {
+            let path = score_env.resolve_path(plugin);
+            crate::score::run(catalog, &path, score_env.inputs, &cfg.name, score_cache)
+                .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
+        }
+        // Both, or neither, is rejected at load; a pool that reaches here in
+        // either state is a validation gap, not a config the user can hit.
+        _ => {
+            return Err(format!(
+                "pool {:?} must set exactly one of `expr` or `plugin`",
+                cfg.name
+            ));
+        }
+    };
 
     // Group into series, preserving first-appearance order so the pool's
     // `order` fixes the rotation order too. One query for every `show_id` up
@@ -452,7 +485,8 @@ mod tests {
     fn movies_pool() -> Pool {
         Pool {
             name: "movies".into(),
-            expr: "item.type == \"movie\"".into(),
+            expr: Some("item.type == \"movie\"".into()),
+            plugin: None,
             order: Some(Order::parse("title:asc").unwrap()),
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
@@ -464,12 +498,23 @@ mod tests {
     fn shows_pool() -> Pool {
         Pool {
             name: "shows".into(),
-            expr: "item.type == \"episode\"".into(),
+            expr: Some("item.type == \"episode\"".into()),
+            plugin: None,
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
             on_short: OnShort::Next,
+        }
+    }
+
+    /// No pool in these tests draws from a plugin, so the inputs are empty and
+    /// the base dir never gets read — it only has to exist.
+    fn test_env() -> crate::score::ScoreEnv<'static> {
+        const EMPTY: &crate::score::ScoreInputs = &crate::score::ScoreInputs::new_empty();
+        crate::score::ScoreEnv {
+            inputs: EMPTY,
+            base_dir: std::path::Path::new("."),
         }
     }
 
@@ -493,8 +538,8 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = catalog();
-        let (ids, pool_state) =
-            build(&cat, &pools, &pattern, cycles, state_in, seed).expect("pattern builds");
+        let (ids, pool_state) = build(&cat, &pools, &pattern, cycles, state_in, seed, test_env())
+            .expect("pattern builds");
 
         let mut resume = ResumeMap::new();
         resume.pools = pool_state;
@@ -676,7 +721,7 @@ mod tests {
     #[test]
     fn wrap_loop_restarts_an_exhausted_show() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         let (ids, _) = build_with(
             vec![p],
             vec![step("shows", 2)],
@@ -748,7 +793,7 @@ mod tests {
     #[test]
     fn on_short_wrap_loops_the_same_show() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         p.on_short = OnShort::Wrap;
         let (ids, _) = build_with(
             vec![p],
@@ -766,7 +811,7 @@ mod tests {
     #[test]
     fn on_short_wrap_fills_a_take_far_larger_than_the_series() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         p.on_short = OnShort::Wrap;
         let (ids, _) = build_with(
             vec![p],
@@ -783,7 +828,7 @@ mod tests {
     #[test]
     fn on_short_short_emits_a_shorter_visit() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         p.on_short = OnShort::Short;
         let (ids, _) = build_with(
             vec![p],
@@ -931,6 +976,7 @@ mod tests {
             Some(1),
             &GenerationState::empty(),
             0,
+            test_env(),
         )
         .unwrap_err();
         assert!(err.contains("unknown pool"), "err = {err}");
@@ -946,6 +992,7 @@ mod tests {
             Some(MAX_CYCLES + 1),
             &GenerationState::empty(),
             0,
+            test_env(),
         )
         .unwrap_err();
         assert!(err.contains("maximum"), "err = {err}");
@@ -956,7 +1003,7 @@ mod tests {
     #[test]
     fn an_empty_pool_yields_nothing() {
         let mut p = movies_pool();
-        p.expr = "item.type == \"nonesuch\"".into();
+        p.expr = Some("item.type == \"nonesuch\"".into());
         let cat = catalog();
         let (ids, _) = build(
             &cat,
@@ -965,6 +1012,7 @@ mod tests {
             None,
             &GenerationState::empty(),
             0,
+            test_env(),
         )
         .unwrap();
         assert!(ids.is_empty());

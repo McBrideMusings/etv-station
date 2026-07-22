@@ -9,6 +9,8 @@
 //! Every knob defaults to the stateless, least-surprising behavior, so a pool
 //! that names only `expr` behaves like today's `query` entry.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use super::order::Order;
@@ -74,12 +76,33 @@ pub struct Pool {
     pub name: String,
 
     /// CEL expression resolved against the catalog, exactly like a `query`
-    /// entry.
-    pub expr: String,
+    /// entry. Mutually exclusive with [`Pool::plugin`]: a pool names one source
+    /// of items or the other, and validation rejects both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
+
+    /// A scorer plugin script that supplies this pool's items instead of a CEL
+    /// expression — it runs its own queries, ranks what it finds, and returns
+    /// the ordered set. Path is relative to the channel config's directory.
+    ///
+    /// It replaces `expr` rather than `order` because picking the candidates
+    /// and ranking them are the same judgment: a "For You" pool cannot be
+    /// written as a hand-authored expression plus a sort, since the expression
+    /// is the half the config author least knows how to write. See ADR 0002.
+    ///
+    /// Everything downstream — `select`, `rotate`, `advance`, `on_short`, and
+    /// the pattern's `take` — treats the returned list exactly like a
+    /// CEL-resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PathBuf>,
 
     /// Internal order of the pool's resolved set. Unset keeps the query's own
     /// order. This also fixes the series rotation order: series rotate in
     /// order of first appearance in the ordered set.
+    ///
+    /// Meaningless on a `plugin` pool — the plugin returns its set already
+    /// ranked, and re-sorting it would discard exactly the judgment the plugin
+    /// exists to make — so validation rejects the pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Order>,
 
@@ -133,6 +156,7 @@ expr: 'item.type == "episode"'
         let pool: Pool = serde_norway::from_str(yaml).unwrap();
         assert_eq!(pool.name, "shows");
         assert!(pool.order.is_none());
+        assert!(pool.plugin.is_none());
         // Every knob defaults to the stateless, least-surprising behavior.
         assert_eq!(pool.select, Select::RoundRobin);
         assert_eq!(pool.rotate, Rotate::Visit);

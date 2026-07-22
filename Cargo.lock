@@ -511,6 +511,7 @@ dependencies = [
  "humantime-serde",
  "nix",
  "regex",
+ "rhai",
  "rusqlite",
  "serde",
  "serde_json",

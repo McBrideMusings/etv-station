@@ -214,8 +214,10 @@ not, and are rejected by name at load rather than silently read as a field sort:
 - `collection` (#107) — a collection's authored sequence belongs to the
   (collection, item) pair, so it lives on
   [`kind: collection`](#kind-collection-play-a-catalog-collection-in-its-authored-order).
-- `score` (#108) — needed a scoring plugin. Scoring is unspecified; if a score
-  ever lands as a per-item column, sort on it directly (`score:desc`).
+- `score` (#108) — needed a scoring plugin. Scoring landed instead as
+  [a pool's `plugin`](#pool-plugin--items-chosen-by-a-scorer-script) (#74):
+  picking the candidates and ranking them turned out to be the same judgment,
+  so it replaces a pool's `expr`, not its `order`.
 
 A bare field name defaults to ascending. Examples: `release_date:asc`,
 `season:asc,episode:asc`, `year:desc`. Invalid directions are rejected at load.
@@ -358,6 +360,74 @@ reference and an equivalent inline block resolve identically. `mode`, `order`,
 and `filter` are **composition fields on the include** — they never live in the
 block file body.
 
+### Pool `plugin` — items chosen by a scorer script
+
+A pool normally names an `expr`, a CEL expression the catalog resolves. It can
+instead name a `plugin`: a Rhai script that runs its own queries, ranks what it
+finds, and returns the ordered set. The two are mutually exclusive — a pool that
+sets both, or neither, fails at load.
+
+```yaml
+pools:
+  - name: foryou
+    plugin: "../plugins/taste-engine.rhai"
+    select: round_robin
+    advance: resume
+```
+
+Everything else about the pool is unchanged: `select`, `rotate`, `advance`,
+`on_short`, and the pattern's `take` treat the returned list exactly as they
+treat a CEL-resolved one. There is no `order` on a plugin pool — the script
+returns its set already ranked, and sorting it again would discard the ranking,
+so the pair is rejected at load.
+
+The script defines two functions:
+
+```rhai
+// Every catalog query this plugin reads, named. Run once, up front, so a
+// malformed expression fails before any ranking work.
+fn sources() {
+    #{ movies: `item.type == "movie"` }
+}
+
+// Returns entry_ids, most-wanted first.
+fn pick(ctx) { … }
+```
+
+`ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
+`entries` plus genres / cast / labels / … as arrays), `ctx.pool` (the name of
+the pool asking, so one script can serve several pools of a channel — a
+`movies` pool and a `shows` pool ranked by the same taste), `ctx.target_count` (how
+many items the generation needs), `ctx.history` (recent server-wide watch
+events, `#{entry_id, watched_at}`), `ctx.recent` (what this channel aired most
+recently, oldest first), and `ctx.now` (unix seconds at generation time).
+
+The station computes no score of its own — it supplies those inputs and takes
+back an ordered list, so swapping one script for another changes nothing in
+etv-station. Why this rides on `expr` rather than on `order` is
+[ADR 0002](./adr/0002-scorer-plugin-replaces-a-pool-expr.md).
+
+A `plugin:` path is relative to the **channel config file's** directory, the
+same as a `block:` include — never to wherever the daemon was launched from.
+Absolute paths are used as written.
+
+Two knobs sit on the channel, under `scoring:`, both optional:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. |
+| `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
+
+`target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
+window — a generation lays the returned list end-to-end, so a hint covering 30
+days would push a single generation to materialize the whole month at once.
+
+Watch history comes from Tautulli, configured by the `TAUTULLI_URL` and
+`TAUTULLI_API_KEY` environment variables and never by tracked config. When
+either is unset or Tautulli is unreachable, `ctx.history` arrives empty and the
+generation proceeds — a script still has release dates, tags, and `ctx.recent`
+to rank on, so an outage degrades the ranking rather than stopping the channel.
+
 ## Sample configs
 
 The committed samples under `examples/` are authored in YAML:
@@ -368,6 +438,8 @@ The committed samples under `examples/` are authored in YAML:
 | Test channel (three lavfi items) | `examples/channels/lavfi-test.yaml` |
 | The Lord of the Rings (query channel) | `examples/samples/lotr.yaml` |
 | Trending Mix (pools + pattern interleave) | `examples/samples/trending-mix.yaml` |
+| For You (taste-scored via a plugin) | `examples/samples/foryou.yaml` |
+| Worked example scorer plugin | `examples/plugins/taste-engine.rhai` |
 | Star Wars timeline block (8 items, manual order) | `examples/blocks/starwars-timeline.yaml` |
 | Die Hard block (1 item) | `examples/blocks/diehard.yaml` |
 

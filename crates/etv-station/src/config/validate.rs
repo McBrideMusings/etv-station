@@ -245,8 +245,45 @@ fn validate_pattern_block<'a>(
         if pool.name.trim().is_empty() {
             return Err(bad("a pool has an empty name".into()));
         }
-        if pool.expr.trim().is_empty() {
-            return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
+        // A pool names exactly one source of items. Both is ambiguous about
+        // which one wins; neither leaves the pool with nothing to resolve.
+        match (&pool.expr, &pool.plugin) {
+            (Some(expr), None) => {
+                if expr.trim().is_empty() {
+                    return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
+                }
+            }
+            (None, Some(plugin)) => {
+                if plugin.as_os_str().is_empty() {
+                    return Err(bad(format!(
+                        "pool {:?} has an empty plugin path",
+                        pool.name
+                    )));
+                }
+                // The plugin returns its set already ranked; a re-sort would
+                // discard the ranking it exists to produce.
+                if pool.order.is_some() {
+                    return Err(bad(format!(
+                        "pool {:?} sets both `plugin` and `order` — a plugin returns its \
+                         set already ranked, so ordering it again would discard the \
+                         ranking; drop `order`",
+                        pool.name
+                    )));
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err(bad(format!(
+                    "pool {:?} sets both `expr` and `plugin` — a pool draws its items \
+                     from one or the other",
+                    pool.name
+                )));
+            }
+            (None, None) => {
+                return Err(bad(format!(
+                    "pool {:?} sets neither `expr` nor `plugin` — it has no items to draw",
+                    pool.name
+                )));
+            }
         }
         if !pool_names.insert(pool.name.as_str()) {
             return Err(bad(format!(
@@ -323,7 +360,8 @@ mod tests {
     fn pool(name: &str) -> Pool {
         Pool {
             name: name.into(),
-            expr: format!("item.type == \"{name}\""),
+            expr: Some(format!("item.type == \"{name}\"")),
+            plugin: None,
             order: None,
             select: Select::default(),
             rotate: Rotate::default(),
@@ -349,6 +387,7 @@ mod tests {
 
     fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            scoring: None,
             name: None,
             window_days: 1,
             chunk_hours: 24,

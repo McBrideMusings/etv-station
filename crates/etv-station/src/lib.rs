@@ -13,4 +13,6 @@ pub mod resolve;
 pub mod resume;
 pub mod rule;
 pub mod scan;
+pub mod score;
+pub mod tautulli;
 pub mod tz;

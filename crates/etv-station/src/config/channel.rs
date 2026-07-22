@@ -51,6 +51,13 @@ pub struct ChannelConfig {
     )]
     pub anchor: Option<time::OffsetDateTime>,
 
+    /// Tuning for pools that draw from a scorer plugin (#74). Absent on every
+    /// channel that uses none, which is why it is optional rather than a
+    /// defaulted struct — an unused knob in a config file invites tuning that
+    /// does nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring: Option<ScoringConfig>,
+
     pub rule: RuleConfig,
 
     /// Optional live overlay. When set, the station daemon supervises an
@@ -96,6 +103,42 @@ pub struct ChannelOverlayConfig {
     /// defaults to `{output_folder}/overlay.fifo`.
     #[serde(default)]
     pub fifo_path: Option<PathBuf>,
+}
+
+/// What a scorer plugin is told about, per channel.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScoringConfig {
+    /// How many recently-aired entries the plugin sees in `ctx.recent`. This is
+    /// the window a script suppresses repeats over, so it belongs to the
+    /// channel's taste, not to the daemon: a channel with a deep library wants
+    /// a long memory, a narrow one would starve on the same setting.
+    #[serde(default = "default_recent_depth")]
+    pub recent_depth: usize,
+
+    /// Nominal seconds per item, used only to turn a generation's span into the
+    /// `ctx.target_count` hint. A channel of half-hour episodes and one of
+    /// three-hour films need very different numbers to ask for a sensible
+    /// amount.
+    #[serde(default = "default_nominal_item_secs")]
+    pub nominal_item_secs: u32,
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        Self {
+            recent_depth: default_recent_depth(),
+            nominal_item_secs: default_nominal_item_secs(),
+        }
+    }
+}
+
+fn default_recent_depth() -> usize {
+    200
+}
+
+fn default_nominal_item_secs() -> u32 {
+    1800
 }
 
 fn default_window_days() -> u32 {
