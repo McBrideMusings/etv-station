@@ -1,0 +1,30 @@
+# Sample S5 — Trending: shuffle a collection, play all, reshuffle, repeat.
+#
+# A *query* channel that treats a Plex collection as a SET, not an order: it
+# resolves every member of the "Trending" collection (membership EXISTS —
+# `collection_items.position` is ignored here), collapses any accidental
+# duplicate, then shuffles. `order: "random"` with NO `seed` draws fresh entropy
+# each generation, so every loop feels fresh; pin a `seed` to reproduce a
+# shuffle. Contrast with Sample S6 (Marathon), which reads the SAME collection
+# structure for its authored `position` (collections-as-order).
+#
+# Not registered in examples/station.yaml: a query channel needs a populated
+# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# proven by the `trending_shuffle_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+# no seed → a fresh shuffle each generation
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "random"
+      duplicates: "collapse"
+      program:
+        title: "Trending"
+        categories: ["Movie"]
+      entries:
+        - kind: query
+          query: 'item.collections.contains("Trending")'
