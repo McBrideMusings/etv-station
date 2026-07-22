@@ -1,0 +1,49 @@
+# Sample S4 — Dragon Ball, full chronological order.
+#
+# The hardest authored-order case: a *manual*-order block whose entries mix
+# `query` (resolved against the catalog) and an inline `item`, woven into one
+# curated watch order. The block plays the ENTRIES in authored order; each
+# `query` entry carries its OWN `order`, sorting its resolved episodes internally
+# before they take their place in the sequence:
+#
+#   eps 1–13  (absolute_episode:asc)  →  a movie  →  eps 14–28  (absolute_episode:asc)
+#
+# `absolute_episode` is the anime-friendly franchise-wide number (Plex
+# `absoluteIndex`, promoted by the ingester — #47). A Western show with no
+# absolute numbering uses `season`/`episode` with a compound sort instead
+# (`order: "season:asc,episode:asc"`) — the same per-entry order mechanism.
+#
+# Not registered in examples/station.yaml: a query channel needs a populated
+# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# proven by the `dragonball_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "manual"
+      program:
+        title: "Dragon Ball: Chronological"
+        categories: ["Series", "Anime"]
+      entries:
+        # First TV arc, in franchise-episode order.
+        - kind: query
+          query: 'item.show == "Dragon Ball" && item.absolute_episode >= 1 && item.absolute_episode <= 13'
+          order: "absolute_episode:asc"
+
+        # A film slotted into the timeline between the arcs — inline, by hand.
+        - kind: item
+          source:
+            kind: local
+            path: "${ETV_TEST_MEDIA_DIR}/anime/Dragon Ball - Curse of the Blood Rubies (1986) {imdb-tt0142255}/Dragon.Ball.Curse.of.the.Blood.Rubies.1986.1080p.mkv"
+          program:
+            title: "Dragon Ball: Curse of the Blood Rubies"
+            year: 1986
+
+        # Second TV arc, continuing the franchise-episode order.
+        - kind: query
+          query: 'item.show == "Dragon Ball" && item.absolute_episode >= 14 && item.absolute_episode <= 28'
+          order: "absolute_episode:asc"
