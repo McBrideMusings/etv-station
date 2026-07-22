@@ -120,6 +120,7 @@ fn advance_state(
         resume,
         cursor: ledger.series_cursor(),
         tail: ledger.tail(etv_station::constrain::SEAM_TAIL),
+        ..Default::default()
     }
 }
 

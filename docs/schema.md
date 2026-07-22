@@ -358,6 +358,57 @@ reference and an equivalent inline block resolve identically. `mode`, `order`,
 and `filter` are **composition fields on the include** — they never live in the
 block file body.
 
+### Pool `plugin` — items chosen by a scorer script
+
+A pool normally names an `expr`, a CEL expression the catalog resolves. It can
+instead name a `plugin`: a Rhai script that runs its own queries, ranks what it
+finds, and returns the ordered set. The two are mutually exclusive — a pool that
+sets both, or neither, fails at load.
+
+```yaml
+pools:
+  - name: foryou
+    plugin: "../plugins/taste-engine.rhai"
+    select: round_robin
+    advance: resume
+```
+
+Everything else about the pool is unchanged: `select`, `rotate`, `advance`,
+`on_short`, and the pattern's `take` treat the returned list exactly as they
+treat a CEL-resolved one. There is no `order` on a plugin pool — the script
+returns its set already ranked, and sorting it again would discard the ranking,
+so the pair is rejected at load.
+
+The script defines two functions:
+
+```rhai
+// Every catalog query this plugin reads, named. Run once, up front, so a
+// malformed expression fails before any ranking work.
+fn sources() {
+    #{ movies: `item.type == "movie"` }
+}
+
+// Returns entry_ids, most-wanted first.
+fn pick(ctx) { … }
+```
+
+`ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
+`entries` plus genres / cast / labels / … as arrays), `ctx.target_count` (how
+many items the generation needs), `ctx.history` (recent server-wide watch
+events, `#{entry_id, watched_at}`), `ctx.recent` (what this channel aired most
+recently, oldest first), and `ctx.now` (unix seconds at generation time).
+
+The station computes no score of its own — it supplies those inputs and takes
+back an ordered list, so swapping one script for another changes nothing in
+etv-station. Why this rides on `expr` rather than on `order` is
+[ADR 0002](./adr/0002-scorer-plugin-replaces-a-pool-expr.md).
+
+Watch history comes from Tautulli, configured by the `TAUTULLI_URL` and
+`TAUTULLI_API_KEY` environment variables and never by tracked config. When
+either is unset or Tautulli is unreachable, `ctx.history` arrives empty and the
+generation proceeds — a script still has release dates, tags, and `ctx.recent`
+to rank on, so an outage degrades the ranking rather than stopping the channel.
+
 ## Sample configs
 
 The committed samples under `examples/` are authored in YAML:

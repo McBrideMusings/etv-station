@@ -338,16 +338,33 @@ fn resolve_pool<'a>(
     cfg: &'a Pool,
     state: &GenerationState,
 ) -> Result<PoolRuntime<'a>, String> {
-    let mut ids = catalog
-        .resolve_query(&cfg.expr)
-        .map_err(|e| e.to_string())?;
-    if let Some(order) = &cfg.order {
-        // Seed 0: a pool's internal `order` is its own stable sort. A shuffled
-        // pool is `select = "random"`, which is seeded per visit.
-        ids = catalog
-            .resolve_order(&ids, order, 0)
-            .map_err(|e| e.to_string())?;
-    }
+    // A pool draws its items from a CEL expression or from a scorer plugin,
+    // never both (validated at load). A plugin returns its set already ranked —
+    // gathering and ranking are the same judgment for a taste algorithm — so
+    // the `order` step below applies only to the expression case (ADR 0002).
+    let ids = match (&cfg.expr, &cfg.plugin) {
+        (Some(expr), None) => {
+            let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
+            if let Some(order) = &cfg.order {
+                // Seed 0: a pool's internal `order` is its own stable sort. A
+                // shuffled pool is `select = "random"`, seeded per visit.
+                ids = catalog
+                    .resolve_order(&ids, order, 0)
+                    .map_err(|e| e.to_string())?;
+            }
+            ids
+        }
+        (None, Some(plugin)) => crate::score::run(catalog, plugin, &state.scoring)
+            .map_err(|m| format!("pool {:?}: {m}", cfg.name))?,
+        // Both, or neither, is rejected at load; a pool that reaches here in
+        // either state is a validation gap, not a config the user can hit.
+        _ => {
+            return Err(format!(
+                "pool {:?} must set exactly one of `expr` or `plugin`",
+                cfg.name
+            ));
+        }
+    };
 
     // Group into series, preserving first-appearance order so the pool's
     // `order` fixes the rotation order too. One query for every `show_id` up
@@ -452,7 +469,8 @@ mod tests {
     fn movies_pool() -> Pool {
         Pool {
             name: "movies".into(),
-            expr: "item.type == \"movie\"".into(),
+            expr: Some("item.type == \"movie\"".into()),
+            plugin: None,
             order: Some(Order::parse("title:asc").unwrap()),
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
@@ -464,7 +482,8 @@ mod tests {
     fn shows_pool() -> Pool {
         Pool {
             name: "shows".into(),
-            expr: "item.type == \"episode\"".into(),
+            expr: Some("item.type == \"episode\"".into()),
+            plugin: None,
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
@@ -514,6 +533,7 @@ mod tests {
                 resume,
                 cursor,
                 tail,
+                ..Default::default()
             },
         )
     }
@@ -665,6 +685,7 @@ mod tests {
                 ("show:got".to_string(), "got-e99-deleted".to_string()),
                 ("show:inv".to_string(), "inv-e2".to_string()),
             ]),
+            ..Default::default()
         };
 
         let (ids, _) = build_with(vec![p], vec![step("shows", 2)], Some(2), &state, 0);
@@ -676,7 +697,7 @@ mod tests {
     #[test]
     fn wrap_loop_restarts_an_exhausted_show() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         let (ids, _) = build_with(
             vec![p],
             vec![step("shows", 2)],
@@ -748,7 +769,7 @@ mod tests {
     #[test]
     fn on_short_wrap_loops_the_same_show() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         p.on_short = OnShort::Wrap;
         let (ids, _) = build_with(
             vec![p],
@@ -766,7 +787,7 @@ mod tests {
     #[test]
     fn on_short_wrap_fills_a_take_far_larger_than_the_series() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         p.on_short = OnShort::Wrap;
         let (ids, _) = build_with(
             vec![p],
@@ -783,7 +804,7 @@ mod tests {
     #[test]
     fn on_short_short_emits_a_shorter_visit() {
         let mut p = shows_pool();
-        p.expr = "item.show == \"inv\"".into();
+        p.expr = Some("item.show == \"inv\"".into());
         p.on_short = OnShort::Short;
         let (ids, _) = build_with(
             vec![p],
@@ -956,7 +977,7 @@ mod tests {
     #[test]
     fn an_empty_pool_yields_nothing() {
         let mut p = movies_pool();
-        p.expr = "item.type == \"nonesuch\"".into();
+        p.expr = Some("item.type == \"nonesuch\"".into());
         let cat = catalog();
         let (ids, _) = build(
             &cat,

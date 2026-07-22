@@ -1243,7 +1243,8 @@ mod tests {
         inc.pools = vec![
             Pool {
                 name: "movies".into(),
-                expr: "item.type == \"movie\"".into(),
+                expr: Some("item.type == \"movie\"".into()),
+                plugin: None,
                 order: Some(Order::parse("title:asc").unwrap()),
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
@@ -1252,7 +1253,8 @@ mod tests {
             },
             Pool {
                 name: "shows".into(),
-                expr: "item.type == \"episode\"".into(),
+                expr: Some("item.type == \"episode\"".into()),
+                plugin: None,
                 order: Some(Order::parse("season:asc,episode:asc").unwrap()),
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
@@ -1310,6 +1312,7 @@ mod tests {
             resume,
             cursor: ledger.series_cursor(),
             tail: ledger.tail(crate::constrain::SEAM_TAIL),
+            ..Default::default()
         }
     }
 
@@ -1439,7 +1442,7 @@ mod tests {
         let mut narrowed = interleave_block(crate::config::Advance::Resume);
         for pool in &mut narrowed.pools {
             if pool.name == "shows" {
-                pool.expr = "item.show == \"inv\"".into();
+                pool.expr = Some("item.show == \"inv\"".into());
             }
         }
         let narrowed_cfg = channel(vec![narrowed]);
@@ -1574,7 +1577,7 @@ mod tests {
         let cat = interleave_catalog();
         let mut inc = interleave_block(crate::config::Advance::Resume);
         for pool in &mut inc.pools {
-            pool.expr = "item.type == \"nonesuch\"".into();
+            pool.expr = Some("item.type == \"nonesuch\"".into());
         }
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
         assert!(format!("{err}").contains("zero items"), "err = {err}");

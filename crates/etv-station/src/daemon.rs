@@ -633,6 +633,28 @@ async fn forward_channel_loop(
 
 /// Generate and emit forward until the window through `now + window_days` is
 /// covered, chaining one generation into the next through the resume map.
+/// How much of the recently-aired tail a scorer plugin sees. Deeper than the
+/// adjacency seam, which only needs the last few items: a scorer suppressing
+/// repeats wants a window, not a neighbour.
+const RECENT_AIRED: usize = 200;
+
+/// Nominal item length used only to turn a generation's span into an item
+/// count. Deliberately crude — the number is a hint to a scorer plugin about
+/// how much to return, and overshooting costs nothing because the pattern
+/// simply never reaches the tail of an over-long list.
+const NOMINAL_ITEM_SECS: i64 = 1800;
+
+/// Hint a scorer plugin about how many items this generation needs.
+///
+/// Clamped at both ends: at least one item, so a nearly-covered window still
+/// asks for something rather than handing a plugin a target of zero; and
+/// capped, so a long window cannot ask a plugin to rank the entire library.
+fn target_count(from: OffsetDateTime, target: OffsetDateTime) -> usize {
+    const MAX: i64 = 500;
+    let span = (target - from).whole_seconds().max(0);
+    span.div_euclid(NOMINAL_ITEM_SECS).clamp(1, MAX) as usize
+}
+
 /// Returns the map to carry into the next tick.
 async fn pattern_catch_up(
     channel: &LoadedChannel,
@@ -655,6 +677,25 @@ async fn pattern_catch_up(
     // timeline stays gapless across the seam.
     let existing = scan::scan_output_folder(output).await?;
     let mut from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+
+    // Watch history is read once per tick, not once per generation: a catch-up
+    // chains many generations in a row and they all share the same "what has
+    // been watched lately". Empty when Tautulli is unset or unreachable, which
+    // degrades a scorer's ranking rather than failing the tick (#74).
+    // The HTTP half runs on a blocking thread — `ureq` is synchronous and would
+    // otherwise stall this runtime worker for the request timeout, exactly as
+    // the Plex ingest above avoids. The catalog join is local work and stays
+    // here, where the mutex is already reachable.
+    let history = match catalog {
+        Some(sc) => {
+            let rows = tokio::task::spawn_blocking(crate::tautulli::fetch_rows_from_env)
+                .await
+                .unwrap_or_default();
+            let guard = sc.catalog.lock().unwrap_or_else(|e| e.into_inner());
+            crate::tautulli::join(&guard, rows)
+        }
+        None => Vec::new(),
+    };
 
     let mut generations = 0;
     while from < target {
@@ -682,6 +723,12 @@ async fn pattern_catch_up(
             resume: resume.clone(),
             cursor: ledger.series_cursor(),
             tail: ledger.tail(crate::constrain::SEAM_TAIL),
+            scoring: crate::score::ScoreInputs {
+                target_count: target_count(from, target),
+                history: history.clone(),
+                recent: ledger.tail(RECENT_AIRED),
+                now: now.unix_timestamp(),
+            },
         };
 
         let (items, resume_out, show_ids) = {
