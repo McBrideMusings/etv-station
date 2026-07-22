@@ -333,7 +333,8 @@ The committed samples under `examples/` are authored in YAML:
 |---|---|
 | Station manifest | `examples/station.yaml` |
 | Test channel (three lavfi items) | `examples/channels/lavfi-test.yaml` |
-| The Lord of the Rings (query channel) | `examples/channels/lotr.yaml` |
+| The Lord of the Rings (query channel) | `examples/samples/lotr.yaml` |
+| Trending Mix (pools + pattern interleave) | `examples/samples/trending-mix.yaml` |
 | Star Wars timeline block (8 items, manual order) | `examples/blocks/starwars-timeline.yaml` |
 | Die Hard block (1 item) | `examples/blocks/diehard.yaml` |
 

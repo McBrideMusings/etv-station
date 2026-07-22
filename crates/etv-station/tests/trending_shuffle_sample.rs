@@ -1,5 +1,5 @@
 //! Acceptance test for Sample S5 (#79): the committed
-//! `examples/channels/trending-shuffle.yaml` query channel resolves every member
+//! `examples/samples/trending-shuffle.yaml` query channel resolves every member
 //! of the "Trending" collection (membership EXISTS, position ignored), excludes
 //! non-members, and shuffles — a fresh shuffle when unseeded, a reproducible one
 //! when a `seed` is pinned. Proves collections-as-set + the resolve→collapse→
@@ -45,7 +45,7 @@ fn trending_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/trending-shuffle.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/trending-shuffle.yaml")
 }
 
 /// Every member of the collection plays; the non-member is excluded. Order is

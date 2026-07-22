@@ -13,8 +13,9 @@
 # absolute numbering uses `season`/`episode` with a compound sort instead
 # (`order: "season:asc,episode:asc"`) — the same per-entry order mechanism.
 #
-# Not registered in examples/station.yaml: a query channel needs a populated
-# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# Lives in examples/samples/, not examples/channels/, so the dev station never
+# registers it: a query channel needs a populated catalog + the daemon-side
+# catalog wiring (#96) to run live. Its resolution is
 # proven by the `dragonball_sample` acceptance test.
 window_days: 1
 chunk_hours: 6

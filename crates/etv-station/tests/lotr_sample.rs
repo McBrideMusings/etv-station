@@ -1,4 +1,4 @@
-//! Acceptance test for Sample S2 (#76): the committed `examples/channels/lotr.yaml`
+//! Acceptance test for Sample S2 (#76): the committed `examples/samples/lotr.yaml`
 //! query channel resolves the LOTR films and plays them oldest-first by release
 //! date, deterministically. Proves the query (#68) + order (#69) + resolve
 //! pipeline (#71) path end-to-end against a fixture catalog — no live Plex.
@@ -49,7 +49,7 @@ fn lotr_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/lotr.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/lotr.yaml")
 }
 
 #[test]

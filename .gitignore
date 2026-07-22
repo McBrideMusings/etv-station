@@ -16,16 +16,18 @@ examples/etv-next/channel*.json
 examples/etv-next/presentation.json
 examples/output/
 tools/__pycache__/
-# Personal example configs: track only the committed sample fixtures and
-# ignore everything else, so renaming or adding a personal file can't silently
-# leak it into the repo (an exact-name ignore breaks the moment the file moves).
+# examples/channels/ holds the channels the dev station actually RUNS, and
+# examples/station.yaml globs it. Personal channels live here and are ignored;
+# only the runnable committed one is tracked. Ignore-then-negate rather than
+# naming personal files, so renaming or adding one can't silently leak it into
+# the repo (an exact-name ignore breaks the moment the file moves).
+#
+# Worked sample channels live in examples/samples/ instead — they are test
+# fixtures, not station channels. Most are query channels that need a populated
+# catalog, so registering them with the dev station would fail it at startup.
+# They are tracked wholesale; nothing personal belongs there.
 examples/channels/*
 !examples/channels/lavfi-test.yaml
-!examples/channels/lotr.yaml
-!examples/channels/dragonball.yaml
-!examples/channels/trending-shuffle.yaml
-!examples/channels/ghibli.yaml
-!examples/channels/lotr-theatrical.yaml
 examples/blocks/
 examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml

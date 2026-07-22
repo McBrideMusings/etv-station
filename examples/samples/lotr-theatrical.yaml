@@ -7,8 +7,9 @@
 # the extended ones — which a title-substring hack (`!title.contains("Extended")`)
 # can't do reliably. Plays oldest-first by release date.
 #
-# Not registered in examples/station.yaml: a query channel needs a populated
-# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# Lives in examples/samples/, not examples/channels/, so the dev station never
+# registers it: a query channel needs a populated catalog + the daemon-side
+# catalog wiring (#96) to run live. Its resolution is
 # proven by the `lotr_theatrical_sample` acceptance test.
 window_days: 1
 chunk_hours: 6
