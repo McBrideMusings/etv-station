@@ -63,6 +63,14 @@ pub struct PlexItem {
     pub studio: Option<String>,
     pub duration_ms: Option<i64>,
     pub genres: Vec<String>,
+    /// Namespaced person/label tags: Plex `Label`, `Role` (cast), `Director`,
+    /// `Writer`, `Producer`, `Country`.
+    pub labels: Vec<String>,
+    pub cast: Vec<String>,
+    pub directors: Vec<String>,
+    pub writers: Vec<String>,
+    pub producers: Vec<String>,
+    pub countries: Vec<String>,
 }
 
 /// What one ingest pass touched.
@@ -147,8 +155,18 @@ pub fn ingest_items(
             last_seen: now.clone(),
         })?;
 
-        for genre in &item.genres {
-            catalog.add_tag(&entry_id, TagNs::Genre, genre)?;
+        for (ns, values) in [
+            (TagNs::Genre, &item.genres),
+            (TagNs::Label, &item.labels),
+            (TagNs::Cast, &item.cast),
+            (TagNs::Director, &item.directors),
+            (TagNs::Writer, &item.writers),
+            (TagNs::Producer, &item.producers),
+            (TagNs::Country, &item.countries),
+        ] {
+            for value in values {
+                catalog.add_tag(&entry_id, ns, value)?;
+            }
         }
         stats.sources_written += 1;
     }
@@ -245,8 +263,20 @@ fn to_plex_item(m: &PlexMetadata, translate: impl Fn(&str) -> String) -> Option<
         studio: m.studio.as_deref().and_then(non_empty).map(str::to_string),
         // Plex `duration` is already milliseconds.
         duration_ms: m.duration,
-        genres: m.genre.iter().filter_map(|g| g.tag.clone()).collect(),
+        genres: tagged(&m.genre),
+        labels: tagged(&m.label),
+        cast: tagged(&m.role),
+        directors: tagged(&m.director),
+        writers: tagged(&m.writer),
+        producers: tagged(&m.producer),
+        countries: tagged(&m.country),
     })
+}
+
+/// Collect the non-empty `tag` strings from a Plex tagged-field array
+/// (`Genre`/`Label`/`Role`/…).
+fn tagged(fields: &[TaggedField]) -> Vec<String> {
+    fields.iter().filter_map(|f| f.tag.clone()).collect()
 }
 
 // ---- HTTP client (thin outer layer) --------------------------------------
@@ -376,6 +406,18 @@ struct PlexMetadata {
     guid: Vec<PlexGuid>,
     #[serde(default, rename = "Genre")]
     genre: Vec<TaggedField>,
+    #[serde(default, rename = "Label")]
+    label: Vec<TaggedField>,
+    #[serde(default, rename = "Role")]
+    role: Vec<TaggedField>,
+    #[serde(default, rename = "Director")]
+    director: Vec<TaggedField>,
+    #[serde(default, rename = "Writer")]
+    writer: Vec<TaggedField>,
+    #[serde(default, rename = "Producer")]
+    producer: Vec<TaggedField>,
+    #[serde(default, rename = "Country")]
+    country: Vec<TaggedField>,
     #[serde(default, rename = "Media")]
     media: Vec<PlexMedia>,
 }
@@ -445,6 +487,12 @@ mod tests {
             studio: None,
             duration_ms: Some(7_920_000),
             genres: vec!["Action".into()],
+            labels: vec![],
+            cast: vec![],
+            directors: vec![],
+            writers: vec![],
+            producers: vec![],
+            countries: vec![],
         }
     }
 
@@ -601,6 +649,53 @@ mod tests {
         assert_eq!(
             cat.resolve_query(r#"item.edition == "Extended Edition""#).unwrap(),
             vec!["imdb:tt-e".to_string()]
+        );
+    }
+
+    #[test]
+    fn to_plex_item_promotes_crew_cast_and_label_tags() {
+        let json = r#"{
+            "ratingKey": "1",
+            "type": "movie",
+            "title": "Die Hard",
+            "Role": [{"tag": "Bruce Willis"}, {"tag": "Alan Rickman"}],
+            "Director": [{"tag": "John McTiernan"}],
+            "Writer": [{"tag": "Jeb Stuart"}],
+            "Producer": [{"tag": "Joel Silver"}],
+            "Country": [{"tag": "United States"}],
+            "Label": [{"tag": "Christmas"}],
+            "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        assert_eq!(item.cast, vec!["Bruce Willis", "Alan Rickman"]);
+        assert_eq!(item.directors, vec!["John McTiernan"]);
+        assert_eq!(item.writers, vec!["Jeb Stuart"]);
+        assert_eq!(item.producers, vec!["Joel Silver"]);
+        assert_eq!(item.countries, vec!["United States"]);
+        assert_eq!(item.labels, vec!["Christmas"]);
+    }
+
+    #[test]
+    fn ingest_writes_crew_cast_and_label_tags_queryable() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut item = movie("plex-t", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-t")]);
+        item.cast = vec!["Jackie Chan".into()];
+        item.directors = vec!["Stanley Tong".into()];
+        item.labels = vec!["Kung Fu".into()];
+        ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
+
+        assert_eq!(cat.tags_for("imdb:tt-t", TagNs::Cast).unwrap(), vec!["Jackie Chan".to_string()]);
+        assert_eq!(cat.tags_for("imdb:tt-t", TagNs::Director).unwrap(), vec!["Stanley Tong".to_string()]);
+        assert_eq!(cat.tags_for("imdb:tt-t", TagNs::Label).unwrap(), vec!["Kung Fu".to_string()]);
+        // Reachable through the CEL→SQL surface: dedicated fields and generic `tags`.
+        assert_eq!(
+            cat.resolve_query(r#"item.cast.contains("Jackie Chan")"#).unwrap(),
+            vec!["imdb:tt-t".to_string()]
+        );
+        assert_eq!(
+            cat.resolve_query(r#"item.labels.contains("Kung Fu")"#).unwrap(),
+            vec!["imdb:tt-t".to_string()]
         );
     }
 
