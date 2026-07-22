@@ -221,15 +221,30 @@ fn resolve_collection(
             ));
         }
         n => {
+            // Names are not unique, and the catalog stores no finer qualifier
+            // than `source` (which every collection shares today, since only
+            // Plex ingest writes them). So name the offending ids rather than
+            // pretend a filter could pick between them.
             return Err(format!(
-                "{n} collections are named {:?} — a collection entry must name exactly one",
-                entry.name
+                "{n} collections are named {:?} — a collection entry must name exactly one \
+                 (conflicting ids: {}); rename one in the source and re-ingest",
+                entry.name,
+                ids.join(", ")
             ));
         }
     };
     let members = catalog
         .collection_members(&collection_id)
         .map_err(|e| e.to_string())?;
+    // Naming a collection asserts it has content — unlike a query, which is a
+    // filter and may legitimately match nothing. An empty one would otherwise
+    // vanish from the channel silently.
+    if members.is_empty() {
+        return Err(format!(
+            "collection {:?} ({collection_id}) has no members",
+            entry.name
+        ));
+    }
     members
         .iter()
         .map(|id| catalog_item(catalog, id, defaults))
@@ -857,6 +872,20 @@ mod tests {
             format!("{err}").contains("must name exactly one"),
             "err = {err}"
         );
+    }
+
+    #[test]
+    fn empty_collection_errors_rather_than_vanishing() {
+        let cat = catalog_with_marathon();
+        cat.upsert_collection(&CatCollection {
+            collection_id: "plex:coll:empty".into(),
+            name: "Empty Shelf".into(),
+            source: Source::Plex,
+        })
+        .unwrap();
+        let inc = collection_block("Empty Shelf");
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("has no members"), "err = {err}");
     }
 
     #[test]
