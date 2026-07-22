@@ -71,9 +71,12 @@ impl Catalog {
     /// - `Manual` returns the input (authored) order unchanged.
     /// - `Random` is a deterministic seeded shuffle (`seed` supplied by the
     ///   caller; a pinned seed reproduces the order).
-    /// - `Collection` reads `collection_items.position` for `collection_id`
-    ///   (required — the set must be one collection); missing context is an error.
-    /// - `Score` is not yet implemented (a separate plugin issue).
+    ///
+    /// Every case here is a function of the ids themselves — that is the whole
+    /// contract. Two orders that were not are deliberately absent: collection
+    /// order depends on *which* collection the set came from, so it is read at
+    /// the entry that names it ([`Self::collection_members`], #107); score
+    /// order depended on a plugin nothing here can reach (#108).
     ///
     /// An empty input yields an empty output.
     pub fn resolve_order(
@@ -81,54 +84,18 @@ impl Catalog {
         ids: &[String],
         order: &Order,
         seed: u64,
-        collection_id: Option<&str>,
     ) -> Result<Vec<String>, CatalogError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         match order {
             Order::Manual => Ok(ids.to_vec()),
-            Order::Score => Err(CatalogError::Query(
-                "score order requires the scoring plugin (not yet implemented)".to_string(),
-            )),
             Order::Random => {
                 let mut shuffled = ids.to_vec();
                 // Sort first so the result depends only on the set + seed.
                 shuffled.sort();
                 order::seeded_shuffle(&mut shuffled, seed);
                 Ok(shuffled)
-            }
-            Order::Collection => {
-                let collection_id = collection_id.ok_or_else(|| {
-                    CatalogError::Query(
-                        "collection order needs a single-collection context".to_string(),
-                    )
-                })?;
-                let placeholders = vec!["?"; ids.len()].join(", ");
-                let sql = format!(
-                    "SELECT ci.entry_id FROM collection_items ci \
-                     WHERE ci.collection_id = ? AND ci.entry_id IN ({placeholders}) \
-                     ORDER BY ci.position, ci.entry_id"
-                );
-                let mut params: Vec<Value> = Vec::with_capacity(ids.len() + 1);
-                params.push(Value::Text(collection_id.to_string()));
-                params.extend(ids.iter().map(|s| Value::Text(s.clone())));
-                let ordered = self.ordered_ids(&sql, params)?;
-                // #69: `collection` order is valid only when the whole resolved
-                // set belongs to the collection. A member missing from it would
-                // otherwise silently truncate the playlist — that's a config
-                // error, not a shorter list.
-                let distinct: std::collections::HashSet<&str> =
-                    ids.iter().map(String::as_str).collect();
-                if ordered.len() < distinct.len() {
-                    return Err(CatalogError::Query(format!(
-                        "collection order: {} of {} resolved entries are not members of \
-                         collection {collection_id:?}",
-                        distinct.len() - ordered.len(),
-                        distinct.len(),
-                    )));
-                }
-                Ok(ordered)
             }
             Order::Fields(terms) => {
                 let clause = order::order_by_clause(terms)?;
@@ -180,7 +147,10 @@ impl Catalog {
         F: FnOnce(&Self) -> Result<T, E>,
         E: From<CatalogError>,
     {
-        let tx = self.conn.unchecked_transaction().map_err(CatalogError::from)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(CatalogError::from)?;
         let out = f(self)?;
         tx.commit().map_err(CatalogError::from)?;
         Ok(out)
@@ -392,6 +362,16 @@ impl Catalog {
             "SELECT entry_id FROM collection_items WHERE collection_id = ?1
              ORDER BY position, entry_id",
             params![collection_id],
+        )
+    }
+
+    /// Collection ids carrying `name`, ascending. A name is not unique — two
+    /// sources can each define a "Halloween Marathon" — so this returns every
+    /// match and leaves "missing" and "ambiguous" for the caller to phrase.
+    pub fn collection_ids_by_name(&self, name: &str) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT collection_id FROM collections WHERE name = ?1 ORDER BY collection_id",
+            params![name],
         )
     }
 

@@ -157,7 +157,9 @@ async fn open_and_ingest_catalog(
             sources = stats.sources_written,
             "local-fs catalog ingest complete",
         ),
-        Err(e) => tracing::error!(event = "catalog.ingest.fs_failed", error = %e, "local-fs catalog ingest failed; continuing"),
+        Err(e) => {
+            tracing::error!(event = "catalog.ingest.fs_failed", error = %e, "local-fs catalog ingest failed; continuing")
+        }
     }
 
     // Plex: only when both env vars are set — an unconfigured Plex is normal, not
@@ -181,7 +183,9 @@ async fn open_and_ingest_catalog(
                 sources = stats.sources_written,
                 "plex catalog ingest complete",
             ),
-            Err(e) => tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing"),
+            Err(e) => {
+                tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing")
+            }
         }
     }
 

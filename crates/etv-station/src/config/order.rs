@@ -28,10 +28,25 @@ pub struct FieldSort {
 
 /// Block ordering, parsed from a string per the Phase C locked decisions (#46).
 ///
+/// Block ordering, parsed from a string per the Phase C locked decisions (#46).
+///
 /// - `field:dir` (e.g. `release_date:desc`), compound comma-separated
 ///   (`season:asc,episode:asc`); a bare field defaults to `:asc`.
-/// - bare keywords: `manual` (authored file order), `random`, `collection`
-///   (Plex collection position), `score` (plugin-ranked).
+/// - bare keywords: `manual` (authored file order), `random`.
+///
+/// **Every variant is computable from the items being ordered** — their columns,
+/// the authored list, or the set plus a seed. That invariant is the type's whole
+/// contract, and two former variants broke it:
+///
+/// - `collection` (#107) — `collection_items.position` belongs to the
+///   (collection, item) pair, not to the item, so a flat set handed to a sort no
+///   longer knows which collection's positions to read. It rides on the entry
+///   that names the collection instead: [`CollectionEntry`](super::entry::CollectionEntry).
+/// - `score` (#108) — needed a scoring plugin: which one, configured how,
+///   ranking against what. None of that is derivable from a list of ids.
+///
+/// A new variant that cannot be computed from the ids alone belongs somewhere
+/// else in the schema, not here.
 ///
 /// An implicit `entry_id` tiebreaker and null-handling are the resolution
 /// engine's concern (#69); this type only captures the parsed shape.
@@ -40,8 +55,6 @@ pub enum Order {
     #[default]
     Manual,
     Random,
-    Collection,
-    Score,
     Fields(Vec<FieldSort>),
 }
 
@@ -51,8 +64,26 @@ impl Order {
         match s {
             "manual" => return Ok(Order::Manual),
             "random" => return Ok(Order::Random),
-            "collection" => return Ok(Order::Collection),
-            "score" => return Ok(Order::Score),
+            // Both removed keywords are named explicitly so they fail loudly
+            // here rather than falling through to the field-sort branch and
+            // surfacing much later as "cannot order by item.collection".
+            "collection" => {
+                return Err(
+                    "order = \"collection\" was removed (#107): a collection's authored \
+                     order belongs to the collection, not to the items, so it rides on a \
+                     kind = \"collection\" entry instead of on a block's order"
+                        .to_string(),
+                );
+            }
+            "score" => {
+                return Err(
+                    "order = \"score\" was removed (#108): a relevance score is not derivable \
+                     from the items being ordered, so it cannot be a bare order keyword. \
+                     Scoring is unspecified — if it lands as a per-item column, sort on it \
+                     directly (e.g. \"score:desc\")"
+                        .to_string(),
+                );
+            }
             _ => {}
         }
 
@@ -92,8 +123,6 @@ impl Order {
         match self {
             Order::Manual => "manual".to_string(),
             Order::Random => "random".to_string(),
-            Order::Collection => "collection".to_string(),
-            Order::Score => "score".to_string(),
             Order::Fields(terms) => terms
                 .iter()
                 .map(|t| format!("{}:{}", t.field, t.dir.as_str()))
@@ -134,8 +163,25 @@ mod tests {
     fn bare_keywords() {
         assert_eq!(parse("manual"), Order::Manual);
         assert_eq!(parse("random"), Order::Random);
-        assert_eq!(parse("collection"), Order::Collection);
-        assert_eq!(parse("score"), Order::Score);
+    }
+
+    /// Both removed keywords must be rejected by name. Without these arms they
+    /// would parse as a one-term field sort and fail far later, at resolution,
+    /// as "cannot order by item.score".
+    #[test]
+    fn score_keyword_is_rejected_rather_than_read_as_a_field() {
+        let err = Order::parse("score").unwrap_err();
+        assert!(err.contains("#108"), "err = {err}");
+        assert!(
+            !matches!(Order::parse("score"), Ok(Order::Fields(_))),
+            "score must not fall through to the field-sort branch"
+        );
+    }
+
+    #[test]
+    fn collection_keyword_is_rejected_with_a_pointer_to_the_entry_kind() {
+        let err = Order::parse("collection").unwrap_err();
+        assert!(err.contains("kind = \"collection\" entry"), "err = {err}");
     }
 
     #[test]

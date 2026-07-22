@@ -68,8 +68,8 @@ pub async fn ingest_roots(
         let escaped_root = glob::Pattern::escape(&root.to_string_lossy());
         for ext in MEDIA_EXTS {
             let pattern = format!("{escaped_root}/**/*.{ext}");
-            let matches = glob::glob_with(&pattern, opts)
-                .map_err(|e| FsIngestError::Glob(e.to_string()))?;
+            let matches =
+                glob::glob_with(&pattern, opts).map_err(|e| FsIngestError::Glob(e.to_string()))?;
             files.extend(matches.filter_map(Result::ok));
         }
     }
@@ -121,7 +121,12 @@ pub fn ingest_files(
         // foreign entry (Plex/GUID-derived id): inheriting it means Plex has the
         // richer record; we only attach local provenance below.
         if entry_id.starts_with("fs:") {
-            let mut entry = Entry::new(&entry_id, type_from_path(path), file_title(path), Source::LocalFs);
+            let mut entry = Entry::new(
+                &entry_id,
+                type_from_path(path),
+                file_title(path),
+                Source::LocalFs,
+            );
             entry.duration_ms = duration_secs.map(|s| (s * 1000.0) as i64);
             catalog.upsert_entry(&entry)?;
             stats.entries_written += 1;
@@ -255,8 +260,13 @@ mod tests {
     fn file_indexed_by_plex_dedupes_onto_plex_entry() {
         let cat = Catalog::open_in_memory().unwrap();
         // Seed a Plex-style entry with a provenance row for a real file path.
-        cat.upsert_entry(&Entry::new("imdb:tt0095016", "movie", "Die Hard", Source::Plex))
-            .unwrap();
+        cat.upsert_entry(&Entry::new(
+            "imdb:tt0095016",
+            "movie",
+            "Die Hard",
+            Source::Plex,
+        ))
+        .unwrap();
         cat.add_source(&EntrySource {
             source: Source::Plex,
             source_id: "plex-12345".into(),
@@ -267,18 +277,28 @@ mod tests {
         .unwrap();
 
         // FS scan reaches the same file under a *different* mount root.
-        let files = [file("/mnt/media/movies/Die Hard (1988)/Die.Hard.mkv", 132.0 * 60.0)];
-        let stats = ingest_files(&cat, &files, &["/data/media".into(), "/mnt/media".into()]).unwrap();
+        let files = [file(
+            "/mnt/media/movies/Die Hard (1988)/Die.Hard.mkv",
+            132.0 * 60.0,
+        )];
+        let stats =
+            ingest_files(&cat, &files, &["/data/media".into(), "/mnt/media".into()]).unwrap();
 
         // Inherited the Plex entry_id, wrote no new entry, added a second row.
         assert_eq!(stats.inherited, 1);
         assert_eq!(stats.entries_written, 0);
-        assert_eq!(cat.all_entry_ids().unwrap(), vec!["imdb:tt0095016".to_string()]);
+        assert_eq!(
+            cat.all_entry_ids().unwrap(),
+            vec!["imdb:tt0095016".to_string()]
+        );
         let sources = cat.sources_for("imdb:tt0095016").unwrap();
         assert_eq!(sources.len(), 2);
         assert!(sources.iter().any(|s| s.source == Source::LocalFs));
         // Plex metadata untouched — FS did not clobber the title.
-        assert_eq!(cat.entry("imdb:tt0095016").unwrap().unwrap().title, "Die Hard");
+        assert_eq!(
+            cat.entry("imdb:tt0095016").unwrap().unwrap().title,
+            "Die Hard"
+        );
     }
 
     #[test]
@@ -332,13 +352,19 @@ mod tests {
         let roots = ["/data/media".to_string()];
         ingest_files(&cat, &files, &roots).unwrap();
         let first_ids = cat.all_entry_ids().unwrap();
-        let first_sources: usize = first_ids.iter().map(|id| cat.sources_for(id).unwrap().len()).sum();
+        let first_sources: usize = first_ids
+            .iter()
+            .map(|id| cat.sources_for(id).unwrap().len())
+            .sum();
 
         // Second pass: same files → same rows, now all inherited, no duplication.
         let stats = ingest_files(&cat, &files, &roots).unwrap();
         assert_eq!(stats.inherited, 2);
         assert_eq!(cat.all_entry_ids().unwrap(), first_ids);
-        let second_sources: usize = first_ids.iter().map(|id| cat.sources_for(id).unwrap().len()).sum();
+        let second_sources: usize = first_ids
+            .iter()
+            .map(|id| cat.sources_for(id).unwrap().len())
+            .sum();
         assert_eq!(first_sources, second_sources);
         assert_eq!(cat.all_sources().unwrap().len(), 2);
     }
@@ -360,7 +386,10 @@ mod tests {
     #[test]
     fn type_from_path_maps_known_dirs() {
         assert_eq!(type_from_path(Path::new("/m/bumpers/a.mp4")), "bumper");
-        assert_eq!(type_from_path(Path::new("/m/musicvideos/a.mp4")), "music_video");
+        assert_eq!(
+            type_from_path(Path::new("/m/musicvideos/a.mp4")),
+            "music_video"
+        );
         assert_eq!(type_from_path(Path::new("/m/concerts/a.mkv")), "concert");
         assert_eq!(type_from_path(Path::new("/m/whatever/a.mp4")), "video");
     }

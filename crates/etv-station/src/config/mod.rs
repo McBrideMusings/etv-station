@@ -12,7 +12,7 @@ mod validate;
 
 pub use block::{BlockFile, Duplicates};
 pub use channel::{ChannelConfig, ChannelOverlayConfig};
-pub use entry::{Entry, IncludeEntry, ItemEntry, QueryEntry};
+pub use entry::{CollectionEntry, Entry, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
 pub use load::{LoadedChannel, Station, load, read_channel};
 pub use mode::Mode;

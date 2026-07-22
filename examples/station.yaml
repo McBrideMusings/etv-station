@@ -7,10 +7,8 @@ output_base: examples/output
 
 # Each entry is a literal path or a glob (e.g. `channels/*.yaml`), resolved
 # relative to this file's directory. A glob expands to every match.
+# Only committed channels belong here — this file is tracked, so a reference to
+# a channel that lives outside git breaks `load` on a fresh clone. Local-only
+# channels go in a station file of your own.
 channels:
   - channels/lavfi-test.yaml
-  - channels/diehard.yaml
-  - channels/trending.yaml
-  - channels/showcase.yaml
-  - channels/marquee.yaml
-  - channels/starwars.yaml

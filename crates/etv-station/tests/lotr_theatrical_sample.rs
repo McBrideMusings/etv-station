@@ -31,12 +31,37 @@ fn lotr_catalog() -> Catalog {
         .unwrap();
     };
     // Theatrical cuts — no edition.
-    seed("lotr:rotk", "The Lord of the Rings: The Return of the King", "2003-12-17", None);
-    seed("lotr:fotr", "The Lord of the Rings: The Fellowship of the Ring", "2001-12-19", None);
-    seed("lotr:ttt", "The Lord of the Rings: The Two Towers", "2002-12-18", None);
+    seed(
+        "lotr:rotk",
+        "The Lord of the Rings: The Return of the King",
+        "2003-12-17",
+        None,
+    );
+    seed(
+        "lotr:fotr",
+        "The Lord of the Rings: The Fellowship of the Ring",
+        "2001-12-19",
+        None,
+    );
+    seed(
+        "lotr:ttt",
+        "The Lord of the Rings: The Two Towers",
+        "2002-12-18",
+        None,
+    );
     // Extended Editions — must be excluded.
-    seed("lotr:fotr-ext", "The Lord of the Rings: The Fellowship of the Ring", "2001-12-19", Some("Extended Edition"));
-    seed("lotr:ttt-ext", "The Lord of the Rings: The Two Towers", "2002-12-18", Some("Extended Edition"));
+    seed(
+        "lotr:fotr-ext",
+        "The Lord of the Rings: The Fellowship of the Ring",
+        "2001-12-19",
+        Some("Extended Edition"),
+    );
+    seed(
+        "lotr:ttt-ext",
+        "The Lord of the Rings: The Two Towers",
+        "2002-12-18",
+        Some("Extended Edition"),
+    );
     cat
 }
 
@@ -62,12 +87,18 @@ fn lotr_theatrical_sample_excludes_extended_editions() {
 fn lotr_theatrical_sample_keeps_null_edition_films() {
     let cat = lotr_catalog();
     let mut theatrical = cat
-        .resolve_query(r#"item.title.contains("Lord of the Rings") && item.edition != "Extended Edition""#)
+        .resolve_query(
+            r#"item.title.contains("Lord of the Rings") && item.edition != "Extended Edition""#,
+        )
         .unwrap();
     theatrical.sort();
     // Exactly the three NULL-edition cuts; neither `-ext` entry.
     assert_eq!(
         theatrical,
-        vec!["lotr:fotr".to_string(), "lotr:rotk".to_string(), "lotr:ttt".to_string()],
+        vec![
+            "lotr:fotr".to_string(),
+            "lotr:rotk".to_string(),
+            "lotr:ttt".to_string()
+        ],
     );
 }

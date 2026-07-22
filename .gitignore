@@ -26,6 +26,7 @@ examples/channels/*
 !examples/channels/trending-shuffle.yaml
 !examples/channels/ghibli.yaml
 !examples/channels/lotr-theatrical.yaml
+!examples/channels/marathon.yaml
 examples/blocks/
 examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml
