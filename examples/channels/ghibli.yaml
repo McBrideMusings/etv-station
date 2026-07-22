@@ -1,0 +1,34 @@
+# Sample S9 — Studio / brand channel (the studio tier).
+#
+# A *query* channel of everything from one studio, resolved by the promoted
+# `item.studio` column and played alphabetically. This is the CLEAN tier: Studio
+# Ghibli is a single production company, so a plain `studio ==` string is enough.
+#
+# Two harder brand tiers use `item.labels` instead — the same channel shape over
+# a different metadata source, because one `studio` string isn't enough for a
+# brand:
+#   - A24     — a distributor, not the production company → a user-applied Label:
+#               'item.labels.contains("A24")'
+#   - Disney  — an umbrella spanning Pixar / Marvel / Lucasfilm / … sub-studios,
+#               where 'item.studio == "Disney"' matches almost nothing → a Label:
+#               'item.labels.contains("Disney")'
+# The `studio_brand_sample` acceptance test proves all three query forms.
+#
+# Not registered in examples/station.yaml: a query channel needs a populated
+# catalog + the daemon-side catalog wiring (#96) to run live. Its resolution is
+# proven by the `studio_brand_sample` acceptance test.
+window_days: 1
+chunk_hours: 6
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "title:asc"
+      program:
+        title: "Studio Ghibli"
+        categories: ["Movie", "Anime"]
+      entries:
+        - kind: query
+          query: 'item.studio == "Studio Ghibli"'
