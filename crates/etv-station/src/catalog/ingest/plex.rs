@@ -57,6 +57,10 @@ pub struct PlexItem {
     pub episode: Option<i64>,
     pub year: Option<i64>,
     pub content_rating: Option<String>,
+    /// Plex `editionTitle`; `None`/empty = theatrical.
+    pub edition: Option<String>,
+    /// Plex `studio` — single production-company string.
+    pub studio: Option<String>,
     pub duration_ms: Option<i64>,
     pub genres: Vec<String>,
 }
@@ -123,6 +127,8 @@ pub fn ingest_items(
             item.content_rating.clone(),
             existing.as_ref().and_then(|e| e.content_rating.clone()),
         );
+        entry.edition = or_existing(item.edition.clone(), existing.as_ref().and_then(|e| e.edition.clone()));
+        entry.studio = or_existing(item.studio.clone(), existing.as_ref().and_then(|e| e.studio.clone()));
         entry.duration_ms = item.duration_ms.or_else(|| existing.as_ref().and_then(|e| e.duration_ms));
         catalog.upsert_entry(&entry)?;
         stats.entries_written += 1;
@@ -233,6 +239,10 @@ fn to_plex_item(m: &PlexMetadata, translate: impl Fn(&str) -> String) -> Option<
         year: m.year,
         kind,
         content_rating: m.content_rating.clone(),
+        // Absent/blank `editionTitle` means theatrical — normalise to `None` so
+        // the merge never overwrites an existing edition with an empty string.
+        edition: m.edition_title.as_deref().and_then(non_empty).map(str::to_string),
+        studio: m.studio.as_deref().and_then(non_empty).map(str::to_string),
         // Plex `duration` is already milliseconds.
         duration_ms: m.duration,
         genres: m.genre.iter().filter_map(|g| g.tag.clone()).collect(),
@@ -358,6 +368,10 @@ struct PlexMetadata {
     duration: Option<i64>,
     #[serde(default)]
     content_rating: Option<String>,
+    #[serde(default)]
+    edition_title: Option<String>,
+    #[serde(default)]
+    studio: Option<String>,
     #[serde(default, rename = "Guid")]
     guid: Vec<PlexGuid>,
     #[serde(default, rename = "Genre")]
@@ -427,6 +441,8 @@ mod tests {
             episode: None,
             year: Some(1988),
             content_rating: None,
+            edition: None,
+            studio: None,
             duration_ms: Some(7_920_000),
             genres: vec!["Action".into()],
         }
@@ -531,6 +547,61 @@ mod tests {
         );
         assert_eq!(item.rating_key, "12345");
         assert_eq!(item.duration_ms, Some(7_920_000));
+    }
+
+    #[test]
+    fn to_plex_item_promotes_edition_and_studio() {
+        let json = r#"{
+            "ratingKey": "1",
+            "type": "movie",
+            "title": "The Lord of the Rings: The Fellowship of the Ring",
+            "editionTitle": "Extended Edition",
+            "studio": "New Line Cinema",
+            "Media": [{"Part": [{"file": "/media/lotr.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        assert_eq!(item.edition.as_deref(), Some("Extended Edition"));
+        assert_eq!(item.studio.as_deref(), Some("New Line Cinema"));
+    }
+
+    #[test]
+    fn theatrical_item_has_no_edition() {
+        // A film with no `editionTitle` (and a blank one) is theatrical — both
+        // normalise to `None` so the merge never overwrites with an empty string.
+        let json = r#"{
+            "ratingKey": "2",
+            "type": "movie",
+            "title": "Theatrical Cut",
+            "editionTitle": "",
+            "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        assert_eq!(item.edition, None);
+        assert_eq!(item.studio, None);
+    }
+
+    #[test]
+    fn ingest_writes_edition_and_studio_queryable() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut item = movie("plex-e", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-e")]);
+        item.edition = Some("Extended Edition".into());
+        item.studio = Some("New Line Cinema".into());
+        ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
+
+        let e = cat.entry("imdb:tt-e").unwrap().unwrap();
+        assert_eq!(e.edition.as_deref(), Some("Extended Edition"));
+        assert_eq!(e.studio.as_deref(), Some("New Line Cinema"));
+        // Both promoted columns are queryable via the CEL→SQL surface.
+        assert_eq!(
+            cat.resolve_query(r#"item.studio == "New Line Cinema""#).unwrap(),
+            vec!["imdb:tt-e".to_string()]
+        );
+        assert_eq!(
+            cat.resolve_query(r#"item.edition == "Extended Edition""#).unwrap(),
+            vec!["imdb:tt-e".to_string()]
+        );
     }
 
     #[test]
