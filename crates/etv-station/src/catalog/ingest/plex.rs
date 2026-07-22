@@ -55,6 +55,10 @@ pub struct PlexItem {
     pub show: Option<String>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
+    /// Plex `absoluteIndex` (franchise-wide episode number), when Plex provides
+    /// one. The computed fallback for shows Plex leaves unset is a separate,
+    /// deferred slice (needs a per-show catalog pass — see #104).
+    pub absolute_episode: Option<i64>,
     pub year: Option<i64>,
     pub content_rating: Option<String>,
     /// Plex `editionTitle`; `None`/empty = theatrical.
@@ -130,6 +134,8 @@ pub fn ingest_items(
         entry.show = or_existing(item.show.clone(), existing.as_ref().and_then(|e| e.show.clone()));
         entry.season = item.season.or_else(|| existing.as_ref().and_then(|e| e.season));
         entry.episode = item.episode.or_else(|| existing.as_ref().and_then(|e| e.episode));
+        entry.absolute_episode =
+            item.absolute_episode.or_else(|| existing.as_ref().and_then(|e| e.absolute_episode));
         entry.year = item.year.or_else(|| existing.as_ref().and_then(|e| e.year));
         entry.content_rating = or_existing(
             item.content_rating.clone(),
@@ -254,6 +260,7 @@ fn to_plex_item(m: &PlexMetadata, translate: impl Fn(&str) -> String) -> Option<
         show: m.grandparent_title.clone(),
         season: is_episode.then_some(m.parent_index).flatten(),
         episode: is_episode.then_some(m.index).flatten(),
+        absolute_episode: is_episode.then_some(m.absolute_index).flatten(),
         year: m.year,
         kind,
         content_rating: m.content_rating.clone(),
@@ -393,6 +400,8 @@ struct PlexMetadata {
     #[serde(default)]
     index: Option<i64>,
     #[serde(default)]
+    absolute_index: Option<i64>,
+    #[serde(default)]
     year: Option<i64>,
     #[serde(default)]
     duration: Option<i64>,
@@ -481,6 +490,7 @@ mod tests {
             show: None,
             season: None,
             episode: None,
+            absolute_episode: None,
             year: Some(1988),
             content_rating: None,
             edition: None,
@@ -696,6 +706,55 @@ mod tests {
         assert_eq!(
             cat.resolve_query(r#"item.labels.contains("Kung Fu")"#).unwrap(),
             vec!["imdb:tt-t".to_string()]
+        );
+    }
+
+    #[test]
+    fn to_plex_item_promotes_absolute_episode_for_episodes() {
+        let json = r#"{
+            "ratingKey": "1",
+            "type": "episode",
+            "title": "The Arrival of Raditz",
+            "grandparentTitle": "Dragon Ball Z",
+            "parentIndex": 1,
+            "index": 1,
+            "absoluteIndex": 154,
+            "Media": [{"Part": [{"file": "/media/dbz/e.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        assert_eq!(item.absolute_episode, Some(154));
+        assert_eq!(item.season, Some(1));
+        assert_eq!(item.episode, Some(1));
+    }
+
+    #[test]
+    fn movie_never_carries_absolute_episode() {
+        // A movie with a stray `absoluteIndex` must not land `absolute_episode`
+        // — same is_episode guard as season/episode.
+        let json = r#"{
+            "ratingKey": "2",
+            "type": "movie",
+            "title": "A Film",
+            "absoluteIndex": 7,
+            "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        assert_eq!(item.absolute_episode, None);
+    }
+
+    #[test]
+    fn ingest_writes_absolute_episode_queryable() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut item = movie("plex-ae", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-ae")]);
+        item.absolute_episode = Some(154);
+        ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
+
+        assert_eq!(cat.entry("imdb:tt-ae").unwrap().unwrap().absolute_episode, Some(154));
+        assert_eq!(
+            cat.resolve_query("item.absolute_episode == 154").unwrap(),
+            vec!["imdb:tt-ae".to_string()]
         );
     }
 
