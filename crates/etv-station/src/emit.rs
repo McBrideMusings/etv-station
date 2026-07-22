@@ -61,7 +61,7 @@ mod tests {
     use super::*;
     use crate::config::SourceConfig;
     use crate::resolve::ResolvedItem;
-    use crate::rule::LoopForever;
+    use crate::rule::Sequential;
     use std::time::Duration;
     use tempfile::tempdir;
     use time::macros::datetime;
@@ -83,7 +83,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let items = vec![item("a", 60), item("b", 60)];
         let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
-        let rule = LoopForever::new(&items, &durs);
+        let rule = Sequential::new(&items, &durs);
         let tz = tzmod::parse("UTC").unwrap();
         let anchor = datetime!(2026-04-13 00:00 UTC);
         let from = anchor;
@@ -107,7 +107,7 @@ mod tests {
         let dir2 = tempdir().unwrap();
         let items = vec![item("a", 30), item("b", 90)];
         let durs = vec![Duration::from_secs(30), Duration::from_secs(90)];
-        let rule = LoopForever::new(&items, &durs);
+        let rule = Sequential::new(&items, &durs);
         let tz = tzmod::parse("America/Chicago").unwrap();
         let anchor = datetime!(2026-04-13 05:00 UTC); // local midnight CDT
         let from = anchor;

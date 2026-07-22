@@ -1,4 +1,3 @@
-pub mod anchor;
 pub mod atomic;
 pub mod catalog;
 pub mod config;

@@ -45,7 +45,8 @@ With the query language picked and graphics rendering working, redesign the chan
 - New TOML (or YAML) schema with blocks, channels, `[[entries]]`, includes, modes (`all` / `count`), filters, channel-seeded random order.
 - Pools + pattern interleave ([#72](https://github.com/McBrideMusings/etv-station/issues/72), shipped) — "1 movie, then 3 episodes, repeat" across independently-progressing series, with a `.resume` sidecar carrying progression across window seams. Ships the resume-map half of the generation model.
 - Generation model ([#70](https://github.com/McBrideMusings/etv-station/issues/70), shipped) — the play-history ledger: one `.history` line per scheduled airing, with the per-series resume cursor as a projection of it rather than a second store.
-- Adjacency constraints — `[constraints] no_repeat_within = N` over the whole channel list (#73). The property-level `separate_by` / `separate_min_gap` form is deferred.
+- Adjacency constraints — `[constraints] no_repeat_within = N` over the whole channel list, reaching back across the generation seam via the ledger (#73). The property-level `separate_by` / `separate_min_gap` form is deferred.
+- One emission model. The `LoopForever` rule and its `.anchor` sidecar are gone: every channel materializes forward, and a channel whose list never changes loops by repeating that list. Pool `wrap = "drop"` and the "channel exhausted" state went with them — television does not stop when it reaches the end of its library.
 - Plex catalog ingester + local-FS catalog ingester (bumpers / commercials / errata).
 - Runtime query resolution with snapshot-at-boot and configurable refresh interval.
 - Graphics overlay cascade: channel default → block override → item override.

@@ -15,7 +15,7 @@ Therefore anyone running ETV-next must produce playout JSON externally. The bund
 ## Goals
 
 1. **Continuously feed ETV-next.** At any moment, every configured channel has playout JSON files on disk whose `[start, finish)` window contains "now" and extends N days into the future.
-2. **Plug-in sequencing rules.** A channel is defined by a rule type plus parameters. v1 ships with **Loop Forever**. Architecture supports adding more rules without rewriting the core.
+2. **Composable sequencing.** A channel is defined by blocks — flat entry lists or pool/pattern interleaves — resolved into one ordered list per generation. Architecture supports adding composition primitives without rewriting the core.
 3. **Embed program metadata.** Items carry title / description / season / episode / categories / rating / artwork — written into the `program` block of each playout item so ETV-next's XMLTV is populated.
 4. **Stay decoupled from ETV-next.** Filesystem-only contract. No IPC, no shared process, no schema fork. ETV-next's `schema/playout.json` is the boundary.
 5. **Track ETV-next's schema without drifting.** Achieved by depending on ETV-next's `ersatztv-playout` Rust crate at the source level, via a git submodule (see Architecture below).
@@ -106,24 +106,19 @@ volumes:
 
 Key properties:
 - `etv-station` has read/write on the playout volume; `etv-next` has read-only. Lock-free producer/consumer; the OS guarantees atomicity for `rename(2)`.
-- Either container can restart independently. ETV-next keeps serving from already-materialized files; etv-station picks up where it left off using the persisted anchor.
+- Either container can restart independently. ETV-next keeps serving from already-materialized files; etv-station picks up after the last thing it wrote.
 - Neither container has any knowledge of the other's existence at the protocol level. The only coupling is the playout JSON schema and the directory layout convention.
 
-## Sequencing rules
+## Emission model
 
-A channel config picks one rule. v1 implements one; the rule trait is designed for later additions.
+Every channel materializes **forward**. Each generation resolves the channel, lays the resulting sequence end-to-end after the last thing already written, and records the seam. The emitted chunk JSON is the durable timeline.
 
-### Loop Forever (v1, only rule shipped)
+There is **one** model, not one per rule. An earlier design had a separate "Loop Forever" rule that resolved a list once and replayed it from a persisted `.anchor` for any `t` via `(t - anchor) mod total_loop_duration`. It was removed: a channel whose list never changes resolves the same list every generation, and those laid end-to-end *are* the loop, so looping needs no rule of its own. Keeping it also cost correctness in two places — a list that advances between generations (any pool with `advance = "resume"`) re-anchored and restarted its schedule on every change, and an unseeded `order = "random"` channel resolved exactly once per process, replaying one shuffle until the daemon restarted rather than reshuffling per pass.
 
-**Inputs**
-- Ordered list of items, each with: source spec (path / URL / lavfi), optional in/out points, optional track selections, full program metadata.
-- Anchor timestamp — the wall-clock instant `items[0]` is considered to "start". Defaults to first run; persisted across restarts.
-
-**Behavior**
-Items concatenate end-to-end, looping when exhausted. For any future timestamp `t`, the active item is determined by `(t - anchor) mod total_loop_duration`, then walking the cumulative item durations.
+**Running out is not a state.** A series that reaches its last item starts over. Nothing retires a series or a pool, because a television channel does not stop broadcasting when it reaches the end of its library. Resolving to zero items therefore always means the resolved *set* is empty — an expression that matches nothing, an empty catalog — which is a config error and is reported as one.
 
 **Determinism**
-Given the same `(anchor, items)`, the program emits identical playout JSON every time. This matters for: regeneration after config edits, multi-instance setups, debugging.
+Generation is a pure function of `(catalog, config, resume_in)`: the same three inputs always produce the same items and the same `resume_out`. This is what makes regeneration after a config edit safe.
 
 ### Pattern interleave (Phase C)
 
@@ -146,11 +141,9 @@ A series is keyed by the catalog `show_id`; an item without one — a movie — 
 
 A series that reaches its last item starts over. That is the only behaviour there is — there is no setting that retires a series or a pool, because a television channel does not stop broadcasting when it reaches the end of its library.
 
-### Generation model for pattern channels
+### Generation model
 
-A pattern channel cannot use the anchor-and-loop model: a pool with `advance = "resume"` produces a different item list every generation by design, and `.anchor` re-anchors whenever the list changes, so an anchored loop would restart the schedule on every roll tick.
-
-Instead these channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
+Channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
 
 Two files carry that state, and they hold different things. The **play-history ledger** (`.history`) is one JSONL line per scheduled airing — `entry_id`, `show_id`, the scheduled `start`, and when the row was written. It is a dumb record: no taste logic, no TTL, no relevance. Where each series left off is a **projection** of it ("the last airing per `show_id`"), so there is exactly one place that knows a show's position and nothing to drift out of sync. A future taste scorer reads the same lines the other way — all of them, with timestamps. One structure, two read shapes.
 
@@ -185,7 +178,7 @@ A `channel.toml` declaring:
 | `roll_interval` | no, default `1h` | How often to extend the window forward. |
 | `retention_days` | no, default 7 | Past playout files older than this get deleted. |
 | `rule` | yes | Rule type + rule-specific params. |
-| `items` | yes (for Loop Forever) | Ordered list with metadata. |
+| `items` | yes (for an entries block) | Ordered list with metadata. |
 
 A channel does **not** declare its own output folder. The daemon derives it as `{output_base}/{identity}`, where `output_base` is a station-level field and `identity` is the channel's `name` (above) or, unset, its config file stem. ETV-next still reads playout files from that same folder, configured on its own side.
 
@@ -195,7 +188,7 @@ A top-level station file (`station.toml` or `station.yaml`) declares `output_bas
 
 The station file declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.
 
-The configured zone affects **chunk-boundary alignment only**: a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC. The persisted anchor in the `.anchor` sidecar stays in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
+The configured zone affects **chunk-boundary alignment only**: a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC. Persisted timestamps in the sidecars stay in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
 
 Per-channel `tz` override is **not** in v1 — single household, single zone. Adding it later is a strict superset (channel-level overrides station-level) so deferring is safe.
 
@@ -229,15 +222,15 @@ Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffect
 | # | Question | Current answer |
 |---|---|---|
 | 1 | Daemon vs. cron-invoked one-shot? | Daemon. Roll cadence + reload watcher both want a long-lived process. |
-| 2 | Anchor persistence | Sidecar JSON file per channel (`<output_folder>/.anchor`). |
-| 3 | Source-media duration probing | `ffprobe` at config-load time; cache durations in the anchor sidecar. Re-probe on file mtime change. |
+| 2 | Scheduling-state persistence | Sidecar files per channel: `.resume` (rotation + checkpoints) and `.history` (the play ledger). |
+| 3 | Source-media duration probing | `ffprobe` at config-load time; cache durations in the `.durations.json` sidecar. Re-probe on file mtime change. |
 | 4 | What if an item file is missing at probe time? | Fail loudly at config load (don't silently substitute). v1 is explicit about its inputs. |
 | 5 | Logging/observability | stdout structured logs (JSON lines). Container runtime captures them. No metrics endpoint v1. |
 | 6 | What if `etv-next-private` updates `ersatztv-playout` in a breaking way? | Compile-time error on submodule bump. PR cycle on `etv-station` to absorb the change. Considered a feature. |
 
 ## Verification (v1 acceptance)
 
-- One channel configured with Loop Forever, 4 items totaling ~9 hours.
+- One channel configured with a single entries block, 4 items totaling ~9 hours.
 - `etv-station` and `etv-next` running continuously for 7 days as two containers sharing the playout volume.
 - At every probe (hourly): ETV-next's `/channel/1.m3u8` returns valid HLS, `/xmltv.xml` includes correctly populated `<programme>` entries for the next ≥7 days, and ETV-next's logs contain zero `unable to find playout JSON file for time …` errors.
 - Stopping `etv-station` mid-run: ETV-next continues serving until the materialized window expires; the failure mode is graceful degradation (back to synthetic black + silence after the window's end), not an immediate outage.

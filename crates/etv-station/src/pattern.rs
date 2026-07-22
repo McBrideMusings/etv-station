@@ -515,7 +515,15 @@ mod tests {
             let key = show_ids.get(id).cloned().unwrap_or_else(|| id.clone());
             cursor.insert(key, id.clone());
         }
-        (ids, GenerationState { resume, cursor })
+        let tail = ids.clone();
+        (
+            ids,
+            GenerationState {
+                resume,
+                cursor,
+                tail,
+            },
+        )
     }
 
     /// The headline acceptance criterion: `{movies take=1}, {shows take=3}`
@@ -660,6 +668,7 @@ mod tests {
         // catalog — the id no longer resolves to anything in got's series.
         let state = GenerationState {
             resume,
+            tail: Vec::new(),
             cursor: BTreeMap::from([
                 ("show:got".to_string(), "got-e99-deleted".to_string()),
                 ("show:inv".to_string(), "inv-e2".to_string()),

@@ -2,11 +2,12 @@
 //!
 //! The Phase C resolve pipeline (#71): for each `[[rule.blocks]]` it
 //! **resolves entries → applies `duplicates` → applies `order` → (mode)**,
-//! producing the flat [`ResolvedItem`] list the window-filling sequencer
-//! ([`crate::rule::LoopForever`]) loops across the chunk window. Collapse runs
+//! producing the flat [`ResolvedItem`] list the sequencer
+//! ([`crate::rule::Sequential`]) lays across the chunk window. Collapse runs
 //! *before* order, so which duplicate survives is deterministic regardless of a
 //! `random` shuffle. The blocks concatenate, then the adjacency constraint pass
-//! ([`crate::constrain`], #73) runs once over the whole list.
+//! ([`crate::constrain`], #73) runs once over the whole list, reaching back
+//! across the generation seam via the play-history ledger.
 //!
 //! `query` entries resolve against the [`Catalog`] (#68 CEL→SQL) and each
 //! resolved `entry_id` becomes a `ResolvedItem`; `order` is applied by the
@@ -151,7 +152,7 @@ pub fn resolve_channel_with_resume(
     //    order engine.
     if gaps.iter().any(|&g| g > 0) {
         let ids: Vec<String> = out.iter().map(|item| item.id.clone()).collect();
-        let perm = crate::constrain::order_no_repeat(&ids, &gaps);
+        let perm = crate::constrain::order_no_repeat(&ids, &gaps, &state.tail);
         out = permute(out, &perm);
     }
 
@@ -689,10 +690,41 @@ mod tests {
         }
     }
 
+    /// The seam is the *generation* boundary, not the list's own ends:
+    /// `Sequential` plays this list once and lays the next one after it, so the
+    /// head is constrained against what already aired.
     #[test]
-    fn no_repeat_within_holds_across_the_loop_wrap() {
-        // Linearly `a b c a` is legal, but LoopForever replays the list end to
-        // end, so its tail `a` airs immediately before its head `a`.
+    fn no_repeat_within_holds_across_the_generation_seam() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+            Entry::Item(item_entry("c")),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let state = crate::resume::GenerationState {
+            tail: vec!["lavfi:a".to_string()],
+            ..Default::default()
+        };
+        let (items, _) = resolve_channel_with_resume(
+            &channel(vec![constrained(inc, 1)]),
+            path(),
+            &[],
+            None,
+            None,
+            &state,
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_ne!(
+            ids[0], "lavfi:a",
+            "repeated the previously-aired item across the seam: {ids:?}"
+        );
+    }
+
+    /// The list's own head and tail are NOT adjacent — nothing replays it end
+    /// to end — so an already-legal list must come back untouched.
+    #[test]
+    fn the_lists_own_ends_are_left_alone() {
         let mut inc = include_with(vec![
             Entry::Item(item_entry("a")),
             Entry::Item(item_entry("b")),
@@ -701,7 +733,11 @@ mod tests {
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let ids = resolved_ids(vec![constrained(inc, 1)]);
-        assert_ne!(ids[ids.len() - 1], ids[0], "wrap seam repeats: {ids:?}");
+        assert_eq!(
+            ids,
+            vec!["lavfi:a", "lavfi:b", "lavfi:c", "lavfi:a"],
+            "a legal list was reordered"
+        );
     }
 
     #[test]
@@ -1273,6 +1309,7 @@ mod tests {
         crate::resume::GenerationState {
             resume,
             cursor: ledger.series_cursor(),
+            tail: ledger.tail(crate::constrain::SEAM_TAIL),
         }
     }
 
