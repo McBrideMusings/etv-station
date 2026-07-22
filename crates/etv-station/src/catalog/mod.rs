@@ -322,6 +322,45 @@ impl Catalog {
         Ok(row)
     }
 
+    /// The `show_id` of each requested entry, in one round trip.
+    ///
+    /// The pattern engine (#72) needs nothing from an entry but its `show_id`,
+    /// for every item of every pool, on every generation — and a catch-up runs
+    /// many generations in a row. Fetching whole rows one id at a time turns
+    /// that into a query per item; this is the same answer in a single
+    /// statement. Ids absent from the catalog, and entries with no `show_id`,
+    /// are simply missing from the returned map.
+    pub fn show_ids_for(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, CatalogError> {
+        let mut out = std::collections::HashMap::new();
+        if entry_ids.is_empty() {
+            return Ok(out);
+        }
+        // Chunked so a large pool can't exceed sqlite's variable limit (999 by
+        // default). Well under it, and still one query per ~500 items instead
+        // of one per item.
+        for chunk in entry_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT entry_id, show_id FROM entries \
+                 WHERE show_id IS NOT NULL AND entry_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, show_id) = row?;
+                out.insert(id, show_id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every entry id, ascending — a stable enumeration for callers that scan.
     pub fn all_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])
@@ -656,5 +695,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entry_id, "imdb:tt1375666");
+    }
+
+    #[test]
+    fn show_ids_for_returns_only_entries_that_have_one() {
+        let c = cat();
+        let mut ep = Entry::new("ep1", "episode", "Winter Is Coming", Source::Plex);
+        ep.show_id = Some("show:got".into());
+        c.upsert_entry(&ep).unwrap();
+        let mut ep2 = Entry::new("ep2", "episode", "The Kingsroad", Source::Plex);
+        ep2.show_id = Some("show:got".into());
+        c.upsert_entry(&ep2).unwrap();
+        // A movie has no show_id, and "missing" isn't in the catalog at all.
+        c.upsert_entry(&Entry::new("mov1", "movie", "Inception", Source::Plex))
+            .unwrap();
+
+        let ids = vec![
+            "ep1".to_string(),
+            "ep2".to_string(),
+            "mov1".to_string(),
+            "missing".to_string(),
+        ];
+        let map = c.show_ids_for(&ids).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("ep1").unwrap(), "show:got");
+        assert_eq!(map.get("ep2").unwrap(), "show:got");
+        assert!(!map.contains_key("mov1"), "a movie has no show_id");
+        assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn show_ids_for_handles_an_empty_request_and_large_batches() {
+        let c = cat();
+        assert!(c.show_ids_for(&[]).unwrap().is_empty());
+
+        // Past the 500-id chunk boundary, so the chunking loop is exercised
+        // rather than assumed.
+        let mut ids = Vec::new();
+        for n in 0..1200 {
+            let id = format!("ep{n}");
+            let mut e = Entry::new(&id, "episode", format!("Episode {n}"), Source::Plex);
+            e.show_id = Some(format!("show:{}", n % 3));
+            c.upsert_entry(&e).unwrap();
+            ids.push(id);
+        }
+        let map = c.show_ids_for(&ids).unwrap();
+        assert_eq!(map.len(), 1200);
+        assert_eq!(map.get("ep1199").unwrap(), "show:2");
     }
 }

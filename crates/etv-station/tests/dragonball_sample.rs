@@ -1,4 +1,4 @@
-//! Acceptance test for Sample S4 (#78): the committed `examples/channels/dragonball.yaml`
+//! Acceptance test for Sample S4 (#78): the committed `examples/samples/dragonball.yaml`
 //! manual block weaves query episode-ranges — each ordered by `absolute_episode`
 //! — around an inline movie, playing entries in authored order. Proves the
 //! hardest authored-order case: a `manual` block with per-entry query order
@@ -40,7 +40,7 @@ fn dragonball_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/dragonball.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/dragonball.yaml")
 }
 
 #[test]

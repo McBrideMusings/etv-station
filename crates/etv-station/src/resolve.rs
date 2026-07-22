@@ -33,6 +33,7 @@ use crate::config::{
     QueryEntry, SourceConfig,
 };
 use crate::errors::ConfigError;
+use crate::resume::{GenerationState, ResumeMap};
 
 /// A concrete, ordered item ready for duration probing and sequencing. Produced
 /// by [`resolve_channel`] — the post-resolution counterpart to the on-disk
@@ -57,6 +58,10 @@ impl ResolvedItem {
 /// config path, used only for error messages. `catalog` resolves `query`
 /// entries and non-`manual` order; it may be `None` for a channel that is
 /// entirely inline items in `manual` order.
+///
+/// This is the stateless entry point: pattern pools declaring
+/// `advance = "resume"` start from the top. Use [`resolve_channel_with_resume`]
+/// to continue a channel across a window seam.
 pub fn resolve_channel(
     config: &ChannelConfig,
     path: &Path,
@@ -64,6 +69,36 @@ pub fn resolve_channel(
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
+    let (items, _) = resolve_channel_with_resume(
+        config,
+        path,
+        source_roots,
+        path_index,
+        catalog,
+        &GenerationState::empty(),
+    )?;
+    Ok(items)
+}
+
+/// [`resolve_channel`], plus the resume map that carries a pattern channel's
+/// progression across a window seam (#72).
+///
+/// Generation is a pure function of `(catalog, config, resume_in)`: the same
+/// three inputs always produce the same items and the same `resume_out`. There
+/// is no live cursor anywhere — a pool that wants to continue rather than
+/// replay reads where it left off from `resume_in` and reports where it got to
+/// in the returned map, which the daemon persists to the `.resume` sidecar.
+///
+/// A channel with no pattern block ignores `resume_in` and returns an empty
+/// map, so the resume sidecar only ever appears for channels that need it.
+pub fn resolve_channel_with_resume(
+    config: &ChannelConfig,
+    path: &Path,
+    source_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
+    catalog: Option<&Catalog>,
+    state: &GenerationState,
+) -> Result<(Vec<ResolvedItem>, ResumeMap), ConfigError> {
     // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
     // one draws fresh entropy so an unseeded `random` block reshuffles each
     // generation (#46 "unset = fresh per generation").
@@ -74,19 +109,39 @@ pub fn resolve_channel(
     // whose path is in it inherits that entry_id, so it collapses against a
     // `query` result for the same physical file (manual∩query dedup).
     let mut out = Vec::new();
+    let mut resume_out = ResumeMap::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
-        let block_items =
-            resolve_block(include, idx, path, source_roots, path_index, catalog, seed)?;
+        let block_items = resolve_block(
+            include,
+            idx,
+            path,
+            source_roots,
+            path_index,
+            catalog,
+            seed,
+            state,
+            &mut resume_out,
+        )?;
         out.extend(block_items);
     }
 
     if out.is_empty() {
+        // A pattern channel whose pools have all dropped out (`wrap = "drop"`,
+        // every series exhausted) has legitimately reached the end of its
+        // content. That is a runtime state, not a broken config, and reporting
+        // it as an error would make the daemon log the same failure on every
+        // roll tick forever. It is only a config error when nothing has *ever*
+        // played — an empty `resume_in` — which is the real "bad expr / empty
+        // catalog" case.
+        if config.is_pattern() && !state.is_fresh() {
+            return Ok((out, resume_out));
+        }
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
             message: "channel resolved to zero items".into(),
         });
     }
-    Ok(out)
+    Ok((out, resume_out))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -98,6 +153,8 @@ fn resolve_block(
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
     seed: u64,
+    state: &GenerationState,
+    resume_out: &mut ResumeMap,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
@@ -112,6 +169,39 @@ fn resolve_block(
     }
 
     let defaults = include.program();
+
+    // A pattern block builds its list by interleaving pools instead of playing
+    // a flat entries list, so it takes its own path: the pattern IS the
+    // ordering and the repeats are deliberate, which is why validation rejects
+    // a block-level `order` or an explicit `collapse` here rather than letting
+    // either quietly undo the interleave.
+    if include.is_pattern() {
+        let cat = catalog.ok_or_else(|| {
+            unsupported(format!(
+                "block #{idx}: a pattern block needs the catalog, which is not available"
+            ))
+        })?;
+        let (ids, pools) = crate::pattern::build(
+            cat,
+            &include.pools,
+            &include.pattern,
+            include.cycles,
+            state,
+            seed,
+        )
+        .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+        resume_out.pools.extend(pools);
+
+        let mut items: Vec<ResolvedItem> = ids
+            .iter()
+            .map(|id| catalog_item(cat, id, defaults))
+            .collect::<Result<_, _>>()
+            .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?;
+        if let Mode::Count(n) = include.mode {
+            items.truncate(n);
+        }
+        return Ok(items);
+    }
 
     // 1. Resolve entries to a flat item list (authored order).
     let mut items: Vec<ResolvedItem> = Vec::new();
@@ -470,6 +560,9 @@ mod tests {
             program: None,
             duplicates: None,
             entries,
+            pools: Vec::new(),
+            pattern: Vec::new(),
+            cycles: None,
             mode: Mode::All,
             order: Order::Manual,
             filter: None,
@@ -945,6 +1038,406 @@ mod tests {
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(items.len(), 3);
         assert!(ids.contains(&"imdb:tt0120737"));
+    }
+
+    // ---- pattern blocks (#72) ---------------------------------------------
+
+    /// A catalog with two shows of different lengths and two movies — enough to
+    /// prove the interleave and the independent progression end to end.
+    fn interleave_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        let add = |id: &str, kind: &str, show: Option<(&str, i64)>| {
+            let mut e = CatEntry::new(id, kind, format!("Title {id}"), Source::Plex);
+            if let Some((show_id, episode)) = show {
+                e.show_id = Some(show_id.into());
+                e.show = Some(show_id.trim_start_matches("show:").to_string());
+                e.season = Some(1);
+                e.episode = Some(episode);
+            }
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        };
+        add("mov-1", "movie", None);
+        add("mov-2", "movie", None);
+        for n in 1..=4 {
+            add(&format!("got-e{n}"), "episode", Some(("show:got", n)));
+        }
+        for n in 1..=2 {
+            add(&format!("inv-e{n}"), "episode", Some(("show:inv", n)));
+        }
+        c
+    }
+
+    fn interleave_block(advance: crate::config::Advance) -> BlockInclude {
+        use crate::config::{OnShort, PatternStep, Pool, Rotate, Select, Wrap};
+        let mut inc = include_with(vec![]);
+        inc.pools = vec![
+            Pool {
+                name: "movies".into(),
+                expr: "item.type == \"movie\"".into(),
+                order: Some(Order::parse("title:asc").unwrap()),
+                select: Select::RoundRobin,
+                rotate: Rotate::Visit,
+                advance,
+                wrap: Wrap::Loop,
+                on_short: OnShort::Next,
+            },
+            Pool {
+                name: "shows".into(),
+                expr: "item.type == \"episode\"".into(),
+                order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+                select: Select::RoundRobin,
+                rotate: Rotate::Visit,
+                advance,
+                wrap: Wrap::Loop,
+                on_short: OnShort::Next,
+            },
+        ];
+        inc.pattern = vec![
+            PatternStep {
+                pool: "movies".into(),
+                take: 1,
+                chance: 1.0,
+            },
+            PatternStep {
+                pool: "shows".into(),
+                take: 2,
+                chance: 1.0,
+            },
+        ];
+        inc.cycles = Some(2);
+        inc
+    }
+
+    /// Project the state a following window would be handed, exactly as the
+    /// daemon does: the pools' rotation from this resolve, and the per-series
+    /// cursor read back out of the play-history ledger the airings were
+    /// recorded in (#70).
+    fn advance_state(
+        cat: &Catalog,
+        prev: &crate::resume::GenerationState,
+        resume: ResumeMap,
+        items: &[ResolvedItem],
+    ) -> crate::resume::GenerationState {
+        use crate::history::{Ledger, PlayRecord};
+        use time::OffsetDateTime;
+
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let show_ids = cat.show_ids_for(&ids).unwrap();
+        let mut ledger = Ledger::new();
+        // Seed with whatever the previous windows had already recorded, so the
+        // projection sees the channel's whole history and not just this window.
+        ledger.extend(prev.cursor.iter().map(|(key, entry_id)| PlayRecord {
+            entry_id: entry_id.clone(),
+            show_id: Some(key.clone()),
+            start: OffsetDateTime::UNIX_EPOCH,
+            played_at: OffsetDateTime::UNIX_EPOCH,
+        }));
+        ledger.extend(ids.iter().map(|id| PlayRecord {
+            entry_id: id.clone(),
+            show_id: show_ids.get(id).cloned(),
+            start: OffsetDateTime::UNIX_EPOCH,
+            played_at: OffsetDateTime::UNIX_EPOCH,
+        }));
+        crate::resume::GenerationState {
+            resume,
+            cursor: ledger.series_cursor(),
+        }
+    }
+
+    /// The whole pipeline through the public entry point: a pattern block
+    /// resolves to the interleaved list, with catalog metadata and playback
+    /// paths attached exactly as a query entry gets them.
+    #[test]
+    fn pattern_block_resolves_through_the_channel() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
+        let (items, resume) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["mov-1", "got-e1", "got-e2", "mov-2", "inv-e1", "inv-e2"]
+        );
+        // Catalog-backed like any other resolved item.
+        assert_eq!(items[1].program.as_ref().unwrap().episode, Some(1));
+        match &items[0].source {
+            SourceConfig::Local { path } => assert!(path.ends_with("mov-1.mkv")),
+            other => panic!("expected local source, got {other:?}"),
+        }
+        // Both pools reported their rotation, keyed by pool name; where each
+        // series stopped lives in the ledger, not here.
+        assert!(resume.pool("movies").is_some());
+        assert!(resume.pool("shows").is_some());
+        let next = advance_state(&cat, &GenerationState::empty(), resume, &items);
+        assert_eq!(next.cursor.get("show:got").unwrap(), "got-e2");
+    }
+
+    /// Window continuation with no live cursor: window 2 is generated from
+    /// window 1's `resume_out` and each show picks up where it left off.
+    #[test]
+    fn resume_carries_progression_across_a_window_seam() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+
+        let (first, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            first_ids,
+            vec!["mov-1", "got-e1", "got-e2", "mov-2", "inv-e1", "inv-e2"]
+        );
+
+        let next = advance_state(&cat, &GenerationState::empty(), next, &first);
+        let (second, _) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &next).unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
+        // got continues at e3 (it never restarts because inv is shorter), inv
+        // wraps, and the movies pool continues its own rotation.
+        assert_eq!(
+            second_ids,
+            vec!["mov-1", "got-e3", "got-e4", "mov-2", "inv-e1", "inv-e2"]
+        );
+    }
+
+    /// The same three inputs always produce the same two outputs — the property
+    /// the whole no-live-cursor model rests on.
+    #[test]
+    fn generation_is_a_pure_function_of_catalog_config_and_resume() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+        let (first, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let state = advance_state(&cat, &GenerationState::empty(), next, &first);
+
+        let (a, ra) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let (b, rb) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let ids_a: Vec<&str> = a.iter().map(|i| i.id.as_str()).collect();
+        let ids_b: Vec<&str> = b.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(ra, rb);
+    }
+
+    /// #70 acceptance: a show that leaves the resolved set and comes back
+    /// resumes from its stored position, not from its first episode.
+    ///
+    /// This is exactly what a churning "Trending" list does. The ledger is
+    /// keyed by `show_id` and is never pruned to the current set, so a show's
+    /// position outlives its absence — which is why the cursor could not be a
+    /// per-generation index.
+    #[test]
+    fn a_show_that_leaves_and_returns_resumes_where_it_stopped() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+
+        // Window 1 airs both shows; GoT reaches e2.
+        let (first, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        let state = advance_state(&cat, &GenerationState::empty(), next, &first);
+        assert_eq!(state.cursor.get("show:got").unwrap(), "got-e2");
+
+        // GoT drops out of the resolved set entirely for a while — the pool's
+        // expr no longer matches it. Its ledger entries stay.
+        let mut narrowed = interleave_block(crate::config::Advance::Resume);
+        for pool in &mut narrowed.pools {
+            if pool.name == "shows" {
+                pool.expr = "item.show == \"inv\"".into();
+            }
+        }
+        let narrowed_cfg = channel(vec![narrowed]);
+        let (away, next_away) =
+            resolve_channel_with_resume(&narrowed_cfg, path(), &[], None, Some(&cat), &state)
+                .unwrap();
+        assert!(
+            !away.iter().any(|i| i.id.starts_with("got-")),
+            "GoT is out of the set for this window"
+        );
+        let state = advance_state(&cat, &state, next_away, &away);
+
+        // It comes back. It must continue at e3, not restart at e1.
+        let (back, _) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        let first_got = back
+            .iter()
+            .map(|i| i.id.as_str())
+            .find(|id| id.starts_with("got-"))
+            .expect("GoT returns to the set");
+        assert_eq!(
+            first_got, "got-e3",
+            "a returning show resumes from its stored position, not S1E1"
+        );
+    }
+
+    /// #70 acceptance: one ledger row per scheduled airing — no more, no fewer.
+    /// The row count is what makes the cursor's projection correct, so a
+    /// duplicate or a dropped row is a scheduling bug, not a bookkeeping one.
+    #[test]
+    fn every_scheduled_airing_records_exactly_one_row() {
+        use crate::history::{Ledger, PlayRecord};
+        use time::OffsetDateTime;
+
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
+        let (items, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let show_ids = cat.show_ids_for(&ids).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.extend(ids.iter().enumerate().map(|(i, id)| PlayRecord {
+            entry_id: id.clone(),
+            show_id: show_ids.get(id).cloned(),
+            start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
+            played_at: OffsetDateTime::UNIX_EPOCH,
+        }));
+
+        assert_eq!(
+            ledger.len(),
+            items.len(),
+            "one row per airing — the generation aired {} items",
+            items.len()
+        );
+        // A repeat under `wrap = "loop"` is a genuine second airing and gets
+        // its own row; the cursor still resolves to the latest one.
+        let cursor = ledger.series_cursor();
+        assert_eq!(cursor.get("show:got").unwrap(), "got-e2");
+    }
+
+    /// The stateless entry point stays stateless: `resolve_channel` never
+    /// consults a resume map, so a `resume` pool replays from the top.
+    #[test]
+    fn resolve_channel_ignores_resume_state() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+        let first = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
+        let second = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
+        let ids1: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
+        let ids2: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids1, ids2);
+    }
+
+    /// A channel with no pattern block never grows a resume map, so the sidecar
+    /// only ever appears for channels that need it.
+    #[test]
+    fn an_entries_channel_produces_an_empty_resume_map() {
+        let inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        let (_, next) = resolve_channel_with_resume(
+            &channel(vec![inc]),
+            path(),
+            &[],
+            None,
+            None,
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        assert!(next.is_empty());
+    }
+
+    /// A pattern channel that has played everything under `wrap = "drop"` is
+    /// exhausted, not misconfigured: it resolves to an empty list rather than
+    /// erroring, so the daemon can idle instead of failing every roll tick.
+    /// A channel that has *never* played anything still errors — that is the
+    /// genuine "bad expr / empty catalog" case.
+    #[test]
+    fn an_exhausted_pattern_channel_resolves_empty_instead_of_erroring() {
+        use crate::config::Wrap;
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Resume);
+        for pool in &mut inc.pools {
+            pool.wrap = Wrap::Drop;
+        }
+        inc.cycles = Some(20); // long enough to drain everything
+        let cfg = channel(vec![inc]);
+
+        let (played, next) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+        )
+        .unwrap();
+        assert!(!played.is_empty());
+
+        // Second window: every series has dropped, so there is nothing left.
+        let state = advance_state(&cat, &GenerationState::empty(), next, &played);
+        let (items, _) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &state).unwrap();
+        assert!(items.is_empty(), "an exhausted channel resolves to nothing");
+    }
+
+    #[test]
+    fn a_pattern_channel_that_never_played_still_errors_on_zero_items() {
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Resume);
+        for pool in &mut inc.pools {
+            pool.expr = "item.type == \"nonesuch\"".into();
+        }
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("zero items"), "err = {err}");
+    }
+
+    #[test]
+    fn pattern_block_without_catalog_errors() {
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
+        let err = resolve_channel(&cfg, path(), &[], None, None).unwrap_err();
+        assert!(format!("{err}").contains("catalog"), "err = {err}");
+    }
+
+    /// `mode = "count"` still truncates a pattern block's interleaved list.
+    #[test]
+    fn count_mode_truncates_a_pattern_block() {
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Restart);
+        inc.mode = Mode::Count(3);
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["mov-1", "got-e1", "got-e2"]);
     }
 
     #[test]

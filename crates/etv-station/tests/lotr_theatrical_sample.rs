@@ -1,5 +1,5 @@
 //! Acceptance test for Sample S3 (#77): the committed
-//! `examples/channels/lotr-theatrical.yaml` query channel resolves only the
+//! `examples/samples/lotr-theatrical.yaml` query channel resolves only the
 //! theatrical LOTR films (edition NULL) and excludes the Extended Editions,
 //! oldest-first. Proves the `item.edition` filter + the NULL-as-default `!=`
 //! rule (#103) — a theatrical cut has no edition yet is still matched — against
@@ -66,7 +66,7 @@ fn lotr_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/lotr-theatrical.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/lotr-theatrical.yaml")
 }
 
 #[test]

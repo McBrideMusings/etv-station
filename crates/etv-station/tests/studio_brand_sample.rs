@@ -1,4 +1,4 @@
-//! Acceptance test for Sample S9 (#83): the committed `examples/channels/ghibli.yaml`
+//! Acceptance test for Sample S9 (#83): the committed `examples/samples/ghibli.yaml`
 //! query channel resolves a studio by the clean `item.studio` column, while the
 //! two brand tiers (A24, Disney) resolve by `item.labels` — the same channel
 //! shape over three metadata-reliability tiers. Proves why one `studio` string
@@ -52,7 +52,7 @@ fn brand_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/ghibli.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/ghibli.yaml")
 }
 
 /// The studio tier: `item.studio == "Studio Ghibli"` resolves exactly the Ghibli

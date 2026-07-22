@@ -82,6 +82,88 @@ impl<'a> Rule for LoopForever<'a> {
     }
 }
 
+/// Play a resolved list **once**, end to end, from a given start — the emission
+/// model a pattern channel needs (#72).
+///
+/// [`LoopForever`] repeats a fixed list forever from a stable anchor, which is
+/// exactly right when the list never changes. A pattern channel's list *does*
+/// change every generation, because its pools advance; re-anchoring a looping
+/// list on every change would restart the schedule each time. So a pattern
+/// channel materializes **forward** instead: each generation covers the span
+/// after the last one, the already-written chunk JSON is the durable timeline,
+/// and the `.resume` sidecar carries only where the next span picks up.
+///
+/// `anchor_utc` is therefore read as "where this sequence starts", not as a
+/// repeating phase origin, and the sequence simply ends when the items run out.
+pub struct Sequential<'a> {
+    items: &'a [ResolvedItem],
+    durations: &'a [Duration],
+    overlay: Option<OverlaySpec>,
+}
+
+impl<'a> Sequential<'a> {
+    pub fn new(items: &'a [ResolvedItem], durations: &'a [Duration]) -> Self {
+        assert_eq!(
+            items.len(),
+            durations.len(),
+            "items/durations length mismatch"
+        );
+        Self {
+            items,
+            durations,
+            overlay: None,
+        }
+    }
+
+    pub fn with_overlay(mut self, overlay: Option<OverlaySpec>) -> Self {
+        self.overlay = overlay;
+        self
+    }
+
+    /// Wall-clock length of the whole sequence — how far forward one generation
+    /// reaches, which is what bounds the emission window.
+    pub fn total_duration(&self) -> time::Duration {
+        time::Duration::seconds_f64(self.durations.iter().map(|d| d.as_secs_f64()).sum())
+    }
+}
+
+impl Rule for Sequential<'_> {
+    fn items_covering(
+        &self,
+        start_utc: OffsetDateTime,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Vec<PlayoutItem> {
+        if self.items.is_empty() || to <= from {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut item_start_utc = start_utc;
+        for (idx, dur) in self.durations.iter().enumerate() {
+            let item_finish_utc = item_start_utc + time::Duration::seconds_f64(dur.as_secs_f64());
+            // Past the window — the sequence is ordered, so nothing later can
+            // qualify either.
+            if item_start_utc >= to {
+                break;
+            }
+            // An item that finishes exactly at `from` belongs to the previous
+            // window, not this one; one straddling `from` is emitted whole so
+            // the boundary never cuts a program in half.
+            if item_finish_utc > from {
+                out.push(build_playout_item(
+                    &self.items[idx],
+                    item_start_utc,
+                    item_finish_utc,
+                    self.overlay.as_ref(),
+                ));
+            }
+            item_start_utc = item_finish_utc;
+        }
+        out
+    }
+}
+
 fn walk_to_offset(durations: &[Duration], offset_secs: f64) -> (usize, f64) {
     let mut remaining = offset_secs;
     for (i, d) in durations.iter().enumerate() {
@@ -196,6 +278,67 @@ mod tests {
         let j1 = serde_json::to_vec(&r1).unwrap();
         let j2 = serde_json::to_vec(&r2).unwrap();
         assert_eq!(j1, j2);
+    }
+
+    // ---- Sequential (#72) --------------------------------------------------
+
+    #[test]
+    fn sequential_plays_the_list_once_and_stops() {
+        let items = vec![lavfi("a", 60), lavfi("b", 60)];
+        let durs = vec![Duration::from_secs(60), Duration::from_secs(60)];
+        let rule = Sequential::new(&items, &durs);
+        let start = datetime!(2026-04-13 00:00 UTC);
+        // A window far longer than the sequence: it must not loop to fill it.
+        let result = rule.items_covering(start, start, datetime!(2026-04-13 01:00 UTC));
+        let ids: Vec<&str> = result.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(result[0].start, start);
+        assert_eq!(result[1].finish, datetime!(2026-04-13 00:02 UTC));
+    }
+
+    #[test]
+    fn sequential_slices_to_the_requested_window() {
+        let items = vec![lavfi("a", 60), lavfi("b", 60), lavfi("c", 60)];
+        let durs = vec![
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ];
+        let rule = Sequential::new(&items, &durs);
+        let start = datetime!(2026-04-13 00:00 UTC);
+        // Second minute only — "a" has finished, "c" has not begun.
+        let result = rule.items_covering(
+            start,
+            datetime!(2026-04-13 00:01 UTC),
+            datetime!(2026-04-13 00:02 UTC),
+        );
+        let ids: Vec<&str> = result.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["b"]);
+    }
+
+    #[test]
+    fn sequential_emits_a_straddling_item_whole() {
+        // A chunk boundary must not cut a program in half: an item running
+        // across `from` is emitted with its real start.
+        let items = vec![lavfi("a", 120)];
+        let durs = vec![Duration::from_secs(120)];
+        let rule = Sequential::new(&items, &durs);
+        let start = datetime!(2026-04-13 00:00 UTC);
+        let result = rule.items_covering(
+            start,
+            datetime!(2026-04-13 00:01 UTC),
+            datetime!(2026-04-13 00:03 UTC),
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start, start);
+    }
+
+    #[test]
+    fn sequential_total_duration_bounds_the_window() {
+        let items = vec![lavfi("a", 30), lavfi("b", 90)];
+        let durs = vec![Duration::from_secs(30), Duration::from_secs(90)];
+        let rule = Sequential::new(&items, &durs);
+        assert_eq!(rule.total_duration(), time::Duration::seconds(120));
     }
 
     #[test]

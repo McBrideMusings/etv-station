@@ -1,5 +1,5 @@
 //! Acceptance test for Sample S6 (#80): the committed
-//! `examples/channels/marathon.yaml` collection channel plays every member of
+//! `examples/samples/marathon.yaml` collection channel plays every member of
 //! the "Halloween Marathon" collection in its authored `collection_items.position`
 //! order, excludes non-members, and is stable across generations. Proves
 //! collections-as-order — the counterpart to Sample S5, which reads the same
@@ -60,7 +60,7 @@ fn marathon_catalog() -> Catalog {
 }
 
 fn sample_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/channels/marathon.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/marathon.yaml")
 }
 
 /// The whole point of the sample: authored position order, start to finish.

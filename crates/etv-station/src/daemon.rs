@@ -493,6 +493,13 @@ async fn channel_loop(
     // this task (see #34), so it exists by the time we scan/emit into it here.
     let output = &channel.output_folder;
 
+    // A pattern channel advances its pools every generation, so its resolved
+    // list is different each time and the loop-a-fixed-list-from-an-anchor
+    // model doesn't apply. It runs its own emission loop instead (#72).
+    if channel.config.is_pattern() {
+        return pattern_channel_loop(channel, tz, source_roots, catalog, shutdown).await;
+    }
+
     // Resolve this channel's items. With a catalog, `query` entries and
     // non-`manual` order resolve and manual items path-match onto catalog
     // identities; without one, only inline-item `manual` channels resolve (others
@@ -596,6 +603,370 @@ async fn channel_loop(
                 tick.instrument(tracing::info_span!("roll_tick")).await;
             }
         }
+    }
+}
+
+/// Bound on how many generations one catch-up will chain before giving up, so
+/// a pathological config (a sequence with no wall-clock length) can't spin.
+const MAX_GENERATIONS_PER_TICK: usize = 512;
+
+/// Delete emitted playout files that begin at or after `from`, leaving anything
+/// already airing or aired in place. Returns how many were removed.
+async fn wipe_playout_from(
+    channel: &LoadedChannel,
+    from: OffsetDateTime,
+) -> Result<usize, StationError> {
+    let files = scan::scan_output_folder(&channel.output_folder).await?;
+    let mut removed = 0;
+    for f in files.iter().filter(|f| f.start >= from) {
+        match tokio::fs::remove_file(&f.path).await {
+            Ok(()) => removed += 1,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StationError::Io {
+                    path: f.path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// The emission loop for a pattern channel (#72): **materialize forward**.
+///
+/// The looping model can't work here. `LoopForever` repeats one fixed list from
+/// a stable anchor, and `.anchor` re-anchors whenever the item list changes —
+/// but a pool with `advance = "resume"` produces a *different* list every
+/// generation by design, so an anchored loop would restart the schedule on
+/// every roll tick.
+///
+/// So the emitted chunk JSON becomes the durable timeline instead. Each pass
+/// resolves from the stored resume map, lays the resulting sequence end-to-end
+/// after the last thing already written, and stores where it got to. Nothing
+/// already written is ever rewritten — which is also why this path skips the
+/// startup wipe that `LoopForever` channels use to pick up config changes
+/// (#53): for a forward-materialized channel the past is a record, not a
+/// rendering of the current config.
+async fn pattern_channel_loop(
+    channel: &LoadedChannel,
+    tz: &'static Tz,
+    source_roots: &[String],
+    catalog: Option<&SharedCatalog>,
+    shutdown: Arc<Notify>,
+) -> Result<(), StationError> {
+    let (resume, how) = crate::resume::load(&channel.output_folder).await?;
+    match &how {
+        crate::resume::ResumeLoad::Fresh => tracing::info!(
+            event = "resume.init",
+            channel = %channel.name,
+            "no resume sidecar; starting every pool from the top",
+        ),
+        crate::resume::ResumeLoad::Loaded => tracing::info!(
+            event = "resume.load",
+            channel = %channel.name,
+            pools = resume.pools.len(),
+            "loaded resume map",
+        ),
+        crate::resume::ResumeLoad::Discarded(reason) => tracing::warn!(
+            event = "resume.discard",
+            channel = %channel.name,
+            reason = %reason,
+            "resume sidecar unusable; starting every pool from the top",
+        ),
+    }
+    let mut resume = resume;
+
+    // The play-history ledger (#70) — the single record of what this channel
+    // has aired, and the thing each series' resume position is derived from.
+    // Loaded once here and carried across every tick, so a catch-up chaining
+    // many generations never re-reads it.
+    let (mut ledger, skipped) = crate::history::load(&channel.output_folder).await?;
+    if skipped > 0 {
+        tracing::warn!(
+            event = "history.partial",
+            channel = %channel.name,
+            skipped = skipped,
+            "skipped unparseable play-history lines; affected series resume from an earlier position",
+        );
+    }
+    tracing::info!(
+        event = "history.load",
+        channel = %channel.name,
+        airings = ledger.len(),
+        "loaded play history",
+    );
+
+    // Startup: throw away the future this channel had already written and
+    // generate it again from the config as it stands now.
+    //
+    // A `LoopForever` channel gets this from `wipe_emitted_playout` — its whole
+    // output is a pure function of (anchor, items), so wiping and re-emitting
+    // is free. A pattern channel can't wipe wholesale: its output depends on
+    // where the pools had advanced to, and that state is gone once consumed.
+    // The checkpoint trail is what makes the same thing possible here — rewind
+    // the pools to the start of the earliest unaired generation, drop exactly
+    // the files from that instant on, and regenerate. What has already aired,
+    // or is airing now, is untouched. Without this, a config or overlay edit
+    // wouldn't reach a pattern channel until its entire written window had
+    // played out (#53).
+    let now = OffsetDateTime::now_utc();
+    if let Some(regen_from) = resume.rewind_to_unaired(now) {
+        let removed = wipe_playout_from(channel, regen_from).await?;
+        // Those airings are no longer scheduled, so they are no longer history.
+        // Because the resume position is a projection of the ledger, dropping
+        // them is also what rewinds each series — the two cannot disagree.
+        ledger.truncate_from(regen_from);
+        crate::history::save(&channel.output_folder, &mut ledger).await?;
+        tracing::info!(
+            event = "resume.rewind",
+            channel = %channel.name,
+            from = %regen_from,
+            removed = removed,
+            airings = ledger.len(),
+            "rewound to the earliest unaired generation; regenerating it from the current config",
+        );
+    }
+
+    resume = pattern_catch_up(
+        channel,
+        tz,
+        source_roots,
+        catalog,
+        resume,
+        &mut ledger,
+        "startup",
+    )
+    .await?;
+
+    let mut interval = tokio::time::interval(channel.config.roll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await; // consume immediate tick
+
+    loop {
+        select! {
+            _ = shutdown.notified() => {
+                tracing::info!(event = "channel.shutdown", channel = %channel.name, "shutdown received");
+                return Ok(());
+            }
+            _ = interval.tick() => {
+                let tick = async {
+                    match pattern_catch_up(channel, tz, source_roots, catalog, resume.clone(), &mut ledger, "roll").await {
+                        Ok(next) => resume = next,
+                        Err(err) => tracing::error!(
+                            event = "roll.error",
+                            channel = %channel.name,
+                            error = %err,
+                            "roll tick failed; will retry next interval",
+                        ),
+                    }
+                };
+                tick.instrument(tracing::info_span!("roll_tick")).await;
+            }
+        }
+    }
+}
+
+/// Generate and emit forward until the window through `now + window_days` is
+/// covered, chaining one generation into the next through the resume map.
+/// Returns the map to carry into the next tick.
+async fn pattern_catch_up(
+    channel: &LoadedChannel,
+    tz: &'static Tz,
+    source_roots: &[String],
+    catalog: Option<&SharedCatalog>,
+    mut resume: crate::resume::ResumeMap,
+    ledger: &mut crate::history::Ledger,
+    phase: &'static str,
+) -> Result<crate::resume::ResumeMap, StationError> {
+    let output = &channel.output_folder;
+    let now = OffsetDateTime::now_utc();
+    let target = now + window_duration(channel.config.window_days);
+    let overlay_spec = load_overlay_playout_spec(channel);
+    let mut cache = DurationCache::load(output).await?;
+
+    // Pick up exactly where the written record ends. Unlike the looping path
+    // this is deliberately NOT snapped to a chunk boundary: a forward-
+    // materialized channel continues from the last item's finish, so the
+    // timeline stays gapless across the seam.
+    let existing = scan::scan_output_folder(output).await?;
+    let mut from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+
+    let mut generations = 0;
+    while from < target {
+        if generations >= MAX_GENERATIONS_PER_TICK {
+            tracing::warn!(
+                event = "pattern.generation_cap",
+                channel = %channel.name,
+                phase = phase,
+                generations = generations,
+                covered_through = %from,
+                target = %target,
+                "hit the per-tick generation cap; the window is only covered this far and will extend on the next roll tick",
+            );
+            break;
+        }
+
+        // Record the state entering this generation before anything consumes
+        // it, so the span it is about to write stays regenerable while it is
+        // still in the future.
+        resume.checkpoint(from);
+
+        // Where each series left off comes from the ledger, not from a cursor
+        // of the sidecar's own (#70): one record, projected on demand.
+        let state = crate::resume::GenerationState {
+            resume: resume.clone(),
+            cursor: ledger.series_cursor(),
+        };
+
+        let (items, resume_out, show_ids) = {
+            let guard = catalog.map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
+            let (items, resume_out) = crate::resolve::resolve_channel_with_resume(
+                &channel.config,
+                &channel.config_path,
+                source_roots,
+                catalog.map(|sc| &sc.path_index),
+                guard.as_deref(),
+                &state,
+            )?;
+            // The ledger needs each airing's show, and only the catalog knows
+            // it. One query for the whole generation, under the lock we already
+            // hold.
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            let show_ids = match guard.as_deref() {
+                Some(cat) => cat.show_ids_for(&ids)?,
+                None => HashMap::new(),
+            };
+            (items, resume_out, show_ids)
+        };
+
+        if items.is_empty() {
+            // Every pool has dropped out — the channel has played all the
+            // content it had. Not an error (see `resolve_channel_with_resume`):
+            // say so once per catch-up and stop, rather than failing every
+            // roll tick forever.
+            tracing::info!(
+                event = "pattern.exhausted",
+                channel = %channel.name,
+                phase = phase,
+                covered_through = %from,
+                "every pool has run out under wrap = \"drop\"; nothing further to schedule until new content appears",
+            );
+            resume.checkpoints.pop();
+            break;
+        }
+
+        let (durations, _) = cache.resolve_all(&items).await?;
+        let rule = crate::rule::Sequential::new(&items, &durations)
+            .with_overlay(overlay_spec.as_ref().map(clone_overlay_spec));
+        let span = rule.total_duration();
+        if span <= time::Duration::ZERO {
+            // Zero wall-clock length would never advance `from`. Stop rather
+            // than spin, and say so — silently emitting nothing would look
+            // exactly like a healthy idle channel.
+            tracing::error!(
+                event = "pattern.zero_length",
+                channel = %channel.name,
+                phase = phase,
+                items = items.len(),
+                "generation produced no playable duration; nothing further can be emitted",
+            );
+            resume.checkpoints.pop();
+            break;
+        }
+
+        // Emit the generation *whole*, even when it reaches past the target.
+        // Clamping to the target would drop the sequence's tail while the
+        // resume map still recorded those items as played, skipping them
+        // permanently. Overshooting the window by less than one generation
+        // costs nothing; a hole in the schedule is unrecoverable.
+        let to = from + span;
+        let written = emit_window(
+            output,
+            &rule,
+            from,
+            tz,
+            channel.config.chunk_hours,
+            from,
+            to,
+        )
+        .await?;
+        log_emission(&channel.name, phase, &written, from, to);
+
+        // One ledger row per scheduled airing, in schedule order. The times are
+        // the same walk `Sequential` just emitted: items laid end to end from
+        // `from`, which is why the whole generation is emitted rather than
+        // clamped — a row must correspond to something actually on disk.
+        //
+        // `written_at` is read per generation rather than reusing the tick's
+        // `now`: a catch-up can chain many generations, and stamping them all
+        // with the moment the tick began would misreport when each was
+        // actually scheduled.
+        let written_at = OffsetDateTime::now_utc();
+        let mut airing = from;
+        let records: Vec<crate::history::PlayRecord> = items
+            .iter()
+            .zip(durations.iter())
+            .map(|(item, dur)| {
+                let start = airing;
+                airing += time::Duration::seconds_f64(dur.as_secs_f64());
+                crate::history::PlayRecord {
+                    entry_id: item.id.clone(),
+                    show_id: show_ids.get(&item.id).cloned(),
+                    start,
+                    played_at: written_at,
+                }
+            })
+            .collect();
+        ledger.extend(records);
+        crate::history::save(output, ledger).await?;
+
+        // `resume_out` carries only pool state; the checkpoint trail is the
+        // daemon's, so it rides across rather than being replaced.
+        let checkpoints = std::mem::take(&mut resume.checkpoints);
+        resume = resume_out;
+        resume.checkpoints = checkpoints;
+        resume.prune_elapsed(now);
+        crate::resume::save(output, &resume).await?;
+        from += span;
+        generations += 1;
+    }
+
+    if generations == 0 {
+        tracing::info!(
+            event = "chunk.skip",
+            channel = %channel.name,
+            phase = phase,
+            "window already materialized through {target}",
+        );
+    }
+    cache.save(output).await?;
+
+    let removed = scan::sweep_retention(output, channel.config.retention_days, now).await;
+    if removed > 0 {
+        tracing::info!(
+            event = "retention.sweep",
+            channel = %channel.name,
+            phase = phase,
+            removed = removed,
+            retention_days = channel.config.retention_days,
+            "retention sweep pruned playout files",
+        );
+    }
+    Ok(resume)
+}
+
+/// `OverlaySpec` (an ETV-next type) is not `Clone`, and each generation in a
+/// catch-up builds its own rule.
+fn clone_overlay_spec(spec: &PlayoutOverlaySpec) -> PlayoutOverlaySpec {
+    PlayoutOverlaySpec {
+        fifo_path: spec.fifo_path.clone(),
+        pixel_format: spec.pixel_format.clone(),
+        width: spec.width,
+        height: spec.height,
+        framerate: spec.framerate,
+        x: spec.x,
+        y: spec.y,
     }
 }
 
