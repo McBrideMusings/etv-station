@@ -123,6 +123,16 @@ pub fn resolve_channel_with_resume(
     }
 
     if out.is_empty() {
+        // A pattern channel whose pools have all dropped out (`wrap = "drop"`,
+        // every series exhausted) has legitimately reached the end of its
+        // content. That is a runtime state, not a broken config, and reporting
+        // it as an error would make the daemon log the same failure on every
+        // roll tick forever. It is only a config error when nothing has *ever*
+        // played — an empty `resume_in` — which is the real "bad expr / empty
+        // catalog" case.
+        if config.is_pattern() && !resume_in.is_empty() {
+            return Ok((out, resume_out));
+        }
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
             message: "channel resolved to zero items".into(),
@@ -1038,6 +1048,44 @@ mod tests {
         )
         .unwrap();
         assert!(resume.is_empty());
+    }
+
+    /// A pattern channel that has played everything under `wrap = "drop"` is
+    /// exhausted, not misconfigured: it resolves to an empty list rather than
+    /// erroring, so the daemon can idle instead of failing every roll tick.
+    /// A channel that has *never* played anything still errors — that is the
+    /// genuine "bad expr / empty catalog" case.
+    #[test]
+    fn an_exhausted_pattern_channel_resolves_empty_instead_of_erroring() {
+        use crate::config::Wrap;
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Resume);
+        for pool in &mut inc.pools {
+            pool.wrap = Wrap::Drop;
+        }
+        inc.cycles = Some(20); // long enough to drain everything
+        let cfg = channel(vec![inc]);
+
+        let (played, resume) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &ResumeMap::new())
+                .unwrap();
+        assert!(!played.is_empty());
+
+        // Second window: every series has dropped, so there is nothing left.
+        let (items, _) =
+            resolve_channel_with_resume(&cfg, path(), &[], None, Some(&cat), &resume).unwrap();
+        assert!(items.is_empty(), "an exhausted channel resolves to nothing");
+    }
+
+    #[test]
+    fn a_pattern_channel_that_never_played_still_errors_on_zero_items() {
+        let cat = interleave_catalog();
+        let mut inc = interleave_block(crate::config::Advance::Resume);
+        for pool in &mut inc.pools {
+            pool.expr = "item.type == \"nonesuch\"".into();
+        }
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("zero items"), "err = {err}");
     }
 
     #[test]

@@ -388,15 +388,15 @@ fn resolve_pool<'a>(
     }
 
     // Group into series, preserving first-appearance order so the pool's
-    // `order` fixes the rotation order too.
+    // `order` fixes the rotation order too. One query for every `show_id` up
+    // front, rather than a catalog round trip per item — a catch-up re-resolves
+    // every pool on every generation.
+    let show_ids = catalog.show_ids_for(&ids).map_err(|e| e.to_string())?;
     let mut series: Vec<Series> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for id in ids {
-        let key = catalog
-            .entry(&id)
-            .map_err(|e| e.to_string())?
-            .and_then(|e| e.show_id)
-            .unwrap_or_else(|| id.clone());
+        // An item with no `show_id` — a movie — is its own series of one.
+        let key = show_ids.get(&id).cloned().unwrap_or_else(|| id.clone());
         match index.get(&key) {
             Some(&i) => series[i].ids.push(id),
             None => {

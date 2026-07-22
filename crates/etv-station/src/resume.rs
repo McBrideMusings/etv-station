@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::atomic::atomic_write_json;
 use crate::errors::StationError;
@@ -39,6 +40,31 @@ const CURRENT_VERSION: u32 = 1;
 pub struct ResumeMap {
     #[serde(default = "current_version")]
     pub version: u32,
+    #[serde(default)]
+    pub pools: BTreeMap<String, PoolResume>,
+
+    /// Where each not-yet-aired generation *started* from, newest last.
+    ///
+    /// Forward materialization otherwise makes a pattern channel's emitted
+    /// future permanent: nothing rewrites it, so a config or overlay edit would
+    /// only take effect once the already-written window had fully aired (the
+    /// #53 sharp edge, made worse by never wiping). These checkpoints are the
+    /// way back — each records the pool state immediately *before* the
+    /// generation that begins at `start`, so a channel can throw away its
+    /// unaired chunks, rewind to the matching pool state, and regenerate from
+    /// the current config without losing or repeating a single item.
+    ///
+    /// Only future entries are worth keeping; [`prune_elapsed`] drops the rest,
+    /// which bounds the list to the generations covering one window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+/// The pool state immediately before the generation that starts at `start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    #[serde(with = "time::serde::rfc3339")]
+    pub start: OffsetDateTime,
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
 }
@@ -74,6 +100,7 @@ impl ResumeMap {
         Self {
             version: CURRENT_VERSION,
             pools: BTreeMap::new(),
+            checkpoints: Vec::new(),
         }
     }
 
@@ -83,6 +110,38 @@ impl ResumeMap {
 
     pub fn is_empty(&self) -> bool {
         self.pools.is_empty()
+    }
+
+    /// Record the state entering a generation that begins at `start`.
+    pub fn checkpoint(&mut self, start: OffsetDateTime) {
+        self.checkpoints.push(Checkpoint {
+            start,
+            pools: self.pools.clone(),
+        });
+    }
+
+    /// Drop checkpoints for generations that have already begun airing — their
+    /// content is a record now, not something to regenerate.
+    pub fn prune_elapsed(&mut self, now: OffsetDateTime) {
+        self.checkpoints.retain(|c| c.start > now);
+    }
+
+    /// Rewind to the earliest generation that has not started airing: returns
+    /// the instant to re-emit from, having restored the pool state as it was
+    /// before that generation ran. `None` when nothing is regenerable, in which
+    /// case the map is untouched.
+    ///
+    /// This is what makes a config or overlay edit take effect on a pattern
+    /// channel: the caller deletes the emitted files at or after the returned
+    /// instant and generates the same span again from the current config.
+    pub fn rewind_to_unaired(&mut self, now: OffsetDateTime) -> Option<OffsetDateTime> {
+        self.prune_elapsed(now);
+        let earliest = self.checkpoints.first()?.clone();
+        self.pools = earliest.pools;
+        // Everything from here forward is about to be regenerated, so its
+        // checkpoints are re-recorded as it goes.
+        self.checkpoints.clear();
+        Some(earliest.start)
     }
 }
 
@@ -149,6 +208,7 @@ pub async fn save(output_folder: &Path, map: &ResumeMap) -> Result<(), StationEr
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use time::macros::datetime;
 
     fn sample() -> ResumeMap {
         let mut map = ResumeMap::new();
@@ -207,6 +267,85 @@ mod tests {
         let (map, how) = load(dir.path()).await.unwrap();
         assert!(map.is_empty());
         assert!(matches!(how, ResumeLoad::Discarded(_)));
+    }
+
+    // ---- checkpoints -------------------------------------------------------
+
+    fn at(hour: u8) -> OffsetDateTime {
+        datetime!(2026-04-13 00:00 UTC) + time::Duration::hours(hour as i64)
+    }
+
+    fn pools_with(cursor_id: &str) -> BTreeMap<String, PoolResume> {
+        let mut pool = PoolResume::default();
+        pool.cursor.insert("show:got".into(), cursor_id.into());
+        BTreeMap::from([("shows".to_string(), pool)])
+    }
+
+    #[test]
+    fn rewind_restores_the_state_before_the_earliest_unaired_generation() {
+        let mut map = ResumeMap::new();
+        // Three generations recorded, the first already airing by `now`.
+        map.pools = pools_with("e0");
+        map.checkpoint(at(0));
+        map.pools = pools_with("e1");
+        map.checkpoint(at(6));
+        map.pools = pools_with("e2");
+        map.checkpoint(at(12));
+        map.pools = pools_with("e3");
+
+        // At hour 8, the 06:00 generation has started — the 12:00 one has not.
+        let regen = map.rewind_to_unaired(at(8)).unwrap();
+        assert_eq!(regen, at(12));
+        assert_eq!(
+            map.pools,
+            pools_with("e2"),
+            "pools must be exactly what they were entering the 12:00 generation"
+        );
+        assert!(
+            map.checkpoints.is_empty(),
+            "regenerated spans re-record their own checkpoints"
+        );
+    }
+
+    #[test]
+    fn rewind_is_a_no_op_when_nothing_is_unaired() {
+        let mut map = ResumeMap::new();
+        map.pools = pools_with("e0");
+        map.checkpoint(at(0));
+        map.pools = pools_with("e1");
+
+        // Everything already airing: nothing to regenerate, state untouched.
+        assert!(map.rewind_to_unaired(at(9)).is_none());
+        assert_eq!(map.pools, pools_with("e1"));
+    }
+
+    #[test]
+    fn rewind_on_a_fresh_map_does_nothing() {
+        let mut map = ResumeMap::new();
+        assert!(map.rewind_to_unaired(at(1)).is_none());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_only_future_checkpoints() {
+        let mut map = ResumeMap::new();
+        map.checkpoint(at(0));
+        map.checkpoint(at(6));
+        map.checkpoint(at(12));
+        map.prune_elapsed(at(7));
+        assert_eq!(map.checkpoints.len(), 1);
+        assert_eq!(map.checkpoints[0].start, at(12));
+    }
+
+    #[tokio::test]
+    async fn checkpoints_survive_the_sidecar_round_trip() {
+        let dir = tempdir().unwrap();
+        let mut map = sample();
+        map.checkpoint(at(12));
+        save(dir.path(), &map).await.unwrap();
+        let (loaded, _) = load(dir.path()).await.unwrap();
+        assert_eq!(loaded, map);
+        assert_eq!(loaded.checkpoints[0].start, at(12));
     }
 
     #[tokio::test]

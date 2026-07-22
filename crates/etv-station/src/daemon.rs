@@ -610,6 +610,29 @@ async fn channel_loop(
 /// a pathological config (a sequence with no wall-clock length) can't spin.
 const MAX_GENERATIONS_PER_TICK: usize = 512;
 
+/// Delete emitted playout files that begin at or after `from`, leaving anything
+/// already airing or aired in place. Returns how many were removed.
+async fn wipe_playout_from(
+    channel: &LoadedChannel,
+    from: OffsetDateTime,
+) -> Result<usize, StationError> {
+    let files = scan::scan_output_folder(&channel.output_folder).await?;
+    let mut removed = 0;
+    for f in files.iter().filter(|f| f.start >= from) {
+        match tokio::fs::remove_file(&f.path).await {
+            Ok(()) => removed += 1,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StationError::Io {
+                    path: f.path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// The emission loop for a pattern channel (#72): **materialize forward**.
 ///
 /// The looping model can't work here. `LoopForever` repeats one fixed list from
@@ -653,6 +676,31 @@ async fn pattern_channel_loop(
         ),
     }
     let mut resume = resume;
+
+    // Startup: throw away the future this channel had already written and
+    // generate it again from the config as it stands now.
+    //
+    // A `LoopForever` channel gets this from `wipe_emitted_playout` — its whole
+    // output is a pure function of (anchor, items), so wiping and re-emitting
+    // is free. A pattern channel can't wipe wholesale: its output depends on
+    // where the pools had advanced to, and that state is gone once consumed.
+    // The checkpoint trail is what makes the same thing possible here — rewind
+    // the pools to the start of the earliest unaired generation, drop exactly
+    // the files from that instant on, and regenerate. What has already aired,
+    // or is airing now, is untouched. Without this, a config or overlay edit
+    // wouldn't reach a pattern channel until its entire written window had
+    // played out (#53).
+    let now = OffsetDateTime::now_utc();
+    if let Some(regen_from) = resume.rewind_to_unaired(now) {
+        let removed = wipe_playout_from(channel, regen_from).await?;
+        tracing::info!(
+            event = "resume.rewind",
+            channel = %channel.name,
+            from = %regen_from,
+            removed = removed,
+            "rewound to the earliest unaired generation; regenerating it from the current config",
+        );
+    }
 
     resume = pattern_catch_up(channel, tz, source_roots, catalog, resume, "startup").await?;
 
@@ -723,6 +771,11 @@ async fn pattern_catch_up(
             break;
         }
 
+        // Record the state entering this generation before anything consumes
+        // it, so the span it is about to write stays regenerable while it is
+        // still in the future.
+        resume.checkpoint(from);
+
         let (items, resume_out) = {
             let guard = catalog.map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
             crate::resolve::resolve_channel_with_resume(
@@ -734,6 +787,22 @@ async fn pattern_catch_up(
                 &resume,
             )?
         };
+
+        if items.is_empty() {
+            // Every pool has dropped out — the channel has played all the
+            // content it had. Not an error (see `resolve_channel_with_resume`):
+            // say so once per catch-up and stop, rather than failing every
+            // roll tick forever.
+            tracing::info!(
+                event = "pattern.exhausted",
+                channel = %channel.name,
+                phase = phase,
+                covered_through = %from,
+                "every pool has run out under wrap = \"drop\"; nothing further to schedule until new content appears",
+            );
+            resume.checkpoints.pop();
+            break;
+        }
 
         let (durations, _) = cache.resolve_all(&items).await?;
         let rule = crate::rule::Sequential::new(&items, &durations)
@@ -750,6 +819,7 @@ async fn pattern_catch_up(
                 items = items.len(),
                 "generation produced no playable duration; nothing further can be emitted",
             );
+            resume.checkpoints.pop();
             break;
         }
 
@@ -771,7 +841,12 @@ async fn pattern_catch_up(
         .await?;
         log_emission(&channel.name, phase, &written, from, to);
 
+        // `resume_out` carries only pool state; the checkpoint trail is the
+        // daemon's, so it rides across rather than being replaced.
+        let checkpoints = std::mem::take(&mut resume.checkpoints);
         resume = resume_out;
+        resume.checkpoints = checkpoints;
+        resume.prune_elapsed(now);
         crate::resume::save(output, &resume).await?;
         from += span;
         generations += 1;

@@ -7,10 +7,11 @@ output_base: examples/output
 
 # Each entry is a literal path or a glob (e.g. `channels/*.yaml`), resolved
 # relative to this file's directory. A glob expands to every match.
+#
+# Deliberately a glob, not a list of filenames. Most of `channels/` is
+# gitignored (personal configs), so a committed list naming those files fails
+# to load in a fresh clone — the file it points at simply isn't there. A glob
+# always matches what is actually present: the committed sample channels in a
+# clean checkout, plus whatever personal channels a working copy adds.
 channels:
-  - channels/lavfi-test.yaml
-  - channels/diehard.yaml
-  - channels/trending.yaml
-  - channels/showcase.yaml
-  - channels/marquee.yaml
-  - channels/starwars.yaml
+  - channels/*.yaml

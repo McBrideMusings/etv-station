@@ -153,6 +153,10 @@ Instead these channels **materialize forward**. Generation is a pure function of
 
 The sidecar records, per pool, the **last-played `entry_id`** per series plus which series is next — never an index, because the resolved set churns and an index would silently mean something else after any change. An id that has vanished restarts its own series and no other. A missing or corrupt sidecar starts every pool from the top rather than failing the channel.
 
+It also carries **checkpoints**: the pool state entering each generation that has not started airing. On startup the channel rewinds to the earliest of them, deletes the emitted files from that instant forward, and regenerates them from the current config — so a config or overlay edit reaches a pattern channel without waiting for its whole written window to play out, and without losing or repeating an item. Aired and currently-airing chunks are never touched.
+
+A pattern channel whose pools have all dropped out under `wrap = "drop"` is **exhausted**, not misconfigured: it resolves to an empty list, logs that it has nothing left to schedule, and idles until new content appears. Resolving to nothing when nothing has *ever* played is still a config error.
+
 The play-history ledger — the other half of the generation model — is still open (#70). This ships the resume map only.
 
 ### Future rules (designed for, not implemented)

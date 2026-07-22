@@ -55,7 +55,9 @@ Because ETV-next is Rust and the submodule + path-dep approach is essentially fr
 
 Loop Forever is deterministic in `(anchor, items)` — same inputs always produce the same output. This is what makes config reload safe: re-rendering a future-window file in place is idempotent. Past files are immutable; only the unmaterialized window is touched on reload.
 
-A **pattern** channel (#72) is deterministic in `(catalog, config, resume_in)` instead. Its item list advances every generation by design, so an anchored loop would restart the schedule each time the list changed. These channels materialize forward: each generation writes the span after the last one and records the seam in a `.resume` sidecar, so the emitted chunk JSON is the durable timeline rather than a re-derivable rendering. That also means a pattern channel skips the startup wipe — for it, the past is a record, not a view of the current config.
+A **pattern** channel (#72) is deterministic in `(catalog, config, resume_in)` instead. Its item list advances every generation by design, so an anchored loop would restart the schedule each time the list changed. These channels materialize forward: each generation writes the span after the last one and records the seam in a `.resume` sidecar, so the emitted chunk JSON is the durable timeline rather than a re-derivable rendering.
+
+Reload still reaches them. A `LoopForever` channel just wipes and re-emits, which is free when the output is a pure function of `(anchor, items)`; a pattern channel can't, because its output depends on pool state that is consumed as it goes. So the sidecar also carries **checkpoints** — the pool state entering each not-yet-aired generation. On startup the channel rewinds to the earliest unaired checkpoint, deletes exactly the files from that instant forward, and regenerates them from the current config. What has aired, or is airing, is left alone. Without this a config or overlay edit wouldn't land until the whole written window had played out (#53).
 
 ## Time zones
 
