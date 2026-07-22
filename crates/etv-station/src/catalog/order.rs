@@ -11,7 +11,11 @@
 //!   reproducible order even when the primary key ties or is null.
 //! - Nulls sort last regardless of direction.
 //! - `manual` preserves the authored (input) order; `random` is a seeded
-//!   shuffle; `collection` reads `collection_items.position`.
+//!   shuffle.
+//! - A collection's authored sequence is *not* an order here (#107). It belongs
+//!   to the (collection, item) pair, not to the item, so a flat set of ids can't
+//!   say which collection's positions to read; it is emitted already-ordered by
+//!   the `collection` entry via `Catalog::collection_members`.
 
 use crate::config::{Dir, FieldSort};
 
@@ -123,9 +127,7 @@ mod tests {
     #[test]
     fn release_date_asc_with_tiebreaker() {
         let (c, ids) = seeded();
-        let got = c
-            .resolve_order(&ids, &ord("release_date:asc"), 0, None)
-            .unwrap();
+        let got = c.resolve_order(&ids, &ord("release_date:asc"), 0).unwrap();
         // 2001 pair first, ordered by entry_id (…737 < …999); then 2002, 2003.
         assert_eq!(
             got,
@@ -141,9 +143,7 @@ mod tests {
     #[test]
     fn descending_reverses_but_keeps_entry_id_tiebreak_ascending() {
         let (c, ids) = seeded();
-        let got = c
-            .resolve_order(&ids, &ord("release_date:desc"), 0, None)
-            .unwrap();
+        let got = c.resolve_order(&ids, &ord("release_date:desc"), 0).unwrap();
         // 2003, 2002, then the 2001 pair — still entry_id-ascending within the tie.
         assert_eq!(
             got,
@@ -166,11 +166,11 @@ mod tests {
         c.upsert_entry(&e).unwrap();
         let ids = vec!["a".to_string(), "b".to_string()];
         assert_eq!(
-            c.resolve_order(&ids, &ord("year:asc"), 0, None).unwrap(),
+            c.resolve_order(&ids, &ord("year:asc"), 0).unwrap(),
             vec!["b", "a"]
         );
         assert_eq!(
-            c.resolve_order(&ids, &ord("year:desc"), 0, None).unwrap(),
+            c.resolve_order(&ids, &ord("year:desc"), 0).unwrap(),
             vec!["b", "a"]
         );
     }
@@ -185,7 +185,7 @@ mod tests {
         ];
         let _ = ids;
         assert_eq!(
-            c.resolve_order(&authored, &Order::Manual, 0, None).unwrap(),
+            c.resolve_order(&authored, &Order::Manual, 0).unwrap(),
             authored
         );
     }
@@ -193,8 +193,8 @@ mod tests {
     #[test]
     fn random_is_deterministic_per_seed_and_a_permutation() {
         let (c, ids) = seeded();
-        let a = c.resolve_order(&ids, &Order::Random, 42, None).unwrap();
-        let b = c.resolve_order(&ids, &Order::Random, 42, None).unwrap();
+        let a = c.resolve_order(&ids, &Order::Random, 42).unwrap();
+        let b = c.resolve_order(&ids, &Order::Random, 42).unwrap();
         assert_eq!(a, b, "same seed must reproduce the order");
         let mut sorted = a.clone();
         sorted.sort();
@@ -203,8 +203,12 @@ mod tests {
         assert_eq!(sorted, expect, "shuffle must be a permutation of the input");
     }
 
+    /// Collection order is not an [`Order`] at all (#107) — it is read straight
+    /// off the collection, in stored `position` order, by the entry that names
+    /// it. Kept here because this module documents the ordering contract, and
+    /// "position order lives over there" is part of it.
     #[test]
-    fn collection_reads_position_order_with_entry_id_tiebreak() {
+    fn collection_members_read_in_position_order_with_entry_id_tiebreak() {
         let (c, _ids) = seeded();
         c.upsert_collection(&Collection {
             collection_id: "coll".into(),
@@ -216,37 +220,13 @@ mod tests {
         c.add_collection_item("coll", "imdb:tt0120737", 1).unwrap();
         // Shared position 1 → entry_id ascending breaks the tie: tt0120737 < tt0167261.
         c.add_collection_item("coll", "imdb:tt0167261", 1).unwrap();
-        // The resolved set must be exactly the members (the containment guard
-        // rejects the seed's decoy entry, which isn't in the collection).
-        let members = vec![
-            "imdb:tt0167260".to_string(),
-            "imdb:tt0120737".to_string(),
-            "imdb:tt0167261".to_string(),
-        ];
-        let got = c
-            .resolve_order(&members, &Order::Collection, 0, Some("coll"))
-            .unwrap();
         assert_eq!(
-            got,
+            c.collection_members("coll").unwrap(),
             vec!["imdb:tt0167260", "imdb:tt0120737", "imdb:tt0167261"]
         );
-    }
-
-    #[test]
-    fn collection_order_errors_when_set_is_not_fully_contained() {
-        let (c, ids) = seeded();
-        c.upsert_collection(&Collection {
-            collection_id: "coll".into(),
-            name: "Partial".into(),
-            source: Source::Plex,
-        })
-        .unwrap();
-        // Only one of the resolved entries is actually a collection member.
-        c.add_collection_item("coll", "imdb:tt0120737", 0).unwrap();
-        let e = c
-            .resolve_order(&ids, &Order::Collection, 0, Some("coll"))
-            .unwrap_err();
-        assert!(e.to_string().contains("not members of"), "got {e}");
+        // The seed's decoy entry is not a member, so it simply isn't emitted —
+        // there is no resolved set to reconcile against.
+        assert_eq!(c.collection_members("coll").unwrap().len(), 3);
     }
 
     #[test]
@@ -260,7 +240,7 @@ mod tests {
         }
         let ids = vec!["e21".to_string(), "e13".to_string(), "e11".to_string()];
         let got = c
-            .resolve_order(&ids, &ord("season:asc,episode:asc"), 0, None)
+            .resolve_order(&ids, &ord("season:asc,episode:asc"), 0)
             .unwrap();
         assert_eq!(got, vec!["e11", "e13", "e21"]);
     }
@@ -268,33 +248,22 @@ mod tests {
     #[test]
     fn non_sortable_field_is_an_error() {
         let (c, ids) = seeded();
-        let e = c
-            .resolve_order(&ids, &ord("genres:asc"), 0, None)
-            .unwrap_err();
+        let e = c.resolve_order(&ids, &ord("genres:asc"), 0).unwrap_err();
         assert!(e.to_string().contains("not a sortable scalar field"));
     }
 
     #[test]
     fn score_order_is_unsupported() {
         let (c, ids) = seeded();
-        let e = c.resolve_order(&ids, &Order::Score, 0, None).unwrap_err();
+        let e = c.resolve_order(&ids, &Order::Score, 0).unwrap_err();
         assert!(e.to_string().contains("score"));
-    }
-
-    #[test]
-    fn collection_order_without_context_is_an_error() {
-        let (c, ids) = seeded();
-        let e = c
-            .resolve_order(&ids, &Order::Collection, 0, None)
-            .unwrap_err();
-        assert!(e.to_string().contains("collection"));
     }
 
     #[test]
     fn empty_input_is_empty_output() {
         let (c, _) = seeded();
         assert!(
-            c.resolve_order(&[], &ord("year:asc"), 0, None)
+            c.resolve_order(&[], &ord("year:asc"), 0)
                 .unwrap()
                 .is_empty()
         );

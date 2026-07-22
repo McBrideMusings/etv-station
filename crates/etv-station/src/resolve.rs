@@ -9,8 +9,11 @@
 //!
 //! `query` entries resolve against the [`Catalog`] (#68 CEL→SQL) and each
 //! resolved `entry_id` becomes a `ResolvedItem`; `order` is applied by the
-//! order engine (#69). A channel with no query entries and `manual` order needs
-//! no catalog, so `catalog` is optional.
+//! order engine (#69). `collection` entries also resolve against the catalog
+//! but arrive *already ordered* — their sequence is the collection's stored
+//! `position`, so the order step leaves them alone (#107). A channel with no
+//! catalog-backed entries and `manual` order needs no catalog, so `catalog` is
+//! optional.
 //!
 //! Still rejected with a clear `unsupported` error (later issues): `include`
 //! entries, a non-empty block `filter`, and a block `fallback` (its schema is a
@@ -26,8 +29,8 @@ use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
 use crate::catalog::{Catalog, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, Duplicates, Entry, ItemEntry, Mode, Order, QueryEntry,
-    SourceConfig,
+    BlockInclude, ChannelConfig, CollectionEntry, Duplicates, Entry, ItemEntry, Mode, Order,
+    QueryEntry, SourceConfig,
 };
 use crate::errors::ConfigError;
 
@@ -107,14 +110,6 @@ fn resolve_block(
             "block #{idx}: [filter] resolution is not implemented yet (#69)"
         )));
     }
-    // `collection` order needs the block to know which collection its set came
-    // from — that context isn't wired into resolution yet (#71 follow-up), so a
-    // block-level collection sort would otherwise fail deep in the order engine.
-    if include.order == Order::Collection {
-        return Err(unsupported(format!(
-            "block #{idx}: order = \"collection\" is not wired yet (needs block collection context)"
-        )));
-    }
 
     let defaults = include.program();
 
@@ -132,6 +127,16 @@ fn resolve_block(
                     ))
                 })?;
                 let resolved = resolve_query(cat, query, defaults, seed)
+                    .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                items.extend(resolved);
+            }
+            Entry::Collection(collection) => {
+                let cat = catalog.ok_or_else(|| {
+                    unsupported(format!(
+                        "block #{idx}: a collection entry needs the catalog, which is not available"
+                    ))
+                })?;
+                let resolved = resolve_collection(cat, collection, defaults)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                 items.extend(resolved);
             }
@@ -184,10 +189,49 @@ fn resolve_query(
         .map_err(|e| e.to_string())?;
     if let Some(order) = &query.order {
         ids = catalog
-            .resolve_order(&ids, order, seed, None)
+            .resolve_order(&ids, order, seed)
             .map_err(|e| e.to_string())?;
     }
     ids.iter()
+        .map(|id| catalog_item(catalog, id, defaults))
+        .collect()
+}
+
+/// Resolve a `collection` entry: look the collection up by name and emit its
+/// members in stored `collection_items.position` order.
+///
+/// No ordering step is involved — the run arrives ordered out of the catalog,
+/// and the block's default `manual` order preserves it. That is the whole point
+/// of collection being an entry kind rather than an `order` value (#107): the
+/// authored sequence never has to survive a round-trip through a flat id set.
+fn resolve_collection(
+    catalog: &Catalog,
+    entry: &CollectionEntry,
+    defaults: Option<&ProgramMetadata>,
+) -> Result<Vec<ResolvedItem>, String> {
+    let mut ids = catalog
+        .collection_ids_by_name(&entry.name)
+        .map_err(|e| e.to_string())?;
+    let collection_id = match ids.len() {
+        1 => ids.remove(0),
+        0 => {
+            return Err(format!(
+                "no collection named {:?} in the catalog",
+                entry.name
+            ));
+        }
+        n => {
+            return Err(format!(
+                "{n} collections are named {:?} — a collection entry must name exactly one",
+                entry.name
+            ));
+        }
+    };
+    let members = catalog
+        .collection_members(&collection_id)
+        .map_err(|e| e.to_string())?;
+    members
+        .iter()
         .map(|id| catalog_item(catalog, id, defaults))
         .collect()
 }
@@ -201,7 +245,7 @@ fn apply_order(
 ) -> Result<Vec<ResolvedItem>, String> {
     let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
     let ordered = catalog
-        .resolve_order(&ids, order, seed, None)
+        .resolve_order(&ids, order, seed)
         .map_err(|e| e.to_string())?;
     Ok(reorder_to(items, &ordered))
 }
@@ -628,7 +672,9 @@ mod tests {
     // ---- catalog-backed pipeline (#71) ------------------------------------
 
     use crate::catalog::ingest::canonical_index;
-    use crate::catalog::{Catalog, Entry as CatEntry, EntrySource, Source};
+    use crate::catalog::{
+        Catalog, Collection as CatCollection, Entry as CatEntry, EntrySource, Source,
+    };
     use crate::config::QueryEntry;
 
     fn seeded_catalog() -> Catalog {
@@ -711,12 +757,113 @@ mod tests {
         );
     }
 
+    // ---- collection entries (#107) ----------------------------------------
+
+    /// The seeded catalog plus a "Halloween Marathon" collection whose authored
+    /// positions deliberately contradict both release order and `entry_id`
+    /// order, so a passing test can only be reading `position`.
+    fn catalog_with_marathon() -> Catalog {
+        let c = seeded_catalog();
+        c.upsert_collection(&CatCollection {
+            collection_id: "plex:coll:1".into(),
+            name: "Halloween Marathon".into(),
+            source: Source::Plex,
+        })
+        .unwrap();
+        c.add_collection_item("plex:coll:1", "imdb:tt0167260", 0)
+            .unwrap(); // Return of the King first
+        c.add_collection_item("plex:coll:1", "imdb:tt0120737", 1)
+            .unwrap(); // then Fellowship
+        c.add_collection_item("plex:coll:1", "imdb:tt0167261", 2)
+            .unwrap(); // then Two Towers
+        c
+    }
+
+    fn collection_block(name: &str) -> BlockInclude {
+        include_with(vec![Entry::Collection(CollectionEntry {
+            name: name.into(),
+        })])
+    }
+
     #[test]
-    fn block_collection_order_errors_clearly() {
-        let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
-        inc.order = Order::Collection;
+    fn collection_entry_plays_members_in_authored_position_order() {
+        let cat = catalog_with_marathon();
+        let inc = collection_block("Halloween Marathon");
+        // Block order is left at its `manual` default — the run is already
+        // ordered, and nothing re-sorts it.
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0167260", "imdb:tt0120737", "imdb:tt0167261"]
+        );
+        // Catalog-backed like a query result: metadata and playback path resolved.
+        assert_eq!(items[0].program.as_ref().unwrap().year, Some(2003));
+        match &items[0].source {
+            SourceConfig::Local { path } => assert!(path.ends_with("tt0167260.mkv")),
+            other => panic!("expected local source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_entry_composes_with_other_entries_in_authored_order() {
+        // A bumper, then the marathon. The block stays `manual`, so the bumper
+        // leads and the collection's internal order survives intact.
+        let cat = catalog_with_marathon();
+        let inc = include_with(vec![
+            Entry::Item(item_entry("bumper")),
+            Entry::Collection(CollectionEntry {
+                name: "Halloween Marathon".into(),
+            }),
+        ]);
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "lavfi:bumper",
+                "imdb:tt0167260",
+                "imdb:tt0120737",
+                "imdb:tt0167261"
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_collection_name_errors() {
+        let cat = catalog_with_marathon();
+        let inc = collection_block("Nonesuch");
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(
+            format!("{err}").contains("no collection named"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_collection_name_errors() {
+        // Two sources each define a collection of the same name — the entry
+        // names one collection, so this is a config error, not a merge.
+        let cat = catalog_with_marathon();
+        cat.upsert_collection(&CatCollection {
+            collection_id: "plex:coll:2".into(),
+            name: "Halloween Marathon".into(),
+            source: Source::Plex,
+        })
+        .unwrap();
+        let inc = collection_block("Halloween Marathon");
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(
+            format!("{err}").contains("must name exactly one"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn collection_entry_without_catalog_errors() {
+        let inc = collection_block("Halloween Marathon");
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap_err();
-        assert!(format!("{err}").contains("collection"), "err = {err}");
+        assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
 
     #[test]

@@ -71,9 +71,13 @@ impl Catalog {
     /// - `Manual` returns the input (authored) order unchanged.
     /// - `Random` is a deterministic seeded shuffle (`seed` supplied by the
     ///   caller; a pinned seed reproduces the order).
-    /// - `Collection` reads `collection_items.position` for `collection_id`
-    ///   (required — the set must be one collection); missing context is an error.
     /// - `Score` is not yet implemented (a separate plugin issue).
+    ///
+    /// Every case here is a function of the ids themselves. Collection order is
+    /// deliberately absent: it depends on *which* collection the set came from,
+    /// which a flat id list cannot carry, so it is read at the entry that names
+    /// the collection ([`Self::collection_members`]) rather than sorted here
+    /// (#107).
     ///
     /// An empty input yields an empty output.
     pub fn resolve_order(
@@ -81,7 +85,6 @@ impl Catalog {
         ids: &[String],
         order: &Order,
         seed: u64,
-        collection_id: Option<&str>,
     ) -> Result<Vec<String>, CatalogError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -97,38 +100,6 @@ impl Catalog {
                 shuffled.sort();
                 order::seeded_shuffle(&mut shuffled, seed);
                 Ok(shuffled)
-            }
-            Order::Collection => {
-                let collection_id = collection_id.ok_or_else(|| {
-                    CatalogError::Query(
-                        "collection order needs a single-collection context".to_string(),
-                    )
-                })?;
-                let placeholders = vec!["?"; ids.len()].join(", ");
-                let sql = format!(
-                    "SELECT ci.entry_id FROM collection_items ci \
-                     WHERE ci.collection_id = ? AND ci.entry_id IN ({placeholders}) \
-                     ORDER BY ci.position, ci.entry_id"
-                );
-                let mut params: Vec<Value> = Vec::with_capacity(ids.len() + 1);
-                params.push(Value::Text(collection_id.to_string()));
-                params.extend(ids.iter().map(|s| Value::Text(s.clone())));
-                let ordered = self.ordered_ids(&sql, params)?;
-                // #69: `collection` order is valid only when the whole resolved
-                // set belongs to the collection. A member missing from it would
-                // otherwise silently truncate the playlist — that's a config
-                // error, not a shorter list.
-                let distinct: std::collections::HashSet<&str> =
-                    ids.iter().map(String::as_str).collect();
-                if ordered.len() < distinct.len() {
-                    return Err(CatalogError::Query(format!(
-                        "collection order: {} of {} resolved entries are not members of \
-                         collection {collection_id:?}",
-                        distinct.len() - ordered.len(),
-                        distinct.len(),
-                    )));
-                }
-                Ok(ordered)
             }
             Order::Fields(terms) => {
                 let clause = order::order_by_clause(terms)?;
@@ -392,6 +363,16 @@ impl Catalog {
             "SELECT entry_id FROM collection_items WHERE collection_id = ?1
              ORDER BY position, entry_id",
             params![collection_id],
+        )
+    }
+
+    /// Collection ids carrying `name`, ascending. A name is not unique — two
+    /// sources can each define a "Halloween Marathon" — so this returns every
+    /// match and leaves "missing" and "ambiguous" for the caller to phrase.
+    pub fn collection_ids_by_name(&self, name: &str) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT collection_id FROM collections WHERE name = ?1 ORDER BY collection_id",
+            params![name],
         )
     }
 

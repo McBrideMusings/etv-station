@@ -30,8 +30,16 @@ pub struct FieldSort {
 ///
 /// - `field:dir` (e.g. `release_date:desc`), compound comma-separated
 ///   (`season:asc,episode:asc`); a bare field defaults to `:asc`.
-/// - bare keywords: `manual` (authored file order), `random`, `collection`
-///   (Plex collection position), `score` (plugin-ranked).
+/// - bare keywords: `manual` (authored file order), `random`, `score`
+///   (plugin-ranked).
+///
+/// Every variant here is computable from the items themselves — their columns,
+/// the authored list, or the set plus a seed. A collection's authored sequence
+/// is deliberately *not* one of them: `collection_items.position` belongs to the
+/// (collection, item) pair, not to the item, so a flat set handed to a sort no
+/// longer knows which collection's positions to read. That order rides on the
+/// entry that names the collection instead — see
+/// [`CollectionEntry`](super::entry::CollectionEntry) (#107).
 ///
 /// An implicit `entry_id` tiebreaker and null-handling are the resolution
 /// engine's concern (#69); this type only captures the parsed shape.
@@ -40,7 +48,6 @@ pub enum Order {
     #[default]
     Manual,
     Random,
-    Collection,
     Score,
     Fields(Vec<FieldSort>),
 }
@@ -51,8 +58,18 @@ impl Order {
         match s {
             "manual" => return Ok(Order::Manual),
             "random" => return Ok(Order::Random),
-            "collection" => return Ok(Order::Collection),
             "score" => return Ok(Order::Score),
+            // Named explicitly so the removed keyword fails loudly here rather
+            // than falling through to the field-sort branch and surfacing much
+            // later as "cannot order by item.collection".
+            "collection" => {
+                return Err(
+                    "order = \"collection\" was removed (#107): a collection's authored \
+                     order belongs to the collection, not to the items, so it rides on a \
+                     kind = \"collection\" entry instead of on a block's order"
+                        .to_string(),
+                );
+            }
             _ => {}
         }
 
@@ -92,7 +109,6 @@ impl Order {
         match self {
             Order::Manual => "manual".to_string(),
             Order::Random => "random".to_string(),
-            Order::Collection => "collection".to_string(),
             Order::Score => "score".to_string(),
             Order::Fields(terms) => terms
                 .iter()
@@ -134,8 +150,13 @@ mod tests {
     fn bare_keywords() {
         assert_eq!(parse("manual"), Order::Manual);
         assert_eq!(parse("random"), Order::Random);
-        assert_eq!(parse("collection"), Order::Collection);
         assert_eq!(parse("score"), Order::Score);
+    }
+
+    #[test]
+    fn collection_keyword_is_rejected_with_a_pointer_to_the_entry_kind() {
+        let err = Order::parse("collection").unwrap_err();
+        assert!(err.contains("kind = \"collection\" entry"), "err = {err}");
     }
 
     #[test]
