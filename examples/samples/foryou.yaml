@@ -51,6 +51,14 @@ rule:
     - mode: "all"
       program:
         title: "For You"
+
+      # No `constraints: no_repeat_within` here, deliberately. It would be the
+      # natural way to stop a scorer with no replay policy from playing one film
+      # forever — but the adjacency pass runs over the whole flattened list and
+      # is blind to which pattern slot an item came from, so it repairs a repeat
+      # by swapping an episode into a movie slot and destroys the 2+3 shape.
+      # Replay policy on this channel therefore lives entirely in the plugin.
+      # See #115.
       pools:
         # Movies the plugin thinks are worth surfacing right now. No `order` —
         # the plugin returns its set already ranked, and re-sorting it would

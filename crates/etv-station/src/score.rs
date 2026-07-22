@@ -41,7 +41,8 @@
 //! (genres, cast, labels, …), so extending an algorithm to weigh a new signal
 //! is a script edit, never a rebuild.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use rhai::{Array, Dynamic, Engine, Map, Scope};
 
@@ -103,6 +104,30 @@ const EXPOSED_TAGS: &[(&str, TagNs)] = &[
     ("countries", TagNs::Country),
 ];
 
+/// One generation's compiled scripts and resolved query sets, keyed by script
+/// path.
+///
+/// A channel commonly points several pools at the same script — a `movies` pool
+/// and a `shows` pool ranked by the same taste — and `sources()` takes no
+/// arguments, so what it declares cannot vary by pool. Without this each pool
+/// would recompile the script and re-run every declared query, materializing
+/// the same slice of the library once per pool.
+///
+/// Scoped to a single generation and dropped with it, so a catalog that changes
+/// between generations is picked up on the next one.
+#[derive(Debug, Default)]
+pub struct ScoreCache {
+    entries: HashMap<PathBuf, CachedScript>,
+}
+
+#[derive(Debug)]
+struct CachedScript {
+    ast: rhai::AST,
+    /// The resolved sets, already a shared Rhai value, so handing it to a
+    /// second pool costs a refcount rather than a deep copy of every item map.
+    sets: Dynamic,
+}
+
 /// A scorer plugin's inputs plus the directory its path is relative to.
 ///
 /// `base_dir` is the channel config file's directory, matching how a `block:`
@@ -139,10 +164,8 @@ pub fn run(
     script_path: &Path,
     inputs: &ScoreInputs,
     pool_name: &str,
+    cache: &mut ScoreCache,
 ) -> Result<Vec<String>, String> {
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
-
     let mut engine = Engine::new();
     // Set the nesting limits explicitly. Rhai's defaults are lower in a debug
     // build than a release one, so leaving them alone means a plugin that
@@ -151,42 +174,19 @@ pub fn run(
     // ordinary scripts and still bounded, so a runaway nesting depth fails to
     // compile rather than overflowing the stack.
     engine.set_max_expr_depths(128, 64);
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
+
+    if !cache.entries.contains_key(script_path) {
+        let cached = compile_and_resolve(catalog, &engine, script_path)?;
+        cache.entries.insert(script_path.to_path_buf(), cached);
+    }
+    let cached = &cache.entries[script_path];
+    let ast = &cached.ast;
+    let sets = cached.sets.clone();
 
     let mut scope = Scope::new();
-    let sources: Map = engine
-        .call_fn(&mut scope, &ast, "sources", ())
-        .map_err(|e| format!("scorer plugin {}: sources(): {e}", script_path.display()))?;
-
-    // Resolve every declared query once, up front. A bad expression fails here,
-    // before any ranking work, and names the source it came from.
-    let mut sets = Map::new();
-    for (name, expr) in sources {
-        let cel = expr.into_string().map_err(|actual| {
-            format!(
-                "scorer plugin {}: source {name:?} must be a CEL string, got {actual}",
-                script_path.display()
-            )
-        })?;
-        let ids = catalog.resolve_query(&cel).map_err(|e| {
-            format!(
-                "scorer plugin {}: source {name:?} ({cel}): {e}",
-                script_path.display()
-            )
-        })?;
-        let items = load_items(catalog, &ids).map_err(|e| {
-            format!(
-                "scorer plugin {}: source {name:?}: {e}",
-                script_path.display()
-            )
-        })?;
-        sets.insert(name, Dynamic::from_array(items));
-    }
 
     let mut ctx = Map::new();
-    ctx.insert("sets".into(), Dynamic::from_map(sets));
+    ctx.insert("sets".into(), sets);
     // Which pool is asking. One script commonly serves several pools of the
     // same channel — a "movies" pool and a "shows" pool ranked by the same
     // taste — and without this the script cannot tell them apart, so both
@@ -221,7 +221,7 @@ pub fn run(
     );
 
     let picked: Array = engine
-        .call_fn(&mut scope, &ast, "pick", (Dynamic::from_map(ctx),))
+        .call_fn(&mut scope, ast, "pick", (Dynamic::from_map(ctx),))
         .map_err(|e| format!("scorer plugin {}: pick(): {e}", script_path.display()))?;
 
     let mut out = Vec::with_capacity(picked.len());
@@ -252,6 +252,58 @@ pub fn run(
         ));
     }
     Ok(out)
+}
+
+/// Compile a script and resolve every query its `sources()` declares.
+///
+/// Runs once per script per generation. A bad expression fails here — before
+/// any ranking work, and before any pool has drawn — naming the source it came
+/// from rather than surfacing as a mystery empty pool later.
+fn compile_and_resolve(
+    catalog: &Catalog,
+    engine: &Engine,
+    script_path: &Path,
+) -> Result<CachedScript, String> {
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
+    let ast = engine
+        .compile(&source)
+        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
+
+    let mut scope = Scope::new();
+    let sources: Map = engine
+        .call_fn(&mut scope, &ast, "sources", ())
+        .map_err(|e| format!("scorer plugin {}: sources(): {e}", script_path.display()))?;
+
+    let mut sets = Map::new();
+    for (name, expr) in sources {
+        let cel = expr.into_string().map_err(|actual| {
+            format!(
+                "scorer plugin {}: source {name:?} must be a CEL string, got {actual}",
+                script_path.display()
+            )
+        })?;
+        let ids = catalog.resolve_query(&cel).map_err(|e| {
+            format!(
+                "scorer plugin {}: source {name:?} ({cel}): {e}",
+                script_path.display()
+            )
+        })?;
+        let items = load_items(catalog, &ids).map_err(|e| {
+            format!(
+                "scorer plugin {}: source {name:?}: {e}",
+                script_path.display()
+            )
+        })?;
+        sets.insert(name, Dynamic::from_array(items));
+    }
+
+    Ok(CachedScript {
+        ast,
+        // Shared, so a second pool pointed at this script gets a refcount bump
+        // rather than a deep copy of every item map.
+        sets: Dynamic::from_map(sets).into_shared(),
+    })
 }
 
 /// Load each id as a Rhai map: every column on `entries`, plus every exposed
@@ -347,7 +399,14 @@ fn pick(ctx) {
 }
 "#,
         );
-        let got = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap();
+        let got = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(got, vec!["m2", "m1"]);
     }
 
@@ -370,7 +429,14 @@ fn pick(ctx) {
 "#,
         );
         assert_eq!(
-            run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap(),
+            run(
+                &catalog(),
+                &p,
+                &ScoreInputs::default(),
+                "test",
+                &mut Default::default()
+            )
+            .unwrap(),
             ["m1"]
         );
     }
@@ -397,7 +463,10 @@ fn pick(ctx) {
             recent: vec!["m1".into()],
             ..Default::default()
         };
-        assert_eq!(run(&catalog(), &p, &inputs, "test").unwrap(), ["m2"]);
+        assert_eq!(
+            run(&catalog(), &p, &inputs, "test", &mut Default::default()).unwrap(),
+            ["m2"]
+        );
     }
 
     #[test]
@@ -407,7 +476,14 @@ fn pick(ctx) {
             &dir,
             "fn sources() { #{ broken: `item.nope == 1` } }\nfn pick(ctx) { [] }\n",
         );
-        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
+        let e = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            &mut Default::default(),
+        )
+        .unwrap_err();
         assert!(e.contains("broken"), "got {e}");
     }
 
@@ -415,7 +491,14 @@ fn pick(ctx) {
     fn an_empty_pick_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [] }\n");
-        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
+        let e = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            &mut Default::default(),
+        )
+        .unwrap_err();
         assert!(e.contains("picked nothing"), "got {e}");
     }
 
@@ -426,7 +509,14 @@ fn pick(ctx) {
             &dir,
             "fn sources() { #{} }\nfn pick(ctx) { [\"m1\", \"m1\"] }\n",
         );
-        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
+        let e = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            &mut Default::default(),
+        )
+        .unwrap_err();
         assert!(e.contains("more than once"), "got {e}");
     }
 
@@ -434,7 +524,14 @@ fn pick(ctx) {
     fn a_missing_pick_function_names_the_plugin() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn sources() { #{} }\n");
-        let e = run(&catalog(), &p, &ScoreInputs::default(), "test").unwrap_err();
+        let e = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            &mut Default::default(),
+        )
+        .unwrap_err();
         assert!(e.contains("pick()"), "got {e}");
     }
 }

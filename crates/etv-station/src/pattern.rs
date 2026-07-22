@@ -254,9 +254,19 @@ pub fn build(
     seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
 ) -> Result<(Vec<String>, BTreeMap<String, PoolResume>), String> {
+    // One cache for the whole generation: pools pointed at the same script
+    // share its compiled AST and its resolved query sets instead of each
+    // re-running every query the script declares.
+    let mut score_cache = crate::score::ScoreCache::default();
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
     for cfg in pools {
-        runtimes.push(resolve_pool(catalog, cfg, state, score_env)?);
+        runtimes.push(resolve_pool(
+            catalog,
+            cfg,
+            state,
+            score_env,
+            &mut score_cache,
+        )?);
     }
 
     let mut by_name: HashMap<&str, usize> = HashMap::new();
@@ -339,6 +349,7 @@ fn resolve_pool<'a>(
     cfg: &'a Pool,
     state: &GenerationState,
     score_env: crate::score::ScoreEnv<'_>,
+    score_cache: &mut crate::score::ScoreCache,
 ) -> Result<PoolRuntime<'a>, String> {
     // A pool draws its items from a CEL expression or from a scorer plugin,
     // never both (validated at load). A plugin returns its set already ranked —
@@ -358,7 +369,7 @@ fn resolve_pool<'a>(
         }
         (None, Some(plugin)) => {
             let path = score_env.resolve_path(plugin);
-            crate::score::run(catalog, &path, score_env.inputs, &cfg.name)
+            crate::score::run(catalog, &path, score_env.inputs, &cfg.name, score_cache)
                 .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
         }
         // Both, or neither, is rejected at load; a pool that reaches here in

@@ -52,10 +52,11 @@ fn pick(ctx) {
         for item in ctx.sets[name] {
             // Kept as two statements: an object literal whose value is itself a
             // call trips Rhai's expression-complexity limit.
-            let s = score_item(item, ctx);
-            // `aired` is kept alongside the score so the all-suppressed
-            // fallback below can rank by staleness without recomputing it.
+            // Where this item sits in the recently-aired tail, computed once:
+            // both the score and the all-suppressed fallback below need it, and
+            // it is a scan of the whole tail per item.
             let a = index_of_recent(ctx.recent, item.entry_id);
+            let s = score_item(item, ctx, a);
             scored.push(#{ id: item.entry_id, score: s, aired: a });
         }
     }
@@ -100,10 +101,9 @@ fn pick(ctx) {
     out
 }
 
-fn score_item(item, ctx) {
+fn score_item(item, ctx, aired_at) {
     // Anything this channel aired recently is out entirely. `ctx.recent` is
     // ordered oldest-first, so a position near the end is a very recent airing.
-    let aired_at = index_of_recent(ctx.recent, item.entry_id);
     if aired_at >= 0 {
         let staleness = ctx.recent.len - aired_at;
         if staleness < replay_ttl_days() { return 0.0; }
