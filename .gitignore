@@ -33,3 +33,4 @@ examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml
 examples/overlays/scripts/
 .claude/scheduled_tasks.lock
+*.local.*
