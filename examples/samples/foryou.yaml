@@ -30,12 +30,12 @@
 # most hours stale when it airs. A 30-day window would rank once and air the
 # result a month later, against watch history a month out of date.
 #
-# Lives in examples/samples/, not examples/channels/, so the dev station never
-# registers it: it needs a populated catalog, the daemon-side catalog wiring
-# (#96), and a reachable Tautulli. Its resolution is proven by the
+# Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
+# dev-run serves it live. It resolves to nothing unless the station's
+# `catalog_path` points at a populated catalog, and its ranking degrades to
+# arbitrary without a reachable Tautulli. Its resolution is also proven by the
 # `foryou_sample` acceptance test.
 window_days: 1
-chunk_hours: 6
 roll_interval: "60s"
 retention_days: 1
 

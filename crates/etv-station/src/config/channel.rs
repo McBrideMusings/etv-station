@@ -145,7 +145,7 @@ fn default_window_days() -> u32 {
     30
 }
 fn default_chunk_hours() -> u32 {
-    24
+    6
 }
 fn default_roll_interval() -> Duration {
     Duration::from_secs(3600)

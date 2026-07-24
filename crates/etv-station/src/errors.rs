@@ -73,6 +73,13 @@ pub enum StationError {
         source: serde_json::Error,
     },
 
+    #[error("playout chunk {path} corrupt: {source}")]
+    PlayoutCorrupt {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("invalid playout filename {name}: {reason}")]
     BadFilename { name: String, reason: String },
 

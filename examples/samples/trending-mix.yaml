@@ -24,12 +24,11 @@
 # into broadcast order AND fixes the rotation order of the shows themselves
 # (series rotate in order of first appearance in the ordered set).
 #
-# Lives in examples/samples/, not examples/channels/, so the dev station never
-# registers it: a query channel needs a populated catalog + the daemon-side
-# catalog wiring (#96) to run live. Its resolution is proven by the
-# `trending_mix_sample` acceptance test.
+# Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
+# dev-run serves it live. Being a query channel it resolves to nothing
+# unless the station's `catalog_path` points at a populated catalog. Its
+# resolution is also proven by the `trending_mix_sample` acceptance test.
 window_days: 1
-chunk_hours: 6
 roll_interval: "60s"
 retention_days: 1
 

@@ -1,6 +1,9 @@
 name: test
 window_days: 1
-chunk_hours: 6
+# Deliberately overrides the 6h default to 1h — the one committed channel that
+# exercises a non-default chunk size, so chunking is checked at !=6 on every
+# dev-run. See ADR 0003.
+chunk_hours: 1
 roll_interval: "60s"
 retention_days: 1
 

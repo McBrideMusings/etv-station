@@ -4,12 +4,11 @@
 # the catalog (#68) and plays the results oldest-first by release date (#69),
 # with the `entry_id` tiebreaker making the order deterministic.
 #
-# Not registered in examples/station.yaml: a query channel needs a populated
-# catalog and the daemon-side catalog wiring (#96) to run in a dev-run. Its
-# resolution is proven by the `lotr_sample` acceptance test, which resolves this
-# exact file against a fixture catalog.
+# Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
+# dev-run serves it live. Being a query channel it resolves to nothing
+# unless the station's `catalog_path` points at a populated catalog. Its
+# resolution is also proven by the `lotr_sample` acceptance test.
 window_days: 1
-chunk_hours: 6
 roll_interval: "60s"
 retention_days: 1
 
