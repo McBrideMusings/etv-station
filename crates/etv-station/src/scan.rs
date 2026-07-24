@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use ersatztv_playout::playout::DATE_FORMAT;
+use ersatztv_playout::playout::{DATE_FORMAT, Playout};
 use time::OffsetDateTime;
 
 use crate::errors::StationError;
@@ -109,6 +109,71 @@ pub async fn sweep_retention(folder: &Path, retention_days: u32, now: OffsetDate
     removed
 }
 
+/// The earliest instant in `[now, horizon)` that no scheduled item covers, when
+/// a later item *does* cover something after it — i.e. an interior hole in the
+/// timeline, the kind that airs as black. `None` means the window is covered
+/// contiguously from `now` up to wherever content currently reaches.
+///
+/// Coverage is read from item spans, not filenames, so a file whose name
+/// over-claims (the very defect this exists to catch) cannot hide a hole. A
+/// purely trailing edge — content simply stops and nothing follows — is *not* a
+/// gap: that is the un-materialized frontier the roll tick extends, not damage.
+///
+/// `horizon` bounds the scan: a small near-future horizon on a roll tick is
+/// cheap and still catches a hole before the playhead reaches it, while a
+/// full-window horizon at startup repairs damage already on disk in one pass.
+pub async fn first_coverage_gap(
+    folder: &Path,
+    now: OffsetDateTime,
+    horizon: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>, StationError> {
+    if horizon <= now {
+        return Ok(None);
+    }
+    let files = scan_output_folder(folder).await?;
+
+    // Gather item spans overlapping [now, horizon]. The filename span only
+    // decides which files are worth opening; the hole test uses item times.
+    let mut spans: Vec<(OffsetDateTime, OffsetDateTime)> = Vec::new();
+    for f in &files {
+        if f.finish <= now || f.start >= horizon {
+            continue;
+        }
+        let bytes = tokio::fs::read(&f.path)
+            .await
+            .map_err(|source| StationError::Io {
+                path: f.path.clone(),
+                source,
+            })?;
+        let playout: Playout =
+            serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
+                path: f.path.clone(),
+                source,
+            })?;
+        for item in playout.items {
+            if item.finish > now && item.start < horizon {
+                spans.push((item.start, item.finish));
+            }
+        }
+    }
+    spans.sort_by_key(|(start, _)| *start);
+
+    let mut covered_to = now;
+    for (start, finish) in spans {
+        if start > covered_to {
+            // A hole `[covered_to, start)`, and this span is content after it.
+            return Ok(Some(covered_to));
+        }
+        if finish > covered_to {
+            covered_to = finish;
+        }
+        if covered_to >= horizon {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
 fn split_start_finish(stem: &str) -> Option<(&str, &str)> {
     // Filename is `{start}_{finish}` where each side may contain `-` or `+` from
     // the offset and `T`. Underscore appears once between them — our DATE_FORMAT
@@ -145,6 +210,156 @@ mod tests {
         let s = start.format(&DATE_FORMAT).unwrap();
         let f = finish.format(&DATE_FORMAT).unwrap();
         format!("{s}_{f}.json")
+    }
+
+    /// Write a playout file named `[file_start, file_finish]` holding items with
+    /// the given `[start, finish]` spans. Names and contents are supplied
+    /// independently so a test can build an over-claiming file on purpose.
+    async fn write_playout(
+        dir: &Path,
+        file_start: OffsetDateTime,
+        file_finish: OffsetDateTime,
+        item_spans: &[(OffsetDateTime, OffsetDateTime)],
+    ) {
+        let items: Vec<String> = item_spans
+            .iter()
+            .enumerate()
+            .map(|(i, (s, f))| {
+                format!(
+                    r#"{{"id":"i{i}","start":"{}","finish":"{}"}}"#,
+                    s.format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                    f.format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let body = format!(
+            r#"{{"version":"https://ersatztv.org/playout/version/0.0.1","items":[{}]}}"#,
+            items.join(",")
+        );
+        tokio::fs::write(dir.join(window_name(file_start, file_finish)), body)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_gap_when_coverage_is_contiguous() {
+        let dir = tempdir().unwrap();
+        let now = datetime!(2026-04-20 12:00 UTC);
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 12:00 UTC),
+            datetime!(2026-04-20 13:00 UTC),
+            &[
+                (datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC)),
+                (datetime!(2026-04-20 12:30 UTC), datetime!(2026-04-20 13:00 UTC)),
+            ],
+        )
+        .await;
+        let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 13:00 UTC))
+            .await
+            .unwrap();
+        assert_eq!(gap, None);
+    }
+
+    #[tokio::test]
+    async fn trailing_frontier_is_not_a_gap() {
+        // Content stops at 12:30 and nothing follows: that is the un-materialized
+        // frontier, not a hole, even though the horizon extends past it.
+        let dir = tempdir().unwrap();
+        let now = datetime!(2026-04-20 12:00 UTC);
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 12:00 UTC),
+            datetime!(2026-04-20 12:30 UTC),
+            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC))],
+        )
+        .await;
+        let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 18:00 UTC))
+            .await
+            .unwrap();
+        assert_eq!(gap, None);
+    }
+
+    #[tokio::test]
+    async fn interior_hole_is_reported_at_its_start() {
+        // Covered 12:00–12:30, nothing 12:30–13:00, covered again 13:00–13:30.
+        // The hole begins at 12:30.
+        let dir = tempdir().unwrap();
+        let now = datetime!(2026-04-20 12:00 UTC);
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 12:00 UTC),
+            datetime!(2026-04-20 12:30 UTC),
+            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC))],
+        )
+        .await;
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 13:00 UTC),
+            datetime!(2026-04-20 13:30 UTC),
+            &[(datetime!(2026-04-20 13:00 UTC), datetime!(2026-04-20 13:30 UTC))],
+        )
+        .await;
+        let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 14:00 UTC))
+            .await
+            .unwrap();
+        assert_eq!(gap, Some(datetime!(2026-04-20 12:30 UTC)));
+    }
+
+    #[tokio::test]
+    async fn an_over_claiming_name_cannot_hide_a_hole() {
+        // The exact defect that aired black: a file NAMED [12:00,18:00] but
+        // holding only 3 minutes. Coverage is read from items, so the hole after
+        // 12:03 is still found despite the name reaching 18:00.
+        let dir = tempdir().unwrap();
+        let now = datetime!(2026-04-20 12:00 UTC);
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 12:00 UTC),
+            datetime!(2026-04-20 18:00 UTC), // name over-claims 6h
+            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:03 UTC))],
+        )
+        .await;
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 18:00 UTC),
+            datetime!(2026-04-20 18:30 UTC),
+            &[(datetime!(2026-04-20 18:00 UTC), datetime!(2026-04-20 18:30 UTC))],
+        )
+        .await;
+        let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 19:00 UTC))
+            .await
+            .unwrap();
+        assert_eq!(gap, Some(datetime!(2026-04-20 12:03 UTC)));
+    }
+
+    #[tokio::test]
+    async fn a_horizon_before_the_hole_reports_nothing() {
+        // The near-future look-ahead only heals what is about to air; a hole past
+        // the horizon waits for a later tick.
+        let dir = tempdir().unwrap();
+        let now = datetime!(2026-04-20 12:00 UTC);
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 12:00 UTC),
+            datetime!(2026-04-20 12:30 UTC),
+            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC))],
+        )
+        .await;
+        write_playout(
+            dir.path(),
+            datetime!(2026-04-20 13:00 UTC),
+            datetime!(2026-04-20 13:30 UTC),
+            &[(datetime!(2026-04-20 13:00 UTC), datetime!(2026-04-20 13:30 UTC))],
+        )
+        .await;
+        // Horizon 12:20 — before the 12:30 hole — so nothing to report yet.
+        let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 12:20 UTC))
+            .await
+            .unwrap();
+        assert_eq!(gap, None);
     }
 
     #[tokio::test]

@@ -748,6 +748,45 @@ async fn pattern_catch_up(
     let overlay_spec = load_overlay_playout_spec(channel);
     let mut cache = DurationCache::load(output).await?;
 
+    // Repair a coverage hole before extending the window. An interrupted run
+    // from before the honest-naming fix — or any unforeseen cause — can leave a
+    // chunk that airs black between two covered spans, and forward
+    // materialization alone never revisits it (`highest_finish` only ever moves
+    // the frontier forward). So read the *actual* item coverage: if a hole opens
+    // before the frontier, wipe from the chunk that should contain it and let
+    // the generation loop below regenerate it.
+    //
+    // Horizon differs by phase. Startup scans the whole window, healing damage
+    // already on disk in one pass. A roll tick scans only the near future — two
+    // roll intervals — which is cheap and still spots a hole at least one tick
+    // before the playhead reaches it; a hole further out is caught as `now`
+    // advances toward it on later ticks.
+    let heal_horizon = if phase == "startup" {
+        target
+    } else {
+        now + time::Duration::seconds_f64(channel.config.roll_interval.as_secs_f64() * 2.0)
+    };
+    if let Some(gap) = scan::first_coverage_gap(output, now, heal_horizon).await? {
+        let regen_from = tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, tz);
+        let removed = wipe_playout_from(channel, regen_from).await?;
+        // Best-effort pool alignment: rewind to the checkpoint covering the hole
+        // if it survives, else leave the pools as they are and accept a possible
+        // seam glitch — either way the black is gone once the loop regenerates.
+        resume.rewind_to(regen_from);
+        ledger.truncate_from(regen_from);
+        crate::history::save(output, ledger).await?;
+        crate::resume::save(output, &resume).await?;
+        tracing::warn!(
+            event = "coverage.heal",
+            channel = %channel.name,
+            phase = phase,
+            gap = %gap,
+            regen_from = %regen_from,
+            removed = removed,
+            "coverage hole found; wiped the affected chunk onward to regenerate it",
+        );
+    }
+
     // Pick up exactly where the written record ends. Unlike the looping path
     // this is deliberately NOT snapped to a chunk boundary: a forward-
     // materialized channel continues from the last item's finish, so the

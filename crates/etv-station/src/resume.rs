@@ -129,6 +129,26 @@ impl ResumeMap {
         self.checkpoints.clear();
         Some(earliest.start)
     }
+
+    /// Rewind to the generation that was airing at `instant`: restore the pool
+    /// state recorded before it and drop it (and every later checkpoint), so the
+    /// span from `instant` on can be regenerated. Returns that generation's start
+    /// instant, or `None` when no checkpoint covers `instant` — its record was
+    /// pruned after it aired, so its pool state is gone and the caller must
+    /// regenerate from the current pools instead (a possible seam glitch, never
+    /// black).
+    ///
+    /// Distinct from [`rewind_to_unaired`], which always rewinds to the *earliest*
+    /// unaired generation to apply a config edit. This targets a specific
+    /// instant — the start of an observed coverage hole — and rewinds only as far
+    /// as that hole, leaving healthy earlier chunks in place.
+    pub fn rewind_to(&mut self, instant: OffsetDateTime) -> Option<OffsetDateTime> {
+        let idx = self.checkpoints.iter().rposition(|c| c.start <= instant)?;
+        let cp = self.checkpoints[idx].clone();
+        self.pools = cp.pools;
+        self.checkpoints.truncate(idx);
+        Some(cp.start)
+    }
 }
 
 /// Everything one generation is handed about where the channel stands.
@@ -336,6 +356,40 @@ mod tests {
         let mut map = ResumeMap::new();
         assert!(map.rewind_to_unaired(at(1)).is_none());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn rewind_to_targets_the_generation_covering_an_instant() {
+        let mut map = ResumeMap::new();
+        map.pools = pools_with("e0");
+        map.checkpoint(at(0));
+        map.pools = pools_with("e1");
+        map.checkpoint(at(6));
+        map.pools = pools_with("e2");
+        map.checkpoint(at(12));
+        map.pools = pools_with("e3");
+
+        // A hole at hour 8 lives inside the 06:00 generation: rewind to it,
+        // restoring the pools recorded before it, and drop it and everything
+        // later so they regenerate. The 00:00 checkpoint (healthy, earlier) stays.
+        let regen = map.rewind_to(at(8)).unwrap();
+        assert_eq!(regen, at(6));
+        assert_eq!(map.pools, pools_with("e1"));
+        assert_eq!(map.checkpoints.len(), 1);
+        assert_eq!(map.checkpoints[0].start, at(0));
+    }
+
+    #[test]
+    fn rewind_to_is_none_when_the_instant_predates_every_checkpoint() {
+        let mut map = ResumeMap::new();
+        map.pools = pools_with("e1");
+        map.checkpoint(at(6));
+        map.pools = pools_with("e2");
+
+        // The covering checkpoint was pruned after airing — its pool state is
+        // gone, so the caller must regenerate from the current pools.
+        assert!(map.rewind_to(at(3)).is_none());
+        assert_eq!(map.pools, pools_with("e2"), "state left untouched");
     }
 
     #[test]
