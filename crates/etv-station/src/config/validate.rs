@@ -408,6 +408,8 @@ mod tests {
             channels: vec![],
             source_roots: vec![],
             catalog_path: None,
+            catalog_refresh_secs: 900,
+            full_sweep_after_secs: 86_400,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         let msg = format!("{err}");
@@ -422,6 +424,8 @@ mod tests {
             channels: vec!["channels/a.yaml".into()],
             source_roots: vec![],
             catalog_path: None,
+            catalog_refresh_secs: 900,
+            full_sweep_after_secs: 86_400,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
@@ -435,6 +439,8 @@ mod tests {
             channels: vec!["  ".into()],
             source_roots: vec![],
             catalog_path: None,
+            catalog_refresh_secs: 900,
+            full_sweep_after_secs: 86_400,
         };
         assert!(validate_station(&dummy_path(), &s).is_err());
     }

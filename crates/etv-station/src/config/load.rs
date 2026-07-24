@@ -35,6 +35,7 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
         std::env::var("ETV_STATION_TZ").ok(),
         std::env::var("ETV_STATION_OUTPUT_BASE").ok(),
         std::env::var("ETV_STATION_CATALOG").ok(),
+        std::env::var("ETV_STATION_SOURCE_ROOTS").ok(),
     );
     validate::validate_station(station_path, &station)?;
 
@@ -80,15 +81,23 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
 
 /// Apply runtime overrides to the station config — the Docker-friendly knobs
 /// that override the file value without editing it. `tz` comes from
-/// `ETV_STATION_TZ`, `output_base` from `ETV_STATION_OUTPUT_BASE` (both read at
-/// the single call site in [`load`]). An absent or blank value leaves the file
-/// value untouched. Taking the values as parameters keeps this pure and testable
-/// without mutating process-global env in parallel tests.
+/// `ETV_STATION_TZ`, `output_base` from `ETV_STATION_OUTPUT_BASE`,
+/// `catalog_path` from `ETV_STATION_CATALOG`, and `source_roots` from
+/// `ETV_STATION_SOURCE_ROOTS` (all read at the single call site in [`load`]).
+/// An absent or blank value leaves the file value untouched. Taking the values
+/// as parameters keeps this pure and testable without mutating process-global
+/// env in parallel tests.
+///
+/// `source_roots` is colon-separated, matching `PATH` and the `ETV_FS_ROOTS`
+/// convention the query-test harness already uses. It exists so the mount paths
+/// a given host happens to use — which differ between a laptop, the deployed
+/// container, and CI — stay out of the committed station config entirely.
 fn apply_env_overrides(
     station: &mut StationConfig,
     tz: Option<String>,
     output_base: Option<String>,
     catalog_path: Option<String>,
+    source_roots: Option<String>,
 ) {
     if let Some(tz) = tz
         && !tz.trim().is_empty()
@@ -104,6 +113,19 @@ fn apply_env_overrides(
         && !path.trim().is_empty()
     {
         station.catalog_path = Some(path);
+    }
+    if let Some(roots) = source_roots
+        && !roots.trim().is_empty()
+    {
+        // Empty segments are dropped so a stray leading/trailing/doubled colon
+        // can't inject "" as a root — an empty root would strip nothing and
+        // prefix-match every path during identity canonicalisation.
+        station.source_roots = roots
+            .split(':')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
     }
 }
 
@@ -578,6 +600,8 @@ mod tests {
             channels: vec!["channels/a.yaml".into()],
             source_roots: vec![],
             catalog_path: None,
+            catalog_refresh_secs: 900,
+            full_sweep_after_secs: 86_400,
         }
     }
 
@@ -589,19 +613,37 @@ mod tests {
             Some("America/Chicago".into()),
             Some("/shared/playout".into()),
             Some("/var/lib/etv/catalog.db".into()),
+            Some("/mnt/movies:/mnt/tv".into()),
         );
         assert_eq!(s.tz, "America/Chicago");
         assert_eq!(s.output_base, PathBuf::from("/shared/playout"));
         assert_eq!(s.catalog_path.as_deref(), Some("/var/lib/etv/catalog.db"));
+        assert_eq!(s.source_roots, vec!["/mnt/movies", "/mnt/tv"]);
     }
 
     #[test]
     fn env_overrides_ignore_absent_and_blank() {
         let mut s = station_config();
-        apply_env_overrides(&mut s, None, Some("   ".into()), Some("  ".into()));
+        apply_env_overrides(&mut s, None, Some("   ".into()), Some("  ".into()), None);
         assert_eq!(s.tz, "UTC");
         assert_eq!(s.output_base, PathBuf::from("out"));
         assert_eq!(s.catalog_path, None);
+        assert!(s.source_roots.is_empty());
+    }
+
+    #[test]
+    fn source_roots_override_drops_empty_segments() {
+        let mut s = station_config();
+        apply_env_overrides(&mut s, None, None, None, Some(":/mnt/a: :/mnt/b:".into()));
+        assert_eq!(s.source_roots, vec!["/mnt/a", "/mnt/b"]);
+    }
+
+    #[test]
+    fn source_roots_override_keeps_file_value_when_blank() {
+        let mut s = station_config();
+        s.source_roots = vec!["/from/file".into()];
+        apply_env_overrides(&mut s, None, None, None, Some("   ".into()));
+        assert_eq!(s.source_roots, vec!["/from/file"]);
     }
 
     #[test]

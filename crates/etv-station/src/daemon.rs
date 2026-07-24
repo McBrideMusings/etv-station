@@ -113,13 +113,12 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     }
 }
 
-/// Open the station catalog (if `catalog_path` is set) and populate it with a
-/// full ingest pass at startup, returning a shareable handle for the channel
-/// tasks. `None` → the station is catalog-free and only inline `manual` channels
-/// resolve. Opening is fatal (a broken db must not be silently ignored); an
-/// ingest failure is logged and the daemon continues with whatever was written —
-/// a Plex outage or a bad media root shouldn't take playout down. Delta sync,
-/// the refresh TTL, and a manual re-ingest trigger are follow-ups (#91/#96).
+/// Open the station catalog (if `catalog_path` is set) and bring it up to date,
+/// returning a shareable handle for the channel tasks. `None` → the station is
+/// catalog-free and only inline `manual` channels resolve. Opening is fatal (a
+/// broken db must not be silently ignored); an ingest failure is logged and the
+/// daemon continues with whatever was written — a Plex outage or a bad media
+/// root shouldn't take playout down.
 /// The station catalog shared into every channel task: the `Catalog` behind a
 /// `Mutex` (it is `Send` but `!Sync`, and only ever locked for a synchronous
 /// resolve) plus the canonical-path → `entry_id` index built **once** after
@@ -128,6 +127,62 @@ pub async fn run(station: Station) -> Result<(), StationError> {
 struct SharedCatalog {
     catalog: Mutex<Catalog>,
     path_index: HashMap<String, String>,
+}
+
+/// What a startup should do about the Plex half of the catalog.
+#[derive(Debug, PartialEq, Eq)]
+enum PlexIngestPlan {
+    /// The catalog was ingested recently enough to trust as-is; don't contact
+    /// Plex at all.
+    Skip { age_secs: i64 },
+    /// Ask Plex only for records touched since this unix-seconds cursor.
+    Delta { since: i64 },
+    /// Re-read everything.
+    Full,
+}
+
+impl PlexIngestPlan {
+    /// The `since` cursor to hand the ingest — `None` for a full pass.
+    fn since(&self) -> Option<i64> {
+        match self {
+            PlexIngestPlan::Delta { since } => Some(*since),
+            _ => None,
+        }
+    }
+}
+
+/// Decide between skipping, a delta, and a full re-read.
+///
+/// Pure so the three boundaries can be tested without a Plex server or a clock:
+/// `last` is when the previous pass started, `now` the current unix seconds.
+///
+/// Ordering matters. A never-ingested catalog is always full. Then age is
+/// checked against `full_sweep_after_secs` *before* the refresh window, so a
+/// catalog left untouched over a long weekend gets its deletion-catching full
+/// pass rather than being skipped as "recent enough" forever. A clock that went
+/// backwards (NTP correction, a restored snapshot) yields a negative age, which
+/// falls through to a full pass — the safe direction, since we cannot tell what
+/// a delta would be relative to.
+fn plex_ingest_plan(
+    last: Option<i64>,
+    now: i64,
+    catalog_refresh_secs: u64,
+    full_sweep_after_secs: u64,
+) -> PlexIngestPlan {
+    let Some(last) = last else {
+        return PlexIngestPlan::Full;
+    };
+    let age = now - last;
+    if age < 0 {
+        return PlexIngestPlan::Full;
+    }
+    if full_sweep_after_secs == 0 || age >= full_sweep_after_secs as i64 {
+        return PlexIngestPlan::Full;
+    }
+    if age < catalog_refresh_secs as i64 {
+        return PlexIngestPlan::Skip { age_secs: age };
+    }
+    PlexIngestPlan::Delta { since: last }
 }
 
 async fn open_and_ingest_catalog(
@@ -166,23 +221,43 @@ async fn open_and_ingest_catalog(
     // runtime. `spawn_blocking` works on any runtime flavor, unlike
     // `block_in_place`.
     if std::env::var_os("PLEX_URL").is_some() && std::env::var_os("PLEX_TOKEN").is_some() {
-        let roots = source_roots.clone();
-        let (returned, plex) = tokio::task::spawn_blocking(move || {
-            let result = crate::catalog::ingest::plex::ingest_from_env(&catalog, &roots);
-            (catalog, result)
-        })
-        .await
-        .expect("plex ingest task panicked");
-        catalog = returned;
-        match plex {
-            Ok(stats) => tracing::info!(
-                event = "catalog.ingest.plex",
-                entries = stats.entries_written,
-                sources = stats.sources_written,
-                "plex catalog ingest complete",
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let last = catalog.last_plex_ingest()?;
+        match plex_ingest_plan(
+            last,
+            now,
+            station.station.catalog_refresh_secs,
+            station.station.full_sweep_after_secs,
+        ) {
+            PlexIngestPlan::Skip { age_secs } => tracing::info!(
+                event = "catalog.ingest.plex_skipped",
+                age_secs = age_secs,
+                refresh_secs = station.station.catalog_refresh_secs,
+                "catalog is younger than catalog_refresh_secs; reusing it without contacting plex",
             ),
-            Err(e) => {
-                tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing")
+            plan => {
+                let since = plan.since();
+                let roots = source_roots.clone();
+                let (returned, plex) = tokio::task::spawn_blocking(move || {
+                    let result =
+                        crate::catalog::ingest::plex::ingest_from_env(&catalog, &roots, since);
+                    (catalog, result)
+                })
+                .await
+                .expect("plex ingest task panicked");
+                catalog = returned;
+                match plex {
+                    Ok(stats) => tracing::info!(
+                        event = "catalog.ingest.plex",
+                        mode = if since.is_some() { "delta" } else { "full" },
+                        entries = stats.entries_written,
+                        sources = stats.sources_written,
+                        "plex catalog ingest complete",
+                    ),
+                    Err(e) => {
+                        tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing")
+                    }
+                }
             }
         }
     }
@@ -936,6 +1011,89 @@ fn log_emission(
         to = %to,
         "emitted playout files",
     );
+}
+
+#[cfg(test)]
+mod ingest_plan_tests {
+    use super::*;
+
+    const REFRESH: u64 = 900;
+    const SWEEP: u64 = 86_400;
+
+    #[test]
+    fn a_catalog_never_ingested_is_read_in_full() {
+        assert_eq!(
+            plex_ingest_plan(None, 1_000_000, REFRESH, SWEEP),
+            PlexIngestPlan::Full
+        );
+    }
+
+    #[test]
+    fn a_restart_inside_the_refresh_window_does_not_contact_plex() {
+        let last = 1_000_000;
+        assert_eq!(
+            plex_ingest_plan(Some(last), last + 899, REFRESH, SWEEP),
+            PlexIngestPlan::Skip { age_secs: 899 }
+        );
+    }
+
+    #[test]
+    fn past_the_refresh_window_asks_plex_only_for_changes() {
+        let last = 1_000_000;
+        assert_eq!(
+            plex_ingest_plan(Some(last), last + 900, REFRESH, SWEEP),
+            PlexIngestPlan::Delta { since: last }
+        );
+    }
+
+    #[test]
+    fn past_the_sweep_interval_forces_a_full_pass() {
+        let last = 1_000_000;
+        assert_eq!(
+            plex_ingest_plan(Some(last), last + SWEEP as i64, REFRESH, SWEEP),
+            PlexIngestPlan::Full
+        );
+    }
+
+    /// The sweep outranks the refresh window: a catalog older than the sweep
+    /// interval must not be skipped as "recent", or deletions would never be
+    /// noticed on a station that is restarted constantly.
+    #[test]
+    fn the_sweep_wins_over_the_refresh_window() {
+        assert_eq!(
+            plex_ingest_plan(Some(0), 10, /* refresh */ 100_000, /* sweep */ 5),
+            PlexIngestPlan::Full
+        );
+    }
+
+    #[test]
+    fn a_zero_sweep_interval_disables_delta_entirely() {
+        let last = 1_000_000;
+        assert_eq!(
+            plex_ingest_plan(Some(last), last + 1, REFRESH, 0),
+            PlexIngestPlan::Full
+        );
+    }
+
+    #[test]
+    fn a_zero_refresh_window_never_skips() {
+        let last = 1_000_000;
+        assert_eq!(
+            plex_ingest_plan(Some(last), last, 0, SWEEP),
+            PlexIngestPlan::Delta { since: last }
+        );
+    }
+
+    /// A clock that jumped backwards (NTP correction, restored snapshot) leaves
+    /// a "last ingest" in the future. There is no sound delta cursor in that
+    /// case, so fall back to reading everything.
+    #[test]
+    fn a_backwards_clock_falls_back_to_a_full_pass() {
+        assert_eq!(
+            plex_ingest_plan(Some(2_000_000), 1_000_000, REFRESH, SWEEP),
+            PlexIngestPlan::Full
+        );
+    }
 }
 
 #[cfg(test)]

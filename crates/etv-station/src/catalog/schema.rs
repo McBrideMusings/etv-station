@@ -74,6 +74,18 @@ pub const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_collection_items_entry ON collection_items(entry_id);
     "#,
+    // v2 — ingest bookkeeping. A single key/value table so the catalog carries
+    // its own "when was this last filled, and from where" rather than the daemon
+    // having to guess from row counts or file mtimes. Read at startup to decide
+    // between skipping the ingest, asking Plex only for what changed, and a full
+    // pass. Deliberately generic: the next thing worth remembering about an
+    // ingest is another row, not another migration.
+    r#"
+    CREATE TABLE catalog_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

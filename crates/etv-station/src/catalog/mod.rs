@@ -34,6 +34,10 @@ pub use error::CatalogError;
 pub use identity::{canonical_path, derive_entry_id};
 pub use model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
 
+/// `catalog_meta` key holding the unix-seconds timestamp of the last completed
+/// Plex ingest.
+const META_LAST_PLEX_INGEST: &str = "last_plex_ingest";
+
 /// A handle to the catalog database.
 pub struct Catalog {
     conn: Connection,
@@ -255,6 +259,22 @@ impl Catalog {
         Ok(())
     }
 
+    /// Drop every membership row for one collection.
+    ///
+    /// Membership is authored in Plex and re-read wholesale, so it has to be
+    /// cleared before a re-ingest writes it back: `add_collection_item` only
+    /// inserts and updates, which means an entry the user removed from a
+    /// collection would otherwise survive in the catalog forever and keep
+    /// airing. Called per collection actually fetched, so a collection skipped
+    /// as unchanged keeps the rows it already has.
+    pub fn clear_collection_items(&self, collection_id: &str) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "DELETE FROM collection_items WHERE collection_id = ?1",
+            params![collection_id],
+        )?;
+        Ok(())
+    }
+
     /// Place an entry in a collection at an authored `position`.
     pub fn add_collection_item(
         &self,
@@ -412,6 +432,43 @@ impl Catalog {
             "SELECT collection_id FROM collections WHERE name = ?1 ORDER BY collection_id",
             params![name],
         )
+    }
+
+    /// Read one `catalog_meta` value, `None` when the key was never written.
+    pub fn meta(&self, key: &str) -> Result<Option<String>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM catalog_meta WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write one `catalog_meta` value, replacing any previous one.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT INTO catalog_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Unix seconds of the last completed Plex ingest, `None` if none has ever
+    /// finished. Written only after a pass commits, so an ingest that failed
+    /// half-way leaves the previous timestamp in place and the next start
+    /// re-fetches the same span rather than skipping over the gap.
+    pub fn last_plex_ingest(&self) -> Result<Option<i64>, CatalogError> {
+        Ok(self
+            .meta(META_LAST_PLEX_INGEST)?
+            .and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    /// Record that a Plex ingest completed at `unix_secs`.
+    pub fn set_last_plex_ingest(&self, unix_secs: i64) -> Result<(), CatalogError> {
+        self.set_meta(META_LAST_PLEX_INGEST, &unix_secs.to_string())
     }
 
     /// Run a query whose rows are a single TEXT column, collecting them in order.

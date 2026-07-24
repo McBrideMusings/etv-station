@@ -14,9 +14,22 @@ output_base: examples/output
 # always matches what is actually present: the one committed runnable channel
 # in a clean checkout, plus whatever personal channels a working copy adds.
 #
-# The worked sample channels are NOT here — they live in `examples/samples/`
-# and are exercised by their acceptance tests. Most are query channels that
-# need a populated catalog, so registering them with a catalog-free dev station
-# would fail every one of them at startup.
+# The worked sample channels in `examples/samples/` are registered too. They are
+# query channels, so every one of them needs the catalog below to be populated —
+# with `catalog_path` unset they resolve to nothing.
 channels:
   - channels/*.yaml
+  - samples/*.yaml
+
+# Sqlite catalog the daemon opens and ingests at startup: the local filesystem
+# roots first, then Plex when PLEX_URL and PLEX_TOKEN are both in the
+# environment. Without it only inline-item, manual-order channels resolve, which
+# is why the sample channels sat unregistered until now. Under `tmp/` because it
+# is a rebuildable cache, not a source artifact — delete it and the next start
+# re-ingests. `ETV_STATION_CATALOG` overrides it at runtime.
+catalog_path: tmp/catalog.db
+
+# `source_roots` is deliberately absent: the mount paths differ per host (a
+# laptop's SMB mount, the container's bind mount, CI's fixture dir) and they are
+# nobody else's business, so they come from ETV_STATION_SOURCE_ROOTS in the
+# gitignored `.env` (colon-separated) rather than being hardcoded here.

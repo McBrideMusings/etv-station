@@ -284,6 +284,8 @@ source_roots:                  # optional — media mount roots, daemon's view
   - /data/media
 
 catalog_path: /var/lib/etv-station/catalog.db   # optional — enables query channels
+catalog_refresh_secs: 900      # optional — trust the catalog this long without asking Plex
+full_sweep_after_secs: 86400   # optional — force a full (deletion-catching) re-read this often
 ```
 
 | Field | Required | Type / default |
@@ -291,8 +293,23 @@ catalog_path: /var/lib/etv-station/catalog.db   # optional — enables query cha
 | `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
-| `source_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts is one identity. Empty just skips root-stripping. |
+| `source_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts is one identity. Empty just skips root-stripping. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime — the intended way to supply them, since mount paths are host-specific and do not belong in a committed config. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
+
+| `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
+| `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
+
+**How the three ingest modes are chosen.** At startup the daemon compares the
+catalog's recorded last-ingest time against the two knobs above. Age below
+`catalog_refresh_secs` → skip, no HTTP at all. Age at or beyond
+`full_sweep_after_secs` (or no prior ingest, or a clock that moved backwards) →
+full re-read. Anything between → delta: each library section is queried with
+`updatedAt>=<last ingest>`, and a collection whose own `updatedAt` predates the
+cursor skips its per-collection children request. The full-sweep check is
+applied *before* the refresh window, so a constantly-restarted station still
+gets its periodic deletion-catching pass. The timestamp is recorded inside the
+ingest transaction and taken before the fetch begins, so a failed pass never
+advances the cursor past changes it did not write.
 
 Each entry in `channels` is resolved relative to the station file's directory. A
 glob expands to every matching file (matching nothing is an error); a literal

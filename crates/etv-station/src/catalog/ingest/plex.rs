@@ -17,13 +17,19 @@
 //! `collections` + ordered `collection_items`, with each member's ratingKey
 //! resolved back to its `entry_id` via the `plex` provenance row.
 //!
-//! Out of scope (tracked separately): playlists, delta sync via `lastUpdated`,
-//! and the refresh TTL / manual trigger — all land with the catalog-into-daemon
-//! wiring (#96).
+//! [`ingest_from_env`] takes a `since` cursor: when set, each section is asked
+//! only for records with `updatedAt>=since` and a collection whose own
+//! `updatedAt` predates it skips its children request. That is what keeps a
+//! restart cheap — see `plex_ingest_plan` in `daemon.rs` for how the cursor is
+//! chosen, and note that a delta can never report a deletion, which is why a
+//! full pass is still forced periodically.
+//!
+//! Out of scope (tracked separately): playlists.
 
 use std::time::Duration;
 
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 use crate::catalog::identity::{canonical_path, derive_entry_id};
 use crate::catalog::model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
@@ -244,6 +250,11 @@ pub fn ingest_collections(
             name: coll.name.clone(),
             source: Source::Plex,
         })?;
+        // Membership is replaced, not merged: what Plex returns now IS the
+        // collection. Without the clear, an entry dragged out of a collection
+        // would keep its row and keep airing, because add_collection_item only
+        // ever inserts or updates.
+        catalog.clear_collection_items(&coll.collection_id)?;
         stats.collections_written += 1;
 
         let mut position = 0i64;
@@ -274,16 +285,25 @@ pub fn ingest_collections(
 pub fn ingest_from_env(
     catalog: &Catalog,
     source_roots: &[String],
+    since: Option<i64>,
 ) -> Result<PlexIngestStats, PlexIngestError> {
     let client = PlexClient::from_env()?;
-    let items = client.fetch_all()?;
-    let collections = client.fetch_collections()?;
+    let items = client.fetch_all(since)?;
+    let collections = client.fetch_collections(since)?;
     // One transaction for the whole write pass — a mid-ingest failure rolls back
     // rather than leaving a partial catalog. Entries are written before
     // collections so member ratingKeys resolve to their entry ids.
+    //
+    // The ingest timestamp is written inside the same transaction, so a failed
+    // pass cannot advance the delta cursor past changes it never wrote. It is
+    // taken *before* the fetch, not after: anything Plex modifies while the
+    // ingest is running is then re-read by the next pass rather than falling
+    // into the gap between the fetch and the commit.
+    let started = OffsetDateTime::now_utc().unix_timestamp();
     catalog.in_transaction(|c| {
         let stats = ingest_items(c, &items, source_roots)?;
         ingest_collections(c, &collections)?;
+        c.set_last_plex_ingest(started)?;
         Ok(stats)
     })
 }
@@ -445,22 +465,48 @@ impl PlexClient {
     }
 
     /// Every movie and episode across all library sections, as [`PlexItem`]s.
-    fn fetch_all(&self) -> Result<Vec<PlexItem>, PlexIngestError> {
+    ///
+    /// `since` (unix seconds) narrows each section to items Plex has touched
+    /// after that moment, via the server-side `updatedAt>=` filter. On a library
+    /// of ~86k items that is the difference between 20s of transfer and a
+    /// fraction of a second. `None` fetches everything.
+    ///
+    /// A delta cannot report a *deletion* — an item removed from Plex simply
+    /// stops appearing, which is indistinguishable from "unchanged" here. The
+    /// caller is responsible for periodically running a full pass; see
+    /// `full_sweep_after_secs` in the station config.
+    fn fetch_all(&self, since: Option<i64>) -> Result<Vec<PlexItem>, PlexIngestError> {
         let sections: SectionListResp = self.get("/library/sections", &[])?;
         let mut items = Vec::new();
+        // `updatedAt>` (strictly greater), not `updatedAt>=`. `ureq` builds every
+        // query pair as `key=value` with the key percent-encoded, so the pair
+        // `("updatedAt>", v)` goes out as `updatedAt%3E=v` — a spelling Plex
+        // accepts. `("updatedAt>=", v)` would become `updatedAt%3E%3D=v`, which
+        // this server answers with the *entire* unfiltered library rather than an
+        // error, so the mistake reads as a working delta that silently re-ingests
+        // everything. Verified against the live server: unfiltered 11,149 items,
+        // `updatedAt%3E=` 105, `updatedAt%3E%3D=` 11,149.
+        //
+        // Since the comparison is strict, step the cursor back a second: an item
+        // touched during the very second the previous pass recorded would
+        // otherwise fall between the two runs and never be seen.
+        let since_param = since.map(|s| (s - 1).to_string());
         for section in &sections.media_container.directory {
             let Some(id) = section.key.as_deref() else {
                 continue;
             };
             // Movies come back directly; a show section is expanded to its
             // episode leaves (type=4).
-            let params: &[(&str, &str)] = match section.kind.as_deref() {
-                Some("show") => &[("type", "4")],
-                Some("movie") => &[("type", "1")],
-                _ => &[],
+            let mut params: Vec<(&str, &str)> = match section.kind.as_deref() {
+                Some("show") => vec![("type", "4")],
+                Some("movie") => vec![("type", "1")],
+                _ => Vec::new(),
             };
+            if let Some(s) = since_param.as_deref() {
+                params.push(("updatedAt>", s));
+            }
             let endpoint = format!("/library/sections/{id}/all");
-            let resp: MediaContainerResp = self.get(&endpoint, params)?;
+            let resp: MediaContainerResp = self.get(&endpoint, &params)?;
             for m in &resp.media_container.metadata {
                 if let Some(item) = to_plex_item(m, |p| self.translate(p)) {
                     items.push(item);
@@ -473,7 +519,17 @@ impl PlexClient {
     /// Every collection across all library sections, with members in Plex's
     /// authored order. One request per section for its collection list, then one
     /// per collection for its ordered children.
-    fn fetch_collections(&self) -> Result<Vec<ParsedCollection>, PlexIngestError> {
+    ///
+    /// The children requests dominate the cost — measured at 72s of the 92s a
+    /// full ingest spends on HTTP, because there is one sequential round trip
+    /// per collection and no bulk endpoint. `since` (unix seconds) skips the
+    /// children request for any collection whose own `updatedAt` predates it,
+    /// which is what makes a warm restart cheap. A collection omitted this way
+    /// keeps the membership already in the catalog.
+    fn fetch_collections(
+        &self,
+        since: Option<i64>,
+    ) -> Result<Vec<ParsedCollection>, PlexIngestError> {
         let sections: SectionListResp = self.get("/library/sections", &[])?;
         let mut out = Vec::new();
         for section in &sections.media_container.directory {
@@ -486,6 +542,14 @@ impl PlexClient {
                 let Some(collection_id) = c.rating_key.clone() else {
                     continue;
                 };
+                // A collection with no `updatedAt` is always fetched: unknown is
+                // not the same as unchanged, and silently skipping it would
+                // freeze its membership permanently.
+                if let (Some(cutoff), Some(updated)) = (since, c.updated_at)
+                    && updated < cutoff
+                {
+                    continue;
+                }
                 let members_ep = format!("/library/metadata/{collection_id}/children");
                 let members: MediaContainerResp = self.get(&members_ep, &[])?;
                 let member_rating_keys = members
@@ -542,6 +606,10 @@ struct PlexMetadata {
     duration: Option<i64>,
     #[serde(default)]
     content_rating: Option<String>,
+    /// Unix seconds Plex last touched this record. Only read for collections, to
+    /// skip the per-collection children request when nothing has changed.
+    #[serde(default)]
+    updated_at: Option<i64>,
     #[serde(default)]
     edition_title: Option<String>,
     #[serde(default)]
@@ -1019,6 +1087,42 @@ mod tests {
         assert_eq!(
             cat.collection_members("coll-1").unwrap(),
             vec!["imdb:tt-a".to_string(), "imdb:tt-b".to_string()]
+        );
+    }
+
+    /// A member dragged out of a collection in Plex has to disappear from the
+    /// catalog. `add_collection_item` only inserts and updates, so without the
+    /// clear in `ingest_collections` the stale row would survive every future
+    /// ingest and the entry would keep airing on a collection channel.
+    #[test]
+    fn ingest_collections_drops_a_member_removed_upstream() {
+        let cat = Catalog::open_in_memory().unwrap();
+        for (rk, id) in [("rk-a", "tt-a"), ("rk-b", "tt-b")] {
+            let m = movie(
+                rk,
+                &format!("/data/media/m/{rk}.mkv"),
+                &[(ExternalNs::Imdb, id)],
+            );
+            ingest_items(&cat, std::slice::from_ref(&m), &["/data/media".into()]).unwrap();
+        }
+        let both = ParsedCollection {
+            collection_id: "coll-1".into(),
+            name: "C".into(),
+            member_rating_keys: vec!["rk-a".into(), "rk-b".into()],
+        };
+        ingest_collections(&cat, std::slice::from_ref(&both)).unwrap();
+        assert_eq!(cat.collection_members("coll-1").unwrap().len(), 2);
+
+        // Plex now reports only one member.
+        let one = ParsedCollection {
+            collection_id: "coll-1".into(),
+            name: "C".into(),
+            member_rating_keys: vec!["rk-a".into()],
+        };
+        ingest_collections(&cat, std::slice::from_ref(&one)).unwrap();
+        assert_eq!(
+            cat.collection_members("coll-1").unwrap(),
+            vec!["imdb:tt-a".to_string()]
         );
     }
 

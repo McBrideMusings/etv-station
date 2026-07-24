@@ -38,6 +38,34 @@ pub struct StationConfig {
     /// overrides at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_path: Option<String>,
+
+    /// How long a freshly ingested catalog is trusted without contacting Plex at
+    /// all, in seconds. A restart inside this window reuses the sqlite file as
+    /// it stands — the common case when iterating on channel configs, where the
+    /// daemon may be restarted many times an hour and the library has not
+    /// changed. `0` disables the skip and re-checks Plex on every start.
+    #[serde(default = "default_catalog_refresh_secs")]
+    pub catalog_refresh_secs: u64,
+
+    /// How long before a delta ingest is escalated to a full re-read, in
+    /// seconds. A delta asks Plex only for records touched since the last pass,
+    /// which cannot express a deletion — an item removed from the library simply
+    /// stops being mentioned. Only a full pass notices those, so one is forced
+    /// this often. `0` disables delta ingest entirely: every pass is full.
+    #[serde(default = "default_full_sweep_after_secs")]
+    pub full_sweep_after_secs: u64,
+}
+
+/// 15 minutes: long enough that a restart-heavy editing session pays the ingest
+/// once, short enough that a library change shows up without thinking about it.
+fn default_catalog_refresh_secs() -> u64 {
+    900
+}
+
+/// 24 hours. Deletions are the only thing a delta misses, and they are rare and
+/// rarely urgent; a daily full pass costs one slow startup.
+fn default_full_sweep_after_secs() -> u64 {
+    86_400
 }
 
 fn default_tz() -> String {
