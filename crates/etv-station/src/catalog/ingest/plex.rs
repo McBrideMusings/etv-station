@@ -229,6 +229,8 @@ pub struct CollectionIngestStats {
     /// Members whose ratingKey resolved to no catalog entry (not ingested, or
     /// FS-only) — skipped, never recorded as members.
     pub members_unresolved: usize,
+    /// Collections dropped because a full pass no longer found them in Plex.
+    pub collections_pruned: usize,
 }
 
 /// Write `collections` + `collection_items` for already-parsed Plex collections.
@@ -239,11 +241,32 @@ pub struct CollectionIngestStats {
 /// ratingKey with no catalog entry (un-ingested, or FS-only) is skipped. Position
 /// is the member's rank in Plex's authored order among the members that resolve
 /// (contiguous, 0-based); the `Collection` order read sorts by it.
+/// Ingest the fetched collections. `prune_absent` reconciles *deletions*: when
+/// true, any collection the catalog holds but the fetch did not return is
+/// dropped (its membership cascades away). It must be true only on a **full**
+/// pass — a delta fetch returns just the changed collections, so absence there
+/// means "unchanged", not "deleted", and pruning would wipe live collections.
 pub fn ingest_collections(
     catalog: &Catalog,
     collections: &[ParsedCollection],
+    prune_absent: bool,
 ) -> Result<CollectionIngestStats, PlexIngestError> {
     let mut stats = CollectionIngestStats::default();
+
+    if prune_absent {
+        // A collection deleted in Plex never appears in a full fetch, so
+        // upsert-only never removes it and `contains("…")` keeps matching a name
+        // that is gone. Drop every stored collection the fetch did not return.
+        let fetched: std::collections::HashSet<&str> =
+            collections.iter().map(|c| c.collection_id.as_str()).collect();
+        for id in catalog.all_collection_ids()? {
+            if !fetched.contains(id.as_str()) {
+                catalog.delete_collection(&id)?;
+                stats.collections_pruned += 1;
+            }
+        }
+    }
+
     for coll in collections {
         catalog.upsert_collection(&Collection {
             collection_id: coll.collection_id.clone(),
@@ -289,7 +312,19 @@ pub fn ingest_from_env(
 ) -> Result<PlexIngestStats, PlexIngestError> {
     let client = PlexClient::from_env()?;
     let items = client.fetch_all(since)?;
+    // The collection children fetch is the slow half — one sequential request
+    // per collection. Log between the stages so a stall is attributable.
+    tracing::info!(
+        event = "catalog.ingest.plex_items_fetched",
+        items = items.len(),
+        "fetched library items; fetching collections next",
+    );
     let collections = client.fetch_collections(since)?;
+    tracing::info!(
+        event = "catalog.ingest.plex_collections_fetched",
+        collections = collections.len(),
+        "fetched collections; writing to the catalog",
+    );
     // One transaction for the whole write pass — a mid-ingest failure rolls back
     // rather than leaving a partial catalog. Entries are written before
     // collections so member ratingKeys resolve to their entry ids.
@@ -300,9 +335,12 @@ pub fn ingest_from_env(
     // ingest is running is then re-read by the next pass rather than falling
     // into the gap between the fetch and the commit.
     let started = OffsetDateTime::now_utc().unix_timestamp();
+    // Prune deleted collections only on a full pass (`since` is None); a delta
+    // fetch omits unchanged collections, which must not be read as deletions.
+    let prune_absent = since.is_none();
     catalog.in_transaction(|c| {
         let stats = ingest_items(c, &items, source_roots)?;
-        ingest_collections(c, &collections)?;
+        ingest_collections(c, &collections, prune_absent)?;
         c.set_last_plex_ingest(started)?;
         Ok(stats)
     })
@@ -1034,7 +1072,7 @@ mod tests {
             name: "Halloween Marathon".into(),
             member_rating_keys: vec!["rk-b".into(), "rk-a".into(), "rk-missing".into()],
         };
-        let stats = ingest_collections(&cat, std::slice::from_ref(&coll)).unwrap();
+        let stats = ingest_collections(&cat, std::slice::from_ref(&coll), false).unwrap();
         assert_eq!(stats.collections_written, 1);
         assert_eq!(stats.members_written, 2);
         assert_eq!(stats.members_unresolved, 1);
@@ -1081,7 +1119,7 @@ mod tests {
             name: "C".into(),
             member_rating_keys: vec!["rk-4k".into(), "rk-hd".into(), "rk-b".into()],
         };
-        let stats = ingest_collections(&cat, &[coll]).unwrap();
+        let stats = ingest_collections(&cat, &[coll], false).unwrap();
         // The deduped entry counts once; positions stay contiguous (a=0, b=1).
         assert_eq!(stats.members_written, 2);
         assert_eq!(
@@ -1110,7 +1148,7 @@ mod tests {
             name: "C".into(),
             member_rating_keys: vec!["rk-a".into(), "rk-b".into()],
         };
-        ingest_collections(&cat, std::slice::from_ref(&both)).unwrap();
+        ingest_collections(&cat, std::slice::from_ref(&both), false).unwrap();
         assert_eq!(cat.collection_members("coll-1").unwrap().len(), 2);
 
         // Plex now reports only one member.
@@ -1119,11 +1157,45 @@ mod tests {
             name: "C".into(),
             member_rating_keys: vec!["rk-a".into()],
         };
-        ingest_collections(&cat, std::slice::from_ref(&one)).unwrap();
+        ingest_collections(&cat, std::slice::from_ref(&one), false).unwrap();
         assert_eq!(
             cat.collection_members("coll-1").unwrap(),
             vec!["imdb:tt-a".to_string()]
         );
+    }
+
+    /// A whole collection deleted in Plex vanishes from a full pass, so it must
+    /// be pruned — but only on a full pass. A delta, which omits unchanged
+    /// collections, must leave them alone.
+    #[test]
+    fn full_pass_prunes_a_collection_gone_from_plex_but_a_delta_does_not() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let m = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        ingest_items(&cat, std::slice::from_ref(&m), &["/data/media".into()]).unwrap();
+        let keep = ParsedCollection {
+            collection_id: "keep".into(),
+            name: "Keep".into(),
+            member_rating_keys: vec!["rk-a".into()],
+        };
+        let gone = ParsedCollection {
+            collection_id: "gone".into(),
+            name: "Gone".into(),
+            member_rating_keys: vec!["rk-a".into()],
+        };
+        ingest_collections(&cat, &[keep.clone(), gone], false).unwrap();
+        assert_eq!(cat.all_collection_ids().unwrap().len(), 2);
+
+        // A delta pass returns only "keep" (it changed); "gone" is merely absent,
+        // not deleted, so it must survive.
+        ingest_collections(&cat, std::slice::from_ref(&keep), false).unwrap();
+        assert_eq!(cat.all_collection_ids().unwrap().len(), 2, "delta keeps absent");
+
+        // A full pass returns only "keep": "gone" is really gone and is pruned,
+        // its membership cascading away.
+        let stats = ingest_collections(&cat, std::slice::from_ref(&keep), true).unwrap();
+        assert_eq!(stats.collections_pruned, 1);
+        assert_eq!(cat.all_collection_ids().unwrap(), vec!["keep".to_string()]);
+        assert!(cat.collection_members("gone").unwrap().is_empty());
     }
 
     #[test]
@@ -1136,9 +1208,9 @@ mod tests {
             name: "C".into(),
             member_rating_keys: vec!["rk-a".into()],
         };
-        ingest_collections(&cat, std::slice::from_ref(&coll)).unwrap();
+        ingest_collections(&cat, std::slice::from_ref(&coll), false).unwrap();
         // A second pass must not duplicate the membership row.
-        ingest_collections(&cat, &[coll]).unwrap();
+        ingest_collections(&cat, &[coll], false).unwrap();
         assert_eq!(
             cat.collection_members("coll-1").unwrap(),
             vec!["imdb:tt-a".to_string()]

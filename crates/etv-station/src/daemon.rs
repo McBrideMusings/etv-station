@@ -237,6 +237,15 @@ async fn open_and_ingest_catalog(
             ),
             plan => {
                 let since = plan.since();
+                // Announce the pass before it starts. A full ingest reads the
+                // whole library over the network and can take minutes; without
+                // this line the daemon is silent throughout, so a slow or stale
+                // mount is indistinguishable from a hang.
+                tracing::info!(
+                    event = "catalog.ingest.plex_start",
+                    mode = if since.is_some() { "delta" } else { "full" },
+                    "contacting plex to ingest the catalog; a full pass reads the whole library and can take a few minutes",
+                );
                 let roots = source_roots.clone();
                 let (returned, plex) = tokio::task::spawn_blocking(move || {
                     let result =

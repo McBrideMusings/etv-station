@@ -275,6 +275,23 @@ impl Catalog {
         Ok(())
     }
 
+    /// Every collection id currently stored, ascending. Used to reconcile a full
+    /// re-ingest against what Plex still returns.
+    pub fn all_collection_ids(&self) -> Result<Vec<String>, CatalogError> {
+        self.query_strings("SELECT collection_id FROM collections ORDER BY collection_id", [])
+    }
+
+    /// Delete a collection and, by cascade, its membership rows. For a collection
+    /// that no longer exists in Plex; safe only on a full pass, where absence
+    /// from the fetch means deletion rather than "unchanged".
+    pub fn delete_collection(&self, collection_id: &str) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "DELETE FROM collections WHERE collection_id = ?1",
+            params![collection_id],
+        )?;
+        Ok(())
+    }
+
     /// Place an entry in a collection at an authored `position`.
     pub fn add_collection_item(
         &self,
