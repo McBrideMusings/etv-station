@@ -46,6 +46,7 @@ fn install_shutdown_handlers() {
 }
 
 /// What happened while writing one frame to the fifo.
+#[derive(Debug)]
 enum FrameWrite {
     /// Written to the current reader.
     Written,
@@ -322,14 +323,8 @@ fn pipe_to_fifo(
         OpenOutcome::Opened => {}
         OpenOutcome::Shutdown | OpenOutcome::Idle => return Ok(()),
     }
-    let mut last_activity = std::time::Instant::now();
-    match write_frame_resilient(
-        &mut fifo,
-        &first_frame,
-        &SHUTDOWN,
-        last_activity + IDLE_TIMEOUT,
-    )? {
-        FrameWrite::Written | FrameWrite::Reopened => last_activity = std::time::Instant::now(),
+    match write_frame_resilient(&mut fifo, &first_frame, &SHUTDOWN, IDLE_TIMEOUT)? {
+        FrameWrite::Written | FrameWrite::Reopened => {}
         FrameWrite::Shutdown | FrameWrite::Idle => return Ok(()),
     }
     if let Some(path) = ready_file.as_deref()
@@ -359,10 +354,9 @@ fn pipe_to_fifo(
         let ctx = current_context(program_source.as_mut());
         let state = engine.evaluate(time_seconds, frame_index, &ctx);
         let frame = renderer.render_frame(&state)?;
-        match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN, last_activity + IDLE_TIMEOUT)? {
-            FrameWrite::Written => last_activity = std::time::Instant::now(),
+        match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN, IDLE_TIMEOUT)? {
+            FrameWrite::Written => {}
             FrameWrite::Reopened => {
-                last_activity = std::time::Instant::now();
                 pace_start = std::time::Instant::now();
                 paced_frames = 0;
             }
@@ -398,7 +392,7 @@ fn write_frame_resilient(
     fifo: &mut FifoWriter,
     frame: &[u8],
     shutdown: &AtomicBool,
-    idle_deadline: std::time::Instant,
+    idle_timeout: Duration,
 ) -> anyhow::Result<FrameWrite> {
     let mut reopened = false;
     loop {
@@ -417,7 +411,18 @@ fn write_frame_resilient(
                 tracing::info!("reader disconnected; waiting for next reader to reattach");
                 // Backoff so rapid reader open/close churn can't spin this hot.
                 thread::sleep(REOPEN_BACKOFF);
-                match fifo.reopen(shutdown, Some(idle_deadline))? {
+                // Anchor the idle clock at THIS disconnect, not at the last
+                // completed write. Writes to the fifo block, so a reader that
+                // attaches and then stalls (a wedged ffmpeg) can hold us inside
+                // one write_all for longer than IDLE_TIMEOUT. A deadline
+                // carried in from before that write is already expired by the
+                // time we get here, which turns a routine per-item reader swap
+                // into an instant "no reader" exit — and the exit kills the
+                // only writer the replacement ffmpeg is waiting on, wedging the
+                // channel for good. Idle means "no reader since the last one
+                // left", so measure it from here.
+                let deadline = std::time::Instant::now() + idle_timeout;
+                match fifo.reopen(shutdown, Some(deadline))? {
                     OpenOutcome::Opened => reopened = true,
                     OpenOutcome::Shutdown => return Ok(FrameWrite::Shutdown),
                     OpenOutcome::Idle => return Ok(FrameWrite::Idle),
@@ -481,4 +486,80 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> an
         .write_image_data(rgba)
         .map_err(|e| anyhow::anyhow!("png write: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::time::Instant;
+
+    /// Regression test for the channel-wedging overlay exit.
+    ///
+    /// A reader that attaches and then stops draining blocks us inside a single
+    /// `write_frame` for as long as it likes — fifo writes block once the pipe
+    /// buffer fills. The idle clock previously ran from the last *completed*
+    /// write, so by the time such a reader disconnected the deadline was
+    /// already in the past, and the routine wait for the next reader returned
+    /// `Idle` immediately instead of waiting. That exit killed the only writer
+    /// the replacement ffmpeg was about to block on, wedging the channel for
+    /// good. A stall longer than the idle timeout must still leave a full
+    /// timeout to pick up the next reader.
+    #[test]
+    fn stalled_reader_does_not_poison_the_next_reader_wait() {
+        const IDLE: Duration = Duration::from_millis(500);
+        // Larger than any pipe buffer, so the write is guaranteed to block
+        // while the reader sits on it rather than completing outright.
+        const FRAME_LEN: usize = 512 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("overlay.fifo");
+        mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        let frame = vec![0xABu8; FRAME_LEN];
+        let shutdown = AtomicBool::new(false);
+        let mut fifo = FifoWriter::attach(fifo_path.clone());
+
+        // Reader 1 stalls well past IDLE with the write in flight, then leaves;
+        // reader 2 attaches shortly after, as the next playout item's ffmpeg
+        // would.
+        let reader_path = fifo_path.clone();
+        let readers = thread::spawn(move || {
+            let mut f = OpenOptions::new().read(true).open(&reader_path).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            thread::sleep(IDLE * 2);
+            drop(f);
+            // Comfortably clear of REOPEN_BACKOFF, comfortably inside IDLE.
+            thread::sleep(REOPEN_BACKOFF * 2);
+            let mut f2 = OpenOptions::new().read(true).open(&reader_path).unwrap();
+            let mut buf = vec![0u8; FRAME_LEN];
+            f2.read_exact(&mut buf).unwrap();
+            assert!(
+                buf.iter().all(|b| *b == 0xAB),
+                "reader 2 must get a whole frame from a fresh boundary"
+            );
+        });
+
+        assert_eq!(
+            fifo.open_for_writing(&shutdown, None).unwrap(),
+            OpenOutcome::Opened
+        );
+        let started = Instant::now();
+        let outcome = write_frame_resilient(&mut fifo, &frame, &shutdown, IDLE).unwrap();
+
+        assert!(
+            matches!(outcome, FrameWrite::Reopened),
+            "a stall longer than the idle timeout must not turn the next \
+             reader wait into an immediate give-up; got {outcome:?}",
+        );
+        assert!(
+            started.elapsed() > IDLE,
+            "sanity: the reader really did stall past the idle timeout"
+        );
+        readers.join().unwrap();
+    }
 }

@@ -21,9 +21,18 @@
 //! Despawn is owned by the overlay process itself: it exits once it has had no
 //! reader for its idle timeout (the same 90s etv-next's worker uses to stop a
 //! channel), so the overlay winds down in lockstep with the channel it serves.
-//! This supervisor just reaps that exit — clearing `.overlay-wanted` on a clean
-//! idle exit so the process isn't immediately respawned, and respawning only on
-//! a crash while the channel is still wanted.
+//! This supervisor reaps that exit, and decides from it whether the channel has
+//! actually gone cold.
+//!
+//! That decision cannot be read directly. An ffmpeg blocked in `open()` on the
+//! fifo — which is what etv-next leaves behind when it replaces a failed item
+//! mid-stream — is indistinguishable from no reader at all, unless something
+//! opens the fifo for write. So the supervisor probes by respawning: a clean
+//! exit *after* the overlay had served a reader leaves `.overlay-wanted` in
+//! place and brings a fresh overlay up, which unblocks any parked ffmpeg on its
+//! first open. Only when an overlay lives its whole idle timeout without ever
+//! seeing a reader — no `.overlay-ready` — is the channel treated as cold and
+//! the marker retired. A crash always respawns while the channel is wanted.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -138,31 +147,44 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
             }
             _ = time::sleep(POLL_INTERVAL) => {
                 match child.as_mut() {
-                    // Running: reap the process if it has exited. A clean exit
-                    // (code 0) is the overlay's own idle timeout — the channel
-                    // stopped being watched — so clear `.overlay-wanted` to
-                    // avoid an immediate respawn; a returning viewer's worker
-                    // re-touches it. A non-zero exit is a crash: leave
-                    // `.overlay-wanted` so the next tick respawns while watched.
+                    // Running: reap the process if it has exited. A non-zero
+                    // exit is a crash: leave `.overlay-wanted` so the next tick
+                    // respawns while watched. A clean exit (code 0) is the
+                    // overlay's own idle timeout, and what that means depends on
+                    // whether it ever had a reader — see the module docs.
                     Some(c) => {
                         if let Ok(Some(status)) = c.try_wait() {
+                            // The overlay touches its ready file only after a
+                            // frame has reached an attached reader, so this is
+                            // the record of whether this instance ever served
+                            // one. Check the file as well as the flag: an
+                            // instance can come and go inside a single poll
+                            // interval, and the flag is only set by a poll that
+                            // finds it still running.
+                            let had_reader = ready_observed || ctx.ready_path().exists();
                             child = None;
                             ready_observed = false;
                             let _ = std::fs::remove_file(ctx.ready_path());
-                            if status.success() {
-                                tracing::info!(
-                                    event = "overlay.despawn",
-                                    channel = %ctx.channel_name,
-                                    "overlay exited on idle (channel no longer watched)",
-                                );
-                                let _ = std::fs::remove_file(ctx.wanted_path());
-                            } else {
-                                tracing::warn!(
+                            match reap_decision(status.success(), had_reader) {
+                                Reap::Crashed => tracing::warn!(
                                     event = "overlay.exit",
                                     channel = %ctx.channel_name,
                                     status = %status,
                                     "overlay process crashed; will respawn while watched",
-                                );
+                                ),
+                                Reap::Reprobe => tracing::info!(
+                                    event = "overlay.reprobe",
+                                    channel = %ctx.channel_name,
+                                    "overlay idled out after serving a reader; respawning to check for a waiting reader",
+                                ),
+                                Reap::Retire => {
+                                    tracing::info!(
+                                        event = "overlay.despawn",
+                                        channel = %ctx.channel_name,
+                                        "overlay saw no reader before idling out (channel no longer watched)",
+                                    );
+                                    let _ = std::fs::remove_file(ctx.wanted_path());
+                                }
                             }
                         } else if !ready_observed && ctx.ready_path().exists() {
                             tracing::info!(
@@ -213,6 +235,29 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                 }
             }
         }
+    }
+}
+
+/// What reaping an exited overlay means for `.overlay-wanted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reap {
+    /// Non-zero exit. Keep the marker; the next tick respawns.
+    Crashed,
+    /// Clean exit after serving a reader. Indistinguishable from the outside:
+    /// the channel may have gone cold, or an ffmpeg may be parked in `open()`
+    /// on the fifo waiting for the writer that just exited. Keep the marker and
+    /// respawn — the fresh overlay's own open is the probe.
+    Reprobe,
+    /// Clean exit having never served a reader, i.e. a whole idle timeout with
+    /// nothing attached. Nobody is watching; retire the marker.
+    Retire,
+}
+
+fn reap_decision(exited_cleanly: bool, had_reader: bool) -> Reap {
+    match (exited_cleanly, had_reader) {
+        (false, _) => Reap::Crashed,
+        (true, true) => Reap::Reprobe,
+        (true, false) => Reap::Retire,
     }
 }
 
@@ -279,6 +324,28 @@ mod tests {
             resolved,
             PathBuf::from("/etc/etv/channels/overlays/watermark.toml")
         );
+    }
+
+    // Reaping a clean exit used to retire `.overlay-wanted` unconditionally.
+    // When the overlay exited while etv-next was mid-restart — a replacement
+    // ffmpeg already blocked in open() on the fifo — that retired the marker,
+    // so nothing ever respawned the writer that ffmpeg was waiting on and the
+    // channel served an empty playlist forever. An overlay that had a reader
+    // must leave the marker alone and be respawned.
+    #[test]
+    fn clean_exit_after_serving_a_reader_respawns_rather_than_retiring() {
+        assert_eq!(reap_decision(true, true), Reap::Reprobe);
+    }
+
+    #[test]
+    fn clean_exit_without_ever_seeing_a_reader_retires_the_marker() {
+        assert_eq!(reap_decision(true, false), Reap::Retire);
+    }
+
+    #[test]
+    fn crash_respawns_regardless_of_whether_it_served_a_reader() {
+        assert_eq!(reap_decision(false, true), Reap::Crashed);
+        assert_eq!(reap_decision(false, false), Reap::Crashed);
     }
 
     #[test]
