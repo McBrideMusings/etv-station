@@ -136,7 +136,6 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | Path | What |
 |---|---|
 | `tools/dev-run.sh` | Builds etv-overlay, both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. The canonical local integration test. |
-| `tools/render-etv-next.py` | Superseded by `etv-station --render-etv-next` (`crates/etv-station/src/etv_next.rs`) and no longer called by anything — the runtime image has no interpreter, so the generator had to live in the binary. Slated for deletion. |
 | `tools/kill-dev.sh` | Sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
 | `tools/frame-grab.sh` | Captures one JPEG frame from a live HLS channel via ffmpeg (15 s timeout) and opens it in Preview. `CHANNEL=N` selects the channel (default 1). |
 | `tools/validate-streams.sh` | HTTP probes, codec check, blackdetect, and log scan across all channels in the lineup. Run while a dev integration is active. |

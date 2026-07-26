@@ -233,8 +233,9 @@ fn resolve_identity(
         });
     }
     // A newline (or other control char) in the identity becomes a folder leaf
-    // that `--list-folders` prints one-per-line, so render-etv-next.py would
-    // split one channel into two and misalign every channel number after it.
+    // that `--list-folders` prints one-per-line, so a consumer reading that
+    // output would split one channel into two and misalign every channel number
+    // after it.
     if identity.chars().any(char::is_control) {
         return Err(ConfigError::Validation {
             path: station_path.to_path_buf(),
