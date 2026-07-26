@@ -57,6 +57,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::Notify;
 use tokio::time;
 
+// These duplicate ersatztv-core's OVERLAY_READY_FILE_NAME /
+// OVERLAY_WANTED_FILE_NAME rather than importing them, so a rename on the
+// etv-next side would compile here and silently break the handshake.
+// See https://github.com/McBrideMusings/etv-station/issues/120.
 const READY_FILE_NAME: &str = ".overlay-ready";
 const WANTED_FILE_NAME: &str = ".overlay-wanted";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
