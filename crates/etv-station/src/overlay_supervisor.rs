@@ -31,8 +31,19 @@
 //! exit *after* the overlay had served a reader leaves `.overlay-wanted` in
 //! place and brings a fresh overlay up, which unblocks any parked ffmpeg on its
 //! first open. Only when an overlay lives its whole idle timeout without ever
-//! seeing a reader — no `.overlay-ready` — is the channel treated as cold and
-//! the marker retired. A crash always respawns while the channel is wanted.
+//! seeing a reader — no `.overlay-ready` — is the channel treated as cold. A
+//! crash always respawns while the channel is wanted.
+//!
+//! Going cold does not delete `.overlay-wanted`. The file is written by
+//! etv-next, and one process retracting another's assertion is what let a
+//! channel wedge: the retraction could land while a replacement ffmpeg was
+//! already blocked opening the fifo, and nothing was left to respawn the writer
+//! it waited on. Instead the supervisor remembers the mtime of the request it
+//! served (etv-next rewrites the marker before every item, so it doubles as a
+//! heartbeat) and stays asleep until a newer one appears. The startup and
+//! shutdown paths still clear the marker — those are process boundaries where
+//! the station is resetting its own view, and keeping the clear there is what
+//! holds the "zero overlay processes at boot" property above.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -132,6 +143,10 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
 
     let mut child: Option<Child> = None;
     let mut ready_observed = false;
+    // The mtime of the last watch request we served all the way to a cold idle
+    // exit. `None` means "not cold" — any request is live. Set instead of
+    // deleting the marker, so a request newer than this wakes us again.
+    let mut cold_at: Option<std::time::SystemTime> = None;
 
     loop {
         tokio::select! {
@@ -183,7 +198,12 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                                         channel = %ctx.channel_name,
                                         "overlay saw no reader before idling out (channel no longer watched)",
                                     );
-                                    let _ = std::fs::remove_file(ctx.wanted_path());
+                                    // Go cold by remembering the request we just
+                                    // served, NOT by deleting etv-next's file.
+                                    // See the module docs: whoever writes the
+                                    // marker owns it, and a returning viewer is
+                                    // signalled by a fresher mtime.
+                                    cold_at = wanted_mtime(&ctx);
                                 }
                             }
                         } else if !ready_observed && ctx.ready_path().exists() {
@@ -195,9 +215,10 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                             ready_observed = true;
                         }
                     }
-                    // Not running: spawn when a viewer's worker has requested it.
+                    // Not running: spawn when a viewer's worker has requested it
+                    // and we haven't already served that same request.
                     None => {
-                        if ctx.wanted_path().exists() {
+                        if wants_overlay(&ctx, cold_at) {
                             if let Err(err) = ensure_fifo(&ctx.fifo_path) {
                                 tracing::warn!(
                                     event = "overlay.fifo_failed",
@@ -220,6 +241,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                                     );
                                     child = Some(new_child);
                                     ready_observed = false;
+                                    cold_at = None;
                                 }
                                 Err(err) => {
                                     tracing::warn!(
@@ -235,6 +257,35 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                 }
             }
         }
+    }
+}
+
+/// Modification time of the `.overlay-wanted` marker, or `None` if it isn't
+/// there (or can't be stat'd).
+fn wanted_mtime(ctx: &OverlayContext) -> Option<std::time::SystemTime> {
+    std::fs::metadata(ctx.wanted_path())
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Whether a live watch request is outstanding.
+///
+/// etv-next rewrites `.overlay-wanted` before every playout item, refreshing its
+/// mtime, so the marker doubles as a heartbeat. `cold_at` records the request we
+/// already served to a no-reader idle exit; a marker no newer than that is the
+/// same dead request and must not respawn us. Anything newer — a returning
+/// viewer's worker touching it again — is a fresh request.
+///
+/// Reading the mtime rather than deleting the file keeps the marker owned by the
+/// single process that writes it. The station used to delete it on going cold,
+/// which raced etv-next's own restart: if a replacement ffmpeg was already
+/// waiting on the fifo, the retraction meant nothing ever respawned the writer
+/// it was blocked on.
+fn wants_overlay(ctx: &OverlayContext, cold_at: Option<std::time::SystemTime>) -> bool {
+    match (wanted_mtime(ctx), cold_at) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(now), Some(cold)) => now > cold,
     }
 }
 
@@ -346,6 +397,59 @@ mod tests {
     fn crash_respawns_regardless_of_whether_it_served_a_reader() {
         assert_eq!(reap_decision(false, true), Reap::Crashed);
         assert_eq!(reap_decision(false, false), Reap::Crashed);
+    }
+
+    fn ctx_in(dir: &Path) -> OverlayContext {
+        OverlayContext {
+            channel_name: "test".into(),
+            output_folder: dir.to_path_buf(),
+            overlay_config: dir.join("overlay.toml"),
+            fifo_path: dir.join("overlay.fifo"),
+        }
+    }
+
+    #[test]
+    fn no_marker_means_no_overlay_wanted() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!wants_overlay(&ctx_in(dir.path()), None));
+    }
+
+    #[test]
+    fn a_marker_with_no_cold_record_is_a_live_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        std::fs::write(ctx.wanted_path(), b"").unwrap();
+        assert!(wants_overlay(&ctx, None));
+    }
+
+    // Going cold records the request just served instead of deleting the file,
+    // so the same request must not immediately respawn the overlay.
+    #[test]
+    fn the_request_we_already_served_does_not_respawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        std::fs::write(ctx.wanted_path(), b"").unwrap();
+        let cold = wanted_mtime(&ctx);
+        assert!(cold.is_some());
+        assert!(!wants_overlay(&ctx, cold));
+    }
+
+    // A returning viewer's worker rewrites the marker; the fresher mtime is the
+    // signal to wake up, replacing the old delete-and-recreate handshake.
+    #[test]
+    fn a_newer_request_wakes_a_cold_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        std::fs::write(ctx.wanted_path(), b"").unwrap();
+        let cold = wanted_mtime(&ctx);
+        // Filesystem mtime resolution varies; set it explicitly rather than
+        // sleeping and hoping the clock moved far enough to notice.
+        let later = cold.unwrap() + Duration::from_secs(30);
+        std::fs::File::open(ctx.wanted_path())
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(wants_overlay(&ctx, cold));
     }
 
     #[test]

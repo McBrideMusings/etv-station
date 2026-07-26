@@ -6,6 +6,7 @@ include = ["src/**", "assets/fonts/Inter-Regular.ttf", "assets/fonts/LICENSE.OFL
 
 [dependencies]
 anyhow = { workspace = true }
+ersatztv-core = { workspace = true }
 bytemuck = { workspace = true }
 clap = { workspace = true }
 nix = { workspace = true }

@@ -92,6 +92,11 @@ pub enum StationError {
     #[error("local file not found for item {id}: {path}")]
     MissingLocalFile { id: String, path: PathBuf },
 
+    #[error(
+        "channel {channel} failed earlier in this run and was already reported as channel.failed; the daemon itself ran to shutdown: {reason}"
+    )]
+    ChannelFailed { channel: String, reason: String },
+
     #[error("task panicked: {0}")]
     Task(String),
 }

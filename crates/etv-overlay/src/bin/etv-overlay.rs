@@ -71,6 +71,18 @@ enum FrameWrite {
 /// good), the overlay exits this long after and frees its GPU context.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+// The ordering above is load-bearing, so check it against the real constant
+// rather than the "(90s)" written in the comment. If the overlay ever tolerated
+// a reader gap for longer than etv-next keeps a channel warm, it would still be
+// waiting when the worker that feeds it has already gone — and a bump on either
+// side of the submodule boundary could introduce that silently. Assert it here
+// so the drift is a build failure instead of a channel that quietly stops
+// rendering its overlay.
+const _: () = assert!(
+    IDLE_TIMEOUT.as_secs() < ersatztv_core::HEARTBEAT_FILE_TIMEOUT.as_secs(),
+    "overlay IDLE_TIMEOUT must stay below etv-next's HEARTBEAT_FILE_TIMEOUT",
+);
+
 #[derive(Parser)]
 #[command(name = "etv-overlay")]
 #[command(about = "Vello+Rhai overlay renderer for Velo phase B spike")]

@@ -374,11 +374,22 @@ async fn run_generation(
             Ok((name, Ok(()))) => {
                 tracing::info!(event = "channel.exit", channel = %name, "channel loop exited cleanly");
             }
-            Ok((_name, Err(e))) => {
+            Ok((name, Err(e))) => {
                 // Already logged at the point of failure inside the task
                 // (event = "channel.failed"); here we only capture the first
                 // error to surface through the daemon's exit code.
-                first_err.get_or_insert(e);
+                //
+                // Wrap it so it can't masquerade as a daemon-level failure. A
+                // channel error is isolated and can happen minutes or hours
+                // before shutdown, but it only reaches a human here — at exit,
+                // stripped of which channel raised it and of the fact that the
+                // daemon went on serving every other channel. Reported bare, a
+                // startup problem on one channel reads at 22:11 as "the daemon
+                // just died", which is the opposite of what happened.
+                first_err.get_or_insert_with(|| StationError::ChannelFailed {
+                    channel: name.clone(),
+                    reason: e.to_string(),
+                });
             }
             Err(e) => {
                 tracing::error!(event = "channel.panic", error = %e, "channel task panicked");
