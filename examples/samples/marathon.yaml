@@ -1,9 +1,13 @@
 # Sample S6 — Marathon: play a Plex collection in its authored order, then loop.
 #
 # A *collection* channel that treats a Plex collection as an ORDER, not a set:
-# it emits every member of "Halloween Marathon" in the sequence hand-arranged in
+# it emits every member of "Feels Like Fall" in the sequence hand-arranged in
 # Plex (`collection_items.position`), start to finish, then loops. Re-ordering
 # the marathon is a drag-sort in Plex plus a re-ingest — this file never changes.
+#
+# The collection name is the one thing here that is host-specific: any Plex
+# collection with an authored order works, and this one is only what happened to
+# be on hand. Point it at another and nothing else in the file changes.
 #
 # Note what is NOT here: there is no `order` key. A collection's authored
 # sequence belongs to the (collection, item) pair, not to the items, so it
@@ -25,8 +29,8 @@ rule:
   blocks:
     - mode: "all"
       program:
-        title: "Halloween Marathon"
+        title: "Feels Like Fall"
         categories: ["Movie"]
       entries:
         - kind: collection
-          name: "Halloween Marathon"
+          name: "Feels Like Fall"

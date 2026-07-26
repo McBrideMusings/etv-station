@@ -14,9 +14,18 @@
 #   - the window-continuation generation model — stateful-feeling progression
 #     with **no live cursor**, just a resume map handed across window seams
 #
-# Two pools, one collection. `movies` and `shows` query the same "Trending"
-# collection and split it by `type`, which is why one curated list can drive
-# both halves of the pattern. Each item with no `show_id` — every movie — is
+# Two pools, one curated idea. Plex splits a "Trending" list into per-type
+# collections ("Trending Movies", "Trending TV Shows", "Trending Anime", …), so
+# the pools match on the collection NAME with `startsWith` rather than naming
+# each one — `contains` is exact membership and would match none of them. Each
+# pool then splits the result by `type`, which is why one curated idea can drive
+# both halves of the pattern.
+#
+# The `shows` pool resolves to nothing today, and not because of anything here:
+# Plex files TV collections with members that are shows, and the catalog stores
+# only movies and episodes, so a TV collection's memberships are dropped at
+# ingest and no episode is a collection member. Until #119 lands this channel
+# plays its movies half only. Each item with no `show_id` — every movie — is
 # its own series of one, so `movies` needs no special configuration: rotating
 # through one-item series is simply playing the movies in order.
 #
@@ -40,7 +49,7 @@ rule:
       pools:
         # Every trending movie, alphabetical, cycling forever.
         - name: movies
-          expr: 'item.collections.contains("Trending") && item.type == "movie"'
+          expr: 'item.collections.startsWith("Trending") && item.type == "movie"'
           order: "title:asc"
           select: round_robin
           advance: resume
@@ -50,7 +59,7 @@ rule:
         # it is, and a show that reaches its finale starts over rather than
         # dropping out.
         - name: shows
-          expr: 'item.collections.contains("Trending") && item.type == "episode"'
+          expr: 'item.collections.startsWith("Trending") && item.type == "episode"'
           order: "season:asc,episode:asc"
           select: round_robin
           rotate: visit

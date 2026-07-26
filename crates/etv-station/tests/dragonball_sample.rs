@@ -1,9 +1,8 @@
 //! Acceptance test for Sample S4 (#78): the committed `examples/samples/dragonball.yaml`
-//! manual block weaves query episode-ranges — each ordered by `absolute_episode`
-//! — around an inline movie, playing entries in authored order. Proves the
+//! manual block weaves query episode-ranges — each ordered by `episode` within a
+//! season — around an inline movie, playing entries in authored order. Proves the
 //! hardest authored-order case: a `manual` block with per-entry query order
-//! (#46) over the `absolute_episode` field (#47), and query/inline intermingling,
-//! resolved against a fixture catalog.
+//! (#46), and query/inline intermingling, resolved against a fixture catalog.
 
 use std::path::Path;
 
@@ -11,27 +10,37 @@ use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
 use etv_station::config::{ChannelConfig, read_channel};
 use etv_station::resolve::resolve_channel;
 
-/// Seed Dragon Ball episodes carrying franchise-wide `absolute_episode` numbers,
-/// out of insertion order so the per-entry `absolute_episode:asc` sort — not the
-/// seed order — decides the result. Values span both authored arcs (1–13, 14–28).
+/// Seed Dragon Ball episodes across the two authored arcs (season 1, then season
+/// 2), inserted out of episode order so the per-entry `episode:asc` sort — not
+/// the seed order — decides the result.
 fn dragonball_catalog() -> Catalog {
     let cat = Catalog::open_in_memory().unwrap();
-    for abs in [3, 1, 2, 13, 12, 15, 14, 28] {
-        let id = format!("db:{abs}");
+    for (season, episode) in [
+        (1, 3),
+        (1, 1),
+        (1, 2),
+        (1, 13),
+        (1, 12),
+        (2, 15),
+        (2, 14),
+        (2, 1),
+    ] {
+        let id = format!("db:s{season}e{episode}");
         let mut e = Entry::new(
             &id,
             "episode",
-            format!("Dragon Ball Ep {abs}"),
+            format!("Dragon Ball S{season}E{episode}"),
             Source::Plex,
         );
         e.show = Some("Dragon Ball".to_string());
-        e.absolute_episode = Some(abs);
+        e.season = Some(season);
+        e.episode = Some(episode);
         cat.upsert_entry(&e).unwrap();
         cat.add_source(&EntrySource {
             source: Source::LocalFs,
             source_id: format!("fs-{id}"),
             entry_id: id.clone(),
-            playback_path: format!("/media/db/{abs}.mkv"),
+            playback_path: format!("/media/db/s{season}e{episode}.mkv"),
             last_seen: None,
         })
         .unwrap();
@@ -50,20 +59,20 @@ fn dragonball_sample_weaves_ranges_and_movie_in_authored_order() {
     let items = resolve_channel(&config, &sample_path(), &[], None, Some(&cat)).expect("resolve");
 
     let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-    // Entry 1 (eps 1–13, absolute_episode:asc), then the inline movie (an `fs:`
-    // id derived from its path), then entry 2 (eps 14–28, absolute_episode:asc).
-    // The block is `manual`, so the entries stay in authored order while each
-    // query entry sorts its own resolved episodes.
+    // Entry 1 (season 1, episode:asc), then the inline movie (an `fs:` id derived
+    // from its path), then entry 2 (season 2, episode:asc). The block is
+    // `manual`, so the entries stay in authored order while each query entry
+    // sorts its own resolved episodes.
     assert_eq!(
         &ids[..5],
-        ["db:1", "db:2", "db:3", "db:12", "db:13"].as_slice()
+        ["db:s1e1", "db:s1e2", "db:s1e3", "db:s1e12", "db:s1e13"].as_slice()
     );
     assert!(
         ids[5].starts_with("fs:"),
         "the movie must sit between the two arcs, got {}",
         ids[5],
     );
-    assert_eq!(&ids[6..], ["db:14", "db:15", "db:28"].as_slice());
+    assert_eq!(&ids[6..], ["db:s2e1", "db:s2e14", "db:s2e15"].as_slice());
     assert_eq!(items.len(), 9, "5 episodes + 1 movie + 3 episodes");
 }
 

@@ -6,12 +6,15 @@
 # `query` entry carries its OWN `order`, sorting its resolved episodes internally
 # before they take their place in the sequence:
 #
-#   eps 1–13  (absolute_episode:asc)  →  a movie  →  eps 14–28  (absolute_episode:asc)
+#   season 1  (episode:asc)  →  a movie  →  season 2  (episode:asc)
 #
-# `absolute_episode` is the anime-friendly franchise-wide number (Plex
-# `absoluteIndex`, promoted by the ingester — #47). A Western show with no
-# absolute numbering uses `season`/`episode` with a compound sort instead
-# (`order: "season:asc,episode:asc"`) — the same per-entry order mechanism.
+# Ordering is by `season`/`episode` rather than the anime-friendly franchise-wide
+# `absolute_episode` (Plex `absoluteIndex`, promoted by the ingester — #47),
+# because Plex only reports `absoluteIndex` for shows filed under an
+# absolute-order agent, and this library's Dragon Ball is not one: its episode
+# metadata carries no such attribute, so the column is empty for every episode
+# and a query on it resolves to nothing. Season order reaches the same watch
+# order here — season 1 is 13 episodes and season 2 is 15, the same 1–28 run.
 #
 # Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
 # dev-run serves it live. Being a query channel it resolves to nothing
@@ -31,19 +34,19 @@ rule:
       entries:
         # First TV arc, in franchise-episode order.
         - kind: query
-          query: 'item.show == "Dragon Ball" && item.absolute_episode >= 1 && item.absolute_episode <= 13'
-          order: "absolute_episode:asc"
+          query: 'item.show == "Dragon Ball" && item.season == 1'
+          order: "episode:asc"
 
         # A film slotted into the timeline between the arcs — inline, by hand.
         - kind: item
           source:
             kind: local
-            path: "${ETV_TEST_MEDIA_DIR}/anime/Dragon Ball - Curse of the Blood Rubies (1986) {imdb-tt0142255}/Dragon.Ball.Curse.of.the.Blood.Rubies.1986.1080p.mkv"
+            path: "${ETV_TEST_MEDIA_DIR}/movies/Dragon Ball Curse of the Blood Rubies (1986) {imdb-tt0142251}/Dragon.Ball.Curse.of.the.Blood.Rubies.1986.WEBDL-1080p.x265.AAC[JA+EN].[EN].Radarr.mkv"
           program:
             title: "Dragon Ball: Curse of the Blood Rubies"
             year: 1986
 
         # Second TV arc, continuing the franchise-episode order.
         - kind: query
-          query: 'item.show == "Dragon Ball" && item.absolute_episode >= 14 && item.absolute_episode <= 28'
-          order: "absolute_episode:asc"
+          query: 'item.show == "Dragon Ball" && item.season == 2'
+          order: "episode:asc"

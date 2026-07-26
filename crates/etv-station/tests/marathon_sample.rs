@@ -1,6 +1,6 @@
 //! Acceptance test for Sample S6 (#80): the committed
 //! `examples/samples/marathon.yaml` collection channel plays every member of
-//! the "Halloween Marathon" collection in its authored `collection_items.position`
+//! the "Feels Like Fall" collection in its authored `collection_items.position`
 //! order, excludes non-members, and is stable across generations. Proves
 //! collections-as-order — the counterpart to Sample S5, which reads the same
 //! stored structure for membership only and shuffles it.
@@ -28,7 +28,7 @@ fn marathon_catalog() -> Catalog {
     let cat = Catalog::open_in_memory().unwrap();
     cat.upsert_collection(&Collection {
         collection_id: "coll-marathon".to_string(),
-        name: "Halloween Marathon".to_string(),
+        name: "Feels Like Fall".to_string(),
         source: Source::Plex,
     })
     .unwrap();

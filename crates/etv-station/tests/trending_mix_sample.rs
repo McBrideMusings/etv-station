@@ -1,7 +1,7 @@
 //! Acceptance test for Sample S7 (#81): the committed
 //! `examples/samples/trending-mix.yaml` pattern channel weaves one trending
 //! movie and three trending episodes, repeated, drawing both halves from a
-//! single "Trending" collection split by `type`.
+//! set of `^Trending`-named collections split by `type`.
 //!
 //! Proves the deepest part of the Phase C schema: pools + pattern, the
 //! per-`show_id` resume map under `advance = "resume"`, `select = "round_robin"`
@@ -19,7 +19,7 @@ use etv_station::resolve::{resolve_channel, resolve_channel_with_resume};
 use etv_station::resume::{GenerationState, ResumeMap};
 use time::OffsetDateTime;
 
-/// A "Trending" collection holding two movies and two shows of deliberately
+/// A "Trending Movies" collection holding two movies and two shows of deliberately
 /// unequal length — Game of Thrones with 8 episodes, Invincible with 3 — plus a
 /// movie and an episode outside the collection that must never resolve.
 ///
@@ -30,7 +30,7 @@ fn trending_catalog() -> Catalog {
     let cat = Catalog::open_in_memory().unwrap();
     cat.upsert_collection(&Collection {
         collection_id: "coll-trending".to_string(),
-        name: "Trending".to_string(),
+        name: "Trending Movies".to_string(),
         source: Source::Plex,
     })
     .unwrap();

@@ -1,9 +1,12 @@
 # Sample S5 — Trending: shuffle a collection, play all, reshuffle, repeat.
 #
 # A *query* channel that treats a Plex collection as a SET, not an order: it
-# resolves every member of the "Trending" collection (membership EXISTS —
-# `collection_items.position` is ignored here), collapses any accidental
-# duplicate, then shuffles. `order: "random"` with NO `seed` draws fresh entropy
+# resolves every member of every collection whose name matches `^Trending`
+# (membership EXISTS — `collection_items.position` is ignored here), collapses
+# any accidental duplicate, then shuffles. The regex is what makes one curated
+# idea addressable when Plex has split it into "Trending Movies", "Trending TV
+# Shows", and so on; `matches` and `startsWith` both read the collection NAME,
+# while `contains` stays an exact whole-name membership test. `order: "random"` with NO `seed` draws fresh entropy
 # each generation, so every loop feels fresh; pin a `seed` to reproduce a
 # shuffle. Contrast with Sample S6 (Marathon), which reads the SAME collection
 # structure for its authored `position` (collections-as-order).
@@ -27,4 +30,4 @@ rule:
         categories: ["Movie"]
       entries:
         - kind: query
-          query: 'item.collections.contains("Trending")'
+          query: 'item.collections.matches("^Trending")'

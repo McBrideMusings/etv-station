@@ -292,26 +292,32 @@ fn method_predicate(
                 "item.{field_name} does not support contains()"
             ))),
         },
-        "startsWith" => {
-            let FieldKind::Str(col) = kind else {
-                return Err(err(format!(
-                    "item.{field_name}.startsWith() needs a text field"
-                )));
-            };
-            params.push(literal_like(arg)?);
-            Ok(format!(
-                "COALESCE(entries.{col}, '') LIKE ? || '%' ESCAPE '\\'"
-            ))
-        }
-        "matches" => {
-            let FieldKind::Str(col) = kind else {
-                return Err(err(format!(
-                    "item.{field_name}.matches() needs a text field"
-                )));
-            };
-            params.push(literal_text(arg)?);
-            Ok(format!("COALESCE(entries.{col}, '') REGEXP ?"))
-        }
+        // On a collection these two match the collection's NAME, not the item's
+        // — `contains` stays an exact-membership test, so a curated list split
+        // across several similarly-named collections ("Trending Movies",
+        // "Trending TV Shows", …) is reachable without naming each one.
+        "startsWith" => match kind {
+            FieldKind::Str(col) => {
+                params.push(literal_like(arg)?);
+                Ok(format!(
+                    "COALESCE(entries.{col}, '') LIKE ? || '%' ESCAPE '\\'"
+                ))
+            }
+            FieldKind::Collection => collection_name_like(arg, params),
+            _ => Err(err(format!(
+                "item.{field_name}.startsWith() needs a text field or item.collections"
+            ))),
+        },
+        "matches" => match kind {
+            FieldKind::Str(col) => {
+                params.push(literal_text(arg)?);
+                Ok(format!("COALESCE(entries.{col}, '') REGEXP ?"))
+            }
+            FieldKind::Collection => collection_name_regexp(arg, params),
+            _ => Err(err(format!(
+                "item.{field_name}.matches() needs a text field or item.collections"
+            ))),
+        },
         other => Err(err(format!("unsupported method .{other}() in query"))),
     }
 }
@@ -350,6 +356,31 @@ fn collection_exists(value: &IdedExpr, params: &mut Vec<Value>) -> Result<String
     Ok("EXISTS (SELECT 1 FROM collection_items ci \
          JOIN collections c ON c.collection_id = ci.collection_id \
          WHERE ci.entry_id = entries.entry_id AND c.name = ?)"
+        .to_string())
+}
+
+/// `item.collections.startsWith("<prefix>")` — membership in ANY collection
+/// whose name starts with the prefix. `%`/`_` in the literal are escaped so
+/// they match themselves.
+fn collection_name_like(value: &IdedExpr, params: &mut Vec<Value>) -> Result<String, CatalogError> {
+    params.push(literal_like(value)?);
+    Ok("EXISTS (SELECT 1 FROM collection_items ci \
+         JOIN collections c ON c.collection_id = ci.collection_id \
+         WHERE ci.entry_id = entries.entry_id AND c.name LIKE ? || '%' ESCAPE '\\')"
+        .to_string())
+}
+
+/// `item.collections.matches("<regex>")` — membership in ANY collection whose
+/// name matches the pattern. Backed by the same `regexp()` function the text
+/// fields use, so one compiled pattern serves every candidate row.
+fn collection_name_regexp(
+    value: &IdedExpr,
+    params: &mut Vec<Value>,
+) -> Result<String, CatalogError> {
+    params.push(literal_text(value)?);
+    Ok("EXISTS (SELECT 1 FROM collection_items ci \
+         JOIN collections c ON c.collection_id = ci.collection_id \
+         WHERE ci.entry_id = entries.entry_id AND c.name REGEXP ?)"
         .to_string())
 }
 
@@ -483,6 +514,76 @@ mod tests {
             "Adventure",
         );
         c
+    }
+
+    /// Three similarly-named collections, the shape Plex actually produces when
+    /// one curated idea is split by media type.
+    fn seeded_with_trending_collections() -> Catalog {
+        use crate::catalog::model::Collection;
+        let c = seeded();
+        for (id, name, member) in [
+            ("plex:1", "Trending Movies", "imdb:tt0120737"),
+            ("plex:2", "Trending TV Shows", "imdb:tt0167261"),
+            ("plex:3", "Staff Picks", "imdb:tt0325980"),
+        ] {
+            c.upsert_collection(&Collection {
+                collection_id: id.to_string(),
+                name: name.to_string(),
+                source: Source::Plex,
+            })
+            .unwrap();
+            c.add_collection_item(id, member, 0).unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn collection_contains_stays_an_exact_name_match() {
+        let c = seeded_with_trending_collections();
+        // "Trending" names no collection here, so exact membership finds nothing.
+        let got = c
+            .resolve_query(r#"item.collections.contains("Trending")"#)
+            .unwrap();
+        assert!(got.is_empty(), "expected no items, got {got:?}");
+
+        let got = c
+            .resolve_query(r#"item.collections.contains("Trending Movies")"#)
+            .unwrap();
+        assert_eq!(got, vec!["imdb:tt0120737"]);
+    }
+
+    #[test]
+    fn collection_starts_with_spans_similarly_named_collections() {
+        let c = seeded_with_trending_collections();
+        let got = c
+            .resolve_query(r#"item.collections.startsWith("Trending")"#)
+            .unwrap();
+        assert_eq!(got, vec!["imdb:tt0120737", "imdb:tt0167261"]);
+    }
+
+    #[test]
+    fn collection_matches_takes_a_regex_over_the_name() {
+        let c = seeded_with_trending_collections();
+        let got = c
+            .resolve_query(r#"item.collections.matches("^Trending (Movies|TV)")"#)
+            .unwrap();
+        assert_eq!(got, vec!["imdb:tt0120737", "imdb:tt0167261"]);
+
+        // Anchored elsewhere, the same rows must NOT come back.
+        let got = c
+            .resolve_query(r#"item.collections.matches("^Staff")"#)
+            .unwrap();
+        assert_eq!(got, vec!["imdb:tt0325980"]);
+    }
+
+    #[test]
+    fn collection_starts_with_escapes_wildcards_in_the_literal() {
+        let c = seeded_with_trending_collections();
+        // `_` is a LIKE wildcard; escaped, it matches only a literal underscore.
+        let got = c
+            .resolve_query(r#"item.collections.startsWith("Trending_")"#)
+            .unwrap();
+        assert!(got.is_empty(), "expected no items, got {got:?}");
     }
 
     #[test]

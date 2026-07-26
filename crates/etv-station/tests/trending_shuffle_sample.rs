@@ -1,6 +1,7 @@
 //! Acceptance test for Sample S5 (#79): the committed
 //! `examples/samples/trending-shuffle.yaml` query channel resolves every member
-//! of the "Trending" collection (membership EXISTS, position ignored), excludes
+//! of every collection whose name matches `^Trending` (membership EXISTS,
+//! position ignored), excludes
 //! non-members, and shuffles — a fresh shuffle when unseeded, a reproducible one
 //! when a `seed` is pinned. Proves collections-as-set + the resolve→collapse→
 //! order (`random`) pipeline against a fixture catalog.
@@ -11,17 +12,25 @@ use etv_station::catalog::{Catalog, Collection, Entry, EntrySource, Source};
 use etv_station::config::{ChannelConfig, read_channel};
 use etv_station::resolve::resolve_channel;
 
-/// Seed four movies in a "Trending" collection plus one movie outside it, so the
-/// membership filter has something to exclude. Position is set but irrelevant to
-/// this sample (membership is a set, not an order).
+/// Seed four movies split across TWO similarly-named collections — the shape
+/// Plex produces when one curated idea is filed per media type — plus one movie
+/// in a collection the pattern must not reach, so the name regex has something
+/// to both span and exclude. Position is set but irrelevant to this sample
+/// (membership is a set, not an order).
 fn trending_catalog() -> Catalog {
     let cat = Catalog::open_in_memory().unwrap();
-    cat.upsert_collection(&Collection {
-        collection_id: "coll-trending".to_string(),
-        name: "Trending".to_string(),
-        source: Source::Plex,
-    })
-    .unwrap();
+    for (id, name) in [
+        ("coll-trending", "Trending Movies"),
+        ("coll-trending-intl", "Trending International Movies"),
+        ("coll-other", "Staff Picks"),
+    ] {
+        cat.upsert_collection(&Collection {
+            collection_id: id.to_string(),
+            name: name.to_string(),
+            source: Source::Plex,
+        })
+        .unwrap();
+    }
 
     let seed_movie = |id: &str| {
         let e = Entry::new(id, "movie", format!("Movie {id}"), Source::Plex);
@@ -35,13 +44,21 @@ fn trending_catalog() -> Catalog {
         })
         .unwrap();
     };
-    for (pos, id) in ["m-a", "m-b", "m-c", "m-d"].iter().enumerate() {
+    for (pos, id) in ["m-a", "m-b"].iter().enumerate() {
         seed_movie(id);
         cat.add_collection_item("coll-trending", id, pos as i64)
             .unwrap();
     }
-    // A movie that is NOT in the collection — must never resolve.
+    // Same curated idea, different Plex collection — the `^Trending` name match
+    // is the only reason these reach the channel.
+    for (pos, id) in ["m-c", "m-d"].iter().enumerate() {
+        seed_movie(id);
+        cat.add_collection_item("coll-trending-intl", id, pos as i64)
+            .unwrap();
+    }
+    // A movie in a collection the pattern does not match — must never resolve.
     seed_movie("m-out");
+    cat.add_collection_item("coll-other", "m-out", 0).unwrap();
     cat
 }
 
