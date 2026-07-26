@@ -10,19 +10,25 @@ config, applies a sequencing rule, and continuously writes the
 channel always has JSON on disk whose `[start, finish)` window covers "now" and
 extends N days into the future.
 
-The two run as separate containers over one shared volume. The only coupling is
+The two ship in one container over one playout folder. The only coupling is
 the playout JSON schema (pinned via the `etv-next` git submodule, so schema drift
-is a compile-time error) and the directory-layout convention.
+is a compile-time error) and the directory-layout convention, which is derived
+from the station config rather than authored twice.
 
 ```
-┌────────────────┐  writes   ┌──────────────────┐  reads   ┌────────────────┐
-│  etv-station   │ ────────▶ │  shared volume   │ ◀─────── │  etv-next      │
-│  rules → JSON  │           │  {start}_{fin}.  │          │  JSON→HLS+XMLTV│
-└────────────────┘           │  json per chan   │          └────────────────┘
-                             └──────────────────┘                  │ HTTP
-                                                                    ▼
-                                                          IPTV clients (Plex,
-                                                          Jellyfin, Kodi, …)
+┌─────────────── one container ───────────────┐
+│ ┌────────────────┐ writes  ┌──────────────┐ │
+│ │  etv-station   │ ──────▶ │ playout dir  │ │
+│ │  rules → JSON  │         │ {start}_{fin}│ │
+│ └────────────────┘         │ .json / chan │ │
+│ ┌────────────────┐  reads  └──────────────┘ │
+│ │  etv-next      │ ◀───────────────┘        │
+│ │ JSON→HLS+XMLTV │                          │
+│ └────────┬───────┘                          │
+└──────────┼──────────────────────────────────┘
+           │ HTTP
+           ▼
+   IPTV clients (Plex, Jellyfin, Kodi, …)
 ```
 
 ## Status

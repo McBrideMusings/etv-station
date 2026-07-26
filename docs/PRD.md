@@ -76,38 +76,25 @@ The submodule pinning means:
 
 ### Deployment
 
-Two Docker images, two containers, one shared volume:
+One Docker image carrying both programs, three mounts:
 
-```yaml
-# docker-compose-style sketch (the real compose file lives elsewhere; this
-# is just to fix the topology in the reader's head)
-services:
-  etv-next:
-    image: ersatztv-next:latest
-    volumes:
-      - playout:/var/lib/ersatztv/playout:ro    # read-only mount
-      - hls:/var/lib/ersatztv/hls
-    ports: ["8409:8409"]
-
-  etv-station:
-    image: etv-station:latest
-    volumes:
-      - playout:/var/lib/ersatztv/playout       # read/write
-      - ./station-config:/etc/etv-station:ro
-      - media:/media:ro                         # for ffprobe duration reads
-
-volumes:
-  playout: {}
-  hls: {}
-  media:
-    driver: local
-    driver_opts: { type: bind, o: bind, device: /mnt/user/media }
+```
+docker run -d --name etv-station \
+  -v /mnt/user/appdata/etv-station:/config \       # station.yaml, channels/, blocks/, overlays/
+  -v /mnt/user/appdata/etv-station/data:/data \    # playout JSON, HLS working set, catalog cache
+  -v /mnt/user/media:/media:ro \                   # the library, for ffprobe and playback
+  -p 8419:8409 \
+  -e PLEX_URL=... -e PLEX_TOKEN=... \
+  etv-station:latest
 ```
 
+The image is built from this repo's `Dockerfile`: one builder stage for the station workspace, one for the ETV-next submodule, and a runtime stage on ErsatzTV's own ffmpeg image carrying `etv-station`, `etv-overlay`, `ersatztv`, and `ersatztv-channel`. `docker/entrypoint.sh` renders ETV-next's config from `station.yaml`, creates every channel's playout folder, then runs both processes.
+
 Key properties:
-- `etv-station` has read/write on the playout volume; `etv-next` has read-only. Lock-free producer/consumer; the OS guarantees atomicity for `rename(2)`.
-- Either container can restart independently. ETV-next keeps serving from already-materialized files; etv-station picks up after the last thing it wrote.
-- Neither container has any knowledge of the other's existence at the protocol level. The only coupling is the playout JSON schema and the directory layout convention.
+- The playout folder is a plain directory inside the container that the daemon writes and ETV-next reads. Lock-free producer/consumer; the OS guarantees atomicity for `rename(2)`.
+- The two halves still fail independently: a crashed daemon is restarted in place while ETV-next keeps serving the materialized window; a crashed ETV-next ends the container and the restart policy takes over.
+- Neither program has any knowledge of the other at the protocol level. The only coupling is the playout JSON schema and the directory layout convention — and the layout is derived from `station.yaml` at every start, never authored twice.
+- Config and code deploy separately: editing a channel is an rsync of the config folder, changing behavior is an image rebuild. Neither forces the other.
 
 ## Emission model
 
@@ -233,9 +220,9 @@ Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffect
 ## Verification (v1 acceptance)
 
 - One channel configured with a single entries block, 4 items totaling ~9 hours.
-- `etv-station` and `etv-next` running continuously for 7 days as two containers sharing the playout volume.
+- `etv-station` and `etv-next` running continuously for 7 days in one container over the shared playout folder.
 - At every probe (hourly): ETV-next's `/channel/1.m3u8` returns valid HLS, `/xmltv.xml` includes correctly populated `<programme>` entries for the next ≥7 days, and ETV-next's logs contain zero `unable to find playout JSON file for time …` errors.
-- Stopping `etv-station` mid-run: ETV-next continues serving until the materialized window expires; the failure mode is graceful degradation (back to synthetic black + silence after the window's end), not an immediate outage.
+- Killing the `etv-station` process mid-run: the entrypoint restarts it, and ETV-next serves without interruption throughout; even with the restart suppressed, the failure mode is graceful degradation (back to synthetic black + silence once the materialized window ends), not an immediate outage.
 - Restarting `etv-station`: the next roll tick refills the window without rewriting past files.
 - Bumping the `etv-next` submodule by one commit: `cargo build` either still succeeds (schema-compatible change) or fails with a clear compiler diagnostic (schema-incompatible change). Either outcome is acceptable; silent runtime drift is not.
 
@@ -312,5 +299,5 @@ This section captures decisions made *during PRD authoring* so future readers kn
 - **Why a separate repo (not a crate inside `etv-next-private`)?** Two reasons. (1) Clean independent release cadence and CI; the station program iterates on rules and metadata workflows that are unrelated to ETV-next's pipeline work. (2) Possible eventual public release as a standalone companion project — `etv-next-private` will always be private (it's a personal fork), but `etv-station` could be open-sourced cleanly without disentangling.
 - **Why submodule rather than a vendored copy or a Cargo registry crate?** Submodule is the only option that gives source-level dependency on `ersatztv-playout` without forcing Jason to publish it on crates.io. Schema drift becomes a compile-time question. Vendoring duplicates the file and reintroduces drift risk.
 - **Why filesystem-only IPC?** Matches ETV-next's existing process model (it already uses files for ready/heartbeat signaling between server and channel subprocesses). No new protocol surface. Easy to debug — `ls` shows you the state. Also: never builds in any assumption Jason has not himself adopted, so upstream evolution can't break the contract.
-- **Why two containers, not one?** Honest separation of failure domains. ETV-station can crash, leak memory, get stuck on a bad rule — ETV-next keeps streaming. Independent restart cadence. Independent resource limits. Independent images = independent CI. Cost: one more container to deploy. Worth it.
+- **Why one container, not two?** *(Supersedes the original two-container decision.)* The playout folder is the entire interface between the two programs, so two containers meant sharing that folder, keeping two configs in step, and ordering their startup — machinery whose only purpose was separating two processes that are useless apart. One image makes the folder an ordinary directory and the deploy one image plus one config mount. The failure separation that motivated two containers is kept in `docker/entrypoint.sh`, which restarts a crashed daemon in place while ETV-next keeps streaming, and ends the container when ETV-next itself dies. What is actually given up: per-half resource limits and per-half restart cadence.
 - **Why Rust?** Already chosen language for ETV-next, but the deciding factor is the submodule + path-dep approach: depending on `ersatztv-playout` as a Rust crate from inside the submodule is essentially free, and any other language would need to either re-implement the schema models (drift risk) or codegen them from `schema/playout.json` (added build complexity, weaker type safety than serde-on-the-shared-types).

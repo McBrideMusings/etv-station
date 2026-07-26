@@ -4,7 +4,7 @@
 
 ## Architecture in one sentence
 
-Two containers, one shared filesystem, one shared schema: `etv-station` writes `{start}_{finish}.json` files; ETV-next reads them, produces HLS + XMLTV. The schema is pinned via the `etv-next/` git submodule so drift is a compile-time error.
+One container running two programs over one folder, with one shared schema: `etv-station` writes `{start}_{finish}.json` files; ETV-next reads them, produces HLS + XMLTV. The schema is pinned via the `etv-next/` git submodule so drift is a compile-time error.
 
 See `docs/architecture.md` for the full picture and `docs/PRD.md` for the spec.
 

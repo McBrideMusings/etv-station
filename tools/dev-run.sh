@@ -156,9 +156,10 @@ cargo build -p etv-overlay 2>&1 \
 
 # Generate ETV-next's lineup.json + channelN.json from the station config, so the
 # playout folders it reads are derived from where the station writes (never
-# hand-authored to match). The station binary was just built by --list-folders
-# above, so this reuses it.
-STATION_CONFIG="$STATION_CONFIG" python3 "$(dirname "$0")/render-etv-next.py" \
+# hand-authored to match). Same binary, same flag the container entrypoint runs,
+# so dev and prod render through one code path.
+cargo run -q -p etv-station -- \
+  --config "$STATION_CONFIG" --render-etv-next "${ETV_NEXT_DIR:-examples/etv-next}" \
   | while IFS= read -r l; do printf '[dev] %s\n' "$l"; done
 
 cat <<EOF

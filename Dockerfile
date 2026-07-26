@@ -1,9 +1,13 @@
 # syntax=docker/dockerfile:1
 #
-# Multi-stage build for the etv-station daemon (and the etv-overlay renderer it
-# supervises). The builder compiles a release binary with the full Rust
-# toolchain; the runtime stage is a slim Debian image carrying just the two
-# binaries plus the runtime libraries they need.
+# One image, both halves of the stack: the etv-station daemon (plus the
+# etv-overlay renderer it supervises) and the ErsatzTV-next server that streams
+# what the daemon writes. They are packaged together because the playout folder
+# is the entire interface between them — two containers would need that folder
+# shared, kept in sync, and started in the right order, whereas in one container
+# it is just a directory both processes see. The container takes the station
+# config (and whatever env it needs to reach Plex or the media roots) and serves
+# HLS + XMLTV; nothing else has to be wired up.
 #
 # Dependency compilation is cached via cargo-chef. The `planner` stage emits a
 # recipe describing the dependency graph; the `builder` stage cooks just those
@@ -64,39 +68,73 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json -p etv-station 
 COPY . .
 RUN cargo build --release --locked -p etv-station -p etv-overlay
 
-# ---- runtime ----
-FROM debian:bookworm-slim AS runtime
+# ---- etv-builder ----
+# ErsatzTV-next is its own cargo workspace under the submodule, so it builds on
+# its own here rather than as part of the station workspace above. The layer is
+# keyed on the submodule contents, so it only recompiles when the pinned SHA
+# moves. `ersatztv-channel` is built alongside the server because the server
+# looks for it as a sibling executable when it spawns a channel session.
+FROM chef AS etv-builder
+COPY etv-next /build/etv-next
+WORKDIR /build/etv-next
+RUN cargo build --release --locked --bin ersatztv --bin ersatztv-channel
 
-# ffmpeg provides ffprobe, which the daemon shells out to for media duration
-# (the duration cache). libvulkan1 + mesa-vulkan-drivers give etv-overlay a
-# software Vulkan (lavapipe), so overlay rendering works on a headless host with
-# no GPU; channels without an overlay never spawn it and don't exercise these.
+# ---- runtime ----
+# ErsatzTV's own ffmpeg image: it carries the ffmpeg/ffprobe build ETV-next
+# expects for streaming, and the same ffprobe covers the station daemon's
+# duration probing.
+FROM ghcr.io/ersatztv/ersatztv-ffmpeg:7.1.1 AS runtime
+
+# tini reaps zombies and forwards signals — the entrypoint runs two long-lived
+# children, so PID 1 has real supervision work to do. libvulkan1 +
+# mesa-vulkan-drivers give etv-overlay a software Vulkan (lavapipe), so overlay
+# rendering works on a headless host with no GPU; channels without an overlay
+# never spawn it and don't exercise these.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        ffmpeg \
         libvulkan1 \
         mesa-vulkan-drivers \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Fixed non-root uid/gid for the daemon. It needs no root privileges: it reads
-# config and writes the playout JSON, the duration/anchor sidecars, and the
-# overlay fifo into the bind-mounted output volume. Running as non-root also
-# keeps those files from being created root-owned on the host volume.
-RUN groupadd --system --gid 10001 etv \
-    && useradd --system --uid 10001 --gid 10001 --no-create-home etv
+# ETV-next burns subtitles with libass, which resolves fonts through fontconfig.
+ENV FONTCONFIG_PATH=/etc/fonts
+RUN fc-cache -f
+
+# One fixed non-root uid/gid for both processes. They share the playout folder,
+# so a single owner is the only arrangement where neither can write files the
+# other cannot read. Neither needs root: they read config and write playout
+# JSON, sidecars, the overlay fifo, and the HLS working set.
+RUN groupadd --system --gid 1000 etv \
+    && useradd --system --uid 1000 --gid 1000 --no-create-home etv
 
 # The daemon resolves the overlay binary next to its own executable
-# (overlay_supervisor::overlay_binary_path), so the two sit side by side.
+# (overlay_supervisor::overlay_binary_path) and ETV-next resolves
+# ersatztv-channel next to its own, so all four sit in one directory.
 COPY --from=builder /build/target/release/etv-station /usr/local/bin/etv-station
 COPY --from=builder /build/target/release/etv-overlay /usr/local/bin/etv-overlay
+COPY --from=etv-builder /build/etv-next/target/release/ersatztv /usr/local/bin/ersatztv
+COPY --from=etv-builder /build/etv-next/target/release/ersatztv-channel /usr/local/bin/ersatztv-channel
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
-# Drop to the non-root user for the runtime process. The bind-mounted /config and
-# output volumes must be readable/writable by uid 10001; if the host volume is
-# owned by a different uid, override at run time with `docker run --user
-# <uid>:<gid>` to match it.
+# Config lives on a bind mount; the playout folders and the HLS working set are
+# written under /data so a restart resumes from what the daemon already emitted.
+RUN mkdir -p /config /data \
+    && chown etv:etv /config /data
+
+ENV ETV_STATION_CONFIG=/config/station.yaml \
+    ETV_NEXT_DIR=/config/etv-next \
+    ETV_STATION_OUTPUT_BASE=/data/playout \
+    ETV_STATION_CATALOG=/data/catalog.db \
+    ETV_HLS_OUTPUT=/data/hls \
+    ETV_BIND_ADDRESS=0.0.0.0 \
+    ETV_PORT=8409
+
+EXPOSE 8409
+
+# Drop to the non-root user. The bind-mounted /config and /data must be
+# readable/writable by uid 1000; if the host volume is owned by a different uid,
+# override at run time with `docker run --user <uid>:<gid>` to match it.
 USER etv
 
-# Config and the shared playout volume are bind-mounted at run time. JSON logging
-# is the default so the container runtime captures structured stdout lines.
-ENTRYPOINT ["etv-station"]
-CMD ["--config", "/config/station.toml", "--log-format", "json"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

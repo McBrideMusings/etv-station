@@ -5,23 +5,25 @@ Quick reference. The full rationale lives in [PRD §Architecture](/PRD#architect
 ## Two programs, one shared filesystem, one shared schema
 
 ```
-                                ┌─────────────────────┐
-                                │  shared volume      │
-                                │  /playout/<chan>/   │
-                                │    {start}_{finish}.json
-                                │                     │
-┌────────────────────┐  writes  │                     │  reads  ┌────────────────────┐
-│  etv-station       │ ────────▶│                     │ ◀────── │  etv-next          │
-│  container         │          └─────────────────────┘         │  container         │
-│                    │                                          │                    │
-│  rules → JSON      │                                          │  JSON → HLS+XMLTV  │
-└────────────────────┘                                          └────────────────────┘
+┌──────────────────────────── one container ────────────────────────────┐
+│                          ┌─────────────────────┐                      │
+│                          │  /data/playout/     │                      │
+│                          │    <chan>/          │                      │
+│                          │      {start}_{finish}.json                 │
+│                          │                     │                      │
+│  ┌────────────────┐ writes                     │ reads ┌────────────┐ │
+│  │  etv-station   │ ────▶│                     │◀───── │  etv-next  │ │
+│  │  rules → JSON  │      └─────────────────────┘       │ JSON→HLS   │ │
+│  └────────────────┘                                    └────────────┘ │
+│         ▲                                                      │      │
+└─────────┼──────────────────────────────────────────────────────┼──────┘
+     /config (station.yaml, channels, blocks, overlays)     :8409 HLS + XMLTV
 ```
 
 - **etv-station** has read/write on the playout volume. Computes "what plays when," writes JSON.
 - **etv-next** has read-only on the same volume. Loads the JSON file whose `[start, finish)` covers "now," produces HLS + XMLTV.
 - Coupling is exactly two things: the playout JSON schema (pinned via the `etv-next` submodule + Rust path-dep) and the directory layout convention.
-- The directory layout is single-sourced from the station config: each channel's output folder is derived as `{output_base}/{identity}` (see [schema](/schema#station-file)), and `tools/render-etv-next.py` generates ETV-next's `lineup.json` + `channelN.json` from that same config — so ETV-next reads exactly where the station writes, with no folder path authored twice.
+- The directory layout is single-sourced from the station config: each channel's output folder is derived as `{output_base}/{identity}` (see [schema](/schema#station-file)), and `etv-station --render-etv-next <dir>` generates ETV-next's `lineup.json` + `channelN.json` from that same config — so ETV-next reads exactly where the station writes, with no folder path authored twice. The container entrypoint runs that render at every start, so the two can only ever agree.
 
 ## Why a submodule
 
@@ -35,13 +37,16 @@ Quick reference. The full rationale lives in [PRD §Architecture](/PRD#architect
 
 ETV-next's README is explicit: "Library and metadata management, scheduling and playout creation are not in scope for this project." Forking to add scheduling would mean eating merge conflicts on every pipeline-side PR forever. The companion-program approach keeps ETV-next's pipeline work and `etv-station`'s rule work on independent release cadences.
 
-## Why two containers
+## Why one container
 
-Honest separation of failure domains:
+The playout folder is the entire interface between the two programs, so shipping them separately would mean sharing that folder between containers, keeping their config in step, and starting them in the right order — all to separate two processes that are useless apart. In one image the folder is just a directory both processes see, and deploying the stack is one image plus one config mount.
 
-- `etv-station` can crash, leak memory, get stuck on a bad rule — `etv-next` keeps streaming the materialized window.
-- Independent restart cadence, resource limits, images, CI.
-- Cost is one extra container; benefit is graceful degradation when something goes wrong on the planning side.
+The failure separation that two containers used to provide is kept by the entrypoint (`docker/entrypoint.sh`), which treats the two processes differently:
+
+- `etv-station` can crash, leak memory, get stuck on a bad rule — it is restarted in place and `etv-next` keeps streaming the window already written, which is the whole point of materializing forward. Repeated crashes (default 5) end the container rather than loop forever.
+- `etv-next` exiting *is* the service being down, so it ends the container and the restart policy takes over.
+
+What is genuinely given up: independent resource limits and independent restart cadence for the two halves.
 
 ## Why filesystem-only IPC
 

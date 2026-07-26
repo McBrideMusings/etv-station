@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use etv_station::{config, daemon};
+use etv_station::{config, daemon, etv_next};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -25,6 +25,14 @@ struct Cli {
     /// never disagree with where the daemon actually writes.
     #[arg(long)]
     list_folders: bool,
+
+    /// Render ETV-next's lineup.json + channelN.json into this directory from
+    /// the station config, then exit. The directory must already hold
+    /// `normalization.default.json`; `presentation.json` is used if present.
+    /// The container entrypoint runs this before starting ETV-next, so the
+    /// playout folders it reads are always the ones the daemon writes.
+    #[arg(long, value_name = "DIR")]
+    render_etv_next: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -40,6 +48,10 @@ fn main() -> ExitCode {
     // setup, so stdout carries only the folder list for a caller to capture.
     if cli.list_folders {
         return list_folders(&cli.config);
+    }
+
+    if let Some(dir) = cli.render_etv_next.as_deref() {
+        return render_etv_next(&cli.config, dir);
     }
 
     init_tracing(cli.log_format);
@@ -109,6 +121,35 @@ fn list_folders(config_path: &Path) -> ExitCode {
         }
         Err(err) => {
             eprintln!("failed to load configuration: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Render ETV-next's config from the station config and exit. Progress goes to
+/// stdout so the container entrypoint's log shows what the lineup ended up as;
+/// a failure is fatal, since ETV-next would otherwise boot on stale config.
+fn render_etv_next(config_path: &Path, out_dir: &Path) -> ExitCode {
+    let opts = match etv_next::RenderOptions::from_env(out_dir.to_path_buf()) {
+        Ok(opts) => opts,
+        Err(err) => {
+            eprintln!("render-etv-next: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    match etv_next::render(config_path, &opts) {
+        Ok(rendered) => {
+            println!(
+                "render-etv-next: {} + {} channel file(s) (bind={} port={})",
+                rendered.lineup_path.display(),
+                rendered.channels,
+                opts.bind_address,
+                opts.port,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("render-etv-next: {err}");
             ExitCode::from(1)
         }
     }

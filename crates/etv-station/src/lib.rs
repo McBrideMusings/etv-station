@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod duration;
 pub mod emit;
 pub mod errors;
+pub mod etv_next;
 pub mod history;
 pub mod overlay_supervisor;
 pub mod pattern;
