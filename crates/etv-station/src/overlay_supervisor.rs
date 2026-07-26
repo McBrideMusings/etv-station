@@ -19,10 +19,11 @@
 //!   before opening the fifo.
 //!
 //! Despawn is owned by the overlay process itself: it exits once it has had no
-//! reader for its idle timeout (the same 90s etv-next's worker uses to stop a
-//! channel), so the overlay winds down in lockstep with the channel it serves.
-//! This supervisor reaps that exit, and decides from it whether the channel has
-//! actually gone cold.
+//! reader for its own idle timeout (60s — deliberately *under* the 90s
+//! `HEARTBEAT_FILE_TIMEOUT` etv-next's worker uses to stop a channel, which
+//! `etv-overlay` asserts at compile time), so the overlay winds down in lockstep
+//! with the channel it serves. This supervisor reaps that exit, and decides from
+//! it whether the channel has actually gone cold.
 //!
 //! That decision cannot be read directly. An ffmpeg blocked in `open()` on the
 //! fifo — which is what etv-next leaves behind when it replaces a failed item
