@@ -278,7 +278,10 @@ impl Catalog {
     /// Every collection id currently stored, ascending. Used to reconcile a full
     /// re-ingest against what Plex still returns.
     pub fn all_collection_ids(&self) -> Result<Vec<String>, CatalogError> {
-        self.query_strings("SELECT collection_id FROM collections ORDER BY collection_id", [])
+        self.query_strings(
+            "SELECT collection_id FROM collections ORDER BY collection_id",
+            [],
+        )
     }
 
     /// Delete a collection and, by cascade, its membership rows. For a collection

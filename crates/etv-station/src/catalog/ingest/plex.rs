@@ -257,8 +257,10 @@ pub fn ingest_collections(
         // A collection deleted in Plex never appears in a full fetch, so
         // upsert-only never removes it and `contains("…")` keeps matching a name
         // that is gone. Drop every stored collection the fetch did not return.
-        let fetched: std::collections::HashSet<&str> =
-            collections.iter().map(|c| c.collection_id.as_str()).collect();
+        let fetched: std::collections::HashSet<&str> = collections
+            .iter()
+            .map(|c| c.collection_id.as_str())
+            .collect();
         for id in catalog.all_collection_ids()? {
             if !fetched.contains(id.as_str()) {
                 catalog.delete_collection(&id)?;
@@ -1188,7 +1190,11 @@ mod tests {
         // A delta pass returns only "keep" (it changed); "gone" is merely absent,
         // not deleted, so it must survive.
         ingest_collections(&cat, std::slice::from_ref(&keep), false).unwrap();
-        assert_eq!(cat.all_collection_ids().unwrap().len(), 2, "delta keeps absent");
+        assert_eq!(
+            cat.all_collection_ids().unwrap().len(),
+            2,
+            "delta keeps absent"
+        );
 
         // A full pass returns only "keep": "gone" is really gone and is pruned,
         // its membership cascading away.

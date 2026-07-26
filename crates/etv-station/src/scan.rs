@@ -252,8 +252,14 @@ mod tests {
             datetime!(2026-04-20 12:00 UTC),
             datetime!(2026-04-20 13:00 UTC),
             &[
-                (datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC)),
-                (datetime!(2026-04-20 12:30 UTC), datetime!(2026-04-20 13:00 UTC)),
+                (
+                    datetime!(2026-04-20 12:00 UTC),
+                    datetime!(2026-04-20 12:30 UTC),
+                ),
+                (
+                    datetime!(2026-04-20 12:30 UTC),
+                    datetime!(2026-04-20 13:00 UTC),
+                ),
             ],
         )
         .await;
@@ -273,7 +279,10 @@ mod tests {
             dir.path(),
             datetime!(2026-04-20 12:00 UTC),
             datetime!(2026-04-20 12:30 UTC),
-            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC))],
+            &[(
+                datetime!(2026-04-20 12:00 UTC),
+                datetime!(2026-04-20 12:30 UTC),
+            )],
         )
         .await;
         let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 18:00 UTC))
@@ -292,14 +301,20 @@ mod tests {
             dir.path(),
             datetime!(2026-04-20 12:00 UTC),
             datetime!(2026-04-20 12:30 UTC),
-            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC))],
+            &[(
+                datetime!(2026-04-20 12:00 UTC),
+                datetime!(2026-04-20 12:30 UTC),
+            )],
         )
         .await;
         write_playout(
             dir.path(),
             datetime!(2026-04-20 13:00 UTC),
             datetime!(2026-04-20 13:30 UTC),
-            &[(datetime!(2026-04-20 13:00 UTC), datetime!(2026-04-20 13:30 UTC))],
+            &[(
+                datetime!(2026-04-20 13:00 UTC),
+                datetime!(2026-04-20 13:30 UTC),
+            )],
         )
         .await;
         let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 14:00 UTC))
@@ -319,14 +334,20 @@ mod tests {
             dir.path(),
             datetime!(2026-04-20 12:00 UTC),
             datetime!(2026-04-20 18:00 UTC), // name over-claims 6h
-            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:03 UTC))],
+            &[(
+                datetime!(2026-04-20 12:00 UTC),
+                datetime!(2026-04-20 12:03 UTC),
+            )],
         )
         .await;
         write_playout(
             dir.path(),
             datetime!(2026-04-20 18:00 UTC),
             datetime!(2026-04-20 18:30 UTC),
-            &[(datetime!(2026-04-20 18:00 UTC), datetime!(2026-04-20 18:30 UTC))],
+            &[(
+                datetime!(2026-04-20 18:00 UTC),
+                datetime!(2026-04-20 18:30 UTC),
+            )],
         )
         .await;
         let gap = first_coverage_gap(dir.path(), now, datetime!(2026-04-20 19:00 UTC))
@@ -345,14 +366,20 @@ mod tests {
             dir.path(),
             datetime!(2026-04-20 12:00 UTC),
             datetime!(2026-04-20 12:30 UTC),
-            &[(datetime!(2026-04-20 12:00 UTC), datetime!(2026-04-20 12:30 UTC))],
+            &[(
+                datetime!(2026-04-20 12:00 UTC),
+                datetime!(2026-04-20 12:30 UTC),
+            )],
         )
         .await;
         write_playout(
             dir.path(),
             datetime!(2026-04-20 13:00 UTC),
             datetime!(2026-04-20 13:30 UTC),
-            &[(datetime!(2026-04-20 13:00 UTC), datetime!(2026-04-20 13:30 UTC))],
+            &[(
+                datetime!(2026-04-20 13:00 UTC),
+                datetime!(2026-04-20 13:30 UTC),
+            )],
         )
         .await;
         // Horizon 12:20 — before the 12:30 hole — so nothing to report yet.

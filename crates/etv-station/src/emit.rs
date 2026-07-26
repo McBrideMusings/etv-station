@@ -226,7 +226,11 @@ mod tests {
         assert_eq!(files.len(), 1, "three passes, still one chunk file");
         assert_eq!(read_items(&files[0].path).await.len(), 6, "all six items");
         let (_, nf) = name_span(&files[0].path);
-        assert_eq!(nf, datetime!(2026-04-13 00:06 UTC), "name grew with content");
+        assert_eq!(
+            nf,
+            datetime!(2026-04-13 00:06 UTC),
+            "name grew with content"
+        );
     }
 
     // A generation spanning a chunk boundary seals the completed chunk to its
@@ -257,8 +261,18 @@ mod tests {
         assert_eq!(files[1].start, datetime!(2026-04-13 02:00 UTC));
         assert_eq!(files[1].finish, datetime!(2026-04-13 04:00 UTC));
         // The straddling item appears in BOTH chunks so either side can play it.
-        assert!(read_items(&files[0].path).await.iter().any(|i| i.id == "long"));
-        assert!(read_items(&files[1].path).await.iter().any(|i| i.id == "long"));
+        assert!(
+            read_items(&files[0].path)
+                .await
+                .iter()
+                .any(|i| i.id == "long")
+        );
+        assert!(
+            read_items(&files[1].path)
+                .await
+                .iter()
+                .any(|i| i.id == "long")
+        );
     }
 
     // Two independent emissions of the same inputs are byte-identical.
