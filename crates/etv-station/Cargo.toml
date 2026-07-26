@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 cel = { workspace = true }
 clap = { workspace = true }
+ersatztv-core = { workspace = true }
 ersatztv-playout = { workspace = true }
 etv-overlay = { workspace = true }
 glob = { workspace = true }

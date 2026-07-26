@@ -57,12 +57,15 @@ use tokio::process::{Child, Command};
 use tokio::sync::Notify;
 use tokio::time;
 
-// These duplicate ersatztv-core's OVERLAY_READY_FILE_NAME /
-// OVERLAY_WANTED_FILE_NAME rather than importing them, so a rename on the
-// etv-next side would compile here and silently break the handshake.
-// See https://github.com/McBrideMusings/etv-station/issues/120.
-const READY_FILE_NAME: &str = ".overlay-ready";
-const WANTED_FILE_NAME: &str = ".overlay-wanted";
+// Both marker names come from ersatztv-core, the crate that also defines them
+// for the etv-next side of the handshake. Importing rather than redeclaring is
+// the point: these two filenames ARE the protocol, and a copy here would let a
+// rename over there compile cleanly and fail silently at runtime — the station
+// polling for a file the channel worker no longer writes, so no overlay ever
+// spawns and every overlay channel's ffmpeg blocks forever on a fifo with no
+// writer.
+use ersatztv_core::{OVERLAY_READY_FILE_NAME, OVERLAY_WANTED_FILE_NAME};
+
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct OverlayContext {
@@ -74,11 +77,11 @@ pub struct OverlayContext {
 
 impl OverlayContext {
     pub fn ready_path(&self) -> PathBuf {
-        self.output_folder.join(READY_FILE_NAME)
+        self.output_folder.join(OVERLAY_READY_FILE_NAME)
     }
 
     pub fn wanted_path(&self) -> PathBuf {
-        self.output_folder.join(WANTED_FILE_NAME)
+        self.output_folder.join(OVERLAY_WANTED_FILE_NAME)
     }
 }
 
@@ -410,6 +413,24 @@ mod tests {
             overlay_config: dir.join("overlay.toml"),
             fifo_path: dir.join("overlay.fifo"),
         }
+    }
+
+    // The two filenames ARE the protocol with etv-next, so pin what actually
+    // lands on disk. Sourcing them from ersatztv-core stops a rename drifting
+    // silently, but an import can still name the wrong one of the pair — and
+    // swapping ready for wanted would compile, pass every other test here, and
+    // deadlock the handshake at runtime.
+    #[test]
+    fn the_marker_paths_render_the_names_etv_next_looks_for() {
+        let ctx = ctx_in(Path::new("/playout/chan"));
+        assert_eq!(
+            ctx.ready_path(),
+            PathBuf::from("/playout/chan/.overlay-ready")
+        );
+        assert_eq!(
+            ctx.wanted_path(),
+            PathBuf::from("/playout/chan/.overlay-wanted")
+        );
     }
 
     #[test]
