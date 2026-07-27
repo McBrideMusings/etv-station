@@ -151,6 +151,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `.claude/skills/check-epg.md` | Skill: fetch `/xmltv.xml`, validate XMLTV structure, cross-check titles against playout JSON on disk. |
 | `.claude/skills/frame-grab.md` | Skill: `ffmpeg` frame capture from a live HLS stream; reads image inline so Claude can see the frame. |
 | `.claude/skills/read-logs.md` | Skill: locate and read the most recent `tmp/<cmd>.*.log` file from a dev run. |
+| `.claude/skills/upstream-sync/SKILL.md` | Skill: absorb upstream ErsatzTV/next into the private `etv-next` fork and land it here via the submodule pointer — the survey, the schema and ffmpeg-pin checks that reach into this repo, and the conflict doctrine for files the fork rewrote. |
 
 ## Submodule
 
