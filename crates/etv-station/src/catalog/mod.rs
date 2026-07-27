@@ -249,6 +249,25 @@ impl Catalog {
         Ok(())
     }
 
+    /// Drop every tag row for one entry in one namespace.
+    ///
+    /// Same reconcile problem as [`Self::clear_collection_items`], one level
+    /// down: a source authors the whole tag set for a namespace and re-reads it
+    /// wholesale, but [`Self::add_tag`] only inserts. A genre (or cast member,
+    /// or director) removed upstream would otherwise survive in the catalog
+    /// forever and keep satisfying queries that should no longer match it.
+    /// Clearing per (entry, namespace) — rather than per entry — keeps a source
+    /// from deleting tags it does not own: the Plex ingester writes seven
+    /// namespaces, the filesystem ingester writes only `fs_dir`, and neither
+    /// should touch the other's rows.
+    pub fn clear_tags(&self, entry_id: &str, namespace: TagNs) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "DELETE FROM tags WHERE entry_id = ?1 AND namespace = ?2",
+            params![entry_id, namespace.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// Insert or rename a collection.
     pub fn upsert_collection(&self, c: &Collection) -> Result<(), CatalogError> {
         self.conn.execute(
