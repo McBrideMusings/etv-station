@@ -3,11 +3,13 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontStack, Layout, LayoutContext,
+    Alignment, AlignmentOptions, FontContext, FontFamily, Layout, LayoutContext,
     PositionedLayoutItem, StyleProperty,
 };
 use vello::kurbo::{Affine, RoundedRect};
-use vello::peniko::{Blob, Color, Fill, Image as PenikoImage, ImageFormat};
+use vello::peniko::{
+    Blob, Color, Fill, ImageAlphaType, ImageBrush as PenikoImage, ImageData, ImageFormat,
+};
 use vello::wgpu;
 use vello::{AaConfig, AaSupport, Glyph, RenderParams, Renderer, RendererOptions, Scene};
 
@@ -44,11 +46,11 @@ fn build_text_layout(
 ) -> Layout<()> {
     let stack = font_stack(font_family);
     let mut builder = layout_context.ranged_builder(font_context, content, 1.0, true);
-    builder.push_default(StyleProperty::FontStack(FontStack::Source(stack.into())));
+    builder.push_default(StyleProperty::FontFamily(FontFamily::Source(stack.into())));
     builder.push_default(StyleProperty::FontSize(font_size));
     let mut layout = builder.build(content);
     layout.break_all_lines(None);
-    layout.align(None, Alignment::Start, AlignmentOptions::default());
+    layout.align(Alignment::Start, AlignmentOptions::default());
     layout
 }
 
@@ -75,9 +77,10 @@ impl VelloRenderer {
             anyhow::bail!("only rgba8 is supported in the spike");
         }
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        // Offscreen render target only — no surface, so no display handle.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -85,17 +88,16 @@ impl VelloRenderer {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
-        .ok_or_else(|| anyhow::anyhow!("no wgpu adapter available"))?;
+        .map_err(|e| anyhow::anyhow!("no wgpu adapter available: {e}"))?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("etv-overlay-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("etv-overlay-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))
         .map_err(|e| anyhow::anyhow!("wgpu device request failed: {e}"))?;
 
         let renderer = Renderer::new(
@@ -238,13 +240,13 @@ impl VelloRenderer {
                 height: logo_height,
             } => {
                 let image = self.load_or_get_image(path)?.clone();
-                let aspect = image.width as f64 / image.height as f64;
+                let aspect = image.image.width as f64 / image.image.height as f64;
                 let h = *logo_height as f64;
                 let w = h * aspect;
                 let (x0, y0) =
                     corner_origin_f64(*corner, *margin as f64, w, h, self.width, self.height);
-                let scale_x = w / image.width as f64;
-                let scale_y = h / image.height as f64;
+                let scale_x = w / image.image.width as f64;
+                let scale_y = h / image.image.height as f64;
                 let transform =
                     Affine::translate((x0, y0)) * Affine::scale_non_uniform(scale_x, scale_y);
                 let image_with_alpha = image.with_alpha(opacity);
@@ -325,7 +327,7 @@ impl VelloRenderer {
                 let glyphs: Vec<Glyph> = glyph_run
                     .positioned_glyphs()
                     .map(|g| Glyph {
-                        id: g.id as u32,
+                        id: g.id,
                         x: g.x,
                         y: g.y,
                     })
@@ -401,7 +403,10 @@ impl VelloRenderer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        let _ = self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
         rx.recv()
             .map_err(|e| anyhow::anyhow!("readback channel closed: {e}"))?
             .map_err(|e| anyhow::anyhow!("readback map: {e}"))?;
@@ -484,12 +489,13 @@ fn decode_png(path: &Path) -> anyhow::Result<PenikoImage> {
         }
     };
 
-    Ok(PenikoImage::new(
-        Blob::from(rgba),
-        ImageFormat::Rgba8,
-        info.width,
-        info.height,
-    ))
+    Ok(PenikoImage::new(ImageData {
+        data: Blob::from(rgba),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width: info.width,
+        height: info.height,
+    }))
 }
 
 fn expand_rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {

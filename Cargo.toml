@@ -32,6 +32,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ureq = { version = "2", features = ["json"] }
 tempfile = "3"
-vello = "0.5"
-wgpu = "24"
-parley = "0.4"
+vello = "0.9"
+wgpu = "29"
+parley = "0.9"
