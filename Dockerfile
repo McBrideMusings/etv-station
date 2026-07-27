@@ -83,7 +83,7 @@ RUN cargo build --release --locked --bin ersatztv --bin ersatztv-channel
 # ErsatzTV's own ffmpeg image: it carries the ffmpeg/ffprobe build ETV-next
 # expects for streaming, and the same ffprobe covers the station daemon's
 # duration probing.
-FROM ghcr.io/ersatztv/ersatztv-ffmpeg:7.1.1 AS runtime
+FROM ghcr.io/ersatztv/ersatztv-ffmpeg:8.1.2 AS runtime
 
 # tini reaps zombies and forwards signals — the entrypoint runs two long-lived
 # children, so PID 1 has real supervision work to do. libvulkan1 +
