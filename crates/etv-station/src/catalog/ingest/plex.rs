@@ -200,6 +200,10 @@ pub fn ingest_items(
             (TagNs::Producer, &item.producers),
             (TagNs::Country, &item.countries),
         ] {
+            // Plex authors each of these sets wholesale, so reconcile rather
+            // than accumulate: without the clear, a genre removed upstream
+            // stays attached forever and keeps matching queries it shouldn't.
+            catalog.clear_tags(&entry_id, ns)?;
             for value in values {
                 catalog.add_tag(&entry_id, ns, value)?;
             }
@@ -1228,6 +1232,59 @@ mod tests {
         let json = r#"{"ratingKey": "1", "type": "movie", "title": "x", "Media": []}"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
         assert!(to_plex_item(&m, |p| p.to_string()).is_none());
+    }
+
+    /// Plex authors the whole tag set per namespace, so a re-ingest has to
+    /// reconcile it rather than accumulate. Without the clear in `ingest_items`,
+    /// `add_tag`'s `INSERT OR IGNORE` leaves a genre removed upstream attached
+    /// forever, and it keeps matching queries that should no longer select it.
+    /// Same shape as `ingest_collections_drops_a_member_removed_upstream`, one
+    /// level down.
+    #[test]
+    fn ingest_items_drops_tags_removed_upstream() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let mut item = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        item.genres = vec!["Action".into(), "Comedy".into()];
+        item.directors = vec!["Someone".into()];
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+        assert_eq!(
+            cat.tags_for("imdb:tt-a", TagNs::Genre).unwrap(),
+            vec!["Action".to_string(), "Comedy".to_string()]
+        );
+
+        // The Comedy genre is removed in Plex; the director is untouched.
+        item.genres = vec!["Action".into()];
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+        assert_eq!(
+            cat.tags_for("imdb:tt-a", TagNs::Genre).unwrap(),
+            vec!["Action".to_string()],
+            "a genre removed upstream must not survive a re-ingest"
+        );
+        assert_eq!(
+            cat.tags_for("imdb:tt-a", TagNs::Director).unwrap(),
+            vec!["Someone".to_string()],
+            "reconciling one namespace must not disturb another"
+        );
+    }
+
+    /// The filesystem ingester owns `fs_dir` and Plex owns the other seven, so a
+    /// Plex re-ingest must leave an `fs_dir` tag on the same entry alone. Guards
+    /// the per-(entry, namespace) scope of `clear_tags` against being widened to
+    /// per-entry.
+    #[test]
+    fn plex_reingest_leaves_another_sources_namespace_alone() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let item = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+        cat.add_tag("imdb:tt-a", TagNs::FsDir, "bumpers").unwrap();
+
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+        assert_eq!(
+            cat.tags_for("imdb:tt-a", TagNs::FsDir).unwrap(),
+            vec!["bumpers".to_string()]
+        );
     }
 
     #[test]
