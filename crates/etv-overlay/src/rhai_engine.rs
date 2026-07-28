@@ -57,20 +57,41 @@ pub struct RhaiEngine {
     engine: Engine,
     ast: Option<AST>,
     base_layers: Vec<OverlayKind>,
+    /// The spec's `config`, already converted. Held as a `Dynamic` rather than
+    /// as the TOML value because [`RhaiEngine::evaluate`] runs once per frame:
+    /// converting there would re-walk the whole table 30 times a second to
+    /// produce the same result. Cloning a `Dynamic` map is a refcount.
+    config: Dynamic,
 }
 
 impl RhaiEngine {
     pub fn new(base_layers: Vec<OverlayKind>) -> Self {
+        Self::with_config(base_layers, None)
+    }
+
+    /// As [`RhaiEngine::new`], with the spec's opaque `config` table. Anything
+    /// that fails to convert is dropped to an empty map and warned about rather
+    /// than failing the render — an overlay is decoration over a channel that is
+    /// already on the air, so a bad config costs the decoration, not the stream.
+    pub fn with_config(base_layers: Vec<OverlayKind>, config: Option<&toml::Value>) -> Self {
         let mut engine = Engine::new();
         // Bound script complexity so a runaway script can't stall the per-frame
         // render loop. 64 nesting / 50k ops is plenty for fade and blink curves
         // but stops infinite loops at evaluation time.
         engine.set_max_expr_depths(64, 64);
         engine.set_max_operations(50_000);
+        let config = match config {
+            Some(value) => rhai::serde::to_dynamic(value).unwrap_or_else(|e| {
+                tracing::warn!("overlay config is not representable in Rhai: {e}");
+                Dynamic::from_map(rhai::Map::new())
+            }),
+            None => Dynamic::from_map(rhai::Map::new()),
+        };
         Self {
             engine,
             ast: None,
             base_layers,
+            config,
         }
     }
 
@@ -99,6 +120,11 @@ impl RhaiEngine {
         };
 
         let mut scope = Scope::new();
+        // The spec's own `config`, handed over unread. An absent one is an empty
+        // map rather than a missing constant, so a script can read
+        // `config.whatever` unconditionally and get unit for anything unset —
+        // which is also why a mistyped key is silent.
+        scope.push_constant("config", self.config.clone());
         scope.push_constant("time", time_seconds);
         scope.push_constant("frame", frame_index as i64);
         scope.push_constant("title", program.title.clone());
@@ -238,6 +264,104 @@ mod tests {
         let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
         assert!(!state.visible);
         assert_eq!(state.opacity, 1.0);
+    }
+
+    fn toml_config(src: &str) -> toml::Value {
+        toml::from_str::<toml::Value>(src).unwrap()
+    }
+
+    /// The spec's `config` reaches the script with its nesting and scalar types
+    /// intact (#125). Nothing here knows what `fade_seconds` means — the script
+    /// does, and the station only carries the value.
+    #[test]
+    fn config_arrives_nested_with_types_intact() {
+        let script = write_script(
+            r#"
+            if config.fade.seconds != 0.4 { throw "float did not survive"; }
+            if config.fade.steps != 3 { throw "int did not survive"; }
+            if config.fade.enabled != true { throw "bool did not survive"; }
+            if config.fade.labels[1] != "b" { throw "nested array did not survive"; }
+            if config.name != "lower-third" { throw "top-level string did not survive"; }
+            #{ "visible": true, "opacity": config.fade.seconds }
+            "#,
+        );
+        let cfg = toml_config(
+            r#"
+name = "lower-third"
+[fade]
+seconds = 0.4
+steps = 3
+enabled = true
+labels = ["a", "b"]
+"#,
+        );
+        let mut engine = RhaiEngine::with_config(vec![watermark()], Some(&cfg));
+        engine.load_script(script.path()).unwrap();
+
+        let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
+        assert!(state.visible);
+        assert!(
+            (state.opacity - 0.4).abs() < 1e-6,
+            "the config value should reach the resolved state, got {}",
+            state.opacity
+        );
+    }
+
+    /// Two specs, one script, different numbers — the point of the field.
+    #[test]
+    fn the_same_script_renders_differently_per_config() {
+        let script = write_script(r#"#{ "visible": true, "opacity": config.opacity }"#);
+        let render = |opacity: &str| {
+            let cfg = toml_config(&format!("opacity = {opacity}\n"));
+            let mut engine = RhaiEngine::with_config(vec![watermark()], Some(&cfg));
+            engine.load_script(script.path()).unwrap();
+            engine.evaluate(0.0, 0, &ProgramContext::unknown()).opacity
+        };
+        assert!((render("0.25") - 0.25).abs() < 1e-6);
+        assert!((render("0.75") - 0.75).abs() < 1e-6);
+    }
+
+    /// An absent config is an empty map, not a missing constant: a script may
+    /// read straight through it without guarding, and an unrecognised key is
+    /// unit rather than an evaluation failure.
+    #[test]
+    fn an_absent_config_is_an_empty_map_and_unknown_keys_are_unit() {
+        let script = write_script(
+            r#"
+            if config.len() != 0 { throw "expected an empty map"; }
+            if config.anything != () { throw "expected unit"; }
+            #{ "visible": true, "opacity": 1.0 }
+            "#,
+        );
+        let mut engine = RhaiEngine::new(vec![watermark()]);
+        engine.load_script(script.path()).unwrap();
+
+        let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
+        assert!(
+            state.visible,
+            "reading an unset config must not fail evaluation"
+        );
+    }
+
+    /// A mistyped key is silent by construction — it reads as unset and the
+    /// script takes its own fallback, because nothing here knows the spelling.
+    #[test]
+    fn a_mistyped_key_falls_back_without_warning() {
+        let script = write_script(
+            r#"
+            let fade = if config.fade_seconds == () { 1.0 } else { config.fade_seconds };
+            #{ "visible": true, "opacity": fade }
+            "#,
+        );
+        let cfg = toml_config("fade_secconds = 0.2\n");
+        let mut engine = RhaiEngine::with_config(vec![watermark()], Some(&cfg));
+        engine.load_script(script.path()).unwrap();
+
+        let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
+        assert!(
+            (state.opacity - 1.0).abs() < 1e-6,
+            "the typo should read as unset and take the script's fallback"
+        );
     }
 
     #[test]

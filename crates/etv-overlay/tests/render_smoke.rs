@@ -61,6 +61,73 @@ fn renders_watermark_with_visible_box() {
     );
 }
 
+/// A config value reaches the rendered pixels, not merely the script's scope
+/// (#125). One script, one layer set, two configs naming different corners —
+/// the watermark lands in a different place on the frame each time.
+///
+/// Probing the frame rather than asserting on `OverlayState` is the point: a
+/// value that arrived in scope but never made it through the renderer would
+/// satisfy a state assertion and still ship a broken overlay.
+#[test]
+fn a_config_value_moves_the_rendered_watermark() {
+    let mut renderer = match VelloRenderer::new(320, 240, PixelFormat::Rgba8) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: no GPU available ({e})");
+            return;
+        }
+    };
+
+    let mut script = tempfile::NamedTempFile::new().unwrap();
+    write!(script, r#"#{{ layers: [ #{{ corner: config.corner }} ] }}"#).unwrap();
+
+    let base = vec![OverlayKind::Watermark {
+        corner: Corner::TopRight,
+        margin: 20,
+        box_size: 80,
+        color: [200, 30, 30, 255],
+    }];
+
+    let mut render_with = |corner: &str| {
+        let cfg: toml::Value = toml::from_str(&format!("corner = \"{corner}\"\n")).unwrap();
+        let mut engine = RhaiEngine::with_config(base.clone(), Some(&cfg));
+        engine.load_script(script.path()).unwrap();
+        let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
+        renderer.render_frame(&state).expect("render")
+    };
+
+    let top_right = render_with("top_right");
+    let bottom_left = render_with("bottom_left");
+
+    // Top-right box spans x in [220, 300], y in [20, 100]; bottom-left spans
+    // x in [20, 100], y in [140, 220]. Each probe is opaque in one frame and
+    // transparent in the other, so neither could pass by accident.
+    let at = |frame: &[u8], x: usize, y: usize| frame[(y * 320 + x) * 4 + 3];
+
+    assert!(
+        at(&top_right, 260, 60) > 100,
+        "top_right config should paint the top-right box"
+    );
+    assert_eq!(
+        at(&top_right, 60, 180),
+        0,
+        "top_right config should leave the bottom-left empty"
+    );
+    assert!(
+        at(&bottom_left, 60, 180) > 100,
+        "bottom_left config should paint the bottom-left box"
+    );
+    assert_eq!(
+        at(&bottom_left, 260, 60),
+        0,
+        "bottom_left config should leave the top-right empty"
+    );
+    assert_ne!(
+        top_right, bottom_left,
+        "the two configs must not produce identical frames"
+    );
+}
+
 /// End-to-end check that program-context metadata reaches the renderer: a
 /// Rhai script reads `title` from scope and overrides a text layer's
 /// content, and the rendered frame actually contains glyphs.

@@ -497,6 +497,29 @@ fn affinity_window_days(ctx) { tunable(ctx, "affinity_window_days", 14) }
 fn replay_ttl_days(ctx)      { tunable(ctx, "replay_ttl_days", 30) }
 ```
 
+**This is the project-wide rule for script tunables, not a scorer quirk.** The
+overlay renderer's TOML takes a `config` table on the same terms — arbitrary
+nesting, nothing validated, absent means an empty map, typos silent — reaching
+its Rhai script as a `config` constant rather than as `ctx.config`, because an
+overlay script is evaluated against flat scope constants while a scorer receives
+one `ctx` map. That is the only difference, and it follows from how each engine
+is invoked rather than from a decision either side made.
+
+```toml
+# the overlay TOML named by a channel's `overlay.config`
+script = "lower-third.rhai"
+
+[config]
+corner = "bottom-left"
+
+[config.font]
+family = "Inter"
+size = 42
+```
+
+Any future scripting surface follows the same shape: the station carries a bag
+of values it does not understand, and the script decides what they mean.
+
 The station computes no score of its own — it supplies those inputs and takes
 back an ordered list, so swapping one script for another changes nothing in
 etv-station. Why this rides on `expr` rather than on `order` is

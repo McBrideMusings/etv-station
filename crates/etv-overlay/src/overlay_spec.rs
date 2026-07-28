@@ -10,6 +10,29 @@ pub struct OverlaySpec {
     #[serde(default)]
     pub pixel_format: PixelFormat,
     pub script: Option<PathBuf>,
+    /// Arbitrary configuration handed to `script` verbatim, reaching it as the
+    /// `config` constant. Any TOML shape is accepted — tables, arrays, strings,
+    /// numbers, booleans, nested to any depth — and no key is reserved.
+    ///
+    /// **Nothing here reads it.** It is converted and passed through, and that
+    /// is the whole contract: no validation, no known keys, no injected
+    /// defaults, and an unrecognised key is not an error. A key means whatever
+    /// the script decides it means, which is what lets two channels share one
+    /// overlay script with different type sizes or corners.
+    ///
+    /// Unset yields an empty map rather than a missing constant, so a script may
+    /// read `config.anything` unconditionally and get unit back.
+    ///
+    /// **A typo is silent, by construction** — a mistyped key reads as unset and
+    /// the script takes its own fallback, because nothing here knows the correct
+    /// spelling. A script wanting strictness declares and checks its own keys.
+    ///
+    /// The same contract the scorer-plugin side carries on
+    /// `etv_station::config::Pool::config`; only the plumbing differs, because a
+    /// scorer receives one `ctx` map and an overlay receives flat scope
+    /// constants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<toml::Value>,
     /// Layers are rendered bottom-up in declaration order. A single Rhai script
     /// (if `script` is set) controls visibility/opacity uniformly across all
     /// layers — per-layer scripts are a future extension.
@@ -338,6 +361,7 @@ framerate = 24
             framerate: 30,
             pixel_format: PixelFormat::Rgba8,
             script: None,
+            config: None,
             layers: vec![],
         };
         assert_eq!(spec.frame_byte_len(), 40_000);
