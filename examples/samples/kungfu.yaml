@@ -4,6 +4,12 @@
 # every fifth slot — and never the same film twice in a row, including across a
 # window seam.
 #
+# The no-repeat rule is per pool. Both pools inherit the block's `constraints`
+# (#115) and each applies it to its own draw order, so nothing checks a pile film
+# against a Jackie Chan one. Here that costs nothing, because the two pools are
+# disjoint by construction (below) and no film can be in both — which is the only
+# reason the channel-wide reading of the rule and the per-pool one agree.
+#
 # What this exercises that no other sample does:
 #   - `item.cast.contains(...)` — filtering by performer, from Plex `Role` tags
 #   - `[constraints] no_repeat_within` — the post-order adjacency pass (#73)
@@ -48,8 +54,10 @@ rule:
         title: "Kung Fu Theater"
         categories: ["Movie"]
 
-      # Never the same film back-to-back, wherever in the pattern the two
-      # occurrences land — and across the generation seam too.
+      # Never the same film back-to-back within a pool's own draw order — and
+      # across the generation seam too. On a pattern block this table is the
+      # default each pool inherits; either pool could state its own instead and
+      # that would replace this one wholesale for that pool.
       constraints:
         no_repeat_within: 1
 

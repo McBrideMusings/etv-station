@@ -86,7 +86,7 @@ impl ChannelConfig {
         self.rule
             .blocks
             .iter()
-            .map(|b| b.constraints().reach())
+            .map(|b| b.adjacency_reach())
             .max()
             .unwrap_or(0)
     }

@@ -3,6 +3,7 @@ use std::path::Path;
 
 use super::block::Duplicates;
 use super::channel::ChannelConfig;
+use super::constraints::Constraints;
 use super::order::Order;
 use super::rule::BlockInclude;
 use super::station::StationConfig;
@@ -120,8 +121,11 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         };
 
         // Checked before the pattern/entries split: `[constraints]` applies to
-        // either kind of block, so this must not sit on one branch only.
-        validate_constraints(include, &bad)?;
+        // either kind of block, so this must not sit on one branch only. On a
+        // pattern block it is the default its pools inherit (#115) rather than a
+        // rule over the block's own list, but it has to be a legal table either
+        // way — an inherited nonsense value is still nonsense.
+        validate_constraints(&include.constraints(), &bad)?;
 
         if include.is_pattern() {
             validate_pattern_block(include, &mut pool_names, &bad)?;
@@ -143,18 +147,17 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     Ok(())
 }
 
-/// Semantic checks for a block's `[constraints]` (#73), for either block kind.
+/// Semantic checks for one `[constraints]` table (#73) — a block's, for either
+/// block kind, or a pool's own (#115).
 ///
 /// Every refusal here is the same shape: a constraint the config states but that
 /// would not actually constrain anything. Silently doing nothing is the failure
 /// mode worth preventing — the author reads the file, sees a rule, and believes
 /// it holds.
 fn validate_constraints(
-    include: &BlockInclude,
+    c: &Constraints,
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
-    let c = include.constraints();
-
     // An explicit `0` reads as "on" but spaces nothing apart.
     if c.no_repeat_within == Some(0) {
         return Err(bad(
@@ -178,13 +181,8 @@ fn validate_constraints(
 
     // A field that isn't multi-valued has nothing to intersect, so separating on
     // it would quietly never fire.
-    if let Some(field) = &c.separate_by
-        && crate::catalog::TagNs::from_query_field(field).is_none()
-    {
-        return Err(bad(format!(
-            "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
-            crate::catalog::TagNs::QUERY_FIELDS.join(", ")
-        )));
+    if let Some(field) = &c.separate_by {
+        crate::catalog::TagNs::for_separate_by(field).map_err(bad)?;
     }
 
     Ok(())
@@ -285,6 +283,13 @@ fn validate_pattern_block<'a>(
                 )));
             }
         }
+        // A pool's own `[constraints]` replaces the block's wholesale, so it has
+        // to stand on its own — and the error names the pool, since that is the
+        // line the author has to go and fix (#115).
+        if let Some(c) = &pool.constraints {
+            let pool_bad = |m: String| bad(format!("pool {:?}: {m}", pool.name));
+            validate_constraints(c, &pool_bad)?;
+        }
         if !pool_names.insert(pool.name.as_str()) {
             return Err(bad(format!(
                 "pool name {:?} is already used by another block in this channel; \
@@ -367,6 +372,7 @@ mod tests {
             rotate: Rotate::default(),
             advance: Advance::default(),
             on_short: OnShort::default(),
+            constraints: None,
         }
     }
 
@@ -559,6 +565,79 @@ mod tests {
             separate_min_gap: Some(5),
         });
         assert_eq!(channel_with(vec![a, b]).adjacency_reach(), 5);
+    }
+
+    /// A pool's gap counts *its own* draws, so the aired history it needs is
+    /// longer than the number authored: `movies` is drawn twice per five-item
+    /// cycle, so reaching back 5 draws is three cycles — fifteen aired items.
+    /// Sizing the tail at 5 would let the seam check silently see too little.
+    #[test]
+    fn adjacency_reach_converts_a_pool_gap_into_channel_positions() {
+        let mut movies = pool("movies");
+        movies.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(5),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        let block = pattern_block(
+            vec![movies, pool("shows")],
+            vec![step("movies", 2), step("shows", 3)],
+        );
+        assert_eq!(channel_with(vec![block]).adjacency_reach(), 15);
+    }
+
+    /// A pattern block's own `[constraints]` is the default its pools inherit,
+    /// so it reaches the seam through them — and is converted the same way.
+    #[test]
+    fn adjacency_reach_counts_a_block_constraint_a_pattern_block_lends_its_pools() {
+        let mut block = pattern_block(
+            vec![pool("movies"), pool("shows")],
+            vec![step("movies", 2), step("shows", 3)],
+        );
+        block.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(2),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        // `shows` draws 3 per cycle, so 2 of its draws fit inside one cycle;
+        // `movies` draws 2, so 2 draws is also one cycle. One cycle is 5 items.
+        assert_eq!(channel_with(vec![block]).adjacency_reach(), 5);
+    }
+
+    /// A pool naming a constraint that constrains nothing is refused exactly as
+    /// a block naming it is — and the message says which pool, since that is the
+    /// line the author has to go and fix.
+    #[test]
+    fn rejects_a_pool_constraint_that_constrains_nothing() {
+        let mut movies = pool("movies");
+        movies.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(0),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no_repeat_within must be > 0"), "msg = {msg}");
+        assert!(msg.contains("pool \"movies\""), "msg = {msg}");
+    }
+
+    /// The block-level table stays legal on a pattern block — it is what pools
+    /// declaring none inherit, so validating it is still the only chance to
+    /// catch a nonsense value before every pool takes it.
+    #[test]
+    fn rejects_a_nonsense_block_constraint_on_a_pattern_block() {
+        let mut block = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        block.constraints = Some(crate::config::Constraints {
+            no_repeat_within: None,
+            separate_by: Some("title".into()),
+            separate_min_gap: None,
+        });
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a multi-valued field"),
+            "msg = {err}"
+        );
     }
 
     #[test]

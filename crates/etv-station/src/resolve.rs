@@ -9,6 +9,12 @@
 //! ([`crate::constrain`], #73) runs once over the whole list, reaching back
 //! across the generation seam via the play-history ledger.
 //!
+//! A **pattern** block sits out that final pass. Its constraints run pool by
+//! pool inside [`crate::pattern`], before the interleave (#115) — reordering the
+//! finished list would swap items between the pattern's slots and lose the shape
+//! the pattern was written to build. Its `[constraints]` table is therefore the
+//! default its pools inherit, not a rule over the block's own output.
+//!
 //! `query` entries resolve against the [`Catalog`] (#68 CEL→SQL) and each
 //! resolved `entry_id` becomes a `ResolvedItem`; `order` is applied by the
 //! order engine (#69). `collection` entries also resolve against the catalog
@@ -31,8 +37,8 @@ use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
 use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, CollectionEntry, Duplicates, Entry, ItemEntry, Mode, Order,
-    QueryEntry, SourceConfig,
+    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, ItemEntry, Mode,
+    Order, QueryEntry, SourceConfig,
 };
 use crate::constrain::{ItemKeys, Limits};
 use crate::errors::ConfigError;
@@ -135,7 +141,16 @@ pub fn resolve_channel_with_resume(
             scoring,
             &mut resume_out,
         )?;
-        let c = include.constraints();
+        // A pattern block is constrained pool by pool, inside the interleave
+        // (#115) — so it contributes no limits here. Constraining its finished
+        // list would reorder the pattern's slots and destroy the shape the
+        // pattern was written to build; its `[constraints]` table is the default
+        // its pools inherit, not a rule over the block's output.
+        let c = if include.is_pattern() {
+            Constraints::default()
+        } else {
+            include.constraints()
+        };
         limits.resize(
             limits.len() + block_items.len(),
             Limits {
@@ -224,12 +239,9 @@ fn adjacency_keys(
             let Some(field) = field else {
                 return Ok(ItemKeys::new(id.clone()));
             };
-            let ns = TagNs::from_query_field(field).ok_or_else(|| ConfigError::Validation {
+            let ns = TagNs::for_separate_by(field).map_err(|message| ConfigError::Validation {
                 path: path.to_path_buf(),
-                message: format!(
-                    "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
-                    TagNs::QUERY_FIELDS.join(", ")
-                ),
+                message,
             })?;
             let Some(cat) = catalog else {
                 return Err(ConfigError::Unsupported {
@@ -314,6 +326,7 @@ fn resolve_block(
             &include.pools,
             &include.pattern,
             include.cycles,
+            include.constraints.as_ref(),
             state,
             seed,
             score_env,
@@ -1355,6 +1368,7 @@ mod tests {
                 rotate: Rotate::Visit,
                 advance,
                 on_short: OnShort::Next,
+                constraints: None,
             },
             Pool {
                 name: "shows".into(),
@@ -1365,6 +1379,7 @@ mod tests {
                 rotate: Rotate::Visit,
                 advance,
                 on_short: OnShort::Next,
+                constraints: None,
             },
         ];
         inc.pattern = vec![

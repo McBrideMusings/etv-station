@@ -89,6 +89,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     rotate: Default::default(),
                     advance: Advance::Restart,
                     on_short: Default::default(),
+                    constraints: None,
                 }],
                 pattern: vec![PatternStep {
                     pool: "foryou".into(),

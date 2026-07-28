@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::constraints::Constraints;
 use super::order::Order;
 
 /// Which series the next draw comes from.
@@ -117,6 +118,54 @@ pub struct Pool {
 
     #[serde(default)]
     pub on_short: OnShort,
+
+    /// Adjacency constraints applied to *this pool's* ordered list, before the
+    /// pattern interleaves it (#115). Unset inherits the block's `constraints`;
+    /// set, it **replaces** them wholesale rather than merging field by field,
+    /// so a pool's table reads as the complete rule for that pool.
+    ///
+    /// The gap counts **this pool's own draws**, not aired channel positions:
+    /// `no_repeat_within: 10` on a pool the pattern visits once per cycle spaces
+    /// its repeats ten *draws* apart, which is ten cycles of aired schedule.
+    /// That is the honest reading of a number authored on a pool, and it is what
+    /// keeps the pattern's shape intact — the rule is enforced entirely inside
+    /// the pool, so the interleave is never reordered and "2 movies then 3
+    /// episodes" cannot be repaired into something else.
+    ///
+    /// Enforced in two places, because a pool makes repeats in two ways. Its
+    /// resolved list is ordered under the rule before the pattern runs; and each
+    /// draw is checked against what the pool recently emitted, which is where
+    /// the rotation's own repeats come from — a series that only half-filled a
+    /// visit keeps its turn, and a series played to its end loops. The list
+    /// order alone cannot see either.
+    ///
+    /// **Sizing.** `cycles` is derived to drain the largest pool once, so a
+    /// no-repeat rule on a pool the pattern draws heavily from will march
+    /// through that pool's whole set in one window. That is the rule working;
+    /// but on a channel whose replay policy lives elsewhere — a scorer plugin
+    /// suppressing what recently aired — it leaves that policy nothing to hold
+    /// back. See `examples/samples/foryou.yaml`, which declines the field for
+    /// exactly this reason.
+    ///
+    /// **Blind across pools.** Each pool is constrained against its own list
+    /// alone, so if two pools in one block resolve the same `entry_id`, neither
+    /// pool's constraint can see the collision. Pools that must not collide have
+    /// to be disjoint by construction — by their own expressions, or by a plugin
+    /// that partitions what it returns — because the pool contract does not
+    /// guarantee it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<Constraints>,
+}
+
+impl Pool {
+    /// This pool's effective constraints: its own if it declares any, otherwise
+    /// the block's, otherwise unconstrained.
+    pub fn constraints(&self, block: Option<&Constraints>) -> Constraints {
+        self.constraints
+            .clone()
+            .or_else(|| block.cloned())
+            .unwrap_or_default()
+    }
 }
 
 /// One step of the repeating pattern template.
@@ -202,6 +251,53 @@ on_short: short
         let step: PatternStep =
             toml::from_str("pool = \"shows\"\ntake = 3\nchance = 0.3\n").unwrap();
         assert_eq!(step.chance, 0.3);
+    }
+
+    #[test]
+    fn parses_pool_constraints() {
+        let yaml = "name: movies\nexpr: 'x'\nconstraints:\n  no_repeat_within: 5\n";
+        let pool: Pool = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(pool.constraints.as_ref().unwrap().no_repeat_within, Some(5));
+    }
+
+    fn bare(name: &str) -> Pool {
+        serde_norway::from_str(&format!("name: {name}\nexpr: 'x'\n")).unwrap()
+    }
+
+    #[test]
+    fn a_pool_declaring_nothing_inherits_the_block() {
+        let block = Constraints {
+            no_repeat_within: Some(3),
+            separate_by: None,
+            separate_min_gap: None,
+        };
+        assert_eq!(bare("movies").constraints(Some(&block)), block);
+    }
+
+    #[test]
+    fn a_pool_with_no_block_default_is_unconstrained() {
+        assert_eq!(bare("movies").constraints(None), Constraints::default());
+    }
+
+    /// A pool's own table *replaces* the block's rather than merging field by
+    /// field: the pool separates on cast and does not inherit the block's
+    /// `no_repeat_within`, so its table reads as the whole rule for that pool.
+    #[test]
+    fn a_pool_declaring_its_own_replaces_the_block_wholesale() {
+        let block = Constraints {
+            no_repeat_within: Some(3),
+            separate_by: None,
+            separate_min_gap: None,
+        };
+        let mut pool = bare("movies");
+        pool.constraints = Some(Constraints {
+            no_repeat_within: None,
+            separate_by: Some("cast".into()),
+            separate_min_gap: Some(2),
+        });
+        let effective = pool.constraints(Some(&block));
+        assert_eq!(effective.no_repeat_gap(), 0);
+        assert_eq!(effective.separate_gap(), 2);
     }
 
     #[test]
