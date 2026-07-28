@@ -213,9 +213,9 @@ not, and are rejected by name at load rather than silently read as a field sort:
 
 - `collection` (#107) — a collection's authored sequence belongs to the
   (collection, item) pair, so it lives on
-  [`kind: collection`](#kind-collection-play-a-catalog-collection-in-its-authored-order).
+  [`kind: collection`](#kind-collection-—-play-a-catalog-collection-in-its-authored-order).
 - `score` (#108) — needed a scoring plugin. Scoring landed instead as
-  [a pool's `plugin`](#pool-plugin--items-chosen-by-a-scorer-script) (#74):
+  [a pool's `plugin`](#pool-plugin-—-items-chosen-by-a-scorer-script) (#74):
   picking the candidates and ranking them turned out to be the same judgment,
   so it replaces a pool's `expr`, not its `order`.
 
@@ -257,7 +257,7 @@ filter:
 ### Duplicates
 
 Block-level dedupe policy, keyed on each item's **derived** source identity (see
-[`kind: item`](#kind-item-an-authored-file)) — so two entries resolving to the
+[`kind: item`](#kind-item-—-an-authored-file)) — so two entries resolving to the
 same physical file collapse regardless of how they entered the block. Source:
 `config/block.rs`.
 

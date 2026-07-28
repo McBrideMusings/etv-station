@@ -216,7 +216,7 @@ fn pick(ctx) {
     );
     let inputs = ScoreInputs {
         target_count: 10,
-        history: vec![
+        history: [
             WatchEvent {
                 entry_id: "mov-a".into(),
                 watched_at: 1000,
@@ -225,7 +225,8 @@ fn pick(ctx) {
                 entry_id: "mov-c".into(),
                 watched_at: 2000,
             },
-        ],
+        ]
+        .into(),
         recent: vec!["mov-c".into()],
         now: 3000,
     };
@@ -282,10 +283,11 @@ fn the_committed_example_plugin_runs() {
     let cat = catalog();
     let inputs = ScoreInputs {
         target_count: 3,
-        history: vec![WatchEvent {
+        history: [WatchEvent {
             entry_id: "mov-a".into(),
             watched_at: 900_000,
-        }],
+        }]
+        .into(),
         // mov-d aired most recently, so the example's replay TTL drops it.
         recent: vec!["mov-d".into()],
         now: 900_000 + 3600,

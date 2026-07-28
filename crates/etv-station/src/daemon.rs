@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
 use time::OffsetDateTime;
@@ -127,6 +128,96 @@ pub async fn run(station: Station) -> Result<(), StationError> {
 struct SharedCatalog {
     catalog: Mutex<Catalog>,
     path_index: HashMap<String, String>,
+}
+
+/// Everything a channel loop needs that belongs to the *station* rather than to
+/// the channel: the parsed time zone, the media roots, the shared catalog, and
+/// the shared watch history.
+///
+/// One value per generation, handed whole to every channel task. Threading these
+/// individually meant each new station-wide resource added a parameter to three
+/// nested functions — which is how #126's history ended up fetched per channel
+/// in the first place: the cheap change was to fetch it where it was used.
+#[derive(Clone, Copy)]
+struct StationContext<'a> {
+    tz: &'static Tz,
+    source_roots: &'a [String],
+    catalog: Option<&'a SharedCatalog>,
+    history: &'a SharedHistory,
+}
+
+/// The station's one copy of "what has been watched on this server lately"
+/// (#126).
+///
+/// Watch history is server-wide and pooled with no user dimension, so nothing
+/// about it varies by channel: before this, an N-channel station issued N
+/// identical `get_history` calls of a thousand rows and ran N identical catalog
+/// joins on every tick to produce N identical `Vec<WatchEvent>`. Channels tick
+/// on their own `roll_interval`s and there is no station-wide clock to hang a
+/// single fetch off, so the sharing is a cache the channels pull from rather
+/// than a task that pushes to them: the first channel into a refresh window
+/// pays for the fetch and join, every other channel that ticks inside that
+/// window gets the same `Arc` back.
+///
+/// Contention is the point, not a cost: the mutex is held across the fetch, so
+/// channels that tick together queue behind one request instead of racing N.
+struct SharedHistory {
+    /// `None` for a catalog-free station — there is nothing to join rows
+    /// against, so no request is ever made and no join event is ever logged.
+    catalog: Option<Arc<SharedCatalog>>,
+    /// How long a fetched history is reused before the next channel to ask
+    /// refetches. Set to the shortest `roll_interval` on the station, so no
+    /// channel ever sees a history older than one of its own ticks.
+    refresh_after: Duration,
+    state: tokio::sync::Mutex<HistoryCache>,
+}
+
+#[derive(Default)]
+struct HistoryCache {
+    /// `None` until the first fetch. Tokio's clock, so tests can advance it.
+    fetched_at: Option<tokio::time::Instant>,
+    events: Arc<[crate::score::WatchEvent]>,
+}
+
+impl SharedHistory {
+    fn new(catalog: Option<Arc<SharedCatalog>>, refresh_after: Duration) -> Self {
+        Self {
+            catalog,
+            refresh_after,
+            state: tokio::sync::Mutex::new(HistoryCache::default()),
+        }
+    }
+
+    /// The history to generate against right now, fetching it first if the
+    /// cached copy has aged past `refresh_after`.
+    ///
+    /// Empty when Tautulli is unset or unreachable, which degrades a scorer's
+    /// ranking rather than failing the tick (#74).
+    async fn current(&self) -> Arc<[crate::score::WatchEvent]> {
+        let Some(sc) = self.catalog.as_ref() else {
+            return Arc::from(Vec::new());
+        };
+        let mut cache = self.state.lock().await;
+        if let Some(at) = cache.fetched_at
+            && at.elapsed() < self.refresh_after
+        {
+            return Arc::clone(&cache.events);
+        }
+        // The HTTP half runs on a blocking thread — `ureq` is synchronous and
+        // would otherwise stall this runtime worker for the request timeout,
+        // exactly as the Plex ingest above avoids. The catalog join is local
+        // work and stays here, where the mutex is already reachable.
+        let rows = tokio::task::spawn_blocking(crate::tautulli::fetch_rows_from_env)
+            .await
+            .unwrap_or_default();
+        let events = {
+            let guard = sc.catalog.lock().unwrap_or_else(|e| e.into_inner());
+            crate::tautulli::join(&guard, rows)
+        };
+        cache.events = Arc::from(events);
+        cache.fetched_at = Some(tokio::time::Instant::now());
+        Arc::clone(&cache.events)
+    }
 }
 
 /// What a startup should do about the Plex half of the catalog.
@@ -298,6 +389,20 @@ async fn run_generation(
 ) -> (bool, Option<StationError>) {
     let mut handles = Vec::new();
     let mut supervisor_handles = Vec::new();
+    // One watch history for the whole station (#126). Built per generation
+    // because a reload can change the roll intervals it is sized from; the
+    // catalog behind it is the same one every generation shares. With no
+    // channels nothing ever asks, and a zero window is the inert choice — it
+    // means "always refetch", which is the pre-#126 behaviour.
+    let history = Arc::new(SharedHistory::new(
+        catalog.cloned(),
+        station
+            .channels
+            .iter()
+            .map(|c| c.config.roll_interval)
+            .min()
+            .unwrap_or(Duration::ZERO),
+    ));
     // One stop signal per spawned task. `notify_one` stores a permit if the task
     // is not yet parked, so a reload that races a slow generation startup
     // (duration probing, catch-up emit) is never lost — unlike `notify_waiters`,
@@ -321,6 +426,7 @@ async fn run_generation(
         }
         let s = station.clone();
         let cat = catalog.cloned();
+        let hist = history.clone();
         let stop = Arc::new(Notify::new());
         stops.push(stop.clone());
         let channel_name = station.channels[idx].name.clone();
@@ -331,8 +437,13 @@ async fn run_generation(
         handles.push(tokio::spawn(
             async move {
                 let ch = &s.channels[idx];
-                let result =
-                    channel_loop(ch, tz, &s.station.source_roots, cat.as_deref(), stop).await;
+                let ctx = StationContext {
+                    tz,
+                    source_roots: &s.station.source_roots,
+                    catalog: cat.as_deref(),
+                    history: &hist,
+                };
+                let result = channel_loop(ch, ctx, stop).await;
                 // A channel_loop error is fatal to THIS channel. Task handles
                 // are only joined at shutdown (see below), so without logging
                 // here a startup failure — a failed duration probe, unreadable
@@ -553,12 +664,10 @@ fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySp
 
 async fn channel_loop(
     channel: &LoadedChannel,
-    tz: &'static Tz,
-    source_roots: &[String],
-    catalog: Option<&SharedCatalog>,
+    ctx: StationContext<'_>,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
-    forward_channel_loop(channel, tz, source_roots, catalog, shutdown).await
+    forward_channel_loop(channel, ctx, shutdown).await
 }
 
 /// Bound on how many generations one catch-up will chain before giving up, so
@@ -611,9 +720,7 @@ async fn wipe_playout_from(
 /// loop. So there is one emission model rather than two.
 async fn forward_channel_loop(
     channel: &LoadedChannel,
-    tz: &'static Tz,
-    source_roots: &[String],
-    catalog: Option<&SharedCatalog>,
+    ctx: StationContext<'_>,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
     let (resume, how) = crate::resume::load(&channel.output_folder).await?;
@@ -687,16 +794,7 @@ async fn forward_channel_loop(
         );
     }
 
-    resume = pattern_catch_up(
-        channel,
-        tz,
-        source_roots,
-        catalog,
-        resume,
-        &mut ledger,
-        "startup",
-    )
-    .await?;
+    resume = pattern_catch_up(channel, ctx, resume, &mut ledger, "startup").await?;
 
     let mut interval = tokio::time::interval(channel.config.roll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -710,7 +808,7 @@ async fn forward_channel_loop(
             }
             _ = interval.tick() => {
                 let tick = async {
-                    match pattern_catch_up(channel, tz, source_roots, catalog, resume.clone(), &mut ledger, "roll").await {
+                    match pattern_catch_up(channel, ctx, resume.clone(), &mut ledger, "roll").await {
                         Ok(next) => resume = next,
                         Err(err) => tracing::error!(
                             event = "roll.error",
@@ -755,9 +853,7 @@ fn target_count(config: &ChannelConfig, from: OffsetDateTime, target: OffsetDate
 /// Returns the map to carry into the next tick.
 async fn pattern_catch_up(
     channel: &LoadedChannel,
-    tz: &'static Tz,
-    source_roots: &[String],
-    catalog: Option<&SharedCatalog>,
+    ctx: StationContext<'_>,
     mut resume: crate::resume::ResumeMap,
     ledger: &mut crate::history::Ledger,
     phase: &'static str,
@@ -787,7 +883,8 @@ async fn pattern_catch_up(
         now + time::Duration::seconds_f64(channel.config.roll_interval.as_secs_f64() * 2.0)
     };
     if let Some(gap) = scan::first_coverage_gap(output, now, heal_horizon).await? {
-        let regen_from = tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, tz);
+        let regen_from =
+            tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, ctx.tz);
         let removed = wipe_playout_from(channel, regen_from).await?;
         // Best-effort pool alignment: rewind to the checkpoint covering the hole
         // if it survives, else leave the pools as they are and accept a possible
@@ -817,24 +914,14 @@ async fn pattern_catch_up(
     // list mid-way from a past `anchor`; see the phase calculation below.
     let mut first_generation = existing.is_empty();
 
-    // Watch history is read once per tick, not once per generation: a catch-up
-    // chains many generations in a row and they all share the same "what has
-    // been watched lately". Empty when Tautulli is unset or unreachable, which
-    // degrades a scorer's ranking rather than failing the tick (#74).
-    // The HTTP half runs on a blocking thread — `ureq` is synchronous and would
-    // otherwise stall this runtime worker for the request timeout, exactly as
-    // the Plex ingest above avoids. The catalog join is local work and stays
-    // here, where the mutex is already reachable.
-    let history = match catalog {
-        Some(sc) => {
-            let rows = tokio::task::spawn_blocking(crate::tautulli::fetch_rows_from_env)
-                .await
-                .unwrap_or_default();
-            let guard = sc.catalog.lock().unwrap_or_else(|e| e.into_inner());
-            crate::tautulli::join(&guard, rows)
-        }
-        None => Vec::new(),
-    };
+    // Watch history is read at most once per station tick — not once per
+    // generation, and not once per channel. A catch-up chains many generations
+    // in a row and they all share the same "what has been watched lately", and
+    // so does every other channel that ticks in the same refresh window: the
+    // history is server-wide and pooled, so nothing about it varies by channel
+    // (#126). Empty when Tautulli is unset or unreachable, which degrades a
+    // scorer's ranking rather than failing the tick (#74).
+    let history = ctx.history.current().await;
 
     // How deep a recently-aired tail this channel's scorer sees. Read once —
     // it cannot change inside a tick.
@@ -878,18 +965,20 @@ async fn pattern_catch_up(
         // worth would make a single generation try to cover the month.
         let scoring = crate::score::ScoreInputs {
             target_count: target_count(&channel.config, from, target),
-            history: history.clone(),
+            history: Arc::clone(&history),
             recent: ledger.tail(recent_depth),
             now: now.unix_timestamp(),
         };
 
         let (items, resume_out, show_ids) = {
-            let guard = catalog.map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
+            let guard = ctx
+                .catalog
+                .map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
             let (items, resume_out) = crate::resolve::resolve_channel_with_resume(
                 &channel.config,
                 &channel.config_path,
-                source_roots,
-                catalog.map(|sc| &sc.path_index),
+                ctx.source_roots,
+                ctx.catalog.map(|sc| &sc.path_index),
                 guard.as_deref(),
                 &state,
                 &scoring,
@@ -965,7 +1054,7 @@ async fn pattern_catch_up(
             output,
             &rule,
             seq_start,
-            tz,
+            ctx.tz,
             channel.config.chunk_hours,
             from,
             to,
@@ -1152,6 +1241,137 @@ mod ingest_plan_tests {
             plex_ingest_plan(Some(2_000_000), 1_000_000, REFRESH, SWEEP),
             PlexIngestPlan::Full
         );
+    }
+}
+
+/// The station-wide watch history (#126): one fetch + join per tick, shared by
+/// every channel, refetched once the refresh window has passed.
+#[cfg(test)]
+mod shared_history_tests {
+    use std::sync::Mutex as StdMutex;
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use super::*;
+
+    /// Counts `tautulli.join` events. That event is emitted once per catalog
+    /// join, so its count *is* the number of fetch+join passes performed.
+    struct CountJoins(Arc<StdMutex<usize>>);
+
+    #[derive(Default)]
+    struct EventName(Option<String>);
+
+    impl Visit for EventName {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "event" {
+                self.0 = Some(value.to_string());
+            }
+        }
+        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for CountJoins {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut name = EventName::default();
+            event.record(&mut name);
+            if name.0.as_deref() == Some("tautulli.join") {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+    }
+
+    /// Install a `tautulli.join` counter on this thread for as long as the
+    /// returned guard lives. `#[tokio::test]` runs a current-thread runtime, so
+    /// every `.await` in the test body is polled on this same thread and stays
+    /// under it.
+    fn count_joins() -> (Arc<StdMutex<usize>>, tracing::subscriber::DefaultGuard) {
+        let seen = Arc::new(StdMutex::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountJoins(Arc::clone(&seen)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        (seen, guard)
+    }
+
+    /// A catalog to join against, and no Tautulli to fetch from.
+    ///
+    /// Clearing the env is what keeps this hermetic: the dev shell exports
+    /// `TAUTULLI_URL`/`TAUTULLI_API_KEY`, and left in place these tests would
+    /// make a real network call. Only `fetch_rows_from_env` reads them, and
+    /// nothing else in the suite does, so removing them here cannot affect
+    /// another test. The fetch still runs and still reaches the join — it just
+    /// joins zero rows, which is exactly the "Tautulli unreachable" path.
+    ///
+    /// Behind a `Once` because mutating the environment races every other
+    /// thread reading it, and the tests in this module run concurrently:
+    /// clearing exactly once narrows that window to a single call rather than
+    /// one per test.
+    fn catalog_without_tautulli() -> Arc<SharedCatalog> {
+        static CLEARED: std::sync::Once = std::sync::Once::new();
+        CLEARED.call_once(|| unsafe {
+            std::env::remove_var("TAUTULLI_URL");
+            std::env::remove_var("TAUTULLI_API_KEY");
+        });
+        Arc::new(SharedCatalog {
+            catalog: Mutex::new(crate::catalog::Catalog::open_in_memory().unwrap()),
+            path_index: HashMap::new(),
+        })
+    }
+
+    /// The acceptance criterion: N channels ticking inside one refresh window
+    /// produce **one** fetch + join between them, not N.
+    #[tokio::test(start_paused = true)]
+    async fn every_channel_in_one_tick_shares_a_single_fetch() {
+        let (joins, _guard) = count_joins();
+        let history =
+            SharedHistory::new(Some(catalog_without_tautulli()), Duration::from_secs(3600));
+
+        // Four channels, each asking at the top of its own tick.
+        let first = history.current().await;
+        for _ in 0..3 {
+            let again = history.current().await;
+            assert!(
+                Arc::ptr_eq(&first, &again),
+                "every channel must get the same allocation, not a copy",
+            );
+        }
+
+        assert_eq!(
+            *joins.lock().unwrap(),
+            1,
+            "one tick must fetch and join once, however many channels ask",
+        );
+    }
+
+    /// The cache is a refresh window, not a one-shot: a channel ticking after
+    /// the window has passed gets freshly-fetched history. Without this the
+    /// station would rank forever against whatever was watched at startup.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_tick_refetches_once_the_window_has_passed() {
+        let (joins, _guard) = count_joins();
+        let history = SharedHistory::new(Some(catalog_without_tautulli()), Duration::from_secs(60));
+
+        history.current().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        history.current().await;
+        history.current().await;
+
+        assert_eq!(
+            *joins.lock().unwrap(),
+            2,
+            "the second tick refetches, and is again shared by every channel",
+        );
+    }
+
+    /// A catalog-free station has nothing to join rows against, so it never
+    /// contacts Tautulli at all — unchanged from before #126.
+    #[tokio::test(start_paused = true)]
+    async fn a_station_with_no_catalog_never_fetches() {
+        let (joins, _guard) = count_joins();
+        let history = SharedHistory::new(None, Duration::ZERO);
+
+        assert!(history.current().await.is_empty());
+        assert!(history.current().await.is_empty());
+        assert_eq!(*joins.lock().unwrap(), 0);
     }
 }
 

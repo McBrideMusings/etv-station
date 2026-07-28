@@ -839,9 +839,10 @@ mod tests {
     /// No pool in these tests draws from a plugin, so the inputs are empty and
     /// the base dir never gets read — it only has to exist.
     fn test_env() -> crate::score::ScoreEnv<'static> {
-        const EMPTY: &crate::score::ScoreInputs = &crate::score::ScoreInputs::new_empty();
+        static EMPTY: std::sync::LazyLock<crate::score::ScoreInputs> =
+            std::sync::LazyLock::new(crate::score::ScoreInputs::default);
         crate::score::ScoreEnv {
-            inputs: EMPTY,
+            inputs: &EMPTY,
             base_dir: std::path::Path::new("."),
         }
     }
