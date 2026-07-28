@@ -26,12 +26,20 @@
 //! fn pick(ctx) {
 //!     // ctx.sets.movies   — array of item maps, one per match
 //!     // ctx.pool          — the name of the pool asking
+//!     // ctx.config        — the pool's `config:` block, passed through unread
 //!     // ctx.target_count  — how many items the generation needs
 //!     // ctx.history       — recent server-wide watch events
 //!     // ctx.recent        — entry_ids this channel aired most recently
 //!     // ctx.now           — unix seconds at generation time
 //! }
 //! ```
+//!
+//! `ctx.config` is the one input the station does not construct: it is whatever
+//! the channel author wrote under that pool, converted and handed over with
+//! nothing read out of it. Its keys are the *script's* vocabulary — a scorer
+//! decides what `affinity_window_days` means, and ETV never learns. That keeps a
+//! script swappable at the cost of a mistyped key being silent, which is the
+//! trade [`crate::config::Pool::config`] documents in full.
 //!
 //! Queries are declared up front rather than callable mid-`pick` so that a
 //! malformed expression fails before any ranking work, and so the catalog is
@@ -164,6 +172,7 @@ pub fn run(
     script_path: &Path,
     inputs: &ScoreInputs,
     pool_name: &str,
+    pool_config: Option<&serde_norway::Value>,
     cache: &mut ScoreCache,
 ) -> Result<Vec<String>, String> {
     let mut engine = Engine::new();
@@ -192,6 +201,23 @@ pub fn run(
     // taste — and without this the script cannot tell them apart, so both
     // would get the same list.
     ctx.insert("pool".into(), pool_name.to_string().into());
+    // The pool's own `config`, handed over verbatim. The station reads nothing
+    // out of it: whatever the author wrote is whatever the script sees, nested
+    // to any depth. An absent config becomes an empty map rather than a missing
+    // key, so a script can read `ctx.config.whatever` unconditionally and get
+    // unit for anything unset — which is also why a mistyped key is silent.
+    ctx.insert(
+        "config".into(),
+        match pool_config {
+            Some(value) => rhai::serde::to_dynamic(value).map_err(|e| {
+                format!(
+                    "scorer plugin {}: pool {pool_name:?} config is not representable in Rhai: {e}",
+                    script_path.display()
+                )
+            })?,
+            None => Dynamic::from_map(Map::new()),
+        },
+    );
     ctx.insert("target_count".into(), (inputs.target_count as i64).into());
     ctx.insert("now".into(), inputs.now.into());
     ctx.insert(
@@ -384,6 +410,154 @@ mod tests {
         p
     }
 
+    fn yaml(src: &str) -> serde_norway::Value {
+        serde_norway::from_str(src).unwrap()
+    }
+
+    /// A script that reports what it saw in `ctx.config` by picking the ids the
+    /// config names, so an assertion about the returned order is an assertion
+    /// about what actually arrived inside the script.
+    #[test]
+    fn config_arrives_nested_with_types_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let c = ctx.config;
+    // Three levels down, through a map, a map, and an array — and the scalars
+    // must still be their own types, not strings.
+    let deep = c.weights.nested.values;
+    if deep[0] != 42 { throw "int did not survive: " + deep[0]; }
+    if deep[1] != 1.5 { throw "float did not survive: " + deep[1]; }
+    if deep[2] != true { throw "bool did not survive: " + deep[2]; }
+    if deep[3] != "four" { throw "string did not survive: " + deep[3]; }
+    if c.weights.affinity != 3.0 { throw "nested float wrong"; }
+    if c.name != "taste" { throw "top-level string wrong"; }
+    [c.first, c.second]
+}
+"#,
+        );
+        let cfg = yaml(
+            r#"
+name: taste
+first: m2
+second: m1
+weights:
+  affinity: 3.0
+  nested:
+    values: [42, 1.5, true, "four"]
+"#,
+        );
+        let got = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            Some(&cfg),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(got, vec!["m2", "m1"]);
+    }
+
+    #[test]
+    fn an_absent_config_is_an_empty_map_not_a_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    // Reading straight through an unset config must yield unit rather than
+    // erroring, so a script never has to guard before looking.
+    if ctx.config.anything != () { throw "expected unit"; }
+    if ctx.config.len() != 0 { throw "expected an empty map"; }
+    ["m1"]
+}
+"#,
+        );
+        let got = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(got, vec!["m1"]);
+    }
+
+    #[test]
+    fn an_unrecognised_key_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { ["m1"] }
+"#,
+        );
+        // Nothing in the station knows what any of these mean, and a script that
+        // reads none of them is not a config error — the whole bag is opaque.
+        let cfg = yaml("afinity_window_days: 14\nutter_nonsense: [1, 2]\n");
+        let got = run(
+            &catalog(),
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            Some(&cfg),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(got, vec!["m1"]);
+    }
+
+    #[test]
+    fn each_pool_gets_its_own_config_from_one_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { [ctx.config.want] }
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        let movies = yaml("want: m1\n");
+        let shows = yaml("want: m2\n");
+        let cat = catalog();
+        // One compiled script, two pools, two different configs — the cache is
+        // keyed on the script path, so this is where a config wrongly cached
+        // alongside the AST would show up.
+        assert_eq!(
+            run(
+                &cat,
+                &p,
+                &ScoreInputs::default(),
+                "movies",
+                Some(&movies),
+                &mut cache
+            )
+            .unwrap(),
+            ["m1"]
+        );
+        assert_eq!(
+            run(
+                &cat,
+                &p,
+                &ScoreInputs::default(),
+                "shows",
+                Some(&shows),
+                &mut cache
+            )
+            .unwrap(),
+            ["m2"]
+        );
+    }
+
     #[test]
     fn picks_in_the_order_the_script_returns() {
         let dir = tempfile::tempdir().unwrap();
@@ -404,6 +578,7 @@ fn pick(ctx) {
             &p,
             &ScoreInputs::default(),
             "test",
+            None,
             &mut Default::default(),
         )
         .unwrap();
@@ -434,6 +609,7 @@ fn pick(ctx) {
                 &p,
                 &ScoreInputs::default(),
                 "test",
+                None,
                 &mut Default::default()
             )
             .unwrap(),
@@ -464,7 +640,15 @@ fn pick(ctx) {
             ..Default::default()
         };
         assert_eq!(
-            run(&catalog(), &p, &inputs, "test", &mut Default::default()).unwrap(),
+            run(
+                &catalog(),
+                &p,
+                &inputs,
+                "test",
+                None,
+                &mut Default::default()
+            )
+            .unwrap(),
             ["m2"]
         );
     }
@@ -481,6 +665,7 @@ fn pick(ctx) {
             &p,
             &ScoreInputs::default(),
             "test",
+            None,
             &mut Default::default(),
         )
         .unwrap_err();
@@ -496,6 +681,7 @@ fn pick(ctx) {
             &p,
             &ScoreInputs::default(),
             "test",
+            None,
             &mut Default::default(),
         )
         .unwrap_err();
@@ -514,6 +700,7 @@ fn pick(ctx) {
             &p,
             &ScoreInputs::default(),
             "test",
+            None,
             &mut Default::default(),
         )
         .unwrap_err();
@@ -529,6 +716,7 @@ fn pick(ctx) {
             &p,
             &ScoreInputs::default(),
             "test",
+            None,
             &mut Default::default(),
         )
         .unwrap_err();

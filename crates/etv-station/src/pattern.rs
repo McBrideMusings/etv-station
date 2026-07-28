@@ -579,8 +579,15 @@ fn resolve_pool<'a>(
         }
         (None, Some(plugin)) => {
             let path = score_env.resolve_path(plugin);
-            crate::score::run(catalog, &path, score_env.inputs, &cfg.name, score_cache)
-                .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
+            crate::score::run(
+                catalog,
+                &path,
+                score_env.inputs,
+                &cfg.name,
+                cfg.config.as_ref(),
+                score_cache,
+            )
+            .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
         }
         // Both, or neither, is rejected at load; a pool that reaches here in
         // either state is a validation gap, not a config the user can hit.
@@ -810,6 +817,7 @@ mod tests {
             advance: Advance::Restart,
             on_short: OnShort::Next,
             constraints: None,
+            config: None,
         }
     }
 
@@ -824,6 +832,7 @@ mod tests {
             advance: Advance::Restart,
             on_short: OnShort::Next,
             constraints: None,
+            config: None,
         }
     }
 

@@ -284,6 +284,77 @@ fn watch_history_changes_what_plays() {
     );
 }
 
+/// A pool's `config:` reaches the script and changes its judgment (#124). The
+/// station reads none of these keys — `affinity_window_days` means something
+/// only because `taste-engine.rhai` looks it up — so this is the proof that an
+/// opaque bag authored in YAML arrives intact and is acted on.
+///
+/// Driven through the window rather than a weight because it has a clean
+/// threshold: a watch 20 days old sits *outside* the script's default 14-day
+/// window and earns no affinity, and *inside* a 30-day one. Same catalog, same
+/// history, same channel — only the config moves.
+#[test]
+fn a_pool_config_value_changes_the_scripts_ranking() {
+    let cat = library();
+    let now = 900_000 + 20 * 86_400;
+    let inputs = ScoreInputs {
+        target_count: 20,
+        history: vec![WatchEvent {
+            entry_id: "mov-dune".into(),
+            watched_at: 900_000,
+        }],
+        recent: Vec::new(),
+        now,
+    };
+
+    let resolve_with = |config: Option<serde_norway::Value>| {
+        let cfg = config_with_movies_config(config);
+        ids(&resolve_channel_with_resume(
+            &cfg,
+            &sample_path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::default(),
+            &inputs,
+        )
+        .expect("resolve the For You sample")
+        .0)
+    };
+
+    let default_window = resolve_with(None);
+    let widened = resolve_with(Some(
+        serde_norway::from_str("affinity_window_days: 30\n").unwrap(),
+    ));
+
+    assert_ne!(
+        default_window, widened,
+        "widening the affinity window must change the schedule"
+    );
+    assert_eq!(
+        widened.first().map(String::as_str),
+        Some("mov-dune"),
+        "inside a 30-day window the watched movie should lead: {widened:?}"
+    );
+    assert_ne!(
+        default_window.first().map(String::as_str),
+        Some("mov-dune"),
+        "outside the default 14-day window it should not: {default_window:?}"
+    );
+}
+
+/// The committed sample with an arbitrary `config` attached to its movies pool.
+fn config_with_movies_config(pool_config: Option<serde_norway::Value>) -> ChannelConfig {
+    let mut cfg = config();
+    let pool = cfg.rule.blocks[0]
+        .pools
+        .iter_mut()
+        .find(|p| p.name == "movies")
+        .expect("the sample declares a movies pool");
+    pool.config = pool_config;
+    cfg
+}
+
 /// Acceptance criterion 3, first half: recently-played content is suppressed by
 /// the plugin's own TTL, not by anything in etv-station. What the channel aired
 /// last generation comes back as `ctx.recent`, and the example script drops it
