@@ -472,7 +472,7 @@ fn touch(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 fn build_engine(spec: &OverlaySpec) -> anyhow::Result<RhaiEngine> {
-    let mut engine = RhaiEngine::new(spec.layers.clone());
+    let mut engine = RhaiEngine::with_config(spec.layers.clone(), spec.config.as_ref());
     if let Some(script) = &spec.script {
         engine.load_script(script)?;
     }
