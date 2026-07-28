@@ -445,6 +445,68 @@ either is unset or Tautulli is unreachable, `ctx.history` arrives empty and the
 generation proceeds — a script still has release dates, tags, and `ctx.recent`
 to rank on, so an outage degrades the ranking rather than stopping the channel.
 
+### Pool `constraints` — spacing counted in a pool's own draw order
+
+`constraints` (`no_repeat_within`, `separate_by`, `separate_min_gap`) is the same
+table on a pool as on a block, but it is enforced in a different place. On an
+**entries** block the pass runs last, over the channel's whole flattened list. On
+a **pattern** block it is enforced entirely inside each pool, never over the
+interleaved result:
+
+```yaml
+pools:
+  - name: pile
+    expr: 'item.genres.contains("Martial Arts")'
+    constraints:
+      no_repeat_within: 3     # three *draws from this pool*, not three aired items
+  - name: jackie
+    expr: 'item.cast.contains("Jackie Chan")'
+```
+
+**The pattern's shape cannot move.** A pass over the finished list knows item ids
+and gaps and nothing else — in particular not which pattern step an item came
+from — so repairing a repeat swapped an episode into a movie slot and silently
+destroyed the `2 + 3` shape the pattern was written to build. Keeping the rule
+inside the pool means the interleave is never reordered at all.
+
+**It is enforced at two moments,** because a pool makes repeats in two ways. Its
+resolved list is ordered under the rule before the pattern runs — that settles
+which item opens a window, the order the series rotate in, and the generation
+seam. Then every draw is checked against what the pool just emitted. The second
+is the one that usually bites: a query returns each item once, so the list has no
+repeats to fix, while the draw loop makes them freely — the rotation keeps its
+place on a series that only half-filled a visit, and a series played to its end
+loops back to its start.
+
+**The gap counts that pool's draws.** `no_repeat_within: 3` means three draws
+from this pool, however much other content the pattern lays between them. The
+seam is read the same way: the aired tail is narrowed to items this pool could
+have supplied, and the station sizes the history it keeps to cover the
+conversion.
+
+**A pool is blind to every other pool.** Each pool is constrained against its own
+draws alone, so if two pools in one block resolve the same `entry_id`, neither
+pool's constraint sees the collision. Pools that must not collide have to be
+disjoint by construction — `examples/samples/kungfu.yaml` does it with the pools'
+own expressions, `examples/samples/foryou.yaml` with a plugin that splits on
+`item.type` — because the pool contract does not guarantee it.
+
+**Mind the window size.** `cycles` is derived to drain the largest pool once, so
+a no-repeat rule on a pool the pattern draws heavily from marches through that
+pool's whole set inside one window. That is the rule doing its job — but on a
+channel whose replay policy lives elsewhere, such as a scorer plugin suppressing
+what recently aired, it leaves that policy nothing left to hold back.
+`examples/samples/foryou.yaml` declines the field for exactly this reason.
+
+When no item can be drawn without a clash, one is drawn anyway and the shortfall
+is logged as `constraints.unsatisfied` — a pool that cannot satisfy its own
+constraint still has to put television on the air.
+
+A block-level `constraints` on a pattern block stays legal and becomes the
+**default every pool that declares none inherits**. A pool declaring its own
+table **replaces** the block's wholesale rather than merging field by field, so a
+pool's table always reads as the complete rule for that pool.
+
 ## Sample configs
 
 The committed samples under `examples/` are authored in YAML:

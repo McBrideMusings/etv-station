@@ -209,6 +209,46 @@ fn two_movies_then_three_episodes_from_disjoint_pools() {
     }
 }
 
+/// The #115 regression, reproduced from the issue: `no_repeat_within: 10`
+/// authored at *block* level on this pattern block used to reorder the finished
+/// list and turn a cycle of `[mov, mov, ep, ep, ep]` into
+/// `[mov, ep, ep, ep, mov]`. It is now the default the pools inherit, applied to
+/// each pool's own list before the interleave, so the shape cannot move.
+#[test]
+fn a_block_level_constraint_is_inherited_without_reordering_the_pattern() {
+    let mut cfg = config();
+    cfg.rule.blocks[0].constraints = Some(etv_station::config::Constraints {
+        no_repeat_within: Some(10),
+        separate_by: None,
+        separate_min_gap: None,
+    });
+
+    let cat = library();
+    let got = ids(&resolve_channel_with_resume(
+        &cfg,
+        &sample_path(),
+        &[],
+        None,
+        Some(&cat),
+        &GenerationState::default(),
+        &ScoreInputs::default(),
+    )
+    .expect("resolve with a block-level constraint")
+    .0);
+
+    assert_eq!(got.len() % 5, 0, "the shape survived unevenly: {got:?}");
+    for (i, chunk) in got.chunks(5).enumerate() {
+        assert!(
+            chunk[0..2].iter().all(|id| is_movie(id)),
+            "cycle {i} should open with two movies, got {chunk:?}"
+        );
+        assert!(
+            chunk[2..5].iter().all(|id| !is_movie(id)),
+            "cycle {i} should continue with three episodes, got {chunk:?}"
+        );
+    }
+}
+
 /// Acceptance criterion 2: the plugin drives what plays. Watch history is an
 /// input no CEL expression could express, and moving it changes the schedule —
 /// with the config byte-for-byte identical between the two runs.

@@ -102,8 +102,50 @@ impl BlockInclude {
     }
 
     /// The effective adjacency constraints (defaulting to unconstrained).
+    ///
+    /// On a **pattern** block this is the default every pool inherits rather
+    /// than a rule applied to the block's own interleaved list — the pass runs
+    /// per pool, inside [`crate::pattern`] (#115). Use [`Pool::constraints`] to
+    /// read what actually governs a given pool.
     pub fn constraints(&self) -> Constraints {
         self.constraints.clone().unwrap_or_default()
+    }
+
+    /// How much aired history this block's constraints need at the generation
+    /// seam, in **channel** positions.
+    ///
+    /// An entries block is constrained over the channel list directly, so its
+    /// reach is already in channel positions. A pattern block's pools are
+    /// constrained over their *own* lists, so a pool reaching back N draws
+    /// reaches back further than N aired items: the pattern lays other pools'
+    /// items between consecutive draws. The conversion is the pattern's own
+    /// arithmetic — the cycles that hold N draws of this pool, times the items
+    /// one cycle emits — because a tail sized in pool positions would let a wide
+    /// window hold inside a generation and quietly lapse across the seam.
+    pub fn adjacency_reach(&self) -> usize {
+        if !self.is_pattern() {
+            return self.constraints().reach();
+        }
+        let block = self.constraints.as_ref();
+        let cycle_total: usize = self.pattern.iter().map(|s| s.take).sum();
+        self.pools
+            .iter()
+            .map(|pool| {
+                let per_cycle: usize = self
+                    .pattern
+                    .iter()
+                    .filter(|s| s.pool == pool.name)
+                    .map(|s| s.take)
+                    .sum();
+                let reach = pool.constraints(block).reach();
+                // A pool no step draws from never reaches the seam at all.
+                if reach == 0 || per_cycle == 0 {
+                    return 0;
+                }
+                reach.div_ceil(per_cycle).saturating_mul(cycle_total)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Whether this block interleaves pools via a pattern rather than playing a

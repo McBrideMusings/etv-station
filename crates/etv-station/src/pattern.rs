@@ -13,6 +13,36 @@
 //! Series rotate in order of first appearance in the ordered set, so the pool's
 //! `order` fixes the rotation and nothing else has to.
 //!
+//! # Where adjacency constraints run
+//!
+//! A pool's `constraints` are enforced entirely inside the pool (#115), never
+//! over the interleaved result: a pass that reordered the finished list would
+//! repair a repeat by swapping an episode into a movie slot, destroying the very
+//! shape the pattern was written to build. Keeping the rule inside the pool
+//! makes the shape safe by construction rather than by a slot-aware repair.
+//!
+//! It takes two checks, because a pool makes repeats in two different ways:
+//!
+//! - **The list** — `constrain_pool` orders the flat list after its `order` and
+//!   before it is grouped into series. This settles which item opens a window
+//!   and the order the series rotate in, and is where the generation seam is
+//!   answered.
+//! - **The draw** — [`PoolRuntime::eligible_from`] checks each series' next item
+//!   against what this pool has just emitted. This is the one that matters in
+//!   practice: a resolved set holds each `entry_id` once, so the list pass has
+//!   nothing to fix, while every repeat that reaches air is made *here* — the
+//!   rotation parking on a series that only half-filled a visit, and a series
+//!   played to its end looping.
+//!
+//! A gap therefore counts **this pool's draws**, so `N` on a pool visited once a
+//! cycle means N cycles of aired schedule. And each pool sees only itself: two
+//! pools resolving the same `entry_id` collide unseen, so pools that must stay
+//! apart have to be disjoint by construction.
+//!
+//! When no series can serve without a clash, one serves anyway and the clash is
+//! counted for the `constraints.unsatisfied` warning. A pool that cannot satisfy
+//! its own constraint still has to put television on the air.
+//!
 //! # Who fills a visit
 //!
 //! With `rotate = "visit"` one visit to a step draws all `take` items from one
@@ -33,10 +63,11 @@
 //! seed reproduces the whole schedule, and the roll for one step never shifts
 //! because another step was added or skipped.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::catalog::Catalog;
-use crate::config::{Advance, OnShort, PatternStep, Pool, Rotate, Select};
+use crate::catalog::{Catalog, TagNs};
+use crate::config::{Advance, Constraints, OnShort, PatternStep, Pool, Rotate, Select};
+use crate::constrain::{ItemKeys, Limits, order_constrained};
 use crate::resume::{GenerationState, PoolResume};
 
 /// Upper bound on an explicitly-authored `cycles`. A derived count needs no cap
@@ -59,6 +90,27 @@ impl Series {
     }
 }
 
+/// Every id this pool can draw, paired with the values of the field it
+/// separates on. Empty when nothing is being separated on — the common case,
+/// where the adjacency rule is identity only and no catalog lookup is needed.
+#[derive(Debug, Default)]
+struct PoolKeys {
+    groups: HashMap<String, Vec<String>>,
+}
+
+impl PoolKeys {
+    fn of(&self, id: &str) -> ItemKeys {
+        ItemKeys {
+            id: id.to_string(),
+            group: self.groups.get(id).cloned().unwrap_or_default(),
+        }
+    }
+
+    fn many(&self, ids: &[String]) -> Vec<ItemKeys> {
+        ids.iter().map(|id| self.of(id)).collect()
+    }
+}
+
 /// A pool mid-walk: its config, its series, and where the rotation stands.
 #[derive(Debug)]
 struct PoolRuntime<'a> {
@@ -66,6 +118,18 @@ struct PoolRuntime<'a> {
     series: Vec<Series>,
     /// Index into `series` of whoever is up next.
     rotation: usize,
+
+    /// This pool's effective adjacency limits (#115).
+    limits: Limits,
+    /// Identity + separation values for every id this pool can draw.
+    keys: PoolKeys,
+    /// What this pool has emitted lately, oldest first, holding at most
+    /// `limits.reach()` items — exactly as far back as the rule looks. Seeded
+    /// from the generation seam, so the first draw of a window is checked
+    /// against the last draws of the one before it.
+    recent: Vec<ItemKeys>,
+    /// Draws that had to clash because no series could serve without one.
+    forced: usize,
 }
 
 impl PoolRuntime<'_> {
@@ -92,6 +156,71 @@ impl PoolRuntime<'_> {
         match self.cfg.select {
             Select::RoundRobin => self.series_at(self.rotation),
             Select::Random => self.series_at(roll.u64_at(nonce) as usize),
+        }
+    }
+
+    /// The id a series would serve next — its cursor, or its first item for a
+    /// series whose cursor has just wrapped past the end.
+    fn next_id(&self, si: usize) -> Option<&String> {
+        let s = &self.series[si];
+        s.ids.get(s.cursor).or_else(|| s.ids.first())
+    }
+
+    /// Whether this series' next item may air right now, given what this pool
+    /// has already emitted (#115).
+    fn is_eligible(&self, si: usize) -> bool {
+        match self.next_id(si) {
+            Some(id) => !crate::constrain::conflicts_with_recent(
+                &self.recent,
+                &self.keys.of(id),
+                self.limits,
+            ),
+            None => true,
+        }
+    }
+
+    /// `start`, or the first series after it that may serve — the draw-time half
+    /// of a pool's constraints (#115).
+    ///
+    /// A pool's repeats are made *here*, not by its list order: the rotation
+    /// parks on a series that only partly filled a visit, and a series that runs
+    /// off its end loops. Reordering the pool's list cannot see either, so the
+    /// eligibility check has to sit where the item is chosen.
+    ///
+    /// When no series can serve, `start` serves anyway and the clash is counted.
+    /// A pool that cannot satisfy its own constraint still has to put television
+    /// on the air — the same doctrine [`crate::constrain::order_constrained`]
+    /// applies to a list it cannot arrange.
+    fn eligible_from(&mut self, start: usize) -> Option<usize> {
+        if self.limits.is_unconstrained() {
+            return Some(start);
+        }
+        let n = self.series.len();
+        if n == 0 {
+            return None;
+        }
+        for step in 0..n {
+            let si = (start + step) % n;
+            if self.is_eligible(si) {
+                return Some(si);
+            }
+        }
+        self.forced += 1;
+        Some(start)
+    }
+
+    /// Fold what a draw emitted into the recent window, so the next draw in the
+    /// same visit sees it — a visit's filler must not replay what the visit
+    /// itself just aired.
+    fn remember(&mut self, ids: &[String]) {
+        let reach = self.limits.reach();
+        if reach == 0 || ids.is_empty() {
+            return;
+        }
+        let fresh = self.keys.many(ids);
+        self.recent.extend(fresh);
+        if self.recent.len() > reach {
+            self.recent.drain(..self.recent.len() - reach);
         }
     }
 
@@ -134,7 +263,9 @@ impl PoolRuntime<'_> {
     /// next visit should resume.
     fn serve(&mut self, take: usize, roll: &RollKey, nonce: u64) -> Vec<String> {
         let mut out: Vec<String> = Vec::with_capacity(take);
-        let mut current = self.pick(roll, nonce);
+        let mut current = self
+            .pick(roll, nonce)
+            .and_then(|first| self.eligible_from(first));
         let mut contributed: HashMap<usize, usize> = HashMap::new();
         let mut last: Option<usize> = None;
 
@@ -152,14 +283,27 @@ impl PoolRuntime<'_> {
             }
             *contributed.entry(si).or_default() += taken.len();
             last = Some(si);
+            // Before the next draw, not after the visit: a visit's filler must
+            // not replay what the visit itself just aired (#115).
+            self.remember(&taken);
             out.extend(taken);
             if out.len() >= take {
                 break;
             }
             // Short: someone else has to fill the rest.
             current = match self.cfg.on_short {
-                OnShort::Next => self.series_after(si),
-                OnShort::Wrap => Some(si),
+                OnShort::Next => self
+                    .series_after(si)
+                    .and_then(|next| self.eligible_from(next)),
+                // `wrap` is the author saying "stay on this series", so it does
+                // not shop around — but a clash it forces is still a clash the
+                // config asked for and could not have, so it is counted.
+                OnShort::Wrap => {
+                    if !self.limits.is_unconstrained() && !self.is_eligible(si) {
+                        self.forced += 1;
+                    }
+                    Some(si)
+                }
                 OnShort::Short => None,
             };
         }
@@ -245,11 +389,16 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// makes the stateless default genuinely stateless. Its two halves come from
 /// two places on purpose: the rotation from the `.resume` sidecar, and each
 /// series' position from the play-history ledger (#70).
+///
+/// `block_constraints` is the block's own `[constraints]` table, which every
+/// pool that declares none inherits (#115).
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     catalog: &Catalog,
     pools: &[Pool],
     pattern: &[PatternStep],
     cycles: Option<usize>,
+    block_constraints: Option<&Constraints>,
     state: &GenerationState,
     seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
@@ -263,6 +412,7 @@ pub fn build(
         runtimes.push(resolve_pool(
             catalog,
             cfg,
+            block_constraints,
             state,
             score_env,
             &mut score_cache,
@@ -301,6 +451,22 @@ pub fn build(
                 .get(step.pool.as_str())
                 .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
             out.extend(runtimes[idx].visit(step.take, &roll));
+        }
+    }
+
+    for rt in &runtimes {
+        if rt.forced > 0 {
+            // Every series had a clashing next item, so one had to air anyway —
+            // a pool of one title under `no_repeat_within`, or a `wrap` that
+            // loops a series shorter than the gap. Say so, or a pool quietly
+            // failing its constraint looks exactly like one honouring it.
+            tracing::warn!(
+                event = "constraints.unsatisfied",
+                pool = %rt.cfg.name,
+                phase = "draw",
+                violations = rt.forced,
+                "pool adjacency constraints could not be honoured on every draw; aired the closest choice available",
+            );
         }
     }
 
@@ -347,6 +513,7 @@ fn derive_cycles(
 fn resolve_pool<'a>(
     catalog: &Catalog,
     cfg: &'a Pool,
+    block_constraints: Option<&Constraints>,
     state: &GenerationState,
     score_env: crate::score::ScoreEnv<'_>,
     score_cache: &mut crate::score::ScoreCache,
@@ -382,6 +549,29 @@ fn resolve_pool<'a>(
         }
     };
 
+    // Adjacency constraints (#115). Two halves, both scoped to this pool and
+    // both running before anything is interleaved, so the pattern's slots are
+    // never reordered: the list order below, and the draw-time eligibility check
+    // in `serve` that this seeds `recent` for.
+    let constraints = cfg.constraints(block_constraints);
+    let limits = Limits {
+        no_repeat: constraints.no_repeat_gap(),
+        separate: constraints.separate_gap(),
+    };
+    let keys = pool_keys(catalog, &ids, constraints.separate_by.as_deref(), &cfg.name)?;
+    // What this pool aired most recently: the channel's tail, narrowed to items
+    // this pool could have supplied. Same projection the list pass reads, and
+    // it carries the same cross-pool blindness — an id two pools share cannot be
+    // attributed to one of them.
+    let own: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let seam: Vec<String> = state
+        .tail
+        .iter()
+        .filter(|id| own.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let ids = constrain_pool(cfg, limits, &keys, &seam, ids);
+
     // Group into series, preserving first-appearance order so the pool's
     // `order` fixes the rotation order too. One query for every `show_id` up
     // front, rather than a catalog round trip per item — a catch-up re-resolves
@@ -409,7 +599,14 @@ fn resolve_pool<'a>(
         cfg,
         series,
         rotation: 0,
+        limits,
+        keys,
+        recent: Vec::new(),
+        forced: 0,
     };
+    // Seeded through the same path a draw takes, so the window is trimmed to
+    // `reach` by one rule rather than two.
+    rt.remember(&seam);
 
     if cfg.advance == Advance::Resume {
         let prev = state.resume.pool(&cfg.name);
@@ -435,6 +632,88 @@ fn resolve_pool<'a>(
     }
 
     Ok(rt)
+}
+
+/// Order one pool's resolved list so it satisfies that pool's adjacency
+/// constraints (#115), leaving it untouched when nothing is constrained.
+///
+/// This is the *list* half. It settles which item opens the window and how the
+/// series rotate; it cannot settle the repeats a looping pool makes at draw
+/// time, which is what [`PoolRuntime::eligible_from`] is for. Both are needed:
+/// a set with no duplicate ids has nothing for this pass to fix, and every
+/// repeat that reaches air is then made downstream of it.
+///
+/// `seam` is the channel's aired tail already narrowed to ids this pool could
+/// have supplied — the only part of it that says anything about this pool's
+/// next draw.
+fn constrain_pool(
+    cfg: &Pool,
+    limits: Limits,
+    keys: &PoolKeys,
+    seam: &[String],
+    ids: Vec<String>,
+) -> Vec<String> {
+    if limits.is_unconstrained() || ids.is_empty() {
+        return ids;
+    }
+
+    let items = keys.many(&ids);
+    let preceding = keys.many(seam);
+    let result = order_constrained(&items, &vec![limits; ids.len()], &preceding);
+    if result.unresolved > 0 {
+        // The pool cannot satisfy what the config asks — an all-one-title set,
+        // or a cast too interlinked to separate. Generation completes either
+        // way; say so, or a pool quietly failing its constraint looks exactly
+        // like one honouring it.
+        tracing::warn!(
+            event = "constraints.unsatisfied",
+            pool = %cfg.name,
+            phase = "list",
+            violations = result.unresolved,
+            items = ids.len(),
+            "pool adjacency constraints could not be fully satisfied; airing the closest arrangement found",
+        );
+    }
+
+    let mut slots: Vec<Option<String>> = ids.into_iter().map(Some).collect();
+    result
+        .order
+        .iter()
+        .map(|&i| {
+            slots[i]
+                .take()
+                .expect("a permutation visits each index exactly once")
+        })
+        .collect()
+}
+
+/// The keys the adjacency checks compare for one pool: the `entry_id`, plus the
+/// values of the field this pool separates on. Read with the vocabulary an
+/// expression uses, so `separate_by: "cast"` reads exactly what `item.cast`
+/// reads; an item with no values simply never triggers the separation.
+fn pool_keys(
+    catalog: &Catalog,
+    ids: &[String],
+    field: Option<&str>,
+    pool: &str,
+) -> Result<PoolKeys, String> {
+    let Some(field) = field else {
+        return Ok(PoolKeys::default());
+    };
+    let ns = TagNs::from_query_field(field).ok_or_else(|| {
+        format!(
+            "pool {pool:?}: separate_by = {field:?} is not a multi-valued field (expected one of: {})",
+            TagNs::QUERY_FIELDS.join(", ")
+        )
+    })?;
+    let mut groups = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let values = catalog
+            .tags_for(id, ns)
+            .map_err(|e| format!("pool {pool:?}: reading {field:?} for {id}: {e}"))?;
+        groups.insert(id.clone(), values);
+    }
+    Ok(PoolKeys { groups })
 }
 
 #[cfg(test)]
@@ -492,6 +771,7 @@ mod tests {
             rotate: Rotate::Visit,
             advance: Advance::Restart,
             on_short: OnShort::Next,
+            constraints: None,
         }
     }
 
@@ -505,6 +785,7 @@ mod tests {
             rotate: Rotate::Visit,
             advance: Advance::Restart,
             on_short: OnShort::Next,
+            constraints: None,
         }
     }
 
@@ -538,8 +819,17 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = catalog();
-        let (ids, pool_state) = build(&cat, &pools, &pattern, cycles, state_in, seed, test_env())
-            .expect("pattern builds");
+        let (ids, pool_state) = build(
+            &cat,
+            &pools,
+            &pattern,
+            cycles,
+            None,
+            state_in,
+            seed,
+            test_env(),
+        )
+        .expect("pattern builds");
 
         let mut resume = ResumeMap::new();
         resume.pools = pool_state;
@@ -974,6 +1264,7 @@ mod tests {
             &[movies_pool()],
             &[step("shows", 1)],
             Some(1),
+            None,
             &GenerationState::empty(),
             0,
             test_env(),
@@ -990,6 +1281,7 @@ mod tests {
             &[movies_pool()],
             &[step("movies", 1)],
             Some(MAX_CYCLES + 1),
+            None,
             &GenerationState::empty(),
             0,
             test_env(),
@@ -1010,11 +1302,255 @@ mod tests {
             &[p],
             &[step("movies", 1)],
             None,
+            None,
             &GenerationState::empty(),
             0,
             test_env(),
         )
         .unwrap();
         assert!(ids.is_empty());
+    }
+
+    // ---- pool-level adjacency constraints (#115) -------------------------
+
+    fn no_repeat(n: usize) -> crate::config::Constraints {
+        crate::config::Constraints {
+            no_repeat_within: Some(n),
+            separate_by: None,
+            separate_min_gap: None,
+        }
+    }
+
+    /// The previous generation's aired run, oldest first — what the seam reads.
+    fn aired(tail: &[&str]) -> GenerationState {
+        GenerationState {
+            tail: tail.iter().map(|s| s.to_string()).collect(),
+            ..GenerationState::empty()
+        }
+    }
+
+    fn build_pools(
+        pools: &[Pool],
+        pattern: &[PatternStep],
+        cycles: Option<usize>,
+        block: Option<&Constraints>,
+        state: &GenerationState,
+    ) -> Vec<String> {
+        let cat = catalog();
+        build(&cat, pools, pattern, cycles, block, state, 0, test_env())
+            .expect("pattern builds")
+            .0
+    }
+
+    /// The pool's own list is reordered so the first draw does not repeat what
+    /// aired last. Unconstrained, `title:asc` would open on `mov-1` — which is
+    /// exactly the item at position -1.
+    #[test]
+    fn a_pool_constraint_holds_across_the_generation_seam() {
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat(1));
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 1)],
+            Some(3),
+            None,
+            &aired(&["mov-1"]),
+        );
+        assert_ne!(ids[0], "mov-1", "the seam repeats: {ids:?}");
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["mov-1", "mov-2", "mov-3"],
+            "the pass reorders, it does not drop: {ids:?}"
+        );
+    }
+
+    /// The regression #115 exists for: repairing a repeat must not move an
+    /// episode into a movie slot. The pass runs on the pool's list, so the
+    /// interleave it feeds is untouched however hard the constraint bites.
+    #[test]
+    fn a_pool_constraint_leaves_the_pattern_shape_intact() {
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat(3));
+        let ids = build_pools(
+            &[movies, shows_pool()],
+            &[step("movies", 2), step("shows", 3)],
+            Some(2),
+            None,
+            &aired(&["mov-1", "mov-2"]),
+        );
+        assert_eq!(ids.len(), 10, "{ids:?}");
+        for (i, chunk) in ids.chunks(5).enumerate() {
+            assert!(
+                chunk[0..2].iter().all(|id| id.starts_with("mov-")),
+                "cycle {i} should open with two movies: {chunk:?}"
+            );
+            assert!(
+                chunk[2..5].iter().all(|id| !id.starts_with("mov-")),
+                "cycle {i} should continue with three episodes: {chunk:?}"
+            );
+        }
+    }
+
+    /// A block-level `[constraints]` on a pattern block is the default every
+    /// pool that declares none inherits — it is not applied to the block's
+    /// interleaved output.
+    #[test]
+    fn a_block_constraint_is_inherited_by_a_pool_that_declares_none() {
+        let ids = build_pools(
+            &[movies_pool()],
+            &[step("movies", 1)],
+            Some(3),
+            Some(&no_repeat(1)),
+            &aired(&["mov-1"]),
+        );
+        assert_ne!(
+            ids[0], "mov-1",
+            "the block default did not reach the pool: {ids:?}"
+        );
+    }
+
+    /// A pool declaring its own table takes it whole: the block's
+    /// `no_repeat_within` is not merged back in, so the seam is unconstrained
+    /// and `title:asc` survives untouched.
+    #[test]
+    fn a_pool_table_replaces_the_block_default_rather_than_merging() {
+        let mut movies = movies_pool();
+        movies.constraints = Some(crate::config::Constraints {
+            no_repeat_within: None,
+            separate_by: Some("genres".into()),
+            separate_min_gap: Some(1),
+        });
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 1)],
+            Some(3),
+            Some(&no_repeat(1)),
+            &aired(&["mov-1"]),
+        );
+        assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3"], "{ids:?}");
+    }
+
+    /// Nothing constrained leaves the pool's `order` exactly as it resolved,
+    /// aired history or not.
+    #[test]
+    fn an_unconstrained_pool_keeps_its_own_order() {
+        let ids = build_pools(
+            &[movies_pool()],
+            &[step("movies", 1)],
+            Some(3),
+            None,
+            &aired(&["mov-1"]),
+        );
+        assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3"]);
+    }
+
+    /// The regression the live drive caught: a pool's repeats are made by the
+    /// *rotation*, not by its list order. `take = 2` over one-item series parks
+    /// the rotation on the series that only half-filled the visit, so the next
+    /// visit opens on the same film. Unconstrained that is the documented
+    /// `on_short` behaviour; under `no_repeat_within` it has to be skipped past.
+    #[test]
+    fn a_pool_constraint_stops_the_rotation_replaying_a_series() {
+        let plain = build_pools(
+            &[movies_pool()],
+            &[step("movies", 2)],
+            Some(2),
+            None,
+            &GenerationState::empty(),
+        );
+        // Baseline: the parking rule really does replay mov-2 back-to-back, so
+        // the assertion below is testing something that would otherwise fail.
+        assert!(
+            plain.windows(2).any(|w| w[0] == w[1]),
+            "expected the unconstrained rotation to repeat: {plain:?}"
+        );
+
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat(1));
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 2)],
+            Some(2),
+            None,
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids.len(), plain.len(), "the visit still fills: {ids:?}");
+        assert!(
+            ids.windows(2).all(|w| w[0] != w[1]),
+            "a draw repeats under no_repeat_within = 1: {ids:?}"
+        );
+    }
+
+    /// The gap is counted in draws, so a wider one spaces the pool further —
+    /// three distinct films before any may come round again.
+    #[test]
+    fn a_wider_gap_spaces_the_draw_sequence_further() {
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat(3));
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 1)],
+            Some(3),
+            None,
+            &GenerationState::empty(),
+        );
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["mov-1", "mov-2", "mov-3"], "{ids:?}");
+    }
+
+    /// A pool that cannot satisfy its own constraint still puts television on
+    /// the air: one film with "never twice in a row" has no arrangement, so the
+    /// clash is accepted (and counted for the `constraints.unsatisfied` warning)
+    /// rather than emitting dead air or looping forever.
+    #[test]
+    fn a_pool_that_cannot_satisfy_its_constraint_still_airs() {
+        let mut movies = movies_pool();
+        movies.expr = Some("item.title == \"Title mov-1\"".into());
+        movies.order = None;
+        movies.constraints = Some(no_repeat(1));
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 2)],
+            Some(2),
+            None,
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids, vec!["mov-1", "mov-1", "mov-1", "mov-1"], "{ids:?}");
+    }
+
+    /// The draw-time check reads the seam too, so the first draw of a window is
+    /// measured against the last draws of the one before it.
+    #[test]
+    fn the_draw_check_reads_the_generation_seam() {
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat(2));
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 1)],
+            Some(1),
+            None,
+            &aired(&["mov-3", "mov-1"]),
+        );
+        assert_eq!(ids, vec!["mov-2"], "{ids:?}");
+    }
+
+    /// The seam is read per pool: only the aired items this pool could have
+    /// supplied are position -1 for it. An episode airing last says nothing
+    /// about which movie may open the next generation.
+    #[test]
+    fn the_seam_ignores_aired_items_from_other_pools() {
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat(1));
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 1)],
+            Some(3),
+            None,
+            &aired(&["got-e1"]),
+        );
+        assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3"]);
     }
 }

@@ -84,11 +84,12 @@ pub struct Limits {
 }
 
 impl Limits {
-    fn reach(&self) -> usize {
+    /// How far back this item's wider constraint looks. `0` = unconstrained.
+    pub fn reach(&self) -> usize {
         self.no_repeat.max(self.separate)
     }
 
-    fn is_unconstrained(&self) -> bool {
+    pub fn is_unconstrained(&self) -> bool {
         self.reach() == 0
     }
 }
@@ -147,6 +148,30 @@ pub fn order_constrained(
         order: out,
         unresolved,
     }
+}
+
+/// Whether `cand` may follow a run that has *already been emitted*.
+///
+/// The list passes above reorder a set they still hold; this answers the same
+/// question for a sequence that is being produced one item at a time and cannot
+/// be revisited — [`crate::pattern`]'s draw loop, where a pool's repeats are
+/// made by the rotation rather than by its list order (#115). `recent` is the
+/// tail of what that sequence has emitted, **oldest first**, so its last element
+/// is position `-1` relative to `cand`.
+///
+/// Only `cand`'s own limits apply: what is emitted is emitted, and the settings
+/// that produced it are not ours to revisit — the same rule the seam half of
+/// [`violates`] follows.
+pub fn conflicts_with_recent(recent: &[ItemKeys], cand: &ItemKeys, limits: Limits) -> bool {
+    if limits.is_unconstrained() {
+        return false;
+    }
+    recent
+        .iter()
+        .rev()
+        .enumerate()
+        .take(limits.reach())
+        .any(|(back, prev)| conflict(cand, prev, limits, Limits::default(), back + 1))
 }
 
 /// Whether two items conflict at `distance` positions apart, under the stricter
@@ -597,5 +622,81 @@ mod tests {
         assert!(!any_constrained(&repeat_only(3, 0)));
         assert!(any_constrained(&repeat_only(3, 1)));
         assert!(any_constrained(&separate_only(3, 2)));
+    }
+
+    // ---- conflicts_with_recent: the emitted-sequence check (#115) ----------
+
+    fn keyed(id: &str, group: &[&str]) -> ItemKeys {
+        ItemKeys {
+            id: id.into(),
+            group: group.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn recent_check_is_off_when_nothing_is_constrained() {
+        let recent = vec![ItemKeys::new("a")];
+        assert!(!conflicts_with_recent(
+            &recent,
+            &ItemKeys::new("a"),
+            Limits::default()
+        ));
+    }
+
+    #[test]
+    fn recent_check_catches_a_repeat_inside_the_gap() {
+        let recent = vec![ItemKeys::new("a"), ItemKeys::new("b")];
+        let limits = Limits {
+            no_repeat: 2,
+            separate: 0,
+        };
+        // `a` is two back, `b` one back — both inside a gap of 2.
+        assert!(conflicts_with_recent(&recent, &ItemKeys::new("a"), limits));
+        assert!(conflicts_with_recent(&recent, &ItemKeys::new("b"), limits));
+        assert!(!conflicts_with_recent(&recent, &ItemKeys::new("c"), limits));
+    }
+
+    #[test]
+    fn recent_check_lets_a_repeat_through_once_it_is_far_enough_back() {
+        let recent = vec![ItemKeys::new("a"), ItemKeys::new("b"), ItemKeys::new("c")];
+        let limits = Limits {
+            no_repeat: 2,
+            separate: 0,
+        };
+        // `a` is three back, outside a gap of 2.
+        assert!(!conflicts_with_recent(&recent, &ItemKeys::new("a"), limits));
+    }
+
+    #[test]
+    fn recent_check_covers_the_separation_axis_too() {
+        let recent = vec![keyed("a", &["Bruce Lee"])];
+        let limits = Limits {
+            no_repeat: 0,
+            separate: 1,
+        };
+        assert!(conflicts_with_recent(
+            &recent,
+            &keyed("b", &["Bruce Lee", "Nora Miao"]),
+            limits
+        ));
+        assert!(!conflicts_with_recent(
+            &recent,
+            &keyed("c", &["Jackie Chan"]),
+            limits
+        ));
+    }
+
+    /// The two axes are measured independently: a wide `separate` must not drag
+    /// a narrow `no_repeat` along with it.
+    #[test]
+    fn recent_check_measures_each_axis_at_its_own_distance() {
+        let recent = vec![keyed("a", &["x"]), keyed("b", &["y"])];
+        let limits = Limits {
+            no_repeat: 1,
+            separate: 2,
+        };
+        // `a` is two back: outside no_repeat = 1, inside separate = 2.
+        assert!(!conflicts_with_recent(&recent, &ItemKeys::new("a"), limits));
+        assert!(conflicts_with_recent(&recent, &keyed("z", &["x"]), limits));
     }
 }
