@@ -58,7 +58,7 @@ pub struct RhaiEngine {
     ast: Option<AST>,
     base_layers: Vec<OverlayKind>,
     /// The spec's `config`, already converted. Held as a `Dynamic` rather than
-    /// as the TOML value because [`RhaiEngine::evaluate`] runs once per frame:
+    /// as the carrier value because [`RhaiEngine::evaluate`] runs once per frame:
     /// converting there would re-walk the whole table 30 times a second to
     /// produce the same result. Cloning a `Dynamic` map is a refcount.
     config: Dynamic,
@@ -73,7 +73,7 @@ impl RhaiEngine {
     /// that fails to convert is dropped to an empty map and warned about rather
     /// than failing the render — an overlay is decoration over a channel that is
     /// already on the air, so a bad config costs the decoration, not the stream.
-    pub fn with_config(base_layers: Vec<OverlayKind>, config: Option<&toml::Value>) -> Self {
+    pub fn with_config(base_layers: Vec<OverlayKind>, config: Option<&serde_json::Value>) -> Self {
         let mut engine = Engine::new();
         // Bound script complexity so a runaway script can't stall the per-frame
         // render loop. 64 nesting / 50k ops is plenty for fade and blink curves
@@ -266,8 +266,12 @@ mod tests {
         assert_eq!(state.opacity, 1.0);
     }
 
-    fn toml_config(src: &str) -> toml::Value {
-        toml::from_str::<toml::Value>(src).unwrap()
+    /// A config bag built the way loading a spec builds one — TOML text in,
+    /// carrier value out, through the same conversion
+    /// [`OverlaySpec::config`](crate::overlay_spec::OverlaySpec::config) is read
+    /// with, so these tests assert on exactly what an authored spec produces.
+    fn toml_config(src: &str) -> serde_json::Value {
+        crate::overlay_spec::toml_to_carrier(toml::from_str::<toml::Value>(src).unwrap())
     }
 
     /// The spec's `config` reaches the script with its nesting and scalar types

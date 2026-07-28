@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use etv_overlay::overlay_spec::{Corner, OverlayKind, PixelFormat};
+use etv_overlay::overlay_spec::{Corner, OverlayKind, OverlaySpec, PixelFormat};
 use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
 use etv_overlay::rhai_engine::{OverlayState, RhaiEngine};
 use etv_overlay::vello_renderer::VelloRenderer;
@@ -89,8 +89,13 @@ fn a_config_value_moves_the_rendered_watermark() {
     }];
 
     let mut render_with = |corner: &str| {
-        let cfg: toml::Value = toml::from_str(&format!("corner = \"{corner}\"\n")).unwrap();
-        let mut engine = RhaiEngine::with_config(base.clone(), Some(&cfg));
+        // Through the real load path, so what reaches the script is what an
+        // authored overlay spec would put there.
+        let spec = OverlaySpec::from_toml_str(&format!(
+            "width = 320\nheight = 240\nframerate = 30\n\n[config]\ncorner = \"{corner}\"\n"
+        ))
+        .unwrap();
+        let mut engine = RhaiEngine::with_config(base.clone(), spec.config.as_ref());
         engine.load_script(script.path()).unwrap();
         let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
         renderer.render_frame(&state).expect("render")

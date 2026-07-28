@@ -164,7 +164,7 @@ pub fn run(
     script_path: &Path,
     inputs: &ScoreInputs,
     pool_name: &str,
-    pool_config: Option<&serde_norway::Value>,
+    pool_config: Option<&serde_json::Value>,
     cache: &mut ScoreCache,
 ) -> Result<Vec<String>, String> {
     let mut engine = Engine::new();
@@ -402,7 +402,10 @@ mod tests {
         p
     }
 
-    fn yaml(src: &str) -> serde_norway::Value {
+    /// Parse a config bag exactly as a channel file does — YAML text in,
+    /// `serde_json::Value` out, with no intermediate step, which is the whole
+    /// reason the field can name one carrier type across both surfaces.
+    fn yaml(src: &str) -> serde_json::Value {
         serde_norway::from_str(src).unwrap()
     }
 
