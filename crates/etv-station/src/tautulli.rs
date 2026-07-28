@@ -1,8 +1,9 @@
 //! Tautulli watch history (#74) — the station's one source of "what has been
 //! watched on this server lately".
 //!
-//! Read once per generation, pooled across every user with no user dimension,
-//! and handed to a scorer plugin as a signal. It is never a query filter field:
+//! Read at most once per station tick and shared by every channel (#126) —
+//! pooled across every user with no user dimension, and handed to a scorer
+//! plugin as a signal. It is never a query filter field:
 //! a channel cannot say "movies nobody has watched" in CEL, because watch
 //! activity belongs to the algorithm's judgment, not to the catalog.
 //!
@@ -16,7 +17,7 @@
 //! unset or unreachable. A plugin still has release dates, `last_seen`, tags,
 //! and the channel's own recently-aired tail to rank on, so an outage degrades
 //! the ranking instead of stopping a channel that is otherwise fine. The reason
-//! is logged at each generation so the degradation is visible.
+//! is logged on each fetch so the degradation is visible.
 
 use std::time::Duration;
 
