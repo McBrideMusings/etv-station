@@ -220,6 +220,14 @@ pub struct Entry {
     pub release_date: Option<String>,
     pub duration_ms: Option<i64>,
     pub content_rating: Option<String>,
+    /// The library this entry came from, by **title** — the Plex section title
+    /// ("4K Movies"), so a config author writes `item.library == "4K Movies"`.
+    /// `None` for a source that has no library concept (the `fs` ingester).
+    ///
+    /// Storing the title rather than the section key is a deliberate trade
+    /// (#128): renaming the library in Plex makes every expression naming the
+    /// old title resolve to nothing, with no error.
+    pub library: Option<String>,
     /// Which source's normalized values won the merge. Persisted as
     /// `entries.primary_source` text; typed here for parity with the other
     /// fixed-set discriminators.

@@ -93,6 +93,7 @@ impl FieldKind {
             "content_rating" => Str("content_rating"),
             "edition" => Str("edition"),
             "studio" => Str("studio"),
+            "library" => Str("library"),
             "year" => Num("year"),
             "season" => Num("season"),
             "episode" => Num("episode"),

@@ -61,6 +61,10 @@ pub struct PlexItem {
     pub playback_path: String,
     pub kind: String,
     pub title: String,
+    /// The Plex library section this item was fetched from, by title
+    /// ("4K Movies") — the value `item.library` reads. `None` when the section
+    /// reports no title.
+    pub library: Option<String>,
     /// Show name for an episode (`grandparentTitle`); `None` for a movie.
     pub show: Option<String>,
     pub season: Option<i64>,
@@ -174,6 +178,21 @@ pub fn ingest_items(
         entry.duration_ms = item
             .duration_ms
             .or_else(|| existing.as_ref().and_then(|e| e.duration_ms));
+        // Same merge as the other Plex-authored columns: the section this pass
+        // read the item from wins, and an item Plex reports without one keeps
+        // whatever the entry already had (notably NULL, for an fs-only entry).
+        // An entry holds ONE library, so when two Plex files in different
+        // sections share a GUID and collapse onto it, the later of the two in
+        // the fetch is the one recorded — whichever section `/library/sections`
+        // happened to list second. Nothing here reorders that list, so a
+        // re-ingest lands the same value; if the server ever reorders it, the
+        // recorded library flips. Modelling an item as belonging to several
+        // libraries at once would need a join table, which #128 deliberately
+        // did not take on.
+        entry.library = or_existing(
+            item.library.clone(),
+            existing.as_ref().and_then(|e| e.library.clone()),
+        );
         catalog.upsert_entry(&entry)?;
         stats.entries_written += 1;
 
@@ -401,8 +420,15 @@ fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
 }
 
 /// Convert one Plex metadata record into a [`PlexItem`], applying `translate` to
-/// the file path. Returns `None` for a record with no playable file part.
-fn to_plex_item(m: &PlexMetadata, translate: impl Fn(&str) -> String) -> Option<PlexItem> {
+/// the file path. `library` is the title of the section the record was fetched
+/// from — the API's per-item payload does not carry it, so the caller walking
+/// the sections supplies it. Returns `None` for a record with no playable file
+/// part.
+fn to_plex_item(
+    m: &PlexMetadata,
+    library: Option<&str>,
+    translate: impl Fn(&str) -> String,
+) -> Option<PlexItem> {
     let raw_path = m.media.first()?.part.first()?.file.as_deref()?;
     let external_ids = m
         .guid
@@ -418,6 +444,7 @@ fn to_plex_item(m: &PlexMetadata, translate: impl Fn(&str) -> String) -> Option<
         external_ids,
         playback_path: translate(raw_path),
         title: m.title.clone().unwrap_or_default(),
+        library: library.and_then(non_empty).map(str::to_string),
         show: m.grandparent_title.clone(),
         season: is_episode.then_some(m.parent_index).flatten(),
         episode: is_episode.then_some(m.index).flatten(),
@@ -552,7 +579,8 @@ impl PlexClient {
             let endpoint = format!("/library/sections/{id}/all");
             let resp: MediaContainerResp = self.get(&endpoint, &params)?;
             for m in &resp.media_container.metadata {
-                if let Some(item) = to_plex_item(m, |p| self.translate(p)) {
+                if let Some(item) = to_plex_item(m, section.title.as_deref(), |p| self.translate(p))
+                {
                     items.push(item);
                 }
             }
@@ -721,6 +749,10 @@ struct SectionEntry {
     key: Option<String>,
     #[serde(default, rename = "type")]
     kind: Option<String>,
+    /// The library's display name ("4K Movies") — stamped onto every item the
+    /// section yields as `entries.library`.
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[cfg(test)]
@@ -737,6 +769,7 @@ mod tests {
             playback_path: path.into(),
             kind: "movie".into(),
             title: "A Movie".into(),
+            library: None,
             show: None,
             season: None,
             episode: None,
@@ -872,7 +905,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/Movies/Die Hard.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, |p| p.replace("/media", "/data/media")).unwrap();
+        let item = to_plex_item(&m, None, |p| p.replace("/media", "/data/media")).unwrap();
         assert_eq!(item.playback_path, "/data/media/Movies/Die Hard.mkv");
         assert_eq!(
             item.external_ids,
@@ -896,7 +929,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/lotr.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
         assert_eq!(item.edition.as_deref(), Some("Extended Edition"));
         assert_eq!(item.studio.as_deref(), Some("New Line Cinema"));
     }
@@ -913,7 +946,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
         assert_eq!(item.edition, None);
         assert_eq!(item.studio, None);
     }
@@ -946,6 +979,144 @@ mod tests {
         );
     }
 
+    /// The section title is stamped onto every item the section yields — the
+    /// per-item payload never carries it, so the section walk is the only place
+    /// it can come from.
+    #[test]
+    fn to_plex_item_stamps_the_section_title_as_the_library() {
+        let json = r#"{
+            "ratingKey": "1",
+            "type": "movie",
+            "title": "A Film",
+            "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, Some("4K Movies"), |p| p.to_string()).unwrap();
+        assert_eq!(item.library.as_deref(), Some("4K Movies"));
+
+        // A section with no title (or a blank one) yields no library rather than
+        // an empty string, so the merge never overwrites a real value with "".
+        let blank = to_plex_item(&m, Some("   "), |p| p.to_string()).unwrap();
+        assert_eq!(blank.library, None);
+        let none = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        assert_eq!(none.library, None);
+    }
+
+    #[test]
+    fn section_list_parses_the_library_title() {
+        let json = r#"{"MediaContainer": {"Directory": [
+            {"key": "1", "type": "movie", "title": "Movies"},
+            {"key": "2", "type": "movie", "title": "4K Movies"},
+            {"key": "3", "type": "show"}
+        ]}}"#;
+        let resp: SectionListResp = serde_json::from_str(json).unwrap();
+        let titles: Vec<Option<&str>> = resp
+            .media_container
+            .directory
+            .iter()
+            .map(|s| s.title.as_deref())
+            .collect();
+        assert_eq!(titles, vec![Some("Movies"), Some("4K Movies"), None]);
+    }
+
+    /// Two movie libraries are indistinguishable by `type` alone — separating
+    /// them is the whole point of the column (#128).
+    #[test]
+    fn ingest_separates_entries_by_library_and_leaves_fs_entries_null() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let mut hd = movie(
+            "rk-hd",
+            "/data/media/m/hd.mkv",
+            &[(ExternalNs::Imdb, "tt-hd")],
+        );
+        hd.library = Some("Movies".into());
+        let mut uhd = movie(
+            "rk-uhd",
+            "/data/media/m/uhd.mkv",
+            &[(ExternalNs::Imdb, "tt-uhd")],
+        );
+        uhd.library = Some("4K Movies".into());
+        ingest_items(&cat, &[hd, uhd], &roots).unwrap();
+
+        // An fs-sourced file no Plex library covers.
+        crate::catalog::ingest::fs::ingest_files(
+            &cat,
+            &[(std::path::PathBuf::from("/data/media/bumpers/b.mkv"), None)],
+            &roots,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cat.entry("imdb:tt-uhd")
+                .unwrap()
+                .unwrap()
+                .library
+                .as_deref(),
+            Some("4K Movies")
+        );
+        assert_eq!(
+            cat.entry("imdb:tt-hd").unwrap().unwrap().library.as_deref(),
+            Some("Movies")
+        );
+
+        // The CEL surface selects exactly one library and excludes the other —
+        // `item.type == "movie"` matches both, which is the gap being closed.
+        assert_eq!(
+            cat.resolve_query(r#"item.library == "4K Movies""#).unwrap(),
+            vec!["imdb:tt-uhd".to_string()]
+        );
+        assert_eq!(
+            cat.resolve_query(r#"item.type == "movie""#).unwrap().len(),
+            2
+        );
+
+        // The fs entry has no library, is matched by no `library == "…"`
+        // expression, and querying it is not an error.
+        let fs_id = cat
+            .all_entry_ids()
+            .unwrap()
+            .into_iter()
+            .find(|id| id.starts_with("fs:"))
+            .expect("fs entry");
+        assert_eq!(cat.entry(&fs_id).unwrap().unwrap().library, None);
+        for expr in [
+            r#"item.library == "Movies""#,
+            r#"item.library == "4K Movies""#,
+        ] {
+            assert!(
+                !cat.resolve_query(expr).unwrap().contains(&fs_id),
+                "{expr} must not match the fs entry"
+            );
+        }
+    }
+
+    /// A re-ingest must land the same library value, not flap — and must not
+    /// erase one when Plex hands the item back without a section title.
+    #[test]
+    fn library_is_stable_across_reingest_and_survives_a_titleless_pass() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let mut item = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        item.library = Some("4K Movies".into());
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+        assert_eq!(cat.all_entry_ids().unwrap(), vec!["imdb:tt-a".to_string()]);
+        assert_eq!(cat.all_sources().unwrap().len(), 1);
+        assert_eq!(
+            cat.entry("imdb:tt-a").unwrap().unwrap().library.as_deref(),
+            Some("4K Movies")
+        );
+
+        item.library = None;
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+        assert_eq!(
+            cat.entry("imdb:tt-a").unwrap().unwrap().library.as_deref(),
+            Some("4K Movies"),
+            "a pass with no section title must not clear the library"
+        );
+    }
+
     #[test]
     fn to_plex_item_promotes_crew_cast_and_label_tags() {
         let json = r#"{
@@ -961,7 +1132,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
         assert_eq!(item.cast, vec!["Bruce Willis", "Alan Rickman"]);
         assert_eq!(item.directors, vec!["John McTiernan"]);
         assert_eq!(item.writers, vec!["Jeb Stuart"]);
@@ -1021,7 +1192,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/dbz/e.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
         assert_eq!(item.absolute_episode, Some(154));
         assert_eq!(item.season, Some(1));
         assert_eq!(item.episode, Some(1));
@@ -1039,7 +1210,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
         assert_eq!(item.absolute_episode, None);
     }
 
@@ -1231,7 +1402,7 @@ mod tests {
     fn item_without_a_file_part_is_skipped() {
         let json = r#"{"ratingKey": "1", "type": "movie", "title": "x", "Media": []}"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        assert!(to_plex_item(&m, |p| p.to_string()).is_none());
+        assert!(to_plex_item(&m, None, |p| p.to_string()).is_none());
     }
 
     /// Plex authors the whole tag set per namespace, so a re-ingest has to

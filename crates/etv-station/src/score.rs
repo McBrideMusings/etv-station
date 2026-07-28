@@ -350,6 +350,7 @@ fn load_items(catalog: &Catalog, ids: &[String]) -> Result<Array, String> {
         insert_opt_str(&mut m, "release_date", entry.release_date);
         insert_opt_int(&mut m, "duration_ms", entry.duration_ms);
         insert_opt_str(&mut m, "content_rating", entry.content_rating);
+        insert_opt_str(&mut m, "library", entry.library);
 
         for (key, ns) in EXPOSED_TAGS {
             let values = catalog.tags_for(id, *ns).map_err(|e| e.to_string())?;
@@ -455,6 +456,47 @@ weights:
         )
         .unwrap();
         assert_eq!(got, vec!["m2", "m1"]);
+    }
+
+    /// `item.library` (#128) has to reach a scorer's item maps, not just the CEL
+    /// surface — the maps are built from an explicit column list, so a new
+    /// column only arrives there if it is added by hand.
+    #[test]
+    fn item_maps_carry_the_library() {
+        let c = Catalog::open_in_memory().unwrap();
+        for (id, library) in [("m1", Some("4K Movies")), ("m2", None)] {
+            let mut e = Entry::new(id, "movie", id, Source::Plex);
+            e.library = library.map(str::to_string);
+            c.upsert_entry(&e).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let ids = [];
+    for item in ctx.sets.movies {
+        if item.library == "4K Movies" { ids.push(item.entry_id); }
+    }
+    // A column with no value arrives as unit, same as every other absent one.
+    for item in ctx.sets.movies {
+        if item.entry_id == "m2" && item.library != () { throw "expected unit"; }
+    }
+    ids
+}
+"#,
+        );
+        let got = run(
+            &c,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(got, vec!["m1"]);
     }
 
     #[test]
