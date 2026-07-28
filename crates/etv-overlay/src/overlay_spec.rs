@@ -27,17 +27,73 @@ pub struct OverlaySpec {
     /// the script takes its own fallback, because nothing here knows the correct
     /// spelling. A script wanting strictness declares and checks its own keys.
     ///
+    /// **A TOML datetime arrives as the text the author wrote.** TOML has a
+    /// first-class datetime and the carrier type does not, so `date =
+    /// 2026-07-28` reaches the script as the string `"2026-07-28"` — offset,
+    /// local, date-only and time-only forms alike, each rendered in TOML's own
+    /// spelling. Nothing is dropped and nothing needs a reserved key, and it
+    /// makes the two surfaces agree on identical authored text: `date:
+    /// 2026-07-28` in a channel YAML already reaches a scorer as that same
+    /// string. A script wanting a moment rather than a label parses it, on the
+    /// same terms as every other key here — the meaning is the script's.
+    ///
     /// The same contract the scorer-plugin side carries on
-    /// `etv_station::config::Pool::config`; only the plumbing differs, because a
+    /// `etv_station::config::Pool::config`, down to the carrier type: one
+    /// opaque-config value type for the whole project, so a third scripting
+    /// surface inherits the decision instead of picking one by looking at which
+    /// file format it happens to parse. Only the plumbing differs, because a
     /// scorer receives one `ctx` map and an overlay receives flat scope
     /// constants.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<toml::Value>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_config",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub config: Option<serde_json::Value>,
     /// Layers are rendered bottom-up in declaration order. A single Rhai script
     /// (if `script` is set) controls visibility/opacity uniformly across all
     /// layers — per-layer scripts are a future extension.
     #[serde(default, alias = "kind", deserialize_with = "deserialize_layers")]
     pub layers: Vec<OverlayKind>,
+}
+
+/// Read [`OverlaySpec::config`] through TOML's own value type before handing it
+/// to the shared carrier, because TOML has one type the carrier does not.
+///
+/// Deserializing the carrier straight from the TOML parser *works*, but a
+/// datetime arrives wrapped in a reserved key the toml crate uses to smuggle it
+/// through serde — a private spelling that would then be what an overlay script
+/// sees. Walking the TOML value instead is the only step where this pair of
+/// formats needs one, and it is what lets the datetime land as plain text.
+fn deserialize_config<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<toml::Value>::deserialize(deserializer)?.map(toml_to_carrier))
+}
+
+/// TOML value → the shared carrier type, mapping the one type TOML has and the
+/// carrier does not: a datetime becomes its TOML text.
+pub(crate) fn toml_to_carrier(value: toml::Value) -> serde_json::Value {
+    use serde_json::Value as Carrier;
+    match value {
+        toml::Value::String(s) => Carrier::String(s),
+        toml::Value::Integer(i) => Carrier::Number(i.into()),
+        // A non-finite float has no carrier representation and becomes null —
+        // the same thing `.inf` in a channel YAML already does on the scorer
+        // side, so the two surfaces stay in step.
+        toml::Value::Float(f) => {
+            serde_json::Number::from_f64(f).map_or(Carrier::Null, Carrier::Number)
+        }
+        toml::Value::Boolean(b) => Carrier::Bool(b),
+        toml::Value::Datetime(d) => Carrier::String(d.to_string()),
+        toml::Value::Array(a) => Carrier::Array(a.into_iter().map(toml_to_carrier).collect()),
+        toml::Value::Table(t) => Carrier::Object(
+            t.into_iter()
+                .map(|(k, v)| (k, toml_to_carrier(v)))
+                .collect(),
+        ),
+    }
 }
 
 fn deserialize_layers<'de, D>(deserializer: D) -> Result<Vec<OverlayKind>, D::Error>
@@ -351,6 +407,83 @@ framerate = 24
         let spec = OverlaySpec::from_toml_str(toml).unwrap();
         assert_eq!(spec.pixel_format, PixelFormat::Rgba8);
         assert!(spec.layers.is_empty());
+    }
+
+    /// A `[config]` table parses into the carrier type with its nesting and
+    /// scalar types intact — the shape a script reads (#125, #129).
+    #[test]
+    fn config_parses_into_the_shared_carrier_type() {
+        let toml = r#"
+width = 320
+height = 240
+framerate = 30
+
+[config]
+name = "lower-third"
+
+[config.fade]
+seconds = 0.4
+steps = 3
+enabled = true
+labels = ["a", "b"]
+"#;
+        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let config = spec.config.as_ref().unwrap();
+        assert_eq!(config["name"], serde_json::json!("lower-third"));
+        assert_eq!(config["fade"]["seconds"], serde_json::json!(0.4));
+        assert_eq!(config["fade"]["steps"], serde_json::json!(3));
+        assert_eq!(config["fade"]["enabled"], serde_json::json!(true));
+        assert_eq!(config["fade"]["labels"][1], serde_json::json!("b"));
+    }
+
+    /// TOML's native datetime — the one type it has that the carrier does not —
+    /// arrives as the text the author wrote, wherever it sits and in every form
+    /// TOML spells it. Nothing is dropped and no reserved key leaks through
+    /// (#129), and this is the same string a channel YAML's `released:
+    /// 2026-07-28` already hands a scorer plugin.
+    #[test]
+    fn a_toml_datetime_arrives_as_its_authored_text() {
+        let toml = r#"
+width = 320
+height = 240
+framerate = 30
+
+[config]
+date = 2026-07-28
+offset = 2026-07-28T10:32:00Z
+local = 2026-07-28T10:32:00
+clock = 10:32:00
+window = [2026-07-28, 2026-07-29]
+
+[config.nested]
+since = 2026-07-28
+"#;
+        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let config = spec.config.as_ref().unwrap();
+        assert_eq!(config["date"], serde_json::json!("2026-07-28"));
+        assert_eq!(config["offset"], serde_json::json!("2026-07-28T10:32:00Z"));
+        assert_eq!(config["local"], serde_json::json!("2026-07-28T10:32:00"));
+        assert_eq!(config["clock"], serde_json::json!("10:32:00"));
+        assert_eq!(config["window"][1], serde_json::json!("2026-07-29"));
+        assert_eq!(config["nested"]["since"], serde_json::json!("2026-07-28"));
+
+        // The toml crate smuggles a datetime through serde under a reserved
+        // key; deserializing the carrier straight from the parser would make
+        // that private spelling the thing a script sees. Nothing here may
+        // contain it at any depth.
+        let rendered = config.to_string();
+        assert!(
+            !rendered.contains("$__toml"),
+            "a toml-private key leaked into the config a script reads: {rendered}"
+        );
+    }
+
+    /// An unset `config` stays unset — the empty map a script reads is made at
+    /// the engine, not injected into the spec.
+    #[test]
+    fn an_absent_config_stays_absent() {
+        let spec = OverlaySpec::from_toml_str("width = 1\nheight = 1\nframerate = 1\n").unwrap();
+        assert!(spec.config.is_none());
     }
 
     #[test]

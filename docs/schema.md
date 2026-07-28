@@ -517,6 +517,15 @@ family = "Inter"
 size = 42
 ```
 
+Both surfaces carry the bag in one and the same value type internally, so the
+two cannot drift apart on what a shape means. That has one visible consequence:
+**a TOML datetime reaches an overlay script as the text the author wrote.**
+`date = 2026-07-28` arrives as `"2026-07-28"`, and offset, local, and time-only
+values likewise arrive in TOML's own spelling. Nothing is dropped, and it is the
+same string a channel YAML's `date: 2026-07-28` already hands a scorer plugin. A
+script wanting a moment rather than a label parses it — the meaning of a key is
+the script's, here as everywhere else in the bag.
+
 Any future scripting surface follows the same shape: the station carries a bag
 of values it does not understand, and the script decides what they mean.
 

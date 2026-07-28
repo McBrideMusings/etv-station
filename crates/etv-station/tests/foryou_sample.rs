@@ -307,7 +307,7 @@ fn a_pool_config_value_changes_the_scripts_ranking() {
         now,
     };
 
-    let resolve_with = |config: Option<serde_norway::Value>| {
+    let resolve_with = |config: Option<serde_json::Value>| {
         let cfg = config_with_movies_config(config);
         ids(&resolve_channel_with_resume(
             &cfg,
@@ -344,7 +344,7 @@ fn a_pool_config_value_changes_the_scripts_ranking() {
 }
 
 /// The committed sample with an arbitrary `config` attached to its movies pool.
-fn config_with_movies_config(pool_config: Option<serde_norway::Value>) -> ChannelConfig {
+fn config_with_movies_config(pool_config: Option<serde_json::Value>) -> ChannelConfig {
     let mut cfg = config();
     let pool = cfg.rule.blocks[0]
         .pools

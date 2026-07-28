@@ -204,8 +204,15 @@ pub struct Pool {
     /// Meaningless on an `expr` pool — a CEL expression has no script to read
     /// it — where it is ignored rather than rejected, on the same terms as an
     /// unrecognised key inside it.
+    ///
+    /// Carried as a `serde_json::Value` rather than the channel format's own
+    /// value type: one opaque-config carrier for the whole project, so a third
+    /// scripting surface inherits the decision instead of picking a type by
+    /// looking at which file format it happens to parse. The same type carries
+    /// `etv_overlay::OverlaySpec::config`. It is a carrier, not a format — a
+    /// pool's `config` is authored in the channel YAML like everything else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<serde_norway::Value>,
+    pub config: Option<serde_json::Value>,
 }
 
 impl Pool {
@@ -355,5 +362,33 @@ on_short: short
     fn rejects_an_unknown_pool_field() {
         let yaml = "name: shows\nexpr: 'x'\nselekt: random\n";
         assert!(serde_norway::from_str::<Pool>(yaml).is_err());
+    }
+
+    /// The channel YAML parses straight into the carrier type with no
+    /// intermediate value — nesting and scalar types intact, and a YAML
+    /// timestamp landing as the text the author wrote, which is the same thing
+    /// an overlay's TOML datetime becomes on the other surface (#129).
+    #[test]
+    fn config_parses_from_yaml_into_the_shared_carrier_type() {
+        let yaml = r#"
+name: movies
+expr: 'x'
+config:
+  name: taste
+  released: 2026-07-28
+  weights:
+    affinity: 3.0
+    steps: 3
+    enabled: true
+    labels: ["a", "b"]
+"#;
+        let pool: Pool = serde_norway::from_str(yaml).unwrap();
+        let config = pool.config.as_ref().unwrap();
+        assert_eq!(config["name"], serde_json::json!("taste"));
+        assert_eq!(config["released"], serde_json::json!("2026-07-28"));
+        assert_eq!(config["weights"]["affinity"], serde_json::json!(3.0));
+        assert_eq!(config["weights"]["steps"], serde_json::json!(3));
+        assert_eq!(config["weights"]["enabled"], serde_json::json!(true));
+        assert_eq!(config["weights"]["labels"][1], serde_json::json!("b"));
     }
 }
