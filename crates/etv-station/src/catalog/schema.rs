@@ -86,6 +86,16 @@ pub const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
     "#,
+    // v3 — the library an entry came from (#128). Holds the Plex section
+    // *title* ("4K Movies"), not its numeric section key, so a channel reads
+    // `item.library == "4K Movies"` rather than `item.library == "1"`. The
+    // rename hazard is accepted deliberately: renaming a library in Plex makes
+    // every expression naming the old title resolve to nothing, silently.
+    // NULL for entries no library authored — everything the `fs` ingester
+    // writes.
+    r#"
+    ALTER TABLE entries ADD COLUMN library TEXT;
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

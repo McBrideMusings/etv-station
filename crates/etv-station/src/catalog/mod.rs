@@ -166,9 +166,9 @@ impl Catalog {
             "INSERT INTO entries (
                 entry_id, type, title, title_sort, show, show_id, season, episode,
                 absolute_episode, edition, studio, year, release_date, duration_ms,
-                content_rating, primary_source, raw_metadata
+                content_rating, library, primary_source, raw_metadata
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
             )
             ON CONFLICT(entry_id) DO UPDATE SET
                 type=excluded.type, title=excluded.title, title_sort=excluded.title_sort,
@@ -176,7 +176,8 @@ impl Catalog {
                 episode=excluded.episode, absolute_episode=excluded.absolute_episode,
                 edition=excluded.edition, studio=excluded.studio, year=excluded.year,
                 release_date=excluded.release_date, duration_ms=excluded.duration_ms,
-                content_rating=excluded.content_rating, primary_source=excluded.primary_source,
+                content_rating=excluded.content_rating, library=excluded.library,
+                primary_source=excluded.primary_source,
                 raw_metadata=excluded.raw_metadata",
             params![
                 e.entry_id,
@@ -194,6 +195,7 @@ impl Catalog {
                 e.release_date,
                 e.duration_ms,
                 e.content_rating,
+                e.library,
                 e.primary_source.as_str(),
                 e.raw_metadata,
             ],
@@ -562,7 +564,7 @@ fn collect_sources(
 /// Column list for `entries`, in the order [`row_to_entry`] reads.
 const ENTRY_COLS: &str = "entry_id, type, title, title_sort, show, show_id, season, episode, \
      absolute_episode, edition, studio, year, release_date, duration_ms, content_rating, \
-     primary_source, raw_metadata";
+     library, primary_source, raw_metadata";
 
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     Ok(Entry {
@@ -581,17 +583,18 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         release_date: r.get(12)?,
         duration_ms: r.get(13)?,
         content_rating: r.get(14)?,
+        library: r.get(15)?,
         primary_source: {
-            let raw: String = r.get(15)?;
+            let raw: String = r.get(16)?;
             raw.parse().map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    15,
+                    16,
                     rusqlite::types::Type::Text,
                     format!("invalid primary_source {raw:?}").into(),
                 )
             })?
         },
-        raw_metadata: r.get(16)?,
+        raw_metadata: r.get(17)?,
     })
 }
 
@@ -635,6 +638,48 @@ mod tests {
         assert_eq!(c.entry("id1").unwrap().unwrap().title, "Kept");
     }
 
+    /// A catalog written by an older binary must gain `entries.library` (#128)
+    /// on the next open, keeping its rows and reading the new column as NULL —
+    /// otherwise every existing deployment needs its catalog rebuilt.
+    #[test]
+    fn an_older_catalog_gains_the_library_column_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        {
+            // Stand up the schema exactly as the pre-#128 binary left it: every
+            // migration up to (but not including) the one that adds `library`.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+            )
+            .unwrap();
+            for (i, ddl) in schema::MIGRATIONS.iter().enumerate().take(2) {
+                conn.execute_batch(ddl).unwrap();
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    [(i + 1) as i64],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO entries (entry_id, type, title, primary_source)
+                 VALUES ('old1', 'movie', 'Pre-existing', 'plex')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let c = Catalog::open(&path).unwrap();
+        let version: i64 = c
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+        let got = c.entry("old1").unwrap().unwrap();
+        assert_eq!(got.title, "Pre-existing");
+        assert_eq!(got.library, None);
+    }
+
     #[test]
     fn entry_round_trips_all_columns() {
         let c = cat();
@@ -650,6 +695,7 @@ mod tests {
             release_date: Some("1977-05-25".into()),
             duration_ms: Some(7_320_000),
             content_rating: Some("PG".into()),
+            library: Some("4K Movies".into()),
             raw_metadata: Some(r#"{"tagline":"…"}"#.into()),
             ..Entry::new("imdb:tt0076759", "movie", "Star Wars", Source::Plex)
         };

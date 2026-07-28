@@ -104,6 +104,46 @@ A string comparison treats a missing value as the empty string, so a film with
 no `edition` counts as theatrical: `item.edition != "Extended Edition"` matches
 it, and `item.edition == ""` selects exactly the no-edition items.
 
+#### Item fields
+
+Each field is either a column on the catalog's `entries` table (scalar —
+compared with `==`, `!=`, `in`, and for text `contains` / `startsWith` /
+`matches`) or a tag namespace (multi-valued — membership only, via `contains`).
+
+| Field | Kind | Notes |
+|---|---|---|
+| `title` | string | |
+| `show` | string | the series name on an episode |
+| `type` | string | `movie`, `episode`, `bumper`, … |
+| `content_rating` | string | |
+| `edition` | string | empty = theatrical |
+| `studio` | string | one production company |
+| `library` | string | the library the item came from, by name |
+| `year` | int | |
+| `season` | int | |
+| `episode` | int | |
+| `absolute_episode` | int | franchise-wide episode number |
+| `duration_ms` | int | |
+| `genres` | tags | |
+| `labels` | tags | |
+| `cast` | tags | |
+| `directors` | tags | |
+| `tags` | tags | every namespace at once |
+| `source` | membership | `item.source == "plex"` |
+| `collections` | membership | by collection name |
+
+`library` is what scopes a channel to one library when a server keeps several:
+`item.library == "4K Movies"` selects that library and excludes "Movies" and
+"Kids", where `item.type == "movie"` matches all three together. An expression
+that does not mention `library` spans every library, which stays the default.
+
+It stores the library's **name**, not its internal id, so the expression reads as
+what it is. The cost: renaming the library in Plex breaks every expression naming
+the old name, with no error — the expression resolves to nothing and the channel
+goes quiet. Items from a source with no library concept (everything the
+filesystem scan writes) have no `library`, so no `item.library == "…"` matches
+them.
+
 ### `kind: collection` — play a catalog collection in its authored order
 
 Emits every member of one collection in the sequence hand-arranged in the source
