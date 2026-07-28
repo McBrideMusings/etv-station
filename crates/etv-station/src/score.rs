@@ -51,6 +51,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rhai::{Array, Dynamic, Engine, Map, Scope};
 
@@ -78,27 +79,18 @@ pub struct ScoreInputs {
     /// dimension. Empty when the history source is unreachable: a plugin still
     /// has release dates, `last_seen`, tags, and `recent` to rank on, so a
     /// history outage degrades the ranking instead of failing the generation.
-    pub history: Vec<WatchEvent>,
+    ///
+    /// Shared rather than owned (#126): one fetch+join per station tick is
+    /// handed to every channel, and every generation inside a channel's
+    /// catch-up rebuilds these inputs. A `Vec` here made both of those a deep
+    /// copy of up to a thousand events; behind an `Arc` they are a refcount.
+    pub history: Arc<[WatchEvent]>,
     /// What this channel aired most recently, newest last, from the
     /// play-history ledger.
     pub recent: Vec<String>,
     /// Unix seconds at generation time. Passed in rather than read inside the
     /// script so a generation is reproducible from its inputs.
     pub now: i64,
-}
-
-impl ScoreInputs {
-    /// A const-constructible empty set of inputs — no history, no airings, no
-    /// target. `Default` cannot be used in a const context, and tests that
-    /// exercise pools which never reach a plugin still have to name something.
-    pub const fn new_empty() -> Self {
-        Self {
-            target_count: 0,
-            history: Vec::new(),
-            recent: Vec::new(),
-            now: 0,
-        }
-    }
 }
 
 /// The tag namespaces exposed to a plugin, each as an array under its own key.

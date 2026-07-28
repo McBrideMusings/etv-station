@@ -29,6 +29,9 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `test-util` gates tokio's pausable clock, which is how the shared watch
+# history's refresh window is tested without a real sleep.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lib]
 name = "etv_station"

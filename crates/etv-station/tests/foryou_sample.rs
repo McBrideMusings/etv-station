@@ -257,10 +257,11 @@ fn watch_history_changes_what_plays() {
     let cat = library();
     let watched = |id: &str| ScoreInputs {
         target_count: 20,
-        history: vec![WatchEvent {
+        history: [WatchEvent {
             entry_id: id.into(),
             watched_at: 900_000,
-        }],
+        }]
+        .into(),
         recent: Vec::new(),
         now: 900_000 + 3600,
     };
@@ -299,10 +300,11 @@ fn a_pool_config_value_changes_the_scripts_ranking() {
     let now = 900_000 + 20 * 86_400;
     let inputs = ScoreInputs {
         target_count: 20,
-        history: vec![WatchEvent {
+        history: [WatchEvent {
             entry_id: "mov-dune".into(),
             watched_at: 900_000,
-        }],
+        }]
+        .into(),
         recent: Vec::new(),
         now,
     };
