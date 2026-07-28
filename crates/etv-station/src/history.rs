@@ -117,24 +117,41 @@ impl Ledger {
     /// This is the adjacency seam (#73): the last id here airs immediately
     /// before the first item of the next generation, so the constraint pass
     /// reads it to avoid repeating across the boundary.
+    ///
+    /// "Most recent" is decided by [`PlayRecord::start`], not by position in
+    /// the file — a writer that appends out of schedule order gets the same
+    /// answer as one that doesn't. Equal starts keep file order, so the record
+    /// written later sorts later.
     pub fn tail(&self, n: usize) -> Vec<String> {
-        self.records[self.records.len().saturating_sub(n)..]
+        let mut order: Vec<usize> = (0..self.records.len()).collect();
+        order.sort_by_key(|&i| self.records[i].start);
+        order[order.len().saturating_sub(n)..]
             .iter()
-            .map(|r| r.entry_id.clone())
+            .map(|&i| self.records[i].entry_id.clone())
             .collect()
     }
 
     /// What each series played last — the resume cursor, projected.
     ///
-    /// Records are appended in schedule order and a rewind truncates rather
-    /// than interleaving, so the last record for a key is the latest airing of
-    /// it. Returns `series_key -> entry_id`.
+    /// "Last" is the greatest [`PlayRecord::start`] for the key, not the last
+    /// record in file order: appending out of schedule order — backfilling a
+    /// gap, merging two ledgers — must not silently rewind a series. Equal
+    /// starts resolve to the later record in file order. Returns
+    /// `series_key -> entry_id`.
     pub fn series_cursor(&self) -> BTreeMap<String, String> {
-        let mut cursor = BTreeMap::new();
+        let mut cursor: BTreeMap<String, (OffsetDateTime, String)> = BTreeMap::new();
         for r in &self.records {
-            cursor.insert(r.series_key().to_string(), r.entry_id.clone());
+            let latest = cursor
+                .entry(r.series_key().to_string())
+                .or_insert_with(|| (r.start, r.entry_id.clone()));
+            if latest.0 <= r.start {
+                *latest = (r.start, r.entry_id.clone());
+            }
         }
         cursor
+            .into_iter()
+            .map(|(key, (_, entry_id))| (key, entry_id))
+            .collect()
     }
 
     /// Drop every airing scheduled at or after `from`.
@@ -186,8 +203,31 @@ pub async fn load(output_folder: &Path) -> Result<(Ledger, usize), StationError>
             Err(_) => skipped += 1,
         }
     }
+    // The reads no longer depend on file order, so an out-of-order file is not
+    // a correctness problem — but it does mean some writer appended out of
+    // schedule order, and that should be visible rather than absorbed. Warn;
+    // never fail, because failing here takes the channel off the air over a
+    // condition the reads already handle.
+    if let Some(i) = first_out_of_order(&records) {
+        tracing::warn!(
+            event = "history.out_of_order",
+            path = %path.display(),
+            index = i,
+            "play history is not in schedule order; reads are ordered by start, but some writer appended out of order",
+        );
+    }
+
     let flushed = records.len();
     Ok((Ledger { records, flushed }, skipped))
+}
+
+/// The index of the first record whose `start` precedes its predecessor's, if
+/// any.
+fn first_out_of_order(records: &[PlayRecord]) -> Option<usize> {
+    records
+        .windows(2)
+        .position(|w| w[1].start < w[0].start)
+        .map(|i| i + 1)
 }
 
 /// Persist anything not yet on disk.
@@ -316,6 +356,70 @@ mod tests {
         assert!(Ledger::new().series_cursor().is_empty());
     }
 
+    /// The airings of one busy day, in schedule order. Two shows interleave and
+    /// a movie sits in the middle, so a shuffle can plausibly move any of them.
+    fn a_days_airings() -> Vec<PlayRecord> {
+        vec![
+            ep("got-e1", "show:got", 0),
+            ep("inv-e1", "show:inv", 1),
+            ep("got-e2", "show:got", 2),
+            movie("mov-dune", 3),
+            ep("inv-e2", "show:inv", 4),
+            ep("got-e3", "show:got", 5),
+        ]
+    }
+
+    /// The same airings, appended in an order no generation would produce — a
+    /// backfilled gap, a merge of two ledgers, a manual insertion.
+    fn shuffled(records: &[PlayRecord]) -> Vec<PlayRecord> {
+        let order = [3usize, 0, 5, 2, 4, 1];
+        order.iter().map(|&i| records[i].clone()).collect()
+    }
+
+    fn ledger_of(records: Vec<PlayRecord>) -> Ledger {
+        let mut l = Ledger::new();
+        l.extend(records);
+        l
+    }
+
+    #[test]
+    fn the_cursor_reads_the_same_whatever_order_the_records_were_appended_in() {
+        let in_order = ledger_of(a_days_airings());
+        let out_of_order = ledger_of(shuffled(&a_days_airings()));
+        assert_eq!(out_of_order.series_cursor(), in_order.series_cursor());
+        assert_eq!(in_order.series_cursor().get("show:got").unwrap(), "got-e3");
+    }
+
+    #[test]
+    fn the_seam_tail_reads_the_same_whatever_order_the_records_were_appended_in() {
+        let in_order = ledger_of(a_days_airings());
+        let out_of_order = ledger_of(shuffled(&a_days_airings()));
+        for n in 0..=7 {
+            assert_eq!(out_of_order.tail(n), in_order.tail(n), "tail({n})");
+        }
+        assert_eq!(in_order.tail(2), vec!["inv-e2", "got-e3"]);
+    }
+
+    #[test]
+    fn two_airings_at_one_instant_resolve_to_the_later_record() {
+        // Nothing schedules two things at the same start, but a merge of two
+        // ledgers can. File order is the only tiebreak left, and it is the one
+        // that matches what an in-order ledger does today.
+        let l = ledger_of(vec![
+            ep("got-e1", "show:got", 0),
+            ep("got-e2", "show:got", 0),
+        ]);
+        assert_eq!(l.series_cursor().get("show:got").unwrap(), "got-e2");
+        assert_eq!(l.tail(1), vec!["got-e2"]);
+    }
+
+    #[test]
+    fn out_of_order_detection_reports_the_first_offending_index() {
+        assert_eq!(first_out_of_order(&a_days_airings()), None);
+        assert_eq!(first_out_of_order(&shuffled(&a_days_airings())), Some(1));
+        assert_eq!(first_out_of_order(&[]), None);
+    }
+
     #[test]
     fn truncation_drops_airings_at_or_after_the_instant() {
         let mut l = Ledger::new();
@@ -441,6 +545,89 @@ mod tests {
             "the whole ledger must be rewritten, not just the unflushed tail"
         );
         assert_eq!(loaded.series_cursor().get("show:got").unwrap(), "got-e3");
+    }
+
+    /// Collects the formatted log output of whatever runs under it.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn an_out_of_order_file_warns_and_still_loads() {
+        let dir = tempdir().unwrap();
+        let path = sidecar_path(dir.path());
+        std::fs::write(&path, encode(&shuffled(&a_days_airings()))).unwrap();
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        // A current-thread runtime so the load runs on the thread the
+        // subscriber is defaulted on.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (loaded, skipped) =
+            tracing::subscriber::with_default(subscriber, || rt.block_on(load(dir.path())))
+                .unwrap();
+
+        assert_eq!(skipped, 0);
+        assert_eq!(loaded.len(), 6, "an out-of-order file still loads");
+        assert_eq!(loaded.series_cursor().get("show:got").unwrap(), "got-e3");
+
+        let text = logs.text();
+        assert_eq!(
+            text.matches("history.out_of_order").count(),
+            1,
+            "exactly one warning, got: {text}"
+        );
+        assert!(text.contains(&path.display().to_string()), "got: {text}");
+        assert!(text.contains("index=1"), "got: {text}");
+    }
+
+    #[test]
+    fn an_in_order_file_loads_silently() {
+        let dir = tempdir().unwrap();
+        std::fs::write(sidecar_path(dir.path()), encode(&a_days_airings())).unwrap();
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || rt.block_on(load(dir.path()))).unwrap();
+
+        assert!(!logs.text().contains("history.out_of_order"));
     }
 
     #[tokio::test]
