@@ -373,6 +373,7 @@ mod tests {
             advance: Advance::default(),
             on_short: OnShort::default(),
             constraints: None,
+            config: None,
         }
     }
 

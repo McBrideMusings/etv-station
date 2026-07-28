@@ -177,6 +177,35 @@ pub struct Pool {
     /// guarantee it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraints: Option<Constraints>,
+
+    /// Arbitrary configuration handed to this pool's [`Pool::plugin`] verbatim,
+    /// reaching the script as `ctx.config`. Any YAML shape is accepted — maps,
+    /// arrays, strings, numbers, booleans, nested to any depth — and no key is
+    /// reserved.
+    ///
+    /// **The station never reads it.** It is converted and passed through, and
+    /// that is the whole of the contract: nothing here is validated, no key is
+    /// known, no default is injected, and an unrecognised key is not an error.
+    /// This is what keeps a scorer swappable — a script's tunables are its own
+    /// vocabulary, and ETV holding opinions about them would make the station a
+    /// party to the taste it exists not to have. See ADR 0002.
+    ///
+    /// Unset yields an empty map rather than a missing key, so a script may read
+    /// `ctx.config.anything` unconditionally and get unit back.
+    ///
+    /// **A typo is silent, by construction.** `afinity_window_days` reads as
+    /// unset and the script falls back to its own default, exactly as if the key
+    /// had been omitted. That is the price of the station not interpreting the
+    /// bag, and it is not worth buying off with station-side validation: any
+    /// list of known keys here would have to be updated for every script anyone
+    /// writes, which is the coupling this field exists to avoid. A script that
+    /// wants strictness can declare its own expected keys and check them.
+    ///
+    /// Meaningless on an `expr` pool — a CEL expression has no script to read
+    /// it — where it is ignored rather than rejected, on the same terms as an
+    /// unrecognised key inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_norway::Value>,
 }
 
 impl Pool {

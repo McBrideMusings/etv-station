@@ -443,7 +443,59 @@ the pool asking, so one script can serve several pools of a channel — a
 `movies` pool and a `shows` pool ranked by the same taste), `ctx.target_count` (how
 many items the generation needs), `ctx.history` (recent server-wide watch
 events, `#{entry_id, watched_at}`), `ctx.recent` (what this channel aired most
-recently, oldest first), and `ctx.now` (unix seconds at generation time).
+recently, oldest first), `ctx.now` (unix seconds at generation time), and
+`ctx.config` (this pool's `config:` block — see below).
+
+### Pool `config` — the script's own tunables, authored in YAML
+
+A plugin pool may carry a `config:` block. **The station passes it to the script
+verbatim and never reads it.**
+
+```yaml
+pools:
+  - name: movies
+    plugin: "../plugins/taste-engine.rhai"
+    config:
+      affinity_window_days: 30
+      weights:
+        affinity: 3.0
+        nested: [1, 2.5, true, "mixed"]
+```
+
+Any YAML shape is accepted — maps, arrays, strings, numbers, booleans, nested to
+any depth — and it arrives as `ctx.config` with its structure and scalar types
+intact. No key is reserved.
+
+This is what lets two channels share one algorithm with different numbers, and
+it is deliberately opaque: nothing here is validated, no key is known to ETV, no
+default is injected, and an unrecognised key is not an error. **A key means
+whatever the script decides it means.** `affinity_window_days` is not a concept
+etv-station has — it exists because `examples/plugins/taste-engine.rhai` looks it
+up, and a different scorer would read entirely different keys. That is the same
+argument that put taste in the plugin at all ([ADR 0002](./adr/0002-scorer-plugin-replaces-a-pool-expr.md)):
+a station that validated these keys would be a party to the taste it exists not
+to hold, and its list would need updating for every script anyone writes.
+
+An absent `config:` arrives as an empty map rather than a missing key, so a
+script can read `ctx.config.anything` unconditionally and get unit back. Which
+is also the catch: **a mistyped key is silent.** `afinity_window_days` reads as
+unset and the script falls back to its own default, exactly as if it had been
+omitted — there is no warning, because there is nothing that knows the correct
+spelling. A script that wants strictness has to declare and check its own
+expected keys. On an `expr` pool `config:` is ignored, on the same terms.
+
+The worked example reads its two tunables this way, each falling back to the
+value written in the script:
+
+```rhai
+fn tunable(ctx, key, fallback) {
+    let v = ctx.config[key];
+    if v == () { fallback } else { v }
+}
+
+fn affinity_window_days(ctx) { tunable(ctx, "affinity_window_days", 14) }
+fn replay_ttl_days(ctx)      { tunable(ctx, "replay_ttl_days", 30) }
+```
 
 The station computes no score of its own — it supplies those inputs and takes
 back an ordered list, so swapping one script for another changes nothing in

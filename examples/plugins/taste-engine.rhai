@@ -22,15 +22,29 @@
 // Tunables. Written as functions, not `const`, because a top-level constant is
 // only in scope once the script's body has run — and the station calls
 // `sources()` and `pick()` directly, so the body never does.
+//
+// Each one reads the pool's `config:` block first and falls back to the value
+// written here. The station passes that block through without looking at it, so
+// these key names are this script's vocabulary and nothing else's — a channel
+// that sets `affinity_window_days:` is talking to this file, not to ETV. A key
+// this script does not read is ignored, and a mistyped one reads as unset and
+// silently takes the fallback below.
 fn day() { 86400 }
+
+// `ctx.config` is always a map — an absent `config:` block arrives empty — so a
+// missing key is unit and every lookup below can be unconditional.
+fn tunable(ctx, key, fallback) {
+    let v = ctx.config[key];
+    if v == () { fallback } else { v }
+}
 
 // How long a watch keeps boosting a show. Watching one episode of something
 // says "I am interested in this" for about a fortnight.
-fn affinity_window_days() { 14 }
+fn affinity_window_days(ctx) { tunable(ctx, "affinity_window_days", 14) }
 
 // How long an airing suppresses a repeat. Nothing this channel played inside
 // this window comes back.
-fn replay_ttl_days() { 30 }
+fn replay_ttl_days(ctx) { tunable(ctx, "replay_ttl_days", 30) }
 
 fn sources() {
     #{
@@ -106,7 +120,7 @@ fn score_item(item, ctx, aired_at) {
     // ordered oldest-first, so a position near the end is a very recent airing.
     if aired_at >= 0 {
         let staleness = ctx.recent.len - aired_at;
-        if staleness < replay_ttl_days() { return 0.0; }
+        if staleness < replay_ttl_days(ctx) { return 0.0; }
     }
 
     let score = 1.0;
@@ -131,11 +145,12 @@ fn score_item(item, ctx, aired_at) {
 // decaying linearly over affinity_window_days().
 fn watch_affinity(item, ctx) {
     let best = 0.0;
+    let window_days = affinity_window_days(ctx);
     for event in ctx.history {
         if event.entry_id != item.entry_id { continue; }
         let age_days = (ctx.now - event.watched_at) / day();
-        if age_days >= affinity_window_days() { continue; }
-        let window = affinity_window_days().to_float();
+        if age_days >= window_days { continue; }
+        let window = window_days.to_float();
         let weight = 1.0 - (age_days.to_float() / window);
         if weight > best { best = weight; }
     }

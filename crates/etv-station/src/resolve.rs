@@ -1369,6 +1369,7 @@ mod tests {
                 advance,
                 on_short: OnShort::Next,
                 constraints: None,
+                config: None,
             },
             Pool {
                 name: "shows".into(),
@@ -1380,6 +1381,7 @@ mod tests {
                 advance,
                 on_short: OnShort::Next,
                 constraints: None,
+                config: None,
             },
         ];
         inc.pattern = vec![

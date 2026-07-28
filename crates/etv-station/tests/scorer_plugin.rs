@@ -90,6 +90,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     advance: Advance::Restart,
                     on_short: Default::default(),
                     constraints: None,
+                    config: None,
                 }],
                 pattern: vec![PatternStep {
                     pool: "foryou".into(),
@@ -289,8 +290,15 @@ fn the_committed_example_plugin_runs() {
         recent: vec!["mov-d".into()],
         now: 900_000 + 3600,
     };
-    let picked =
-        etv_station::score::run(&cat, &path, &inputs, "movies", &mut Default::default()).unwrap();
+    let picked = etv_station::score::run(
+        &cat,
+        &path,
+        &inputs,
+        "movies",
+        None,
+        &mut Default::default(),
+    )
+    .unwrap();
 
     assert!(
         !picked.contains(&"mov-d".to_string()),
