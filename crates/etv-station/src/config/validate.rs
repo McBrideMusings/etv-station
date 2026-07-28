@@ -181,13 +181,8 @@ fn validate_constraints(
 
     // A field that isn't multi-valued has nothing to intersect, so separating on
     // it would quietly never fire.
-    if let Some(field) = &c.separate_by
-        && crate::catalog::TagNs::from_query_field(field).is_none()
-    {
-        return Err(bad(format!(
-            "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
-            crate::catalog::TagNs::QUERY_FIELDS.join(", ")
-        )));
+    if let Some(field) = &c.separate_by {
+        crate::catalog::TagNs::for_separate_by(field).map_err(bad)?;
     }
 
     Ok(())

@@ -239,12 +239,9 @@ fn adjacency_keys(
             let Some(field) = field else {
                 return Ok(ItemKeys::new(id.clone()));
             };
-            let ns = TagNs::from_query_field(field).ok_or_else(|| ConfigError::Validation {
+            let ns = TagNs::for_separate_by(field).map_err(|message| ConfigError::Validation {
                 path: path.to_path_buf(),
-                message: format!(
-                    "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
-                    TagNs::QUERY_FIELDS.join(", ")
-                ),
+                message,
             })?;
             let Some(cat) = catalog else {
                 return Err(ConfigError::Unsupported {

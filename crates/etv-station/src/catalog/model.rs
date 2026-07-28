@@ -142,6 +142,23 @@ impl TagNs {
         })
     }
 
+    /// [`Self::from_query_field`], with the one rejection message every layer
+    /// that validates a `separate_by` field shares: config load, the
+    /// channel-level adjacency pass, and the per-pool one. Three copies of a
+    /// message is three chances for them to drift apart while all claiming to
+    /// describe the same rule.
+    ///
+    /// Returns the message alone; a caller that needs to say *where* the bad
+    /// field was wraps it rather than rewriting it.
+    pub fn for_separate_by(field: &str) -> Result<Self, String> {
+        Self::from_query_field(field).ok_or_else(|| {
+            format!(
+                "separate_by = {field:?} is not a multi-valued field (expected one of: {})",
+                Self::QUERY_FIELDS.join(", ")
+            )
+        })
+    }
+
     /// Every field name [`Self::from_query_field`] accepts, for error messages.
     pub const QUERY_FIELDS: [&'static str; 7] = [
         "genres",

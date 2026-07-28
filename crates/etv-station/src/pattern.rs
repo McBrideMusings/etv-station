@@ -74,6 +74,17 @@ use crate::resume::{GenerationState, PoolResume};
 /// — it is bounded by the pools' own sizes.
 pub const MAX_CYCLES: usize = 10_000;
 
+/// How many times a constrained `select = "random"` pool redraws before giving
+/// up and walking the rotation instead. A constraint blocks at most `reach`
+/// series, so on any pool bigger than that a handful of draws finds a free one;
+/// the cap only stops a pool with nothing eligible from rerolling forever.
+const RANDOM_REROLLS: u64 = 8;
+
+/// Keeps a reroll's nonce clear of the small nonces the rest of the walk uses —
+/// slot indices in a `rotate = "slot"` visit, and `u64::MAX` for a step's
+/// `chance` — so one decision's roll never doubles as another's.
+const REROLL_STRIDE: u64 = 1 << 32;
+
 /// One series inside a pool: a show's episodes, or a single movie.
 #[derive(Debug)]
 struct Series {
@@ -187,6 +198,11 @@ impl PoolRuntime<'_> {
     /// off its end loops. Reordering the pool's list cannot see either, so the
     /// eligibility check has to sit where the item is chosen.
     ///
+    /// Sliding to the neighbour is the right recovery for a rotation — "the
+    /// next series in order" is what round-robin and `on_short = "next"` both
+    /// already mean. It is the wrong one for a random draw, which is why
+    /// [`Self::eligible_pick`] rerolls instead.
+    ///
     /// When no series can serve, `start` serves anyway and the clash is counted.
     /// A pool that cannot satisfy its own constraint still has to put television
     /// on the air — the same doctrine [`crate::constrain::order_constrained`]
@@ -207,6 +223,35 @@ impl PoolRuntime<'_> {
         }
         self.forced += 1;
         Some(start)
+    }
+
+    /// Which series opens a visit, honouring both `select` and the pool's
+    /// constraints.
+    ///
+    /// A `random` pool **rerolls** when its draw is blocked rather than sliding
+    /// to the neighbour: sliding would hand the series *after* a blocked one
+    /// every one of its neighbour's turns as well as its own, and under a
+    /// constraint the blocked ones are exactly the recently-played ones — so the
+    /// skew would land on the same few series over and over. The rerolls are
+    /// keyed like every other decision here, so a pinned seed still reproduces
+    /// the schedule. Exhausting them falls back to the ordered walk, which is
+    /// also what reports an unsatisfiable pool.
+    fn eligible_pick(&mut self, roll: &RollKey, nonce: u64) -> Option<usize> {
+        let first = self.pick(roll, nonce)?;
+        if self.limits.is_unconstrained() || self.is_eligible(first) {
+            return Some(first);
+        }
+        if self.cfg.select == Select::Random {
+            for attempt in 1..=RANDOM_REROLLS {
+                let rolled = roll.u64_at(nonce.wrapping_add(attempt.wrapping_mul(REROLL_STRIDE)));
+                if let Some(si) = self.series_at(rolled as usize)
+                    && self.is_eligible(si)
+                {
+                    return Some(si);
+                }
+            }
+        }
+        self.eligible_from(first)
     }
 
     /// Fold what a draw emitted into the recent window, so the next draw in the
@@ -263,9 +308,7 @@ impl PoolRuntime<'_> {
     /// next visit should resume.
     fn serve(&mut self, take: usize, roll: &RollKey, nonce: u64) -> Vec<String> {
         let mut out: Vec<String> = Vec::with_capacity(take);
-        let mut current = self
-            .pick(roll, nonce)
-            .and_then(|first| self.eligible_from(first));
+        let mut current = self.eligible_pick(roll, nonce);
         let mut contributed: HashMap<usize, usize> = HashMap::new();
         let mut last: Option<usize> = None;
 
@@ -700,12 +743,7 @@ fn pool_keys(
     let Some(field) = field else {
         return Ok(PoolKeys::default());
     };
-    let ns = TagNs::from_query_field(field).ok_or_else(|| {
-        format!(
-            "pool {pool:?}: separate_by = {field:?} is not a multi-valued field (expected one of: {})",
-            TagNs::QUERY_FIELDS.join(", ")
-        )
-    })?;
+    let ns = TagNs::for_separate_by(field).map_err(|m| format!("pool {pool:?}: {m}"))?;
     let mut groups = HashMap::with_capacity(ids.len());
     for id in ids {
         let values = catalog
@@ -1519,6 +1557,37 @@ mod tests {
             &GenerationState::empty(),
         );
         assert_eq!(ids, vec!["mov-1", "mov-1", "mov-1", "mov-1"], "{ids:?}");
+    }
+
+    /// A `random` pool honours its constraint by redrawing, not by sliding onto
+    /// the blocked series' neighbour — and stays reproducible for a pinned seed
+    /// while doing it.
+    #[test]
+    fn a_random_pool_rerolls_rather_than_sliding_to_the_neighbour() {
+        let mut movies = movies_pool();
+        movies.select = Select::Random;
+        movies.constraints = Some(no_repeat(1));
+        let pattern = [step("movies", 1)];
+        let ids = build_pools(
+            std::slice::from_ref(&movies),
+            &pattern,
+            Some(6),
+            None,
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids.len(), 6, "{ids:?}");
+        assert!(
+            ids.windows(2).all(|w| w[0] != w[1]),
+            "a random draw repeats back-to-back: {ids:?}"
+        );
+        let again = build_pools(
+            std::slice::from_ref(&movies),
+            &pattern,
+            Some(6),
+            None,
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids, again, "the reroll is not reproducible");
     }
 
     /// The draw-time check reads the seam too, so the first draw of a window is
