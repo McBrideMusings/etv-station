@@ -13,8 +13,11 @@
 #     and takes back nothing but entry_ids in order
 #   - a plugin pool composing with `pattern` / `take` / `advance: resume`
 #     exactly as a CEL pool does
-#   - a channel that deliberately declines `constraints` (#115) and leaves every
-#     replay decision to the plugin — see the note on the `movies` pool
+#   - a channel that could set a config-level replay floor and deliberately does
+#     not: `constraints: no_repeat_within` on a pool (#115) is available to any
+#     plugin pool and holds whatever the script does, but this scorer already
+#     suppresses what it recently returned, and the two do not layer — see the
+#     note on the `movies` pool (#116)
 #
 # Two pools, one plugin. `movies` and `shows` name the same `taste-engine.rhai`;
 # the script's own `sources()` splits the library by type, and each pool draws
@@ -69,6 +72,16 @@ rule:
         # on this channel therefore stays entirely in the plugin, which is the
         # only half that knows what "recently" means across generations.
         # `kungfu.yaml` is the sample that exercises the field.
+        #
+        # That reasoning is a bet on *this* script. `taste-engine.rhai`
+        # suppresses what it recently returned; ETV does not check that any
+        # plugin does, and with `advance: restart` nothing else here stops a
+        # scorer that doesn't from handing back the same top-ranked film every
+        # generation. Point this pool at a different script and the floor
+        # becomes the thing to add — `constraints: { no_repeat_within: N }`,
+        # applied to the list the plugin returned before the pattern draws from
+        # it. Accept the whole-library sweep as the price, or keep the
+        # suppression in the script. See #116 and ADR 0002.
         - name: movies
           plugin: "../plugins/taste-engine.rhai"
           select: round_robin

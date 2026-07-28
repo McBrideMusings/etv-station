@@ -94,6 +94,28 @@ pub struct Pool {
     /// Everything downstream — `select`, `rotate`, `advance`, `on_short`, and
     /// the pattern's `take` — treats the returned list exactly like a
     /// CEL-resolved one.
+    ///
+    /// **Replay is the plugin's, unless this pool claims it.** ETV computes no
+    /// replay policy for a plugin pool: it hands the script `ctx.recent` and
+    /// takes back whatever order comes out. A scorer that suppresses what it
+    /// recently returned holds a title back for as long as its own policy says;
+    /// one written without suppression hands back the same top-ranked item
+    /// every generation, and with
+    /// `advance: restart` nothing else in the config stops it — a valid
+    /// schedule that plays one film forever. Swapping the script swaps that
+    /// behavior, and neither the pool nor the pattern can tell which kind it
+    /// got. [`Pool::constraints`] with `no_repeat_within` is the channel
+    /// author's own floor, enforced inside pool resolution over the list the
+    /// plugin returned, independent of what the script does.
+    ///
+    /// It is deliberately opt-in and it is **not** a free addition on top of a
+    /// scorer that already suppresses: the two do not layer. `cycles` is
+    /// derived to drain the largest pool once, so a no-repeat rule marches the
+    /// pool through its whole returned set inside one window and leaves the
+    /// script's own `ctx.recent` suppression nothing left to hold back. Set it
+    /// where the config is the only thing guarding replay; leave it unset where
+    /// the script is. See the sizing note on [`Pool::constraints`], ADR 0002,
+    /// and `examples/samples/foryou.yaml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PathBuf>,
 

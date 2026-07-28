@@ -398,6 +398,32 @@ treat a CEL-resolved one. There is no `order` on a plugin pool — the script
 returns its set already ranked, and sorting it again would discard the ranking,
 so the pair is rejected at load.
 
+**Replay is the plugin's business, unless the pool claims it.** ETV computes no
+replay policy of its own here. It hands the script `ctx.recent` and takes back
+whatever order comes out, so whether the same title can air two generations
+running is entirely a property of the script: one that suppresses what it
+recently returned holds a title back for as long as its own policy says, one
+written without suppression hands back its same top-ranked item every time.
+With `advance: restart` nothing else
+in the config stops that — the result is a valid schedule that plays one film
+forever. Swapping the script swaps that behavior, and nothing in the YAML says
+which kind you have.
+
+[`constraints` on the pool](#pool-constraints-—-spacing-counted-in-a-pool-s-own-draw-order)
+is the channel author's own floor. `no_repeat_within: N` is applied to the
+ordered list the plugin returned, inside pool resolution and before the pattern
+draws from it, so it holds whatever the script does or fails to do.
+
+It is opt-in on purpose, and it is not a belt-and-braces addition on top of a
+script that already suppresses — **the two do not layer.** `cycles` is derived
+to drain the largest pool once, so a no-repeat rule marches the pool through its
+whole returned set inside a single window, which leaves the script's own
+`ctx.recent` suppression nothing left to hold back. Set it on a plugin pool when
+the config is the only thing guarding replay; leave it unset when the script is.
+`examples/samples/foryou.yaml` ships a scorer that suppresses and therefore
+declines the field; `examples/samples/kungfu.yaml` is the sample that exercises
+it, on CEL pools.
+
 The script defines two functions:
 
 ```rhai

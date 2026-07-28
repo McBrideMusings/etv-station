@@ -4,7 +4,7 @@ Resolved vocabulary for this project. Terms only — decisions live in `docs/adr
 
 ## Scorer plugin
 
-A Rhai script a pool names instead of a CEL expression. It picks its own candidates, ranks them, and returns an ordered list of `entry_id`s. All recommendation and replay policy lives inside it; the station supplies inputs and never computes a taste score itself. See ADR 0002.
+A Rhai script a pool names instead of a CEL expression. It picks its own candidates, ranks them, and returns an ordered list of `entry_id`s. Recommendation lives entirely inside it, and so does replay by default — the station supplies inputs and never computes a taste score or a replay rule of its own, so a scorer written without suppression legitimately repeats. A pool's own `constraints: no_repeat_within` is the channel author's opt-in floor over the returned list; the two do not layer, so it is for pools whose script does *not* suppress. See ADR 0002 and #116.
 
 ## Pooled history
 
