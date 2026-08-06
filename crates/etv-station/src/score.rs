@@ -151,36 +151,72 @@ impl ScoreEnv<'_> {
     }
 }
 
-/// Run `script_path` against the catalog and return the `entry_id`s it picked,
-/// in the order it picked them.
+/// The Rhai engine every plugin call uses.
 ///
-/// Every failure is a config error phrased against the script: a missing file,
-/// a compile error, a missing function, a query the catalog rejects, or a
-/// returned id that is not in the catalog. A plugin that returns nothing is an
-/// error too — an empty pool would silently shorten the channel, and a scorer
-/// that finds nothing worth playing is a broken scorer, not an empty schedule.
-pub fn run(
-    catalog: &Catalog,
+/// The nesting limits are set explicitly because Rhai's defaults are lower in a
+/// debug build than a release one, so leaving them alone means a plugin that
+/// compiles for the daemon can fail under `cargo test` — a difference a plugin
+/// author has no way to see coming. These are generous enough for ordinary
+/// scripts and still bounded, so a runaway nesting depth fails to compile rather
+/// than overflowing the stack.
+///
+/// Compiling and calling must use the same configuration, which is the whole
+/// reason this is one function rather than two call sites that drifted.
+fn engine() -> Engine {
+    let mut engine = Engine::new();
+    engine.set_max_expr_depths(128, 64);
+    engine
+}
+
+impl ScoreCache {
+    /// Compile `script_path` and resolve every query its `sources()` declares,
+    /// if this cache has not already done so.
+    ///
+    /// **This is the only half of scoring that touches the catalog.** Callers
+    /// run every pool's `prepare` up front, while the catalog handle is in
+    /// scope, and then drop that handle before any [`pick`] runs — so the
+    /// database cannot be held open across a plugin's ranking work, which is
+    /// unbounded and entirely the script author's to spend. Before this split,
+    /// a scorer that took six minutes to rank a library held the station's only
+    /// database connection for all six of them and every other channel queued
+    /// behind it.
+    pub fn prepare(&mut self, catalog: &Catalog, script_path: &Path) -> Result<(), String> {
+        if self.entries.contains_key(script_path) {
+            return Ok(());
+        }
+        let cached = compile_and_resolve(catalog, &engine(), script_path)?;
+        self.entries.insert(script_path.to_path_buf(), cached);
+        Ok(())
+    }
+}
+
+/// Run a prepared script's `pick()` and return the `entry_id`s it chose, in the
+/// order it chose them.
+///
+/// Takes no catalog: everything the script reads was materialized by
+/// [`ScoreCache::prepare`]. Ranking is pure computation over that snapshot.
+///
+/// Every failure is a config error phrased against the script: a missing
+/// function, a runtime error, or a returned id that is not a string. A plugin
+/// that returns nothing is an error too — an empty pool would silently shorten
+/// the channel, and a scorer that finds nothing worth playing is a broken
+/// scorer, not an empty schedule.
+pub fn pick(
+    cache: &ScoreCache,
     script_path: &Path,
     inputs: &ScoreInputs,
     pool_name: &str,
     pool_config: Option<&serde_json::Value>,
-    cache: &mut ScoreCache,
 ) -> Result<Vec<String>, String> {
-    let mut engine = Engine::new();
-    // Set the nesting limits explicitly. Rhai's defaults are lower in a debug
-    // build than a release one, so leaving them alone means a plugin that
-    // compiles for the daemon can fail under `cargo test` — a difference a
-    // plugin author has no way to see coming. These are generous enough for
-    // ordinary scripts and still bounded, so a runaway nesting depth fails to
-    // compile rather than overflowing the stack.
-    engine.set_max_expr_depths(128, 64);
+    let engine = engine();
 
-    if !cache.entries.contains_key(script_path) {
-        let cached = compile_and_resolve(catalog, &engine, script_path)?;
-        cache.entries.insert(script_path.to_path_buf(), cached);
-    }
-    let cached = &cache.entries[script_path];
+    let cached = cache.entries.get(script_path).ok_or_else(|| {
+        format!(
+            "scorer plugin {}: pick() called before prepare() — this is a bug in \
+             etv-station, not in the script",
+            script_path.display()
+        )
+    })?;
     let ast = &cached.ast;
     let sets = cached.sets.clone();
 
@@ -385,6 +421,25 @@ fn insert_opt_int(m: &mut Map, key: &str, value: Option<i64>) {
 mod tests {
     use super::*;
     use crate::catalog::{Entry, Source};
+
+    /// `prepare` then `pick`, the two halves a caller always runs in order.
+    ///
+    /// Test-only on purpose. The daemon deliberately has no such function: the
+    /// whole point of the split is that the catalog-reading half and the
+    /// unbounded ranking half happen in separate passes, and a convenience that
+    /// does both would let a caller hold a database handle across the ranking
+    /// again. Tests have one pool and no other channel to starve.
+    fn run(
+        catalog: &Catalog,
+        script_path: &Path,
+        inputs: &ScoreInputs,
+        pool_name: &str,
+        pool_config: Option<&serde_json::Value>,
+        cache: &mut ScoreCache,
+    ) -> Result<Vec<String>, String> {
+        cache.prepare(catalog, script_path)?;
+        pick(cache, script_path, inputs, pool_name, pool_config)
+    }
 
     fn catalog() -> Catalog {
         let c = Catalog::open_in_memory().unwrap();

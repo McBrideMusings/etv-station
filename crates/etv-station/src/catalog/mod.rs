@@ -26,7 +26,7 @@ pub mod schema;
 use std::path::Path;
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::config::Order;
 
@@ -54,6 +54,36 @@ impl Catalog {
         })?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::init(conn)
+    }
+
+    /// Open a **read-only** handle to an existing catalog.
+    ///
+    /// The station opens one of these per channel so channels never queue on a
+    /// shared connection. Reads are the only thing a channel ever does: every
+    /// mutating method on this type is called from `catalog::ingest`, and that
+    /// runs once in `open_and_ingest_catalog` before any channel task is
+    /// spawned, so the database is immutable for the rest of the process.
+    ///
+    /// `SQLITE_OPEN_READ_ONLY` makes that a guarantee rather than a convention —
+    /// a write through one of these handles fails at the database rather than
+    /// silently racing the others.
+    ///
+    /// No migrations and no `journal_mode` pragma: both write, and the writable
+    /// [`Self::open`] that produced this file has already applied them. The
+    /// REGEXP function is registered per connection because it is connection
+    /// state, not schema, and CEL queries depend on it.
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|source| CatalogError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        query::register_regexp(&conn)?;
+        Ok(Catalog { conn })
     }
 
     /// An in-memory catalog — used by tests and ephemeral tooling.

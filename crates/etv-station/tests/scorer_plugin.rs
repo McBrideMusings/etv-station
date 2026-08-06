@@ -292,15 +292,11 @@ fn the_committed_example_plugin_runs() {
         recent: vec!["mov-d".into()],
         now: 900_000 + 3600,
     };
-    let picked = etv_station::score::run(
-        &cat,
-        &path,
-        &inputs,
-        "movies",
-        None,
-        &mut Default::default(),
-    )
-    .unwrap();
+    // The two halves, in the order the daemon runs them: `prepare` reads the
+    // catalog, `pick` ranks what it found and never sees a database handle.
+    let mut cache = etv_station::score::ScoreCache::default();
+    cache.prepare(&cat, &path).unwrap();
+    let picked = etv_station::score::pick(&cache, &path, &inputs, "movies", None).unwrap();
 
     assert!(
         !picked.contains(&"mov-d".to_string()),

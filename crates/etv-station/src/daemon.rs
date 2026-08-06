@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
@@ -114,19 +114,23 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     }
 }
 
-/// Open the station catalog (if `catalog_path` is set) and bring it up to date,
-/// returning a shareable handle for the channel tasks. `None` → the station is
-/// catalog-free and only inline `manual` channels resolve. Opening is fatal (a
-/// broken db must not be silently ignored); an ingest failure is logged and the
-/// daemon continues with whatever was written — a Plex outage or a bad media
-/// root shouldn't take playout down.
-/// The station catalog shared into every channel task: the `Catalog` behind a
-/// `Mutex` (it is `Send` but `!Sync`, and only ever locked for a synchronous
-/// resolve) plus the canonical-path → `entry_id` index built **once** after
-/// ingest (the catalog is immutable afterwards), so channels don't each rebuild
-/// it under the lock.
-struct SharedCatalog {
-    catalog: Mutex<Catalog>,
+/// What the station knows about the catalog after ingest: where the file is,
+/// and the canonical-path → `entry_id` index built **once** here so channels
+/// don't each rebuild it.
+///
+/// Deliberately *not* a shared `Catalog`. It used to be one `Catalog` behind a
+/// `Mutex`, because `rusqlite::Connection` is `Send` but `!Sync` and sixteen
+/// channel tasks cannot share one. That satisfied the type system and created a
+/// station-wide chokepoint: a channel whose scorer plugin took six minutes to
+/// rank the library held the lock for all six, and every other channel's resolve
+/// queued behind it — three channels dark for 6m34s over nine seconds of work.
+///
+/// SQLite has no such limitation. The file is in WAL mode, which exists so many
+/// readers can work at once, and nothing writes it after ingest. So each channel
+/// opens its own read-only handle from `path` (see [`Catalog::open_readonly`])
+/// and there is no shared lock left to contend on.
+struct CatalogInfo {
+    path: PathBuf,
     path_index: HashMap<String, String>,
 }
 
@@ -142,7 +146,7 @@ struct SharedCatalog {
 struct StationContext<'a> {
     tz: &'static Tz,
     source_roots: &'a [String],
-    catalog: Option<&'a SharedCatalog>,
+    catalog: Option<&'a CatalogInfo>,
     history: &'a SharedHistory,
 }
 
@@ -164,7 +168,7 @@ struct StationContext<'a> {
 struct SharedHistory {
     /// `None` for a catalog-free station — there is nothing to join rows
     /// against, so no request is ever made and no join event is ever logged.
-    catalog: Option<Arc<SharedCatalog>>,
+    catalog: Option<Arc<CatalogInfo>>,
     /// How long a fetched history is reused before the next channel to ask
     /// refetches. Set to the shortest `roll_interval` on the station, so no
     /// channel ever sees a history older than one of its own ticks.
@@ -180,7 +184,7 @@ struct HistoryCache {
 }
 
 impl SharedHistory {
-    fn new(catalog: Option<Arc<SharedCatalog>>, refresh_after: Duration) -> Self {
+    fn new(catalog: Option<Arc<CatalogInfo>>, refresh_after: Duration) -> Self {
         Self {
             catalog,
             refresh_after,
@@ -206,13 +210,25 @@ impl SharedHistory {
         // The HTTP half runs on a blocking thread — `ureq` is synchronous and
         // would otherwise stall this runtime worker for the request timeout,
         // exactly as the Plex ingest above avoids. The catalog join is local
-        // work and stays here, where the mutex is already reachable.
+        // work and stays here.
         let rows = tokio::task::spawn_blocking(crate::tautulli::fetch_rows_from_env)
             .await
             .unwrap_or_default();
-        let events = {
-            let guard = sc.catalog.lock().unwrap_or_else(|e| e.into_inner());
-            crate::tautulli::join(&guard, rows)
+        // A reader of its own, opened for this join and dropped with it. Once
+        // per refresh window for the whole station, so the open costs nothing
+        // next to the HTTP request that just happened; keeping a handle alive
+        // between fetches would buy nothing. A failure to open degrades the
+        // ranking rather than failing the tick, same as an unreachable Tautulli.
+        let events = match Catalog::open_readonly(&sc.path) {
+            Ok(reader) => crate::tautulli::join(&reader, rows),
+            Err(e) => {
+                tracing::warn!(
+                    event = "tautulli.catalog_unavailable",
+                    error = %e,
+                    "could not open a catalog reader to join watch history; generating without it",
+                );
+                Vec::new()
+            }
         };
         cache.events = Arc::from(events);
         cache.fetched_at = Some(tokio::time::Instant::now());
@@ -276,9 +292,18 @@ fn plex_ingest_plan(
     PlexIngestPlan::Delta { since: last }
 }
 
+/// Open the station catalog (if `catalog_path` is set), bring it up to date, and
+/// return what the channel tasks need to open readers of their own. `None` → the
+/// station is catalog-free and only inline `manual` channels resolve. Opening is
+/// fatal (a broken db must not be silently ignored); an ingest failure is logged
+/// and the daemon continues with whatever was written — a Plex outage or a bad
+/// media root shouldn't take playout down.
+///
+/// Every write this process makes to the catalog happens inside this function.
+/// That is what lets every reader downstream be read-only.
 async fn open_and_ingest_catalog(
     station: &Station,
-) -> Result<Option<Arc<SharedCatalog>>, StationError> {
+) -> Result<Option<Arc<CatalogInfo>>, StationError> {
     let Some(path) = station
         .station
         .catalog_path
@@ -366,8 +391,12 @@ async fn open_and_ingest_catalog(
     let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
     let path_index = crate::catalog::ingest::canonical_index(&catalog, &roots)?;
 
-    Ok(Some(Arc::new(SharedCatalog {
-        catalog: Mutex::new(catalog),
+    // The writable handle dies here, with the last write this process will make.
+    // Everything downstream reopens the file read-only, one handle per channel.
+    drop(catalog);
+
+    Ok(Some(Arc::new(CatalogInfo {
+        path: PathBuf::from(path),
         path_index,
     })))
 }
@@ -383,7 +412,7 @@ async fn open_and_ingest_catalog(
 async fn run_generation(
     station: &Arc<Station>,
     tz: &'static Tz,
-    catalog: Option<&Arc<SharedCatalog>>,
+    catalog: Option<&Arc<CatalogInfo>>,
     shutdown: &Notify,
     reload: &Notify,
 ) -> (bool, Option<StationError>) {
@@ -443,7 +472,29 @@ async fn run_generation(
                     catalog: cat.as_deref(),
                     history: &hist,
                 };
-                let result = channel_loop(ch, ctx, stop).await;
+                // This channel's own read-only handle on the catalog, opened
+                // once and owned for the life of the task. Owned rather than
+                // borrowed because a `&Catalog` cannot cross an `.await` in a
+                // spawned task — `Connection` is `Send` but `!Sync` — while the
+                // `Option<Catalog>` itself moves freely.
+                //
+                // A handle that won't open is fatal to this channel and nothing
+                // else: it means a query channel has no catalog to resolve
+                // against, which `resolve_channel` already reports per channel.
+                let reader = match cat.as_deref().map(|c| Catalog::open_readonly(&c.path)) {
+                    Some(Ok(c)) => Some(c),
+                    None => None,
+                    Some(Err(e)) => {
+                        tracing::error!(
+                            event = "catalog.reader_failed",
+                            channel = %ch.name,
+                            error = %e,
+                            "could not open this channel's catalog reader; the channel will emit nothing",
+                        );
+                        return (ch.name.clone(), Err(StationError::from(e)));
+                    }
+                };
+                let result = channel_loop(ch, ctx, reader, stop).await;
                 // A channel_loop error is fatal to THIS channel. Task handles
                 // are only joined at shutdown (see below), so without logging
                 // here a startup failure — a failed duration probe, unreadable
@@ -665,9 +716,10 @@ fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySp
 async fn channel_loop(
     channel: &LoadedChannel,
     ctx: StationContext<'_>,
+    catalog: Option<Catalog>,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
-    forward_channel_loop(channel, ctx, shutdown).await
+    forward_channel_loop(channel, ctx, catalog, shutdown).await
 }
 
 /// Bound on how many generations one catch-up will chain before giving up, so
@@ -721,6 +773,7 @@ async fn wipe_playout_from(
 async fn forward_channel_loop(
     channel: &LoadedChannel,
     ctx: StationContext<'_>,
+    mut catalog: Option<Catalog>,
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
     let (resume, how) = crate::resume::load(&channel.output_folder).await?;
@@ -794,7 +847,7 @@ async fn forward_channel_loop(
         );
     }
 
-    resume = pattern_catch_up(channel, ctx, resume, &mut ledger, "startup").await?;
+    resume = pattern_catch_up(channel, ctx, &mut catalog, resume, &mut ledger, "startup").await?;
 
     let mut interval = tokio::time::interval(channel.config.roll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -808,7 +861,7 @@ async fn forward_channel_loop(
             }
             _ = interval.tick() => {
                 let tick = async {
-                    match pattern_catch_up(channel, ctx, resume.clone(), &mut ledger, "roll").await {
+                    match pattern_catch_up(channel, ctx, &mut catalog, resume.clone(), &mut ledger, "roll").await {
                         Ok(next) => resume = next,
                         Err(err) => tracing::error!(
                             event = "roll.error",
@@ -854,6 +907,7 @@ fn target_count(config: &ChannelConfig, from: OffsetDateTime, target: OffsetDate
 async fn pattern_catch_up(
     channel: &LoadedChannel,
     ctx: StationContext<'_>,
+    catalog: &mut Option<Catalog>,
     mut resume: crate::resume::ResumeMap,
     ledger: &mut crate::history::Ledger,
     phase: &'static str,
@@ -970,24 +1024,29 @@ async fn pattern_catch_up(
             now: now.unix_timestamp(),
         };
 
+        // This channel's own reader, borrowed for the synchronous resolve and
+        // released at the end of the block. Nothing else can be waiting on it —
+        // it belongs to this task alone — so however long a scorer plugin takes
+        // in here, no other channel is affected.
+        //
+        // The borrow stays inside the block deliberately: a `&Catalog` held
+        // across the `.await`s further down would make this task's future
+        // non-`Send` and it would not compile at the `tokio::spawn`.
         let (items, resume_out, show_ids) = {
-            let guard = ctx
-                .catalog
-                .map(|sc| sc.catalog.lock().unwrap_or_else(|e| e.into_inner()));
+            let reader = catalog.as_ref();
             let (items, resume_out) = crate::resolve::resolve_channel_with_resume(
                 &channel.config,
                 &channel.config_path,
                 ctx.source_roots,
-                ctx.catalog.map(|sc| &sc.path_index),
-                guard.as_deref(),
+                ctx.catalog.map(|info| &info.path_index),
+                reader,
                 &state,
                 &scoring,
             )?;
             // The ledger needs each airing's show, and only the catalog knows
-            // it. One query for the whole generation, under the lock we already
-            // hold.
+            // it. One query for the whole generation rather than one per item.
             let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-            let show_ids = match guard.as_deref() {
+            let show_ids = match reader {
                 Some(cat) => cat.show_ids_for(&ids)?,
                 None => HashMap::new(),
             };
@@ -1305,16 +1364,27 @@ mod shared_history_tests {
     /// thread reading it, and the tests in this module run concurrently:
     /// clearing exactly once narrows that window to a single call rather than
     /// one per test.
-    fn catalog_without_tautulli() -> Arc<SharedCatalog> {
+    ///
+    /// Returns the `TempDir` alongside the info: `SharedHistory` reopens the
+    /// file per join, so it has to survive the test rather than being an
+    /// in-memory catalog that exists only behind one handle.
+    fn catalog_without_tautulli() -> (Arc<CatalogInfo>, tempfile::TempDir) {
         static CLEARED: std::sync::Once = std::sync::Once::new();
         CLEARED.call_once(|| unsafe {
             std::env::remove_var("TAUTULLI_URL");
             std::env::remove_var("TAUTULLI_API_KEY");
         });
-        Arc::new(SharedCatalog {
-            catalog: Mutex::new(crate::catalog::Catalog::open_in_memory().unwrap()),
-            path_index: HashMap::new(),
-        })
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        // Opened and dropped: this creates the schema the readers expect.
+        crate::catalog::Catalog::open(&path).unwrap();
+        (
+            Arc::new(CatalogInfo {
+                path,
+                path_index: HashMap::new(),
+            }),
+            dir,
+        )
     }
 
     /// The acceptance criterion: N channels ticking inside one refresh window
@@ -1322,8 +1392,8 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn every_channel_in_one_tick_shares_a_single_fetch() {
         let (joins, _guard) = count_joins();
-        let history =
-            SharedHistory::new(Some(catalog_without_tautulli()), Duration::from_secs(3600));
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), Duration::from_secs(3600));
 
         // Four channels, each asking at the top of its own tick.
         let first = history.current().await;
@@ -1348,7 +1418,8 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn the_next_tick_refetches_once_the_window_has_passed() {
         let (joins, _guard) = count_joins();
-        let history = SharedHistory::new(Some(catalog_without_tautulli()), Duration::from_secs(60));
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), Duration::from_secs(60));
 
         history.current().await;
         tokio::time::advance(Duration::from_secs(60)).await;

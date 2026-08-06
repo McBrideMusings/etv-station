@@ -446,20 +446,81 @@ pub fn build(
     seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
 ) -> Result<(Vec<String>, BTreeMap<String, PoolResume>), String> {
-    // One cache for the whole generation: pools pointed at the same script
-    // share its compiled AST and its resolved query sets instead of each
-    // re-running every query the script declares.
+    // Three passes, split by whether they read the database.
+    //
+    // The middle one is why: a scorer plugin's `pick()` is unbounded work owned
+    // by whoever wrote the script, and it must not run with a database handle
+    // alive. Ranking a large library can take minutes, and for as long as it
+    // does, anything sharing that handle is stopped dead. Keeping the plugin
+    // calls in their own pass — between two that do read the catalog, and taking
+    // no catalog themselves — is what makes that structurally impossible rather
+    // than a rule someone has to remember.
+
+    // Pass 1, reads the catalog: resolve every expression pool's ids, and
+    // compile + materialize every plugin pool's declared sources. One cache for
+    // the whole generation, so pools pointed at the same script share its AST
+    // and its resolved sets instead of each re-running every query it declares.
     let mut score_cache = crate::score::ScoreCache::default();
-    let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
+    let mut pool_ids: Vec<Option<Vec<String>>> = Vec::with_capacity(pools.len());
     for cfg in pools {
-        runtimes.push(resolve_pool(
-            catalog,
-            cfg,
-            block_constraints,
-            state,
-            score_env,
-            &mut score_cache,
-        )?);
+        match (&cfg.expr, &cfg.plugin) {
+            (Some(expr), None) => {
+                let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
+                if let Some(order) = &cfg.order {
+                    // Seed 0: a pool's internal `order` is its own stable sort.
+                    // A shuffled pool is `select = "random"`, seeded per visit.
+                    ids = catalog
+                        .resolve_order(&ids, order, 0)
+                        .map_err(|e| e.to_string())?;
+                }
+                pool_ids.push(Some(ids));
+            }
+            (None, Some(plugin)) => {
+                let path = score_env.resolve_path(plugin);
+                score_cache
+                    .prepare(catalog, &path)
+                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+                pool_ids.push(None);
+            }
+            // Both, or neither, is rejected at load; a pool that reaches here in
+            // either state is a validation gap, not a config the user can hit.
+            _ => {
+                return Err(format!(
+                    "pool {:?} must set exactly one of `expr` or `plugin`",
+                    cfg.name
+                ));
+            }
+        }
+    }
+
+    // Pass 2, reads nothing: run each plugin's ranking against the snapshot pass
+    // 1 took. A plugin returns its set already ranked — gathering and ranking are
+    // the same judgment for a taste algorithm — so the `order` step above applies
+    // only to the expression case (ADR 0002).
+    for (slot, cfg) in pool_ids.iter_mut().zip(pools) {
+        if slot.is_none() {
+            let plugin = cfg
+                .plugin
+                .as_ref()
+                .expect("pass 1 leaves a hole only for a plugin pool");
+            let path = score_env.resolve_path(plugin);
+            let ids = crate::score::pick(
+                &score_cache,
+                &path,
+                score_env.inputs,
+                &cfg.name,
+                cfg.config.as_ref(),
+            )
+            .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+            *slot = Some(ids);
+        }
+    }
+
+    // Pass 3, reads the catalog again: turn each pool's ids into its runtime.
+    let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
+    for (cfg, ids) in pools.iter().zip(pool_ids) {
+        let ids = ids.expect("pass 2 fills every hole pass 1 left");
+        runtimes.push(pool_runtime(catalog, cfg, ids, block_constraints, state)?);
     }
 
     let mut by_name: HashMap<&str, usize> = HashMap::new();
@@ -551,54 +612,20 @@ fn derive_cycles(
     cycles
 }
 
-/// Resolve one pool to its series, then seat each series' cursor from the
-/// resume map when the pool asks to continue.
-fn resolve_pool<'a>(
+/// Turn one pool's resolved ids into the runtime the pattern draws from: split
+/// them into series, then seat each series' cursor from the resume map when the
+/// pool asks to continue.
+///
+/// Where the ids came from — a CEL expression or a scorer plugin — is settled
+/// before this is called (see the three passes in [`build`]), which is what
+/// keeps plugin execution out of any scope holding a database handle.
+fn pool_runtime<'a>(
     catalog: &Catalog,
     cfg: &'a Pool,
+    ids: Vec<String>,
     block_constraints: Option<&Constraints>,
     state: &GenerationState,
-    score_env: crate::score::ScoreEnv<'_>,
-    score_cache: &mut crate::score::ScoreCache,
 ) -> Result<PoolRuntime<'a>, String> {
-    // A pool draws its items from a CEL expression or from a scorer plugin,
-    // never both (validated at load). A plugin returns its set already ranked —
-    // gathering and ranking are the same judgment for a taste algorithm — so
-    // the `order` step below applies only to the expression case (ADR 0002).
-    let ids = match (&cfg.expr, &cfg.plugin) {
-        (Some(expr), None) => {
-            let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
-            if let Some(order) = &cfg.order {
-                // Seed 0: a pool's internal `order` is its own stable sort. A
-                // shuffled pool is `select = "random"`, seeded per visit.
-                ids = catalog
-                    .resolve_order(&ids, order, 0)
-                    .map_err(|e| e.to_string())?;
-            }
-            ids
-        }
-        (None, Some(plugin)) => {
-            let path = score_env.resolve_path(plugin);
-            crate::score::run(
-                catalog,
-                &path,
-                score_env.inputs,
-                &cfg.name,
-                cfg.config.as_ref(),
-                score_cache,
-            )
-            .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
-        }
-        // Both, or neither, is rejected at load; a pool that reaches here in
-        // either state is a validation gap, not a config the user can hit.
-        _ => {
-            return Err(format!(
-                "pool {:?} must set exactly one of `expr` or `plugin`",
-                cfg.name
-            ));
-        }
-    };
-
     // Adjacency constraints (#115). Two halves, both scoped to this pool and
     // both running before anything is interleaved, so the pattern's slots are
     // never reordered: the list order below, and the draw-time eligibility check
