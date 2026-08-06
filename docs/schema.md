@@ -486,6 +486,37 @@ events, `#{entry_id, watched_at}`), `ctx.recent` (what this channel aired most
 recently, oldest first), `ctx.now` (unix seconds at generation time), and
 `ctx.config` (this pool's `config:` block — see below).
 
+### Writing a plugin that finishes
+
+`pick()` runs once per generation, per pool, and the station waits for it. The
+channel it belongs to airs nothing until it returns. Two things about Rhai decide
+whether that is milliseconds or minutes, and neither is guessable from the
+language:
+
+**Search once, not once per item.** A loop over `ctx.sets.<name>` runs its body
+for every item in the set — on a real library that is tens of thousands of times.
+Anything inside it that walks `ctx.history` or `ctx.recent` looking for a match
+multiplies the two: 84,722 items against 1,000 watch rows and a 200-deep aired
+tail is about 101 million interpreted steps to choose four things, which measured
+at 6 minutes 34 seconds. Build a map keyed by `entry_id` **before** the loop and
+read it inside:
+
+```rhai
+let watched = #{};
+for event in ctx.history { watched[event.entry_id] = event.watched_at; }
+// …then inside the item loop: `let last = watched[item.entry_id];`
+```
+
+**A function call copies its arguments.** Rhai passes by value, so
+`score_item(item, ctx)` clones the whole of `ctx` — the entire watch history and
+aired tail — on every call. A few helpers per item is a few full copies per item:
+the same scoring arithmetic measured 124 s split across helpers and 13 s written
+inline in the loop. Keep per-item work in the loop body; keep named functions for
+the things called once, like reading a tunable out of `ctx.config`.
+
+`examples/plugins/taste-engine.rhai` is written to both rules and says so in its
+comments.
+
 ### Pool `config` — the script's own tunables, authored in YAML
 
 A plugin pool may carry a `config:` block. **The station passes it to the script

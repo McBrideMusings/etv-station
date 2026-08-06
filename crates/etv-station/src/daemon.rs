@@ -478,9 +478,15 @@ async fn run_generation(
                 // spawned task — `Connection` is `Send` but `!Sync` — while the
                 // `Option<Catalog>` itself moves freely.
                 //
-                // A handle that won't open is fatal to this channel and nothing
-                // else: it means a query channel has no catalog to resolve
-                // against, which `resolve_channel` already reports per channel.
+                // A handle that won't open leaves this channel catalog-free, the
+                // same state a station with no `catalog_path` puts every channel
+                // in. That is exactly right for the two kinds of channel: one
+                // built from inline `manual` entries never reads the catalog and
+                // keeps airing, and one built from a `query` has nothing to
+                // resolve against — which `resolve_channel` already reports, per
+                // channel, naming the query. Failing the task here instead would
+                // take a manual channel off the air over a database it does not
+                // use.
                 let reader = match cat.as_deref().map(|c| Catalog::open_readonly(&c.path)) {
                     Some(Ok(c)) => Some(c),
                     None => None,
@@ -489,9 +495,10 @@ async fn run_generation(
                             event = "catalog.reader_failed",
                             channel = %ch.name,
                             error = %e,
-                            "could not open this channel's catalog reader; the channel will emit nothing",
+                            "could not open this channel's catalog reader; it will run \
+                             catalog-free — inline entries still air, queries will error",
                         );
-                        return (ch.name.clone(), Err(StationError::from(e)));
+                        None
                     }
                 };
                 let result = channel_loop(ch, ctx, reader, stop).await;
