@@ -109,6 +109,8 @@ it, and `item.edition == ""` selects exactly the no-edition items.
 Each field is either a column on the catalog's `entries` table (scalar —
 compared with `==`, `!=`, `in`, and for text `contains` / `startsWith` /
 `matches`) or a tag namespace (multi-valued — membership only, via `contains`).
+`source`, `collections`, and `fs_dir` are membership over a related table, and
+take `==` only — the one comparison that reads as "has one of".
 
 | Field | Kind | Notes |
 |---|---|---|
@@ -131,6 +133,7 @@ compared with `==`, `!=`, `in`, and for text `contains` / `startsWith` /
 | `tags` | tags | every namespace at once |
 | `source` | membership | `item.source == "plex"` |
 | `collections` | membership | by collection name |
+| `fs_dir` | membership | `item.fs_dir == "bumpers"` — the folder a file sits in |
 
 `library` is what scopes a channel to one library when a server keeps several:
 `item.library == "4K Movies"` selects that library and excludes "Movies" and
@@ -143,6 +146,18 @@ the old name, with no error — the expression resolves to nothing and the chann
 goes quiet. Items from a source with no library concept (everything the
 filesystem scan writes) have no `library`, so no `item.library == "…"` matches
 them.
+
+`fs_dir` is the immediate folder a file sits in — `item.fs_dir == "bumpers"`
+selects everything under a folder named `bumpers`, which is how a filesystem-only
+station separates its bumpers from its commercials without any metadata source.
+It is worked out from the item's stored file paths every time the query runs,
+never recorded, so drag a file from `bumpers/` into `commercials/` and the next
+scan is all it takes: the item answers to `commercials` and stops answering to
+`bumpers`. An item that exists as more than one file — the same movie kept at two
+resolutions in two folders — matches either folder, because both are true.
+
+Only the last folder in the path counts: a file at `/media/library/bumpers/x.mkv`
+matches `"bumpers"` and not `"library"`.
 
 ### `kind: collection` — play a catalog collection in its authored order
 

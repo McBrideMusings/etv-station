@@ -96,6 +96,18 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE entries ADD COLUMN library TEXT;
     "#,
+    // v4 — drop the stored `fs_dir` tags (#123). The filesystem scan used to
+    // record each file's folder as a tag, but `add_tag` only ever inserts, so an
+    // entry kept every folder any of its files had ever been in: move
+    // `station-bumper-01.mp4` from `bumpers/` to `commercials/` and it answered
+    // to both. `item.fs_dir` now computes the folder from
+    // `entry_sources.playback_path` when the query runs, so these rows are read
+    // by nothing. Deleting them here rather than in the ingest loop keeps it a
+    // one-off for catalogs written by an older binary, instead of a sweep every
+    // scan has to carry forever.
+    r#"
+    DELETE FROM tags WHERE namespace = 'fs_dir';
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.
@@ -127,4 +139,66 @@ pub fn apply(conn: &Connection) -> Result<(), CatalogError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bring a fresh connection up to `version` only, so a test can stand where
+    /// an older binary left a real `catalog.db`.
+    fn at_version(version: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL);")
+            .unwrap();
+        for (i, ddl) in MIGRATIONS.iter().take(version).enumerate() {
+            conn.execute_batch(ddl).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                [(i + 1) as i64],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// A catalog written by a binary that still stored the folder as a tag has
+    /// rows saying a bumper is in `bumpers/` *and* `commercials/` — it was moved
+    /// and the old tag never went away. Nothing reads those rows now, so the
+    /// upgrade takes them out; the genres beside them, which Plex still authors,
+    /// have to survive untouched.
+    #[test]
+    fn upgrading_drops_stored_fs_dir_tags_and_keeps_the_rest() {
+        let conn = at_version(3);
+        conn.execute_batch(
+            "INSERT INTO entries (entry_id, type, title, primary_source)
+                 VALUES ('fs:1', 'bumper', 'station-bumper-01', 'local_fs');
+             INSERT INTO tags (entry_id, namespace, value) VALUES
+                 ('fs:1', 'fs_dir', 'bumpers'),
+                 ('fs:1', 'fs_dir', 'commercials'),
+                 ('fs:1', 'genre', 'Ident');",
+        )
+        .unwrap();
+
+        apply(&conn).unwrap();
+
+        let remaining: Vec<String> = conn
+            .prepare("SELECT namespace || '=' || value FROM tags ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["genre=Ident".to_string()]);
+    }
+
+    #[test]
+    fn a_fresh_catalog_lands_on_the_current_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
 }

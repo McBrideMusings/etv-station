@@ -69,9 +69,9 @@ impl Catalog {
     /// silently racing the others.
     ///
     /// No migrations and no `journal_mode` pragma: both write, and the writable
-    /// [`Self::open`] that produced this file has already applied them. The
-    /// REGEXP function is registered per connection because it is connection
-    /// state, not schema, and CEL queries depend on it.
+    /// [`Self::open`] that produced this file has already applied them. The SQL
+    /// functions CEL queries compile down to (`regexp`, `parent_dir`) are
+    /// registered per connection because they are connection state, not schema.
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
         let path = path.as_ref();
         let conn = Connection::open_with_flags(
@@ -82,7 +82,7 @@ impl Catalog {
             path: path.to_path_buf(),
             source,
         })?;
-        query::register_regexp(&conn)?;
+        query::register_functions(&conn)?;
         Ok(Catalog { conn })
     }
 
@@ -93,7 +93,7 @@ impl Catalog {
 
     fn init(conn: Connection) -> Result<Self, CatalogError> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        query::register_regexp(&conn)?;
+        query::register_functions(&conn)?;
         schema::apply(&conn)?;
         Ok(Catalog { conn })
     }
@@ -336,10 +336,11 @@ impl Catalog {
     /// wholesale, but [`Self::add_tag`] only inserts. A genre (or cast member,
     /// or director) removed upstream would otherwise survive in the catalog
     /// forever and keep satisfying queries that should no longer match it.
-    /// Clearing per (entry, namespace) — rather than per entry — keeps a source
-    /// from deleting tags it does not own: the Plex ingester writes seven
-    /// namespaces, the filesystem ingester writes only `fs_dir`, and neither
-    /// should touch the other's rows.
+    /// Clearing per (entry, namespace) — rather than per entry — keeps the
+    /// reconcile of one namespace from taking another's rows with it: an item
+    /// whose genres changed must come out of the pass with its directors
+    /// intact. Plex is the only author of tags today, but it authors each of the
+    /// seven namespaces separately and re-reads them separately.
     pub fn clear_tags(&self, entry_id: &str, namespace: TagNs) -> Result<(), CatalogError> {
         self.conn.execute(
             "DELETE FROM tags WHERE entry_id = ?1 AND namespace = ?2",
