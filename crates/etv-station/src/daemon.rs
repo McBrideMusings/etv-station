@@ -1083,6 +1083,12 @@ async fn pattern_catch_up(
                 reader,
                 &state,
                 &scoring,
+                // How much airtime is still missing. A pattern block with no
+                // authored `cycles` stops once it has laid this much down,
+                // rather than running its pools to the end — which on a
+                // 51-pool channel was eleven years in one pass (#140). The
+                // loop condition guarantees this is positive.
+                Some((target - from).unsigned_abs()),
             )?;
             // The ledger needs each airing's show, and only the catalog knows
             // it. One query for the whole generation rather than one per item.

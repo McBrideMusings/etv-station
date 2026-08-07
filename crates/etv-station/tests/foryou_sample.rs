@@ -121,6 +121,7 @@ fn resolve(
         Some(cat),
         state,
         inputs,
+        None,
     )
     .expect("resolve the For You sample")
 }
@@ -234,6 +235,7 @@ fn a_block_level_constraint_is_inherited_without_reordering_the_pattern() {
         Some(&cat),
         &GenerationState::default(),
         &ScoreInputs::default(),
+        None,
     )
     .expect("resolve with a block-level constraint")
     .0);
@@ -321,6 +323,7 @@ fn a_pool_config_value_changes_the_scripts_ranking() {
             Some(&cat),
             &GenerationState::default(),
             &inputs,
+            None,
         )
         .expect("resolve the For You sample")
         .0)
@@ -482,6 +485,7 @@ fn pick(ctx) {
         Some(&cat),
         &GenerationState::default(),
         &ScoreInputs::default(),
+        None,
     )
     .expect("a different scorer must still produce a schedule");
 
