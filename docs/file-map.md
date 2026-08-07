@@ -143,6 +143,9 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `tools/query.sh` | Standalone ad-hoc CEL query wrapper (sources `.env`, then invokes the `etv-query-test` binary). |
 | `tools/overlay-test.sh` | Runs the etv-overlay pipeline against a bumper fixture and opens the resulting mp4. `FIXTURE=`, `CONFIG=`, `OUTPUT=` override defaults. |
 | `tools/overlay-still.sh` | Renders a single overlay frame to PNG and opens it. `CONFIG=`, `TIME=` override defaults. |
+| `tools/diag-install.sh` | Copies the two stream diagnostics below to the Unraid host and runs them: `start`, `stop`, `status`, `logs [access\|events]`. Reads host and paths from `.env`. |
+| `tools/stream-access-log.py` | Runs on the Unraid host. Parses tcpdump on the published port into one tab-separated row per HLS request — timestamp, client IP, method, path, User-Agent — so a frozen player's last request is recoverable after the fact. Rotates at 50 MB. |
+| `tools/stream-watch.py` | Runs on the Unraid host. Reads each channel's `live.m3u8` off disk (never over HTTP, which would spawn workers) and logs only events: `session-start`, `session-end`, `restart`, `stall`, `recovered`, `discontinuity`. |
 
 ## Agent skills
 
