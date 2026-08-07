@@ -28,14 +28,34 @@ pub struct LoadedChannel {
     pub config: ChannelConfig,
 }
 
+/// How config loading resolves an environment variable by name. Production
+/// passes [`process_env`]; tests pass a closure over a fixed table.
+///
+/// This exists so a test never has to write to the process environment to steer
+/// a load. `std::env::set_var` is unsound in Rust 2024 once any other thread
+/// reads the environment, and `cargo test` runs this module's tests
+/// concurrently — so the old "set the variable, then load" shape was a race
+/// waiting for the next test that reads env.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The process environment, as an [`EnvLookup`]. The single impure boundary
+/// config loading has; everything below it takes the lookup as an argument.
+fn process_env(var: &str) -> Option<String> {
+    std::env::var(var).ok()
+}
+
 pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
+    load_with_env(station_path, &process_env)
+}
+
+fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, ConfigError> {
     let mut station: StationConfig = read_config_file(station_path)?;
     apply_env_overrides(
         &mut station,
-        std::env::var("ETV_STATION_TZ").ok(),
-        std::env::var("ETV_STATION_OUTPUT_BASE").ok(),
-        std::env::var("ETV_STATION_CATALOG").ok(),
-        std::env::var("ETV_STATION_SOURCE_ROOTS").ok(),
+        env("ETV_STATION_TZ"),
+        env("ETV_STATION_OUTPUT_BASE"),
+        env("ETV_STATION_CATALOG"),
+        env("ETV_STATION_SOURCE_ROOTS"),
     );
     validate::validate_station(station_path, &station)?;
 
@@ -49,7 +69,7 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
     let mut channels = Vec::with_capacity(channel_paths.len());
     for channel_path in channel_paths {
         let mut config: ChannelConfig = read_config_file(&channel_path)?;
-        resolve_blocks(&mut config, &channel_path)?;
+        resolve_blocks(&mut config, &channel_path, env)?;
         validate::validate_channel(&channel_path, &config)?;
         let name = resolve_identity(station_path, &channel_path, &config)?;
         // Verbatim relative to CWD (matching how the daemon writes), NOT joined
@@ -246,9 +266,13 @@ fn resolve_identity(
 }
 
 /// Splice path-referenced block files into their includes and expand `${VAR}`
-/// references in every item source. After this runs, every `[[rule.blocks]]`
-/// entry is in normalized inline form.
-fn resolve_blocks(config: &mut ChannelConfig, channel_path: &Path) -> Result<(), ConfigError> {
+/// references in every item source, resolving each name through `env`. After
+/// this runs, every `[[rule.blocks]]` entry is in normalized inline form.
+fn resolve_blocks(
+    config: &mut ChannelConfig,
+    channel_path: &Path,
+    env: EnvLookup<'_>,
+) -> Result<(), ConfigError> {
     let dir = channel_path
         .parent()
         .map(Path::to_path_buf)
@@ -293,7 +317,7 @@ fn resolve_blocks(config: &mut ChannelConfig, channel_path: &Path) -> Result<(),
             if let Entry::Item(item) = entry
                 && let SourceConfig::Local { path } = &mut item.source
             {
-                *path = expand_env(path, channel_path)?;
+                *path = expand_env(path, channel_path, env)?;
             }
         }
     }
@@ -301,7 +325,11 @@ fn resolve_blocks(config: &mut ChannelConfig, channel_path: &Path) -> Result<(),
     Ok(())
 }
 
-fn expand_env(input: &str, ctx: &Path) -> Result<String, ConfigError> {
+/// Substitute every `${VAR}` in `input` with the value `env` returns for that
+/// name. `env` is the seam: production hands this [`process_env`], a test hands
+/// it a fixed table, and neither path needs the variable to exist in the
+/// running process.
+fn expand_env(input: &str, ctx: &Path, env: EnvLookup<'_>) -> Result<String, ConfigError> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("${") {
@@ -318,7 +346,7 @@ fn expand_env(input: &str, ctx: &Path) -> Result<String, ConfigError> {
                 message: format!("empty ${{}} in {input:?}"),
             });
         }
-        let val = std::env::var(var).map_err(|_| ConfigError::Validation {
+        let val = env(var).ok_or_else(|| ConfigError::Validation {
             path: ctx.to_path_buf(),
             message: format!("env var `{var}` referenced by {input:?} is not set"),
         })?;
@@ -373,17 +401,50 @@ mod tests {
         manifest_dir.join("../../examples/station.yaml")
     }
 
+    /// An [`EnvLookup`] backed by a fixed table. Tests use this instead of
+    /// writing to the process environment, which is unsound in Rust 2024 while
+    /// the rest of the module's tests run on other threads.
+    fn env_map(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let table: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name| {
+            table
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// An [`EnvLookup`] where nothing is set, for fixtures with no `${VAR}`.
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn local_paths(loaded: &Station) -> Vec<&str> {
+        loaded
+            .channels
+            .iter()
+            .flat_map(|c| c.config.rule.blocks.iter())
+            .flat_map(|b| b.entries())
+            .filter_map(|e| match e {
+                Entry::Item(item) => match &item.source {
+                    SourceConfig::Local { path } => Some(path.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn loads_example_fixture() {
-        // An example channel may reference ${ETV_TEST_MEDIA_DIR}; set a
-        // placeholder so the env-expansion step in `load` succeeds in test
-        // environments.
-        // SAFETY: single-threaded test; value is local in scope.
-        unsafe {
-            std::env::set_var("ETV_TEST_MEDIA_DIR", "/tmp/etv-test-media");
-        }
+        // An example channel references ${ETV_TEST_MEDIA_DIR}; hand the loader a
+        // table holding it rather than exporting it into the running process.
+        let env = env_map(&[("ETV_TEST_MEDIA_DIR", "/tmp/etv-test-media")]);
         let path = examples_station();
-        let loaded = load(&path).expect("examples/station.yaml should load");
+        let loaded = load_with_env(&path, &env).expect("examples/station.yaml should load");
         let ch = loaded
             .channels
             .iter()
@@ -397,6 +458,14 @@ mod tests {
             .map(|b| b.entries().len())
             .sum();
         assert!(entries > 0, "rule must resolve to at least one entry");
+
+        // Proves the expansion came from the table above and not from whatever
+        // ETV_TEST_MEDIA_DIR happens to hold in the shell running the suite.
+        let paths = local_paths(&loaded);
+        assert!(
+            paths.iter().any(|p| p.starts_with("/tmp/etv-test-media")),
+            "a local source must expand from the supplied table, got {paths:?}"
+        );
     }
 
     #[test]
@@ -416,7 +485,7 @@ mod tests {
         .unwrap();
 
         let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
-        resolve_blocks(&mut config, &channel_path).unwrap();
+        resolve_blocks(&mut config, &channel_path, &no_env).unwrap();
         let inc = &config.rule.blocks[0];
         assert!(
             inc.block.is_none(),
@@ -443,7 +512,7 @@ mod tests {
         .unwrap();
 
         let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
-        resolve_blocks(&mut config, &channel_path).unwrap();
+        resolve_blocks(&mut config, &channel_path, &no_env).unwrap();
         let inc = &config.rule.blocks[0];
         assert!(
             inc.block.is_none(),
@@ -464,7 +533,7 @@ mod tests {
         .unwrap();
 
         let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
-        resolve_blocks(&mut config, &channel_path).unwrap();
+        resolve_blocks(&mut config, &channel_path, &no_env).unwrap();
         let inc = &config.rule.blocks[0];
         assert_eq!(inc.entries().len(), 1);
         assert!(matches!(inc.entries()[0], Entry::Item(_)));
@@ -472,11 +541,13 @@ mod tests {
 
     #[test]
     fn expand_env_substitutes_vars() {
-        // SAFETY: single-threaded test, value scoped to this test only.
-        unsafe {
-            std::env::set_var("ETV_LOAD_TEST_DIR", "/tmp/etv-load-test");
-        }
-        let out = expand_env("${ETV_LOAD_TEST_DIR}/movie.mkv", Path::new("/dev/null")).unwrap();
+        let env = env_map(&[("ETV_LOAD_TEST_DIR", "/tmp/etv-load-test")]);
+        let out = expand_env(
+            "${ETV_LOAD_TEST_DIR}/movie.mkv",
+            Path::new("/dev/null"),
+            &env,
+        )
+        .unwrap();
         assert_eq!(out, "/tmp/etv-load-test/movie.mkv");
     }
 
@@ -485,6 +556,7 @@ mod tests {
         let err = expand_env(
             "${ETV_LOAD_TEST_DEFINITELY_UNSET}/x",
             Path::new("/dev/null"),
+            &no_env,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -496,7 +568,7 @@ mod tests {
 
     #[test]
     fn expand_env_passes_through_literals() {
-        let out = expand_env("/no/vars/here.mkv", Path::new("/dev/null")).unwrap();
+        let out = expand_env("/no/vars/here.mkv", Path::new("/dev/null"), &no_env).unwrap();
         assert_eq!(out, "/no/vars/here.mkv");
     }
 
