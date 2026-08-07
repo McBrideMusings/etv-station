@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config_carrier::non_finite_message;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OverlaySpec {
     pub width: u32,
@@ -26,6 +28,12 @@ pub struct OverlaySpec {
     /// **A typo is silent, by construction** — a mistyped key reads as unset and
     /// the script takes its own fallback, because nothing here knows the correct
     /// spelling. A script wanting strictness declares and checks its own keys.
+    ///
+    /// **A non-finite float is refused at load, naming the key.** `weight = inf`
+    /// (or `-inf`, or `nan`) has no carrier representation, so rather than let
+    /// it reach the script as unit the spec fails to load and says which key is
+    /// at fault. An author wanting "never decays" writes a large finite number.
+    /// The channel-config side refuses the same value in the same words (#130).
     ///
     /// **A TOML datetime arrives as the text the author wrote.** TOML has a
     /// first-class datetime and the carrier type does not, so `date =
@@ -69,31 +77,45 @@ fn deserialize_config<'de, D>(deserializer: D) -> Result<Option<serde_json::Valu
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<toml::Value>::deserialize(deserializer)?.map(toml_to_carrier))
+    Option::<toml::Value>::deserialize(deserializer)?
+        .map(|value| toml_to_carrier(value, "config"))
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 /// TOML value → the shared carrier type, mapping the one type TOML has and the
 /// carrier does not: a datetime becomes its TOML text.
-pub(crate) fn toml_to_carrier(value: toml::Value) -> serde_json::Value {
+///
+/// Fallible for the one type TOML has that the carrier cannot hold at all — a
+/// non-finite float. `weight = inf` is refused here rather than flattened to
+/// null, and `path` is what lets the error name `config.weight` instead of just
+/// the file. The channel-config side refuses the same value through the same
+/// [`non_finite_message`] (#130).
+pub(crate) fn toml_to_carrier(value: toml::Value, path: &str) -> Result<serde_json::Value, String> {
     use serde_json::Value as Carrier;
-    match value {
+    Ok(match value {
         toml::Value::String(s) => Carrier::String(s),
         toml::Value::Integer(i) => Carrier::Number(i.into()),
-        // A non-finite float has no carrier representation and becomes null —
-        // the same thing `.inf` in a channel YAML already does on the scorer
-        // side, so the two surfaces stay in step.
-        toml::Value::Float(f) => {
-            serde_json::Number::from_f64(f).map_or(Carrier::Null, Carrier::Number)
-        }
+        toml::Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(Carrier::Number)
+            .ok_or_else(|| non_finite_message(path, f))?,
         toml::Value::Boolean(b) => Carrier::Bool(b),
         toml::Value::Datetime(d) => Carrier::String(d.to_string()),
-        toml::Value::Array(a) => Carrier::Array(a.into_iter().map(toml_to_carrier).collect()),
+        toml::Value::Array(a) => Carrier::Array(
+            a.into_iter()
+                .enumerate()
+                .map(|(i, v)| toml_to_carrier(v, &format!("{path}[{i}]")))
+                .collect::<Result<_, _>>()?,
+        ),
         toml::Value::Table(t) => Carrier::Object(
             t.into_iter()
-                .map(|(k, v)| (k, toml_to_carrier(v)))
-                .collect(),
+                .map(|(k, v)| {
+                    let value = toml_to_carrier(v, &format!("{path}.{k}"))?;
+                    Ok((k, value))
+                })
+                .collect::<Result<_, String>>()?,
         ),
-    }
+    })
 }
 
 fn deserialize_layers<'de, D>(deserializer: D) -> Result<Vec<OverlayKind>, D::Error>
@@ -434,6 +456,31 @@ labels = ["a", "b"]
         assert_eq!(config["fade"]["steps"], serde_json::json!(3));
         assert_eq!(config["fade"]["enabled"], serde_json::json!(true));
         assert_eq!(config["fade"]["labels"][1], serde_json::json!("b"));
+    }
+
+    /// A float the carrier cannot hold fails the whole spec load and names the
+    /// key that holds it, wherever in the bag it sits — rather than reaching the
+    /// script as unit with nothing said (#130).
+    #[test]
+    fn a_non_finite_float_in_config_fails_the_load_and_names_the_key() {
+        let spec =
+            |bag: &str| format!("width = 320\nheight = 240\nframerate = 30\n\n[config]\n{bag}");
+        for (bag, key) in [
+            ("weight = inf\n", "config.weight"),
+            ("weight = nan\n", "config.weight"),
+            ("weight = -inf\n", "config.weight"),
+            ("steps = [1.0, inf]\n", "config.steps[1]"),
+            ("[config.fade]\nweight = nan\n", "config.fade.weight"),
+        ] {
+            let err = OverlaySpec::from_toml_str(&spec(bag))
+                .expect_err("a non-finite float must fail the load")
+                .to_string();
+            assert!(err.contains(key), "error did not name `{key}`: {err}");
+            assert!(
+                err.contains("large finite number"),
+                "error did not tell the author what to write instead: {err}"
+            );
+        }
     }
 
     /// TOML's native datetime — the one type it has that the carrier does not —
