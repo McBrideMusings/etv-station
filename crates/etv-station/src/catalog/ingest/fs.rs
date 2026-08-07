@@ -17,6 +17,14 @@
 //! moved, were renamed, or were deleted — they are swept, along with any entry
 //! whose last provenance row went with them. Without that, a row for a file that
 //! is gone keeps telling a channel to play a path that no longer resolves.
+//!
+//! It writes **no tags at all**. The directory a file sits in used to be stored
+//! as an `fs_dir` tag, which only ever accumulated: move a bumper from
+//! `bumpers/` to `commercials/` and the entry answered to both folders forever.
+//! `item.fs_dir` now reads the directory off the `entry_sources` row at query
+//! time (#123), so the answer moves when the file does — and an entry with rows
+//! in two folders still matches both, which a per-entry tag reset could not have
+//! got right.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +32,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::catalog::identity::{canonical_path, derive_entry_id};
-use crate::catalog::model::{Entry, EntrySource, Source, TagNs};
+use crate::catalog::model::{Entry, EntrySource, Source};
 use crate::catalog::{Catalog, CatalogError};
 
 /// Video container extensions the walker considers media.
@@ -167,9 +175,6 @@ pub fn ingest_files(
             last_seen: now.clone(),
         })?;
 
-        if let Some(dir) = parent_dir_name(path) {
-            catalog.add_tag(&entry_id, TagNs::FsDir, &dir)?;
-        }
         stats.sources_written += 1;
     }
 
@@ -193,13 +198,6 @@ fn file_title(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// The immediate parent directory name, used as the `fs_dir` tag value.
-fn parent_dir_name(path: &Path) -> Option<String> {
-    path.parent()
-        .and_then(Path::file_name)
-        .map(|s| s.to_string_lossy().into_owned())
 }
 
 /// Derive a semantic `type` from the file's parent directory name.
@@ -317,8 +315,8 @@ mod tests {
         assert_eq!(e.title, "station-01");
         assert_eq!(e.duration_ms, Some(12_000));
         assert_eq!(
-            cat.tags_for(bumper_id, TagNs::FsDir).unwrap(),
-            vec!["bumpers".to_string()]
+            cat.resolve_query(r#"item.fs_dir == "bumpers""#).unwrap(),
+            vec![bumper_id.clone()]
         );
     }
 
@@ -519,12 +517,42 @@ mod tests {
         assert_eq!(fs_paths(&cat), vec!["/data/media/commercials/x.mkv"]);
         let ids = cat.all_entry_ids().unwrap();
         assert_eq!(ids.len(), 1);
-        // The move re-typed it, and the old `fs_dir` tag went with the old entry.
+        // The move re-typed it, and `item.fs_dir` follows the file: it answers to
+        // the folder the file is in now and stops answering to the one it left
+        // (#123). Here the `fs:` id is derived from the path, so the move also
+        // replaces the entry; the folder still has to be read off the surviving
+        // row rather than assumed from the id, which is what this checks.
         assert_eq!(cat.entry(&ids[0]).unwrap().unwrap().kind, "commercial");
         assert_eq!(
-            cat.tags_for(&ids[0], TagNs::FsDir).unwrap(),
-            vec!["commercials".to_string()]
+            cat.resolve_query(r#"item.fs_dir == "commercials""#)
+                .unwrap(),
+            ids
         );
+        assert!(
+            cat.resolve_query(r#"item.fs_dir == "bumpers""#)
+                .unwrap()
+                .is_empty(),
+            "the folder the file left must stop matching"
+        );
+    }
+
+    /// The filesystem scan writes no tag rows at all now — the folder lives only
+    /// in `entry_sources`, where it cannot be a second, staler copy of anything.
+    #[test]
+    fn a_scan_writes_no_tag_rows() {
+        let cat = Catalog::open_in_memory().unwrap();
+        ingest_files(
+            &cat,
+            &[file("/data/media/bumpers/x.mkv", 5.0)],
+            &["/data/media".to_string()],
+            true,
+        )
+        .unwrap();
+        let tag_rows: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tag_rows, 0);
     }
 
     #[test]
@@ -541,7 +569,10 @@ mod tests {
         let id = cat.all_entry_ids().unwrap()[0].clone();
         cat.add_external_id(ExternalNs::Imdb, "tt-swept", &id)
             .unwrap();
-        assert_eq!(cat.tags_for(&id, TagNs::FsDir).unwrap().len(), 1);
+        assert_eq!(
+            cat.resolve_query(r#"item.fs_dir == "bumpers""#).unwrap(),
+            vec![id.clone()]
+        );
         age_fs_rows(&cat);
 
         // The root is now empty: nothing left to attach provenance to.
@@ -550,7 +581,11 @@ mod tests {
         assert_eq!(stats.sources_pruned, 1);
         assert_eq!(stats.entries_pruned, 1);
         assert!(cat.entry(&id).unwrap().is_none());
-        assert!(cat.tags_for(&id, TagNs::FsDir).unwrap().is_empty());
+        assert!(
+            cat.resolve_query(r#"item.fs_dir == "bumpers""#)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             cat.entry_id_for_external_id(ExternalNs::Imdb, "tt-swept")
                 .unwrap(),

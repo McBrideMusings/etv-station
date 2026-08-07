@@ -1441,24 +1441,12 @@ mod tests {
         );
     }
 
-    /// The filesystem ingester owns `fs_dir` and Plex owns the other seven, so a
-    /// Plex re-ingest must leave an `fs_dir` tag on the same entry alone. Guards
-    /// the per-(entry, namespace) scope of `clear_tags` against being widened to
-    /// per-entry.
-    #[test]
-    fn plex_reingest_leaves_another_sources_namespace_alone() {
-        let cat = Catalog::open_in_memory().unwrap();
-        let roots = ["/data/media".to_string()];
-        let item = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
-        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
-        cat.add_tag("imdb:tt-a", TagNs::FsDir, "bumpers").unwrap();
-
-        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
-        assert_eq!(
-            cat.tags_for("imdb:tt-a", TagNs::FsDir).unwrap(),
-            vec!["bumpers".to_string()]
-        );
-    }
+    // A second guard on the per-(entry, namespace) scope of `clear_tags` used to
+    // live here, seeding an `fs_dir` tag the filesystem scan owned and checking
+    // a Plex re-ingest left it alone. `fs_dir` is no longer a stored tag (#123),
+    // so there is no second author to guard against, and the same widening it
+    // watched for — `clear_tags` going per-entry — already fails the
+    // "reconciling one namespace must not disturb another" assertion above.
 
     #[test]
     fn rescans_are_idempotent() {

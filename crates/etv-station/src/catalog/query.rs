@@ -5,15 +5,21 @@
 //! `WHERE` clause against the catalog (see [`super::schema`]), which
 //! [`super::Catalog::resolve_query`] runs to get the matching `entry_id`s.
 //!
-//! Field kinds map to SQL three ways:
+//! Field kinds map to SQL four ways:
 //! - **scalar columns** (`title`, `year`, …) → a direct `entries.<col>` predicate;
 //! - **tag/multi-valued fields** (`genres`, `cast`, …) → an `EXISTS` over `tags`,
 //!   set-membership only (a comparison on one is a config error);
 //! - **`source` / `collections`** → an `EXISTS` sub-query (an entry has many
-//!   sources; collection membership is per-`entry_id`).
+//!   sources; collection membership is per-`entry_id`);
+//! - **`fs_dir`** → an `EXISTS` over `entry_sources` computing the directory from
+//!   `playback_path` at read time (#123). It is derived rather than stored
+//!   precisely so it cannot go stale: move a file between folders and the row
+//!   moves with it, where a stored tag would keep answering for the old folder.
 //!
 //! Everything binds through `?` placeholders — no caller value is ever
 //! interpolated into SQL text.
+
+use std::path::Path;
 
 use cel::Program;
 use cel::common::ast::{Expr, IdedExpr, LiteralValue};
@@ -29,16 +35,26 @@ pub struct WhereClause {
     pub params: Vec<Value>,
 }
 
+/// Register every SQL function a translated `WHERE` clause can call. Called
+/// once per connection on catalog open, because these are connection state
+/// rather than schema — a connection that skipped this fails any query using
+/// `matches()` or `item.fs_dir` with "no such function".
+pub fn register_functions(conn: &Connection) -> Result<(), CatalogError> {
+    register_regexp(conn)?;
+    register_parent_dir(conn)?;
+    Ok(())
+}
+
 /// Register the `regexp(pattern, text)` function sqlite's `X REGEXP Y` syntax
 /// dispatches to (`X REGEXP Y` ⇒ `regexp(Y, X)`), backing the `matches`
-/// operator. Called once per connection on catalog open.
+/// operator.
 ///
 /// The compiled pattern is memoised via sqlite's per-argument auxiliary data
 /// ([`Context::set_aux`]): a `matches()` predicate binds one constant pattern
 /// and evaluates it against every candidate row, so without caching the
 /// `Regex` would recompile on each row of a large catalog. Aux data is keyed to
 /// the (constant) pattern argument, so the compile happens once per query.
-pub fn register_regexp(conn: &Connection) -> Result<(), CatalogError> {
+fn register_regexp(conn: &Connection) -> Result<(), CatalogError> {
     conn.create_scalar_function(
         "regexp",
         2,
@@ -55,6 +71,34 @@ pub fn register_regexp(conn: &Connection) -> Result<(), CatalogError> {
             };
             let text = ctx.get::<String>(1)?;
             Ok(re.is_match(&text))
+        },
+    )?;
+    Ok(())
+}
+
+/// Register `parent_dir(path)` — the immediate parent directory *name* of a
+/// path (`/media/bumpers/x.mkv` → `bumpers`), which is what `item.fs_dir`
+/// compares against.
+///
+/// It lives in Rust rather than as inline SQL because sqlite has no reverse
+/// string search, so finding the segment between the last two separators would
+/// take a nest of `instr`/`substr` that says nothing about what it computes.
+/// Splitting a path is [`Path`]'s job, and one Rust definition means the rule
+/// cannot drift from what a reader of a path would say the directory is.
+///
+/// Returns `NULL` for a path with no parent directory name (a bare filename, or
+/// a path rooted at `/`), which no `=` comparison matches.
+fn register_parent_dir(conn: &Connection) -> Result<(), CatalogError> {
+    conn.create_scalar_function(
+        "parent_dir",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let path = ctx.get::<String>(0)?;
+            Ok(Path::new(&path)
+                .parent()
+                .and_then(Path::file_name)
+                .map(|s| s.to_string_lossy().into_owned()))
         },
     )?;
     Ok(())
@@ -81,6 +125,10 @@ enum FieldKind {
     Source,
     /// Collection membership by name via `EXISTS`.
     Collection,
+    /// The directory an entry's files sit in, computed from
+    /// `entry_sources.playback_path` via `EXISTS`. Multi-valued for the same
+    /// reason `source` is: one entry can have several files.
+    FsDir,
 }
 
 impl FieldKind {
@@ -106,6 +154,7 @@ impl FieldKind {
             "tags" => Tag(None),
             "source" => Source,
             "collections" => Collection,
+            "fs_dir" => FsDir,
             _ => return None,
         })
     }
@@ -209,6 +258,11 @@ fn comparison(
             params.push(literal_text(literal)?);
             Ok(source_exists())
         }
+        // `item.fs_dir == "bumpers"` reads the same way — "has a file in".
+        FieldKind::FsDir if op == "=" => {
+            params.push(literal_text(literal)?);
+            Ok(fs_dir_exists())
+        }
         _ => Err(err(format!(
             "item.{field_name} is multi-valued; use membership (contains), not {op}"
         ))),
@@ -289,7 +343,7 @@ fn method_predicate(
             }
             FieldKind::Tag(ns) => tag_exists(ns, arg, params),
             FieldKind::Collection => collection_exists(arg, params),
-            FieldKind::Source | FieldKind::Num(_) => Err(err(format!(
+            FieldKind::Source | FieldKind::FsDir | FieldKind::Num(_) => Err(err(format!(
                 "item.{field_name} does not support contains()"
             ))),
         },
@@ -387,6 +441,20 @@ fn collection_name_regexp(
 
 fn source_exists() -> String {
     "EXISTS (SELECT 1 FROM entry_sources s WHERE s.entry_id = entries.entry_id AND s.source = ?)"
+        .to_string()
+}
+
+/// `item.fs_dir == "<dir>"` — the entry has a file whose immediate parent
+/// directory is `<dir>` (#123).
+///
+/// Read straight off the provenance rows rather than a `tags` row, so it always
+/// describes where the files are *now*: a file dragged from `bumpers/` to
+/// `commercials/` moves its `entry_sources` row, and the entry stops matching
+/// `bumpers` in the same pass. An entry with rows in two directories matches
+/// either, which is the truth for a movie kept at two resolutions.
+fn fs_dir_exists() -> String {
+    "EXISTS (SELECT 1 FROM entry_sources s \
+     WHERE s.entry_id = entries.entry_id AND parent_dir(s.playback_path) = ?)"
         .to_string()
 }
 
@@ -575,6 +643,57 @@ mod tests {
             .resolve_query(r#"item.collections.matches("^Staff")"#)
             .unwrap();
         assert_eq!(got, vec!["imdb:tt0325980"]);
+    }
+
+    /// A movie present as two files under one GUID sits in two folders, and both
+    /// of those are true at once (#123). The old stored `fs_dir` tag could not be
+    /// reconciled per entry for exactly this reason — a per-entry clear would
+    /// have thrown one of the two away.
+    #[test]
+    fn fs_dir_matches_every_directory_the_entry_has_a_file_in() {
+        let c = seeded();
+        let id = "imdb:tt0120737";
+        for (n, dir) in [(1, "movies-4k"), (2, "movies-1080")] {
+            c.add_source(&EntrySource {
+                source: Source::Plex,
+                source_id: format!("plex-copy-{n}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/data/media/{dir}/fellowship.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            c.resolve_query(r#"item.fs_dir == "movies-4k""#).unwrap(),
+            vec![id.to_string()]
+        );
+        assert_eq!(
+            c.resolve_query(r#"item.fs_dir == "movies-1080""#).unwrap(),
+            vec![id.to_string()]
+        );
+        // Only the immediate parent counts — an ancestor is not the directory.
+        assert!(
+            c.resolve_query(r#"item.fs_dir == "media""#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `fs_dir` is multi-valued, so it takes `==` ("has a file in") and nothing
+    /// else — the same surface `item.source` offers, and for the same reason.
+    #[test]
+    fn fs_dir_rejects_everything_but_equality() {
+        for expr in [
+            r#"item.fs_dir != "bumpers""#,
+            r#"item.fs_dir.contains("bumpers")"#,
+            r#"item.fs_dir in ["bumpers"]"#,
+        ] {
+            assert!(
+                super::translate(expr).is_err(),
+                "expected {expr} to be rejected"
+            );
+        }
     }
 
     #[test]

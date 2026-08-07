@@ -95,6 +95,12 @@ impl FromStr for ExternalNs {
 
 /// Tag namespace. Collections are deliberately NOT a tag namespace — they have
 /// their own tables (#47 locked, option B).
+///
+/// Every namespace here is authored upstream in Plex and re-read wholesale, so
+/// a re-ingest can reconcile it. `fs_dir` was the one exception — written by the
+/// filesystem scan, never reconciled, and therefore always accumulating — and it
+/// is no longer a tag at all: `item.fs_dir` derives the directory from
+/// `entry_sources.playback_path` at query time (#123).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TagNs {
     Genre,
@@ -104,7 +110,6 @@ pub enum TagNs {
     Writer,
     Producer,
     Country,
-    FsDir,
 }
 
 impl TagNs {
@@ -117,7 +122,6 @@ impl TagNs {
             TagNs::Writer => "writer",
             TagNs::Producer => "producer",
             TagNs::Country => "country",
-            TagNs::FsDir => "fs_dir",
         }
     }
 
@@ -188,7 +192,6 @@ impl FromStr for TagNs {
             "writer" => Ok(TagNs::Writer),
             "producer" => Ok(TagNs::Producer),
             "country" => Ok(TagNs::Country),
-            "fs_dir" => Ok(TagNs::FsDir),
             other => Err(format!("unknown tag namespace {other:?}")),
         }
     }
