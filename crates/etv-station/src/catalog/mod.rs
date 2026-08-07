@@ -452,6 +452,42 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Every id's recorded runtime in milliseconds, in one statement.
+    ///
+    /// The pattern walk reads this to know how much airtime it has laid down,
+    /// so it can stop once the window is covered instead of running the pools
+    /// to the end (#140). That is a question about every item of every pool on
+    /// every generation, so it is asked the same way `show_ids_for` asks its
+    /// own: in bulk, not a row at a time. Ids absent from the catalog, and
+    /// entries with no recorded runtime, are simply missing from the map.
+    pub fn durations_for(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>, CatalogError> {
+        let mut out = std::collections::HashMap::new();
+        if entry_ids.is_empty() {
+            return Ok(out);
+        }
+        for chunk in entry_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT entry_id, duration_ms FROM entries \
+                 WHERE duration_ms IS NOT NULL AND entry_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (id, ms) = row?;
+                out.insert(id, ms);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every entry id, ascending — a stable enumeration for callers that scan.
     pub fn all_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])

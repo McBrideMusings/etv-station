@@ -239,6 +239,7 @@ fn kungfu_sample_holds_no_repeat_across_the_generation_seam() {
         Some(&cat),
         &GenerationState::empty(),
         &Default::default(),
+        None,
     )
     .unwrap();
     let first_ids = ids(&first);
@@ -253,6 +254,7 @@ fn kungfu_sample_holds_no_repeat_across_the_generation_seam() {
         Some(&cat),
         &state,
         &Default::default(),
+        None,
     )
     .unwrap();
     let second_ids = ids(&second);
@@ -286,6 +288,7 @@ fn kungfu_sample_keeps_broadcasting_after_playing_everything() {
             Some(&cat),
             &state,
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(!items.is_empty(), "generation {pass} resolved to nothing");

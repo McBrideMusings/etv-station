@@ -64,6 +64,7 @@
 //! because another step was added or skipped.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{Advance, Constraints, OnShort, PatternStep, Pool, Rotate, Select};
@@ -141,9 +142,30 @@ struct PoolRuntime<'a> {
     recent: Vec<ItemKeys>,
     /// Draws that had to clash because no series could serve without one.
     forced: usize,
+
+    /// What the catalog says each of this pool's items runs for, and the mean
+    /// over the ones it has a figure for. Both are loaded only when the
+    /// generation is bounded by a remaining window — nothing else reads them,
+    /// and an unbounded generation should not pay for the query.
+    runtimes: HashMap<String, Duration>,
+    mean_runtime: Duration,
 }
 
 impl PoolRuntime<'_> {
+    /// How much airtime these ids lay down.
+    ///
+    /// An item the catalog never measured is counted at the pool's mean rather
+    /// than at zero: it still occupies a slot on screen, and counting it as
+    /// free would let a pool of unmeasured items walk straight past the window
+    /// — the exact overrun this bound exists to stop. A pool the catalog has no
+    /// figure for at all has a mean of zero and so cannot bind the window; the
+    /// drain-once ceiling is all that holds it, which is where it stood before.
+    fn runtime_of(&self, ids: &[String]) -> Duration {
+        ids.iter()
+            .map(|id| self.runtimes.get(id).copied().unwrap_or(self.mean_runtime))
+            .sum()
+    }
+
     /// A pool is dry only when it resolved to nothing at all — an expression
     /// that matched no item, or a catalog with none. Playing a series to its end
     /// never empties a pool: the series loops. Television does not run out.
@@ -435,6 +457,20 @@ fn splitmix64(state: &mut u64) -> u64 {
 ///
 /// `block_constraints` is the block's own `[constraints]` table, which every
 /// pool that declares none inherits (#115).
+///
+/// `fill` is how much airtime the caller still has to cover — the daemon's
+/// `target - from`. It bounds a **derived** cycle count: without it, a block
+/// with no explicit `cycles` runs until its largest pool drains once, and 51
+/// pools of films drain over about eleven years, so one pass of the generator
+/// booked a channel through 2037 and no later tick ever revisited it (#140).
+/// With it, the walk stops at the first cycle boundary past the span, so the
+/// overshoot is one cycle instead of a decade. `None` leaves the walk
+/// unbounded, which is what an explicit `cycles` and the stateless
+/// [`crate::resolve::resolve_channel`] entry point both want.
+///
+/// Nothing new is persisted to make this work: the walk already stops on a
+/// cycle boundary and already hands back each pool's rotation, so the next
+/// generation resumes from where this one stopped exactly as it does today.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     catalog: &Catalog,
@@ -445,7 +481,12 @@ pub fn build(
     state: &GenerationState,
     seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
+    fill: Option<Duration>,
 ) -> Result<(Vec<String>, BTreeMap<String, PoolResume>), String> {
+    // An authored `cycles` is the author saying how long a pass runs, and the
+    // window does not get to argue with it. Only a derived count is bounded.
+    let budget = fill.filter(|_| cycles.is_none());
+
     // Three passes, split by whether they read the database.
     //
     // The middle one is why: a scorer plugin's `pick()` is unbounded work owned
@@ -520,7 +561,14 @@ pub fn build(
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
     for (cfg, ids) in pools.iter().zip(pool_ids) {
         let ids = ids.expect("pass 2 fills every hole pass 1 left");
-        runtimes.push(pool_runtime(catalog, cfg, ids, block_constraints, state)?);
+        runtimes.push(pool_runtime(
+            catalog,
+            cfg,
+            ids,
+            block_constraints,
+            state,
+            budget.is_some(),
+        )?);
     }
 
     let mut by_name: HashMap<&str, usize> = HashMap::new();
@@ -539,7 +587,17 @@ pub fn build(
     };
 
     let mut out = Vec::new();
+    let mut laid = Duration::ZERO;
     for cycle in 0..cycles {
+        // Checked between cycles, never inside one: a cycle is the unit the
+        // pattern was written in ("1 movie, then 3 episodes"), and cutting one
+        // in half would air a fragment of the shape and leave the pools parked
+        // mid-pattern. So the last cycle is allowed to finish and overrun the
+        // window by its own length — the same bargain `pattern_catch_up`
+        // already strikes when it emits a whole generation past the target.
+        if budget.is_some_and(|fill| laid >= fill) {
+            break;
+        }
         for (step_idx, step) in pattern.iter().enumerate() {
             let roll = RollKey {
                 seed,
@@ -554,7 +612,11 @@ pub fn build(
             let idx = *by_name
                 .get(step.pool.as_str())
                 .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
-            out.extend(runtimes[idx].visit(step.take, &roll));
+            let drawn = runtimes[idx].visit(step.take, &roll);
+            if budget.is_some() {
+                laid += runtimes[idx].runtime_of(&drawn);
+            }
+            out.extend(drawn);
         }
     }
 
@@ -584,6 +646,12 @@ pub fn build(
 /// Enough cycles for the largest pool to drain once. Each pool needs
 /// `ceil(remaining / take-per-cycle)` visits' worth; the pattern runs the max,
 /// so shorter pools repeat under their own `wrap` while the longest plays out.
+///
+/// This is a **ceiling, not the count that runs.** When [`build`] is given a
+/// `fill` span it stops the walk at the first cycle boundary that covers it,
+/// which is what keeps a 51-pool channel from laying down eleven years in one
+/// pass (#140). Draining once is only what happens when nobody said how much
+/// airtime was wanted.
 fn derive_cycles(
     runtimes: &[PoolRuntime],
     pattern: &[PatternStep],
@@ -619,12 +687,17 @@ fn derive_cycles(
 /// Where the ids came from — a CEL expression or a scorer plugin — is settled
 /// before this is called (see the three passes in [`build`]), which is what
 /// keeps plugin execution out of any scope holding a database handle.
+///
+/// `want_runtimes` asks for the per-item lengths the walk needs to know when
+/// the window is covered. It is a whole extra query per pool, so it is only
+/// asked for when something is actually going to read the answer.
 fn pool_runtime<'a>(
     catalog: &Catalog,
     cfg: &'a Pool,
     ids: Vec<String>,
     block_constraints: Option<&Constraints>,
     state: &GenerationState,
+    want_runtimes: bool,
 ) -> Result<PoolRuntime<'a>, String> {
     // Adjacency constraints (#115). Two halves, both scoped to this pool and
     // both running before anything is interleaved, so the pattern's slots are
@@ -672,6 +745,12 @@ fn pool_runtime<'a>(
         }
     }
 
+    let (runtimes, mean_runtime) = if want_runtimes {
+        pool_runtimes(catalog, &series)?
+    } else {
+        (HashMap::new(), Duration::ZERO)
+    };
+
     let mut rt = PoolRuntime {
         cfg,
         series,
@@ -680,6 +759,8 @@ fn pool_runtime<'a>(
         keys,
         recent: Vec::new(),
         forced: 0,
+        runtimes,
+        mean_runtime,
     };
     // Seeded through the same path a draw takes, so the window is trimmed to
     // `reach` by one rule rather than two.
@@ -709,6 +790,31 @@ fn pool_runtime<'a>(
     }
 
     Ok(rt)
+}
+
+/// Every runtime this pool's items have on record, plus the mean over them.
+///
+/// Bogus lengths are thrown out on the same rule [`crate::resolve`] uses to
+/// size a slot: a non-positive figure is not a runtime, and anything past a day
+/// is a stray factor of a thousand in somebody's metadata. Letting one through
+/// would tell the walk a single film covered the whole window.
+fn pool_runtimes(
+    catalog: &Catalog,
+    series: &[Series],
+) -> Result<(HashMap<String, Duration>, Duration), String> {
+    let ids: Vec<String> = series.iter().flat_map(|s| s.ids.iter().cloned()).collect();
+    let raw = catalog.durations_for(&ids).map_err(|e| e.to_string())?;
+    let runtimes: HashMap<String, Duration> = raw
+        .into_iter()
+        .filter(|(_, ms)| *ms > 0 && *ms <= crate::resolve::MAX_CATALOG_DURATION_MS)
+        .map(|(id, ms)| (id, Duration::from_millis(ms as u64)))
+        .collect();
+    let mean = if runtimes.is_empty() {
+        Duration::ZERO
+    } else {
+        runtimes.values().sum::<Duration>() / runtimes.len() as u32
+    };
+    Ok((runtimes, mean))
 }
 
 /// Order one pool's resolved list so it satisfies that pool's adjacency
@@ -903,6 +1009,7 @@ mod tests {
             state_in,
             seed,
             test_env(),
+            None,
         )
         .expect("pattern builds");
 
@@ -1343,6 +1450,7 @@ mod tests {
             &GenerationState::empty(),
             0,
             test_env(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("unknown pool"), "err = {err}");
@@ -1360,6 +1468,7 @@ mod tests {
             &GenerationState::empty(),
             0,
             test_env(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("maximum"), "err = {err}");
@@ -1381,9 +1490,161 @@ mod tests {
             &GenerationState::empty(),
             0,
             test_env(),
+            None,
         )
         .unwrap();
         assert!(ids.is_empty());
+    }
+
+    // ---- bounding a generation by the window still to fill (#140) --------
+
+    /// Twenty-four movies, each one hour long — a day of schedule if you play
+    /// them all. `measured` says how many of them the catalog actually recorded
+    /// a runtime for; the rest have the column empty, which is what a failed
+    /// probe or a Plex row without a duration leaves behind.
+    fn hourly_movies(measured: usize) -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        for n in 1..=24 {
+            let id = format!("mov-{n:02}");
+            let mut e = CatEntry::new(&id, "movie", format!("Title {id}"), Source::Plex);
+            if n <= measured {
+                e.duration_ms = Some(3_600_000);
+            }
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.clone(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        }
+        c
+    }
+
+    /// One movie per cycle, so a cycle is exactly one hour of airtime and the
+    /// item count reads straight off the clock.
+    fn fill_movies(
+        cat: &Catalog,
+        cycles: Option<usize>,
+        state: &GenerationState,
+        fill: Option<Duration>,
+    ) -> (Vec<String>, BTreeMap<String, PoolResume>) {
+        let mut movies = movies_pool();
+        movies.advance = Advance::Resume;
+        build(
+            cat,
+            &[movies],
+            &[step("movies", 1)],
+            cycles,
+            None,
+            state,
+            0,
+            test_env(),
+            fill,
+        )
+        .expect("pattern builds")
+    }
+
+    /// The bug: a pool that takes a day to drain laid down the whole day even
+    /// when only four hours were missing. Unbounded it emits all 24 movies;
+    /// bounded to four hours it emits four.
+    #[test]
+    fn a_derived_generation_stops_once_the_window_is_covered() {
+        let cat = hourly_movies(24);
+        let (unbounded, _) = fill_movies(&cat, None, &GenerationState::empty(), None);
+        assert_eq!(unbounded.len(), 24, "drain-once is still the ceiling");
+
+        let (bounded, _) = fill_movies(
+            &cat,
+            None,
+            &GenerationState::empty(),
+            Some(Duration::from_secs(4 * 3600)),
+        );
+        assert_eq!(
+            bounded,
+            vec!["mov-01", "mov-02", "mov-03", "mov-04"],
+            "four hours of window should buy four hours of schedule",
+        );
+    }
+
+    /// An item the catalog never measured is counted at the pool's mean, not at
+    /// zero. Half-measured, the pool still stops at four hours — counting the
+    /// unmeasured ones as free would let it run to the end of the list, which
+    /// is the overrun this bound exists to stop.
+    #[test]
+    fn an_unmeasured_item_still_spends_the_window() {
+        let cat = hourly_movies(12);
+        let (bounded, _) = fill_movies(
+            &cat,
+            None,
+            &GenerationState::empty(),
+            Some(Duration::from_secs(4 * 3600)),
+        );
+        assert_eq!(bounded.len(), 4, "got {bounded:?}");
+    }
+
+    /// A catalog that knows no runtimes at all cannot bind the window, and says
+    /// so by falling back to draining once rather than emitting nothing.
+    #[test]
+    fn a_pool_with_no_recorded_runtimes_falls_back_to_draining_once() {
+        let cat = hourly_movies(0);
+        let (bounded, _) = fill_movies(
+            &cat,
+            None,
+            &GenerationState::empty(),
+            Some(Duration::from_secs(4 * 3600)),
+        );
+        assert_eq!(bounded.len(), 24, "got {bounded:?}");
+    }
+
+    /// An authored `cycles` is the author saying how long a pass runs. The
+    /// window does not shorten it.
+    #[test]
+    fn an_authored_cycle_count_ignores_the_window() {
+        let cat = hourly_movies(24);
+        let (ids, _) = fill_movies(
+            &cat,
+            Some(10),
+            &GenerationState::empty(),
+            Some(Duration::from_secs(3600)),
+        );
+        assert_eq!(ids.len(), 10, "got {ids:?}");
+    }
+
+    /// The seam the fix rests on: stopping early must not lose the pool's
+    /// place. Two bounded generations back to back play the same run, in the
+    /// same order, as one unbounded generation of the same total length.
+    #[test]
+    fn a_bounded_generation_resumes_where_the_last_one_stopped() {
+        let cat = hourly_movies(24);
+        let four_hours = Some(Duration::from_secs(4 * 3600));
+
+        let (first, pools) = fill_movies(&cat, None, &GenerationState::empty(), four_hours);
+        let mut resume = ResumeMap::new();
+        resume.pools = pools;
+        // What the daemon hands the next generation: the pools' rotation from
+        // the resolver, and each series' last-played id projected from the
+        // play-history ledger. Every movie is its own series of one.
+        let cursor = first.iter().map(|id| (id.clone(), id.clone())).collect();
+        let state = GenerationState {
+            resume,
+            cursor,
+            tail: first.clone(),
+        };
+
+        let (second, _) = fill_movies(&cat, None, &state, four_hours);
+
+        let mut joined = first.clone();
+        joined.extend(second.iter().cloned());
+        assert_eq!(
+            joined,
+            vec![
+                "mov-01", "mov-02", "mov-03", "mov-04", "mov-05", "mov-06", "mov-07", "mov-08",
+            ],
+            "the seam repeated or skipped: {first:?} then {second:?}",
+        );
     }
 
     // ---- pool-level adjacency constraints (#115) -------------------------
@@ -1412,9 +1673,19 @@ mod tests {
         state: &GenerationState,
     ) -> Vec<String> {
         let cat = catalog();
-        build(&cat, pools, pattern, cycles, block, state, 0, test_env())
-            .expect("pattern builds")
-            .0
+        build(
+            &cat,
+            pools,
+            pattern,
+            cycles,
+            block,
+            state,
+            0,
+            test_env(),
+            None,
+        )
+        .expect("pattern builds")
+        .0
     }
 
     /// The pool's own list is reordered so the first draw does not repeat what

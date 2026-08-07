@@ -16,6 +16,10 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
+    /// How far ahead of live the schedule is materialized. This is also what
+    /// bounds a single generation: a pattern whose pools would take years to
+    /// drain stops at the cycle boundary that covers this span (#140), so an
+    /// edit to the channel file shows up on air within roughly this long.
     #[serde(default = "default_window_days")]
     pub window_days: u32,
 
@@ -141,8 +145,14 @@ fn default_nominal_item_secs() -> u32 {
     1800
 }
 
+/// One day. The window is how long an edit to a channel file waits before it
+/// reaches the screen, so the default is the shortest span that still keeps a
+/// full day of schedule standing between the playhead and dead air. Every
+/// channel and sample in this repo already writes `window_days: 1`; the old
+/// default of 30 only ever applied to a file that forgot the line, and it
+/// bought that file a month of un-editable schedule.
 fn default_window_days() -> u32 {
-    30
+    1
 }
 fn default_chunk_hours() -> u32 {
     6

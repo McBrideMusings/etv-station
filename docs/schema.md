@@ -366,8 +366,8 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | Field | Required | Type / default |
 |---|---|---|
 | `name` | no — default: config file stem | string — channel identity override; drives the log label, overlay handshake, and output folder leaf. Must not contain path separators. |
-| `window_days` | no — default `30` | int |
-| `chunk_hours` | no — default `24` | int |
+| `window_days` | no — default `1` | int — how far ahead the schedule is written, and the span one generation is allowed to cover |
+| `chunk_hours` | no — default `6` | int — playout file size only; it does not bound a generation |
 | `roll_interval` | no — default `"3600s"` | duration |
 | `retention_days` | no — default `7` | int |
 | `seed` | no | int — seeds `random` order |
@@ -455,10 +455,10 @@ ordered list the plugin returned, inside pool resolution and before the pattern
 draws from it, so it holds whatever the script does or fails to do.
 
 It is opt-in on purpose, and it is not a belt-and-braces addition on top of a
-script that already suppresses — **the two do not layer.** `cycles` is derived
-to drain the largest pool once, so a no-repeat rule marches the pool through its
-whole returned set inside a single window, which leaves the script's own
-`ctx.recent` suppression nothing left to hold back. Set it on a plugin pool when
+script that already suppresses — **the two do not layer.** A no-repeat rule
+marches the pool forward through its returned set rather than letting it revisit
+recent items, which leaves the script's own `ctx.recent` suppression less to hold
+back over the window a generation covers. Set it on a plugin pool when
 the config is the only thing guarding replay; leave it unset when the script is.
 `examples/samples/foryou.yaml` ships a scorer that suppresses and therefore
 declines the field; `examples/samples/kungfu.yaml` is the sample that exercises
@@ -672,12 +672,15 @@ disjoint by construction — `examples/samples/kungfu.yaml` does it with the poo
 own expressions, `examples/samples/foryou.yaml` with a plugin that splits on
 `item.type` — because the pool contract does not guarantee it.
 
-**Mind the window size.** `cycles` is derived to drain the largest pool once, so
-a no-repeat rule on a pool the pattern draws heavily from marches through that
-pool's whole set inside one window. That is the rule doing its job — but on a
-channel whose replay policy lives elsewhere, such as a scorer plugin suppressing
-what recently aired, it leaves that policy nothing left to hold back.
-`examples/samples/foryou.yaml` declines the field for exactly this reason.
+**Mind the window size.** A no-repeat rule on a pool the pattern draws heavily
+from marches that pool forward instead of letting it revisit, so the wider
+`window_days` is the further through its set one generation gets. That is the
+rule doing its job — but on a channel whose replay policy lives elsewhere, such
+as a scorer plugin suppressing what recently aired, it leaves that policy less to
+hold back. `examples/samples/foryou.yaml` declines the field for exactly this
+reason. An **authored** `cycles` is the case to watch: it is not bounded by the
+window, so a large number there really can march a pool through its whole set in
+one pass.
 
 When no item can be drawn without a clash, one is drawn anyway and the shortfall
 is logged as `constraints.unsatisfied` — a pool that cannot satisfy its own

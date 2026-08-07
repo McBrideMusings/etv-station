@@ -99,6 +99,7 @@ pub fn resolve_channel(
         catalog,
         &GenerationState::empty(),
         &crate::score::ScoreInputs::default(),
+        None,
     )?;
     Ok(items)
 }
@@ -114,6 +115,12 @@ pub fn resolve_channel(
 ///
 /// A channel with no pattern block ignores `resume_in` and returns an empty
 /// map, so the resume sidecar only ever appears for channels that need it.
+///
+/// `fill` is how much airtime the caller still needs covered. A pattern block
+/// with no authored `cycles` stops once it has laid that much down, instead of
+/// running until its largest pool drains (#140). `None` means "however long the
+/// pattern naturally runs" — the stateless callers and the tests.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_channel_with_resume(
     config: &ChannelConfig,
     path: &Path,
@@ -122,6 +129,7 @@ pub fn resolve_channel_with_resume(
     catalog: Option<&Catalog>,
     state: &GenerationState,
     scoring: &crate::score::ScoreInputs,
+    fill: Option<Duration>,
 ) -> Result<(Vec<ResolvedItem>, ResumeMap), ConfigError> {
     // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
     // one draws fresh entropy so an unseeded `random` block reshuffles each
@@ -152,6 +160,7 @@ pub fn resolve_channel_with_resume(
             seed,
             state,
             scoring,
+            fill,
             &mut resume_out,
         )?;
         // A pattern block is constrained pool by pool, inside the interleave
@@ -300,6 +309,7 @@ fn resolve_block(
     seed: u64,
     state: &GenerationState,
     scoring: &crate::score::ScoreInputs,
+    fill: Option<Duration>,
     resume_out: &mut ResumeMap,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
@@ -343,6 +353,7 @@ fn resolve_block(
             state,
             seed,
             score_env,
+            fill,
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(pools);
@@ -588,7 +599,7 @@ fn reorder_to(items: Vec<ResolvedItem>, ordered_ids: &[String]) -> Vec<ResolvedI
 /// cascaded under the block `[program]` defaults.
 /// Longest slot a catalog-reported length is allowed to size. Beyond a day the
 /// number is not a runtime, it is bad metadata.
-const MAX_CATALOG_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
+pub(crate) const MAX_CATALOG_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// `Ok(None)` means the catalog knows this item but nothing can play it — the
 /// row carries no playback source at all. That is not a channel misconfiguration
@@ -901,6 +912,7 @@ mod tests {
             None,
             &state,
             &Default::default(),
+            None,
         )
         .unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -1525,6 +1537,7 @@ mod tests {
             Some(&cat),
             &GenerationState::empty(),
             &Default::default(),
+            None,
         )
         .unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -1561,6 +1574,7 @@ mod tests {
             Some(&cat),
             &GenerationState::empty(),
             &Default::default(),
+            None,
         )
         .unwrap();
         let first_ids: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
@@ -1578,6 +1592,7 @@ mod tests {
             Some(&cat),
             &next,
             &Default::default(),
+            None,
         )
         .unwrap();
         let second_ids: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
@@ -1603,6 +1618,7 @@ mod tests {
             Some(&cat),
             &GenerationState::empty(),
             &Default::default(),
+            None,
         )
         .unwrap();
         let state = advance_state(&cat, &GenerationState::empty(), next, &first);
@@ -1615,6 +1631,7 @@ mod tests {
             Some(&cat),
             &state,
             &Default::default(),
+            None,
         )
         .unwrap();
         let (b, rb) = resolve_channel_with_resume(
@@ -1625,6 +1642,7 @@ mod tests {
             Some(&cat),
             &state,
             &Default::default(),
+            None,
         )
         .unwrap();
         let ids_a: Vec<&str> = a.iter().map(|i| i.id.as_str()).collect();
@@ -1654,6 +1672,7 @@ mod tests {
             Some(&cat),
             &GenerationState::empty(),
             &Default::default(),
+            None,
         )
         .unwrap();
         let state = advance_state(&cat, &GenerationState::empty(), next, &first);
@@ -1676,6 +1695,7 @@ mod tests {
             Some(&cat),
             &state,
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1693,6 +1713,7 @@ mod tests {
             Some(&cat),
             &state,
             &Default::default(),
+            None,
         )
         .unwrap();
         let first_got = back
@@ -1724,6 +1745,7 @@ mod tests {
             Some(&cat),
             &GenerationState::empty(),
             &Default::default(),
+            None,
         )
         .unwrap();
 
@@ -1776,6 +1798,7 @@ mod tests {
             None,
             &GenerationState::empty(),
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(next.is_empty());
@@ -1799,6 +1822,7 @@ mod tests {
             Some(&cat),
             &GenerationState::empty(),
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(!played.is_empty());
@@ -1813,6 +1837,7 @@ mod tests {
             Some(&cat),
             &state,
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(

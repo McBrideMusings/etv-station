@@ -113,6 +113,7 @@ fn resolve_with(cfg: &ChannelConfig, cat: &Catalog, inputs: ScoreInputs) -> Vec<
         Some(cat),
         &state,
         &inputs,
+        None,
     )
     .unwrap();
     items.into_iter().map(|i| i.id).collect()
@@ -341,6 +342,7 @@ fn pick(ctx) { ["mov-a"] }
         Some(&catalog()),
         &state,
         &ScoreInputs::default(),
+        None,
     )
     .expect("a relative plugin path must resolve against the channel config's directory");
 
@@ -369,6 +371,7 @@ fn a_plugin_that_picks_nothing_is_an_error() {
         Some(&catalog()),
         &state,
         &Default::default(),
+        None,
     )
     .unwrap_err();
     assert!(err.to_string().contains("picked nothing"), "got {err}");
