@@ -9,15 +9,18 @@
 //!
 //! Connection details come from the environment — `TAUTULLI_URL` and
 //! `TAUTULLI_API_KEY` — and never from tracked config, so a deployment supplies
-//! them as container environment variables or Docker secrets.
+//! them as container environment variables or Docker secrets. The environment is
+//! read in exactly one place, [`credentials_from_env`], and everything below it
+//! takes the connection as an argument (#132).
 //!
 //! # Failure is not fatal
 //!
-//! [`fetch`] returns an empty history rather than an error when Tautulli is
-//! unset or unreachable. A plugin still has release dates, `last_seen`, tags,
-//! and the channel's own recently-aired tail to rank on, so an outage degrades
-//! the ranking instead of stopping a channel that is otherwise fine. The reason
-//! is logged on each fetch so the degradation is visible.
+//! [`fetch_rows`] returns an empty history rather than an error when Tautulli is
+//! unreachable, and a station with no credentials never calls it at all. A
+//! plugin still has release dates, `last_seen`, tags, and the channel's own
+//! recently-aired tail to rank on, so an outage degrades the ranking instead of
+//! stopping a channel that is otherwise fine. The reason is logged on each fetch
+//! so the degradation is visible.
 
 use std::time::Duration;
 
@@ -35,25 +38,38 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// `get_history`.
 const HISTORY_ROWS: usize = 1000;
 
+/// The `(url, api key)` pair to fetch against, or `None` when the deployment has
+/// not configured Tautulli — which is normal, not an error.
+///
+/// This is the only place in the crate that reads `TAUTULLI_URL` /
+/// `TAUTULLI_API_KEY`, and it is called once per generation, at startup. Keeping
+/// the read here and passing the result down is what makes the fetch testable:
+/// a test hands its `SharedHistory` a `None` instead of deleting the variables
+/// out of the running process. `std::env::remove_var` is unsound in Rust 2024
+/// the moment any other thread reads the environment, and `cargo test` runs a
+/// module's tests concurrently, so the old approach was one added env-reading
+/// test away from a real data race (#132).
+pub fn credentials_from_env() -> Option<(String, String)> {
+    match (std::env::var(URL_VAR), std::env::var(KEY_VAR)) {
+        (Ok(u), Ok(k)) if !u.is_empty() && !k.is_empty() => Some((u, k)),
+        _ => {
+            tracing::debug!(
+                event = "tautulli.skip",
+                "{URL_VAR}/{KEY_VAR} unset; generating with no watch history",
+            );
+            None
+        }
+    }
+}
+
 /// Raw history rows straight off the API, before any catalog join.
 ///
 /// Split from [`join`] because the two halves want different threads: this one
 /// blocks on the network (`ureq`) and must run under `spawn_blocking`, while
 /// the join needs the catalog mutex and no network at all. Never returns an
 /// error — see the module docs.
-pub fn fetch_rows_from_env() -> Vec<HistoryRow> {
-    let (url, key) = match (std::env::var(URL_VAR), std::env::var(KEY_VAR)) {
-        (Ok(u), Ok(k)) if !u.is_empty() && !k.is_empty() => (u, k),
-        _ => {
-            tracing::debug!(
-                event = "tautulli.skip",
-                "{URL_VAR}/{KEY_VAR} unset; generating with no watch history",
-            );
-            return Vec::new();
-        }
-    };
-
-    match fetch_rows(&url, &key) {
+pub fn fetch_rows(url: &str, key: &str) -> Vec<HistoryRow> {
+    match request_rows(url, key) {
         Ok(rows) => {
             tracing::info!(
                 event = "tautulli.history",
@@ -99,9 +115,9 @@ pub struct HistoryRow {
 ///
 /// Tautulli authenticates by query parameter, so the key is part of the request
 /// URL — and `ureq` puts the URL it was given into its error's `Display`. That
-/// error is what [`fetch_rows_from_env`] logs on every failed poll, so without
-/// this the key lands in the daemon log in plaintext, once per tick, for as
-/// long as the outage lasts.
+/// error is what [`fetch_rows`] logs on every failed poll, so without this the
+/// key lands in the daemon log in plaintext, once per tick, for as long as the
+/// outage lasts.
 fn redact_key(e: impl std::fmt::Display, key: &str) -> String {
     let text = e.to_string();
     if key.is_empty() {
@@ -112,7 +128,7 @@ fn redact_key(e: impl std::fmt::Display, key: &str) -> String {
     text.replace(key, "<redacted>")
 }
 
-fn fetch_rows(url: &str, key: &str) -> Result<Vec<HistoryRow>, String> {
+fn request_rows(url: &str, key: &str) -> Result<Vec<HistoryRow>, String> {
     let endpoint = format!(
         "{}/api/v2?apikey={}&cmd=get_history&length={HISTORY_ROWS}",
         url.trim_end_matches('/'),

@@ -9,15 +9,16 @@
 //! a `plex` provenance row, so one physical file is one entry across sources.
 //!
 //! [`ingest_items`] is the pure catalog-writing core (takes already-parsed
-//! [`PlexItem`]s), unit-testable without a live server; [`ingest_from_env`] is
-//! the thin HTTP front door that reads `PLEX_URL`/`PLEX_TOKEN`, fetches, and
-//! calls it.
+//! [`PlexItem`]s), unit-testable without a live server; [`ingest`] is the thin
+//! HTTP front door that fetches and calls it. The connection details are read
+//! out of the environment in exactly one place, [`PlexEnv::from_env`], and
+//! handed down from there (#132).
 //!
 //! [`ingest_collections`] is the parallel pure core for Plex collections:
 //! `collections` + ordered `collection_items`, with each member's ratingKey
 //! resolved back to its `entry_id` via the `plex` provenance row.
 //!
-//! [`ingest_from_env`] takes a `since` cursor: when set, each section is asked
+//! [`ingest`] takes a `since` cursor: when set, each section is asked
 //! only for records with `updatedAt>=since` and a collection whose own
 //! `updatedAt` predates it skips its children request. That is what keeps a
 //! restart cheap — see `plex_ingest_plan` in `daemon.rs` for how the cursor is
@@ -39,14 +40,67 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlexIngestError {
-    #[error("missing env var: {0}")]
-    MissingEnv(&'static str),
     #[error("http: {0}")]
     Http(String),
     #[error("parse: {0}")]
     Parse(String),
     #[error("catalog: {0}")]
     Catalog(#[from] CatalogError),
+}
+
+/// Everything the ingest needs to reach a Plex server, resolved from the
+/// environment once at startup and passed down from there.
+///
+/// This exists so nothing below [`PlexEnv::from_env`] reads the process
+/// environment. A test that must not contact a live Plex hands [`ingest`]'s
+/// caller a `None` instead of deleting `PLEX_URL` / `PLEX_TOKEN` out of the
+/// running process — `std::env::remove_var` is unsound in Rust 2024 once any
+/// other thread reads the environment, and `cargo test` runs a module's tests
+/// concurrently (#132).
+#[derive(Debug, Clone)]
+pub struct PlexEnv {
+    /// Server base URL, trailing slash already stripped.
+    pub base_url: String,
+    pub token: String,
+    /// Optional path translation: a playback path starting with `path_from` is
+    /// rewritten to start with `path_to`. Empty `path_from` disables it.
+    pub path_from: String,
+    pub path_to: String,
+}
+
+impl PlexEnv {
+    /// `None` when `PLEX_URL` or `PLEX_TOKEN` is unset or empty — a station with
+    /// no Plex at all is normal, not an error, and simply ingests without it.
+    ///
+    /// A *half*-configured Plex is not normal, and warns. Before the connection
+    /// was resolved here, a blank `PLEX_URL` still entered the ingest and failed
+    /// against the empty URL, so a typo in a deploy's env file announced itself
+    /// as a `catalog.ingest.plex_failed` error on every startup. Skipping is the
+    /// better behaviour — there is no server in a blank URL to contact — but
+    /// skipping *silently* would take that signal away with it, leaving an
+    /// operator who wrote `PLEX_URL=` staring at a catalog that never fills and
+    /// no line in the log saying why.
+    pub fn from_env() -> Option<Self> {
+        let url = std::env::var("PLEX_URL").unwrap_or_default();
+        let token = std::env::var("PLEX_TOKEN").unwrap_or_default();
+        if url.is_empty() != token.is_empty() {
+            tracing::warn!(
+                event = "catalog.ingest.plex_half_configured",
+                have_url = !url.is_empty(),
+                have_token = !token.is_empty(),
+                "exactly one of PLEX_URL/PLEX_TOKEN is set; ingesting without plex",
+            );
+        }
+        if url.is_empty() || token.is_empty() {
+            return None;
+        }
+        Some(Self {
+            base_url: url.trim_end_matches('/').to_string(),
+            token,
+            path_from: std::env::var("MEDIA_PATH_FROM").unwrap_or_default(),
+            path_to: std::env::var("MEDIA_PATH_TO").unwrap_or_default(),
+        })
+    }
 }
 
 /// One playable Plex item, normalised out of the API's shape into exactly what
@@ -328,14 +382,15 @@ pub fn ingest_collections(
 /// Fetch every library's movies + episodes from Plex and ingest them.
 /// `source_roots` canonicalise paths for identity/path-match.
 ///
-/// Reads `PLEX_URL` / `PLEX_TOKEN` (required) and `MEDIA_PATH_FROM` /
-/// `MEDIA_PATH_TO` (optional path translation) from the environment.
-pub fn ingest_from_env(
+/// `plex` carries the connection; see [`PlexEnv::from_env`] for where it comes
+/// from in production.
+pub fn ingest(
     catalog: &Catalog,
     source_roots: &[String],
     since: Option<i64>,
+    plex: &PlexEnv,
 ) -> Result<PlexIngestStats, PlexIngestError> {
-    let client = PlexClient::from_env()?;
+    let client = PlexClient::new(plex);
     let items = client.fetch_all(since)?;
     // The collection children fetch is the slow half — one sequential request
     // per collection. Log between the stages so a stall is attributable.
@@ -489,18 +544,14 @@ struct PlexClient {
 }
 
 impl PlexClient {
-    fn from_env() -> Result<Self, PlexIngestError> {
-        let base_url =
-            std::env::var("PLEX_URL").map_err(|_| PlexIngestError::MissingEnv("PLEX_URL"))?;
-        let token =
-            std::env::var("PLEX_TOKEN").map_err(|_| PlexIngestError::MissingEnv("PLEX_TOKEN"))?;
-        Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            token,
-            path_from: std::env::var("MEDIA_PATH_FROM").unwrap_or_default(),
-            path_to: std::env::var("MEDIA_PATH_TO").unwrap_or_default(),
+    fn new(plex: &PlexEnv) -> Self {
+        Self {
+            base_url: plex.base_url.clone(),
+            token: plex.token.clone(),
+            path_from: plex.path_from.clone(),
+            path_to: plex.path_to.clone(),
             agent: ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build(),
-        })
+        }
     }
 
     fn translate(&self, p: &str) -> String {

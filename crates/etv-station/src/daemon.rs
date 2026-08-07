@@ -33,7 +33,11 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // Open + populate the station-wide catalog once, before the first generation,
     // so it survives reloads (#96). A catalog-free station keeps working: query /
     // non-`manual` channels just error in `resolve_channel` as before.
-    let catalog = open_and_ingest_catalog(&station).await?;
+    // The one read of `PLEX_URL`/`PLEX_TOKEN` in the daemon; everything below
+    // takes the connection as an argument, so a test supplies `None` rather than
+    // deleting the variables out of the process (#132).
+    let plex = crate::catalog::ingest::plex::PlexEnv::from_env();
+    let catalog = open_and_ingest_catalog(&station, plex.as_ref()).await?;
     // What the catalog was opened against — the catalog is opened once and NOT
     // reopened on reload (#96), so a later reload that changes these diverges.
     let opened_catalog_path = station.station.catalog_path.clone();
@@ -169,6 +173,13 @@ struct SharedHistory {
     /// `None` for a catalog-free station — there is nothing to join rows
     /// against, so no request is ever made and no join event is ever logged.
     catalog: Option<Arc<CatalogInfo>>,
+    /// The Tautulli `(url, api key)` to fetch against, resolved from the
+    /// environment once by the caller. `None` — an unconfigured Tautulli —
+    /// still runs the join, against zero rows: that is the same degraded path
+    /// an unreachable server takes, and holding it here rather than reading the
+    /// environment down in the fetch is what lets a test exercise it without
+    /// mutating the process (#132).
+    tautulli: Option<(String, String)>,
     /// How long a fetched history is reused before the next channel to ask
     /// refetches. Set to the shortest `roll_interval` on the station, so no
     /// channel ever sees a history older than one of its own ticks.
@@ -184,9 +195,14 @@ struct HistoryCache {
 }
 
 impl SharedHistory {
-    fn new(catalog: Option<Arc<CatalogInfo>>, refresh_after: Duration) -> Self {
+    fn new(
+        catalog: Option<Arc<CatalogInfo>>,
+        tautulli: Option<(String, String)>,
+        refresh_after: Duration,
+    ) -> Self {
         Self {
             catalog,
+            tautulli,
             refresh_after,
             state: tokio::sync::Mutex::new(HistoryCache::default()),
         }
@@ -211,9 +227,18 @@ impl SharedHistory {
         // would otherwise stall this runtime worker for the request timeout,
         // exactly as the Plex ingest above avoids. The catalog join is local
         // work and stays here.
-        let rows = tokio::task::spawn_blocking(crate::tautulli::fetch_rows_from_env)
-            .await
-            .unwrap_or_default();
+        //
+        // With no Tautulli configured there is nothing to request, but the join
+        // still runs on the empty row set so the cache and its `tautulli.join`
+        // event behave identically to a fetch that came back empty.
+        let rows = match self.tautulli.clone() {
+            Some((url, key)) => {
+                tokio::task::spawn_blocking(move || crate::tautulli::fetch_rows(&url, &key))
+                    .await
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
         // A reader of its own, opened for this join and dropped with it. Once
         // per refresh window for the whole station, so the open costs nothing
         // next to the HTTP request that just happened; keeping a handle alive
@@ -301,8 +326,12 @@ fn plex_ingest_plan(
 ///
 /// Every write this process makes to the catalog happens inside this function.
 /// That is what lets every reader downstream be read-only.
+///
+/// `plex` is the Plex connection to ingest from, or `None` for a station with no
+/// Plex configured — which skips the Plex pass entirely and contacts nothing.
 async fn open_and_ingest_catalog(
     station: &Station,
+    plex: Option<&crate::catalog::ingest::plex::PlexEnv>,
 ) -> Result<Option<Arc<CatalogInfo>>, StationError> {
     let Some(path) = station
         .station
@@ -331,12 +360,12 @@ async fn open_and_ingest_catalog(
         }
     }
 
-    // Plex: only when both env vars are set — an unconfigured Plex is normal, not
-    // an error. The client is blocking (`ureq`), so run it on a blocking thread
-    // (moving the catalog in and back out) rather than stalling the async
-    // runtime. `spawn_blocking` works on any runtime flavor, unlike
+    // Plex: only when a connection was resolved — an unconfigured Plex is
+    // normal, not an error. The client is blocking (`ureq`), so run it on a
+    // blocking thread (moving the catalog in and back out) rather than stalling
+    // the async runtime. `spawn_blocking` works on any runtime flavor, unlike
     // `block_in_place`.
-    if std::env::var_os("PLEX_URL").is_some() && std::env::var_os("PLEX_TOKEN").is_some() {
+    if let Some(plex) = plex {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let last = catalog.last_plex_ingest()?;
         match plex_ingest_plan(
@@ -363,15 +392,16 @@ async fn open_and_ingest_catalog(
                     "contacting plex to ingest the catalog; a full pass reads the whole library and can take a few minutes",
                 );
                 let roots = source_roots.clone();
-                let (returned, plex) = tokio::task::spawn_blocking(move || {
+                let conn = plex.clone();
+                let (returned, ingested) = tokio::task::spawn_blocking(move || {
                     let result =
-                        crate::catalog::ingest::plex::ingest_from_env(&catalog, &roots, since);
+                        crate::catalog::ingest::plex::ingest(&catalog, &roots, since, &conn);
                     (catalog, result)
                 })
                 .await
                 .expect("plex ingest task panicked");
                 catalog = returned;
-                match plex {
+                match ingested {
                     Ok(stats) => tracing::info!(
                         event = "catalog.ingest.plex",
                         mode = if since.is_some() { "delta" } else { "full" },
@@ -425,6 +455,8 @@ async fn run_generation(
     // means "always refetch", which is the pre-#126 behaviour.
     let history = Arc::new(SharedHistory::new(
         catalog.cloned(),
+        // The one read of `TAUTULLI_URL`/`TAUTULLI_API_KEY` in the daemon (#132).
+        crate::tautulli::credentials_from_env(),
         station
             .channels
             .iter()
@@ -1374,29 +1406,19 @@ mod shared_history_tests {
         (seen, guard)
     }
 
-    /// A catalog to join against, and no Tautulli to fetch from.
-    ///
-    /// Clearing the env is what keeps this hermetic: the dev shell exports
-    /// `TAUTULLI_URL`/`TAUTULLI_API_KEY`, and left in place these tests would
-    /// make a real network call. Only `fetch_rows_from_env` reads them, and
-    /// nothing else in the suite does, so removing them here cannot affect
-    /// another test. The fetch still runs and still reaches the join — it just
-    /// joins zero rows, which is exactly the "Tautulli unreachable" path.
-    ///
-    /// Behind a `Once` because mutating the environment races every other
-    /// thread reading it, and the tests in this module run concurrently:
-    /// clearing exactly once narrows that window to a single call rather than
-    /// one per test.
+    /// A catalog to join against. Every `SharedHistory` in this module is built
+    /// with `None` for the Tautulli connection, which is what keeps these tests
+    /// hermetic: the dev shell exports `TAUTULLI_URL`/`TAUTULLI_API_KEY`, and a
+    /// fetch that read them would make a real network call. Passing the
+    /// connection in means the test simply withholds it — nothing touches the
+    /// process environment, so nothing races another test thread reading it
+    /// (#132). The join still runs, against zero rows, which is exactly the
+    /// "Tautulli unreachable" path.
     ///
     /// Returns the `TempDir` alongside the info: `SharedHistory` reopens the
     /// file per join, so it has to survive the test rather than being an
     /// in-memory catalog that exists only behind one handle.
     fn catalog_without_tautulli() -> (Arc<CatalogInfo>, tempfile::TempDir) {
-        static CLEARED: std::sync::Once = std::sync::Once::new();
-        CLEARED.call_once(|| unsafe {
-            std::env::remove_var("TAUTULLI_URL");
-            std::env::remove_var("TAUTULLI_API_KEY");
-        });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("catalog.db");
         // Opened and dropped: this creates the schema the readers expect.
@@ -1416,7 +1438,7 @@ mod shared_history_tests {
     async fn every_channel_in_one_tick_shares_a_single_fetch() {
         let (joins, _guard) = count_joins();
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
 
         // Four channels, each asking at the top of its own tick.
         let first = history.current().await;
@@ -1442,7 +1464,7 @@ mod shared_history_tests {
     async fn the_next_tick_refetches_once_the_window_has_passed() {
         let (joins, _guard) = count_joins();
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), Duration::from_secs(60));
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(60));
 
         history.current().await;
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -1461,7 +1483,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn a_station_with_no_catalog_never_fetches() {
         let (joins, _guard) = count_joins();
-        let history = SharedHistory::new(None, Duration::ZERO);
+        let history = SharedHistory::new(None, None, Duration::ZERO);
 
         assert!(history.current().await.is_empty());
         assert!(history.current().await.is_empty());
@@ -1527,19 +1549,16 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         // A station without `catalog_path` stays catalog-free — today's behavior.
         let (_dir, path) = write_station("UTC");
         let station = crate::config::load(&path).unwrap();
-        assert!(open_and_ingest_catalog(&station).await.unwrap().is_none());
+        assert!(
+            open_and_ingest_catalog(&station, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn catalog_opens_and_ingests_when_path_set() {
-        // Hermetic: ignore any ambient Plex creds (the dev shell exports them) so
-        // this never makes a real network call. Only `open_and_ingest_catalog`
-        // reads these, and `catalog_disabled_when_no_path` returns before it does,
-        // so clearing them here can't affect another test.
-        unsafe {
-            std::env::remove_var("PLEX_URL");
-            std::env::remove_var("PLEX_TOKEN");
-        }
         let dir = tempfile::tempdir().unwrap();
         let out_base = dir.path().join("out");
         let db = dir.path().join("catalog.db");
@@ -1552,9 +1571,13 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         std::fs::write(dir.path().join("channel.toml"), CHANNEL_BODY).unwrap();
         let station = crate::config::load(&dir.path().join("station.toml")).unwrap();
 
-        // No source_roots + no Plex env → a clean, empty ingest that still opens
-        // the db and returns a shareable handle.
-        let catalog = open_and_ingest_catalog(&station).await.unwrap();
+        // No source_roots + no Plex connection → a clean, empty ingest that still
+        // opens the db and returns a shareable handle. Passing `None` is what
+        // keeps this hermetic: the dev shell exports `PLEX_URL`/`PLEX_TOKEN`, and
+        // an ingest that read them itself would hit a live server. Nothing here
+        // touches the process environment, so nothing races another test thread
+        // reading it (#132).
+        let catalog = open_and_ingest_catalog(&station, None).await.unwrap();
         assert!(catalog.is_some());
         assert!(db.exists());
     }
