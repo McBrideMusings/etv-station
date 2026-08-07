@@ -252,6 +252,54 @@ impl Catalog {
         Ok(())
     }
 
+    /// Drop every provenance row for `source` that this scan did not touch, and
+    /// report how many went.
+    ///
+    /// A scan stamps `last_seen` with one instant, identical on every row it
+    /// writes, so "not stamped with `scan_stamp`" is exactly "not seen by this
+    /// scan" — a file that was moved, renamed, or deleted under a scanned root.
+    /// Without this, `add_source` (insert-or-update only) keeps that row forever:
+    /// its `playback_path` is an instruction to play a file that is not there,
+    /// and `EXISTS` membership tests in [`query`] keep counting it.
+    ///
+    /// The comparison is equality, not "older than", deliberately. `last_seen`
+    /// is an RFC3339 string and its sub-second part is variable-width, so `<`
+    /// would order `…:56.5Z` before `…:56Z`; equality needs no ordering at all.
+    /// It is also fail-safe: two scans landing on the same instant keep rows
+    /// rather than deleting live ones.
+    ///
+    /// Safe only on a **full** pass over every configured root — the same rule as
+    /// [`Self::delete_collection`]. On a partial pass, "not seen" means "not
+    /// looked at", and this would delete files that are still on disk.
+    pub fn sweep_unseen_sources(
+        &self,
+        source: Source,
+        scan_stamp: &str,
+    ) -> Result<usize, CatalogError> {
+        let n = self.conn.execute(
+            "DELETE FROM entry_sources WHERE source = ?1 AND last_seen IS NOT ?2",
+            params![source.as_str(), scan_stamp],
+        )?;
+        Ok(n)
+    }
+
+    /// Delete every entry that has no provenance row left, and report how many
+    /// went. Their `entry_external_ids`, `tags`, and `collection_items` rows go
+    /// with them via `ON DELETE CASCADE`.
+    ///
+    /// An entry's `entry_sources` rows are the only thing that says where to play
+    /// it from; with none left there is nothing to play, and the entry would
+    /// otherwise linger forever satisfying queries that can never air it. Every
+    /// ingester writes a source row for each entry it creates, so an entry only
+    /// reaches zero rows by having them swept.
+    pub fn delete_entries_without_sources(&self) -> Result<usize, CatalogError> {
+        let n = self.conn.execute(
+            "DELETE FROM entries WHERE entry_id NOT IN (SELECT entry_id FROM entry_sources)",
+            [],
+        )?;
+        Ok(n)
+    }
+
     /// Record an external GUID for an entry (also the dedup match index).
     pub fn add_external_id(
         &self,

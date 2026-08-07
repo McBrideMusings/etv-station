@@ -324,6 +324,8 @@ async fn open_and_ingest_catalog(
             event = "catalog.ingest.fs",
             entries = stats.entries_written,
             sources = stats.sources_written,
+            sources_pruned = stats.sources_pruned,
+            entries_pruned = stats.entries_pruned,
             "local-fs catalog ingest complete",
         ),
         Err(e) => {

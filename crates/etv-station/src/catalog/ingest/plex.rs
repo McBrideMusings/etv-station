@@ -864,6 +864,7 @@ mod tests {
                 Some(120.0),
             )],
             &["/mnt/media".into(), "/data/media".into()],
+            false,
         )
         .unwrap();
         let fs_id = cat.all_entry_ids().unwrap()[0].clone();
@@ -1044,6 +1045,7 @@ mod tests {
             &cat,
             &[(std::path::PathBuf::from("/data/media/bumpers/b.mkv"), None)],
             &roots,
+            false,
         )
         .unwrap();
 
@@ -1514,6 +1516,7 @@ mod tests {
             &cat,
             &[(std::path::PathBuf::from(path), Some(120.0))],
             &["/data/media".into()],
+            false,
         )
         .unwrap();
         let id = cat.all_entry_ids().unwrap()[0].clone();
