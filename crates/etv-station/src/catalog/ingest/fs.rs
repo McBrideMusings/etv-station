@@ -11,6 +11,12 @@
 //! `(path, duration)` pairs so it is unit-testable without `ffprobe` or real
 //! media; [`ingest_roots`] is the filesystem front door that globs + probes and
 //! then calls it.
+//!
+//! A full pass also reconciles **deletions** (#144): every row it writes carries
+//! the same `last_seen` stamp, and rows left holding an older one are files that
+//! moved, were renamed, or were deleted — they are swept, along with any entry
+//! whose last provenance row went with them. Without that, a row for a file that
+//! is gone keeps telling a channel to play a path that no longer resolves.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +49,13 @@ pub struct FsIngestStats {
     /// Files that inherited an existing entry_id via path-match (cross-source
     /// dedup or a prior scan).
     pub inherited: usize,
+    /// `local_fs` provenance rows deleted because the file behind them is no
+    /// longer under a scanned root (moved, renamed, or deleted). Always 0 unless
+    /// the pass was a full one.
+    pub sources_pruned: usize,
+    /// Entries deleted because pruning took their last provenance row, leaving
+    /// nothing to play.
+    pub entries_pruned: usize,
 }
 
 /// Walk `roots`, probe durations, and ingest into `catalog`. `source_roots` are
@@ -83,7 +96,11 @@ pub async fn ingest_roots(
     }
     // All writes in one transaction: a failure part-way rolls back, never
     // leaving a half-scanned catalog.
-    catalog.in_transaction(|c| ingest_files(c, &probed, source_roots))
+    //
+    // `prune_absent: true` — this walked every configured root exhaustively, so a
+    // stored row the walk did not reach is a file that is gone, not one that was
+    // skipped. Anything that ever scans a subset of the roots must pass `false`.
+    catalog.in_transaction(|c| ingest_files(c, &probed, source_roots, true))
 }
 
 /// Write catalog rows for already-probed files. Pure over the catalog (no
@@ -91,10 +108,18 @@ pub async fn ingest_roots(
 /// idempotency directly. Re-running with the same inputs is a no-op beyond
 /// refreshing `last_seen`: entry ids are deterministic and every write is an
 /// upsert keyed on a stable canonical path.
+///
+/// `prune_absent` reconciles *deletions*, the same contract as
+/// [`super::plex::ingest_collections`]: when true, any `local_fs` provenance row
+/// this pass did not stamp is deleted, and any entry left with no provenance row
+/// at all goes with it. It must be true only when `files` is the **complete**
+/// content of every root in `source_roots` — on a partial pass, absence means
+/// "not looked at", and pruning would drop files that are still on disk.
 pub fn ingest_files(
     catalog: &Catalog,
     files: &[(PathBuf, Option<f64>)],
     source_roots: &[String],
+    prune_absent: bool,
 ) -> Result<FsIngestStats, FsIngestError> {
     let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
     // Canonical-path → entry_id over everything already in the catalog (Plex rows
@@ -146,6 +171,19 @@ pub fn ingest_files(
             catalog.add_tag(&entry_id, TagNs::FsDir, &dir)?;
         }
         stats.sources_written += 1;
+    }
+
+    // Reconcile deletions last, so every row this pass touched already carries
+    // `now` and only genuinely-absent files are left holding an older stamp.
+    // `now` is `None` only if formatting the clock failed, in which case nothing
+    // written above carries a stamp either — sweeping on it would delete the
+    // whole source. Keeping the rows is the safe failure.
+    if let (true, Some(stamp)) = (prune_absent, now.as_deref()) {
+        stats.sources_pruned = catalog.sweep_unseen_sources(Source::LocalFs, stamp)?;
+        // Unconditional, not gated on `sources_pruned > 0`: an entry can also be
+        // left sourceless by an earlier pass that swept nothing, and one pass
+        // that leaves it behind leaves it behind forever.
+        stats.entries_pruned = catalog.delete_entries_without_sources()?;
     }
     Ok(stats)
 }
@@ -218,9 +256,37 @@ async fn ffprobe_seconds(path: &Path) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::model::ExternalNs;
 
     fn file(path: &str, secs: f64) -> (PathBuf, Option<f64>) {
         (PathBuf::from(path), Some(secs))
+    }
+
+    /// Push every `local_fs` row's `last_seen` back to a fixed old instant, so
+    /// the next pass's stamp is unambiguously different. Two `ingest_files`
+    /// calls microseconds apart can format to the same RFC3339 string, and the
+    /// sweep then (correctly, by design) declines to delete anything — this
+    /// stands in for the real gap between two scans.
+    fn age_fs_rows(cat: &Catalog) {
+        cat.conn
+            .execute(
+                "UPDATE entry_sources SET last_seen = '2000-01-01T00:00:00Z'
+                 WHERE source = 'local_fs'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn fs_paths(cat: &Catalog) -> Vec<String> {
+        let mut paths: Vec<String> = cat
+            .all_sources()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.source == Source::LocalFs)
+            .map(|s| s.playback_path)
+            .collect();
+        paths.sort();
+        paths
     }
 
     #[test]
@@ -230,7 +296,7 @@ mod tests {
             file("/data/media/bumpers/station-01.mkv", 12.0),
             file("/data/media/commercials/cola.mp4", 30.0),
         ];
-        let stats = ingest_files(&cat, &files, &["/data/media".into()]).unwrap();
+        let stats = ingest_files(&cat, &files, &["/data/media".into()], true).unwrap();
         assert_eq!(stats.entries_written, 2);
         assert_eq!(stats.sources_written, 2);
         assert_eq!(stats.inherited, 0);
@@ -281,8 +347,13 @@ mod tests {
             "/mnt/media/movies/Die Hard (1988)/Die.Hard.mkv",
             132.0 * 60.0,
         )];
-        let stats =
-            ingest_files(&cat, &files, &["/data/media".into(), "/mnt/media".into()]).unwrap();
+        let stats = ingest_files(
+            &cat,
+            &files,
+            &["/data/media".into(), "/mnt/media".into()],
+            true,
+        )
+        .unwrap();
 
         // Inherited the Plex entry_id, wrote no new entry, added a second row.
         assert_eq!(stats.inherited, 1);
@@ -329,7 +400,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = ingest_files(&cat, &[file(path, 90.0)], &["/data/media".into()]).unwrap();
+        let stats = ingest_files(&cat, &[file(path, 90.0)], &["/data/media".into()], true).unwrap();
         assert_eq!(stats.inherited, 1);
         assert_eq!(stats.entries_written, 0);
         // The local_fs provenance row now points at the Plex entry.
@@ -350,7 +421,7 @@ mod tests {
             file("/data/media/bumpers/b.mkv", 6.0),
         ];
         let roots = ["/data/media".to_string()];
-        ingest_files(&cat, &files, &roots).unwrap();
+        ingest_files(&cat, &files, &roots, true).unwrap();
         let first_ids = cat.all_entry_ids().unwrap();
         let first_sources: usize = first_ids
             .iter()
@@ -358,8 +429,10 @@ mod tests {
             .sum();
 
         // Second pass: same files → same rows, now all inherited, no duplication.
-        let stats = ingest_files(&cat, &files, &roots).unwrap();
+        let stats = ingest_files(&cat, &files, &roots, true).unwrap();
         assert_eq!(stats.inherited, 2);
+        assert_eq!(stats.sources_pruned, 0);
+        assert_eq!(stats.entries_pruned, 0);
         assert_eq!(cat.all_entry_ids().unwrap(), first_ids);
         let second_sources: usize = first_ids
             .iter()
@@ -376,11 +449,223 @@ mod tests {
             file("/data/media/bumpers/x.mkv", 5.0),
             file("/mnt/media/bumpers/x.mkv", 5.0),
         ];
-        ingest_files(&cat, &files, &["/data/media".into(), "/mnt/media".into()]).unwrap();
+        ingest_files(
+            &cat,
+            &files,
+            &["/data/media".into(), "/mnt/media".into()],
+            true,
+        )
+        .unwrap();
         // Both canonicalise to `bumpers/x.mkv` → one deterministic fs: entry, one
         // provenance row (same canonical source_id upserts in place).
         assert_eq!(cat.all_entry_ids().unwrap().len(), 1);
         assert_eq!(cat.all_sources().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_scan_forgets_a_deleted_file() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        ingest_files(
+            &cat,
+            &[
+                file("/data/media/bumpers/keep.mkv", 5.0),
+                file("/data/media/bumpers/gone.mkv", 6.0),
+            ],
+            &roots,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fs_paths(&cat).len(), 2);
+        age_fs_rows(&cat);
+
+        // `gone.mkv` was deleted off disk, so the next full walk never sees it.
+        let stats = ingest_files(
+            &cat,
+            &[file("/data/media/bumpers/keep.mkv", 5.0)],
+            &roots,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(stats.sources_pruned, 1);
+        assert_eq!(stats.entries_pruned, 1);
+        assert_eq!(fs_paths(&cat), vec!["/data/media/bumpers/keep.mkv"]);
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_scan_leaves_one_row_for_a_moved_file() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        ingest_files(
+            &cat,
+            &[file("/data/media/bumpers/x.mkv", 5.0)],
+            &roots,
+            true,
+        )
+        .unwrap();
+        age_fs_rows(&cat);
+
+        // Same file, dragged from bumpers/ to commercials/.
+        ingest_files(
+            &cat,
+            &[file("/data/media/commercials/x.mkv", 5.0)],
+            &roots,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(fs_paths(&cat), vec!["/data/media/commercials/x.mkv"]);
+        let ids = cat.all_entry_ids().unwrap();
+        assert_eq!(ids.len(), 1);
+        // The move re-typed it, and the old `fs_dir` tag went with the old entry.
+        assert_eq!(cat.entry(&ids[0]).unwrap().unwrap().kind, "commercial");
+        assert_eq!(
+            cat.tags_for(&ids[0], TagNs::FsDir).unwrap(),
+            vec!["commercials".to_string()]
+        );
+    }
+
+    #[test]
+    fn sweeping_the_last_source_takes_the_entry_and_its_children() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        ingest_files(
+            &cat,
+            &[file("/data/media/bumpers/x.mkv", 5.0)],
+            &roots,
+            true,
+        )
+        .unwrap();
+        let id = cat.all_entry_ids().unwrap()[0].clone();
+        cat.add_external_id(ExternalNs::Imdb, "tt-swept", &id)
+            .unwrap();
+        assert_eq!(cat.tags_for(&id, TagNs::FsDir).unwrap().len(), 1);
+        age_fs_rows(&cat);
+
+        // The root is now empty: nothing left to attach provenance to.
+        let stats = ingest_files(&cat, &[], &roots, true).unwrap();
+
+        assert_eq!(stats.sources_pruned, 1);
+        assert_eq!(stats.entries_pruned, 1);
+        assert!(cat.entry(&id).unwrap().is_none());
+        assert!(cat.tags_for(&id, TagNs::FsDir).unwrap().is_empty());
+        assert_eq!(
+            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt-swept")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_partial_scan_deletes_nothing() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        ingest_files(
+            &cat,
+            &[
+                file("/data/media/bumpers/a.mkv", 5.0),
+                file("/data/media/commercials/b.mkv", 6.0),
+            ],
+            &roots,
+            true,
+        )
+        .unwrap();
+        age_fs_rows(&cat);
+
+        // Only `bumpers/` was walked this time. `commercials/b.mkv` is absent
+        // because nobody looked, not because it is gone.
+        let stats = ingest_files(
+            &cat,
+            &[file("/data/media/bumpers/a.mkv", 5.0)],
+            &roots,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stats.sources_pruned, 0);
+        assert_eq!(stats.entries_pruned, 0);
+        assert_eq!(
+            fs_paths(&cat),
+            vec![
+                "/data/media/bumpers/a.mkv".to_string(),
+                "/data/media/commercials/b.mkv".to_string()
+            ]
+        );
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_swept_fs_row_leaves_a_plex_backed_entry_alone() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let path = "/data/media/movies/Die Hard.mkv";
+        cat.upsert_entry(&Entry::new("imdb:tt1", "movie", "Die Hard", Source::Plex))
+            .unwrap();
+        cat.add_source(&EntrySource {
+            source: Source::Plex,
+            source_id: "plex-1".into(),
+            entry_id: "imdb:tt1".into(),
+            playback_path: path.into(),
+            last_seen: Some("2000-01-01T00:00:00Z".into()),
+        })
+        .unwrap();
+        ingest_files(&cat, &[file(path, 120.0)], &roots, true).unwrap();
+        age_fs_rows(&cat);
+
+        // The local copy vanished; Plex still serves the same title.
+        let stats = ingest_files(&cat, &[], &roots, true).unwrap();
+
+        assert_eq!(stats.sources_pruned, 1);
+        assert_eq!(stats.entries_pruned, 0);
+        assert!(fs_paths(&cat).is_empty());
+        // The Plex row's own `last_seen` is stale too, and the fs sweep must not
+        // have touched it.
+        assert_eq!(cat.sources_for("imdb:tt1").unwrap().len(), 1);
+        assert_eq!(cat.entry("imdb:tt1").unwrap().unwrap().title, "Die Hard");
+    }
+
+    /// The daemon's actual front door, driven over a real directory: scan, move
+    /// a file on disk, scan again. Everything above tests the pure core with a
+    /// hand-built file list; this proves the glob walk and the sweep agree about
+    /// what "still there" means. Files are empty, so `ffprobe` fails and every
+    /// duration is `None` — the sweep does not depend on probing.
+    #[tokio::test]
+    async fn ingest_roots_over_a_real_directory_forgets_a_moved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("bumpers")).unwrap();
+        std::fs::create_dir_all(root.join("commercials")).unwrap();
+        std::fs::write(root.join("bumpers/station-bumper-01.mp4"), b"").unwrap();
+
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = vec![root.clone()];
+        let source_roots = vec![root.to_string_lossy().into_owned()];
+        let stats = ingest_roots(&cat, &roots, &source_roots).await.unwrap();
+        assert_eq!(stats.sources_written, 1);
+        assert_eq!(stats.sources_pruned, 0);
+        age_fs_rows(&cat);
+
+        std::fs::rename(
+            root.join("bumpers/station-bumper-01.mp4"),
+            root.join("commercials/station-bumper-01.mp4"),
+        )
+        .unwrap();
+
+        let stats = ingest_roots(&cat, &roots, &source_roots).await.unwrap();
+        assert_eq!(stats.sources_written, 1);
+        assert_eq!(stats.sources_pruned, 1);
+        assert_eq!(stats.entries_pruned, 1);
+        assert_eq!(
+            fs_paths(&cat),
+            vec![
+                root.join("commercials/station-bumper-01.mp4")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 1);
     }
 
     #[test]
