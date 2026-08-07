@@ -9,7 +9,9 @@
 # rebuild and `admin deploy files` (that rsync runs with delete = false).
 #
 # They do NOT survive an Unraid reboot. Run `tools/diag-install.sh start` again
-# after one; `status` will tell you they are not running.
+# after one; `status` tells NOT INSTALLED (never copied to this host, so an
+# empty log means nothing) apart from NOT RUNNING (copied, but the process died
+# — most likely a reboot, and an empty log for that window is a real gap).
 #
 # Usage:
 #   tools/diag-install.sh start     # copy the scripts up and run both
@@ -113,16 +115,23 @@ do_stop() {
 
 do_status() {
   printf '%s status\n' "$(bold '==>')"
+  # Absolute paths rather than a cd, so a missing diag folder is just one more
+  # script reported as never installed instead of a separate one-line dead end.
   remote "
-    cd '$REMOTE_DIR' 2>/dev/null || { echo 'not installed'; exit 0; }
-    for pair in 'access log:access.pid' 'stream watcher:watch.pid'; do
-      label=\${pair%%:*}; file=\${pair##*:}
-      if [ -f \$file ] && kill -0 \"\$(cat \$file)\" 2>/dev/null; then
-        echo \"  RUNNING  \$label (pid \$(cat \$file))\"
+    report() {
+      label=\$1; pid_file='$REMOTE_DIR'/\$2; script='$REMOTE_DIR'/\$3
+      if [ -f \"\$pid_file\" ] && kill -0 \"\$(cat \"\$pid_file\")\" 2>/dev/null; then
+        echo \"  RUNNING        \$label (pid \$(cat \"\$pid_file\"))\"
+      elif [ -f \"\$script\" ]; then
+        echo \"  NOT RUNNING    \$label — installed on this host but no process is alive.\"
+        echo \"                 Restart it (needed after every Unraid reboot): tools/diag-install.sh start\"
       else
-        echo \"  stopped  \$label\"
+        echo \"  NOT INSTALLED  \$label — never installed on this host, so it has never logged anything.\"
+        echo \"                 Install and start it: tools/diag-install.sh start\"
       fi
-    done
+    }
+    report 'access log' access.pid stream-access-log.py
+    report 'stream watcher' watch.pid stream-watch.py
     echo
     for log in '$ACCESS_LOG' '$EVENTS_LOG'; do
       if [ -f \"\$log\" ]; then
