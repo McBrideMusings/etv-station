@@ -170,8 +170,15 @@ struct StationContext<'a> {
 /// Contention is the point, not a cost: the mutex is held across the fetch, so
 /// channels that tick together queue behind one request instead of racing N.
 struct SharedHistory {
-    /// `None` for a catalog-free station — there is nothing to join rows
-    /// against, so no request is ever made and no join event is ever logged.
+    /// What to join fetched rows against, and — because it is `None` whenever
+    /// this generation has no reader for the result — the switch that decides
+    /// whether a fetch happens at all. `None` means no request is ever made and
+    /// no join event is ever logged.
+    ///
+    /// Two things put it there: a station with no `catalog_path`, which has
+    /// nothing to join rows against; and a station whose channels name no
+    /// scorer plugin, which has nobody to hand the joined events to. See
+    /// [`history_catalog`] (#131).
     catalog: Option<Arc<CatalogInfo>>,
     /// The Tautulli `(url, api key)` to fetch against, resolved from the
     /// environment once by the caller. `None` — an unconfigured Tautulli —
@@ -258,6 +265,31 @@ impl SharedHistory {
         cache.events = Arc::from(events);
         cache.fetched_at = Some(tokio::time::Instant::now());
         Arc::clone(&cache.events)
+    }
+}
+
+/// The catalog this generation's [`SharedHistory`] should join watch rows
+/// against — `None` when nothing in it would ever read the result (#131).
+///
+/// Watch history reaches exactly one place: `ScoreInputs::history`, which a Rhai
+/// script only sees through a pool that names a `plugin:`. A station whose
+/// channels are all `manual` or `query` pools has no such reader, so fetching a
+/// thousand `get_history` rows and joining them against the catalog on every
+/// tick produces a `Vec<WatchEvent>` that is dropped unread.
+///
+/// Deciding here rather than inside [`SharedHistory::current`] keeps `current`
+/// a plain cache, and costs nothing in freshness: a generation holds the whole
+/// channel list already, and a station that gains a plugin pool on SIGHUP is
+/// handed a brand-new `SharedHistory` by the next generation, so the answer
+/// cannot go stale under a running station.
+fn history_catalog(
+    channels: &[LoadedChannel],
+    catalog: Option<&Arc<CatalogInfo>>,
+) -> Option<Arc<CatalogInfo>> {
+    if channels.iter().any(|c| c.config.uses_scorer_plugin()) {
+        catalog.cloned()
+    } else {
+        None
     }
 }
 
@@ -451,12 +483,13 @@ async fn run_generation(
     let mut handles = Vec::new();
     let mut supervisor_handles = Vec::new();
     // One watch history for the whole station (#126). Built per generation
-    // because a reload can change the roll intervals it is sized from; the
-    // catalog behind it is the same one every generation shares. With no
-    // channels nothing ever asks, and a zero window is the inert choice — it
-    // means "always refetch", which is the pre-#126 behaviour.
+    // because a reload can change both the roll intervals it is sized from and
+    // whether any channel still reads a history at all; the catalog behind it is
+    // the same one every generation shares. With no channels nothing ever asks,
+    // and a zero window is the inert choice — it means "always refetch", which
+    // is the pre-#126 behaviour.
     let history = Arc::new(SharedHistory::new(
-        catalog.cloned(),
+        history_catalog(&station.channels, catalog),
         // The one read of `TAUTULLI_URL`/`TAUTULLI_API_KEY` in the daemon (#132).
         crate::tautulli::credentials_from_env(),
         station
@@ -1496,6 +1529,72 @@ mod shared_history_tests {
         assert!(history.current().await.is_empty());
         assert!(history.current().await.is_empty());
         assert_eq!(*joins.lock().unwrap(), 0);
+    }
+}
+
+/// Whether a generation asks for a watch history at all (#131) — the decision
+/// [`history_catalog`] makes once, before any channel ticks.
+#[cfg(test)]
+mod history_catalog_tests {
+    use super::*;
+
+    /// A catalog `history_catalog` may hand on. Nothing in this module opens
+    /// it: the decision is made from the channel list alone, so the path only
+    /// has to be distinguishable from `None`.
+    fn some_catalog() -> Arc<CatalogInfo> {
+        Arc::new(CatalogInfo {
+            path: PathBuf::from("/catalog.db"),
+            path_index: HashMap::new(),
+        })
+    }
+
+    /// A one-block channel whose single pool draws from `source` — either
+    /// `plugin: <path>` or `expr: <cel>`.
+    fn channel(name: &str, source: &str) -> LoadedChannel {
+        let yaml = format!(
+            "rule:\n  blocks:\n    - pools:\n        - name: p\n          {source}\n      pattern:\n        - pool: p\n          take: 1\n"
+        );
+        LoadedChannel {
+            name: name.to_string(),
+            config_path: PathBuf::from(format!("{name}.yaml")),
+            output_folder: PathBuf::from(name),
+            config: serde_norway::from_str(&yaml).unwrap(),
+        }
+    }
+
+    /// The acceptance criterion: every channel drawing from a CEL expression
+    /// means nobody would read a watch history, so the generation is handed no
+    /// catalog and makes no Tautulli request — even though the station has one
+    /// configured.
+    #[test]
+    fn a_station_with_no_plugin_pool_is_given_no_catalog_to_join_against() {
+        let channels = vec![
+            channel("movies", "expr: 'item.type == \"movie\"'"),
+            channel("shows", "expr: 'item.type == \"episode\"'"),
+        ];
+
+        assert!(history_catalog(&channels, Some(&some_catalog())).is_none());
+    }
+
+    /// One plugin pool on one channel is a reader, and restores the fetch for
+    /// the whole station.
+    #[test]
+    fn one_plugin_pool_anywhere_restores_the_fetch() {
+        let channels = vec![
+            channel("movies", "expr: 'item.type == \"movie\"'"),
+            channel("foryou", "plugin: taste-engine.rhai"),
+        ];
+
+        assert!(history_catalog(&channels, Some(&some_catalog())).is_some());
+    }
+
+    /// A station with no `catalog_path` is unchanged — there is nothing to join
+    /// rows against, plugin pool or not.
+    #[test]
+    fn a_station_with_no_catalog_stays_catalog_free() {
+        let channels = vec![channel("foryou", "plugin: taste-engine.rhai")];
+
+        assert!(history_catalog(&channels, None).is_none());
     }
 }
 
