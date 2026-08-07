@@ -1065,7 +1065,19 @@ async fn pattern_catch_up(
         // *set*, which `resolve_channel_with_resume` has already raised as the
         // config error it is.
 
-        let (durations, _) = cache.resolve_all(&items).await?;
+        // Takes the list and hands one back: an unreadable file becomes an
+        // on-screen error card of the same length, so the channel keeps its
+        // shape instead of failing over one bad file.
+        let (items, durations, probe_stats) = cache.resolve_all(items).await?;
+        if probe_stats.error_cards > 0 || probe_stats.dropped > 0 {
+            tracing::warn!(
+                event = "generation.unreadable_media",
+                channel = %channel.name,
+                error_cards = probe_stats.error_cards,
+                dropped = probe_stats.dropped,
+                "some items could not be read; see the per-item warnings above",
+            );
+        }
 
         // A channel with an `anchor` in the past joins its list where elapsed
         // time says it should be, rather than at item 0 — "this station has been

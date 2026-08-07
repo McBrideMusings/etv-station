@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -66,6 +66,13 @@ pub enum StationError {
     #[error("ffprobe failed for {path}: {reason}")]
     Ffprobe { path: PathBuf, reason: String },
 
+    /// ffprobe itself could not be run — missing binary, not a missing file.
+    /// Deliberately NOT [`StationError::unreadable_media`]: that would read a
+    /// broken install as "every file in the library is corrupt" and quietly turn
+    /// every channel into wall-to-wall error cards.
+    #[error("could not run ffprobe: {reason}")]
+    FfprobeUnavailable { reason: String },
+
     #[error("sidecar {path} corrupt: {source}")]
     SidecarCorrupt {
         path: PathBuf,
@@ -89,8 +96,15 @@ pub enum StationError {
     #[error("item {id} requires {field} but it is missing")]
     MissingField { id: String, field: &'static str },
 
-    #[error("local file not found for item {id}: {path}")]
-    MissingLocalFile { id: String, path: PathBuf },
+    #[error("local file unreadable for item {id}: {path}: {reason}")]
+    MissingLocalFile {
+        id: String,
+        path: PathBuf,
+        /// Why the file could not be stat'd. A deleted file and a dropped SMB
+        /// mount are different problems and this is what tells them apart —
+        /// both on screen and in the log.
+        reason: String,
+    },
 
     #[error(
         "channel {channel} failed earlier in this run and was already reported as channel.failed; the daemon itself ran to shutdown: {reason}"
@@ -99,4 +113,24 @@ pub enum StationError {
 
     #[error("task panicked: {0}")]
     Task(String),
+}
+
+impl StationError {
+    /// One file the player cannot open — a truncated download, a file Plex still
+    /// lists after it was deleted — as opposed to a channel that is configured
+    /// wrong.
+    ///
+    /// The distinction is the whole point: a misconfigured channel should stop
+    /// and be fixed, but a library of 12,000 films with one bad file in it is a
+    /// working channel with one bad slot. Callers use this to keep going.
+    /// Returns the offending path and a short human-readable reason.
+    pub fn unreadable_media(&self) -> Option<(&Path, &str)> {
+        match self {
+            StationError::Ffprobe { path, reason } => Some((path, reason.as_str())),
+            StationError::MissingLocalFile { path, reason, .. } => Some((path, reason.as_str())),
+            // FfprobeUnavailable is deliberately absent: a tool that cannot run
+            // says nothing about any particular file.
+            _ => None,
+        }
+    }
 }

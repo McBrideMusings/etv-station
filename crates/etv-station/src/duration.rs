@@ -30,7 +30,18 @@ pub struct ProbeStats {
     pub from_cache: usize,
     pub from_probe: usize,
     pub from_config: usize,
+    /// Items whose file could not be opened but whose slot length was known, so
+    /// an on-screen error card took the slot.
+    pub error_cards: usize,
+    /// Items whose file could not be opened AND whose length was unknown, so
+    /// there was no slot to put a card in and the item was left out.
+    pub dropped: usize,
 }
+
+/// Where the error card gets its typeface. The runtime image ships Noto;
+/// `ETV_STATION_ERROR_FONT` overrides it for anyone running the daemon outside
+/// that image.
+const DEFAULT_ERROR_FONT: &str = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf";
 
 impl DurationCache {
     pub async fn load(output_folder: &Path) -> Result<Self, StationError> {
@@ -64,31 +75,85 @@ impl DurationCache {
 
     /// Resolve durations for every item in `items` against this cache, probing
     /// where required. Updates the cache in place; caller must `save` afterward.
+    ///
+    /// Takes the list by value and hands back a possibly-different one: an item
+    /// whose file cannot be read is replaced by an on-screen error card of the
+    /// same length, or — when its length is unknown too — left out entirely. A
+    /// channel is never failed for one unreadable file, because a library with
+    /// one snapped tape in it is still a channel.
     pub async fn resolve_all(
         &mut self,
-        items: &[ResolvedItem],
-    ) -> Result<(Vec<Duration>, ProbeStats), StationError> {
-        let mut durations = Vec::with_capacity(items.len());
-        let mut stats = ProbeStats::default();
-        for item in items {
-            durations.push(self.duration_for(item, &mut stats).await?);
-        }
-        self.prune_to(items);
-        Ok((durations, stats))
-    }
-
-    /// Drop cache entries whose path is no longer referenced by any current
-    /// `Local` item, so the per-channel sidecar doesn't accumulate stale paths
-    /// as items are removed or their source paths change. Marks the cache dirty
-    /// if anything was removed, so the next `save` writes the trimmed sidecar.
-    fn prune_to(&mut self, items: &[ResolvedItem]) {
-        let keep: HashSet<PathBuf> = items
+        items: Vec<ResolvedItem>,
+    ) -> Result<(Vec<ResolvedItem>, Vec<Duration>, ProbeStats), StationError> {
+        // Every local path this generation asked for, captured BEFORE the loop.
+        // Pruning against the surviving items instead would be wrong in exactly
+        // the case that matters: an item that turned into an error card is no
+        // longer a `Local` source, so its cached duration would be evicted. A
+        // dropped network mount fails every file at once, which would empty the
+        // whole sidecar in one pass and force a re-probe of the entire library
+        // when the share comes back.
+        let requested: Vec<PathBuf> = items
             .iter()
             .filter_map(|item| match &item.source {
                 SourceConfig::Local { path } => Some(PathBuf::from(path)),
                 SourceConfig::Lavfi { .. } | SourceConfig::Http { .. } => None,
             })
             .collect();
+
+        let mut kept = Vec::with_capacity(items.len());
+        let mut durations = Vec::with_capacity(items.len());
+        let mut stats = ProbeStats::default();
+        for mut item in items {
+            match self.duration_for(&item, &mut stats).await {
+                Ok(d) => {
+                    kept.push(item);
+                    durations.push(d);
+                }
+                Err(err) => {
+                    let Some((path, reason)) = err.unreadable_media() else {
+                        return Err(err);
+                    };
+                    let path = path.to_path_buf();
+                    let reason = reason.to_string();
+                    match item.catalog_duration {
+                        Some(slot) => {
+                            tracing::warn!(
+                                event = "item.error_card",
+                                item = %item.id,
+                                path = %path.display(),
+                                reason = %reason,
+                                slot_secs = slot.as_secs(),
+                                "file could not be read; airing an on-screen error for its slot",
+                            );
+                            make_error_card(&mut item, &path, &reason, slot);
+                            kept.push(item);
+                            durations.push(slot);
+                            stats.error_cards += 1;
+                        }
+                        None => {
+                            tracing::warn!(
+                                event = "item.dropped",
+                                item = %item.id,
+                                path = %path.display(),
+                                reason = %reason,
+                                "file could not be read and its length is unknown; leaving it out",
+                            );
+                            stats.dropped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.prune_to_paths(&requested);
+        Ok((kept, durations, stats))
+    }
+
+    /// Drop cache entries whose path is no longer referenced by any current
+    /// `Local` item, so the per-channel sidecar doesn't accumulate stale paths
+    /// as items are removed or their source paths change. Marks the cache dirty
+    /// if anything was removed, so the next `save` writes the trimmed sidecar.
+    fn prune_to_paths(&mut self, paths: &[PathBuf]) {
+        let keep: HashSet<&PathBuf> = paths.iter().collect();
         let before = self.entries.len();
         self.entries.retain(|path, _| keep.contains(path));
         if self.entries.len() != before {
@@ -110,10 +175,19 @@ impl DurationCache {
             }
             SourceConfig::Local { path } => {
                 let local_path = PathBuf::from(path);
-                let metadata = tokio::fs::metadata(&local_path).await.map_err(|_| {
+                let metadata = tokio::fs::metadata(&local_path).await.map_err(|e| {
+                    // Keep the kind. A deleted file and a dropped network mount
+                    // both fail here, and the difference is the whole diagnosis
+                    // — one wants a re-download, the other wants the share
+                    // remounting.
                     StationError::MissingLocalFile {
                         id: item.id.clone(),
                         path: local_path.clone(),
+                        reason: match e.kind() {
+                            std::io::ErrorKind::NotFound => "file not found".to_string(),
+                            std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+                            other => format!("{other:?}"),
+                        },
                     }
                 })?;
                 let mtime_secs = metadata
@@ -144,6 +218,83 @@ impl DurationCache {
                 Ok(clamp_to_config(probed, item))
             }
         }
+    }
+}
+
+/// Rewrite `item` in place into a black card that says, on screen, which file
+/// failed and what ffmpeg said about it — sized to exactly the slot the real
+/// item would have filled, so nothing downstream shifts.
+///
+/// The item keeps its `program` metadata, so the guide still lists the film that
+/// was meant to air. A viewer who tunes in sees the title they expected and the
+/// reason it is not playing, rather than a channel that went quiet.
+fn make_error_card(item: &mut ResolvedItem, path: &Path, reason: &str, slot: Duration) {
+    let font =
+        std::env::var("ETV_STATION_ERROR_FONT").unwrap_or_else(|_| DEFAULT_ERROR_FONT.to_string());
+
+    let title = item
+        .program
+        .as_ref()
+        .and_then(|p| p.title.clone())
+        .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| item.id.clone());
+
+    let line = |text: &str, size: u32, y: u32| {
+        format!(
+            "drawtext=fontfile={font}:text={}:fontcolor=white:fontsize={size}:x=60:y={y}",
+            drawtext_safe(text)
+        )
+    };
+
+    // Three stacked lines on black, plus silence. The filter-graph shape — two
+    // labelled outputs — is the same one an authored `lavfi` item uses, so
+    // nothing further down needs to know this item is special.
+    let params = format!(
+        "color=c=black:s=1280x720:r=30,{},{},{} [out0]; \
+         anullsrc=channel_layout=stereo:sample_rate=48000 [out1]",
+        line("PLAYBACK ERROR", 52, 60),
+        line(&title, 30, 150),
+        line(reason, 24, 210),
+    );
+
+    item.source = SourceConfig::Lavfi { params };
+    item.in_point = Some(Duration::ZERO);
+    item.out_point = Some(slot);
+}
+
+/// Reduce arbitrary text to something an ffmpeg filter-graph argument can carry
+/// literally.
+///
+/// ffmpeg's filter syntax gives meaning to `:` `,` `;` `[` `]` `'` `\` and `%`,
+/// and the escaping rules differ by nesting depth — which is exactly the sort of
+/// thing that turns a helpful error message into a broken filter graph and a
+/// dead channel. Rather than escape, this drops the whole problem: anything not
+/// plainly printable becomes a space. "moov atom not found" survives intact,
+/// which is the part worth reading.
+fn drawtext_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(120));
+    let mut last_space = false;
+    for ch in text.chars() {
+        let keep = ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_' | '(' | ')');
+        let ch = if keep { ch } else { ' ' };
+        if ch == ' ' {
+            if last_space {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        out.push(ch);
+        if out.len() >= 110 {
+            break;
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -188,8 +339,7 @@ async fn ffprobe_duration(path: &Path) -> Result<Duration, StationError> {
         .arg(path)
         .output()
         .await
-        .map_err(|e| StationError::Ffprobe {
-            path: path.to_path_buf(),
+        .map_err(|e| StationError::FfprobeUnavailable {
             reason: format!("spawn: {e}"),
         })?;
 
@@ -241,6 +391,7 @@ mod tests {
             in_point: Some(Duration::ZERO),
             out_point: Some(Duration::from_secs(secs)),
             program: None,
+            catalog_duration: None,
         }
     }
 
@@ -265,6 +416,7 @@ mod tests {
             in_point: None,
             out_point: None,
             program: None,
+            catalog_duration: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -282,6 +434,7 @@ mod tests {
             in_point: None,
             out_point: None,
             program: None,
+            catalog_duration: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -295,7 +448,107 @@ mod tests {
             in_point: None,
             out_point: None,
             program: None,
+            catalog_duration: None,
         }
+    }
+
+    // A file that cannot be opened does NOT fail the channel: it keeps its slot
+    // and says on screen why it is not playing. This is the whole point — a
+    // library with one snapped tape is still a channel.
+    #[tokio::test]
+    async fn unreadable_file_becomes_an_error_card_of_its_catalog_length() {
+        let mut cache = DurationCache::default();
+        let mut broken = local_item("tingler", "/no/such/path/The.Tingler.1959.mp4");
+        broken.catalog_duration = Some(Duration::from_secs(4891));
+        let good = lavfi_item("bars", 30);
+
+        let (items, durations, stats) = cache.resolve_all(vec![broken, good]).await.unwrap();
+
+        assert_eq!(
+            items.len(),
+            2,
+            "the broken item keeps its place in the list"
+        );
+        assert_eq!(stats.error_cards, 1);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(
+            durations[0],
+            Duration::from_secs(4891),
+            "the card runs exactly as long as the film would have"
+        );
+        match &items[0].source {
+            SourceConfig::Lavfi { params } => {
+                assert!(params.contains("PLAYBACK ERROR"), "{params}");
+                assert!(params.contains("file not found"), "{params}");
+                assert!(
+                    params.contains("[out0]") && params.contains("[out1]"),
+                    "{params}"
+                );
+            }
+            other => panic!("expected a lavfi error card, got {other:?}"),
+        }
+    }
+
+    // With no length on record there is no slot to fill, so the item is left out
+    // rather than guessed at — and the rest of the list still plays.
+    #[tokio::test]
+    async fn unreadable_file_with_no_known_length_is_dropped() {
+        let mut cache = DurationCache::default();
+        let broken = local_item("ghost", "/no/such/path/zzz.mkv");
+        let good = lavfi_item("bars", 30);
+
+        let (items, durations, stats) = cache.resolve_all(vec![broken, good]).await.unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "bars");
+        assert_eq!(durations, vec![Duration::from_secs(30)]);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.error_cards, 0);
+    }
+
+    // A genuinely misconfigured item is still an error. Only unreadable MEDIA is
+    // survivable; a lavfi item with no out_point cannot be given a slot length
+    // by anyone, and silently dropping it would hide a config mistake.
+    #[tokio::test]
+    async fn a_config_error_still_fails() {
+        let mut cache = DurationCache::default();
+        let bad = ResolvedItem {
+            id: "x".into(),
+            source: SourceConfig::Lavfi {
+                params: "testsrc".into(),
+            },
+            in_point: None,
+            out_point: None,
+            program: None,
+            catalog_duration: None,
+        };
+        let err = cache.resolve_all(vec![bad]).await.unwrap_err();
+        assert!(matches!(err, StationError::MissingField { .. }));
+    }
+
+    #[test]
+    fn drawtext_safe_strips_what_would_break_the_filter_graph() {
+        // ffmpeg gives meaning to : , ; [ ] ' \ % — none may survive.
+        let out = drawtext_safe("moov atom not found: /media/a'b[c],d;e\\f%g");
+        assert!(!out.contains(':'));
+        assert!(!out.contains('\''));
+        assert!(!out.contains('['));
+        assert!(!out.contains(';'));
+        assert!(!out.contains('%'));
+        assert!(!out.contains('\\'));
+        assert!(
+            out.starts_with("moov atom not found"),
+            "the readable part survives: {out}"
+        );
+    }
+
+    #[test]
+    fn drawtext_safe_never_yields_an_empty_argument() {
+        // An all-punctuation reason would otherwise produce `text=`, which is a
+        // filter-graph parse error and would take the channel down — the exact
+        // failure this whole path exists to prevent.
+        assert_eq!(drawtext_safe(":::"), "unknown");
+        assert_eq!(drawtext_safe(""), "unknown");
     }
 
     fn seed_entry(cache: &mut DurationCache, path: &str) {
@@ -315,9 +568,8 @@ mod tests {
         seed_entry(&mut cache, "/stale.mkv");
         cache.dirty = false;
 
-        // Current items reference only /keep.mkv plus a lavfi (no path).
-        let items = vec![local_item("keep", "/keep.mkv"), lavfi_item("bars", 30)];
-        cache.prune_to(&items);
+        // This generation asked for /keep.mkv only.
+        cache.prune_to_paths(&[PathBuf::from("/keep.mkv")]);
 
         assert!(cache.entries.contains_key(Path::new("/keep.mkv")));
         assert!(!cache.entries.contains_key(Path::new("/stale.mkv")));
@@ -330,9 +582,42 @@ mod tests {
         seed_entry(&mut cache, "/keep.mkv");
         cache.dirty = false;
 
-        cache.prune_to(&[local_item("keep", "/keep.mkv")]);
+        cache.prune_to_paths(&[PathBuf::from("/keep.mkv")]);
 
         assert!(cache.entries.contains_key(Path::new("/keep.mkv")));
         assert!(!cache.dirty, "no removals leaves the cache clean");
+    }
+
+    // A file that failed this pass keeps its cached duration. Otherwise a
+    // dropped network mount — which fails every file at once — would empty the
+    // whole sidecar in one generation and force a re-probe of the entire
+    // library when the share came back.
+    #[tokio::test]
+    async fn an_error_card_does_not_evict_its_own_cached_duration() {
+        let mut cache = DurationCache::default();
+        seed_entry(&mut cache, "/gone.mkv");
+        cache.dirty = false;
+
+        let mut broken = local_item("gone", "/gone.mkv");
+        broken.catalog_duration = Some(Duration::from_secs(600));
+        let (items, _, stats) = cache.resolve_all(vec![broken]).await.unwrap();
+
+        assert_eq!(stats.error_cards, 1);
+        assert!(matches!(items[0].source, SourceConfig::Lavfi { .. }));
+        assert!(
+            cache.entries.contains_key(Path::new("/gone.mkv")),
+            "the cached duration survives the file being unreadable this pass"
+        );
+    }
+
+    // A broken ffprobe install is not a broken library. If it were treated as
+    // unreadable media, every item on every channel would become an error card
+    // and the daemon would report itself healthy.
+    #[tokio::test]
+    async fn ffprobe_that_cannot_be_run_is_not_unreadable_media() {
+        let err = StationError::FfprobeUnavailable {
+            reason: "spawn: No such file or directory".into(),
+        };
+        assert!(err.unreadable_media().is_none());
     }
 }

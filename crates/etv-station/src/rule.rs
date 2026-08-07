@@ -170,6 +170,7 @@ mod tests {
             in_point: Some(Duration::ZERO),
             out_point: Some(Duration::from_secs(secs)),
             program: None,
+            catalog_duration: None,
         }
     }
 

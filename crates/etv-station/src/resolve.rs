@@ -55,6 +55,15 @@ pub struct ResolvedItem {
     pub in_point: Option<Duration>,
     pub out_point: Option<Duration>,
     pub program: Option<ProgramMetadata>,
+    /// How long the catalog says this item runs, when it came from one.
+    ///
+    /// Not used for scheduling in the happy path — a local file's length is
+    /// read from the file itself, which is authoritative. It exists for the
+    /// unhappy path: when the file cannot be opened or probed, this is the only
+    /// remaining record of how long its slot was meant to be, and without it an
+    /// unreadable file has no slot to put an error card in. `None` for inline
+    /// items, which carry their length in `in_point`/`out_point` instead.
+    pub catalog_duration: Option<Duration>,
 }
 
 impl ResolvedItem {
@@ -337,8 +346,11 @@ fn resolve_block(
         let mut items: Vec<ResolvedItem> = ids
             .iter()
             .map(|id| catalog_item(cat, id, defaults))
-            .collect::<Result<_, _>>()
-            .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?;
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
+            .into_iter()
+            .flatten()
+            .collect();
         if let Mode::Count(n) = include.mode {
             items.truncate(n);
         }
@@ -422,9 +434,13 @@ fn resolve_query(
             .resolve_order(&ids, order, seed)
             .map_err(|e| e.to_string())?;
     }
-    ids.iter()
+    Ok(ids
+        .iter()
         .map(|id| catalog_item(catalog, id, defaults))
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Resolve a `collection` entry: look the collection up by name and emit its
@@ -475,10 +491,13 @@ fn resolve_collection(
             entry.name
         ));
     }
-    members
+    Ok(members
         .iter()
         .map(|id| catalog_item(catalog, id, defaults))
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Order a resolved item list via the #69 engine and reorder the items to match.
@@ -548,11 +567,20 @@ fn reorder_to(items: Vec<ResolvedItem>, ordered_ids: &[String]) -> Vec<ResolvedI
 /// Build a [`ResolvedItem`] from a catalog `entry_id`: its playback source (the
 /// preferred `entry_sources` row) plus program metadata from the entry columns,
 /// cascaded under the block `[program]` defaults.
+/// Longest slot a catalog-reported length is allowed to size. Beyond a day the
+/// number is not a runtime, it is bad metadata.
+const MAX_CATALOG_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// `Ok(None)` means the catalog knows this item but nothing can play it — the
+/// row carries no playback source at all. That is not a channel misconfiguration
+/// and must not be raised as one: a single hollow row would otherwise take down
+/// every channel whose query happened to match it. It is skipped and logged, and
+/// the rest of the list plays. See #137 for how such a row gets written.
 fn catalog_item(
     catalog: &Catalog,
     entry_id: &str,
     defaults: Option<&ProgramMetadata>,
-) -> Result<ResolvedItem, String> {
+) -> Result<Option<ResolvedItem>, String> {
     let entry = catalog
         .entry(entry_id)
         .map_err(|e| e.to_string())?
@@ -561,11 +589,19 @@ fn catalog_item(
     // Prefer a local-filesystem source (a real path the player can open);
     // fall back to the first provenance row. Source-specific playback (e.g. a
     // Plex streaming URL) is deferred to the ingester that defines it.
-    let source = sources
+    let Some(source) = sources
         .iter()
         .find(|s| s.source == crate::catalog::Source::LocalFs)
         .or_else(|| sources.first())
-        .ok_or_else(|| format!("entry {entry_id} has no playback source"))?;
+    else {
+        tracing::warn!(
+            event = "item.no_playback_source",
+            item = %entry_id,
+            title = %entry.title,
+            "catalog row has no file behind it; skipping this item",
+        );
+        return Ok(None);
+    };
     // Catalog columns are i64; ProgramMetadata uses u32. Out-of-range values
     // (negative / overflow) drop to None rather than wrap.
     let as_u32 = |v: Option<i64>| v.and_then(|n| u32::try_from(n).ok());
@@ -580,7 +616,7 @@ fn catalog_item(
         artwork_url: None,
         year: as_u32(entry.year),
     };
-    Ok(ResolvedItem {
+    Ok(Some(ResolvedItem {
         id: entry.entry_id.clone(),
         source: SourceConfig::Local {
             path: source.playback_path.clone(),
@@ -588,7 +624,18 @@ fn catalog_item(
         in_point: None,
         out_point: None,
         program: merge_program(Some(&program), defaults),
-    })
+        // Bounded on both ends, because this value SIZES A SLOT. A negative or
+        // zero length is meaningless; a wildly large one (a stray factor of
+        // 1000 in a metadata field) would schedule a single item for years,
+        // which emits a chunk file per `chunk_hours` across that whole span and
+        // can overflow the timeline arithmetic outright. Anything past a day is
+        // treated as no length at all — the item is then dropped rather than
+        // given an absurd slot.
+        catalog_duration: entry
+            .duration_ms
+            .filter(|ms| *ms > 0 && *ms <= MAX_CATALOG_DURATION_MS)
+            .map(|ms| Duration::from_millis(ms as u64)),
+    }))
 }
 
 fn resolve_item(
@@ -603,6 +650,9 @@ fn resolve_item(
         in_point: item.in_point,
         out_point: item.out_point,
         program: merge_program(item.program.as_ref(), defaults),
+        // An inline item states its own length via in_point/out_point; there is
+        // no catalog row behind it to fall back to.
+        catalog_duration: None,
     }
 }
 

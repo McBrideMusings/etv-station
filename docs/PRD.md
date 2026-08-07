@@ -82,7 +82,7 @@ One Docker image carrying both programs, three mounts:
 docker run -d --name etv-station \
   -v /mnt/user/appdata/etv-station:/config \       # station.yaml, channels/, blocks/, overlays/
   -v /mnt/user/appdata/etv-station/data:/data \    # playout JSON, HLS working set, catalog cache
-  -v /mnt/user/media:/media:ro \                   # the library, for ffprobe and playback
+  -v /mnt/user/media/library:/media:ro \           # the library, for ffprobe and playback
   -p 8419:8409 \
   -e PLEX_URL=... -e PLEX_TOKEN=... \
   etv-station:latest
@@ -202,6 +202,20 @@ Per-channel `tz` override is **not** in v1 — single household, single zone. Ad
 1. SIGHUP re-reads the station file and every channel config from disk. SIGTERM/SIGINT shut the daemon down; a file watcher is deferred (v2).
 2. A malformed edit (parse error, unknown timezone, invalid overlay spec) is logged and rejected — the previous, still-valid config keeps running and the daemon does not exit.
 3. On a valid reload the daemon stops every channel's playout + overlay tasks and re-runs them against the new config. Today this reuses the startup path, which wipes all emitted JSON and regenerates the future window for every channel (see [#53](https://github.com/McBrideMusings/etv-station/issues/53)); the targeted in-place rewrite of only the changed channels' future files is the intended end state. Determinism (see above) makes regeneration safe.
+
+**Unreadable media**
+One file the player cannot open is one bad slot, never a dead channel. When
+`ffprobe` fails or the file has gone missing, the item keeps its place and its
+length — taken from the catalog's `duration_ms`, which is what the source said
+the item runs — and airs a black card naming the title and the underlying error
+instead. The item keeps its program metadata, so the guide still lists what was
+meant to air and a viewer sees why it is not playing. Only an item whose length
+is unknown *as well* is dropped, since there is no slot to put a card in; both
+cases log once with the path and reason so the library can be repaired.
+
+A catalog row that carries no playback source at all is skipped the same way, for
+the same reason: a single hollow row must not take down every channel whose query
+happens to match it.
 
 **Crash safety**
 Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffected by `etv-station` being down — it keeps playing materialized files until the window expires.

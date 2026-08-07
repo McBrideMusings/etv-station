@@ -15,6 +15,16 @@ The 13 v1 issues group into four implicit phases:
 - **Operational** — reload, retention sweep, structured logging, container ([#6](https://github.com/McBrideMusings/etv-station/issues/6), [#7](https://github.com/McBrideMusings/etv-station/issues/7), [#11](https://github.com/McBrideMusings/etv-station/issues/11), [#13](https://github.com/McBrideMusings/etv-station/issues/13)).
 - **Acceptance** — the 7-day soak run against a live ETV-next instance ([#20](https://github.com/McBrideMusings/etv-station/issues/20)).
 
+**Deployed 2026-08-06.** The stack now runs on the Unraid host alongside the
+legacy ErsatzTV (separate port, separate appdata, nothing shared), carrying 58
+channels ported from that ErsatzTV's schedules — the working set for judging
+whether ErsatzTV can be retired. Three ErsatzTV channels have no equivalent yet:
+Seasonal, which is defined by a Plex label ([#136](https://github.com/McBrideMusings/etv-station/issues/136)),
+plus MTV and DJ, which come from ErsatzTV-local libraries with no Plex source.
+The port also surfaced [#135](https://github.com/McBrideMusings/etv-station/issues/135)
+(`release_date` never populated) and [#137](https://github.com/McBrideMusings/etv-station/issues/137)
+(one Plex film can become two catalog entries).
+
 ## Next — three sequential phases of v2+ scope expansion
 
 The v2+ direction extends `etv-station` from a hand-authored Loop Forever generator into a composable, catalog-aware playout system with overlay graphics. See [PRD §Scope evolution beyond v1](/PRD#scope-evolution-beyond-v1) for the framing and rationale.
