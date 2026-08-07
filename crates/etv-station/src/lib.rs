@@ -5,6 +5,7 @@ pub mod constrain;
 pub mod daemon;
 pub mod duration;
 pub mod emit;
+pub mod error_card;
 pub mod errors;
 pub mod etv_next;
 pub mod history;

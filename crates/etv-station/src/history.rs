@@ -62,6 +62,21 @@ pub struct PlayRecord {
     /// before its airing. Provenance, not scheduling input.
     #[serde(with = "time::serde::rfc3339")]
     pub played_at: OffsetDateTime,
+
+    /// True when the slot aired an error card instead of the item itself,
+    /// because the file could not be read.
+    ///
+    /// The row still exists, and deliberately so: the resume cursor is a
+    /// projection of this ledger, and omitting the row would leave the series
+    /// pointed at the broken item forever — every generation would schedule it
+    /// again and the channel would show the same error card on repeat. The
+    /// slot genuinely was broadcast, so the series genuinely advanced.
+    ///
+    /// What it must NOT do is count as *watched*: the taste scorer reads these
+    /// rows to learn what has been seen recently, and nobody saw this film.
+    /// Scorers filter on this flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub error_card: bool,
 }
 
 impl PlayRecord {
@@ -122,8 +137,17 @@ impl Ledger {
     /// the file — a writer that appends out of schedule order gets the same
     /// answer as one that doesn't. Equal starts keep file order, so the record
     /// written later sorts later.
+    ///
+    /// Airings that showed an error card are left out. Both callers ask this
+    /// question about content the viewer actually saw — the adjacency seam
+    /// ("don't repeat what just played") and the scorer's recency input — and a
+    /// slot that showed a "file not found" card played none of the film it was
+    /// meant to. [`Ledger::series_cursor`] deliberately does the opposite and
+    /// counts them, because the series still advanced past that item.
     pub fn tail(&self, n: usize) -> Vec<String> {
-        let mut order: Vec<usize> = (0..self.records.len()).collect();
+        let mut order: Vec<usize> = (0..self.records.len())
+            .filter(|&i| !self.records[i].error_card)
+            .collect();
         order.sort_by_key(|&i| self.records[i].start);
         order[order.len().saturating_sub(n)..]
             .iter()
@@ -317,6 +341,7 @@ mod tests {
             show_id: Some(show.into()),
             start: at(hour),
             played_at: at(0),
+            error_card: false,
         }
     }
 
@@ -326,6 +351,7 @@ mod tests {
             show_id: None,
             start: at(hour),
             played_at: at(0),
+            error_card: false,
         }
     }
 

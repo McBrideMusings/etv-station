@@ -1162,6 +1162,10 @@ async fn pattern_catch_up(
                     show_id: show_ids.get(&item.id).cloned(),
                     start,
                     played_at: written_at,
+                    // The slot aired either way, so the series advances either
+                    // way. The flag is what keeps a scorer from counting an
+                    // error card as a film somebody watched.
+                    error_card: item.error_card,
                 }
             })
             .collect();

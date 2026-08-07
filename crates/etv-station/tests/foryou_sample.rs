@@ -143,12 +143,14 @@ fn advance(
         show_id: Some(key.clone()),
         start: OffsetDateTime::UNIX_EPOCH,
         played_at: OffsetDateTime::UNIX_EPOCH,
+        error_card: false,
     }));
     ledger.extend(aired.iter().map(|id| PlayRecord {
         entry_id: id.clone(),
         show_id: show_ids.get(id).cloned(),
         start: OffsetDateTime::UNIX_EPOCH,
         played_at: OffsetDateTime::UNIX_EPOCH,
+        error_card: false,
     }));
     let recent = ledger.tail(200);
     (

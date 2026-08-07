@@ -64,6 +64,10 @@ pub struct ResolvedItem {
     /// unreadable file has no slot to put an error card in. `None` for inline
     /// items, which carry their length in `in_point`/`out_point` instead.
     pub catalog_duration: Option<Duration>,
+    /// Set when this item's file could not be read and its slot was given over
+    /// to an on-screen error card. Carried so the play-history ledger can record
+    /// that the slot aired without claiming the film was watched.
+    pub error_card: bool,
 }
 
 impl ResolvedItem {
@@ -351,7 +355,22 @@ fn resolve_block(
             .into_iter()
             .flatten()
             .collect();
+        // Skipping happens before the truncate, so an unplayable row normally
+        // costs nothing — the next playable item slides up into its place. The
+        // one case it cannot cover is the pattern handing back exactly `n` ids
+        // and one of them being unplayable: there is no spare to slide up, and
+        // asking the pattern for more would mean advancing its cursors past
+        // items this block never airs. Say so rather than quietly under-filling.
         if let Mode::Count(n) = include.mode {
+            if items.len() < n {
+                tracing::warn!(
+                    event = "block.count_short",
+                    block = idx,
+                    asked = n,
+                    got = items.len(),
+                    "block asked for more items than the catalog could play; see the item-level warnings above",
+                );
+            }
             items.truncate(n);
         }
         return Ok(items);
@@ -635,6 +654,7 @@ fn catalog_item(
             .duration_ms
             .filter(|ms| *ms > 0 && *ms <= MAX_CATALOG_DURATION_MS)
             .map(|ms| Duration::from_millis(ms as u64)),
+        error_card: false,
     }))
 }
 
@@ -653,6 +673,7 @@ fn resolve_item(
         // An inline item states its own length via in_point/out_point; there is
         // no catalog row behind it to fall back to.
         catalog_duration: None,
+        error_card: false,
     }
 }
 
@@ -1473,12 +1494,14 @@ mod tests {
             show_id: Some(key.clone()),
             start: OffsetDateTime::UNIX_EPOCH,
             played_at: OffsetDateTime::UNIX_EPOCH,
+            error_card: false,
         }));
         ledger.extend(ids.iter().map(|id| PlayRecord {
             entry_id: id.clone(),
             show_id: show_ids.get(id).cloned(),
             start: OffsetDateTime::UNIX_EPOCH,
             played_at: OffsetDateTime::UNIX_EPOCH,
+            error_card: false,
         }));
         crate::resume::GenerationState {
             resume,
@@ -1712,6 +1735,7 @@ mod tests {
             show_id: show_ids.get(id).cloned(),
             start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
             played_at: OffsetDateTime::UNIX_EPOCH,
+            error_card: false,
         }));
 
         assert_eq!(
