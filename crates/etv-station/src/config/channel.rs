@@ -74,6 +74,21 @@ impl ChannelConfig {
         self.rule.blocks.iter().any(|b| b.is_pattern())
     }
 
+    /// Whether any pool on this channel draws its items from a scorer plugin
+    /// (#74) rather than from a CEL expression.
+    ///
+    /// A `plugin:` is the only path by which anything reads the server's watch
+    /// history: the station hands it to a script as `ctx.history` and nothing
+    /// else consumes it. So a station of channels that all answer `false` here
+    /// has no reader for a watch history at all, and the daemon skips fetching
+    /// one (#131).
+    pub fn uses_scorer_plugin(&self) -> bool {
+        self.rule
+            .blocks
+            .iter()
+            .any(|b| b.pools.iter().any(|p| p.plugin.is_some()))
+    }
+
     /// How far back this channel's widest adjacency constraint reaches, in
     /// positions — how much aired history the constraint pass needs to enforce
     /// it across a generation seam (#73). `0` when nothing is constrained.
