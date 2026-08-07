@@ -1,3 +1,4 @@
+pub mod config_carrier;
 pub mod fifo_writer;
 pub mod overlay_spec;
 pub mod program_context;

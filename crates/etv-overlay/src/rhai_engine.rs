@@ -271,7 +271,8 @@ mod tests {
     /// [`OverlaySpec::config`](crate::overlay_spec::OverlaySpec::config) is read
     /// with, so these tests assert on exactly what an authored spec produces.
     fn toml_config(src: &str) -> serde_json::Value {
-        crate::overlay_spec::toml_to_carrier(toml::from_str::<toml::Value>(src).unwrap())
+        crate::overlay_spec::toml_to_carrier(toml::from_str::<toml::Value>(src).unwrap(), "config")
+            .unwrap()
     }
 
     /// The spec's `config` reaches the script with its nesting and scalar types

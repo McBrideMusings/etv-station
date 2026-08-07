@@ -201,9 +201,19 @@ pub struct Pool {
     /// writes, which is the coupling this field exists to avoid. A script that
     /// wants strictness can declare its own expected keys and check them.
     ///
+    /// **A non-finite float is refused at load, naming the key.** `weight: .inf`
+    /// (or `-.inf`, or `.nan`) has no carrier representation, so rather than let
+    /// it reach the script as unit the channel fails to load and says which key
+    /// is at fault. An author wanting "never decays" writes a large finite
+    /// number. This is the one thing inside the bag the station does judge, and
+    /// it is not a judgement about meaning: the value cannot be carried at all.
+    /// The overlay side refuses the same value in the same words (#130).
+    ///
     /// Meaningless on an `expr` pool — a CEL expression has no script to read
     /// it — where it is ignored rather than rejected, on the same terms as an
-    /// unrecognised key inside it.
+    /// unrecognised key inside it. The non-finite refusal above is the one thing
+    /// that still bites there, because it happens while the file is being
+    /// parsed, before anything knows whether this pool has a script at all.
     ///
     /// Carried as a `serde_json::Value` rather than the channel format's own
     /// value type: one opaque-config carrier for the whole project, so a third
@@ -211,7 +221,11 @@ pub struct Pool {
     /// looking at which file format it happens to parse. The same type carries
     /// `etv_overlay::OverlaySpec::config`. It is a carrier, not a format — a
     /// pool's `config` is authored in the channel YAML like everything else.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "etv_overlay::config_carrier::deserialize_config",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub config: Option<serde_json::Value>,
 }
 
@@ -390,5 +404,29 @@ config:
         assert_eq!(config["weights"]["steps"], serde_json::json!(3));
         assert_eq!(config["weights"]["enabled"], serde_json::json!(true));
         assert_eq!(config["weights"]["labels"][1], serde_json::json!("b"));
+    }
+
+    /// A float the carrier cannot hold fails the pool's load and names the key
+    /// that holds it, wherever in the bag it sits — rather than reaching the
+    /// scorer as unit with nothing said (#130).
+    #[test]
+    fn a_non_finite_float_in_config_fails_the_load_and_names_the_key() {
+        for (bag, key) in [
+            ("  weight: .inf\n", "config.weight"),
+            ("  weight: .nan\n", "config.weight"),
+            ("  weight: -.inf\n", "config.weight"),
+            ("  steps: [1.0, .inf]\n", "config.steps[1]"),
+            ("  fade:\n    weight: .nan\n", "config.fade.weight"),
+        ] {
+            let yaml = format!("name: movies\nexpr: 'x'\nconfig:\n{bag}");
+            let err = serde_norway::from_str::<Pool>(&yaml)
+                .expect_err("a non-finite float must fail the load")
+                .to_string();
+            assert!(err.contains(key), "error did not name `{key}`: {err}");
+            assert!(
+                err.contains("large finite number"),
+                "error did not tell the author what to write instead: {err}"
+            );
+        }
     }
 }

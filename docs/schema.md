@@ -553,7 +553,9 @@ is also the catch: **a mistyped key is silent.** `afinity_window_days` reads as
 unset and the script falls back to its own default, exactly as if it had been
 omitted — there is no warning, because there is nothing that knows the correct
 spelling. A script that wants strictness has to declare and check its own
-expected keys. On an `expr` pool `config:` is ignored, on the same terms.
+expected keys. On an `expr` pool `config:` is ignored, on the same terms — except
+for the one refusal below, which happens while the file is being parsed and so
+does not know whether the pool has a script.
 
 The worked example reads its two tunables this way, each falling back to the
 value written in the script:
@@ -596,6 +598,25 @@ values likewise arrive in TOML's own spelling. Nothing is dropped, and it is the
 same string a channel YAML's `date: 2026-07-28` already hands a scorer plugin. A
 script wanting a moment rather than a label parses it — the meaning of a key is
 the script's, here as everywhere else in the bag.
+
+It has one other consequence, and it is the single thing in the bag that can
+fail: **a float that is not a finite number is refused at load, naming the key.**
+`weight: .inf` in a pool's `config:` — or `-.inf`, `.nan`, and `inf`/`nan` in an
+overlay's `[config]` — cannot be carried at all, and would otherwise reach the
+script as unit while the author believed they had written a number. So the
+channel or the spec fails to load instead, with an error like:
+
+```
+`config.weights.affinity` is `inf`, but a script config can only carry finite
+numbers. Write a large finite number instead — `inf` and `nan` have no meaning
+here, and a script would receive nothing at all.
+```
+
+The key is named in full, including through arrays and sub-tables
+(`config.steps[1]`, `config.fade.weight`). Both surfaces refuse it in the same
+words. This is not the station judging what a key means — the value has no
+representation, so an author writing "never decays" writes a large finite number
+and the script's own comparison does the rest.
 
 Any future scripting surface follows the same shape: the station carries a bag
 of values it does not understand, and the script decides what they mean.
