@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use ersatztv_playout::playout::{DATE_FORMAT, Playout};
 use time::OffsetDateTime;
+use time_tz::Tz;
 
 use crate::errors::StationError;
 
@@ -57,9 +58,49 @@ pub fn highest_finish(files: &[DiscoveredFile]) -> Option<OffsetDateTime> {
     files.iter().map(|f| f.finish).max()
 }
 
-/// Delete emitted playout files whose window has fully elapsed past the
-/// retention horizon (`finish < now - retention_days`) and return how many were
-/// removed.
+/// What one sweep removed, split by which end of the window it fell off.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepCounts {
+    /// Files whose window fully elapsed past the retention horizon.
+    pub elapsed: usize,
+    /// Files starting beyond anything the forward window can reach.
+    pub unreachable: usize,
+}
+
+impl SweepCounts {
+    pub fn total(self) -> usize {
+        self.elapsed + self.unreachable
+    }
+}
+
+/// The first instant a correct generation can never write a file at.
+///
+/// Derived from how [`crate::emit`] lays chunks, not picked: a generation runs
+/// until the window target is covered, so the last chunk it opens is the one
+/// containing `target`; an item straddling that chunk's end is emitted whole and
+/// re-emitted into the next chunk, so one chunk of headroom past target's chunk
+/// is reachable and the one after it is not. An item longer than a whole chunk
+/// could in principle reach further; such a file is trimmed here and regenerated
+/// on the same tick, which costs a rewrite and never leaves a hole.
+pub fn unreachable_after(
+    target: OffsetDateTime,
+    chunk_hours: u32,
+    tz: &'static Tz,
+) -> OffsetDateTime {
+    let target_chunk = crate::tz::chunk_boundary_at_or_before(target, chunk_hours, tz);
+    let headroom = crate::tz::add_chunk(target_chunk, chunk_hours, tz);
+    crate::tz::add_chunk(headroom, chunk_hours, tz)
+}
+
+/// Delete emitted playout files that fell off either end of the channel's
+/// window: fully elapsed past the retention horizon (`finish < now -
+/// retention_days`), or starting at/after `unreachable` — beyond anything the
+/// forward window can produce.
+///
+/// The forward edge exists because forward materialization only ever moves the
+/// frontier ahead (`highest_finish`). A file dated years out — however it got
+/// there — makes the daemon read the window as already covered and stop
+/// generating forever, so nothing but this sweep can ever remove it.
 ///
 /// Cheap and idempotent: it parses the `{start}_{finish}.json` filename rather
 /// than the file contents, so re-running with the same inputs removes nothing.
@@ -68,7 +109,12 @@ pub fn highest_finish(files: &[DiscoveredFile]) -> Option<OffsetDateTime> {
 /// never swept. Housekeeping-grade: a scan failure or an individual delete
 /// failure is logged and skipped, never propagated, so a single un-removable
 /// file can't abort the sweep or tear down the daemon.
-pub async fn sweep_retention(folder: &Path, retention_days: u32, now: OffsetDateTime) -> usize {
+pub async fn sweep_window(
+    folder: &Path,
+    retention_days: u32,
+    unreachable: OffsetDateTime,
+    now: OffsetDateTime,
+) -> SweepCounts {
     let cutoff = now - time::Duration::days(i64::from(retention_days));
     let files = match scan_output_folder(folder).await {
         Ok(files) => files,
@@ -77,23 +123,39 @@ pub async fn sweep_retention(folder: &Path, retention_days: u32, now: OffsetDate
                 event = "retention.scan_failed",
                 folder = %folder.display(),
                 error = %e,
-                "retention sweep: scan failed; skipping",
+                "window sweep: scan failed; skipping",
             );
-            return 0;
+            return SweepCounts::default();
         }
     };
 
-    let mut removed = 0;
-    for f in files.iter().filter(|f| f.finish < cutoff) {
+    let mut counts = SweepCounts::default();
+    for f in &files {
+        let elapsed = f.finish < cutoff;
+        let beyond = f.start >= unreachable;
+        if !elapsed && !beyond {
+            continue;
+        }
         match tokio::fs::remove_file(&f.path).await {
             Ok(()) => {
-                tracing::info!(
-                    event = "retention.delete",
-                    file = %f.path.display(),
-                    finish = %f.finish,
-                    "pruned playout file past retention horizon",
-                );
-                removed += 1;
+                if elapsed {
+                    tracing::info!(
+                        event = "retention.delete",
+                        file = %f.path.display(),
+                        finish = %f.finish,
+                        "pruned playout file past retention horizon",
+                    );
+                    counts.elapsed += 1;
+                } else {
+                    tracing::info!(
+                        event = "unreachable.delete",
+                        file = %f.path.display(),
+                        start = %f.start,
+                        unreachable = %unreachable,
+                        "pruned playout file beyond the forward window",
+                    );
+                    counts.unreachable += 1;
+                }
             }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
@@ -101,12 +163,12 @@ pub async fn sweep_retention(folder: &Path, retention_days: u32, now: OffsetDate
                     event = "retention.delete_failed",
                     file = %f.path.display(),
                     error = %source,
-                    "retention sweep: failed to remove file",
+                    "window sweep: failed to remove file",
                 );
             }
         }
     }
-    removed
+    counts
 }
 
 /// The earliest instant in `[now, horizon)` that no scheduled item covers, when
@@ -416,8 +478,11 @@ mod tests {
         write_blank(&dir.path().join(".anchor")).await;
         write_blank(&dir.path().join(".durations.json")).await;
 
-        let removed = sweep_retention(dir.path(), 7, now).await;
-        assert_eq!(removed, 1);
+        // Far enough out that nothing here trips the forward edge.
+        let unreachable = datetime!(2027-01-01 00:00 UTC);
+        let swept = sweep_window(dir.path(), 7, unreachable, now).await;
+        assert_eq!(swept.elapsed, 1);
+        assert_eq!(swept.unreachable, 0);
         assert!(!dir.path().join(&old).exists(), "old file should be pruned");
         assert!(dir.path().join(&recent).exists(), "recent file kept");
         assert!(dir.path().join(&future).exists(), "future file kept");
@@ -428,7 +493,79 @@ mod tests {
         );
 
         // Idempotent: a second sweep removes nothing.
-        assert_eq!(sweep_retention(dir.path(), 7, now).await, 0);
+        assert_eq!(
+            sweep_window(dir.path(), 7, unreachable, now).await.total(),
+            0
+        );
+    }
+
+    // The 2037 case: a run from before the generation bound left files dated
+    // years out. Forward materialization can never revisit them — `highest_finish`
+    // only moves ahead, so the daemon reads the window as covered and stops — so
+    // the sweep is the only thing that can remove them.
+    #[tokio::test]
+    async fn sweep_removes_files_beyond_the_forward_window() {
+        let dir = tempdir().unwrap();
+        let now = datetime!(2026-08-08 00:00 UTC);
+        let unreachable = datetime!(2026-08-10 00:00 UTC);
+
+        // Inside the window: kept.
+        let today = window_name(
+            datetime!(2026-08-08 00:00 UTC),
+            datetime!(2026-08-08 06:00 UTC),
+        );
+        // Straddles the edge — starts before it, so a generation could have
+        // written it. Kept.
+        let straddling = window_name(
+            datetime!(2026-08-09 18:00 UTC),
+            datetime!(2026-08-10 06:00 UTC),
+        );
+        // Starts at the edge, and years past it: unreachable, both pruned.
+        let at_edge = window_name(
+            datetime!(2026-08-10 00:00 UTC),
+            datetime!(2026-08-10 06:00 UTC),
+        );
+        let runaway = window_name(
+            datetime!(2037-06-20 17:00 UTC),
+            datetime!(2037-06-20 23:00 UTC),
+        );
+        for name in [&today, &straddling, &at_edge, &runaway] {
+            write_blank(&dir.path().join(name)).await;
+        }
+
+        let swept = sweep_window(dir.path(), 7, unreachable, now).await;
+        assert_eq!(swept.unreachable, 2);
+        assert_eq!(swept.elapsed, 0);
+        assert!(dir.path().join(&today).exists(), "in-window file kept");
+        assert!(
+            dir.path().join(&straddling).exists(),
+            "a file starting before the edge is reachable and kept",
+        );
+        assert!(!dir.path().join(&at_edge).exists(), "edge file pruned");
+        assert!(!dir.path().join(&runaway).exists(), "2037 file pruned");
+
+        // The point of sweeping first: the frontier the daemon resumes from is
+        // back inside the window, so this tick generates instead of reading the
+        // window as covered through 2037 and doing nothing.
+        let files = scan_output_folder(dir.path()).await.unwrap();
+        assert_eq!(
+            highest_finish(&files),
+            Some(datetime!(2026-08-10 06:00 UTC)),
+        );
+    }
+
+    // Headroom is derived from how chunks are laid, not picked: the chunk
+    // holding the target is reachable, so is the one after it (an item
+    // straddling the boundary is emitted whole), and the one after that is not.
+    #[test]
+    fn unreachable_edge_sits_two_chunks_past_the_target() {
+        let tz = crate::tz::parse("UTC").unwrap();
+        let target = datetime!(2026-08-09 07:30 UTC);
+        // Target sits in the 06:00 chunk; two 6h chunks on gives 18:00.
+        assert_eq!(
+            unreachable_after(target, 6, tz),
+            datetime!(2026-08-09 18:00 UTC),
+        );
     }
 
     #[tokio::test]

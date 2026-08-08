@@ -171,7 +171,7 @@ A `channel.toml` declaring:
 | `window_days` | no, default 1 | How far into the future to materialize. Also the length of one generation, whichever shape the channel is: a pattern block with no `cycles` stops at the first cycle boundary that covers this span, and a flat `entries` list longer than the span stops at the item that covers it and resumes there next time. Neither can book the channel years ahead. |
 | `chunk_hours` | no, default 6 | Each playout JSON file's `[start, finish)` span. File size only — it does not gate how far ahead the scheduler works. |
 | `roll_interval` | no, default `1h` | How often to extend the window forward. |
-| `retention_days` | no, default 7 | Past playout files older than this get deleted. |
+| `retention_days` | no, default 7 | Past playout files older than this get deleted. The forward end of the window is bounded too — see the sweep below. |
 | `rule` | yes | Rule type + rule-specific params. |
 | `items` | yes (for an entries block) | Ordered list with metadata. |
 
@@ -196,13 +196,34 @@ Per-channel `tz` override is **not** in v1 — single household, single zone. Ad
 
 **Startup**
 1. Read the station file + each channel config.
-2. For each channel: scan `output_folder/` for existing playout files; compute the latest `finish` already materialized.
+2. For each channel: sweep the window (below), then scan `output_folder/` for existing playout files and compute the latest `finish` already materialized.
 3. If less than `window_days` is materialized: render new chunks forward until full.
 4. Compute the next roll tick.
 
 **Roll tick**
-1. For each channel: delete playout files whose `finish` < (now − `retention_days`).
+1. For each channel: sweep the window.
 2. Render new chunks until `window_days` from now is materialized.
+
+**Window sweep**
+
+The window has two ends and both are enforced, in this order, before the
+frontier is read:
+
+1. Delete playout files whose `finish` < (now − `retention_days`).
+2. Delete playout files whose `start` is at or after the unreachable edge — two
+   chunk boundaries past `now + window_days`. One chunk of headroom because a
+   generation opens the chunk holding the target; a second because an item
+   straddling that chunk's end is emitted whole into the next one. Nothing
+   further out can be produced by a correct pass.
+3. If step 2 removed anything, rewind the resume sidecar and truncate the play
+   ledger at that same edge, so a scorer's "recently aired" list can't be fed
+   airings from a span that no longer exists.
+
+Step 2 is not optional housekeeping. Forward materialization only ever moves
+the frontier ahead, so a single file dated past the window makes the daemon read
+the window as covered and stop generating — permanently. The sweep is the only
+thing that can remove such a file, which is why it runs before the frontier is
+computed rather than after the chunks are written.
 
 **Config reload** (SIGHUP)
 1. SIGHUP re-reads the station file and every channel config from disk. SIGTERM/SIGINT shut the daemon down; a file watcher is deferred (v2).

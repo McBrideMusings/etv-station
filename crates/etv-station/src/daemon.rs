@@ -1342,6 +1342,37 @@ async fn pattern_catch_up(
     let overlay_spec = load_overlay_playout_spec(channel);
     let mut cache = DurationCache::load(output).await?;
 
+    // Bound the window at both ends BEFORE reading the frontier, so a file
+    // dated past what the window can reach never gets a vote on where
+    // generation resumes. Order matters: `highest_finish` below is the only
+    // thing that decides whether this tick generates at all, and a single
+    // stranded far-future file makes it answer "already covered" forever.
+    let unreachable = scan::unreachable_after(target, channel.config.chunk_hours, ctx.tz);
+    let swept = scan::sweep_window(output, channel.config.retention_days, unreachable, now).await;
+    if swept.unreachable > 0 {
+        // The deleted spans have records: pool checkpoints in the sidecar and
+        // airings in the ledger, both dated in the span just removed. Left
+        // standing, `ledger.tail()` would hand the scorer a "recently aired"
+        // list from years in the future. Same three calls the coverage-heal
+        // path makes below, at the same cutoff.
+        resume.rewind_to(unreachable);
+        ledger.truncate_from(unreachable);
+        crate::history::save(output, ledger).await?;
+        crate::resume::save(output, &resume).await?;
+    }
+    if swept.total() > 0 {
+        tracing::info!(
+            event = "window.sweep",
+            channel = %channel.name,
+            phase = phase,
+            elapsed = swept.elapsed,
+            unreachable = swept.unreachable,
+            retention_days = channel.config.retention_days,
+            unreachable_after = %unreachable,
+            "window sweep pruned playout files",
+        );
+    }
+
     // Repair a coverage hole before extending the window. An interrupted run
     // from before the honest-naming fix — or any unforeseen cause — can leave a
     // chunk that airs black between two covered spans, and forward
@@ -1626,17 +1657,6 @@ async fn pattern_catch_up(
     }
     cache.save(output).await?;
 
-    let removed = scan::sweep_retention(output, channel.config.retention_days, now).await;
-    if removed > 0 {
-        tracing::info!(
-            event = "retention.sweep",
-            channel = %channel.name,
-            phase = phase,
-            removed = removed,
-            retention_days = channel.config.retention_days,
-            "retention sweep pruned playout files",
-        );
-    }
     Ok(resume)
 }
 
