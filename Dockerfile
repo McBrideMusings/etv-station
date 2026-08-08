@@ -89,9 +89,13 @@ FROM ghcr.io/ersatztv/ersatztv-ffmpeg:8.1.2 AS runtime
 # children, so PID 1 has real supervision work to do. libvulkan1 +
 # mesa-vulkan-drivers give etv-overlay a software Vulkan (lavapipe), so overlay
 # rendering works on a headless host with no GPU; channels without an overlay
-# never spawn it and don't exercise these.
+# never spawn it and don't exercise these. iproute2 is here for `ss`: asking
+# whether a frozen player still holds a connection open is a question only the
+# server's own network namespace can answer, and without it the shell answers
+# "command not found" on stderr and exits 0, which reads as "no connections".
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        iproute2 \
         libvulkan1 \
         mesa-vulkan-drivers \
         tini \

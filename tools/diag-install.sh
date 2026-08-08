@@ -127,11 +127,27 @@ do_start() {
 
 do_stop() {
   printf '%s stopping\n' "$(bold '==>')"
+  # Signal the whole process group, not just the script. `start` launches each
+  # diagnostic under setsid, so it leads its own group and the tcpdump it spawns
+  # sits in that group beside it; a negative pid reaches both.
+  #
+  # What this replaces was a second, separate kill that hunted the tcpdump by
+  # grepping the process list for its capture filter. The filter is written in
+  # stream-access-log.py and the pattern that had to match it lived down here,
+  # with nothing tying the two together — so rewording the filter would have
+  # left a tcpdump running against a log nobody reads, while this script
+  # reported a clean stop. Nothing here spells out the filter any more.
+  #
+  # Reaching a whole group makes alive_pid's identity check load-bearing rather
+  # than merely tidy: a stale pid file naming a number the kernel has since
+  # handed to something else would otherwise take down that program and every
+  # process it started.
   remote "$REMOTE_ALIVE_FN
     cd '$REMOTE_DIR' 2>/dev/null || exit 0
     stop_one() {
       if alive_pid \"\$1.pid\" \"\$2\"; then
-        kill \"\$ALIVE_PID\" 2>/dev/null && echo \"stopped \$1 (\$ALIVE_PID)\"
+        kill -TERM \"-\$ALIVE_PID\" 2>/dev/null || kill \"\$ALIVE_PID\" 2>/dev/null
+        echo \"stopped \$1 (\$ALIVE_PID)\"
         rm -f \"\$1.pid\"
       else
         echo \"\$1 was not running\"
@@ -139,7 +155,6 @@ do_stop() {
     }
     stop_one access stream-access-log.py
     stop_one watch stream-watch.py
-    pkill -f 'tcp dst port $ETV_PORT_HOST' 2>/dev/null || true
   "
 }
 
