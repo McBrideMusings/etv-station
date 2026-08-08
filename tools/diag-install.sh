@@ -55,6 +55,39 @@ SSH_TARGET="$UNRAID_USER@$UNRAID_HOST"
 
 remote() { ssh -o ConnectTimeout=10 "$SSH_TARGET" "$@"; }
 
+# Sent ahead of every remote body that cares whether a diagnostic is alive:
+# is the pid recorded in $1 a live process that is actually the script named
+# in $2?
+#
+# Asking the kernel whether the number exists is not enough. Linux hands out
+# process ids in a loop, so once a diagnostic dies the number left behind in
+# its pid file is eventually handed to something else — an smbd worker, a
+# docker helper — and a bare existence check then swears the diagnostic is
+# still recording. Match the script's own name against /proc/<pid>/cmdline,
+# which the kernel already maintains, and treat a pid that belongs to a
+# stranger exactly like no pid at all: report it dead and delete the stale
+# file, so `start` stops believing there is nothing to do.
+#
+# POSIX sh — this runs under /bin/sh on the Unraid host, not bash. On success
+# it sets ALIVE_PID to the confirmed pid.
+# shellcheck disable=SC2016  # the $1/$2 in here are the remote shell's, not ours
+REMOTE_ALIVE_FN='
+alive_pid() {
+  ALIVE_PID=
+  [ -f "$1" ] || return 1
+  _pid=$(cat "$1" 2>/dev/null)
+  case "$_pid" in
+    "" | *[!0-9]*) rm -f "$1"; return 1 ;;
+  esac
+  if [ -r "/proc/$_pid/cmdline" ] && tr "\000" " " < "/proc/$_pid/cmdline" | grep -qF "$2"; then
+    ALIVE_PID="$_pid"
+    return 0
+  fi
+  rm -f "$1"
+  return 1
+}
+'
+
 do_install() {
   printf '%s copying diagnostics to %s:%s\n' "$(bold '==>')" "$UNRAID_HOST" "$REMOTE_DIR"
   remote "mkdir -p '$REMOTE_DIR' '$LOG_DIR'" || exit 2
@@ -70,9 +103,9 @@ do_start() {
   printf '%s starting\n' "$(bold '==>')"
   # setsid detaches from this ssh session, so the processes outlive the
   # connection rather than dying with it.
-  remote "
+  remote "$REMOTE_ALIVE_FN
     cd '$REMOTE_DIR' || exit 2
-    if [ -f access.pid ] && kill -0 \"\$(cat access.pid)\" 2>/dev/null; then
+    if alive_pid access.pid stream-access-log.py; then
       echo 'access log already running'
     else
       PORT='$ETV_PORT_HOST' LOG_FILE='$ACCESS_LOG' \
@@ -80,7 +113,7 @@ do_start() {
       echo \$! > access.pid
       echo 'access log started'
     fi
-    if [ -f watch.pid ] && kill -0 \"\$(cat watch.pid)\" 2>/dev/null; then
+    if alive_pid watch.pid stream-watch.py; then
       echo 'stream watcher already running'
     else
       HLS_ROOT='$ETV_STATION_DATA/hls' LOG_FILE='$EVENTS_LOG' \
@@ -94,21 +127,18 @@ do_start() {
 
 do_stop() {
   printf '%s stopping\n' "$(bold '==>')"
-  remote "
+  remote "$REMOTE_ALIVE_FN
     cd '$REMOTE_DIR' 2>/dev/null || exit 0
-    for name in access watch; do
-      if [ -f \$name.pid ]; then
-        pid=\$(cat \$name.pid)
-        if kill -0 \$pid 2>/dev/null; then
-          kill \$pid 2>/dev/null && echo \"stopped \$name (\$pid)\"
-        else
-          echo \"\$name was not running\"
-        fi
-        rm -f \$name.pid
+    stop_one() {
+      if alive_pid \"\$1.pid\" \"\$2\"; then
+        kill \"\$ALIVE_PID\" 2>/dev/null && echo \"stopped \$1 (\$ALIVE_PID)\"
+        rm -f \"\$1.pid\"
       else
-        echo \"\$name was not running\"
+        echo \"\$1 was not running\"
       fi
-    done
+    }
+    stop_one access stream-access-log.py
+    stop_one watch stream-watch.py
     pkill -f 'tcp dst port $ETV_PORT_HOST' 2>/dev/null || true
   "
 }
@@ -117,11 +147,11 @@ do_status() {
   printf '%s status\n' "$(bold '==>')"
   # Absolute paths rather than a cd, so a missing diag folder is just one more
   # script reported as never installed instead of a separate one-line dead end.
-  remote "
+  remote "$REMOTE_ALIVE_FN
     report() {
       label=\$1; pid_file='$REMOTE_DIR'/\$2; script='$REMOTE_DIR'/\$3
-      if [ -f \"\$pid_file\" ] && kill -0 \"\$(cat \"\$pid_file\")\" 2>/dev/null; then
-        echo \"  RUNNING        \$label (pid \$(cat \"\$pid_file\"))\"
+      if alive_pid \"\$pid_file\" \"\$3\"; then
+        echo \"  RUNNING        \$label (pid \$ALIVE_PID)\"
       elif [ -f \"\$script\" ]; then
         echo \"  NOT RUNNING    \$label — installed on this host but no process is alive.\"
         echo \"                 Restart it (needed after every Unraid reboot): tools/diag-install.sh start\"
