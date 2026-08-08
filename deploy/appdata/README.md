@@ -12,6 +12,9 @@ deploy/appdata/
   channels/                           one file per channel
   blocks/                             block definitions the channels reference
   overlays/                           overlay specs + their scripts
+  plugins/                            scorer scripts a channel's pool names via
+                                      `plugin:`, resolved relative to the
+                                      channel file (so `../plugins/x.rhai`)
   etv-next/
     normalization.default.json        the ffmpeg + normalization block every
                                       channel body is built from
@@ -32,9 +35,11 @@ What the container supplies, so these files stay host-agnostic:
 | `ETV_HLS_OUTPUT` | `/data/hls` | ETV-next's HLS working set |
 | `ETV_PORT` | `8409` | the port the lineup, `channels.m3u`, and `xmltv.xml` are served on |
 
-Media roots (`ETV_STATION_SOURCE_ROOTS`) and Plex credentials (`PLEX_URL`,
-`PLEX_TOKEN`) are per-host, so they come from the container's environment
-rather than from any file here.
+Media roots (`ETV_STATION_SOURCE_ROOTS`), Plex credentials (`PLEX_URL`,
+`PLEX_TOKEN`), and Tautulli credentials (`TAUTULLI_URL`, `TAUTULLI_API_KEY`)
+are per-host, so they come from the container's environment rather than from
+any file here. Tautulli is what a scorer plugin ranks by: without it the watch
+history the daemon hands the script is empty, and the ranking is arbitrary.
 
 Only `README.md` and `etv-next/normalization.default.json` are committed — the
 channels, blocks, overlays, and the station config itself are personal, the same

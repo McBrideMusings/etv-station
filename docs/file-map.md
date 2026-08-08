@@ -175,7 +175,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 
 | Path | What |
 |---|---|
-| `deploy/appdata/` | Local mirror of the folder the deployed container runs out of (`/config`): `station.yaml`, `channels/`, `blocks/`, `overlays/`, and `etv-next/normalization.default.json`. Pushing it is a config change; rebuilding the image is a code change. Only the README and the normalization defaults are committed — the rest is personal, like `examples/channels/`. See the README inside. |
+| `deploy/appdata/` | Local mirror of the folder the deployed container runs out of (`/config`): `station.yaml`, `channels/`, `blocks/`, `overlays/`, `plugins/` (scorer scripts a channel names via `plugin:`, resolved relative to the channel file), and `etv-next/normalization.default.json`. Pushing it is a config change; rebuilding the image is a code change. Only the README and the normalization defaults are committed — the rest is personal, like `examples/channels/`. See the README inside. |
 | `tmp/run.log` | Tee'd output of the most recent dev/tooling invocation. Inspect after a failed run. |
 | `target/` | Cargo build output. Gitignored. |
 | `docs/.vitepress/cache/`, `docs/.vitepress/dist/` | VitePress cache and build output. Gitignored. |
