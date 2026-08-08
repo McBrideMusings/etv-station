@@ -539,51 +539,7 @@ async fn run_generation(
                     catalog: cat.as_deref(),
                     history: &hist,
                 };
-                // This channel's own read-only handle on the catalog, opened
-                // once and owned for the life of the task. Owned rather than
-                // borrowed because a `&Catalog` cannot cross an `.await` in a
-                // spawned task — `Connection` is `Send` but `!Sync` — while the
-                // `Option<Catalog>` itself moves freely.
-                //
-                // A handle that won't open leaves this channel catalog-free, the
-                // same state a station with no `catalog_path` puts every channel
-                // in. That is exactly right for the two kinds of channel: one
-                // built from inline `manual` entries never reads the catalog and
-                // keeps airing, and one built from a `query` has nothing to
-                // resolve against — which `resolve_channel` already reports, per
-                // channel, naming the query. Failing the task here instead would
-                // take a manual channel off the air over a database it does not
-                // use.
-                let reader = match cat.as_deref().map(|c| Catalog::open_readonly(&c.path)) {
-                    Some(Ok(c)) => Some(c),
-                    None => None,
-                    Some(Err(e)) => {
-                        tracing::error!(
-                            event = "catalog.reader_failed",
-                            channel = %ch.name,
-                            error = %e,
-                            "could not open this channel's catalog reader; it will run \
-                             catalog-free — inline entries still air, queries will error",
-                        );
-                        None
-                    }
-                };
-                let result = channel_loop(ch, ctx, reader, stop).await;
-                // A channel_loop error is fatal to THIS channel. Task handles
-                // are only joined at shutdown (see below), so without logging
-                // here a startup failure — a failed duration probe, unreadable
-                // media, sidecar or emit error — would stay invisible until the
-                // daemon stops: the channel silently emits nothing while the
-                // rest of the daemon reports healthy. Log it at the point of
-                // failure so it is immediately diagnosable.
-                if let Err(err) = &result {
-                    tracing::error!(
-                        event = "channel.failed",
-                        channel = %ch.name,
-                        error = %err,
-                        "channel loop exited with error; this channel will emit no further output until the daemon reloads or restarts",
-                    );
-                }
+                let result = supervise_channel(ch, ctx, stop).await;
                 (ch.name.clone(), result)
             }
             .instrument(span),
@@ -794,6 +750,379 @@ async fn channel_loop(
     shutdown: Arc<Notify>,
 ) -> Result<(), StationError> {
     forward_channel_loop(channel, ctx, catalog, shutdown).await
+}
+
+/// How long the supervisor waits before the first restart of a channel loop that
+/// died, doubling per consecutive failure up to the channel's `roll_interval`.
+///
+/// Most causes of a dead loop are transient and outlast a few seconds but not an
+/// hour: a stale SMB mount, a full disk, a sidecar someone had open. Because the
+/// playout JSON already on disk keeps airing for up to `window_days`, a restart
+/// that lands inside the hour is invisible to viewers — nobody sees anything at
+/// all, because the written window never drains.
+const CHANNEL_RESTART_BACKOFF_START: Duration = Duration::from_secs(30);
+
+/// Consecutive failures before the channel gets a card on screen. Two failures
+/// with a doubling wait between them is still a channel having a moment; a third
+/// is a channel that is not coming back on its own, and by then a viewer needs to
+/// be told something rather than watch the written window run out into black.
+const CHANNEL_FAILURES_BEFORE_CARD: u32 = 3;
+
+/// Keep one channel on the air across failures of its own loop.
+///
+/// Without this, a loop that returned `Err` was simply gone: the task handle is
+/// only joined at shutdown, so the failure was logged once and the channel aired
+/// whatever had already been written — up to `window_days` of normal programming
+/// — and then went dark with no further output and no explanation on screen.
+///
+/// So the loop is restarted on a widening backoff, and once it has clearly
+/// stopped coming back the channel says so on screen instead of falling silent.
+/// The first error is still carried out to the caller, so the daemon's exit code
+/// means exactly what it meant before.
+async fn supervise_channel(
+    channel: &LoadedChannel,
+    ctx: StationContext<'_>,
+    stop: Arc<Notify>,
+) -> Result<(), StationError> {
+    let attempt = || {
+        let stop = stop.clone();
+        async move {
+            // This attempt's own read-only handle on the catalog, opened fresh
+            // each time so a restart also retries a database that would not
+            // open. Owned rather than borrowed because a `&Catalog` cannot cross
+            // an `.await` in a spawned task — `Connection` is `Send` but `!Sync`
+            // — while the `Option<Catalog>` itself moves freely.
+            //
+            // A handle that won't open leaves this channel catalog-free, the
+            // same state a station with no `catalog_path` puts every channel in.
+            // That is exactly right for the two kinds of channel: one built from
+            // inline `manual` entries never reads the catalog and keeps airing,
+            // and one built from a `query` has nothing to resolve against —
+            // which `resolve_channel` already reports, per channel, naming the
+            // query. Failing the task here instead would take a manual channel
+            // off the air over a database it does not use.
+            let reader = match ctx.catalog.map(|c| Catalog::open_readonly(&c.path)) {
+                Some(Ok(c)) => Some(c),
+                None => None,
+                Some(Err(e)) => {
+                    tracing::error!(
+                        event = "catalog.reader_failed",
+                        channel = %channel.name,
+                        error = %e,
+                        "could not open this channel's catalog reader; it will run \
+                         catalog-free — inline entries still air, queries will error",
+                    );
+                    None
+                }
+            };
+            channel_loop(channel, ctx, reader, stop).await
+        }
+    };
+    supervise(channel, ctx.tz, stop.clone(), attempt).await
+}
+
+/// The restart-and-card policy on its own, with the thing it supervises passed
+/// in — so a test can drive a channel loop that fails a chosen number of times
+/// and then succeeds, and read the timeline that leaves on disk.
+async fn supervise<F, Fut>(
+    channel: &LoadedChannel,
+    tz: &'static Tz,
+    stop: Arc<Notify>,
+    mut run: F,
+) -> Result<(), StationError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), StationError>>,
+{
+    let mut first_err: Option<StationError> = None;
+    // Never reset, because it cannot go stale: `forward_channel_loop` only
+    // returns `Err` from its startup section — once it reaches the roll loop a
+    // failed tick is logged as `roll.error` and the loop carries on. So every
+    // failure counted here is a failed *start*, and three of them are three in a
+    // row inside about three and a half minutes.
+    let mut consecutive: u32 = 0;
+    let mut backoff = CHANNEL_RESTART_BACKOFF_START;
+    // Never wait longer than a roll tick: past that the channel would miss the
+    // cadence it is configured to extend its window on.
+    let backoff_cap = channel
+        .config
+        .roll_interval
+        .max(CHANNEL_RESTART_BACKOFF_START);
+
+    loop {
+        // Take down any card covering the future before handing the channel back
+        // to its own loop. This runs before every attempt, including the first,
+        // so cards left behind by a daemon that was killed or reloaded while
+        // broken are cleared too. Cards that have already started are left alone:
+        // one is on screen right now, and the rest are a record of what aired.
+        //
+        // It has to happen *before* the loop starts, not after it succeeds: the
+        // loop picks up from the end of everything written, so a card run still
+        // on disk would push the real schedule out beyond it. The cost is that
+        // the far end of the window is briefly uncovered while the attempt runs
+        // — a failed start, which is seconds — and if the attempt fails again the
+        // card run is rewritten immediately below.
+        match crate::channel_card::wipe_cards_from(channel, OffsetDateTime::now_utc()).await {
+            Ok(0) => {}
+            Ok(dropped) => tracing::info!(
+                event = "channel.cards_cleared",
+                channel = %channel.name,
+                dropped = dropped,
+                "cleared channel error cards from the future; regenerating the real schedule",
+            ),
+            Err(err) => tracing::error!(
+                event = "channel.card_clear_failed",
+                channel = %channel.name,
+                error = %err,
+                "could not clear channel error cards; the real schedule will be laid after them",
+            ),
+        }
+
+        let err = match run().await {
+            // The only clean exit is shutdown, and it ends the supervisor too.
+            Ok(()) => return first_err.map_or(Ok(()), Err),
+            Err(err) => err,
+        };
+        consecutive += 1;
+        // Logged on every failure, not just the first: a channel that keeps
+        // dying must not read as healthy to whoever is watching the logs, and the
+        // card below only spares the viewer, never the operator.
+        tracing::error!(
+            event = "channel.failed",
+            channel = %channel.name,
+            error = %err,
+            failures = consecutive,
+            backoff_secs = backoff.as_secs(),
+            "channel loop exited with error; restarting after backoff",
+        );
+        let reason = err.to_string();
+        first_err.get_or_insert(err);
+
+        if consecutive >= CHANNEL_FAILURES_BEFORE_CARD {
+            match crate::channel_card::cover_after_written(
+                channel,
+                tz,
+                &reason,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            {
+                Ok(Some(from)) => tracing::warn!(
+                    event = "channel.carded",
+                    channel = %channel.name,
+                    failures = consecutive,
+                    from = %from,
+                    "channel loop keeps failing; covering the rest of its window with an on-screen card",
+                ),
+                Ok(None) => {}
+                Err(err) => tracing::error!(
+                    event = "channel.card_failed",
+                    channel = %channel.name,
+                    error = %err,
+                    "could not write the channel error card; this channel will go dark when its written window runs out",
+                ),
+            }
+        }
+
+        select! {
+            biased;
+            _ = stop.notified() => return first_err.map_or(Ok(()), Err),
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = backoff.saturating_mul(2).min(backoff_cap);
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+    use ersatztv_playout::playout::{Playout, PlayoutItem};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    fn fixture(dir: &TempDir) -> LoadedChannel {
+        let config: ChannelConfig = toml::from_str(
+            "window_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n\
+             [rule]\nblocks = []\n",
+        )
+        .expect("fixture channel config parses");
+        LoadedChannel {
+            name: "testch".into(),
+            config_path: PathBuf::from("testch.toml"),
+            output_folder: dir.path().to_path_buf(),
+            config,
+        }
+    }
+
+    /// Everything the channel will air, in order. An item straddling a chunk
+    /// boundary is deliberately written into both neighbouring files so either
+    /// side can play it, so the same airing is read twice and folded back into
+    /// one here.
+    async fn timeline(dir: &Path) -> Vec<PlayoutItem> {
+        let mut all = Vec::new();
+        for f in scan::scan_output_folder(dir).await.unwrap() {
+            let bytes = tokio::fs::read(&f.path).await.unwrap();
+            all.extend(serde_json::from_slice::<Playout>(&bytes).unwrap().items);
+        }
+        all.sort_by_key(|i| i.start);
+        all.dedup_by(|a, b| a.id == b.id && a.start == b.start);
+        all
+    }
+
+    fn is_card(item: &PlayoutItem) -> bool {
+        item.id.starts_with("etv-station-channel-card")
+    }
+
+    /// What a healthy loop leaves behind: half-hour programmes laid end to end
+    /// from the end of whatever is already written, out to the end of the window.
+    async fn lay_real_schedule(channel: &LoadedChannel, tz: &'static Tz) {
+        let existing = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+        let slot = Duration::from_secs(1800);
+        let target = now + window_duration(channel.config.window_days);
+        let count = ((target - from).as_seconds_f64() / 1800.0).ceil().max(0.0) as usize;
+        let items: Vec<crate::resolve::ResolvedItem> = (0..count)
+            .map(|i| crate::resolve::ResolvedItem {
+                id: format!("film-{i}"),
+                source: crate::config::SourceConfig::Lavfi {
+                    params: "color=c=blue".into(),
+                },
+                in_point: Some(Duration::ZERO),
+                out_point: Some(slot),
+                program: None,
+                catalog_duration: None,
+                error_card: false,
+            })
+            .collect();
+        let durations = vec![slot; count];
+        let rule = crate::rule::Sequential::new(&items, &durations);
+        crate::emit::emit_window(
+            &channel.output_folder,
+            &rule,
+            from,
+            tz,
+            channel.config.chunk_hours,
+            from,
+            from + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// One bad tick is not a broken channel: the loop is restarted, the window is
+    /// filled with real programmes, and no card is ever written.
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_that_fails_once_recovers_with_no_card_and_no_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let ch = fixture(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let calls = AtomicUsize::new(0);
+
+        let result = supervise(&ch, tz, Arc::new(Notify::new()), || async {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(StationError::Task("stale mount".into()));
+            }
+            lay_real_schedule(&ch, tz).await;
+            Ok(())
+        })
+        .await;
+
+        // The first error still reaches the caller, so the daemon's exit code
+        // means what it always meant.
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the loop was restarted once"
+        );
+        let items = timeline(dir.path()).await;
+        assert!(!items.is_empty());
+        assert!(!items.iter().any(is_card), "one failure must not card");
+        for pair in items.windows(2) {
+            assert_eq!(pair[0].finish, pair[1].start, "gap in the timeline");
+        }
+    }
+
+    /// A channel that keeps dying gets its window covered with cards rather than
+    /// airing out its written schedule and going dark.
+    #[tokio::test(start_paused = true)]
+    async fn three_consecutive_failures_put_a_card_on_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let ch = fixture(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let stop = Arc::new(Notify::new());
+        let calls = AtomicUsize::new(0);
+        let before = OffsetDateTime::now_utc();
+
+        let s = stop.clone();
+        let result = supervise(&ch, tz, stop.clone(), || async {
+            // Four failures: the third is the one that cards, the fourth proves
+            // the card is refreshed rather than written once and forgotten.
+            if calls.fetch_add(1, Ordering::SeqCst) >= 3 {
+                s.notify_one();
+            }
+            Err(StationError::Task("catalog is locked".into()))
+        })
+        .await;
+
+        assert!(result.is_err());
+        let items = timeline(dir.path()).await;
+        assert!(!items.is_empty(), "the window was left uncovered");
+        assert!(items.iter().all(is_card), "everything on air is a card");
+        for pair in items.windows(2) {
+            assert_eq!(pair[0].finish, pair[1].start, "gap between cards");
+        }
+        assert!(
+            items.last().unwrap().finish >= before + window_duration(ch.config.window_days),
+            "cards must reach the end of the window",
+        );
+    }
+
+    /// Recovery: the cards come off and the real schedule takes over, rather than
+    /// being laid behind a day of black. The one card already on screen at that
+    /// moment plays out its five minutes — pulling it would cut a viewer to black
+    /// mid-item, which is the thing this whole path exists to avoid.
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_that_comes_back_replaces_its_cards_with_real_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let ch = fixture(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let calls = AtomicUsize::new(0);
+        let recovered_at = std::sync::Mutex::new(None);
+
+        let result = supervise(&ch, tz, Arc::new(Notify::new()), || async {
+            if calls.fetch_add(1, Ordering::SeqCst) < 3 {
+                return Err(StationError::Task("disk is full".into()));
+            }
+            *recovered_at.lock().unwrap() = Some(OffsetDateTime::now_utc());
+            lay_real_schedule(&ch, tz).await;
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_err(), "the failures still surface");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let recovered_at = recovered_at.lock().unwrap().expect("the loop came back");
+        let items = timeline(dir.path()).await;
+        assert!(!items.is_empty());
+        assert!(
+            items.iter().filter(|i| is_card(i)).count() <= 1,
+            "only the card already airing may survive: {:?}",
+            items.iter().map(|i| &i.id).collect::<Vec<_>>(),
+        );
+        assert!(
+            !items.iter().any(|i| is_card(i) && i.start >= recovered_at),
+            "nothing carded may be scheduled once the channel is back",
+        );
+        assert!(items.iter().any(|i| !is_card(i)), "real items took over");
+        for pair in items.windows(2) {
+            assert_eq!(pair[0].finish, pair[1].start, "gap after recovery");
+        }
+    }
 }
 
 /// Bound on how many generations one catch-up will chain before giving up, so
@@ -1304,7 +1633,7 @@ fn clone_overlay_spec(spec: &PlayoutOverlaySpec) -> PlayoutOverlaySpec {
     }
 }
 
-fn window_duration(window_days: u32) -> time::Duration {
+pub(crate) fn window_duration(window_days: u32) -> time::Duration {
     time::Duration::seconds(window_days as i64 * 24 * 3600)
 }
 

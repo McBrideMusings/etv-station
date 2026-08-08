@@ -1,5 +1,6 @@
 pub mod atomic;
 pub mod catalog;
+pub mod channel_card;
 pub mod config;
 pub mod constrain;
 pub mod daemon;
