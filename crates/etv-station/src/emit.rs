@@ -129,7 +129,10 @@ async fn remove_other_chunk_files(folder: &Path, chunk_start: OffsetDateTime, ke
     }
 }
 
-fn chunk_filename(start: OffsetDateTime, finish: OffsetDateTime) -> Result<String, StationError> {
+pub(crate) fn chunk_filename(
+    start: OffsetDateTime,
+    finish: OffsetDateTime,
+) -> Result<String, StationError> {
     let s = format_for_filename(start)?;
     let f = format_for_filename(finish)?;
     Ok(format!("{s}_{f}.json"))

@@ -34,9 +34,6 @@ const DEFAULT_ERROR_FONT: &str = "/usr/share/fonts/truetype/noto/NotoSans-Regula
 /// was meant to air. A viewer who tunes in sees the title they expected and the
 /// reason it is not playing, rather than a channel that went quiet.
 pub fn make_error_card(item: &mut ResolvedItem, path: &Path, reason: &str, slot: Duration) {
-    let font =
-        std::env::var("ETV_STATION_ERROR_FONT").unwrap_or_else(|_| DEFAULT_ERROR_FONT.to_string());
-
     let title = item
         .program
         .as_ref()
@@ -44,28 +41,59 @@ pub fn make_error_card(item: &mut ResolvedItem, path: &Path, reason: &str, slot:
         .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| item.id.clone());
 
+    item.source = SourceConfig::Lavfi {
+        params: card_params("PLAYBACK ERROR", &title, reason),
+    };
+    item.in_point = Some(Duration::ZERO);
+    item.out_point = Some(slot);
+    item.error_card = true;
+}
+
+/// Build one segment of the card a channel airs when its **own loop** has died
+/// — a different trigger from [`make_error_card`] above (nothing is wrong with
+/// any single file; the thing that schedules them stopped running), rendered the
+/// same way so a viewer sees one consistent failure screen.
+///
+/// Returned as a fresh item rather than applied to an existing one because there
+/// is no resolved item to rewrite: the channel failed before it produced any.
+pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration) -> ResolvedItem {
+    ResolvedItem {
+        id,
+        source: SourceConfig::Lavfi {
+            params: card_params("CHANNEL UNAVAILABLE", channel, reason),
+        },
+        in_point: Some(Duration::ZERO),
+        out_point: Some(slot),
+        // The guide should say what the screen says, not leave a blank cell.
+        program: Some(ersatztv_playout::playout::ProgramMetadata {
+            title: Some(format!("{channel} unavailable")),
+            description: Some(reason.to_string()),
+            ..Default::default()
+        }),
+        catalog_duration: None,
+        error_card: true,
+    }
+}
+
+/// Three stacked lines on black, plus silence. The filter-graph shape — two
+/// labelled outputs — is the same one an authored `lavfi` item uses, so nothing
+/// further down needs to know this item is special.
+fn card_params(headline: &str, subject: &str, reason: &str) -> String {
+    let font =
+        std::env::var("ETV_STATION_ERROR_FONT").unwrap_or_else(|_| DEFAULT_ERROR_FONT.to_string());
     let line = |text: &str, size: u32, y: u32| {
         format!(
             "drawtext=fontfile={font}:text={}:fontcolor=white:fontsize={size}:x=60:y={y}",
             drawtext_safe(text)
         )
     };
-
-    // Three stacked lines on black, plus silence. The filter-graph shape — two
-    // labelled outputs — is the same one an authored `lavfi` item uses, so
-    // nothing further down needs to know this item is special.
-    let params = format!(
+    format!(
         "color=c=black:s=1280x720:r=30,{},{},{} [out0]; \
          anullsrc=channel_layout=stereo:sample_rate=48000 [out1]",
-        line("PLAYBACK ERROR", 52, 60),
-        line(&title, 30, 150),
+        line(headline, 52, 60),
+        line(subject, 30, 150),
         line(reason, 24, 210),
-    );
-
-    item.source = SourceConfig::Lavfi { params };
-    item.in_point = Some(Duration::ZERO);
-    item.out_point = Some(slot);
-    item.error_card = true;
+    )
 }
 
 /// Reduce arbitrary text to something an ffmpeg filter-graph argument can carry
