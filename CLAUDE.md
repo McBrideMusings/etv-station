@@ -26,6 +26,7 @@ The common operations:
 
 ```sh
 ./tools/dev-run.sh                       # run station daemon + ETV-next together (integration test)
+./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
 cargo test --workspace                   # run workspace tests
 cargo clippy --workspace -- -D clippy::all   # lint (deny all warnings)
 cargo +nightly fmt --all                 # format

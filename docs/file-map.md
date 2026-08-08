@@ -142,6 +142,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | Path | What |
 |---|---|
 | `tools/dev-run.sh` | Builds etv-overlay, both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. The canonical local integration test. |
+| `tools/dev-station.sh` | Runs ONLY the station daemon with `.env` sourced — no overlay build, no etv-next binaries, no HTTP server. For reading the daemon's own log or reproducing a config error, where the rest of the stack is dead weight. Takes an optional config path plus any daemon flags (`--list-folders`). |
 | `tools/kill-dev.sh` | Sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
 | `tools/frame-grab.sh` | Captures one JPEG frame from a live HLS channel via ffmpeg (15 s timeout) and opens it in Preview. `CHANNEL=N` selects the channel (default 1). |
 | `tools/validate-streams.sh` | HTTP probes, codec check, blackdetect, and log scan across all channels in the lineup. Run while a dev integration is active. |
