@@ -82,8 +82,9 @@ impl ResolvedItem {
 /// entirely inline items in `manual` order.
 ///
 /// This is the stateless entry point: pattern pools declaring
-/// `advance = "resume"` start from the top. Use [`resolve_channel_with_resume`]
-/// to continue a channel across a window seam.
+/// `advance = "resume"` start from the top, a flat `entries` channel starts at
+/// its first item, and neither is cut to a window. Use
+/// [`resolve_channel_with_resume`] to continue a channel across a window seam.
 pub fn resolve_channel(
     config: &ChannelConfig,
     path: &Path,
@@ -113,13 +114,16 @@ pub fn resolve_channel(
 /// replay reads where it left off from `resume_in` and reports where it got to
 /// in the returned map, which the daemon persists to the `.resume` sidecar.
 ///
-/// A channel with no pattern block ignores `resume_in` and returns an empty
-/// map, so the resume sidecar only ever appears for channels that need it.
+/// A channel with no pattern block has no pools, so it returns an empty pool
+/// map — but it does report the list position it reached (#118), which is what
+/// lets the next generation continue rather than replay.
 ///
-/// `fill` is how much airtime the caller still needs covered. A pattern block
-/// with no authored `cycles` stops once it has laid that much down, instead of
-/// running until its largest pool drains (#140). `None` means "however long the
-/// pattern naturally runs" — the stateless callers and the tests.
+/// `fill` is how much airtime the caller still needs covered, and it bounds one
+/// generation whichever shape the channel is. A pattern block with no authored
+/// `cycles` stops once it has laid that much down instead of running until its
+/// largest pool drains (#140); a flat `entries` channel cuts its list at the
+/// same span and resumes there next time (#118). `None` means "however long the
+/// channel naturally runs" — the stateless callers and the tests.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_channel_with_resume(
     config: &ChannelConfig,
@@ -185,6 +189,46 @@ pub fn resolve_channel_with_resume(
             c.separate_by.clone(),
         );
         out.extend(block_items);
+    }
+
+    // A channel with no pattern block is a flat authored list, played in a
+    // loop. Before the blocks are constrained, seat that list where the last
+    // generation left off and cut it to the airtime still wanted, so one
+    // generation covers the window instead of the whole list (#118) — a
+    // 950-item channel laid a month of playout in one pass and then sat idle
+    // for 29 days, during which an edit to its config changed nothing on air.
+    //
+    // Cutting here rather than after emission is what keeps the cut lossless:
+    // the adjacency pass below, and the ledger the daemon writes, both see
+    // exactly the items that are about to air. Trimming a finished, permuted
+    // list instead would drop items the ledger had already recorded as played.
+    //
+    // Continuing by position is exact for the list that motivated it — an
+    // authored `manual` one, where item 37 is the same item next tick. An
+    // unseeded `order = "random"` channel reshuffles per generation by design,
+    // so its position lands in a different arrangement and an item may come up
+    // sooner or later than it otherwise would. That is what an unseeded shuffle
+    // already promises; what it gains is that a month of random schedule is no
+    // longer decided a month in advance.
+    if !config.is_pattern() && !out.is_empty() {
+        let total = out.len();
+        let start = state.resume.position % total;
+        out.rotate_left(start);
+        limits.rotate_left(start);
+        separate_fields.rotate_left(start);
+
+        let laid = match fill {
+            Some(fill) => {
+                let runtimes = estimated_runtimes(&out, catalog, nominal_item_runtime(config));
+                items_covering(&runtimes, fill)
+            }
+            // The stateless entry point wants the list whole.
+            None => total,
+        };
+        out.truncate(laid);
+        limits.truncate(laid);
+        separate_fields.truncate(laid);
+        resume_out.position = (start + laid) % total;
     }
 
     if out.is_empty() {
@@ -282,6 +326,96 @@ fn adjacency_keys(
             })
         })
         .collect()
+}
+
+/// The stand-in length for an item nothing has measured yet. Shared with the
+/// `ctx.target_count` hint, which is the same quantity asked a different way:
+/// how long an item on this channel typically runs.
+fn nominal_item_runtime(config: &ChannelConfig) -> Duration {
+    let secs = config
+        .scoring
+        .as_ref()
+        .map(|s| s.nominal_item_secs)
+        .unwrap_or_else(|| crate::config::ScoringConfig::default().nominal_item_secs)
+        .max(1);
+    Duration::from_secs(u64::from(secs))
+}
+
+/// Each item's runtime, as well as it can be known before anything is probed —
+/// which is what the window bound above has to work with, since durations are
+/// read off the files themselves and that happens after this returns.
+///
+/// Three sources, most authoritative first: an item that declares its own
+/// in/out points, a catalog row the item already carries, and one bulk catalog
+/// query for the rest. An authored `local` item carries no length of its own,
+/// but when its path matched a catalog row it inherited that row's `entry_id`,
+/// so the catalog has usually measured it.
+///
+/// Whatever is still unmeasured counts at the mean of what is — the same
+/// stand-in [`crate::pattern`] uses for an item the catalog never measured —
+/// and, when nothing at all is known, at the channel's nominal item length.
+fn estimated_runtimes(
+    items: &[ResolvedItem],
+    catalog: Option<&Catalog>,
+    nominal: Duration,
+) -> Vec<Duration> {
+    let mut known: Vec<Option<Duration>> = items
+        .iter()
+        .map(|item| {
+            let in_p = item.in_point.unwrap_or_default();
+            match item.out_point {
+                Some(out_p) if out_p > in_p => Some(out_p - in_p),
+                _ => item.catalog_duration,
+            }
+        })
+        .collect();
+
+    if let Some(cat) = catalog {
+        let unmeasured: Vec<String> = items
+            .iter()
+            .zip(&known)
+            .filter(|(_, k)| k.is_none())
+            .map(|(item, _)| item.id.clone())
+            .collect();
+        // A catalog read that fails leaves every hole to the mean below rather
+        // than failing the channel: this only sizes a generation, and a
+        // mis-sized one is corrected by the next tick.
+        if let Ok(raw) = cat.durations_for(&unmeasured) {
+            for (item, slot) in items.iter().zip(known.iter_mut()) {
+                if slot.is_none() {
+                    *slot = raw
+                        .get(&item.id)
+                        .filter(|ms| **ms > 0 && **ms <= MAX_CATALOG_DURATION_MS)
+                        .map(|ms| Duration::from_millis(*ms as u64));
+                }
+            }
+        }
+    }
+
+    let measured: Vec<Duration> = known.iter().flatten().copied().collect();
+    let stand_in = if measured.is_empty() {
+        nominal
+    } else {
+        measured.iter().sum::<Duration>() / measured.len() as u32
+    };
+    known.into_iter().map(|d| d.unwrap_or(stand_in)).collect()
+}
+
+/// How many items from the top it takes to cover `fill`.
+///
+/// The item that crosses the boundary is included, so the window is covered
+/// rather than left a few minutes short of it — the same bargain the pattern
+/// walk strikes when it lets the last cycle finish. Always at least one: a
+/// generation that laid nothing would never advance the clock.
+fn items_covering(runtimes: &[Duration], fill: Duration) -> usize {
+    let mut laid = Duration::ZERO;
+    for (i, d) in runtimes.iter().enumerate() {
+        laid += *d;
+        if laid >= fill {
+            return i + 1;
+        }
+    }
+    runtimes.len().max(1)
 }
 
 /// Reorder `items` by `perm` (a permutation of `0..items.len()`).
@@ -1788,7 +1922,7 @@ mod tests {
     /// A channel with no pattern block never grows a resume map, so the sidecar
     /// only ever appears for channels that need it.
     #[test]
-    fn an_entries_channel_produces_an_empty_resume_map() {
+    fn an_entries_channel_records_its_list_position_and_no_pools() {
         let inc = include_with(vec![Entry::Item(item_entry("a"))]);
         let (_, next) = resolve_channel_with_resume(
             &channel(vec![inc]),
@@ -1801,7 +1935,109 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(next.is_empty());
+        assert!(next.pools.is_empty(), "a flat channel has no pools");
+        // One item, laid whole, wrapping straight back to the top.
+        assert_eq!(next.position, 0);
+    }
+
+    // ---- bounding a flat entries generation by the window (#118) ------------
+
+    /// One generation of a flat `entries` channel: `at` is where the last one
+    /// left off, `fill` the airtime still wanted. Every item here runs 30s.
+    fn windowed_entries(
+        entries: usize,
+        at: usize,
+        fill: Option<time::Duration>,
+    ) -> (Vec<String>, usize) {
+        let inc = include_with(
+            (0..entries)
+                .map(|i| Entry::Item(item_entry(&i.to_string())))
+                .collect(),
+        );
+        let mut state = GenerationState::empty();
+        state.resume.position = at;
+        let (items, next) = resolve_channel_with_resume(
+            &channel(vec![inc]),
+            path(),
+            &[],
+            None,
+            None,
+            &state,
+            &Default::default(),
+            fill.map(|d| d.unsigned_abs()),
+        )
+        .unwrap();
+        (items.into_iter().map(|i| i.id).collect(), next.position)
+    }
+
+    /// The bug: a list far longer than the window was laid end to end in one
+    /// generation. Ten 30s items is five minutes of playout; a 90s window must
+    /// take three of them, not all ten.
+    #[test]
+    fn a_windowed_entries_generation_stops_at_the_window() {
+        let (ids, next) = windowed_entries(10, 0, Some(time::Duration::seconds(90)));
+        assert_eq!(ids, vec!["lavfi:0", "lavfi:1", "lavfi:2"]);
+        assert_eq!(next, 3, "the next generation continues at item 3");
+    }
+
+    /// The acceptance bar: two generations back to back play the authored list
+    /// straight through — nothing skipped, nothing aired twice.
+    #[test]
+    fn two_windowed_generations_continue_with_no_gap_and_no_repeat() {
+        let window = Some(time::Duration::seconds(90));
+        let (first, after_first) = windowed_entries(10, 0, window);
+        let (second, _) = windowed_entries(10, after_first, window);
+
+        let played: Vec<String> = first.iter().chain(second.iter()).cloned().collect();
+        assert_eq!(
+            played,
+            (0..6).map(|i| format!("lavfi:{i}")).collect::<Vec<_>>(),
+            "the two generations must concatenate to the authored order"
+        );
+    }
+
+    /// The list is a loop, so a generation that reaches the end starts the next
+    /// one at the top rather than running off it.
+    #[test]
+    fn an_entries_channel_wraps_to_the_top_at_the_end_of_its_list() {
+        let (ids, next) = windowed_entries(4, 3, Some(time::Duration::seconds(30)));
+        assert_eq!(ids, vec!["lavfi:3"]);
+        assert_eq!(next, 0);
+    }
+
+    /// Deleting the `.resume` sidecar leaves position 0, which is the top of the
+    /// list — a restart, never an error.
+    #[test]
+    fn a_missing_resume_starts_an_entries_channel_at_the_top() {
+        let (ids, _) = windowed_entries(4, 0, Some(time::Duration::seconds(30)));
+        assert_eq!(ids, vec!["lavfi:0"]);
+    }
+
+    /// A window shorter than a single item still airs one: a generation that
+    /// laid nothing would never move the clock forward.
+    #[test]
+    fn a_window_shorter_than_one_item_still_lays_one() {
+        let (ids, next) = windowed_entries(4, 0, Some(time::Duration::seconds(1)));
+        assert_eq!(ids, vec!["lavfi:0"]);
+        assert_eq!(next, 1);
+    }
+
+    /// The stateless entry point asks for no window and still gets the list
+    /// whole — the tests and the one-shot resolve depend on it.
+    #[test]
+    fn an_unbounded_entries_resolve_still_lays_the_whole_list() {
+        let (ids, next) = windowed_entries(10, 0, None);
+        assert_eq!(ids.len(), 10);
+        assert_eq!(next, 0);
+    }
+
+    /// A position left over from a longer list cannot point off the end of a
+    /// shorter one — an edit that deletes entries must not error or skip.
+    #[test]
+    fn a_position_past_the_end_of_an_edited_list_folds_back_into_it() {
+        let (ids, next) = windowed_entries(3, 100, Some(time::Duration::seconds(30)));
+        assert_eq!(ids, vec!["lavfi:1"], "100 % 3 is item 1");
+        assert_eq!(next, 2);
     }
 
     /// A pattern channel that has played all the way through its content keeps

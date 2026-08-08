@@ -1,12 +1,13 @@
-//! The `.resume` sidecar — the only scheduling state a pattern channel persists
+//! The `.resume` sidecar — the only scheduling state a channel persists
 //! (#72, consuming the resume-map half of the generation model #70).
 //!
 //! Generation is a pure function of `(catalog, config, resume_in)`; the resume
 //! map is what carries progression across a window seam with **no live cursor**.
-//! It records, per pool, where each series left off and which series is up next.
-//! Everything else about a window — the ordering, the interleave, the timings —
-//! is recomputed, so the map stays tiny and a corrupt or missing one costs at
-//! most a restart from the top.
+//! It records, per pool, which series is up next — and, for a channel that is a
+//! flat authored list rather than a pattern, how far into that list the next
+//! generation starts (#118). Everything else about a window — the ordering, the
+//! interleave, the timings — is recomputed, so the map stays tiny and a corrupt
+//! or missing one costs at most a restart from the top.
 //!
 //! **Where each series left off is not here** — that is the play-history
 //! ledger's job (#70, [`crate::history`]), and the cursor is a projection of
@@ -42,6 +43,24 @@ pub struct ResumeMap {
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
 
+    /// How far into a flat `entries` channel's list the next generation starts,
+    /// counted over the channel's blocks concatenated in config order (#118).
+    ///
+    /// A channel with no pattern block has no pools and no rotation, so before
+    /// this it persisted nothing at all: every generation re-resolved the same
+    /// authored list and laid it from the top. That was invisible only because
+    /// one generation emitted the whole list — a 950-item channel booked a month
+    /// of playout in one pass, and an edit to its config took a month to reach
+    /// the screen. A generation now stops at the window, and this is what the
+    /// next one continues from.
+    ///
+    /// It is a position into an **authored** list, not a second copy of a
+    /// derived one: the entries are written in the config file, so "item 37"
+    /// means the same thing next tick. Nothing about where a *series* left off
+    /// lives here — that is still the ledger's, exactly as the header says.
+    #[serde(default, skip_serializing_if = "is_start")]
+    pub position: usize,
+
     /// Where each not-yet-aired generation *started* from, newest last.
     ///
     /// Forward materialization otherwise makes a pattern channel's emitted
@@ -59,13 +78,19 @@ pub struct ResumeMap {
     pub checkpoints: Vec<Checkpoint>,
 }
 
-/// The pool state immediately before the generation that starts at `start`.
+/// The scheduling state immediately before the generation that starts at
+/// `start` — the pool rotation, and a flat channel's list position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     #[serde(with = "time::serde::rfc3339")]
     pub start: OffsetDateTime,
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
+    /// Where the authored list stood entering that generation. Restored by the
+    /// rewinds below, so a config edit re-emits the same items rather than
+    /// jumping the cursor past a span it just threw away.
+    #[serde(default, skip_serializing_if = "is_start")]
+    pub position: usize,
 }
 
 /// One pool's resume state.
@@ -81,11 +106,18 @@ fn current_version() -> u32 {
     CURRENT_VERSION
 }
 
+/// A list position of zero is the top, which is also what an absent field
+/// means, so it is left out of the written bytes.
+fn is_start(position: &usize) -> bool {
+    *position == 0
+}
+
 impl ResumeMap {
     pub fn new() -> Self {
         Self {
             version: CURRENT_VERSION,
             pools: BTreeMap::new(),
+            position: 0,
             checkpoints: Vec::new(),
         }
     }
@@ -95,7 +127,7 @@ impl ResumeMap {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty()
+        self.pools.is_empty() && self.position == 0
     }
 
     /// Record the state entering a generation that begins at `start`.
@@ -103,6 +135,7 @@ impl ResumeMap {
         self.checkpoints.push(Checkpoint {
             start,
             pools: self.pools.clone(),
+            position: self.position,
         });
     }
 
@@ -124,6 +157,7 @@ impl ResumeMap {
         self.prune_elapsed(now);
         let earliest = self.checkpoints.first()?.clone();
         self.pools = earliest.pools;
+        self.position = earliest.position;
         // Everything from here forward is about to be regenerated, so its
         // checkpoints are re-recorded as it goes.
         self.checkpoints.clear();
@@ -146,6 +180,7 @@ impl ResumeMap {
         let idx = self.checkpoints.iter().rposition(|c| c.start <= instant)?;
         let cp = self.checkpoints[idx].clone();
         self.pools = cp.pools;
+        self.position = cp.position;
         self.checkpoints.truncate(idx);
         Some(cp.start)
     }
@@ -412,6 +447,56 @@ mod tests {
         let (loaded, _) = load(dir.path()).await.unwrap();
         assert_eq!(loaded, map);
         assert_eq!(loaded.checkpoints[0].start, at(12));
+    }
+
+    // ---- a flat channel's list position (#118) -----------------------------
+
+    #[tokio::test]
+    async fn the_list_position_round_trips_through_disk() {
+        let dir = tempdir().unwrap();
+        let mut map = ResumeMap::new();
+        map.position = 37;
+        save(dir.path(), &map).await.unwrap();
+        let (loaded, how) = load(dir.path()).await.unwrap();
+        assert_eq!(how, ResumeLoad::Loaded);
+        assert_eq!(loaded.position, 37);
+        assert!(!loaded.is_empty(), "a channel 37 items in is not fresh");
+    }
+
+    #[tokio::test]
+    async fn a_missing_sidecar_puts_a_flat_channel_at_the_top() {
+        let dir = tempdir().unwrap();
+        let (map, _) = load(dir.path()).await.unwrap();
+        assert_eq!(map.position, 0);
+    }
+
+    /// A config edit rewinds to the earliest unaired generation and re-emits it.
+    /// The list position has to come back with the pools, or the regenerated
+    /// span would start where the thrown-away one *finished* and skip a day.
+    #[test]
+    fn rewinding_restores_the_list_position_with_the_pools() {
+        let mut map = ResumeMap::new();
+        map.position = 10;
+        map.checkpoint(at(0));
+        map.position = 40;
+        map.checkpoint(at(6));
+        map.position = 75;
+
+        assert_eq!(map.rewind_to_unaired(at(3)).unwrap(), at(6));
+        assert_eq!(map.position, 40);
+    }
+
+    #[test]
+    fn rewinding_to_an_instant_restores_the_list_position() {
+        let mut map = ResumeMap::new();
+        map.position = 10;
+        map.checkpoint(at(0));
+        map.position = 40;
+        map.checkpoint(at(6));
+        map.position = 75;
+
+        assert_eq!(map.rewind_to(at(8)).unwrap(), at(6));
+        assert_eq!(map.position, 40);
     }
 
     #[tokio::test]
