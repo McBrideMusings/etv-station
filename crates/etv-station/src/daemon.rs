@@ -164,8 +164,8 @@ struct StationContext<'a> {
 /// on their own `roll_interval`s and there is no station-wide clock to hang a
 /// single fetch off, so the sharing is a cache the channels pull from rather
 /// than a task that pushes to them: the first channel into a refresh window
-/// pays for the fetch and join, every other channel that ticks inside that
-/// window gets the same `Arc` back.
+/// pays for the fetch, and for the join when that fetch returned rows, while
+/// every other channel that ticks inside that window gets the same `Arc` back.
 ///
 /// Contention is the point, not a cost: the mutex is held across the fetch, so
 /// channels that tick together queue behind one request instead of racing N.
@@ -182,10 +182,11 @@ struct SharedHistory {
     catalog: Option<Arc<CatalogInfo>>,
     /// The Tautulli `(url, api key)` to fetch against, resolved from the
     /// environment once by the caller. `None` — an unconfigured Tautulli —
-    /// still runs the join, against zero rows: that is the same degraded path
-    /// an unreachable server takes, and holding it here rather than reading the
-    /// environment down in the fetch is what lets a test exercise it without
-    /// mutating the process (#132).
+    /// makes no request and produces no rows, which then takes the same
+    /// skip-the-join path an unreachable or idle server takes (#141). Holding
+    /// the pair here rather than reading the environment down in the fetch is
+    /// what lets a test exercise that path without mutating the process
+    /// (#132).
     tautulli: Option<(String, String)>,
     /// How long a fetched history is reused before the next channel to ask
     /// refetches. Set to the shortest `roll_interval` on the station, so no
@@ -235,9 +236,9 @@ impl SharedHistory {
         // exactly as the Plex ingest above avoids. The catalog join is local
         // work and stays here.
         //
-        // With no Tautulli configured there is nothing to request, but the join
-        // still runs on the empty row set so the cache and its `tautulli.join`
-        // event behave identically to a fetch that came back empty.
+        // With no Tautulli configured there is nothing to request, so no
+        // request is made and the row set is empty before the join is even
+        // considered.
         let rows = match self.tautulli.clone() {
             Some((url, key)) => {
                 tokio::task::spawn_blocking(move || crate::tautulli::fetch_rows(&url, &key))
@@ -246,20 +247,40 @@ impl SharedHistory {
             }
             None => Vec::new(),
         };
-        // A reader of its own, opened for this join and dropped with it. Once
-        // per refresh window for the whole station, so the open costs nothing
-        // next to the HTTP request that just happened; keeping a handle alive
-        // between fetches would buy nothing. A failure to open degrades the
-        // ranking rather than failing the tick, same as an unreachable Tautulli.
-        let events = match Catalog::open_readonly(&sc.path) {
-            Ok(reader) => crate::tautulli::join(&reader, rows),
-            Err(e) => {
-                tracing::warn!(
-                    event = "tautulli.catalog_unavailable",
-                    error = %e,
-                    "could not open a catalog reader to join watch history; generating without it",
-                );
-                Vec::new()
+        let events = if rows.is_empty() {
+            // No rows is the ordinary state, not a corner: a station with no
+            // `TAUTULLI_URL`/`TAUTULLI_API_KEY` never asks for any, and a
+            // configured server that is unreachable or that nobody has watched
+            // lately returns none. A join over an empty row set can only
+            // produce an empty result, so running it costs a SQLite open and a
+            // `tautulli.join` INFO reading `rows=0, keys=0, matched=0` to
+            // arrive back where it started. That line is worse than wasted:
+            // "joined watch history to the catalog" on an unconfigured station
+            // reads as a wired-up Tautulli whose server is idle, which is a
+            // different problem entirely (#141). Skip both, and let
+            // `tautulli.join` mean a join actually happened.
+            //
+            // The empty result is still cached and still stamped below, so the
+            // rest of this refresh window is served from the cache rather than
+            // repeating the fetch on every channel's tick.
+            Vec::new()
+        } else {
+            // A reader of its own, opened for this join and dropped with it.
+            // Once per refresh window for the whole station, so the open costs
+            // nothing next to the HTTP request that just happened; keeping a
+            // handle alive between fetches would buy nothing. A failure to open
+            // degrades the ranking rather than failing the tick, same as an
+            // unreachable Tautulli.
+            match Catalog::open_readonly(&sc.path) {
+                Ok(reader) => crate::tautulli::join(&reader, rows),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "tautulli.catalog_unavailable",
+                        error = %e,
+                        "could not open a catalog reader to join watch history; generating without it",
+                    );
+                    Vec::new()
+                }
             }
         };
         cache.events = Arc::from(events);
@@ -1399,8 +1420,9 @@ mod ingest_plan_tests {
     }
 }
 
-/// The station-wide watch history (#126): one fetch + join per tick, shared by
-/// every channel, refetched once the refresh window has passed.
+/// The station-wide watch history (#126): one fetch per tick, shared by every
+/// channel, refetched once the refresh window has passed — and joined to the
+/// catalog only when that fetch actually returned rows (#141).
 #[cfg(test)]
 mod shared_history_tests {
     use std::sync::Mutex as StdMutex;
@@ -1410,9 +1432,11 @@ mod shared_history_tests {
 
     use super::*;
 
-    /// Counts `tautulli.join` events. That event is emitted once per catalog
-    /// join, so its count *is* the number of fetch+join passes performed.
-    struct CountJoins(Arc<StdMutex<usize>>);
+    /// Counts events carrying a given `event = "…"` name.
+    struct CountEvents {
+        name: &'static str,
+        seen: Arc<StdMutex<usize>>,
+    }
 
     #[derive(Default)]
     struct EventName(Option<String>);
@@ -1426,23 +1450,28 @@ mod shared_history_tests {
         fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
     }
 
-    impl<S: tracing::Subscriber> Layer<S> for CountJoins {
+    impl<S: tracing::Subscriber> Layer<S> for CountEvents {
         fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
             let mut name = EventName::default();
             event.record(&mut name);
-            if name.0.as_deref() == Some("tautulli.join") {
-                *self.0.lock().unwrap() += 1;
+            if name.0.as_deref() == Some(self.name) {
+                *self.seen.lock().unwrap() += 1;
             }
         }
     }
 
-    /// Install a `tautulli.join` counter on this thread for as long as the
+    /// Install a counter for one event name on this thread for as long as the
     /// returned guard lives. `#[tokio::test]` runs a current-thread runtime, so
     /// every `.await` in the test body is polled on this same thread and stays
     /// under it.
-    fn count_joins() -> (Arc<StdMutex<usize>>, tracing::subscriber::DefaultGuard) {
+    fn count_events(
+        name: &'static str,
+    ) -> (Arc<StdMutex<usize>>, tracing::subscriber::DefaultGuard) {
         let seen = Arc::new(StdMutex::new(0));
-        let subscriber = tracing_subscriber::registry().with(CountJoins(Arc::clone(&seen)));
+        let subscriber = tracing_subscriber::registry().with(CountEvents {
+            name,
+            seen: Arc::clone(&seen),
+        });
         let guard = tracing::subscriber::set_default(subscriber);
         (seen, guard)
     }
@@ -1453,8 +1482,9 @@ mod shared_history_tests {
     /// fetch that read them would make a real network call. Passing the
     /// connection in means the test simply withholds it — nothing touches the
     /// process environment, so nothing races another test thread reading it
-    /// (#132). The join still runs, against zero rows, which is exactly the
-    /// "Tautulli unreachable" path.
+    /// (#132). No connection means no rows, which is exactly the path an
+    /// unreachable or idle Tautulli takes: the cache still turns over on its
+    /// refresh window, but the join is skipped (#141).
     ///
     /// Returns the `TempDir` alongside the info: `SharedHistory` reopens the
     /// file per join, so it has to survive the test rather than being an
@@ -1474,61 +1504,139 @@ mod shared_history_tests {
     }
 
     /// The acceptance criterion: N channels ticking inside one refresh window
-    /// produce **one** fetch + join between them, not N.
+    /// produce **one** fetch between them, not N.
+    ///
+    /// Two independent proofs, because with no rows to join there is no
+    /// `tautulli.join` event left to count (#141). The stamp is the load-bearing
+    /// one: every pass writes `fetched_at`, so if a later channel had run its
+    /// own pass the stamp would have moved to that channel's clock reading.
+    /// Allocation identity backs it up — a fresh pass stores a newly built
+    /// `Arc` and `first` holds the original alive for the whole test, so the
+    /// allocator cannot hand the same address back.
     #[tokio::test(start_paused = true)]
     async fn every_channel_in_one_tick_shares_a_single_fetch() {
-        let (joins, _guard) = count_joins();
         let (info, _catalog_dir) = catalog_without_tautulli();
         let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
 
-        // Four channels, each asking at the top of its own tick.
+        // Four channels, each asking at the top of its own tick. The clock moves
+        // a second between them — well inside the hour-long window, but enough
+        // that a second pass would restamp `fetched_at` to a different instant.
         let first = history.current().await;
+        let stamped_at = history.state.lock().await.fetched_at.unwrap();
         for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
             let again = history.current().await;
+            assert_eq!(
+                history.state.lock().await.fetched_at.unwrap(),
+                stamped_at,
+                "a channel inside the window must be served from the cache, \
+                 leaving the stamp of the one pass that filled it",
+            );
             assert!(
                 Arc::ptr_eq(&first, &again),
                 "every channel must get the same allocation, not a copy",
             );
         }
-
-        assert_eq!(
-            *joins.lock().unwrap(),
-            1,
-            "one tick must fetch and join once, however many channels ask",
-        );
     }
 
     /// The cache is a refresh window, not a one-shot: a channel ticking after
     /// the window has passed gets freshly-fetched history. Without this the
     /// station would rank forever against whatever was watched at startup.
+    ///
+    /// The empty result of a skipped join has to obey the window exactly as a
+    /// real join's would — otherwise skipping the join trades one wasted
+    /// catalog open for a Tautulli request on every single channel tick.
     #[tokio::test(start_paused = true)]
     async fn the_next_tick_refetches_once_the_window_has_passed() {
-        let (joins, _guard) = count_joins();
         let (info, _catalog_dir) = catalog_without_tautulli();
         let history = SharedHistory::new(Some(info), None, Duration::from_secs(60));
 
-        history.current().await;
+        let first = history.current().await;
+        let first_at = history.state.lock().await.fetched_at.unwrap();
+
         tokio::time::advance(Duration::from_secs(60)).await;
-        history.current().await;
-        history.current().await;
+        let second = history.current().await;
+        let second_at = history.state.lock().await.fetched_at.unwrap();
 
         assert_eq!(
-            *joins.lock().unwrap(),
-            2,
-            "the second tick refetches, and is again shared by every channel",
+            second_at.duration_since(first_at),
+            Duration::from_secs(60),
+            "the first tick past the window must refetch and restamp the cache",
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a refetch must store its own result, not hand back the stale one",
+        );
+
+        let third = history.current().await;
+        assert!(
+            Arc::ptr_eq(&second, &third),
+            "the refetched history is shared by the rest of its window too",
         );
     }
 
     /// A catalog-free station has nothing to join rows against, so it never
-    /// contacts Tautulli at all — unchanged from before #126.
+    /// contacts Tautulli at all — unchanged from before #126. `current`
+    /// returns before it even takes the lock, so nothing ever stamps
+    /// `fetched_at`.
     #[tokio::test(start_paused = true)]
     async fn a_station_with_no_catalog_never_fetches() {
-        let (joins, _guard) = count_joins();
         let history = SharedHistory::new(None, None, Duration::ZERO);
 
         assert!(history.current().await.is_empty());
         assert!(history.current().await.is_empty());
-        assert_eq!(*joins.lock().unwrap(), 0);
+        assert!(
+            history.state.lock().await.fetched_at.is_none(),
+            "a station with no catalog must never engage the cache at all",
+        );
+    }
+
+    /// `tautulli.join` must mean a join happened (#141). A station with no
+    /// Tautulli configured fetches no rows, and announcing "joined watch
+    /// history to the catalog" over `rows=0, keys=0, matched=0` once a minute
+    /// forever reads as a wired-up server nobody has watched — a completely
+    /// different situation from one that was never configured.
+    #[tokio::test(start_paused = true)]
+    async fn no_rows_logs_no_join_event() {
+        let (joins, _guard) = count_events("tautulli.join");
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+
+        assert!(history.current().await.is_empty());
+        assert_eq!(
+            *joins.lock().unwrap(),
+            0,
+            "nothing was joined, so nothing may claim a join happened",
+        );
+    }
+
+    /// The other half of #141: with no rows there is nothing to open the
+    /// catalog *for*. Pointing the station at a catalog file that does not
+    /// exist makes the open observable — a read-only open of a missing file
+    /// fails, and the failure is logged as `tautulli.catalog_unavailable`.
+    /// Silence is the proof no open was attempted.
+    #[tokio::test(start_paused = true)]
+    async fn no_rows_never_opens_the_catalog() {
+        let (failures, _guard) = count_events("tautulli.catalog_unavailable");
+        let dir = tempfile::tempdir().unwrap();
+        let info = Arc::new(CatalogInfo {
+            path: dir.path().join("never-created.db"),
+            path_index: HashMap::new(),
+        });
+        // The premise, checked rather than assumed: if this path were somehow
+        // openable the test could pass without proving anything at all.
+        assert!(
+            Catalog::open_readonly(&info.path).is_err(),
+            "the observation only works if opening this catalog really does fail",
+        );
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+
+        assert!(history.current().await.is_empty());
+        assert_eq!(
+            *failures.lock().unwrap(),
+            0,
+            "a fetch that produced no rows must not open a catalog reader",
+        );
     }
 }
 
