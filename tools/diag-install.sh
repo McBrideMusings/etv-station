@@ -24,12 +24,37 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# `.env` fills in what the environment has not already said, and never overrules
+# it. Sourcing it plainly does the opposite: every assignment in the file wins,
+# so a caller that exports ETV_STATION_APPDATA is silently ignored and there is
+# no way to point this script at anything but the real host. That cost a
+# debugging session — tools/test-diag-install.sh passed against a worktree,
+# which has no .env because it is gitignored, and failed 9 of 18 in the primary
+# checkout, which has one.
+DIAG_ENV_VARS=(
+  UNRAID_HOST
+  UNRAID_USER
+  ETV_STATION_APPDATA
+  ETV_STATION_DATA
+  ETV_PORT_HOST
+)
+
+declare -A _diag_preset=()
+for _v in "${DIAG_ENV_VARS[@]}"; do
+  if [ -n "${!_v:-}" ]; then _diag_preset[$_v]="${!_v}"; fi
+done
+
 if [ -f "$REPO_ROOT/.env" ]; then
   set -a
   # shellcheck disable=SC1091
   . "$REPO_ROOT/.env"
   set +a
 fi
+
+for _v in "${!_diag_preset[@]}"; do
+  printf -v "$_v" '%s' "${_diag_preset[$_v]}"
+done
+unset _v _diag_preset
 
 UNRAID_HOST="${UNRAID_HOST:-}"
 UNRAID_USER="${UNRAID_USER:-root}"
@@ -146,9 +171,12 @@ do_stop() {
     cd '$REMOTE_DIR' 2>/dev/null || exit 0
     stop_one() {
       if alive_pid \"\$1.pid\" \"\$2\"; then
-        kill -TERM \"-\$ALIVE_PID\" 2>/dev/null || kill \"\$ALIVE_PID\" 2>/dev/null
-        echo \"stopped \$1 (\$ALIVE_PID)\"
-        rm -f \"\$1.pid\"
+        if kill -TERM \"-\$ALIVE_PID\" 2>/dev/null || kill \"\$ALIVE_PID\" 2>/dev/null; then
+          echo \"stopped \$1 (\$ALIVE_PID)\"
+          rm -f \"\$1.pid\"
+        else
+          echo \"could not signal \$1 (\$ALIVE_PID) — still running\"
+        fi
       else
         echo \"\$1 was not running\"
       fi
