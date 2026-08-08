@@ -1116,11 +1116,14 @@ async fn pattern_catch_up(
                 reader,
                 &state,
                 &scoring,
-                // How much airtime is still missing. A pattern block with no
-                // authored `cycles` stops once it has laid this much down,
-                // rather than running its pools to the end — which on a
-                // 51-pool channel was eleven years in one pass (#140). The
-                // loop condition guarantees this is positive.
+                // How much airtime is still missing, and what bounds one
+                // generation. A pattern block with no authored `cycles` stops
+                // once it has laid this much down rather than running its pools
+                // to the end — eleven years in one pass on a 51-pool channel
+                // (#140) — and a flat `entries` channel cuts its authored list
+                // here and resumes at that position next time rather than
+                // laying all 950 items and idling for a month (#118). The loop
+                // condition guarantees this is positive.
                 Some((target - from).unsigned_abs()),
             )?;
             // The ledger needs each airing's show, and only the catalog knows
@@ -1156,8 +1159,10 @@ async fn pattern_catch_up(
         // time says it should be, rather than at item 0 — "this station has been
         // broadcasting since 2020". Only on the very first generation: after
         // that the written timeline is the phase, and re-deriving it would fight
-        // the resume map. Skipped items aren't lost, just not aired this pass —
-        // the next generation resolves the list afresh.
+        // the resume map. The skipped items do not come back: joining at the
+        // anchor means treating them as already aired, which is the whole claim
+        // the anchor makes, and the list position the resolve just recorded has
+        // moved past them.
         let (items_slice, durations_slice, seq_start) =
             match channel.config.anchor.filter(|_| first_generation) {
                 Some(anchor) => {
@@ -1200,6 +1205,11 @@ async fn pattern_catch_up(
         // resume map still recorded those items as played, skipping them
         // permanently. Overshooting the window by less than one generation
         // costs nothing; a hole in the schedule is unrecoverable.
+        //
+        // The generation is sized to the window at the other end instead — the
+        // `fill` span handed to the resolve above — so "one generation" is now
+        // about one window rather than however long the channel's whole list or
+        // pool set happens to run (#140, #118).
         let to = from + span;
         let written = emit_window(
             output,

@@ -17,9 +17,11 @@ pub struct ChannelConfig {
     pub name: Option<String>,
 
     /// How far ahead of live the schedule is materialized. This is also what
-    /// bounds a single generation: a pattern whose pools would take years to
-    /// drain stops at the cycle boundary that covers this span (#140), so an
-    /// edit to the channel file shows up on air within roughly this long.
+    /// bounds a single generation, whichever shape the channel is: a pattern
+    /// whose pools would take years to drain stops at the cycle boundary that
+    /// covers this span (#140), and a flat `entries` list longer than the span
+    /// stops at the item that covers it and resumes there next time (#118). So
+    /// an edit to the channel file shows up on air within roughly this long.
     #[serde(default = "default_window_days")]
     pub window_days: u32,
 
@@ -135,10 +137,18 @@ pub struct ScoringConfig {
     #[serde(default = "default_recent_depth")]
     pub recent_depth: usize,
 
-    /// Nominal seconds per item, used only to turn a generation's span into the
-    /// `ctx.target_count` hint. A channel of half-hour episodes and one of
-    /// three-hour films need very different numbers to ask for a sensible
-    /// amount.
+    /// Nominal seconds per item: how long an item on this channel typically
+    /// runs. A channel of half-hour episodes and one of three-hour films need
+    /// very different numbers.
+    ///
+    /// Two readers, the same question asked twice. It turns a generation's span
+    /// into the `ctx.target_count` hint a scorer plugin is given, and it is the
+    /// stand-in length used to cut a flat `entries` list at the window (#118)
+    /// for an item nothing has measured yet — an authored file with no in/out
+    /// points and no catalog row behind it. Every item that *is* measured
+    /// counts at its real length, and an unmeasured one falls back to the mean
+    /// of the measured ones first, so this only bites a channel where nothing
+    /// at all is known.
     #[serde(default = "default_nominal_item_secs")]
     pub nominal_item_secs: u32,
 }
