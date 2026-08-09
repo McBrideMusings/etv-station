@@ -1,4 +1,5 @@
 pub mod atomic;
+pub mod attribution;
 pub mod catalog;
 pub mod channel_card;
 pub mod config;

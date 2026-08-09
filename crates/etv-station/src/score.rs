@@ -65,6 +65,15 @@ pub struct WatchEvent {
     pub entry_id: String,
     /// Unix seconds when the watch stopped.
     pub watched_at: i64,
+    /// Who watched it, as Tautulli reports them — the account's friendly name
+    /// when it has one, else its username (#113).
+    ///
+    /// `None` when the history row named nobody, which is what a Tautulli that
+    /// has anonymised the row looks like. Nothing ranks on this; it exists so a
+    /// channel can say on screen and in the guide who has been watching. A
+    /// `single_user` channel's rows all carry the same name, which is why the
+    /// attribution line is only interesting on a pooled channel.
+    pub watcher: Option<String>,
 }
 
 /// Everything the station hands a plugin besides the catalog itself.
@@ -258,6 +267,12 @@ pub fn pick(
                     let mut m = Map::new();
                     m.insert("entry_id".into(), e.entry_id.clone().into());
                     m.insert("watched_at".into(), e.watched_at.into());
+                    // Empty string rather than `()` so a script can compare it
+                    // without a type check; Rhai has no null-safe operator.
+                    m.insert(
+                        "watcher".into(),
+                        e.watcher.clone().unwrap_or_default().into(),
+                    );
                     Dynamic::from_map(m)
                 })
                 .collect(),

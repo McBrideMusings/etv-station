@@ -157,7 +157,7 @@ pub fn join(catalog: &Catalog, rows: Vec<HistoryRow>) -> Vec<WatchEvent> {
     resolve(catalog, rows)
 }
 
-/// One `get_history` row, narrowed to the two fields that matter.
+/// One `get_history` row, narrowed to the fields that matter.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct HistoryRow {
     /// The Plex `ratingKey`, which is also the `source_id` of the entry's
@@ -168,6 +168,30 @@ pub struct HistoryRow {
     /// no stop time yet.
     #[serde(default)]
     stopped: Option<i64>,
+    /// The account's display name, which is what a person would recognise
+    /// (#113). Tautulli sets it to the username when no friendly name is
+    /// configured, and both are absent on an anonymised row.
+    #[serde(default)]
+    friendly_name: Option<String>,
+    /// The account name, used when `friendly_name` is missing or blank.
+    #[serde(default)]
+    user: Option<String>,
+}
+
+impl HistoryRow {
+    /// Who to credit this row to, or `None` when it names nobody.
+    ///
+    /// `friendly_name` first: on this server it is what distinguishes `Madison`
+    /// from the account spelled `Madi`. Blank strings are treated as absent —
+    /// Tautulli sends `""` rather than omitting the key.
+    fn watcher(&self) -> Option<String> {
+        [self.friendly_name.as_deref(), self.user.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(str::to_string)
+    }
 }
 
 /// Strip the API key out of anything on its way to a log.
@@ -251,6 +275,7 @@ fn resolve(catalog: &Catalog, rows: Vec<HistoryRow>) -> Vec<WatchEvent> {
                 out.push(WatchEvent {
                     entry_id,
                     watched_at,
+                    watcher: row.watcher(),
                 });
             }
             Ok(None) => {}
@@ -385,7 +410,57 @@ mod tests {
         HistoryRow {
             rating_key: Some(key),
             stopped,
+            friendly_name: None,
+            user: None,
         }
+    }
+
+    /// The same row, credited to someone (#113).
+    fn row_by(
+        key: serde_json::Value,
+        stopped: Option<i64>,
+        friendly_name: Option<&str>,
+        user: Option<&str>,
+    ) -> HistoryRow {
+        HistoryRow {
+            rating_key: Some(key),
+            stopped,
+            friendly_name: friendly_name.map(str::to_string),
+            user: user.map(str::to_string),
+        }
+    }
+
+    /// `friendly_name` wins because it is the name a person recognises — on
+    /// this server the account spelled `Madi` displays as `Madison`.
+    #[test]
+    fn the_friendly_name_is_preferred_over_the_account_name() {
+        let got = resolved(
+            &seeded(),
+            vec![row_by(
+                "plex-1".into(),
+                Some(100),
+                Some("Madison"),
+                Some("Madi"),
+            )],
+        );
+        assert_eq!(got[0].watcher.as_deref(), Some("Madison"));
+    }
+
+    /// Tautulli sends `""` rather than omitting the key, so a blank friendly
+    /// name has to fall through to the username instead of crediting nobody.
+    #[test]
+    fn a_blank_friendly_name_falls_through_to_the_username() {
+        let got = resolved(
+            &seeded(),
+            vec![row_by("plex-1".into(), Some(100), Some("  "), Some("Madi"))],
+        );
+        assert_eq!(got[0].watcher.as_deref(), Some("Madi"));
+    }
+
+    #[test]
+    fn a_row_naming_nobody_credits_nobody() {
+        let got = resolved(&seeded(), vec![row("plex-1".into(), Some(100))]);
+        assert_eq!(got[0].watcher, None);
     }
 
     #[test]

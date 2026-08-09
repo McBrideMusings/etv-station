@@ -652,7 +652,8 @@ Four knobs sit on the channel, under `scoring:`, all optional:
 | `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. |
 | `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
 | `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
-| `user` | — | The account `single_user` follows: a Tautulli username (`"Madi"`) or a numeric user id (`"321912630"`). Which one it is is inferred — a value that parses as an integer is sent as `user_id`, anything else as `user`. |
+| `user` | — | The account `single_user` follows: a Tautulli username (`"Madi"`) or a numeric user id (`"321912630"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
+| `attribution` | `false` | Name who has been watching each item, in the guide and on screen. Off by default; see below. |
 
 `target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
 window — a generation lays the returned list end-to-end, so a hint covering 30
@@ -681,6 +682,48 @@ What is *not* checked at load is whether the named account exists — that needs
 the network, and this is a config pass. Tautulli answers an unknown user with an
 empty history, which shows up at runtime as `rows=0` on that scope's
 `tautulli.history` log line.
+
+#### `attribution` — naming who has been watching
+
+With `attribution: true`, each item the channel schedules gets a line appended to
+its guide description:
+
+```
+A hobbit sets out.
+
+Watched recently by Madi, Pierce and Abby
+```
+
+Up to three names, then `and N others`. A person who rewatched something is named
+once — the line says who has been watching, not how many plays there were — and
+within an item the most recent watchers are the ones that survive the cut. An
+item nobody on record has watched gets no line at all, and an item's existing
+synopsis is never replaced, only appended to.
+
+It reaches two surfaces from that one field:
+
+- **The guide.** `ProgramMetadata.description` is what ETV-next turns into XMLTV,
+  so the line shows up as the programme description in Plex.
+- **On screen.** The overlay parses the same playout JSON, so a Rhai overlay
+  script gets `description` (the whole thing) and `watched_by` (the credit line
+  on its own, empty when there isn't one). Gate a lower third on
+  `watched_by != ""`.
+
+Two things it cannot do. It says **"recently"** and never "this week", because
+Tautulli's `get_history` has no `since` parameter — the rows reach back as far as
+the last thousand reach. And it is only as fresh as the generation that wrote the
+chunk: a chunk written now and aired in six hours carries six-hour-old
+attribution, because there is no path from ETV-next back to the station to
+refresh a chunk in place. A channel that wants it current wants a short
+`window_days` and `chunk_hours`, as the For You sample already does for ranking.
+
+`attribution` is opt-in rather than derived because turning it on publishes every
+viewer's activity to everyone else watching that channel. On a shared server that
+is a privacy decision, not a formatting one.
+
+It is also a second reader of the watch history, alongside a scorer plugin — so a
+channel with `attribution: true` and no `plugin:` pool still fetches history,
+where before only a plugin could cause a fetch (#131).
 
 History is fetched **once per distinct scope per refresh window**, not once per
 channel. Three channels following the same person share one `get_history` call

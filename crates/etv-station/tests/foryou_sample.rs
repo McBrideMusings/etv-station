@@ -264,6 +264,7 @@ fn watch_history_changes_what_plays() {
         history: [WatchEvent {
             entry_id: id.into(),
             watched_at: 900_000,
+            watcher: None,
         }]
         .into(),
         recent: Vec::new(),
@@ -307,6 +308,7 @@ fn a_pool_config_value_changes_the_scripts_ranking() {
         history: [WatchEvent {
             entry_id: "mov-dune".into(),
             watched_at: 900_000,
+            watcher: None,
         }]
         .into(),
         recent: Vec::new(),
