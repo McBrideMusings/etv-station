@@ -207,6 +207,20 @@ pub fn ingest_items(
             item.show.clone(),
             existing.as_ref().and_then(|e| e.show.clone()),
         );
+        // The grouping key every pool's series rotation reads. Derived from the
+        // show's name rather than taken from Plex's `grandparentRatingKey`,
+        // because a rating key belongs to one server and this column has to
+        // mean the same thing for the same show whatever source produced the
+        // row — the same reason the rest of the identity model (#47) prefers
+        // portable values.
+        //
+        // Without it every episode is its own series of one, which is a silent
+        // failure rather than a loud one: the pattern still emits television,
+        // it just draws a different show every slot and nothing that groups
+        // episodes — `rotate = "visit"`, `advance = "resume"`, `group_by`, a
+        // take-all step — can do its job. The prod catalog had 72,255 episodes
+        // and not one `show_id` before this.
+        entry.show_id = entry.show.as_deref().map(show_id_for);
         entry.season = item
             .season
             .or_else(|| existing.as_ref().and_then(|e| e.season));
@@ -445,6 +459,16 @@ fn resolve_existing(
 /// `Some(s)` when `s` is not blank, else `None`.
 fn non_empty(s: &str) -> Option<&str> {
     (!s.trim().is_empty()).then_some(s)
+}
+
+/// The grouping key for a show, from its name.
+///
+/// `show:` + the name verbatim, which is the shape the rest of the project
+/// already reads — [`crate::resolve`] recovers the display name by trimming
+/// exactly this prefix, so anything cleverer here (a slug, a hash) would come
+/// back out as the show's on-screen name.
+fn show_id_for(show: &str) -> String {
+    format!("show:{show}")
 }
 
 /// Prefer a non-empty Plex string, else keep what the entry already had.
@@ -861,6 +885,47 @@ mod tests {
         assert_eq!(parse_guid("nonsense://x"), None);
         assert_eq!(parse_guid("imdb://"), None);
         assert_eq!(parse_guid("garbage"), None);
+    }
+
+    /// Every episode of a show has to land on one `show_id`, because that is
+    /// the only key the pattern engine groups a series by. Without it each
+    /// episode is its own series of one and every grouping knob — `rotate =
+    /// "visit"`, `advance = "resume"`, `group_by`, a take-all step — quietly
+    /// does nothing while the channel still emits television. The prod catalog
+    /// held 72,255 episodes and not one `show_id` before this.
+    #[test]
+    fn episodes_of_one_show_share_a_show_id_and_movies_have_none() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut e1 = movie("plex-e1", "/data/media/tv/got/s01e01.mkv", &[]);
+        e1.kind = "episode".into();
+        e1.title = "Winter Is Coming".into();
+        e1.show = Some("Game of Thrones".into());
+        e1.season = Some(1);
+        e1.episode = Some(1);
+        let mut e2 = movie("plex-e2", "/data/media/tv/got/s02e03.mkv", &[]);
+        e2.kind = "episode".into();
+        e2.title = "What Is Dead May Never Die".into();
+        e2.show = Some("Game of Thrones".into());
+        e2.season = Some(2);
+        e2.episode = Some(3);
+        let film = movie("plex-m1", "/data/media/movies/Die Hard.mkv", &[]);
+
+        ingest_items(&cat, &[e1, e2, film], &["/data/media".into()]).unwrap();
+
+        let ids = cat.all_entry_ids().unwrap();
+        let shows = cat.show_ids_for(&ids).unwrap();
+        let mut got: Vec<&String> = shows.values().collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["show:Game of Thrones", "show:Game of Thrones"],
+            "both episodes group under one show, the film under none"
+        );
+
+        // The name reads back out of the key, which is what `resolve` relies on.
+        for value in shows.values() {
+            assert_eq!(value.trim_start_matches("show:"), "Game of Thrones");
+        }
     }
 
     #[test]
