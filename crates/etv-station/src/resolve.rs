@@ -1581,6 +1581,7 @@ mod tests {
                 expr: Some("item.type == \"movie\"".into()),
                 plugin: None,
                 order: Some(Order::parse("title:asc").unwrap()),
+                group_by: Default::default(),
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
                 advance,
@@ -1593,6 +1594,7 @@ mod tests {
                 expr: Some("item.type == \"episode\"".into()),
                 plugin: None,
                 order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+                group_by: Default::default(),
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
                 advance,
@@ -1604,12 +1606,12 @@ mod tests {
         inc.pattern = vec![
             PatternStep {
                 pool: "movies".into(),
-                take: 1,
+                take: crate::config::Take::Count(1),
                 chance: 1.0,
             },
             PatternStep {
                 pool: "shows".into(),
-                take: 2,
+                take: crate::config::Take::Count(2),
                 chance: 1.0,
             },
         ];

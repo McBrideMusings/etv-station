@@ -6,12 +6,19 @@
 //!
 //! A pool resolves to a flat, ordered id list (its `expr`, then its `order`),
 //! which is then grouped into **series**. A series key is the catalog `show_id`
-//! for an episode; an item with no `show_id` — a movie — is its own series of
-//! one. That single rule is why a movie pool needs no special case: rotating
-//! through one-item series *is* playing the movies in order.
+//! for an episode — or `show_id` plus the season number where the pool sets
+//! `group_by = "season"` (#155) — and an item with neither, a movie, is its own
+//! series of one. That single rule is why a movie pool needs no special case:
+//! rotating through one-item series *is* playing the movies in order.
 //!
 //! Series rotate in order of first appearance in the ordered set, so the pool's
 //! `order` fixes the rotation and nothing else has to.
+//!
+//! Where a season is the series, `take = "all"` empties the one a visit picked,
+//! which is the whole of "air a random season start to finish": nothing in the
+//! walk below knows what a season is, and nothing needs to. The count `all`
+//! stands for is resolved *after* the pick, since which series it means was the
+//! pick's decision.
 //!
 //! # Where adjacency constraints run
 //!
@@ -67,7 +74,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
-use crate::config::{Advance, Constraints, OnShort, PatternStep, Pool, Rotate, Select};
+use crate::config::{
+    Advance, Constraints, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, Take,
+};
 use crate::constrain::{ItemKeys, Limits, order_constrained};
 use crate::resume::{GenerationState, PoolResume};
 
@@ -86,11 +95,20 @@ const RANDOM_REROLLS: u64 = 8;
 /// `chance` — so one decision's roll never doubles as another's.
 const REROLL_STRIDE: u64 = 1 << 32;
 
-/// One series inside a pool: a show's episodes, or a single movie.
+/// One series inside a pool: a show's episodes, one season of them, or a single
+/// movie.
 #[derive(Debug)]
 struct Series {
-    /// `show_id`, or the item's own `entry_id` when it has none.
+    /// What this series is called in the rotation and in the `.resume` sidecar.
+    /// `show_id` under `group_by = "show"`, `"{show_id}|S{season}"` under
+    /// `group_by = "season"`, and the item's own `entry_id` when it has no
+    /// `show_id` at all.
     key: String,
+    /// The key the play-history ledger files this series' airings under —
+    /// always the `show_id`, never the season. Equal to [`Self::key`] except
+    /// under `group_by = "season"`, where several series share one show's
+    /// history and each finds its own place in it.
+    show_key: String,
     ids: Vec<String>,
     /// Index of the next item to play.
     cursor: usize,
@@ -305,19 +323,22 @@ impl PoolRuntime<'_> {
     }
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
-    fn visit(&mut self, take: usize, roll: &RollKey) -> Vec<String> {
-        if take == 0 || self.is_dry() {
+    fn visit(&mut self, take: Take, roll: &RollKey) -> Vec<String> {
+        if take == Take::Count(0) || self.is_dry() {
             return Vec::new();
         }
         match self.cfg.rotate {
-            // A new series every item is just `take` one-item visits.
+            // A new series every item is just `take` one-item visits. `all` is
+            // refused here at load — a step that changes series every item has
+            // no one series to empty — so the count is always present.
             Rotate::Slot => {
-                let mut out = Vec::with_capacity(take);
-                for slot in 0..take {
+                let n = take.count().unwrap_or(1);
+                let mut out = Vec::with_capacity(n);
+                for slot in 0..n {
                     if self.is_dry() {
                         break;
                     }
-                    out.extend(self.serve(1, roll, slot as u64));
+                    out.extend(self.serve(Take::Count(1), roll, slot as u64));
                 }
                 out
             }
@@ -328,9 +349,20 @@ impl PoolRuntime<'_> {
     /// Serve `take` items starting from one picked series, rolling onto others
     /// per `on_short` when it comes up short, then park the rotation where the
     /// next visit should resume.
-    fn serve(&mut self, take: usize, roll: &RollKey, nonce: u64) -> Vec<String> {
+    fn serve(&mut self, want: Take, roll: &RollKey, nonce: u64) -> Vec<String> {
+        let first = self.eligible_pick(roll, nonce);
+        // `all` is sized from the series the visit just picked, so it has to be
+        // resolved after the pick and not before: it means "empty *this* one",
+        // and which one that is was the pick's decision. A series is never
+        // parked past its own end — `take_from` wraps the cursor — so its
+        // remaining count is the whole rest of it.
+        let take = match (want, first) {
+            (Take::Count(n), _) => n,
+            (Take::All, Some(si)) => self.series[si].remaining(),
+            (Take::All, None) => return Vec::new(),
+        };
         let mut out: Vec<String> = Vec::with_capacity(take);
-        let mut current = self.eligible_pick(roll, nonce);
+        let mut current = first;
         let mut contributed: HashMap<usize, usize> = HashMap::new();
         let mut last: Option<usize> = None;
 
@@ -658,24 +690,34 @@ fn derive_cycles(
     by_name: &HashMap<&str, usize>,
 ) -> usize {
     let mut per_cycle: Vec<usize> = vec![0; runtimes.len()];
+    // Take-all steps are counted separately because they drain by the series,
+    // not by the item: one visit empties whichever series it picked, whatever
+    // its length, so what a cycle costs this pool is measured in series.
+    let mut all_steps: Vec<usize> = vec![0; runtimes.len()];
     for step in pattern {
         if let Some(&i) = by_name.get(step.pool.as_str()) {
-            per_cycle[i] += step.take;
+            match step.take {
+                Take::Count(n) => per_cycle[i] += n,
+                Take::All => all_steps[i] += 1,
+            }
         }
     }
 
     let mut cycles = 0;
     for (i, rt) in runtimes.iter().enumerate() {
-        if per_cycle[i] == 0 {
-            continue;
+        if per_cycle[i] > 0 {
+            // What is left to play from here — which, for a resumed pool, is
+            // less than the pool holds. A pool resumed to exactly its end still
+            // deserves a full pass, so fall back to its total.
+            let remaining: usize = rt.series.iter().map(|s| s.remaining()).sum();
+            let total: usize = rt.series.iter().map(|s| s.ids.len()).sum();
+            let want = if remaining > 0 { remaining } else { total };
+            cycles = cycles.max(want.div_ceil(per_cycle[i]));
         }
-        // What is left to play from here — which, for a resumed pool, is less
-        // than the pool holds. A pool resumed to exactly its end still deserves
-        // a full pass, so fall back to its total.
-        let remaining: usize = rt.series.iter().map(|s| s.remaining()).sum();
-        let total: usize = rt.series.iter().map(|s| s.ids.len()).sum();
-        let want = if remaining > 0 { remaining } else { total };
-        cycles = cycles.max(want.div_ceil(per_cycle[i]));
+        if all_steps[i] > 0 {
+            // Every series emptied once, at `all_steps[i]` of them per cycle.
+            cycles = cycles.max(rt.series.len().div_ceil(all_steps[i]));
+        }
     }
     cycles
 }
@@ -727,17 +769,33 @@ fn pool_runtime<'a>(
     // front, rather than a catalog round trip per item — a catch-up re-resolves
     // every pool on every generation.
     let show_ids = catalog.show_ids_for(&ids).map_err(|e| e.to_string())?;
+    // Season numbers only when the pool asks to be cut by them — the query is
+    // the same shape and the same cost as the one above, and a show-grouped
+    // pool has no use for the answer.
+    let seasons = match cfg.group_by {
+        GroupBy::Show => HashMap::new(),
+        GroupBy::Season => catalog.seasons_for(&ids).map_err(|e| e.to_string())?,
+    };
     let mut series: Vec<Series> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for id in ids {
-        // An item with no `show_id` — a movie — is its own series of one.
-        let key = show_ids.get(&id).cloned().unwrap_or_else(|| id.clone());
+        // An item with no `show_id` — a movie — is its own series of one, and
+        // stays one however the pool is grouped: it has no season to be cut at.
+        let show_key = show_ids.get(&id).cloned().unwrap_or_else(|| id.clone());
+        // An episode the catalog never recorded a season for stays with its
+        // show rather than becoming a series of one, which would scatter the
+        // very episodes a season-grouped pool is trying to keep together.
+        let key = match seasons.get(&id) {
+            Some(season) => format!("{show_key}|S{season}"),
+            None => show_key.clone(),
+        };
         match index.get(&key) {
             Some(&i) => series[i].ids.push(id),
             None => {
                 index.insert(key.clone(), series.len());
                 series.push(Series {
                     key,
+                    show_key,
                     ids: vec![id],
                     cursor: 0,
                 });
@@ -773,7 +831,14 @@ fn pool_runtime<'a>(
             // ledger's projection (#70) rather than a cursor of our own. An id
             // that has vanished from this series — deleted, re-identified, or
             // filtered out — restarts that series and only that series.
-            if let Some(last) = state.cursor.get(&s.key)
+            //
+            // Keyed on the show, not on this series' own name: the ledger files
+            // an airing under its `show_id`, so under `group_by = "season"` all
+            // of one show's seasons read the same entry and each keeps only the
+            // position it can find in its own list. The season that was playing
+            // continues; the others sit at their top, which is where a season
+            // nobody has started belongs.
+            if let Some(last) = state.cursor.get(&s.show_key)
                 && let Some(pos) = s.ids.iter().position(|id| id == last)
             {
                 s.cursor = pos + 1;
@@ -945,6 +1010,7 @@ mod tests {
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
             order: Some(Order::parse("title:asc").unwrap()),
+            group_by: GroupBy::Show,
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
@@ -960,6 +1026,7 @@ mod tests {
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+            group_by: GroupBy::Show,
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
@@ -983,9 +1050,207 @@ mod tests {
     fn step(pool: &str, take: usize) -> PatternStep {
         PatternStep {
             pool: pool.into(),
-            take,
+            take: Take::Count(take),
             chance: 1.0,
         }
+    }
+
+    fn step_all(pool: &str) -> PatternStep {
+        PatternStep {
+            pool: pool.into(),
+            take: Take::All,
+            chance: 1.0,
+        }
+    }
+
+    // ---- seasons as buckets (#155) -----------------------------------------
+
+    /// One show with two seasons of different lengths, plus a second show, so a
+    /// season-grouped pool has more than one way to be wrong: it can merge two
+    /// seasons of one show, or split one season across shows.
+    fn seasons_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        let add = |id: &str, show_id: &str, season: i64, episode: i64| {
+            let mut e = CatEntry::new(id, "episode", format!("Title {id}"), Source::Plex);
+            e.show_id = Some(show_id.to_string());
+            e.show = Some(show_id.trim_start_matches("show:").to_string());
+            e.season = Some(season);
+            e.episode = Some(episode);
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        };
+        for n in 1..=4 {
+            add(&format!("got-s1e{n}"), "show:got", 1, n);
+        }
+        for n in 1..=2 {
+            add(&format!("got-s2e{n}"), "show:got", 2, n);
+        }
+        for n in 1..=3 {
+            add(&format!("inv-s1e{n}"), "show:inv", 1, n);
+        }
+        c
+    }
+
+    fn episodes_pool(group_by: GroupBy) -> Pool {
+        Pool {
+            name: "shows".into(),
+            expr: Some("item.type == \"episode\"".into()),
+            plugin: None,
+            order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+            group_by,
+            select: Select::RoundRobin,
+            rotate: Rotate::Visit,
+            advance: Advance::Restart,
+            on_short: OnShort::Next,
+            constraints: None,
+            config: None,
+        }
+    }
+
+    fn build_seasons(
+        pool: Pool,
+        pattern: Vec<PatternStep>,
+        cycles: Option<usize>,
+        state: &GenerationState,
+    ) -> Vec<String> {
+        let cat = seasons_catalog();
+        build(
+            &cat,
+            &[pool],
+            &pattern,
+            cycles,
+            None,
+            state,
+            7,
+            test_env(),
+            None,
+        )
+        .expect("pattern builds")
+        .0
+    }
+
+    /// The whole point of #155: one visit airs one season, in order, and stops
+    /// at the season line rather than running on into the next one.
+    #[test]
+    fn a_season_grouped_take_all_airs_exactly_one_season() {
+        let ids = build_seasons(
+            episodes_pool(GroupBy::Season),
+            vec![step_all("shows")],
+            Some(1),
+            &GenerationState::empty(),
+        );
+        assert_eq!(
+            ids,
+            vec!["got-s1e1", "got-s1e2", "got-s1e3", "got-s1e4"],
+            "a season-grouped visit must air one season end to end and stop"
+        );
+    }
+
+    /// Same `take = "all"`, grouped by show: the bucket is the whole show, so
+    /// both seasons air. This is the knob doing what it says rather than
+    /// season-awareness leaking into the walk.
+    #[test]
+    fn a_show_grouped_take_all_airs_the_whole_show() {
+        let ids = build_seasons(
+            episodes_pool(GroupBy::Show),
+            vec![step_all("shows")],
+            Some(1),
+            &GenerationState::empty(),
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "got-s1e1", "got-s1e2", "got-s1e3", "got-s1e4", "got-s2e1", "got-s2e2"
+            ],
+        );
+    }
+
+    /// Consecutive visits move to the next season rather than replaying the one
+    /// just aired. The order they come in is the pool's own `order` — sorting
+    /// `season:asc` first puts every show's season 1 ahead of any season 2 —
+    /// which is the existing rule that a season bucket inherits unchanged.
+    #[test]
+    fn successive_take_all_visits_walk_the_seasons() {
+        let ids = build_seasons(
+            episodes_pool(GroupBy::Season),
+            vec![step_all("shows")],
+            Some(3),
+            &GenerationState::empty(),
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "got-s1e1", "got-s1e2", "got-s1e3", "got-s1e4", // got, season 1
+                "inv-s1e1", "inv-s1e2", "inv-s1e3", // inv, season 1
+                "got-s2e1", "got-s2e2", // got, season 2
+            ],
+        );
+    }
+
+    /// `advance = "resume"` continues the season that was playing. The ledger
+    /// files an airing under the show, not the season, so every season of that
+    /// show reads the same cursor entry — only the one that actually contains
+    /// the last-played episode may move, and the rest stay at their top.
+    #[test]
+    fn a_season_resumes_inside_its_own_season() {
+        let mut pool = episodes_pool(GroupBy::Season);
+        pool.advance = Advance::Resume;
+
+        let mut state = GenerationState::empty();
+        state
+            .cursor
+            .insert("show:got".into(), "got-s1e2".to_string());
+
+        let ids = build_seasons(pool, vec![step_all("shows")], Some(3), &state);
+        assert_eq!(
+            ids,
+            vec![
+                // got season 1 picks up after the episode the ledger last aired…
+                "got-s1e3", "got-s1e4", //
+                // …a show the cursor says nothing about is untouched…
+                "inv-s1e1", "inv-s1e2", "inv-s1e3", //
+                // …and got season 2, which never played, starts at its top
+                // rather than inheriting its show's cursor.
+                "got-s2e1", "got-s2e2",
+            ],
+        );
+    }
+
+    /// A movie has no season, so a season-grouped pool leaves it exactly where
+    /// a show-grouped one does: its own bucket of one.
+    #[test]
+    fn a_movie_is_its_own_bucket_however_the_pool_is_grouped() {
+        let mut pool = movies_pool();
+        pool.group_by = GroupBy::Season;
+        let (ids, _) = build_with(
+            vec![pool],
+            vec![step_all("movies")],
+            Some(2),
+            &GenerationState::empty(),
+            7,
+        );
+        assert_eq!(ids, vec!["mov-1", "mov-2"], "one movie per visit");
+    }
+
+    /// With no `cycles` authored, the derived count has to drain the pool the
+    /// way a take-all step actually drains it — one bucket per visit — rather
+    /// than dividing the item count by a `take` that isn't there.
+    #[test]
+    fn derived_cycles_drain_every_season_once() {
+        let ids = build_seasons(
+            episodes_pool(GroupBy::Season),
+            vec![step_all("shows")],
+            None,
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids.len(), 9, "all three seasons aired once: {ids:?}");
     }
 
     /// Build once, returning the ids and the state a following window would be
@@ -1400,7 +1665,7 @@ mod tests {
                 step("movies", 1),
                 PatternStep {
                     pool: "shows".into(),
-                    take: 3,
+                    take: Take::Count(3),
                     chance: 0.3,
                 },
             ]

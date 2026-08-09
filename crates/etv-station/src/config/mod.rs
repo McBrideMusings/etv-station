@@ -20,7 +20,7 @@ pub use filter::Filter;
 pub use load::{LoadedChannel, Station, load, read_channel};
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};
-pub use pool::{Advance, OnShort, PatternStep, Pool, Rotate, Select};
+pub use pool::{Advance, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, Take};
 pub use rule::{BlockInclude, RuleConfig};
 pub use source::SourceConfig;
 pub use station::StationConfig;

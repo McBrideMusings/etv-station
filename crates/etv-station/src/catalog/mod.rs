@@ -501,6 +501,42 @@ impl Catalog {
         Ok(out)
     }
 
+    /// The season number of each requested entry, in one round trip.
+    ///
+    /// Read only by a pool that groups its items by season (#155), on the same
+    /// terms and for the same reason as [`Self::show_ids_for`] beside it: one
+    /// statement per ~500 ids rather than a row fetch per item, on every
+    /// generation of a catch-up. Ids absent from the catalog, and entries with
+    /// no season number — every movie, and an episode whose metadata never
+    /// carried one — are simply missing from the returned map.
+    pub fn seasons_for(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>, CatalogError> {
+        let mut out = std::collections::HashMap::new();
+        if entry_ids.is_empty() {
+            return Ok(out);
+        }
+        for chunk in entry_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT entry_id, season FROM entries \
+                 WHERE season IS NOT NULL AND entry_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (id, season) = row?;
+                out.insert(id, season);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every id's recorded runtime in milliseconds, in one statement.
     ///
     /// The pattern walk reads this to know how much airtime it has laid down,

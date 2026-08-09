@@ -120,7 +120,7 @@ pattern:
         assert_eq!(block.pools.len(), 2);
         assert_eq!(block.pattern.len(), 2);
         assert_eq!(block.pattern[1].pool, "shows");
-        assert_eq!(block.pattern[1].take, 3);
+        assert_eq!(block.pattern[1].take, crate::config::Take::Count(3));
         assert_eq!(block.cycles, None);
     }
 

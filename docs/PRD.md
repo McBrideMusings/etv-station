@@ -121,14 +121,19 @@ A block declares named **pools** and a repeating **pattern** instead of a flat `
 |---|---|---|
 | `expr` | — | CEL query, as on a `query` entry |
 | `order` | query order | Internal sort; also fixes the series rotation order |
+| `group_by` | `show` | Where the pool is cut into series — `show` (every episode of a show in one series) or `season` (one series per season) |
 | `select` | `round_robin` | *Which* series serves next — `round_robin` or `random` |
 | `rotate` | `visit` | *When* the series changes — `visit` (take N consecutive from one series) or `slot` (a new series every item) |
 | `advance` | `restart` | `restart` replays from the top; `resume` continues from the resume map |
 | `on_short` | `next` | Who fills slots the current series can't supply — `next`, `wrap`, or `short` |
 
-A pattern step is `{pool, take, chance}`. `chance` (default `1.0`) makes a step fire probabilistically — the "occasionally binge" knob. The roll is keyed on `(seed, cycle, step)`, so a pinned `seed` reproduces the whole skip/fire sequence, and a skipped step consumes no cursor.
+A pattern step is `{pool, take, chance}`. `take` is a count, or the word `all` to empty whichever series the visit picked. `chance` (default `1.0`) makes a step fire probabilistically — the "occasionally binge" knob. The roll is keyed on `(seed, cycle, step)`, so a pinned `seed` reproduces the whole skip/fire sequence, and a skipped step consumes no cursor.
 
-A series is keyed by the catalog `show_id`; an item without one — a movie — is its own series of one, which is why a movie pool needs no special case.
+A series is keyed by the catalog `show_id` — or by `show_id` **and season** where the pool sets `group_by: season` — and an item with neither, a movie, is its own series of one, which is why a movie pool needs no special case. An episode the catalog recorded no season number for stays with its show rather than becoming a series of one.
+
+**Playing a season start to finish** needs no rule of its own: `group_by: season` cuts one series per season, and `take: all` empties the series a visit picked, so `select: random` with both is "pick a random season and air it end to end". The same `take: all` under the default `group_by: show` airs a whole show instead. A visit is atomic, so the pattern's other steps come before and after a season, never inside it.
+
+Two combinations are refused at load rather than given a reading. `take: all` with `rotate: slot` has no single series to empty, since `slot` changes series every item. And `take: all` cannot share a block with `constraints`: converting a pool-draw gap into channel positions is arithmetic over the pattern's `take` numbers done at load, and how much a take-all step lays down is not known until its pool has been resolved — so the seam could only be sized by guessing, and a guess too small would let a repeat cross a generation boundary silently.
 
 `cycles` left unset means "run until the window is covered". Draining the largest pool once is only the ceiling: the walk stops at the first cycle boundary past `window_days`, and the next roll tick picks the pools up where it left them. Without that stop a block with dozens of pools would lay down years of schedule in a single pass, and a channel already booked to 2037 ignores every later edit to its config. An authored `cycles` is exempt — that number is the author saying how long a pass runs.
 

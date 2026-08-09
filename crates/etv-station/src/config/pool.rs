@@ -9,12 +9,108 @@
 //! Every knob defaults to the stateless, least-surprising behavior, so a pool
 //! that names only `expr` behaves like today's `query` entry.
 
+use std::fmt;
 use std::path::PathBuf;
 
+use serde::de::{self, Deserializer, Visitor};
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use super::constraints::Constraints;
 use super::order::Order;
+
+/// Where a pool's items are cut into series — the buckets a draw picks between.
+///
+/// The cut is the whole of the "play a season start to finish" feature (#155):
+/// with a season-sized bucket, `select = "random"` plus `take = "all"` *is*
+/// "pick a random season and air it end to end", and nothing in the walk needs
+/// to know what a season is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBy {
+    /// One bucket per show — every episode of a show in one pile, seasons
+    /// running together. The broadcast-like default.
+    #[default]
+    Show,
+    /// One bucket per season of a show. An episode the catalog has no season
+    /// number for stays with its show rather than becoming a bucket of one.
+    Season,
+}
+
+/// How many items one visit to a pattern step draws.
+///
+/// Written in the channel file as either a number (`take: 3`) or the word
+/// `all` (`take: "all"`). `All` empties the bucket the visit picked, which is
+/// how a whole season — or a whole show, under `group_by = "show"` — airs
+/// without the author having to know how many episodes are in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    Count(usize),
+    All,
+}
+
+impl Take {
+    /// The authored number, or `None` for `all`. Callers that must size a step
+    /// before anything has touched the catalog use this and say what they do
+    /// with the `None` — the count `all` stands for is not knowable until a
+    /// bucket has been picked.
+    pub fn count(self) -> Option<usize> {
+        match self {
+            Take::Count(n) => Some(n),
+            Take::All => None,
+        }
+    }
+}
+
+impl Serialize for Take {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Take::Count(n) => serializer.serialize_u64(*n as u64),
+            Take::All => serializer.serialize_str("all"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Take {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A hand-written visitor rather than an untagged enum: untagged buffers
+        // the value through a self-describing intermediate, which the TOML and
+        // YAML front ends do not agree on for a bare scalar.
+        struct TakeVisitor;
+
+        impl Visitor<'_> for TakeVisitor {
+            type Value = Take;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a positive integer or the string \"all\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Take, E> {
+                Ok(Take::Count(v as usize))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Take, E> {
+                if v < 0 {
+                    return Err(E::custom(format!(
+                        "take = {v} is negative (want a positive integer or \"all\")"
+                    )));
+                }
+                Ok(Take::Count(v as usize))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Take, E> {
+                match v {
+                    "all" => Ok(Take::All),
+                    other => Err(E::custom(format!(
+                        "invalid take {other:?} (want a positive integer or \"all\")"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(TakeVisitor)
+    }
+}
 
 /// Which series the next draw comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -128,6 +224,11 @@ pub struct Pool {
     /// exists to make — so validation rejects the pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Order>,
+
+    /// Where this pool's items are cut into series. Unset groups by show, which
+    /// is what every channel written before #155 means.
+    #[serde(default)]
+    pub group_by: GroupBy,
 
     #[serde(default)]
     pub select: Select,
@@ -247,8 +348,9 @@ pub struct PatternStep {
     /// Name of the [`Pool`] this step draws from.
     pub pool: String,
 
-    /// How many items to draw per visit.
-    pub take: usize,
+    /// How many items to draw per visit — a number, or `"all"` to empty the
+    /// bucket the visit picked.
+    pub take: Take,
 
     /// Probability this step fires on a given pass through the pattern —
     /// "occasionally binge". `1.0` (the default) always fires. The roll is
@@ -314,7 +416,7 @@ on_short: short
     #[test]
     fn pattern_step_chance_defaults_to_always_fire() {
         let step: PatternStep = serde_norway::from_str("pool: shows\ntake: 3\n").unwrap();
-        assert_eq!(step.take, 3);
+        assert_eq!(step.take, Take::Count(3));
         assert_eq!(step.chance, 1.0);
     }
 
@@ -323,6 +425,42 @@ on_short: short
         let step: PatternStep =
             toml::from_str("pool = \"shows\"\ntake = 3\nchance = 0.3\n").unwrap();
         assert_eq!(step.chance, 0.3);
+    }
+
+    #[test]
+    fn group_by_defaults_to_show_and_parses_season() {
+        let bare: Pool = serde_norway::from_str("name: shows\nexpr: 'x'\n").unwrap();
+        assert_eq!(bare.group_by, GroupBy::Show);
+        let seasoned: Pool =
+            serde_norway::from_str("name: shows\nexpr: 'x'\ngroup_by: season\n").unwrap();
+        assert_eq!(seasoned.group_by, GroupBy::Season);
+    }
+
+    /// `take` accepts a number or the word `all`, in both channel formats — the
+    /// integer-or-string shape is the one thing a hand-written visitor buys, so
+    /// it is worth proving on each front end rather than one.
+    #[test]
+    fn take_parses_a_count_or_all_from_either_format() {
+        let yaml: PatternStep = serde_norway::from_str("pool: shows\ntake: all\n").unwrap();
+        assert_eq!(yaml.take, Take::All);
+        let yaml_quoted: PatternStep =
+            serde_norway::from_str("pool: shows\ntake: \"all\"\n").unwrap();
+        assert_eq!(yaml_quoted.take, Take::All);
+        let toml_all: PatternStep = toml::from_str("pool = \"shows\"\ntake = \"all\"\n").unwrap();
+        assert_eq!(toml_all.take, Take::All);
+        let toml_count: PatternStep = toml::from_str("pool = \"shows\"\ntake = 5\n").unwrap();
+        assert_eq!(toml_count.take, Take::Count(5));
+    }
+
+    /// A misspelling has to fail at load naming what was wanted, not read as
+    /// some default and quietly air the wrong amount.
+    #[test]
+    fn an_unknown_take_word_is_refused_by_name() {
+        let err = serde_norway::from_str::<PatternStep>("pool: shows\ntake: everything\n")
+            .expect_err("only \"all\" is a word take accepts")
+            .to_string();
+        assert!(err.contains("everything"), "err = {err}");
+        assert!(err.contains("\"all\""), "err = {err}");
     }
 
     #[test]

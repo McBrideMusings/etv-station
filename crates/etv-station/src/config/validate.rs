@@ -5,6 +5,7 @@ use super::block::Duplicates;
 use super::channel::ChannelConfig;
 use super::constraints::Constraints;
 use super::order::Order;
+use super::pool::{Rotate, Take};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
@@ -307,13 +308,61 @@ fn validate_pattern_block<'a>(
                 step.pool
             )));
         }
-        if step.take == 0 {
+        if step.take == Take::Count(0) {
             return Err(bad(format!("pattern step #{step_idx} has take = 0")));
+        }
+        // `all` empties the bucket the visit picked, and `rotate = "slot"` picks
+        // a new bucket for every single item — so there is no one bucket for
+        // `all` to mean. Refuse the pair rather than pick a reading.
+        if step.take == Take::All
+            && let Some(pool) = include.pools.iter().find(|p| p.name == step.pool)
+            && pool.rotate == Rotate::Slot
+        {
+            return Err(bad(format!(
+                "pattern step #{step_idx} has take = \"all\" but pool {:?} sets \
+                 rotate = \"slot\", which changes series every item — \"all\" has \
+                 no single series to empty. Use rotate = \"visit\", or an explicit count",
+                step.pool
+            )));
         }
         if !(0.0..=1.0).contains(&step.chance) {
             return Err(bad(format!(
                 "pattern step #{step_idx} has chance = {}, outside 0.0–1.0",
                 step.chance
+            )));
+        }
+    }
+
+    // A take-all step and adjacency constraints cannot share a block.
+    //
+    // `RuleConfig::adjacency_reach` converts "N draws of this pool" into "N
+    // positions of aired schedule" so the generation seam can be checked, and
+    // it does that arithmetic from the pattern's `take` numbers while the file
+    // is being loaded — before anything has resolved a pool against the
+    // catalog. `all` has no number there: how many items it emits depends on
+    // which bucket the visit picks. Sizing the seam from the counted steps
+    // alone would report a tail shorter than the schedule actually lays, and a
+    // repeat would cross a generation boundary with nothing logged. Refusing
+    // the pair keeps the seam honest; sizing one across a take-all step is its
+    // own piece of work.
+    if include.pattern.iter().any(|s| s.take == Take::All) {
+        let constrained = include
+            .constraints
+            .is_some()
+            .then(|| "the block".to_string())
+            .or_else(|| {
+                include
+                    .pools
+                    .iter()
+                    .find(|p| p.constraints.is_some())
+                    .map(|p| format!("pool {:?}", p.name))
+            });
+        if let Some(who) = constrained {
+            return Err(bad(format!(
+                "this block has a pattern step with take = \"all\" and {who} declares \
+                 `constraints` — how much airtime a take-all step lays is not known \
+                 until its pool is resolved, so the generation seam cannot be sized \
+                 for it. Drop the constraints, or give every step an explicit count",
             )));
         }
     }
@@ -368,6 +417,7 @@ mod tests {
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
             order: None,
+            group_by: Default::default(),
             select: Select::default(),
             rotate: Rotate::default(),
             advance: Advance::default(),
@@ -380,7 +430,15 @@ mod tests {
     fn step(pool: &str, take: usize) -> PatternStep {
         PatternStep {
             pool: pool.into(),
-            take,
+            take: Take::Count(take),
+            chance: 1.0,
+        }
+    }
+
+    fn step_all(pool: &str) -> PatternStep {
+        PatternStep {
+            pool: pool.into(),
+            take: Take::All,
             chance: 1.0,
         }
     }
@@ -743,6 +801,55 @@ mod tests {
         b.pattern[0].chance = 1.5;
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("chance"), "err = {err}");
+    }
+
+    /// `all` empties the series a visit picked; `rotate = "slot"` picks a new
+    /// series for every item. There is no reading of the pair, so it is refused
+    /// at load rather than resolved to whichever one the walk happens to do.
+    #[test]
+    fn rejects_take_all_on_a_slot_rotating_pool() {
+        let mut p = pool("shows");
+        p.rotate = Rotate::Slot;
+        let b = pattern_block(vec![p], vec![step_all("shows")]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("rotate = \"slot\""),
+            "err = {err}"
+        );
+
+        // The same pool with an explicit count is fine.
+        let mut p = pool("shows");
+        p.rotate = Rotate::Slot;
+        let b = pattern_block(vec![p], vec![step("shows", 3)]);
+        assert!(validate_channel(&dummy_path(), &channel_with(vec![b])).is_ok());
+    }
+
+    /// A take-all step lays an amount of schedule nothing can size until the
+    /// pool is resolved, so the seam arithmetic in `RuleConfig::adjacency_reach`
+    /// cannot cover it. Refused whichever level declares the constraints.
+    #[test]
+    fn rejects_take_all_beside_constraints() {
+        let gap = Constraints {
+            no_repeat_within: Some(3),
+            separate_by: None,
+            separate_min_gap: None,
+        };
+
+        let mut p = pool("shows");
+        p.constraints = Some(gap.clone());
+        let b = pattern_block(vec![p], vec![step_all("shows")]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("pool \"shows\""), "err = {err}");
+        assert!(format!("{err}").contains("take = \"all\""), "err = {err}");
+
+        let mut b = pattern_block(vec![pool("shows")], vec![step_all("shows")]);
+        b.constraints = Some(gap);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("the block"), "err = {err}");
+
+        // Unconstrained, the same take-all block loads.
+        let b = pattern_block(vec![pool("shows")], vec![step_all("shows")]);
+        assert!(validate_channel(&dummy_path(), &channel_with(vec![b])).is_ok());
     }
 
     #[test]

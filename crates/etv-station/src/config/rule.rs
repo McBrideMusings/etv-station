@@ -127,7 +127,19 @@ impl BlockInclude {
             return self.constraints().reach();
         }
         let block = self.constraints.as_ref();
-        let cycle_total: usize = self.pattern.iter().map(|s| s.take).sum();
+        // `take: "all"` contributes nothing to either sum, and it cannot: the
+        // count it stands for depends on which bucket the visit picks, which is
+        // not known until the pool has been resolved against the catalog — and
+        // this runs at load. Guessing a size would quietly under-report the
+        // seam and let a repeat cross a generation boundary with nothing said,
+        // so validation refuses a block that mixes `take: "all"` with any
+        // `constraints` instead. Every pool here therefore has `reach() == 0`
+        // whenever a take-all step is present, and both sums go unread.
+        let cycle_total: usize = self
+            .pattern
+            .iter()
+            .filter_map(|s| s.take.count())
+            .sum::<usize>();
         self.pools
             .iter()
             .map(|pool| {
@@ -135,7 +147,7 @@ impl BlockInclude {
                     .pattern
                     .iter()
                     .filter(|s| s.pool == pool.name)
-                    .map(|s| s.take)
+                    .filter_map(|s| s.take.count())
                     .sum();
                 let reach = pool.constraints(block).reach();
                 // A pool no step draws from never reaches the seam at all.
