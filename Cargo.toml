@@ -4,6 +4,7 @@ exclude = ["etv-next"]
 resolver = "3"
 
 [workspace.dependencies]
+ersatztv = { path = "etv-next/crates/ersatztv" }
 ersatztv-core = { path = "etv-next/crates/ersatztv-core" }
 ersatztv-playout = { path = "etv-next/crates/ersatztv-playout" }
 etv-station = { path = "crates/etv-station" }

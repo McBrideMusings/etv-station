@@ -72,6 +72,11 @@ impl RenderOptions {
 pub struct Rendered {
     pub lineup_path: PathBuf,
     pub channels: usize,
+    /// What was published as the tuner identity. Logged on every render: the
+    /// whole point of this value is that it never changes between runs, and
+    /// when Plex shows a tuner that isn't the expected one, the container log
+    /// is the first place anyone looks.
+    pub device_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,31 +117,47 @@ pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, Rend
         return Err(RenderError::NoChannels(config_path.to_path_buf()));
     }
     // The station config is the only place the tuner identity can come from,
-    // and this is the only entry point that has it.
+    // and this is the only entry point that has it. The minted id is kept beside
+    // that config file — see `resolve_device_id` for why not on the data volume.
     let device_id = resolve_device_id(
         station.station.device_id.as_deref(),
-        &station.station.output_base,
+        config_dir(config_path),
     )?;
     render_folders(&folders, opts, &device_id)
+}
+
+/// The directory holding the station config, which is where state that must
+/// outlive a wipe of the data volume belongs.
+fn config_dir(config_path: &Path) -> &Path {
+    config_path.parent().unwrap_or(Path::new("."))
 }
 
 /// The identity ETV-next reports to Plex, which must be the same string on
 /// every run or Plex sees a new tuner and drops the channel mapping.
 ///
 /// Configured value wins outright. Otherwise the id is read from
-/// `{output_base}/.device_id`, and minted and stored there on the first run
-/// that finds no file. `output_base` is on the data volume, so the stored value
-/// outlives the container; only per-channel subfolders are swept, so nothing
-/// prunes it.
+/// `{station-config-dir}/.device_id`, and minted and stored there on the first
+/// run that finds no file.
+///
+/// It lives beside the station config rather than under `output_base` because
+/// this is the one value on the station that cannot be regenerated. In the
+/// container `output_base` is `/data/playout`, and everything else on that
+/// volume is disposable — playout JSON is rewritten every roll and
+/// `deploy/appdata/README.md` calls `catalog.db` "a rebuildable cache, not
+/// config" — so clearing `/data` to force a catalog rebuild is a normal thing to
+/// do. Doing it with the id stored there would mint a new one, and Plex would
+/// silently drop the channel mapping for every channel. The config directory is
+/// the mount nobody clears. Legacy ErsatzTV keeps its HDHomeRun UUID as config
+/// for the same reason.
 pub fn resolve_device_id(
     configured: Option<&str>,
-    output_base: &Path,
+    state_dir: &Path,
 ) -> Result<String, RenderError> {
     if let Some(id) = configured.map(str::trim).filter(|id| !id.is_empty()) {
         return Ok(id.to_string());
     }
 
-    let path = output_base.join(".device_id");
+    let path = state_dir.join(".device_id");
     match fs::read_to_string(&path) {
         Ok(stored) if !stored.trim().is_empty() => return Ok(stored.trim().to_string()),
         Ok(_) => {}
@@ -150,11 +171,21 @@ pub fn resolve_device_id(
     }
 
     let minted = uuid::Uuid::new_v4().to_string();
-    fs::create_dir_all(output_base).map_err(|source| RenderError::Io {
-        path: output_base.to_path_buf(),
+    fs::create_dir_all(state_dir).map_err(|source| RenderError::Io {
+        path: state_dir.to_path_buf(),
         source,
     })?;
-    fs::write(&path, &minted).map_err(|source| RenderError::Io {
+
+    // Written through a temp file and a rename so a crash between create and
+    // flush cannot leave a zero-length file behind. An empty file reads as "no
+    // id" on the next start and mints a different one — which is the same lost
+    // channel mapping, arrived at by a slower route.
+    let tmp = state_dir.join(".device_id.tmp");
+    fs::write(&tmp, &minted).map_err(|source| RenderError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    fs::rename(&tmp, &path).map_err(|source| RenderError::Io {
         path: path.clone(),
         source,
     })?;
@@ -265,6 +296,7 @@ pub fn render_folders(
     Ok(Rendered {
         lineup_path,
         channels: folders.len(),
+        device_id: device_id.to_string(),
     })
 }
 
@@ -408,10 +440,14 @@ mod tests {
         let folders = vec![PathBuf::from("out/star-trek")];
         let rendered = render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
 
-        // ETV-next reads this and reports it as its HDHomeRun DeviceID; if it
-        // never reaches the lineup, Plex is told the scaffold default instead.
-        let lineup = read(&rendered.lineup_path);
-        assert_eq!(lineup["server"]["device_id"], "test-device-id");
+        // Read back through ETV-next's own config type, not as loose JSON. The
+        // two sides have to agree on this key's name, and a mismatch is exactly
+        // the failure nothing here would notice: ETV-next would ignore the
+        // unknown key and serve a different id than the station published.
+        let text = fs::read_to_string(&rendered.lineup_path).unwrap();
+        let parsed: ersatztv::config::LineupConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.server.device_id, "test-device-id");
+        assert_eq!(rendered.device_id, "test-device-id");
     }
 
     fn read(path: &Path) -> Value {

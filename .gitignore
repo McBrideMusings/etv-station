@@ -16,6 +16,11 @@ examples/etv-next/lineup.json
 examples/etv-next/channel*.json
 examples/etv-next/presentation.json
 examples/output/
+# Minted on first run beside the station config. Per-install, and the one value
+# a fresh clone must not inherit — a shared tuner id makes two people's servers
+# look like the same box to Plex.
+.device_id
+.device_id.tmp
 tools/__pycache__/
 # examples/channels/ holds the channels the dev station actually RUNS, and
 # examples/station.yaml globs it. Personal channels live here and are ignored;

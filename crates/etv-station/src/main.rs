@@ -140,11 +140,12 @@ fn render_etv_next(config_path: &Path, out_dir: &Path) -> ExitCode {
     match etv_next::render(config_path, &opts) {
         Ok(rendered) => {
             println!(
-                "render-etv-next: {} + {} channel file(s) (bind={} port={})",
+                "render-etv-next: {} + {} channel file(s) (bind={} port={} device_id={})",
                 rendered.lineup_path.display(),
                 rendered.channels,
                 opts.bind_address,
                 opts.port,
+                rendered.device_id,
             );
             ExitCode::SUCCESS
         }
