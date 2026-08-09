@@ -54,6 +54,11 @@ retention_days: 1
 scoring:
   recent_depth: 200
   nominal_item_secs: 5400
+  # Name who has been watching, in the guide and on screen (#113). This is the
+  # channel where it means something: its history is the whole house, so a line
+  # reads "Watched recently by <three names> and N others". A channel scoped to
+  # one person leaves it off — there, every line would name the same person.
+  attribution: true
 
 rule:
   blocks:

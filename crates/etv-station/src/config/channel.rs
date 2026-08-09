@@ -126,8 +126,8 @@ impl ChannelConfig {
         match self.scoring.as_ref() {
             Some(s) => match (s.taste_scope, s.user.as_deref()) {
                 // Trimmed, because the surrounding whitespace would otherwise be
-                // sent as part of the name: `user: " Pierce "` reaches Tautulli
-                // as `user=+Pierce+`, matches no account, and returns an empty
+                // sent as part of the name: `user: " carol "` reaches Tautulli
+                // as `user=+carol+`, matches no account, and returns an empty
                 // history that is indistinguishable from a quiet week.
                 // `validate_taste_scope` only rejects an *entirely* blank value,
                 // so trimming has to happen here too.
@@ -209,7 +209,7 @@ pub struct ScoringConfig {
     pub taste_scope: TasteScope,
 
     /// The one account `taste_scope: single_user` ranks against — a Tautulli
-    /// username (`"Madi"`) or a numeric user id (`"321912630"`). Which one it is
+    /// username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is
     /// is inferred, not configured: a value that parses as an integer is sent as
     /// `user_id`, anything else as `user`.
     ///

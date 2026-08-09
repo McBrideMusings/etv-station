@@ -497,12 +497,12 @@ labels = ["a", "b"]
     #[test]
     fn watched_by_finds_the_credit_and_ignores_a_plain_synopsis() {
         assert_eq!(
-            watched_by_line("A hobbit sets out.\n\nWatched recently by Madi and Pierce"),
-            "Watched recently by Madi and Pierce",
+            watched_by_line("A hobbit sets out.\n\nWatched recently by bob and carol"),
+            "Watched recently by bob and carol",
         );
         assert_eq!(
-            watched_by_line("Watched recently by Madi"),
-            "Watched recently by Madi",
+            watched_by_line("Watched recently by bob"),
+            "Watched recently by bob",
         );
         assert_eq!(
             watched_by_line("A hobbit sets out.\n\nHe comes back."),

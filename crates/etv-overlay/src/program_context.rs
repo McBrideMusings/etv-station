@@ -286,7 +286,7 @@ mod tests {
                 "finish": "2026-04-13T00:10:00Z",
                 "program": {
                     "title": "Alpha",
-                    "description": "A hobbit sets out.\n\nWatched recently by Madison and Pierce"
+                    "description": "A hobbit sets out.\n\nWatched recently by Bob Example and carol"
                 }
             }
         ]
@@ -304,7 +304,7 @@ mod tests {
         let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
         assert_eq!(
             ctx.description,
-            "A hobbit sets out.\n\nWatched recently by Madison and Pierce",
+            "A hobbit sets out.\n\nWatched recently by Bob Example and carol",
         );
     }
 

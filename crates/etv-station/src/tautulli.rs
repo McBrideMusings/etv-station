@@ -82,7 +82,7 @@ impl HistoryScope {
     /// The query parameter this scope adds to `get_history`, if any.
     ///
     /// Tautulli takes either `user_id` (numeric) or `user` (the username), and
-    /// a config says which by what it wrote: `"321912630"` is an id, `"Madi"` is
+    /// a config says which by what it wrote: `"1234567"` is an id, `"bob"` is
     /// a name. Inferring beats a second config field that could disagree with
     /// the first.
     ///
@@ -97,7 +97,7 @@ impl HistoryScope {
     ///
     /// The value is *not* escaped here — [`request_rows`] passes it through
     /// `ureq`'s `.query()`, which percent-encodes it. That matters for real
-    /// accounts on this server: a username like `Jacob + Liv` written straight
+    /// accounts on this server: a username like `Sam + Alex` written straight
     /// into a URL would arrive as `Jacob   Liv`, because `+` decodes to a space
     /// in a query string, and would match no user.
     fn query_param(&self) -> Option<(&'static str, &str)> {
@@ -181,8 +181,8 @@ pub struct HistoryRow {
 impl HistoryRow {
     /// Who to credit this row to, or `None` when it names nobody.
     ///
-    /// `friendly_name` first: on this server it is what distinguishes `Madison`
-    /// from the account spelled `Madi`. Blank strings are treated as absent —
+    /// `friendly_name` first: on this server it is what distinguishes `Bob Example`
+    /// from the account spelled `bob`. Blank strings are treated as absent —
     /// Tautulli sends `""` rather than omitting the key.
     fn watcher(&self) -> Option<String> {
         [self.friendly_name.as_deref(), self.user.as_deref()]
@@ -431,7 +431,7 @@ mod tests {
     }
 
     /// `friendly_name` wins because it is the name a person recognises — on
-    /// this server the account spelled `Madi` displays as `Madison`.
+    /// this server the account spelled `bob` displays as `Bob Example`.
     #[test]
     fn the_friendly_name_is_preferred_over_the_account_name() {
         let got = resolved(
@@ -439,11 +439,11 @@ mod tests {
             vec![row_by(
                 "plex-1".into(),
                 Some(100),
-                Some("Madison"),
-                Some("Madi"),
+                Some("Bob Example"),
+                Some("bob"),
             )],
         );
-        assert_eq!(got[0].watcher.as_deref(), Some("Madison"));
+        assert_eq!(got[0].watcher.as_deref(), Some("Bob Example"));
     }
 
     /// Tautulli sends `""` rather than omitting the key, so a blank friendly
@@ -452,9 +452,9 @@ mod tests {
     fn a_blank_friendly_name_falls_through_to_the_username() {
         let got = resolved(
             &seeded(),
-            vec![row_by("plex-1".into(), Some(100), Some("  "), Some("Madi"))],
+            vec![row_by("plex-1".into(), Some(100), Some("  "), Some("bob"))],
         );
-        assert_eq!(got[0].watcher.as_deref(), Some("Madi"));
+        assert_eq!(got[0].watcher.as_deref(), Some("bob"));
     }
 
     #[test]
@@ -512,20 +512,20 @@ mod tests {
     #[test]
     fn a_numeric_user_is_an_id_and_a_name_is_a_name() {
         assert_eq!(
-            HistoryScope::User("568385169".into()).query_param(),
-            Some(("user_id", "568385169")),
+            HistoryScope::User("7654321".into()).query_param(),
+            Some(("user_id", "7654321")),
             "a value that parses as an integer is a Tautulli user_id",
         );
         assert_eq!(
-            HistoryScope::User("Pierce".into()).query_param(),
-            Some(("user", "Pierce")),
+            HistoryScope::User("carol".into()).query_param(),
+            Some(("user", "carol")),
             "anything else is a username",
         );
         // Real account on this server, and the reason the inference is not
         // "starts with a digit".
         assert_eq!(
-            HistoryScope::User("Jacob + Liv".into()).query_param(),
-            Some(("user", "Jacob + Liv")),
+            HistoryScope::User("Sam + Alex".into()).query_param(),
+            Some(("user", "Sam + Alex")),
         );
     }
 
@@ -546,13 +546,13 @@ mod tests {
 
     /// A username with a `+` or a space has to survive the trip as itself.
     ///
-    /// Written straight into a query string, `Jacob + Liv` arrives at Tautulli as
+    /// Written straight into a query string, `Sam + Alex` arrives at Tautulli as
     /// `Jacob   Liv` — `+` is the query-string encoding of a space — and matches
     /// no user, so the channel would rank against an empty history and look
     /// merely unlucky. This pins the encoding `request_rows` relies on.
     #[test]
     fn a_username_with_punctuation_survives_encoding() {
-        let scope = HistoryScope::User("Jacob + Liv".into());
+        let scope = HistoryScope::User("Sam + Alex".into());
         let (param, value) = scope.query_param().unwrap();
         let url = ureq::get("http://tautulli.invalid/api/v2")
             .query(param, value)
@@ -561,7 +561,7 @@ mod tests {
             .as_url()
             .to_string();
         assert!(
-            url.contains("user=Jacob+%2B+Liv"),
+            url.contains("user=Sam+%2B+Alex"),
             "the literal + must be percent-encoded, not left to mean a space: {url}"
         );
     }

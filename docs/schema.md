@@ -652,7 +652,7 @@ Four knobs sit on the channel, under `scoring:`, all optional:
 | `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. |
 | `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
 | `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
-| `user` | — | The account `single_user` follows: a Tautulli username (`"Madi"`) or a numeric user id (`"321912630"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
+| `user` | — | The account `single_user` follows: a Tautulli username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
 | `attribution` | `false` | Name who has been watching each item, in the guide and on screen. Off by default; see below. |
 
 `target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
@@ -691,7 +691,7 @@ its guide description:
 ```
 A hobbit sets out.
 
-Watched recently by Madi, Pierce and Abby
+Watched recently by bob, carol and dave
 ```
 
 Up to three names, then `and N others`. A person who rewatched something is named

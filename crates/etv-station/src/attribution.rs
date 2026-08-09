@@ -145,57 +145,57 @@ mod tests {
 
     #[test]
     fn names_one_watcher() {
-        let a = Attribution::build(&[watch("m1", 100, Some("Madi"))]);
-        assert_eq!(a.line_for("m1").unwrap(), "Watched recently by Madi");
+        let a = Attribution::build(&[watch("m1", 100, Some("bob"))]);
+        assert_eq!(a.line_for("m1").unwrap(), "Watched recently by bob");
     }
 
     #[test]
     fn joins_two_with_and_and_three_with_a_comma() {
         let two = Attribution::build(&[
-            watch("m1", 200, Some("Madi")),
-            watch("m1", 100, Some("Pierce")),
+            watch("m1", 200, Some("bob")),
+            watch("m1", 100, Some("carol")),
         ]);
         assert_eq!(
             two.line_for("m1").unwrap(),
-            "Watched recently by Madi and Pierce"
+            "Watched recently by bob and carol"
         );
 
         let three = Attribution::build(&[
-            watch("m1", 300, Some("Madi")),
-            watch("m1", 200, Some("Pierce")),
-            watch("m1", 100, Some("Abby")),
+            watch("m1", 300, Some("bob")),
+            watch("m1", 200, Some("carol")),
+            watch("m1", 100, Some("dave")),
         ]);
         assert_eq!(
             three.line_for("m1").unwrap(),
-            "Watched recently by Madi, Pierce and Abby",
+            "Watched recently by bob, carol and dave",
         );
     }
 
     /// A film the whole house watched must not produce a twenty-name sentence.
     #[test]
     fn collapses_a_long_list_into_and_n_others() {
-        let events: Vec<WatchEvent> = ["Madi", "Pierce", "Abby", "Zions", "emma"]
+        let events: Vec<WatchEvent> = ["alice", "bob", "carol", "dave", "erin"]
             .iter()
             .enumerate()
             .map(|(i, n)| watch("m1", 500 - i as i64, Some(n)))
             .collect();
         assert_eq!(
             Attribution::build(&events).line_for("m1").unwrap(),
-            "Watched recently by Madi, Pierce, Abby and 2 others",
+            "Watched recently by alice, bob, carol and 2 others",
         );
     }
 
     /// "and 1 other", not "and 1 others".
     #[test]
     fn a_single_leftover_is_singular() {
-        let events: Vec<WatchEvent> = ["Madi", "Pierce", "Abby", "Zions"]
+        let events: Vec<WatchEvent> = ["alice", "bob", "carol", "dave"]
             .iter()
             .enumerate()
             .map(|(i, n)| watch("m1", 500 - i as i64, Some(n)))
             .collect();
         assert_eq!(
             Attribution::build(&events).line_for("m1").unwrap(),
-            "Watched recently by Madi, Pierce, Abby and 1 other",
+            "Watched recently by alice, bob, carol and 1 other",
         );
     }
 
@@ -204,11 +204,11 @@ mod tests {
     #[test]
     fn a_rewatch_names_one_person_once() {
         let a = Attribution::build(&[
-            watch("m1", 300, Some("Madi")),
-            watch("m1", 200, Some("Madi")),
-            watch("m1", 100, Some("Madi")),
+            watch("m1", 300, Some("bob")),
+            watch("m1", 200, Some("bob")),
+            watch("m1", 100, Some("bob")),
         ]);
-        assert_eq!(a.line_for("m1").unwrap(), "Watched recently by Madi");
+        assert_eq!(a.line_for("m1").unwrap(), "Watched recently by bob");
     }
 
     /// The `MAX_NAMES` cut keeps whoever is watching it now, not whoever
@@ -231,7 +231,7 @@ mod tests {
     /// survives untouched.
     #[test]
     fn an_unwatched_entry_gets_no_line() {
-        let a = Attribution::build(&[watch("m1", 100, Some("Madi"))]);
+        let a = Attribution::build(&[watch("m1", 100, Some("bob"))]);
         assert!(a.line_for("m2").is_none());
     }
 
@@ -245,22 +245,20 @@ mod tests {
 
     #[test]
     fn appending_keeps_the_existing_synopsis() {
-        let got = append_to_description(
-            Some("A hobbit sets out.".into()),
-            "Watched recently by Madi",
-        );
-        assert_eq!(got, "A hobbit sets out.\n\nWatched recently by Madi");
+        let got =
+            append_to_description(Some("A hobbit sets out.".into()), "Watched recently by bob");
+        assert_eq!(got, "A hobbit sets out.\n\nWatched recently by bob");
     }
 
     #[test]
     fn appending_to_nothing_is_just_the_line() {
         assert_eq!(
-            append_to_description(None, "Watched recently by Madi"),
-            "Watched recently by Madi",
+            append_to_description(None, "Watched recently by bob"),
+            "Watched recently by bob",
         );
         assert_eq!(
-            append_to_description(Some("   ".into()), "Watched recently by Madi"),
-            "Watched recently by Madi",
+            append_to_description(Some("   ".into()), "Watched recently by bob"),
+            "Watched recently by bob",
         );
     }
 }

@@ -568,7 +568,7 @@ mod tests {
     /// as a personal channel and behaves as the house one.
     #[test]
     fn rejects_a_user_under_the_pooled_scope() {
-        let c = channel_scoped_to(TasteScope::AllUsers, Some("Pierce"));
+        let c = channel_scoped_to(TasteScope::AllUsers, Some("carol"));
         let err = validate_channel(&dummy_path(), &c).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("only meaningful"), "msg = {msg}");
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn accepts_a_single_user_channel_that_names_someone() {
-        let c = channel_scoped_to(TasteScope::SingleUser, Some("Pierce"));
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("carol"));
         assert!(validate_channel(&dummy_path(), &c).is_ok());
     }
 
@@ -598,27 +598,27 @@ mod tests {
 
     #[test]
     fn a_single_user_channel_resolves_to_that_persons_scope() {
-        let c = channel_scoped_to(TasteScope::SingleUser, Some("Pierce"));
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("carol"));
         assert_eq!(
             c.history_scope(),
-            crate::tautulli::HistoryScope::User("Pierce".into()),
+            crate::tautulli::HistoryScope::User("carol".into()),
         );
     }
 
     /// Padding survives validation — only an entirely blank `user` is rejected —
-    /// so it has to be stripped on the way to the scope. Left in, `" Pierce "`
-    /// reaches Tautulli as `user=+Pierce+`, matches nobody, and the channel
+    /// so it has to be stripped on the way to the scope. Left in, `" carol "`
+    /// reaches Tautulli as `user=+carol+`, matches nobody, and the channel
     /// ranks against an empty history while looking perfectly healthy.
     #[test]
     fn a_padded_user_is_trimmed_before_it_becomes_a_scope() {
-        let c = channel_scoped_to(TasteScope::SingleUser, Some("  Pierce  "));
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("  carol  "));
         assert!(
             validate_channel(&dummy_path(), &c).is_ok(),
             "padding is not itself a config error, which is why trimming matters",
         );
         assert_eq!(
             c.history_scope(),
-            crate::tautulli::HistoryScope::User("Pierce".into()),
+            crate::tautulli::HistoryScope::User("carol".into()),
         );
     }
 
