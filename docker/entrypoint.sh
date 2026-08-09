@@ -29,9 +29,46 @@ set -uo pipefail
 log() { printf '[entrypoint] %s\n' "$*"; }
 die() { printf '[entrypoint] %s\n' "$*" >&2; exit 1; }
 
+# Refuse to start on a directory we cannot write, and say why in the terms that
+# actually diagnose it (#156).
+#
+# Without this the first symptom is the renderer below failing with
+# "/config/etv-next/channel1.json: Permission denied (os error 13)", which reads
+# like a bug in the renderer or in the channel that was just edited. It is
+# neither: the *directory* arrived owned by somebody else. The config deploy
+# mirrors the appdata folder from a laptop, and a sync that preserves ownership
+# stamps the sending machine's uid onto directories the container then cannot
+# write. `restart: unless-stopped` turns that into a loop, so every channel stays
+# off the air until someone chowns the folder by hand.
+#
+# Nothing here can fix the ownership — the container is not root — so this exists
+# purely to make one restart's log say the true thing instead of forty saying a
+# misleading one.
+require_writable() {
+    local dir=$1 what=$2
+    [ -w "$dir" ] && return 0
+    # GNU stat (and BusyBox) take -c; BSD stat takes -f. The container is Linux
+    # so -c is the one that fires there, but trying both means this message is
+    # also correct when the script is exercised on a Mac.
+    local owner
+    owner=$(stat -c '%u:%g' "$dir" 2>/dev/null \
+        || stat -f '%u:%g' "$dir" 2>/dev/null \
+        || echo unknown)
+    die "cannot write $what ($dir).
+    directory is owned by uid:gid $owner
+    this process runs as uid:gid $(id -u):$(id -g)
+  Nothing is wrong with your station config. The deploy that copied this folder
+  carried the sending machine's ownership onto it. Fix it on the host with:
+    chown -R $(id -u):$(id -g) <the appdata folder>
+  and make the deploy stop preserving owner/group so it does not recur."
+}
+
 [ -r "$ETV_STATION_CONFIG" ] || die "station config not readable: $ETV_STATION_CONFIG (bind-mount it, or set ETV_STATION_CONFIG)"
 
 mkdir -p "$ETV_NEXT_DIR" || die "cannot create $ETV_NEXT_DIR"
+# Checked before the render rather than after it fails, because the render is
+# the first writer and its own error names only the file.
+require_writable "$ETV_NEXT_DIR" "the ETV-next config directory"
 [ -r "$ETV_NEXT_DIR/normalization.default.json" ] \
     || die "missing $ETV_NEXT_DIR/normalization.default.json — it carries the ffmpeg/normalization block every channel is built from"
 
