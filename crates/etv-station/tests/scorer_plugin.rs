@@ -224,10 +224,12 @@ fn pick(ctx) {
             WatchEvent {
                 entry_id: "mov-a".into(),
                 watched_at: 1000,
+                watcher: None,
             },
             WatchEvent {
                 entry_id: "mov-c".into(),
                 watched_at: 2000,
+                watcher: None,
             },
         ]
         .into(),
@@ -290,6 +292,7 @@ fn the_committed_example_plugin_runs() {
         history: [WatchEvent {
             entry_id: "mov-a".into(),
             watched_at: 900_000,
+            watcher: None,
         }]
         .into(),
         // mov-d aired most recently, so the example's replay TTL drops it.

@@ -30,6 +30,10 @@ const MTIME_POLL: Duration = Duration::from_secs(1);
 pub struct ProgramContext {
     pub title: String,
     pub sub_title: String,
+    /// The current item's guide description. On a channel with
+    /// `scoring.attribution` on, its last line names who has been watching
+    /// (#113) — which is what a lower third would draw.
+    pub description: String,
     pub next_title: String,
     pub next_sub_title: String,
     /// Seconds since the current item's `start`. `-1.0` when unknown so
@@ -44,6 +48,7 @@ impl ProgramContext {
         Self {
             title: String::new(),
             sub_title: String::new(),
+            description: String::new(),
             next_title: String::new(),
             next_sub_title: String::new(),
             item_elapsed: -1.0,
@@ -80,6 +85,10 @@ struct ProgramRow {
     title: Option<String>,
     #[serde(default)]
     sub_title: Option<String>,
+    /// Carries the attribution line the station appends (#113). Read here and
+    /// not in ETV-next because the overlay parses these chunk files itself.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// Loads and caches the channel's chunked playout JSON. Call
@@ -199,6 +208,11 @@ impl ProgramContextSource {
         ProgramContext {
             title,
             sub_title,
+            description: item
+                .program
+                .as_ref()
+                .and_then(|p| p.description.clone())
+                .unwrap_or_default(),
             next_title,
             next_sub_title,
             item_elapsed: elapsed,
@@ -259,6 +273,55 @@ mod tests {
             }
         ]
     }"#;
+
+    /// A chunk written by a channel with `scoring.attribution` on, shaped the
+    /// way the station really writes it: the catalog synopsis, a blank line,
+    /// then the credit.
+    const ATTRIBUTED_CHUNK: &str = r#"{
+        "version": "test",
+        "items": [
+            {
+                "id": "a",
+                "start": "2026-04-13T00:00:00Z",
+                "finish": "2026-04-13T00:10:00Z",
+                "program": {
+                    "title": "Alpha",
+                    "description": "A hobbit sets out.\n\nWatched recently by Madison and Pierce"
+                }
+            }
+        ]
+    }"#;
+
+    /// The overlay reads the playout JSON itself, so the attribution line the
+    /// station appends has to survive that parse to reach a script (#113).
+    #[test]
+    fn carries_the_attribution_description_through_to_the_context() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), "chunk_a.json", ATTRIBUTED_CHUNK);
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
+        assert_eq!(
+            ctx.description,
+            "A hobbit sets out.\n\nWatched recently by Madison and Pierce",
+        );
+    }
+
+    /// A channel that does not attribute writes no description, and that must
+    /// arrive as an empty string rather than blowing up the parse.
+    #[test]
+    fn a_chunk_with_no_description_yields_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), "chunk_a.json", TWO_ITEM_CHUNK);
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 00:05 UTC)).description,
+            ""
+        );
+    }
 
     #[test]
     fn unknown_when_folder_empty() {

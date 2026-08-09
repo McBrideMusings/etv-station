@@ -96,6 +96,22 @@ impl ChannelConfig {
             .any(|b| b.pools.iter().any(|p| p.plugin.is_some()))
     }
 
+    /// Whether this channel names recent watchers on its items (#113).
+    pub fn attributes_watchers(&self) -> bool {
+        self.scoring.as_ref().is_some_and(|s| s.attribution)
+    }
+
+    /// Whether anything on this channel reads the server's watch history.
+    ///
+    /// Two readers, not one: a scorer plugin ranks with it (#74), and
+    /// `attribution` turns it into guide and on-screen text (#113). A channel
+    /// that does neither must never trigger a fetch — that is #131's rule, and
+    /// widening the reader set without widening this check is how a station
+    /// silently starts calling Tautulli for results nothing consumes.
+    pub fn reads_watch_history(&self) -> bool {
+        self.uses_scorer_plugin() || self.attributes_watchers()
+    }
+
     /// Whose watch history this channel ranks against (#112).
     ///
     /// Also the key its history is cached under for the tick, so two channels
@@ -202,6 +218,18 @@ pub struct ScoringConfig {
     /// than silently ranking against the whole server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+
+    /// Name on screen and in the guide who has been watching each item (#113).
+    ///
+    /// Off by default, and deliberately opt-in rather than derived: turning it
+    /// on publishes every viewer's activity to everyone else watching the
+    /// channel, which is a call the person running the server makes once, per
+    /// channel, in writing.
+    ///
+    /// Costs nothing when off — the line is only built for a channel that asked
+    /// for it.
+    #[serde(default)]
+    pub attribution: bool,
 }
 
 /// Whose watch history a channel's scorer plugin sees (#112).
@@ -227,6 +255,7 @@ impl Default for ScoringConfig {
             nominal_item_secs: default_nominal_item_secs(),
             taste_scope: TasteScope::default(),
             user: None,
+            attribution: false,
         }
     }
 }

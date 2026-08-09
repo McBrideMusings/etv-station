@@ -315,11 +315,12 @@ impl SharedHistory {
 /// The catalog this generation's [`SharedHistory`] should join watch rows
 /// against — `None` when nothing in it would ever read the result (#131).
 ///
-/// Watch history reaches exactly one place: `ScoreInputs::history`, which a Rhai
-/// script only sees through a pool that names a `plugin:`. A station whose
-/// channels are all `manual` or `query` pools has no such reader, so fetching a
-/// thousand `get_history` rows and joining them against the catalog on every
-/// tick produces a `Vec<WatchEvent>` that is dropped unread.
+/// Watch history reaches two places: `ScoreInputs::history`, which a Rhai script
+/// sees through a pool that names a `plugin:` (#74), and the attribution line a
+/// channel with `attribution: true` stamps into its items' guide text (#113). A
+/// station whose channels do neither has no reader, so fetching a thousand
+/// `get_history` rows and joining them against the catalog on every tick
+/// produces a `Vec<WatchEvent>` that is dropped unread.
 ///
 /// Deciding here rather than inside [`SharedHistory::current`] keeps `current`
 /// a plain cache, and costs nothing in freshness: a generation holds the whole
@@ -330,7 +331,7 @@ fn history_catalog(
     channels: &[LoadedChannel],
     catalog: Option<&Arc<CatalogInfo>>,
 ) -> Option<Arc<CatalogInfo>> {
-    if channels.iter().any(|c| c.config.uses_scorer_plugin()) {
+    if channels.iter().any(|c| c.config.reads_watch_history()) {
         catalog.cloned()
     } else {
         None
@@ -1461,11 +1462,15 @@ async fn pattern_catch_up(
     // every *other* channel fetch its own scope too, for a `Vec<WatchEvent>`
     // that nothing then reads. Before #112 that cost nothing because they all
     // shared one entry.
-    let history = if channel.config.uses_scorer_plugin() {
+    let history = if channel.config.reads_watch_history() {
         ctx.history.current(&channel.config.history_scope()).await
     } else {
         Arc::from(Vec::new())
     };
+
+    // Whether this generation names watchers, read once — it cannot change
+    // inside a tick, and the check sits in the per-item loop below.
+    let attribution_wanted = channel.config.attributes_watchers();
 
     // How deep a recently-aired tail this channel's scorer sees. Read once —
     // it cannot change inside a tick.
@@ -1551,6 +1556,39 @@ async fn pattern_catch_up(
             };
             (items, resume_out, show_ids)
         };
+
+        // Name who has been watching, on the channels that asked to (#113).
+        //
+        // Stamped here rather than inside `resolve` because the watch history is
+        // the daemon's — `resolve` is handed a `ScoreInputs` for a plugin to
+        // rank with and has no business also editing guide text with it. Doing
+        // it after resolve also means it lands on whatever the channel actually
+        // scheduled, however that list was chosen: a plugin pool, a CEL query,
+        // or a hand-written entry list all get the same treatment.
+        let mut items = items;
+        if attribution_wanted {
+            let credits = crate::attribution::Attribution::build(&history);
+            let mut stamped = 0usize;
+            for item in &mut items {
+                let Some(line) = credits.line_for(&item.id) else {
+                    continue;
+                };
+                let program = item.program.get_or_insert_with(Default::default);
+                program.description = Some(crate::attribution::append_to_description(
+                    program.description.take(),
+                    &line,
+                ));
+                stamped += 1;
+            }
+            tracing::info!(
+                event = "attribution.stamped",
+                channel = %channel.name,
+                items = items.len(),
+                stamped,
+                entries_with_watchers = credits.len(),
+                "named recent watchers on this generation's items",
+            );
+        }
 
         // No "the channel ran out" branch: every series loops, so a pattern
         // channel cannot play itself empty. An empty resolve means an empty
