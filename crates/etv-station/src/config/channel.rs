@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::rule::RuleConfig;
+use crate::tautulli::HistoryScope;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -95,6 +96,36 @@ impl ChannelConfig {
             .any(|b| b.pools.iter().any(|p| p.plugin.is_some()))
     }
 
+    /// Whose watch history this channel ranks against (#112).
+    ///
+    /// Also the key its history is cached under for the tick, so two channels
+    /// naming the same person share one `get_history` call and one catalog join
+    /// rather than each paying for their own — the same sharing #126 gave the
+    /// server-wide history, now per distinct scope instead of per station.
+    ///
+    /// A channel with no `scoring:` block at all is [`HistoryScope::AllUsers`]:
+    /// saying nothing has always meant the server-wide pool, and #112 does not
+    /// change what an existing config means.
+    pub fn history_scope(&self) -> HistoryScope {
+        match self.scoring.as_ref() {
+            Some(s) => match (s.taste_scope, s.user.as_deref()) {
+                // Trimmed, because the surrounding whitespace would otherwise be
+                // sent as part of the name: `user: " Pierce "` reaches Tautulli
+                // as `user=+Pierce+`, matches no account, and returns an empty
+                // history that is indistinguishable from a quiet week.
+                // `validate_taste_scope` only rejects an *entirely* blank value,
+                // so trimming has to happen here too.
+                (TasteScope::SingleUser, Some(u)) => HistoryScope::User(u.trim().to_string()),
+                // `single_user` with no `user` is rejected by `config::validate`,
+                // so this arm is unreachable through a loaded config. Falling
+                // back to the server-wide pool rather than panicking keeps a
+                // hand-built `ScoringConfig` in a test from being a crash.
+                _ => HistoryScope::AllUsers,
+            },
+            None => HistoryScope::AllUsers,
+        }
+    }
+
     /// How far back this channel's widest adjacency constraint reaches, in
     /// positions — how much aired history the constraint pass needs to enforce
     /// it across a generation seam (#73). `0` when nothing is constrained.
@@ -151,6 +182,42 @@ pub struct ScoringConfig {
     /// at all is known.
     #[serde(default = "default_nominal_item_secs")]
     pub nominal_item_secs: u32,
+
+    /// Whose watch history this channel's scorer ranks against (#112).
+    ///
+    /// Defaults to [`TasteScope::AllUsers`], the server-wide aggregate #74
+    /// shipped: every Tautulli user's recent history pooled with no user
+    /// dimension. `single_user` narrows it to the one account named in
+    /// [`user`](Self::user).
+    #[serde(default)]
+    pub taste_scope: TasteScope,
+
+    /// The one account `taste_scope: single_user` ranks against — a Tautulli
+    /// username (`"Madi"`) or a numeric user id (`"321912630"`). Which one it is
+    /// is inferred, not configured: a value that parses as an integer is sent as
+    /// `user_id`, anything else as `user`.
+    ///
+    /// Required when `taste_scope` is `single_user` and rejected otherwise; both
+    /// halves are enforced in `config::validate` so a typo fails at load rather
+    /// than silently ranking against the whole server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Whose watch history a channel's scorer plugin sees (#112).
+///
+/// This is a property of the *channel*, not of the station: two channels on one
+/// station can rank against different people, which is the whole point of a
+/// personal For You channel sitting next to the house one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TasteScope {
+    /// Every user's history, pooled with no user dimension (#74). The default,
+    /// because it is what a station gets without saying anything.
+    #[default]
+    AllUsers,
+    /// One named account's history, and nobody else's.
+    SingleUser,
 }
 
 impl Default for ScoringConfig {
@@ -158,6 +225,8 @@ impl Default for ScoringConfig {
         Self {
             recent_depth: default_recent_depth(),
             nominal_item_secs: default_nominal_item_secs(),
+            taste_scope: TasteScope::default(),
+            user: None,
         }
     }
 }

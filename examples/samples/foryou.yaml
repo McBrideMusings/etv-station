@@ -24,11 +24,15 @@
 # the half it wants. `advance: resume` on `shows` means a show the plugin keeps
 # surfacing continues through its episodes across days rather than restarting.
 #
-# Server-wide, not per-user. The watch history handed to the plugin is pooled
-# across every Tautulli user with no user dimension — this Plex server has 20
-# accounts and several are shared by more than one real person, so "alice's
-# taste" is not a thing the data can support. A single-user variant is #112;
-# on-screen attribution of who is watching is #113.
+# Server-wide, deliberately. This channel says no `taste_scope`, which means
+# `all_users`: the watch history handed to the plugin is pooled across every
+# Tautulli account with no user dimension. That is the right default for a house
+# channel on a server with 20 accounts, several shared by more than one real
+# person — "alice's taste" is not a thing those accounts can support.
+#
+# A channel that follows one named person writes `taste_scope: single_user` plus
+# `user:` under `scoring:` (#112) — a separate channel file with its own
+# output_folder, not a fan-out of this one. See docs/schema.md § taste_scope.
 #
 # Short window on purpose. `window_days: 1` with `chunk_hours: 6` means the
 # plugin re-runs before much of the schedule is written, so the ranking is at

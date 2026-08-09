@@ -645,12 +645,14 @@ A `plugin:` path is relative to the **channel config file's** directory, the
 same as a `block:` include — never to wherever the daemon was launched from.
 Absolute paths are used as written.
 
-Two knobs sit on the channel, under `scoring:`, both optional:
+Four knobs sit on the channel, under `scoring:`, all optional:
 
 | Field | Default | Meaning |
 |---|---|---|
 | `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. |
 | `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
+| `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
+| `user` | — | The account `single_user` follows: a Tautulli username (`"Madi"`) or a numeric user id (`"321912630"`). Which one it is is inferred — a value that parses as an integer is sent as `user_id`, anything else as `user`. |
 
 `target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
 window — a generation lays the returned list end-to-end, so a hint covering 30
@@ -661,6 +663,31 @@ Watch history comes from Tautulli, configured by the `TAUTULLI_URL` and
 either is unset or Tautulli is unreachable, `ctx.history` arrives empty and the
 generation proceeds — a script still has release dates, tags, and `ctx.recent`
 to rank on, so an outage degrades the ranking rather than stopping the channel.
+
+#### `taste_scope` — one channel per audience, not per user
+
+`taste_scope` is a property of the **channel**, so a personal For You channel
+sits beside the house one on the same station and neither knows about the other.
+There is no fan-out: one config file still produces exactly one channel writing
+to one `output_folder`. Two people means two channel files.
+
+`single_user` requires `user`, and `user` is rejected under `all_users` — both
+directions fail at load rather than at air, because both mistakes are silent
+otherwise. A `single_user` channel with nobody named would quietly fall back to
+the pooled history and rank a personal channel against everyone's viewing while
+looking perfectly healthy.
+
+What is *not* checked at load is whether the named account exists — that needs
+the network, and this is a config pass. Tautulli answers an unknown user with an
+empty history, which shows up at runtime as `rows=0` on that scope's
+`tautulli.history` log line.
+
+History is fetched **once per distinct scope per refresh window**, not once per
+channel. Three channels following the same person share one `get_history` call
+and one catalog join between them; a station running the pooled channel plus one
+each for two people makes three calls per window however many channels are
+pointed at those three audiences. Each scope ages on its own clock, so a personal
+channel refreshing does not drag the pooled one along with it.
 
 ### Pool `constraints` — spacing counted in a pool's own draw order
 
