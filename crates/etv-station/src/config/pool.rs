@@ -112,6 +112,28 @@ impl<'de> Deserialize<'de> for Take {
     }
 }
 
+/// Where in a series a visit cuts its slice.
+///
+/// A sort cannot express this, which is why it is its own word: `order =
+/// "episode:desc"` does put the last three episodes first, but it also plays
+/// them backwards, because the sort that chooses the slice is the same sort
+/// that decides play order. `from` moves the cut without touching either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeFrom {
+    /// Where the series left off — its resume cursor, or its top. The default,
+    /// and the only one that continues a series across visits.
+    #[default]
+    Start,
+    /// The last `take` items of the series, in list order. An absolute
+    /// position, so it ignores the resume cursor: "the last three episodes"
+    /// means the same thing every visit, which is the point of asking for it.
+    End,
+    /// A seeded offset, then `take` consecutive items in list order. Also
+    /// absolute, and re-rolled per visit; a pinned `seed` reproduces it.
+    Random,
+}
+
 /// Which series the next draw comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +246,27 @@ pub struct Pool {
     /// exists to make — so validation rejects the pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Order>,
+
+    /// The order the *series* come up in, when it should differ from the order
+    /// their items play in.
+    ///
+    /// [`Pool::order`] does both jobs by default — it sorts the flat list, and
+    /// the series then rotate in order of first appearance in it. That is one
+    /// answer to two questions, and it only holds while both want the same
+    /// sort. "Newest show first, but its episodes in episode order" wants
+    /// `year:desc` between series and `season:asc,episode:asc` inside one, and
+    /// no single sort is both.
+    ///
+    /// Set here, the series sequence is read from this sort instead and `order`
+    /// keeps its other job unchanged. A series is placed by whichever of its
+    /// items this sort puts first, so "the season with the newest episode"
+    /// rather than an average of anything — a rule that can be checked against
+    /// the catalog by eye.
+    ///
+    /// Meaningless without series to sequence and meaningless on a plugin pool,
+    /// on the same grounds as `order`: validation rejects the pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_order: Option<Order>,
 
     /// Where this pool's items are cut into series. Unset groups by show, which
     /// is what every channel written before #155 means.
@@ -352,6 +395,12 @@ pub struct PatternStep {
     /// bucket the visit picked.
     pub take: Take,
 
+    /// Where in the series the visit cuts those items from. Unset continues
+    /// from where the series left off, which is what every channel written
+    /// before #155 means.
+    #[serde(default)]
+    pub from: TakeFrom,
+
     /// Probability this step fires on a given pass through the pattern —
     /// "occasionally binge". `1.0` (the default) always fires. The roll is
     /// seeded from the channel `seed` plus the step's position, so a pinned
@@ -450,6 +499,33 @@ on_short: short
         assert_eq!(toml_all.take, Take::All);
         let toml_count: PatternStep = toml::from_str("pool = \"shows\"\ntake = 5\n").unwrap();
         assert_eq!(toml_count.take, Take::Count(5));
+    }
+
+    #[test]
+    fn from_defaults_to_start_and_parses_its_other_two() {
+        let bare: PatternStep = serde_norway::from_str("pool: shows\ntake: 3\n").unwrap();
+        assert_eq!(bare.from, TakeFrom::Start);
+        let end: PatternStep = serde_norway::from_str("pool: shows\ntake: 3\nfrom: end\n").unwrap();
+        assert_eq!(end.from, TakeFrom::End);
+        let random: PatternStep =
+            toml::from_str("pool = \"shows\"\ntake = 3\nfrom = \"random\"\n").unwrap();
+        assert_eq!(random.from, TakeFrom::Random);
+    }
+
+    #[test]
+    fn bucket_order_is_its_own_optional_sort() {
+        let bare: Pool = serde_norway::from_str("name: shows\nexpr: 'x'\n").unwrap();
+        assert!(bare.bucket_order.is_none());
+        let both: Pool = serde_norway::from_str(
+            "name: shows\nexpr: 'x'\norder: \"episode:asc\"\nbucket_order: \"year:desc\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            both.bucket_order,
+            Some(Order::parse("year:desc").unwrap()),
+            "the two sorts are independent"
+        );
+        assert_eq!(both.order, Some(Order::parse("episode:asc").unwrap()));
     }
 
     /// A misspelling has to fail at load naming what was wanted, not read as

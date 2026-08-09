@@ -5,7 +5,7 @@ use super::block::Duplicates;
 use super::channel::ChannelConfig;
 use super::constraints::Constraints;
 use super::order::Order;
-use super::pool::{Rotate, Take};
+use super::pool::{Rotate, Take, TakeFrom};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
@@ -269,6 +269,17 @@ fn validate_pattern_block<'a>(
                         pool.name
                     )));
                 }
+                // Same reasoning one level up: the series sequence a plugin
+                // pool gets is the ranking's, and re-sequencing it throws the
+                // ranking away just as surely as re-sorting the items would.
+                if pool.bucket_order.is_some() {
+                    return Err(bad(format!(
+                        "pool {:?} sets both `plugin` and `bucket_order` — the order its \
+                         series come up in is the plugin's ranking, so re-sequencing them \
+                         would discard it; drop `bucket_order`",
+                        pool.name
+                    )));
+                }
             }
             (Some(_), Some(_)) => {
                 return Err(bad(format!(
@@ -323,6 +334,17 @@ fn validate_pattern_block<'a>(
                  rotate = \"slot\", which changes series every item — \"all\" has \
                  no single series to empty. Use rotate = \"visit\", or an explicit count",
                 step.pool
+            )));
+        }
+        // `all` empties the series whatever the cut position, so a `from` beside
+        // it is a line the author wrote that does nothing. Refused on the same
+        // grounds as a constraint that would not constrain.
+        if step.take == Take::All && step.from != TakeFrom::Start {
+            return Err(bad(format!(
+                "pattern step #{step_idx} has take = \"all\" and from = {:?} — \
+                 \"all\" empties the series, so there is no slice to move. Drop \
+                 one of the two",
+                step.from
             )));
         }
         if !(0.0..=1.0).contains(&step.chance) {
@@ -417,6 +439,7 @@ mod tests {
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
             order: None,
+            bucket_order: None,
             group_by: Default::default(),
             select: Select::default(),
             rotate: Rotate::default(),
@@ -431,6 +454,7 @@ mod tests {
         PatternStep {
             pool: pool.into(),
             take: Take::Count(take),
+            from: TakeFrom::Start,
             chance: 1.0,
         }
     }
@@ -439,6 +463,7 @@ mod tests {
         PatternStep {
             pool: pool.into(),
             take: Take::All,
+            from: TakeFrom::Start,
             chance: 1.0,
         }
     }
@@ -850,6 +875,33 @@ mod tests {
         // Unconstrained, the same take-all block loads.
         let b = pattern_block(vec![pool("shows")], vec![step_all("shows")]);
         assert!(validate_channel(&dummy_path(), &channel_with(vec![b])).is_ok());
+    }
+
+    /// `all` empties the series, so a cut position beside it is a line that
+    /// does nothing — refused rather than silently ignored.
+    #[test]
+    fn rejects_a_cut_position_beside_take_all() {
+        let mut b = pattern_block(vec![pool("shows")], vec![step_all("shows")]);
+        b.pattern[0].from = TakeFrom::End;
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("empties the series"),
+            "err = {err}"
+        );
+    }
+
+    /// The series sequence a plugin pool gets is its ranking, so re-sequencing
+    /// it discards the ranking exactly as re-sorting the items would — the same
+    /// refusal `order` already carries, one level up.
+    #[test]
+    fn rejects_bucket_order_on_a_plugin_pool() {
+        let mut p = pool("shows");
+        p.expr = None;
+        p.plugin = Some(PathBuf::from("../plugins/taste-engine.rhai"));
+        p.bucket_order = Some(Order::Random);
+        let b = pattern_block(vec![p], vec![step("shows", 3)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("bucket_order"), "err = {err}");
     }
 
     #[test]

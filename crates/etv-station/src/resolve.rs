@@ -1581,6 +1581,7 @@ mod tests {
                 expr: Some("item.type == \"movie\"".into()),
                 plugin: None,
                 order: Some(Order::parse("title:asc").unwrap()),
+                bucket_order: None,
                 group_by: Default::default(),
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
@@ -1594,6 +1595,7 @@ mod tests {
                 expr: Some("item.type == \"episode\"".into()),
                 plugin: None,
                 order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+                bucket_order: None,
                 group_by: Default::default(),
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
@@ -1607,11 +1609,13 @@ mod tests {
             PatternStep {
                 pool: "movies".into(),
                 take: crate::config::Take::Count(1),
+                from: crate::config::TakeFrom::Start,
                 chance: 1.0,
             },
             PatternStep {
                 pool: "shows".into(),
                 take: crate::config::Take::Count(2),
+                from: crate::config::TakeFrom::Start,
                 chance: 1.0,
             },
         ];

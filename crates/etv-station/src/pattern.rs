@@ -75,7 +75,7 @@ use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{
-    Advance, Constraints, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, Take,
+    Advance, Constraints, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, Take, TakeFrom,
 };
 use crate::constrain::{ItemKeys, Limits, order_constrained};
 use crate::resume::{GenerationState, PoolResume};
@@ -94,6 +94,10 @@ const RANDOM_REROLLS: u64 = 8;
 /// slot indices in a `rotate = "slot"` visit, and `u64::MAX` for a step's
 /// `chance` — so one decision's roll never doubles as another's.
 const REROLL_STRIDE: u64 = 1 << 32;
+
+/// Keeps a `from = "random"` offset roll clear of both the small nonces the walk
+/// uses and the reroll band above it, so one decision never doubles as another.
+const FROM_STRIDE: u64 = 1 << 48;
 
 /// One series inside a pool: a show's episodes, one season of them, or a single
 /// movie.
@@ -323,7 +327,7 @@ impl PoolRuntime<'_> {
     }
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
-    fn visit(&mut self, take: Take, roll: &RollKey) -> Vec<String> {
+    fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Vec<String> {
         if take == Take::Count(0) || self.is_dry() {
             return Vec::new();
         }
@@ -338,18 +342,18 @@ impl PoolRuntime<'_> {
                     if self.is_dry() {
                         break;
                     }
-                    out.extend(self.serve(Take::Count(1), roll, slot as u64));
+                    out.extend(self.serve(Take::Count(1), from, roll, slot as u64));
                 }
                 out
             }
-            Rotate::Visit => self.serve(take, roll, 0),
+            Rotate::Visit => self.serve(take, from, roll, 0),
         }
     }
 
     /// Serve `take` items starting from one picked series, rolling onto others
     /// per `on_short` when it comes up short, then park the rotation where the
     /// next visit should resume.
-    fn serve(&mut self, want: Take, roll: &RollKey, nonce: u64) -> Vec<String> {
+    fn serve(&mut self, want: Take, from: TakeFrom, roll: &RollKey, nonce: u64) -> Vec<String> {
         let first = self.eligible_pick(roll, nonce);
         // `all` is sized from the series the visit just picked, so it has to be
         // resolved after the pick and not before: it means "empty *this* one",
@@ -361,6 +365,27 @@ impl PoolRuntime<'_> {
             (Take::All, Some(si)) => self.series[si].remaining(),
             (Take::All, None) => return Vec::new(),
         };
+        // `end` and `random` name an absolute place in the series, so they set
+        // the cursor before the first draw — which is exactly why they ignore
+        // the resume point. "The last three episodes" that continued from
+        // wherever the series left off would not be the last three.
+        if let Some(si) = first
+            && from != TakeFrom::Start
+        {
+            let len = self.series[si].ids.len();
+            let last_start = len.saturating_sub(take);
+            self.series[si].cursor = match from {
+                TakeFrom::Start => unreachable!("guarded above"),
+                TakeFrom::End => last_start,
+                // Offsets that would run off the end are not candidates, so a
+                // `random` visit always gets its full `take` where the series
+                // is long enough to give one.
+                TakeFrom::Random => {
+                    let choices = last_start + 1;
+                    (roll.u64_at(nonce.wrapping_add(FROM_STRIDE)) % choices as u64) as usize
+                }
+            };
+        }
         let mut out: Vec<String> = Vec::with_capacity(take);
         let mut current = first;
         let mut contributed: HashMap<usize, usize> = HashMap::new();
@@ -644,7 +669,7 @@ pub fn build(
             let idx = *by_name
                 .get(step.pool.as_str())
                 .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
-            let drawn = runtimes[idx].visit(step.take, &roll);
+            let drawn = runtimes[idx].visit(step.take, step.from, &roll);
             if budget.is_some() {
                 laid += runtimes[idx].runtime_of(&drawn);
             }
@@ -778,6 +803,9 @@ fn pool_runtime<'a>(
     };
     let mut series: Vec<Series> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    // Which series each id landed in, so a `bucket_order` pass can read the
+    // series sequence back off an ordered id list without regrouping.
+    let mut owner: HashMap<String, usize> = HashMap::new();
     for id in ids {
         // An item with no `show_id` — a movie — is its own series of one, and
         // stays one however the pool is grouped: it has no season to be cut at.
@@ -790,9 +818,13 @@ fn pool_runtime<'a>(
             None => show_key.clone(),
         };
         match index.get(&key) {
-            Some(&i) => series[i].ids.push(id),
+            Some(&i) => {
+                owner.insert(id.clone(), i);
+                series[i].ids.push(id);
+            }
             None => {
                 index.insert(key.clone(), series.len());
+                owner.insert(id.clone(), series.len());
                 series.push(Series {
                     key,
                     show_key,
@@ -801,6 +833,45 @@ fn pool_runtime<'a>(
                 });
             }
         }
+    }
+
+    // A `bucket_order` re-sequences the series without disturbing what is
+    // inside them. It runs through the same ordering engine the pool's own
+    // `order` uses rather than a sort of its own — one implementation of "what
+    // does `year:desc` mean", so a field that sorts one way here cannot sort
+    // another way there — and the series sequence is then read off the result:
+    // each series takes the position of whichever of its items comes first.
+    //
+    // Seed 0 for the same reason `order` uses it: this is a stable arrangement
+    // of the pool, not a per-visit draw. Drawing at random per visit is
+    // `select = "random"`, which is a different question and already answered.
+    if let Some(bucket_order) = &cfg.bucket_order {
+        let flat: Vec<String> = series.iter().flat_map(|s| s.ids.iter().cloned()).collect();
+        let ordered = catalog
+            .resolve_order(&flat, bucket_order, 0)
+            .map_err(|e| format!("pool {:?}: bucket_order: {e}", cfg.name))?;
+        let mut placed = vec![false; series.len()];
+        let mut sequence: Vec<usize> = Vec::with_capacity(series.len());
+        for id in &ordered {
+            if let Some(&i) = owner.get(id)
+                && !placed[i]
+            {
+                placed[i] = true;
+                sequence.push(i);
+            }
+        }
+        // An id the order engine dropped would leave its series unplaced; keep
+        // it, at the back, rather than silently losing a whole show.
+        for (i, seen) in placed.iter().enumerate() {
+            if !seen {
+                sequence.push(i);
+            }
+        }
+        let mut taken: Vec<Option<Series>> = series.into_iter().map(Some).collect();
+        series = sequence
+            .into_iter()
+            .map(|i| taken[i].take().expect("each series placed once"))
+            .collect();
     }
 
     let (runtimes, mean_runtime) = if want_runtimes {
@@ -1010,6 +1081,7 @@ mod tests {
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
             order: Some(Order::parse("title:asc").unwrap()),
+            bucket_order: None,
             group_by: GroupBy::Show,
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
@@ -1026,6 +1098,7 @@ mod tests {
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+            bucket_order: None,
             group_by: GroupBy::Show,
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
@@ -1051,6 +1124,7 @@ mod tests {
         PatternStep {
             pool: pool.into(),
             take: Take::Count(take),
+            from: TakeFrom::Start,
             chance: 1.0,
         }
     }
@@ -1059,6 +1133,7 @@ mod tests {
         PatternStep {
             pool: pool.into(),
             take: Take::All,
+            from: TakeFrom::Start,
             chance: 1.0,
         }
     }
@@ -1104,6 +1179,7 @@ mod tests {
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
+            bucket_order: None,
             group_by,
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
@@ -1237,6 +1313,99 @@ mod tests {
             7,
         );
         assert_eq!(ids, vec!["mov-1", "mov-2"], "one movie per visit");
+    }
+
+    fn step_from(pool: &str, take: usize, from: TakeFrom) -> PatternStep {
+        PatternStep {
+            pool: pool.into(),
+            take: Take::Count(take),
+            from,
+            chance: 1.0,
+        }
+    }
+
+    /// The gap `from` exists to close: `order: "episode:desc"` would put the
+    /// last three episodes first but air them backwards, because the sort that
+    /// chooses the slice is the sort that decides play order. `from: end` takes
+    /// the same three the right way round.
+    #[test]
+    fn take_from_end_airs_the_last_episodes_in_order() {
+        let ids = build_seasons(
+            episodes_pool(GroupBy::Season),
+            vec![step_from("shows", 3, TakeFrom::End)],
+            Some(1),
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids, vec!["got-s1e2", "got-s1e3", "got-s1e4"]);
+    }
+
+    /// A season shorter than the ask gives everything it has, from its top —
+    /// there is no earlier place for the slice to start.
+    #[test]
+    fn take_from_end_of_a_short_series_is_the_whole_series() {
+        let ids = build_seasons(
+            episodes_pool(GroupBy::Season),
+            vec![step_from("shows", 9, TakeFrom::End)],
+            Some(1),
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids[0], "got-s1e1", "nowhere later to start: {ids:?}");
+    }
+
+    /// A random cut lands inside the series and stays consecutive and in order,
+    /// and a pinned seed reproduces it.
+    #[test]
+    fn take_from_random_is_consecutive_in_order_and_reproducible() {
+        let run = || {
+            build_seasons(
+                episodes_pool(GroupBy::Season),
+                vec![step_from("shows", 2, TakeFrom::Random)],
+                Some(1),
+                &GenerationState::empty(),
+            )
+        };
+        let ids = run();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids, run(), "same seed, same cut");
+        // Whatever offset came up, the two are adjacent episodes of season 1.
+        let pairs = [
+            ["got-s1e1", "got-s1e2"],
+            ["got-s1e2", "got-s1e3"],
+            ["got-s1e3", "got-s1e4"],
+        ];
+        assert!(
+            pairs.iter().any(|p| p[..] == ids[..]),
+            "not a consecutive in-order pair: {ids:?}"
+        );
+    }
+
+    /// `bucket_order` sequences the series without touching what is inside
+    /// them: seasons come up newest-episode-first while each still plays in
+    /// episode order. The pool's own `order` cannot do both at once, which is
+    /// why the field exists.
+    #[test]
+    fn bucket_order_sequences_series_without_reordering_their_items() {
+        let mut pool = episodes_pool(GroupBy::Season);
+        pool.bucket_order = Some(Order::parse("season:desc,episode:desc").unwrap());
+        let ids = build_seasons(
+            pool,
+            vec![step_all("shows")],
+            Some(2),
+            &GenerationState::empty(),
+        );
+        assert_eq!(
+            ids,
+            vec![
+                // `season:desc` puts got's season 2 ahead of every season 1,
+                // so it is the first series up…
+                "got-s2e1", "got-s2e2", //
+                // …and got's season 1 next, since `episode:desc` places its e4
+                // ahead of inv's e3. Both still play their own items in
+                // `order`'s ascending sequence — the descending sort chose
+                // which season came up, not how it plays.
+                "got-s1e1", "got-s1e2", "got-s1e3", "got-s1e4",
+            ],
+        );
     }
 
     /// With no `cycles` authored, the derived count has to drain the pool the
@@ -1666,6 +1835,7 @@ mod tests {
                 PatternStep {
                     pool: "shows".into(),
                     take: Take::Count(3),
+                    from: TakeFrom::Start,
                     chance: 0.3,
                 },
             ]

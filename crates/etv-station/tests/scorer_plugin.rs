@@ -85,6 +85,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),
                     order: None,
+                    bucket_order: None,
                     group_by: Default::default(),
                     select: Default::default(),
                     rotate: Default::default(),
@@ -96,6 +97,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                 pattern: vec![PatternStep {
                     pool: "foryou".into(),
                     take: etv_station::config::Take::Count(take),
+                    from: Default::default(),
                     chance: 1.0,
                 }],
                 cycles: Some(cycles),
