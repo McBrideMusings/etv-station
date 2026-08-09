@@ -23,6 +23,7 @@ pub mod order;
 pub mod query;
 pub mod schema;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use rusqlite::types::Value;
@@ -37,6 +38,16 @@ pub use model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
 /// `catalog_meta` key holding the unix-seconds timestamp of the last completed
 /// Plex ingest.
 const META_LAST_PLEX_INGEST: &str = "last_plex_ingest";
+
+/// How many ids may ride in one statement's `IN (…)` list.
+///
+/// SQLite refuses a statement with more bound variables than its compiled-in
+/// limit — "too many SQL variables" — and the limit is a property of the build,
+/// not something a caller can raise. 900 sits under the most conservative of
+/// them (999) with room for a statement's other parameters, and matches the
+/// spirit of the 500-id batching the bulk readers below use. It is a ceiling on
+/// one statement, never on how many ids a caller may ask about.
+const MAX_SQL_VARIABLES: usize = 900;
 
 /// A handle to the catalog database.
 pub struct Catalog {
@@ -133,6 +144,24 @@ impl Catalog {
             }
             Order::Fields(terms) => {
                 let clause = order::order_by_clause(terms)?;
+                // A sort cannot be chunked the way the bulk readers below are:
+                // splitting the ids would sort each chunk against itself and
+                // concatenating the pieces is not the sort that was asked for.
+                // So past the point where the ids fit in one statement's bound
+                // variables, the whole table is ordered and the wanted ids are
+                // kept from that sequence. Same clause, same SQLite collation
+                // and null handling, no variables at all — the order is
+                // identical either way, which is the only thing that must not
+                // depend on how many items a pool happens to hold.
+                if ids.len() > MAX_SQL_VARIABLES {
+                    let sql = format!("SELECT entry_id FROM entries ORDER BY {clause}");
+                    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+                    let ordered = self.ordered_ids(&sql, Vec::new())?;
+                    return Ok(ordered
+                        .into_iter()
+                        .filter(|id| wanted.contains(id.as_str()))
+                        .collect());
+                }
                 let placeholders = vec!["?"; ids.len()].join(", ");
                 let sql = format!(
                     "SELECT entry_id FROM entries WHERE entry_id IN ({placeholders}) ORDER BY {clause}"
@@ -755,6 +784,66 @@ mod tests {
 
     fn cat() -> Catalog {
         Catalog::open_in_memory().expect("open in-memory catalog")
+    }
+
+    /// A pool that resolves the whole library hands `resolve_order` far more
+    /// ids than one statement can bind, and SQLite refuses the statement rather
+    /// than truncating it — which took a channel off the air with "too many SQL
+    /// variables". The large path must answer exactly what the small one would.
+    #[test]
+    fn ordering_more_ids_than_one_statement_can_bind_matches_the_small_path() {
+        let c = cat();
+        let mut ids = Vec::new();
+        for n in 0..(MAX_SQL_VARIABLES + 250) {
+            let id = format!("ep{n:05}");
+            let mut e = Entry::new(&id, "episode", format!("Title {n}"), Source::Plex);
+            e.show_id = Some(format!("show:{}", n % 7));
+            // Seasons and episodes interleaved so the sort has real work to do
+            // and cannot be satisfied by the insertion order.
+            e.season = Some((n % 5) as i64 + 1);
+            e.episode = Some((997 - n % 997) as i64);
+            c.upsert_entry(&e).unwrap();
+            ids.push(id);
+        }
+
+        let order = Order::parse("season:asc,episode:asc").unwrap();
+        let big = c.resolve_order(&ids, &order, 0).unwrap();
+        assert_eq!(big.len(), ids.len(), "every id comes back");
+
+        // The same sort over a slice small enough for the `IN` path must be the
+        // large answer with the other ids removed — same order, same rules.
+        let small_ids: Vec<String> = ids.iter().take(100).cloned().collect();
+        let small = c.resolve_order(&small_ids, &order, 0).unwrap();
+        let wanted: std::collections::HashSet<&str> =
+            small_ids.iter().map(String::as_str).collect();
+        let projected: Vec<String> = big
+            .iter()
+            .filter(|id| wanted.contains(id.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(small, projected, "the two paths disagree on order");
+    }
+
+    /// An id the caller asks about that the catalog has never seen must not
+    /// appear in the result, on either path.
+    #[test]
+    fn ordering_a_large_set_drops_ids_the_catalog_does_not_hold() {
+        let c = cat();
+        let mut ids = Vec::new();
+        for n in 0..(MAX_SQL_VARIABLES + 10) {
+            let id = format!("ep{n:05}");
+            let mut e = Entry::new(&id, "episode", format!("Title {n}"), Source::Plex);
+            e.episode = Some(n as i64);
+            c.upsert_entry(&e).unwrap();
+            ids.push(id);
+        }
+        ids.push("never-ingested".to_string());
+
+        let out = c
+            .resolve_order(&ids, &Order::parse("episode:asc").unwrap(), 0)
+            .unwrap();
+        assert_eq!(out.len(), ids.len() - 1);
+        assert!(!out.iter().any(|id| id == "never-ingested"));
     }
 
     #[test]
