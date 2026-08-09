@@ -25,6 +25,56 @@ Quick reference. The full rationale lives in [PRD §Architecture](/PRD#architect
 - Coupling is exactly two things: the playout JSON schema (pinned via the `etv-next` submodule + Rust path-dep) and the directory layout convention.
 - The directory layout is single-sourced from the station config: each channel's output folder is derived as `{output_base}/{identity}` (see [schema](/schema#station-file)), and `etv-station --render-etv-next <dir>` generates ETV-next's `lineup.json` + `channelN.json` from that same config — so ETV-next reads exactly where the station writes, with no folder path authored twice. The container entrypoint runs that render at every start, so the two can only ever agree.
 
+## Subtitles
+
+Subtitles are entirely ETV-next's work — the station never opens a media file
+to look for them. What the station decides is *which of the two ways* ETV-next
+should do it, and it decides that for every channel at once.
+
+The switch is one field in `etv-next/normalization.default.json`, the shared
+playback block `--render-etv-next` copies into every generated `channelN.json`:
+
+```json
+"subtitle": {
+  "mode": "convert"
+}
+```
+
+- **`convert`** (what this station ships) has ETV-next pull the subtitle text
+  out of each file, write it as a WebVTT file beside every video segment, and
+  list those in a second playlist the top-level playlist points at. The viewer's
+  player shows a subtitle track it can switch on and off.
+- **`burn`** has ETV-next paint the words into the video picture instead. Every
+  viewer sees them and no player setting can turn them off, because by the time
+  the video arrives the words are part of the image.
+
+One channel wanting the other behaviour overrides it in `presentation.json`,
+beside the defaults file, under that channel's identity — the same place a
+per-channel resolution override goes. The render deep-merges it over the
+defaults, leaving sibling keys alone:
+
+```json
+{
+  "star-trek": {
+    "config": { "normalization": { "subtitle": { "mode": "burn" } } }
+  }
+}
+```
+
+Two things are worth knowing before flipping it:
+
+- `convert` only works on text subtitle formats. Blu-ray and DVD rips carry
+  their subtitles as pictures, which cannot become WebVTT, and those items
+  currently play with no subtitles at all rather than falling back to burning
+  them in ([etv-next#30](https://github.com/McBrideMusings/etv-next-station/issues/30)).
+- The subtitle track is announced with one language for the whole channel, set
+  by `subtitle.language` in the same block and defaulting to English. HLS has no
+  way to change it per programme, so a channel mixing languages labels them all
+  the same.
+
+The mechanics on the ETV-next side are written up in
+`etv-next/docs/subtitles.md`.
+
 ## Why a submodule
 
 `etv-station` depends on `etv-next-private/crates/ersatztv-playout` as a Rust path dependency through a git submodule pinned to a specific commit:
