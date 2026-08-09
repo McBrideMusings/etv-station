@@ -1,11 +1,13 @@
 //! Tautulli watch history (#74) — the station's one source of "what has been
 //! watched on this server lately".
 //!
-//! Read at most once per station tick and shared by every channel (#126) —
-//! pooled across every user with no user dimension, and handed to a scorer
-//! plugin as a signal. It is never a query filter field:
-//! a channel cannot say "movies nobody has watched" in CEL, because watch
-//! activity belongs to the algorithm's judgment, not to the catalog.
+//! Read at most once per station tick *per audience* and shared by every channel
+//! that wants that audience (#126, #112), then handed to a scorer plugin as a
+//! signal. An audience is a [`HistoryScope`]: every user pooled together with no
+//! user dimension, which is the default and what #74 shipped, or one named
+//! account. It is never a query filter field: a channel cannot say "movies
+//! nobody has watched" in CEL, because watch activity belongs to the algorithm's
+//! judgment, not to the catalog.
 //!
 //! Connection details come from the environment — `TAUTULLI_URL` and
 //! `TAUTULLI_API_KEY` — and never from tracked config, so a deployment supplies
@@ -62,18 +64,74 @@ pub fn credentials_from_env() -> Option<(String, String)> {
     }
 }
 
+/// Whose history to ask for (#112).
+///
+/// Two jobs in one type: it is the `user`/`user_id` parameter on the request,
+/// and it is the key the daemon caches the result under. Those have to be the
+/// same value or the cache would serve one person's ranking to another, so
+/// there is deliberately no way to build a request without stating the scope.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HistoryScope {
+    /// Every user, pooled — the unfiltered server-wide call (#74).
+    AllUsers,
+    /// One account, named by Tautulli username or numeric user id.
+    User(String),
+}
+
+impl HistoryScope {
+    /// The query parameter this scope adds to `get_history`, if any.
+    ///
+    /// Tautulli takes either `user_id` (numeric) or `user` (the username), and
+    /// a config says which by what it wrote: `"321912630"` is an id, `"Madi"` is
+    /// a name. Inferring beats a second config field that could disagree with
+    /// the first.
+    ///
+    /// The test is "every character is an ASCII digit", deliberately narrower
+    /// than `parse::<i64>()`. A signed parse also accepts `"+5"` and `"-3"`,
+    /// neither of which is a Tautulli id, and routing them to `user_id` would
+    /// send a request that matches nobody and returns an empty history — which
+    /// looks exactly like a person who has not watched anything.
+    ///
+    /// A username made only of digits is still read as an id; there is no way to
+    /// tell those apart from one field, and nobody on this server has one.
+    ///
+    /// The value is *not* escaped here — [`request_rows`] passes it through
+    /// `ureq`'s `.query()`, which percent-encodes it. That matters for real
+    /// accounts on this server: a username like `Jacob + Liv` written straight
+    /// into a URL would arrive as `Jacob   Liv`, because `+` decodes to a space
+    /// in a query string, and would match no user.
+    fn query_param(&self) -> Option<(&'static str, &str)> {
+        match self {
+            HistoryScope::AllUsers => None,
+            HistoryScope::User(u) if !u.is_empty() && u.chars().all(|c| c.is_ascii_digit()) => {
+                Some(("user_id", u))
+            }
+            HistoryScope::User(u) => Some(("user", u)),
+        }
+    }
+
+    /// How this scope reads in a log line.
+    fn label(&self) -> &str {
+        match self {
+            HistoryScope::AllUsers => "all_users",
+            HistoryScope::User(u) => u,
+        }
+    }
+}
+
 /// Raw history rows straight off the API, before any catalog join.
 ///
 /// Split from [`join`] because the two halves want different threads: this one
 /// blocks on the network (`ureq`) and must run under `spawn_blocking`, while
 /// the join needs the catalog mutex and no network at all. Never returns an
 /// error — see the module docs.
-pub fn fetch_rows(url: &str, key: &str) -> Vec<HistoryRow> {
-    match request_rows(url, key) {
+pub fn fetch_rows(url: &str, key: &str, scope: &HistoryScope) -> Vec<HistoryRow> {
+    match request_rows(url, key, scope) {
         Ok(rows) => {
             tracing::info!(
                 event = "tautulli.history",
                 rows = rows.len(),
+                scope = scope.label(),
                 "fetched watch history",
             );
             rows
@@ -82,6 +140,7 @@ pub fn fetch_rows(url: &str, key: &str) -> Vec<HistoryRow> {
             tracing::warn!(
                 event = "tautulli.unavailable",
                 error = %e,
+                scope = scope.label(),
                 "watch history unavailable; generating without it",
             );
             Vec::new()
@@ -128,15 +187,21 @@ fn redact_key(e: impl std::fmt::Display, key: &str) -> String {
     text.replace(key, "<redacted>")
 }
 
-fn request_rows(url: &str, key: &str) -> Result<Vec<HistoryRow>, String> {
+fn request_rows(url: &str, key: &str, scope: &HistoryScope) -> Result<Vec<HistoryRow>, String> {
     let endpoint = format!(
         "{}/api/v2?apikey={}&cmd=get_history&length={HISTORY_ROWS}",
         url.trim_end_matches('/'),
         key
     );
 
-    let body: serde_json::Value = ureq::get(&endpoint)
-        .timeout(TIMEOUT)
+    let mut request = ureq::get(&endpoint).timeout(TIMEOUT);
+    // Percent-encoded by `ureq`, which is why the scope is appended here rather
+    // than formatted into the string above — see `HistoryScope::query_param`.
+    if let Some((param, value)) = scope.query_param() {
+        request = request.query(param, value);
+    }
+
+    let body: serde_json::Value = request
         .call()
         .map_err(|e| format!("request failed: {}", redact_key(e, key)))?
         .into_json()
@@ -358,6 +423,72 @@ mod tests {
     #[test]
     fn drops_rows_still_playing() {
         assert!(resolved(&seeded(), vec![row("plex-1".into(), None)]).is_empty());
+    }
+
+    /// The server-wide scope must add nothing at all — that is what keeps #74's
+    /// unfiltered call byte-for-byte what it was before #112.
+    #[test]
+    fn the_pooled_scope_adds_no_filter() {
+        assert_eq!(HistoryScope::AllUsers.query_param(), None);
+    }
+
+    /// Which parameter a scope becomes is inferred from what was written, since
+    /// Tautulli takes the numeric id and the username under different names.
+    #[test]
+    fn a_numeric_user_is_an_id_and_a_name_is_a_name() {
+        assert_eq!(
+            HistoryScope::User("568385169".into()).query_param(),
+            Some(("user_id", "568385169")),
+            "a value that parses as an integer is a Tautulli user_id",
+        );
+        assert_eq!(
+            HistoryScope::User("Pierce".into()).query_param(),
+            Some(("user", "Pierce")),
+            "anything else is a username",
+        );
+        // Real account on this server, and the reason the inference is not
+        // "starts with a digit".
+        assert_eq!(
+            HistoryScope::User("Jacob + Liv".into()).query_param(),
+            Some(("user", "Jacob + Liv")),
+        );
+    }
+
+    /// A signed-integer parse would accept these and send them as `user_id`,
+    /// where they match no account and return an empty history — the same
+    /// silent nothing a real person who stopped watching would produce. Only
+    /// runs of plain digits are ids.
+    #[test]
+    fn a_signed_number_is_a_name_not_an_id() {
+        for name in ["+5", "-3", " 12", "12 ", "1_2", ""] {
+            assert_eq!(
+                HistoryScope::User(name.into()).query_param(),
+                Some(("user", name)),
+                "{name:?} is not a Tautulli user_id",
+            );
+        }
+    }
+
+    /// A username with a `+` or a space has to survive the trip as itself.
+    ///
+    /// Written straight into a query string, `Jacob + Liv` arrives at Tautulli as
+    /// `Jacob   Liv` — `+` is the query-string encoding of a space — and matches
+    /// no user, so the channel would rank against an empty history and look
+    /// merely unlucky. This pins the encoding `request_rows` relies on.
+    #[test]
+    fn a_username_with_punctuation_survives_encoding() {
+        let scope = HistoryScope::User("Jacob + Liv".into());
+        let (param, value) = scope.query_param().unwrap();
+        let url = ureq::get("http://tautulli.invalid/api/v2")
+            .query(param, value)
+            .request_url()
+            .unwrap()
+            .as_url()
+            .to_string();
+        assert!(
+            url.contains("user=Jacob+%2B+Liv"),
+            "the literal + must be percent-encoded, not left to mean a space: {url}"
+        );
     }
 
     #[test]

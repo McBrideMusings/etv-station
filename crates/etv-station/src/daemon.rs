@@ -17,6 +17,7 @@ use crate::emit::emit_window;
 use crate::errors::{ConfigError, StationError};
 use crate::overlay_supervisor;
 use crate::scan;
+use crate::tautulli::HistoryScope;
 use crate::tz as tzmod;
 
 pub async fn run(station: Station) -> Result<(), StationError> {
@@ -154,21 +155,35 @@ struct StationContext<'a> {
     history: &'a SharedHistory,
 }
 
-/// The station's one copy of "what has been watched on this server lately"
-/// (#126).
+/// The station's copy of "what has been watched lately" — one per distinct
+/// audience, not one per channel (#126, #112).
 ///
-/// Watch history is server-wide and pooled with no user dimension, so nothing
-/// about it varies by channel: before this, an N-channel station issued N
-/// identical `get_history` calls of a thousand rows and ran N identical catalog
-/// joins on every tick to produce N identical `Vec<WatchEvent>`. Channels tick
-/// on their own `roll_interval`s and there is no station-wide clock to hang a
-/// single fetch off, so the sharing is a cache the channels pull from rather
-/// than a task that pushes to them: the first channel into a refresh window
-/// pays for the fetch, and for the join when that fetch returned rows, while
-/// every other channel that ticks inside that window gets the same `Arc` back.
+/// Before #126, an N-channel station issued N identical `get_history` calls of a
+/// thousand rows and ran N identical catalog joins on every tick to produce N
+/// identical `Vec<WatchEvent>`. #126 collapsed that to a single cached copy,
+/// which was correct while history had no user dimension. #112 gives it one: a
+/// channel can now rank against one named person, so two channels no longer
+/// always want the same rows.
 ///
-/// Contention is the point, not a cost: the mutex is held across the fetch, so
-/// channels that tick together queue behind one request instead of racing N.
+/// So the cache is keyed by [`HistoryScope`] rather than reverted to a
+/// per-channel fetch. A station running the house For You channel plus one each
+/// for two people makes three requests per refresh window and no more — however
+/// many channels are pointed at those three audiences. Sharing survives; it is
+/// just sharing among the channels that actually want the same rows.
+///
+/// Channels tick on their own `roll_interval`s and there is no station-wide
+/// clock to hang a single fetch off, so this stays a cache the channels pull
+/// from rather than a task that pushes to them: the first channel into a refresh
+/// window for a given scope pays for that scope's fetch, and for the join when
+/// it returned rows, while every other channel on that scope inside that window
+/// gets the same `Arc` back.
+///
+/// Contention is the point, not a cost: the one mutex is held across the fetch,
+/// so channels that tick together queue behind one request instead of racing N.
+/// Keeping a single mutex over the whole map rather than one per scope also caps
+/// how hard a many-channel station can hit Tautulli at once — scopes serialize
+/// against each other, which is the behaviour worth having when the alternative
+/// is three simultaneous thousand-row requests.
 struct SharedHistory {
     /// What to join fetched rows against, and — because it is `None` whenever
     /// this generation has no reader for the result — the switch that decides
@@ -192,7 +207,10 @@ struct SharedHistory {
     /// refetches. Set to the shortest `roll_interval` on the station, so no
     /// channel ever sees a history older than one of its own ticks.
     refresh_after: Duration,
-    state: tokio::sync::Mutex<HistoryCache>,
+    /// One entry per audience any channel has asked for so far, created on first
+    /// ask. Scopes come from the channel list, which is fixed for the life of a
+    /// generation, so this cannot grow without bound under a running station.
+    state: tokio::sync::Mutex<HashMap<HistoryScope, HistoryCache>>,
 }
 
 #[derive(Default)]
@@ -212,20 +230,24 @@ impl SharedHistory {
             catalog,
             tautulli,
             refresh_after,
-            state: tokio::sync::Mutex::new(HistoryCache::default()),
+            state: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// The history to generate against right now, fetching it first if the
-    /// cached copy has aged past `refresh_after`.
+    /// The history to generate `scope`'s channels against right now, fetching it
+    /// first if that scope's cached copy has aged past `refresh_after`.
+    ///
+    /// Each scope ages independently: a channel ranking against one person does
+    /// not refresh the server-wide pool, and vice versa.
     ///
     /// Empty when Tautulli is unset or unreachable, which degrades a scorer's
     /// ranking rather than failing the tick (#74).
-    async fn current(&self) -> Arc<[crate::score::WatchEvent]> {
+    async fn current(&self, scope: &HistoryScope) -> Arc<[crate::score::WatchEvent]> {
         let Some(sc) = self.catalog.as_ref() else {
             return Arc::from(Vec::new());
         };
-        let mut cache = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        let cache = state.entry(scope.clone()).or_default();
         if let Some(at) = cache.fetched_at
             && at.elapsed() < self.refresh_after
         {
@@ -241,7 +263,8 @@ impl SharedHistory {
         // considered.
         let rows = match self.tautulli.clone() {
             Some((url, key)) => {
-                tokio::task::spawn_blocking(move || crate::tautulli::fetch_rows(&url, &key))
+                let scope = scope.clone();
+                tokio::task::spawn_blocking(move || crate::tautulli::fetch_rows(&url, &key, &scope))
                     .await
                     .unwrap_or_default()
             }
@@ -1423,14 +1446,26 @@ async fn pattern_catch_up(
     // list mid-way from a past `anchor`; see the phase calculation below.
     let mut first_generation = existing.is_empty();
 
-    // Watch history is read at most once per station tick — not once per
-    // generation, and not once per channel. A catch-up chains many generations
-    // in a row and they all share the same "what has been watched lately", and
-    // so does every other channel that ticks in the same refresh window: the
-    // history is server-wide and pooled, so nothing about it varies by channel
-    // (#126). Empty when Tautulli is unset or unreachable, which degrades a
-    // scorer's ranking rather than failing the tick (#74).
-    let history = ctx.history.current().await;
+    // Watch history is read at most once per station tick per audience — not
+    // once per generation, and not once per channel. A catch-up chains many
+    // generations in a row and they all share the same "what has been watched
+    // lately", and so does every other channel that ticks in the same refresh
+    // window *and ranks against the same people* (#126, #112). Empty when
+    // Tautulli is unset or unreachable, which degrades a scorer's ranking rather
+    // than failing the tick (#74).
+    //
+    // Asked for only by a channel that actually reads it. `history_catalog`
+    // makes this decision station-wide (#131) — nobody on the station names a
+    // scorer plugin, nobody fetches — but station-wide is too coarse now that
+    // scopes differ: without this check, one plugin channel anywhere would make
+    // every *other* channel fetch its own scope too, for a `Vec<WatchEvent>`
+    // that nothing then reads. Before #112 that cost nothing because they all
+    // shared one entry.
+    let history = if channel.config.uses_scorer_plugin() {
+        ctx.history.current(&channel.config.history_scope()).await
+    } else {
+        Arc::from(Vec::new())
+    };
 
     // How deep a recently-aired tail this channel's scorer sees. Read once —
     // it cannot change inside a tick.
@@ -1862,6 +1897,20 @@ mod shared_history_tests {
         )
     }
 
+    /// When one scope's history was last fetched, or `None` if no channel has
+    /// asked for that scope yet.
+    ///
+    /// The cache is keyed by audience since #112, so a test that used to read
+    /// "the" stamp now has to say whose.
+    async fn stamp(history: &SharedHistory, scope: &HistoryScope) -> Option<tokio::time::Instant> {
+        history
+            .state
+            .lock()
+            .await
+            .get(scope)
+            .and_then(|c| c.fetched_at)
+    }
+
     /// The acceptance criterion: N channels ticking inside one refresh window
     /// produce **one** fetch between them, not N.
     ///
@@ -1880,13 +1929,13 @@ mod shared_history_tests {
         // Four channels, each asking at the top of its own tick. The clock moves
         // a second between them — well inside the hour-long window, but enough
         // that a second pass would restamp `fetched_at` to a different instant.
-        let first = history.current().await;
-        let stamped_at = history.state.lock().await.fetched_at.unwrap();
+        let first = history.current(&HistoryScope::AllUsers).await;
+        let stamped_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
         for _ in 0..3 {
             tokio::time::advance(Duration::from_secs(1)).await;
-            let again = history.current().await;
+            let again = history.current(&HistoryScope::AllUsers).await;
             assert_eq!(
-                history.state.lock().await.fetched_at.unwrap(),
+                stamp(&history, &HistoryScope::AllUsers).await.unwrap(),
                 stamped_at,
                 "a channel inside the window must be served from the cache, \
                  leaving the stamp of the one pass that filled it",
@@ -1910,12 +1959,12 @@ mod shared_history_tests {
         let (info, _catalog_dir) = catalog_without_tautulli();
         let history = SharedHistory::new(Some(info), None, Duration::from_secs(60));
 
-        let first = history.current().await;
-        let first_at = history.state.lock().await.fetched_at.unwrap();
+        let first = history.current(&HistoryScope::AllUsers).await;
+        let first_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
 
         tokio::time::advance(Duration::from_secs(60)).await;
-        let second = history.current().await;
-        let second_at = history.state.lock().await.fetched_at.unwrap();
+        let second = history.current(&HistoryScope::AllUsers).await;
+        let second_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
 
         assert_eq!(
             second_at.duration_since(first_at),
@@ -1927,10 +1976,121 @@ mod shared_history_tests {
             "a refetch must store its own result, not hand back the stale one",
         );
 
-        let third = history.current().await;
+        let third = history.current(&HistoryScope::AllUsers).await;
         assert!(
             Arc::ptr_eq(&second, &third),
             "the refetched history is shared by the rest of its window too",
+        );
+    }
+
+    /// #112's acceptance criterion, and the thing #126's single cache could not
+    /// do: two channels ranking against different people must not be served each
+    /// other's history.
+    ///
+    /// Before the cache was keyed, the second scope to ask inside a refresh
+    /// window got whatever the first scope had fetched — so a personal For You
+    /// channel would have ranked against the whole server's viewing, silently
+    /// and with no log line saying so.
+    #[tokio::test(start_paused = true)]
+    async fn two_scopes_do_not_serve_each_other_the_wrong_history() {
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+
+        let pierce = HistoryScope::User("Pierce".to_string());
+        let madi = HistoryScope::User("Madi".to_string());
+
+        history.current(&HistoryScope::AllUsers).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        history.current(&pierce).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        history.current(&madi).await;
+
+        let all = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
+        let p = stamp(&history, &pierce).await.unwrap();
+        let m = stamp(&history, &madi).await.unwrap();
+
+        assert_eq!(
+            p.duration_since(all),
+            Duration::from_secs(1),
+            "a new audience must run its own fetch, not read the pooled one",
+        );
+        assert_eq!(
+            m.duration_since(p),
+            Duration::from_secs(1),
+            "and so must the next one",
+        );
+        assert_eq!(
+            history.state.lock().await.len(),
+            3,
+            "three audiences asked, so three cache entries",
+        );
+    }
+
+    /// The sharing #126 bought is not lost by keying the cache: two channels
+    /// pointed at the *same* person still make one request between them.
+    ///
+    /// This is what makes "one fetch per audience" different from "one fetch per
+    /// channel" — the shape a naive per-channel fix would have produced.
+    #[tokio::test(start_paused = true)]
+    async fn channels_sharing_one_audience_share_one_fetch() {
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let pierce = HistoryScope::User("Pierce".to_string());
+
+        let first = history.current(&pierce).await;
+        let stamped_at = stamp(&history, &pierce).await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second = history.current(&pierce).await;
+
+        assert_eq!(
+            stamp(&history, &pierce).await.unwrap(),
+            stamped_at,
+            "the second channel on this audience must be served from the cache",
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both channels must get the same allocation, not a copy",
+        );
+        assert_eq!(
+            history.state.lock().await.len(),
+            1,
+            "one audience, one cache entry, however many channels want it",
+        );
+    }
+
+    /// Each audience ages on its own clock. A personal channel refreshing does
+    /// not drag the server-wide pool along with it, and vice versa — otherwise
+    /// adding one personal channel would multiply the station's Tautulli traffic
+    /// by re-fetching every scope whenever any one of them expired.
+    #[tokio::test(start_paused = true)]
+    async fn one_scope_expiring_does_not_refetch_the_others() {
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(60));
+        let pierce = HistoryScope::User("Pierce".to_string());
+
+        history.current(&HistoryScope::AllUsers).await;
+        let all_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
+
+        // Half a window later the personal scope asks for the first time, so its
+        // own window starts here — 30s out of step with the pooled one.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        history.current(&pierce).await;
+        let pierce_at = stamp(&history, &pierce).await.unwrap();
+
+        // Now cross the pooled scope's expiry but not the personal one's.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        history.current(&HistoryScope::AllUsers).await;
+        history.current(&pierce).await;
+
+        assert!(
+            stamp(&history, &HistoryScope::AllUsers).await.unwrap() > all_at,
+            "the pooled scope was past its window and must have refetched",
+        );
+        assert_eq!(
+            stamp(&history, &pierce).await.unwrap(),
+            pierce_at,
+            "the personal scope was still inside its own window and must not have",
         );
     }
 
@@ -1942,10 +2102,10 @@ mod shared_history_tests {
     async fn a_station_with_no_catalog_never_fetches() {
         let history = SharedHistory::new(None, None, Duration::ZERO);
 
-        assert!(history.current().await.is_empty());
-        assert!(history.current().await.is_empty());
+        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
+        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
         assert!(
-            history.state.lock().await.fetched_at.is_none(),
+            history.state.lock().await.is_empty(),
             "a station with no catalog must never engage the cache at all",
         );
     }
@@ -1961,7 +2121,7 @@ mod shared_history_tests {
         let (info, _catalog_dir) = catalog_without_tautulli();
         let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
 
-        assert!(history.current().await.is_empty());
+        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
         assert_eq!(
             *joins.lock().unwrap(),
             0,
@@ -1990,7 +2150,7 @@ mod shared_history_tests {
         );
         let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
 
-        assert!(history.current().await.is_empty());
+        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
         assert_eq!(
             *failures.lock().unwrap(),
             0,

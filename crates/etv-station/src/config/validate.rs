@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::block::Duplicates;
-use super::channel::ChannelConfig;
+use super::channel::{ChannelConfig, TasteScope};
 use super::constraints::Constraints;
 use super::order::Order;
 use super::pool::{Rotate, Take, TakeFrom};
@@ -110,6 +110,8 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         });
     }
 
+    validate_taste_scope(path, channel)?;
+
     // Pool names key the `.resume` sidecar, so they must be unique across the
     // whole channel — that is what lets the sidecar survive blocks being
     // reordered without a block index in the key.
@@ -146,6 +148,46 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     }
 
     Ok(())
+}
+
+/// `taste_scope` and `user` have to agree (#112).
+///
+/// Both halves are rejected rather than papered over, because the failure they
+/// prevent is silent: a `single_user` channel with no `user` would fall back to
+/// the server-wide pool and rank a personal channel against everyone's viewing,
+/// looking exactly like a working channel. And a `user` under `all_users` reads
+/// as a personal channel to whoever wrote it while behaving as the house one.
+///
+/// A `user` that names nobody on the Plex server is *not* caught here — this is
+/// a config pass with no network. Tautulli answers an unknown user with an empty
+/// history, which surfaces at runtime as `rows=0` on the `tautulli.history`
+/// line for that scope.
+fn validate_taste_scope(path: &Path, channel: &ChannelConfig) -> Result<(), ConfigError> {
+    let Some(scoring) = channel.scoring.as_ref() else {
+        return Ok(());
+    };
+
+    let bad = |message: &str| {
+        Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!("scoring: {message}"),
+        })
+    };
+
+    match (scoring.taste_scope, scoring.user.as_deref()) {
+        (TasteScope::SingleUser, None) => bad(
+            "taste_scope: single_user requires `user` — the Tautulli username or \
+             user id whose watch history this channel ranks against",
+        ),
+        (TasteScope::SingleUser, Some(u)) if u.trim().is_empty() => {
+            bad("`user` cannot be empty under taste_scope: single_user")
+        }
+        (TasteScope::AllUsers, Some(_)) => {
+            bad("`user` is only meaningful with taste_scope: single_user; \
+             the default all_users pools every user's history")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Semantic checks for one `[constraints]` table (#73) — a block's, for either
@@ -488,6 +530,96 @@ mod tests {
             rule: RuleConfig { blocks },
             overlay: None,
         }
+    }
+
+    /// A channel with a `scoring:` block scoped to one named person.
+    fn channel_scoped_to(taste_scope: TasteScope, user: Option<&str>) -> ChannelConfig {
+        let mut c = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        c.scoring = Some(super::super::channel::ScoringConfig {
+            taste_scope,
+            user: user.map(str::to_string),
+            ..Default::default()
+        });
+        c
+    }
+
+    /// The silent failure this rule exists to stop: `single_user` with nobody
+    /// named falls back to the pooled history, so a channel built to follow one
+    /// person would rank against all twenty accounts and still look healthy.
+    #[test]
+    fn rejects_single_user_with_no_user_named() {
+        let c = channel_scoped_to(TasteScope::SingleUser, None);
+        let err = validate_channel(&dummy_path(), &c).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("requires `user`"), "msg = {msg}");
+    }
+
+    /// A whitespace-only `user` reaches Tautulli as a filter matching nobody,
+    /// which returns an empty history — indistinguishable from a quiet week.
+    #[test]
+    fn rejects_a_blank_user() {
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("   "));
+        let err = validate_channel(&dummy_path(), &c).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("cannot be empty"), "msg = {msg}");
+    }
+
+    /// The other direction: naming a user while leaving the scope pooled reads
+    /// as a personal channel and behaves as the house one.
+    #[test]
+    fn rejects_a_user_under_the_pooled_scope() {
+        let c = channel_scoped_to(TasteScope::AllUsers, Some("Pierce"));
+        let err = validate_channel(&dummy_path(), &c).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("only meaningful"), "msg = {msg}");
+    }
+
+    #[test]
+    fn accepts_a_single_user_channel_that_names_someone() {
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("Pierce"));
+        assert!(validate_channel(&dummy_path(), &c).is_ok());
+    }
+
+    /// #112 must not change what an already-written config means: every channel
+    /// in this repo predates the field and must still validate and still rank
+    /// against the pooled history.
+    #[test]
+    fn a_channel_that_says_nothing_stays_server_wide() {
+        let c = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        assert!(validate_channel(&dummy_path(), &c).is_ok());
+        assert_eq!(c.history_scope(), crate::tautulli::HistoryScope::AllUsers);
+
+        let pooled = channel_scoped_to(TasteScope::AllUsers, None);
+        assert_eq!(
+            pooled.history_scope(),
+            crate::tautulli::HistoryScope::AllUsers,
+        );
+    }
+
+    #[test]
+    fn a_single_user_channel_resolves_to_that_persons_scope() {
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("Pierce"));
+        assert_eq!(
+            c.history_scope(),
+            crate::tautulli::HistoryScope::User("Pierce".into()),
+        );
+    }
+
+    /// Padding survives validation — only an entirely blank `user` is rejected —
+    /// so it has to be stripped on the way to the scope. Left in, `" Pierce "`
+    /// reaches Tautulli as `user=+Pierce+`, matches nobody, and the channel
+    /// ranks against an empty history while looking perfectly healthy.
+    #[test]
+    fn a_padded_user_is_trimmed_before_it_becomes_a_scope() {
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("  Pierce  "));
+        assert!(
+            validate_channel(&dummy_path(), &c).is_ok(),
+            "padding is not itself a config error, which is why trimming matters",
+        );
+        assert_eq!(
+            c.history_scope(),
+            crate::tautulli::HistoryScope::User("Pierce".into()),
+        );
     }
 
     #[test]
