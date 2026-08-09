@@ -417,6 +417,7 @@ mod tests {
             catalog_path: None,
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
+            device_id: None,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         let msg = format!("{err}");
@@ -433,6 +434,7 @@ mod tests {
             catalog_path: None,
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
+            device_id: None,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
@@ -448,6 +450,7 @@ mod tests {
             catalog_path: None,
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
+            device_id: None,
         };
         assert!(validate_station(&dummy_path(), &s).is_err());
     }

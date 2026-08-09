@@ -111,14 +111,70 @@ pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, Rend
     if folders.is_empty() {
         return Err(RenderError::NoChannels(config_path.to_path_buf()));
     }
-    render_folders(&folders, opts)
+    // The station config is the only place the tuner identity can come from,
+    // and this is the only entry point that has it.
+    let device_id = resolve_device_id(
+        station.station.device_id.as_deref(),
+        &station.station.output_base,
+    )?;
+    render_folders(&folders, opts, &device_id)
+}
+
+/// The identity ETV-next reports to Plex, which must be the same string on
+/// every run or Plex sees a new tuner and drops the channel mapping.
+///
+/// Configured value wins outright. Otherwise the id is read from
+/// `{output_base}/.device_id`, and minted and stored there on the first run
+/// that finds no file. `output_base` is on the data volume, so the stored value
+/// outlives the container; only per-channel subfolders are swept, so nothing
+/// prunes it.
+pub fn resolve_device_id(
+    configured: Option<&str>,
+    output_base: &Path,
+) -> Result<String, RenderError> {
+    if let Some(id) = configured.map(str::trim).filter(|id| !id.is_empty()) {
+        return Ok(id.to_string());
+    }
+
+    let path = output_base.join(".device_id");
+    match fs::read_to_string(&path) {
+        Ok(stored) if !stored.trim().is_empty() => return Ok(stored.trim().to_string()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(RenderError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    }
+
+    let minted = uuid::Uuid::new_v4().to_string();
+    fs::create_dir_all(output_base).map_err(|source| RenderError::Io {
+        path: output_base.to_path_buf(),
+        source,
+    })?;
+    fs::write(&path, &minted).map_err(|source| RenderError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(minted)
 }
 
 /// Render from an already-resolved list of playout folders, in channel order.
 ///
 /// Split out from [`render`] so the emitted shape can be tested without
 /// standing up a whole station config.
-pub fn render_folders(folders: &[PathBuf], opts: &RenderOptions) -> Result<Rendered, RenderError> {
+/// `device_id` is a parameter rather than a field on [`RenderOptions`] so there
+/// is no way to render a lineup without having resolved one. As a field it
+/// defaulted to empty in [`RenderOptions::from_env`], and any caller pairing
+/// that with this function would have emitted a tuner with a blank identity —
+/// which nothing here would notice and only Plex would.
+pub fn render_folders(
+    folders: &[PathBuf],
+    opts: &RenderOptions,
+    device_id: &str,
+) -> Result<Rendered, RenderError> {
     let default_path = opts.out_dir.join("normalization.default.json");
     if !default_path.exists() {
         return Err(RenderError::MissingDefaults(default_path));
@@ -195,7 +251,11 @@ pub fn render_folders(folders: &[PathBuf], opts: &RenderOptions) -> Result<Rende
     }
 
     let lineup = serde_json::json!({
-        "server": {"bind_address": opts.bind_address, "port": opts.port},
+        "server": {
+            "bind_address": opts.bind_address,
+            "port": opts.port,
+            "device_id": device_id,
+        },
         "output": {"folder": opts.hls_output},
         "channels": lineup_channels,
     });
@@ -291,6 +351,69 @@ mod tests {
         }
     }
 
+    // Plex keys a DVR's whole channel mapping on the device id, so an id that
+    // changes between runs costs the user 60 channels of remapping by hand.
+    // These three tests are what "stable" means in practice.
+    #[test]
+    fn a_generated_device_id_is_reused_on_every_later_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let first = resolve_device_id(None, base).unwrap();
+        let second = resolve_device_id(None, base).unwrap();
+
+        assert_eq!(first, second, "a restart must not mint a new identity");
+        assert!(!first.is_empty());
+        assert_eq!(
+            fs::read_to_string(base.join(".device_id")).unwrap().trim(),
+            first,
+            "the id must be on the data volume, not just in memory",
+        );
+    }
+
+    #[test]
+    fn a_configured_device_id_wins_and_is_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // A file is already there from an earlier unconfigured run.
+        let generated = resolve_device_id(None, base).unwrap();
+
+        let resolved = resolve_device_id(Some("  authored-by-hand  "), base).unwrap();
+
+        assert_eq!(resolved, "authored-by-hand", "config wins, and is trimmed");
+        assert_eq!(
+            fs::read_to_string(base.join(".device_id")).unwrap().trim(),
+            generated,
+            "configuring an id must not overwrite the stored one",
+        );
+    }
+
+    #[test]
+    fn a_blank_configured_device_id_falls_through_to_the_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let generated = resolve_device_id(None, base).unwrap();
+
+        // An empty `device_id:` in YAML is a key someone left blank, not a
+        // request for a tuner with no name.
+        assert_eq!(resolve_device_id(Some("   "), base).unwrap(), generated);
+    }
+
+    #[test]
+    fn the_rendered_lineup_carries_the_device_id() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
+
+        let folders = vec![PathBuf::from("out/star-trek")];
+        let rendered = render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
+
+        // ETV-next reads this and reports it as its HDHomeRun DeviceID; if it
+        // never reaches the lineup, Plex is told the scaffold default instead.
+        let lineup = read(&rendered.lineup_path);
+        assert_eq!(lineup["server"]["device_id"], "test-device-id");
+    }
+
     fn read(path: &Path) -> Value {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
@@ -301,7 +424,7 @@ mod tests {
         fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
-        let rendered = render_folders(&folders, &opts(dir.path())).unwrap();
+        let rendered = render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
         assert_eq!(rendered.channels, 2);
 
         let lineup = read(&rendered.lineup_path);
@@ -334,7 +457,7 @@ mod tests {
         .unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek")];
-        let rendered = render_folders(&folders, &opts(dir.path())).unwrap();
+        let rendered = render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
 
         let lineup = read(&rendered.lineup_path);
         assert_eq!(lineup["channels"][0]["name"], "Star Trek 24/7");
@@ -357,7 +480,7 @@ mod tests {
         .unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek")];
-        render_folders(&folders, &opts(dir.path())).unwrap();
+        render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
 
         let channel1 = read(&dir.path().join("channel1.json"));
         assert!(
@@ -378,7 +501,7 @@ mod tests {
         fs::write(dir.path().join("channel.json"), "{}").unwrap();
 
         let folders = vec![PathBuf::from("out/only")];
-        render_folders(&folders, &opts(dir.path())).unwrap();
+        render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
 
         assert!(dir.path().join("channel1.json").exists());
         assert!(!dir.path().join("channel7.json").exists());
@@ -388,7 +511,12 @@ mod tests {
     #[test]
     fn missing_defaults_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = render_folders(&[PathBuf::from("out/x")], &opts(dir.path())).unwrap_err();
+        let err = render_folders(
+            &[PathBuf::from("out/x")],
+            &opts(dir.path()),
+            "test-device-id",
+        )
+        .unwrap_err();
         assert!(matches!(err, RenderError::MissingDefaults(_)));
     }
 }

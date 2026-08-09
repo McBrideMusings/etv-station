@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 serde_norway = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+uuid = { workspace = true }
 time-tz = { workspace = true }
 tokio = { workspace = true }
 ureq = { workspace = true }

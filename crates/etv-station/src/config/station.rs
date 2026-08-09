@@ -8,6 +8,22 @@ pub struct StationConfig {
     #[serde(default = "default_tz")]
     pub tz: String,
 
+    /// How Plex tells this tuner apart from every other one it has seen. Plex
+    /// keys a DVR's entire channel mapping on it, so a value that changes
+    /// between restarts reads as a brand-new tuner and all of the mapping has
+    /// to be redone by hand.
+    ///
+    /// Leave it unset and one is minted on first run and kept in
+    /// `{output_base}/.device_id`, which lives on the data volume and so
+    /// survives container recreates and image rebuilds. Set it here and that
+    /// value wins — the file is not consulted.
+    ///
+    /// The generated id cannot live in the rendered `lineup.json`: the
+    /// container regenerates that file from this config at every start, so a
+    /// value written there would be discarded on the next boot.
+    #[serde(default)]
+    pub device_id: Option<String>,
+
     /// Base directory every channel's output folder is derived under. A
     /// channel writing playout JSON to `{output_base}/{identity}`, where
     /// `identity` is the channel's `name` override or its config file stem.
