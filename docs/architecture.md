@@ -66,14 +66,11 @@ Two things are worth knowing before flipping it:
 - `convert` only works on text subtitle formats. Blu-ray and DVD rips carry
   their subtitles as pictures, which cannot become WebVTT, and those items
   currently play with no subtitles at all rather than falling back to burning
-  them in ([etv-next#30](https://github.com/McBrideMusings/etv-next-station/issues/30)).
+  them in ([etv-next#30](https://github.com/McBrideMusings/etv-next-private/issues/30)).
 - The subtitle track is announced with one language for the whole channel, set
   by `subtitle.language` in the same block and defaulting to English. HLS has no
   way to change it per programme, so a channel mixing languages labels them all
   the same.
-
-The mechanics on the ETV-next side are written up in
-`etv-next/docs/subtitles.md`.
 
 ## Why a submodule
 
