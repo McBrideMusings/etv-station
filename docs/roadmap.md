@@ -62,11 +62,23 @@ With the query language picked and graphics rendering working, redesign the chan
 - Graphics overlay cascade: channel default → block override → item override.
 - Migration script from current `[rule] type = "loop_forever"` configs.
 
+### Phase D — Plugin boundary and catalog-aware scheduling
+
+**[Milestone](https://github.com/McBrideMusings/etv-station/milestone/6).** The 58 ported channels split cleanly into three groups: ones the current schema already builds, ones needing markup the schema does not have yet, and ones needing a metadata graph that does not live in this repo. Phase D builds the second group and draws the boundary the third reaches through.
+
+**The plugin contract splits into two declared hooks.** ADR 0002 already makes a plugin replace a pool's `expr`, which is the candidate-set hook; what is missing is a plugin saying so. A plugin declares which hooks it implements ([#159](https://github.com/McBrideMusings/etv-station/issues/159)), declares the host capabilities it needs so nothing is ambient and core never links an external store it was not granted ([#167](https://github.com/McBrideMusings/etv-station/issues/167)), and returns entries carrying an optional metadata blob and per-entry take override rather than bare ids ([#166](https://github.com/McBrideMusings/etv-station/issues/166)). The second hook, `sequencer` ([#169](https://github.com/McBrideMusings/etv-station/issues/169)), emits a block's final timeline in place of the pattern walk. Reproducibility becomes checkable rather than assumed ([#168](https://github.com/McBrideMusings/etv-station/issues/168)).
+
+Most channels need exactly one of the two hooks — a taste model needs a custom candidate set and standard arrangement; a network mirror needs the reverse. Keeping them separate is what stops the plugin surface from ballooning.
+
+**Markup the ported channels are waiting on.** Keyword scoring so a comedy pool stops admitting horror-comedies ([#161](https://github.com/McBrideMusings/etv-station/issues/161)), named and seed-inferred categories over it ([#170](https://github.com/McBrideMusings/etv-station/issues/170), [#175](https://github.com/McBrideMusings/etv-station/issues/175)); per-show cursors so a series resumes wherever it surfaces ([#160](https://github.com/McBrideMusings/etv-station/issues/160)); arc ranges as pseudo-seasons ([#163](https://github.com/McBrideMusings/etv-station/issues/163), [#171](https://github.com/McBrideMusings/etv-station/issues/171)); standalone chronologies ([#164](https://github.com/McBrideMusings/etv-station/issues/164)); show groups as a rotation domain ([#165](https://github.com/McBrideMusings/etv-station/issues/165)); date-windowed blocks with a first-match cascade ([#162](https://github.com/McBrideMusings/etv-station/issues/162)); item-bound overlays ([#174](https://github.com/McBrideMusings/etv-station/issues/174)).
+
+**Out of this repo entirely.** Negative seeds, embedding similarity, crowd-list bootstrap, affinity-graph expansion, network and critic-rating enrichment, weighted external collections, awards data, trending edges — all need an extended metadata graph. They reach `etv-station` only as pool-provider plugins once the hooks above exist.
+
 ## Later
 
 - **Lottie animation runtime spike** — designer-friendly After Effects format for richer overlays via [`velato`](https://github.com/linebender/velato). Tracked as a side project; the maintainer can author equivalent behavior in Rhai for now.
-- [Recurring grid rule](https://github.com/McBrideMusings/etv-station/issues/14) — fixed-time blocks. Likely subsumed by Phase C once a fixed-time-block primitive returns.
-- [Live event injection](https://github.com/McBrideMusings/etv-station/issues/16) — operator declares a one-shot override window.
+- [Dayparting](https://github.com/McBrideMusings/etv-station/issues/14) — a block that airs at a fixed time on fixed weekdays. Blocks the network-mirror channels (Adult Swim, HBO, Bravo). Open call: block-level schema field, or a Phase D sequencer plugin. Design alongside [#162](https://github.com/McBrideMusings/etv-station/issues/162), which is the calendar half of the same conditional-selection question.
+- [Live event injection](https://github.com/McBrideMusings/etv-station/issues/16) — operator declares a one-shot override window. No channel in the current inventory needs it; recorded so it is not picked up before one does.
 - [Web UI for editing channels and items](https://github.com/McBrideMusings/etv-station/issues/17) — once channel count grows past TOML-by-hand ergonomics.
 - Public open-source release — revisit once the rule abstraction is validated by 2+ rule implementations.
 
