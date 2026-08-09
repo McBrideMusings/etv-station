@@ -78,7 +78,7 @@ Two things are worth knowing before flipping it:
 
 ## Why a submodule
 
-`etv-station` depends on `etv-next-private/crates/ersatztv-playout` as a Rust path dependency through a git submodule pinned to a specific commit:
+`etv-station` depends on `etv-next-station/crates/ersatztv-playout` as a Rust path dependency through a git submodule pinned to a specific commit:
 
 - Schema drift becomes a compile-time question. If upstream renames a field, `cargo build` fails before any test runs.
 - Adopting an upstream schema change is a deliberate two-step: pull `origin/main` into the submodule, bump the submodule SHA in `etv-station`, rebuild.

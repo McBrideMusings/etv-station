@@ -10,7 +10,7 @@ See `docs/architecture.md` for the full picture and `docs/PRD.md` for the spec.
 
 ## Submodule rules — DO NOT EDIT FROM THIS REPO
 
-`etv-next/` is a submodule pointing at `McBrideMusings/etv-next-private`. **Never make changes to files under `etv-next/` from this repo.** Schema / pipeline changes are made in the etv-next checkout proper, then absorbed here by bumping the submodule SHA. Touching `etv-next/` from inside `etv-station` will silently lose work on the next submodule update.
+`etv-next/` is a submodule pointing at `McBrideMusings/etv-next-station`. **Never make changes to files under `etv-next/` from this repo.** Schema / pipeline changes are made in the etv-next checkout proper, then absorbed here by bumping the submodule SHA. Touching `etv-next/` from inside `etv-station` will silently lose work on the next submodule update.
 
 ## Build & run
 

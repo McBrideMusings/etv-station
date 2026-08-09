@@ -168,7 +168,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 
 | Path | What |
 |---|---|
-| `etv-next/` | Submodule → `McBrideMusings/etv-next-private`. **Do not edit from this repo.** Bumped deliberately to absorb upstream schema changes. |
+| `etv-next/` | Submodule → `McBrideMusings/etv-next-station`. **Do not edit from this repo.** Bumped deliberately to absorb upstream schema changes. |
 | `etv-next/crates/ersatztv-playout/` | The schema crate `etv-station` depends on via path. Compile-time check for schema drift. |
 | `etv-next/schema/playout.json` | The JSON Schema for emitted playout files. |
 

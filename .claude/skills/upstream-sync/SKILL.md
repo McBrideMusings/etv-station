@@ -20,7 +20,7 @@ result into etv-station.
 
 | | |
 |---|---|
-| `~/Projects/etv-next` | the fork. `origin` = `McBrideMusings/etv-next-private`, `upstream` = `ErsatzTV/next`. Default branch **`pierce-main`**, not `main`. |
+| `~/Projects/etv-next` | the fork. `origin` = `McBrideMusings/etv-next-station`, `upstream` = `ErsatzTV/next`. Default branch **`pierce-main`**, not `main`. |
 | `~/Projects/etv-station` | consumes the fork as the `etv-next/` submodule. |
 
 **Never push to `upstream`.** Pulling from it is the entire point; pushing is
