@@ -13,9 +13,11 @@
 //!
 //! A plugin declares which hooks it implements (#159) and, for each one it
 //! claims, the functions that hook requires. `pool_provider` — everything
-//! below except `hooks()` itself — is what a `plugin:` pool has always meant;
-//! `sequencer` is declarable today so a channel author's script can name it,
-//! but nothing calls it yet (that lands in a later slice).
+//! below except `hooks()` itself — is what a `plugin:` pool has always meant.
+//! `sequencer` is the second hook (#169, [`crate::sequence`]): a block names
+//! one instead of `pattern`, and it draws its own timeline from this
+//! module's item-map marshalling ([`load_items`]) rather than the pattern
+//! walk.
 //!
 //! ```rhai
 //! // Which hooks this script implements. Read at config load time, without
@@ -248,7 +250,10 @@ pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
 ///
 /// Compiling and calling must use the same configuration, which is the whole
 /// reason this is one function rather than two call sites that drifted.
-fn engine() -> Engine {
+///
+/// `pub(crate)` so [`crate::sequence`] (#169) shares it rather than a second
+/// engine configuration that could drift from this one.
+pub(crate) fn engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
     engine
@@ -454,7 +459,12 @@ fn compile_and_resolve(
 
 /// Load each id as a Rhai map: every column on `entries`, plus every exposed
 /// tag namespace as an array.
-fn load_items(catalog: &Catalog, ids: &[String]) -> Result<Array, String> {
+///
+/// `pub(crate)` so [`crate::sequence`] (#169) builds a sequencer's
+/// `ctx.pools.<name>` item maps with the exact same marshalling a scorer's
+/// `ctx.sets.<name>` already uses (issue #169, decision 1) rather than a
+/// second, driftable implementation.
+pub(crate) fn load_items(catalog: &Catalog, ids: &[String]) -> Result<Array, String> {
     let mut out = Array::with_capacity(ids.len());
     for id in ids {
         let entry = catalog

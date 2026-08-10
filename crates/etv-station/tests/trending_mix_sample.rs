@@ -244,6 +244,7 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
         &GenerationState::empty(),
         &Default::default(),
         None,
+        time::OffsetDateTime::now_utc(),
     )
     .expect("first window");
     let first_ids = ids(&first);
@@ -294,6 +295,7 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
         &state,
         &Default::default(),
         None,
+        time::OffsetDateTime::now_utc(),
     )
     .expect("second window");
     let second_ids = ids(&second);
@@ -343,6 +345,7 @@ fn trending_mix_sample_loops_the_shorter_show_without_disturbing_the_longer() {
         &GenerationState::empty(),
         &Default::default(),
         None,
+        time::OffsetDateTime::now_utc(),
     )
     .unwrap();
     let state = advance_state(&cat, &GenerationState::empty(), next, &first);
@@ -355,6 +358,7 @@ fn trending_mix_sample_loops_the_shorter_show_without_disturbing_the_longer() {
         &state,
         &Default::default(),
         None,
+        time::OffsetDateTime::now_utc(),
     )
     .unwrap();
 

@@ -18,5 +18,6 @@ pub mod resume;
 pub mod rule;
 pub mod scan;
 pub mod score;
+pub mod sequence;
 pub mod tautulli;
 pub mod tz;

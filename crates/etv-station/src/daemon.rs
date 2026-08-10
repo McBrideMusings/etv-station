@@ -1741,6 +1741,12 @@ async fn pattern_catch_up(
                 // laying all 950 items and idling for a month (#118). The loop
                 // condition guarantees this is positive.
                 Some((target - from).unsigned_abs()),
+                // The absolute instant this generation begins airing at — a
+                // sequencer block (#169) reads it as `ctx.window.from`, so a
+                // daypart script asks "what hour does this generation start"
+                // rather than "what hour is it while the daemon happens to be
+                // computing this".
+                from,
             )?;
             // The ledger needs each airing's show, and only the catalog knows
             // it. One query for the whole generation rather than one per item.

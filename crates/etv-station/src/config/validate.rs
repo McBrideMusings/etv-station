@@ -145,6 +145,11 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
             continue;
         }
 
+        if include.is_sequencer() {
+            validate_sequencer_block(include, &mut pool_names, &channel.groups, base_dir, &bad)?;
+            continue;
+        }
+
         if include.entries().is_empty() {
             return Err(ConfigError::Validation {
                 path: path.to_path_buf(),
@@ -343,91 +348,7 @@ fn validate_pattern_block<'a>(
         }
     }
 
-    let mut local: HashSet<&str> = HashSet::new();
-    for pool in &include.pools {
-        if pool.name.trim().is_empty() {
-            return Err(bad("a pool has an empty name".into()));
-        }
-        // A pool names exactly one source of items. Two is ambiguous about
-        // which one wins; none leaves the pool with nothing to resolve.
-        let source_count = [
-            pool.expr.is_some(),
-            pool.plugin.is_some(),
-            !pool.groups.is_empty(),
-        ]
-        .into_iter()
-        .filter(|&set| set)
-        .count();
-        if source_count == 0 {
-            return Err(bad(format!(
-                "pool {:?} sets none of `expr`, `plugin`, or `groups` — it has no items to draw",
-                pool.name
-            )));
-        }
-        if source_count > 1 {
-            return Err(bad(format!(
-                "pool {:?} sets more than one of `expr`, `plugin`, `groups` — a pool draws \
-                 its items from exactly one",
-                pool.name
-            )));
-        }
-        if let Some(expr) = &pool.expr
-            && expr.trim().is_empty()
-        {
-            return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
-        }
-        if let Some(plugin) = &pool.plugin {
-            if plugin.as_os_str().is_empty() {
-                return Err(bad(format!(
-                    "pool {:?} has an empty plugin path",
-                    pool.name
-                )));
-            }
-            // The plugin returns its set already ranked; a re-sort would
-            // discard the ranking it exists to produce.
-            if pool.order.is_some() {
-                return Err(bad(format!(
-                    "pool {:?} sets both `plugin` and `order` — a plugin returns its \
-                     set already ranked, so ordering it again would discard the \
-                     ranking; drop `order`",
-                    pool.name
-                )));
-            }
-            // Same reasoning one level up: the series sequence a plugin
-            // pool gets is the ranking's, and re-sequencing it throws the
-            // ranking away just as surely as re-sorting the items would.
-            if pool.bucket_order.is_some() {
-                return Err(bad(format!(
-                    "pool {:?} sets both `plugin` and `bucket_order` — the order its \
-                     series come up in is the plugin's ranking, so re-sequencing them \
-                     would discard it; drop `bucket_order`",
-                    pool.name
-                )));
-            }
-            // Checked last among this pool's plugin checks — it is the one
-            // that reads the script off disk, so the cheaper structural checks
-            // above get to report first when more than one thing is wrong.
-            validate_plugin_declares_pool_provider(pool, plugin, base_dir, &bad)?;
-        }
-        if !pool.groups.is_empty() {
-            validate_pool_groups(pool, channel_groups, &bad)?;
-        }
-        // A pool's own `[constraints]` replaces the block's wholesale, so it has
-        // to stand on its own — and the error names the pool, since that is the
-        // line the author has to go and fix (#115).
-        if let Some(c) = &pool.constraints {
-            let pool_bad = |m: String| bad(format!("pool {:?}: {m}", pool.name));
-            validate_constraints(c, &pool_bad)?;
-        }
-        if !pool_names.insert(pool.name.as_str()) {
-            return Err(bad(format!(
-                "pool name {:?} is already used by another block in this channel; \
-                 pool names key the .resume sidecar and must be unique per channel",
-                pool.name
-            )));
-        }
-        local.insert(pool.name.as_str());
-    }
+    let local = validate_block_pools(&include.pools, pool_names, channel_groups, base_dir, &bad)?;
 
     for (step_idx, step) in include.pattern.iter().enumerate() {
         if !local.contains(step.pool.as_str()) {
@@ -509,6 +430,182 @@ fn validate_pattern_block<'a>(
     Ok(())
 }
 
+/// Semantic checks for a `pools` + `sequencer` block (#169): a block naming a
+/// plugin script that draws its own timeline instead of walking `pattern`.
+///
+/// The refusals mirror [`validate_pattern_block`]'s exactly, because they
+/// guard the same thing under a different name: a block field that would
+/// silently contradict who actually owns the arrangement. A block-level
+/// `order` would re-sort what the script decided; `duplicates = "collapse"`
+/// could delete a repeat the script deliberately returned; `fallback` is
+/// meaningless because a short sequencer timeline already has its own
+/// handling (falls through to the channel's normal short-generation
+/// behavior, never dead air); `cycles` has no pattern to loop.
+fn validate_sequencer_block<'a>(
+    include: &'a BlockInclude,
+    pool_names: &mut HashSet<&'a str>,
+    channel_groups: &[ShowGroup],
+    base_dir: &Path,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    if !include.entries().is_empty() {
+        return Err(bad(
+            "a block is either an `entries` block or a `pools` + `sequencer` block, not both"
+                .into(),
+        ));
+    }
+    if !include.pattern.is_empty() {
+        return Err(bad(
+            "a block declares either `pattern` or `sequencer`, not both (issue #169 decision 3)"
+                .into(),
+        ));
+    }
+    if include.pools.is_empty() {
+        return Err(bad("`sequencer` needs at least one `pools` entry".into()));
+    }
+    let sequencer = include
+        .sequencer
+        .as_ref()
+        .expect("validate_sequencer_block is only reached when `sequencer` is set");
+    if sequencer.as_os_str().is_empty() {
+        return Err(bad("block has an empty `sequencer` path".into()));
+    }
+    if let Some(order) = &include.order
+        && *order != Order::Manual
+    {
+        return Err(bad(format!(
+            "order {order:?} conflicts with `sequencer` — the script decides the arrangement; \
+             sort inside a pool with its own `order` instead",
+        )));
+    }
+    if include.duplicates == Some(Duplicates::Collapse) {
+        return Err(bad(
+            "duplicates = \"collapse\" conflicts with `sequencer` — collapse could delete an \
+             item the script deliberately repeated; a sequencer block is always \"keep\""
+                .into(),
+        ));
+    }
+    if include.fallback.is_some() {
+        return Err(bad(
+            "fallback conflicts with `sequencer` — a short sequencer timeline falls through to \
+             the channel's normal short-generation handling; block-level `fallback` only \
+             applies to an entries block"
+                .into(),
+        ));
+    }
+    if let Some(n) = include.cycles {
+        return Err(bad(format!(
+            "cycles = {n} is meaningless on a `sequencer` block — there is no pattern to loop"
+        )));
+    }
+
+    validate_plugin_declares_sequencer(sequencer, base_dir, bad)?;
+    validate_block_pools(&include.pools, pool_names, channel_groups, base_dir, bad)?;
+
+    Ok(())
+}
+
+/// Structural + hook checks for a block's `pools` (#72's own per-pool rules,
+/// #159's `pool_provider` hook, #165's groups) — shared by a `pattern` block
+/// and a `sequencer` block (#169), since a pool means the same thing to
+/// either arrangement hook: exactly one source, its own legal `constraints`,
+/// and a name unique across the whole channel. Returns the pool names this
+/// block declares, for a pattern block's own step-name validation.
+fn validate_block_pools<'a>(
+    pools: &'a [Pool],
+    pool_names: &mut HashSet<&'a str>,
+    channel_groups: &[ShowGroup],
+    base_dir: &Path,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<HashSet<&'a str>, ConfigError> {
+    let mut local: HashSet<&str> = HashSet::new();
+    for pool in pools {
+        if pool.name.trim().is_empty() {
+            return Err(bad("a pool has an empty name".into()));
+        }
+        // A pool names exactly one source of items. Two is ambiguous about
+        // which one wins; none leaves the pool with nothing to resolve.
+        let source_count = [
+            pool.expr.is_some(),
+            pool.plugin.is_some(),
+            !pool.groups.is_empty(),
+        ]
+        .into_iter()
+        .filter(|&set| set)
+        .count();
+        if source_count == 0 {
+            return Err(bad(format!(
+                "pool {:?} sets none of `expr`, `plugin`, or `groups` — it has no items to draw",
+                pool.name
+            )));
+        }
+        if source_count > 1 {
+            return Err(bad(format!(
+                "pool {:?} sets more than one of `expr`, `plugin`, `groups` — a pool draws \
+                 its items from exactly one",
+                pool.name
+            )));
+        }
+        if let Some(expr) = &pool.expr
+            && expr.trim().is_empty()
+        {
+            return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
+        }
+        if let Some(plugin) = &pool.plugin {
+            if plugin.as_os_str().is_empty() {
+                return Err(bad(format!(
+                    "pool {:?} has an empty plugin path",
+                    pool.name
+                )));
+            }
+            // The plugin returns its set already ranked; a re-sort would
+            // discard the ranking it exists to produce.
+            if pool.order.is_some() {
+                return Err(bad(format!(
+                    "pool {:?} sets both `plugin` and `order` — a plugin returns its \
+                     set already ranked, so ordering it again would discard the \
+                     ranking; drop `order`",
+                    pool.name
+                )));
+            }
+            // Same reasoning one level up: the series sequence a plugin
+            // pool gets is the ranking's, and re-sequencing it throws the
+            // ranking away just as surely as re-sorting the items would.
+            if pool.bucket_order.is_some() {
+                return Err(bad(format!(
+                    "pool {:?} sets both `plugin` and `bucket_order` — the order its \
+                     series come up in is the plugin's ranking, so re-sequencing them \
+                     would discard it; drop `bucket_order`",
+                    pool.name
+                )));
+            }
+            // Checked last among this pool's plugin checks — it is the one
+            // that reads the script off disk, so the cheaper structural checks
+            // above get to report first when more than one thing is wrong.
+            validate_plugin_declares_pool_provider(pool, plugin, base_dir, bad)?;
+        }
+        if !pool.groups.is_empty() {
+            validate_pool_groups(pool, channel_groups, bad)?;
+        }
+        // A pool's own `[constraints]` replaces the block's wholesale, so it has
+        // to stand on its own — and the error names the pool, since that is the
+        // line the author has to go and fix (#115).
+        if let Some(c) = &pool.constraints {
+            let pool_bad = |m: String| bad(format!("pool {:?}: {m}", pool.name));
+            validate_constraints(c, &pool_bad)?;
+        }
+        if !pool_names.insert(pool.name.as_str()) {
+            return Err(bad(format!(
+                "pool name {:?} is already used by another block in this channel; \
+                 pool names key the .resume sidecar and must be unique per channel",
+                pool.name
+            )));
+        }
+        local.insert(pool.name.as_str());
+    }
+    Ok(local)
+}
+
 /// A pool naming a script for `plugin:` must be able to say the script does
 /// that job (#159). The declaration lives in the script (`hooks()`), read
 /// without running `sources()` or `pick()`, so this never touches the
@@ -531,6 +628,27 @@ fn validate_plugin_declares_pool_provider(
             "pool {:?} names plugin {} via `plugin:`, which requires the plugin to \
              declare the `pool_provider` hook, but it only declares: {}",
             pool.name,
+            script_path.display(),
+            hooks.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// A block naming a script for `sequencer:` must be able to say the script
+/// does that job (#159, #169) — the same check [`validate_plugin_declares_pool_provider`]
+/// runs for a pool's `plugin:`, against the `sequencer` hook instead.
+fn validate_plugin_declares_sequencer(
+    sequencer: &Path,
+    base_dir: &Path,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let script_path = crate::score::resolve_plugin_path(base_dir, sequencer);
+    let hooks = crate::score::declared_hooks(&script_path).map_err(bad)?;
+    if !hooks.iter().any(|h| h == "sequencer") {
+        return Err(bad(format!(
+            "block names plugin {} via `sequencer:`, which requires the plugin to \
+             declare the `sequencer` hook, but it only declares: {}",
             script_path.display(),
             hooks.join(", ")
         )));
@@ -617,6 +735,7 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
+            sequencer: None,
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
