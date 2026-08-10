@@ -543,12 +543,16 @@ the config is the only thing guarding replay; leave it unset when the script is.
 declines the field; `examples/samples/kungfu.yaml` is the sample that exercises
 it, on CEL pools.
 
-The script defines three functions:
+The script defines four functions:
 
 ```rhai
 // Which hooks this script implements. Read at config load time, before the
 // catalog exists and without running anything below.
 fn hooks() { ["pool_provider"] }
+
+// Which host capabilities this script needs (#167). Read at the same time,
+// alongside hooks(). Omitting capabilities() declares none.
+fn capabilities() { ["catalog_read", "watch_history"] }
 
 // Every catalog query this plugin reads, named. Run once, up front, so a
 // malformed expression fails before any ranking work.
@@ -568,7 +572,7 @@ A plugin declares its hooks and the station wires only the declared ones
 | Hook | What a script implementing it does |
 |---|---|
 | `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
-| `sequencer` | takes a block's resolved pools and emits the block's timeline in place of the pattern walk. Declarable today; nothing calls it yet (#169). |
+| `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-a-plugin-arranges-the-block-itself). |
 
 A script may declare one or both. The declaration lives in the script, not in
 the channel config, so swapping one scorer for another needs no YAML edit.
@@ -587,14 +591,56 @@ config load rather than mid-generation:
 - A script declaring an empty array is refused: `declares no hooks — a plugin
   must declare at least one of: pool_provider, sequencer`
 
+#### `capabilities()` — which host inputs a script needs (#167)
+
+Nothing is available to a script ambiently beyond `ctx.pool`, `ctx.config`,
+`ctx.target_count`, `ctx.now`, and `ctx.recent` — the inputs every plugin pool
+has always received. Two more are gated behind a declaration, and a third is
+opened only by name:
+
+| Capability | Gates | Declared as |
+|---|---|---|
+| `catalog_read` | `ctx.sets` — the items each `sources()` query matched | `"catalog_read"` |
+| `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
+| a named external datastore | nothing in this slice exposes it to the script — the grant only proves at load time that its location opens (#167; what is reachable through it is #181, out of scope here) | `#{ datastore: "name" }` |
+
+Unlike `hooks()`, `capabilities()` is optional — a script with no such function
+declares nothing, which is the right answer for a plugin that only reads the
+ambient inputs. `capabilities()` is read the same way `hooks()` is: compiling
+the script and calling that one function alone, so `sources()` and `pick()`
+never run during this check either.
+
+The channel config grants capabilities on the pool, next to `plugin:` — see
+[Pool `capabilities` / `datastores`](#pool-capabilities-datastores-—-granting-a-plugin-what-it-needs)
+below. The two sides must agree exactly:
+
+- A pool naming a script that declares a capability the pool's
+  `capabilities:`/`datastores:` does not grant is refused at load, naming the
+  plugin and the capability.
+- A pool granting a capability the script never declares is refused at load,
+  the other way round — a grant nobody asked for is a typo or a stale config,
+  and silently ignoring it would hide either.
+- A script that reaches for `ctx.sets` or `ctx.history` without the matching
+  capability declared and granted fails the `pick()` call the moment it reads
+  the field, naming the capability. This is the one check that can only happen
+  at run time, because the reach is a script call — `capabilities()` and
+  `pick()`'s actual body can disagree, and only running `pick()` catches it.
+- A datastore grant naming a location that cannot be opened is refused at
+  load, naming the datastore and the underlying error.
+
+`examples/plugins/taste-engine.rhai` reads `ctx.sets` and `ctx.history`, so it
+declares `["catalog_read", "watch_history"]`; `examples/samples/foryou.yaml`
+grants both on each pool that points at it.
+
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
-`entries` plus genres / cast / labels / … as arrays), `ctx.pool` (the name of
-the pool asking, so one script can serve several pools of a channel — a
-`movies` pool and a `shows` pool ranked by the same taste), `ctx.target_count` (how
-many items the generation needs), `ctx.history` (recent server-wide watch
-events, `#{entry_id, watched_at}`), `ctx.recent` (what this channel aired most
-recently, oldest first), `ctx.now` (unix seconds at generation time), and
-`ctx.config` (this pool's `config:` block — see below).
+`entries` plus genres / cast / labels / … as arrays; requires `catalog_read`),
+`ctx.pool` (the name of the pool asking, so one script can serve several pools
+of a channel — a `movies` pool and a `shows` pool ranked by the same taste),
+`ctx.target_count` (how many items the generation needs), `ctx.history` (recent
+server-wide watch events, `#{entry_id, watched_at}`; requires `watch_history`),
+`ctx.recent` (what this channel aired most recently, oldest first), `ctx.now`
+(unix seconds at generation time), and `ctx.config` (this pool's `config:`
+block — see below).
 
 ### The determinism contract
 
@@ -894,6 +940,102 @@ and one catalog join between them; a station running the pooled channel plus one
 each for two people makes three calls per window however many channels are
 pointed at those three audiences. Each scope ages on its own clock, so a personal
 channel refreshing does not drag the pooled one along with it.
+
+### Pool `capabilities` / `datastores` — granting a plugin what it needs
+
+A plugin declares the host inputs it needs with `capabilities()`; the channel
+config grants exactly that set on the pool that names the script (#167).
+Nothing is ambient — a pool that grants nothing gets a script with no
+`ctx.sets` and no `ctx.history`.
+
+```yaml
+pools:
+  - name: movies
+    plugin: "../plugins/taste-engine.rhai"
+    capabilities: [catalog_read, watch_history]
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `capabilities` | list of strings | the simple capabilities granted — `catalog_read`, `watch_history` |
+| `datastores` | list of `{ name, path }` | named external stores granted, one entry per `#{ datastore: "name" }` the script declares |
+
+The check is **symmetric, and both directions fail the load**: a capability the
+script declares that the pool does not grant, and a capability the pool grants
+that the script never declares. The second one matters as much as the first —
+an unasked-for grant is either a typo or a stale config, and quietly ignoring
+it hides both.
+
+A `datastores` entry's `path` is written as an env-var reference and expanded
+at load, per the project rule that a location never appears literally in a
+committed config:
+
+```yaml
+    datastores:
+      - name: taste
+        path: "${ETV_TASTE_STORE}"
+```
+
+The file is opened at load to prove it is reachable; a path that cannot be
+opened fails the load naming the datastore and the underlying error, rather
+than producing an empty pool that looks like a scheduling result. A station
+whose channels grant no datastore never opens one at all.
+
+Reaching for `ctx.sets` or `ctx.history` without the grant fails the `pick()`
+call the moment the script reads the field, naming the capability — that one
+can only be caught at run time, because the reach is a script call.
+
+### Block `sequencer` — a plugin arranges the block itself
+
+A pattern block interleaves its pools by walking the authored `pattern`. A
+block can instead name a `sequencer:` script, which receives the block's
+already-resolved pools plus the generation window and returns the block's
+final ordered timeline (#169).
+
+```yaml
+rule:
+  blocks:
+    - pools:
+        - name: prime
+          expr: 'item.type == "movie"'
+        - name: latenight
+          expr: 'item.type == "episode"'
+      sequencer: "../plugins/foryou-sequencer.rhai"
+```
+
+**`sequencer` and `pattern` are mutually exclusive** — a block authors one or
+the other, and a block declaring both fails validation naming the block. This
+matches the exclusivity rules already in the schema: a block is `entries` or
+`pattern`, and a pool names exactly one of `expr`, `plugin`, or `groups`.
+
+The station resolves the pools exactly as it does for a pattern block — each
+pool's `expr` or `plugin`, then its `order`, `bucket_order`, and `constraints`
+— and only then hands them over. The script sees:
+
+| `ctx` field | What it holds |
+|---|---|
+| `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a daypart script has to prefer items that fit the time left before its next boundary, and ids carry no durations. |
+| `ctx.window.from` | the instant this generation begins airing — the hour a daypart script asks about, not the hour the daemon happens to be computing in |
+| `ctx.resume.<pool>.next` | the series whose turn is next in that pool's rotation |
+| `ctx.cursor` | the per-show cursors from the play-history db |
+
+Resume state is **read-only input**. The script returns only a timeline, and
+the station derives the new state from which items actually came back — the
+same split ADR 0002 chose for scorers. That is how one script gives two pools
+in one block different advance behaviour: a pool it draws from the top of
+ignores the cursor it was handed, a pool it starts at the cursor resumes.
+
+Error cases:
+
+- An item in the returned timeline that is in none of the block's pools fails
+  the generation, naming the item. The pools are the script's entire universe;
+  returning outside them means it invented an airing.
+- A timeline that does not fill the window falls through to the existing
+  short-channel handling rather than leaving dead air.
+- A timeline that overruns the window is truncated at the boundary, matching
+  how the pattern walk is bounded.
+
+Worked sample: `examples/plugins/foryou-sequencer.rhai`.
 
 ### Pool `constraints` — spacing counted in a pool's own draw order
 
