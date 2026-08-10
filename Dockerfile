@@ -93,13 +93,34 @@ FROM ghcr.io/ersatztv/ersatztv-ffmpeg:8.1.2 AS runtime
 # whether a frozen player still holds a connection open is a question only the
 # server's own network namespace can answer, and without it the shell answers
 # "command not found" on stderr and exits 0, which reads as "no connections".
+#
+# tcpdump + python3 are the same argument taken one step further, and they are
+# why the diagnostics now live in here rather than as loose scripts copied onto
+# the Unraid host. Off unless ETV_DIAG_CAPTURE says otherwise, so an ordinary
+# run pays only the image size.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         iproute2 \
+        libcap2-bin \
         libvulkan1 \
         mesa-vulkan-drivers \
+        python3 \
+        tcpdump \
         tini \
     && rm -rf /var/lib/apt/lists/*
+
+# The container runs as uid 1000, and a plain non-root process cannot open the
+# packet socket tcpdump needs. A file capability grants that one binary the one
+# capability, which is narrower than either running the whole container as root
+# or handing it --cap-add on the command line.
+#
+# cap_net_raw only — deliberately not cap_net_admin. NET_RAW is in Docker's
+# default capability set, so this works on an unmodified `docker run`; NET_ADMIN
+# is not, and needing it would put a flag in the Unraid run config that a future
+# container recreate could quietly drop. The cost is that tcpdump cannot go
+# promiscuous, which is why the capture passes -p. Nothing is lost: every packet
+# this cares about is addressed to this container anyway.
+RUN setcap cap_net_raw+eip "$(command -v tcpdump)"
 
 # ETV-next burns subtitles with libass, which resolves fonts through fontconfig.
 ENV FONTCONFIG_PATH=/etc/fonts
@@ -120,6 +141,7 @@ COPY --from=builder /build/target/release/etv-overlay /usr/local/bin/etv-overlay
 COPY --from=etv-builder /build/etv-next/target/release/ersatztv /usr/local/bin/ersatztv
 COPY --from=etv-builder /build/etv-next/target/release/ersatztv-channel /usr/local/bin/ersatztv-channel
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py /usr/local/bin/
 
 # Config lives on a bind mount; the playout folders and the HLS working set are
 # written under /data so a restart resumes from what the daemon already emitted.

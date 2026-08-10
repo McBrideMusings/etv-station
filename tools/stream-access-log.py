@@ -184,9 +184,16 @@ def tcpdump_command():
     -A      print payload as ASCII, which is where the request line lives
     -s 700  enough of each packet to carry the request line and User-Agent
     -l      line-buffered, so rows appear as they happen, not in blocks
+    -p      no promiscuous mode
+
+    -p is what lets this run inside the container as a non-root user. Going
+    promiscuous needs CAP_NET_ADMIN, which Docker does not grant by default;
+    plain capture needs only CAP_NET_RAW, which it does. Nothing is given up:
+    promiscuous mode collects traffic addressed to other machines, and every
+    packet this cares about is addressed to the server it is running beside.
     """
     return [
-        "tcpdump", "-i", IFACE, "-nn", "-A", "-s", "700", "-l", "-tttt",
+        "tcpdump", "-i", IFACE, "-p", "-nn", "-A", "-s", "700", "-l", "-tttt",
         tcpdump_filter(),
     ]
 

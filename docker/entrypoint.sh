@@ -88,13 +88,49 @@ log "${#output_folders[@]} channel folder(s) ready"
 # Teardown: whichever child ends first, stop the other and exit with its status.
 station_pid=
 etv_pid=
+diag_pids=()
 shutdown() {
     trap - TERM INT EXIT
     [ -n "$station_pid" ] && kill -TERM "$station_pid" 2>/dev/null
     [ -n "$etv_pid" ] && kill -TERM "$etv_pid" 2>/dev/null
+    for pid in "${diag_pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null
+    done
     wait 2>/dev/null
 }
 trap shutdown TERM INT EXIT
+
+# 2b. Diagnostics, when asked for.
+#
+# These used to be two scripts copied onto the Unraid host by hand and started
+# over ssh, on the belief that a container could not see a client's real
+# address. It can — ETV-next logs the peer from the socket — so the only thing
+# that arrangement bought was a capture that died at every reboot and was
+# usually off when something finally went wrong.
+#
+# What the wire still answers that the access log cannot: a request that never
+# reached the server at all, and a connection that died mid-answer. That is a
+# small enough set to be worth having and too small to run always, so it is a
+# switch.
+#
+# Neither is supervised. If a capture dies the stream is unaffected, and the
+# wait loop below only ends the container for its two real children — an
+# unrecognised pid falls through and it waits again.
+if [ -n "${ETV_DIAG_CAPTURE:-}" ] \
+    && ! [[ "${ETV_DIAG_CAPTURE}" =~ ^(0|off|false|no)$ ]]; then
+    diag_dir="${ETV_DIAG_DIR:-/data/diag}"
+    if mkdir -p "$diag_dir" 2>/dev/null && [ -w "$diag_dir" ]; then
+        PORT="${ETV_PORT:-8409}" LOG_FILE="$diag_dir/access.log" \
+            stream-access-log.py &
+        diag_pids+=($!)
+        HLS_ROOT="${ETV_HLS_OUTPUT:-/data/hls}" LOG_FILE="$diag_dir/stream-events.log" \
+            stream-watch.py &
+        diag_pids+=($!)
+        log "diagnostics capturing to $diag_dir (ETV_DIAG_CAPTURE=${ETV_DIAG_CAPTURE})"
+    else
+        log "WARNING: ETV_DIAG_CAPTURE is set but $diag_dir is not writable — no capture"
+    fi
+fi
 
 # 3. The daemon.
 etv-station --config "$ETV_STATION_CONFIG" --log-format "$ETV_LOG_FORMAT" &
