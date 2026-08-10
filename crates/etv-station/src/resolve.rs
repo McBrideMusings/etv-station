@@ -1721,40 +1721,53 @@ mod tests {
 
     /// Project the state a following window would be handed, exactly as the
     /// daemon does: the pools' rotation from this resolve, and the per-series
-    /// cursor read back out of the play-history ledger the airings were
-    /// recorded in (#70).
+    /// cursor read back out of the play-history store the airings were
+    /// recorded in (#70, sqlite-backed since #111).
     fn advance_state(
         cat: &Catalog,
         prev: &crate::resume::GenerationState,
         resume: ResumeMap,
         items: &[ResolvedItem],
     ) -> crate::resume::GenerationState {
-        use crate::history::{Ledger, PlayRecord};
+        use crate::history::{HistoryDb, PlayRecord};
         use time::OffsetDateTime;
+
+        const CHANNEL: &str = "test";
 
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         let show_ids = cat.show_ids_for(&ids).unwrap();
-        let mut ledger = Ledger::new();
+        let db = HistoryDb::open_in_memory().unwrap();
         // Seed with whatever the previous windows had already recorded, so the
         // projection sees the channel's whole history and not just this window.
-        ledger.extend(prev.cursor.iter().map(|(key, entry_id)| PlayRecord {
-            entry_id: entry_id.clone(),
-            show_id: Some(key.clone()),
-            start: OffsetDateTime::UNIX_EPOCH,
-            played_at: OffsetDateTime::UNIX_EPOCH,
-            error_card: false,
-        }));
-        ledger.extend(ids.iter().map(|id| PlayRecord {
-            entry_id: id.clone(),
-            show_id: show_ids.get(id).cloned(),
-            start: OffsetDateTime::UNIX_EPOCH,
-            played_at: OffsetDateTime::UNIX_EPOCH,
-            error_card: false,
-        }));
+        let seed: Vec<PlayRecord> = prev
+            .cursor
+            .iter()
+            .map(|(key, entry_id)| PlayRecord {
+                entry_id: entry_id.clone(),
+                show_id: Some(key.clone()),
+                start: OffsetDateTime::UNIX_EPOCH,
+                played_at: OffsetDateTime::UNIX_EPOCH,
+                error_card: false,
+            })
+            .collect();
+        db.record(CHANNEL, &seed).unwrap();
+        let airings: Vec<PlayRecord> = ids
+            .iter()
+            .map(|id| PlayRecord {
+                entry_id: id.clone(),
+                show_id: show_ids.get(id).cloned(),
+                start: OffsetDateTime::UNIX_EPOCH,
+                played_at: OffsetDateTime::UNIX_EPOCH,
+                error_card: false,
+            })
+            .collect();
+        db.record(CHANNEL, &airings).unwrap();
         crate::resume::GenerationState {
             resume,
-            cursor: ledger.series_cursor(),
-            tail: ledger.tail(crate::constrain::DEFAULT_SEAM_TAIL),
+            cursor: db.series_cursor(CHANNEL).unwrap(),
+            tail: db
+                .tail(CHANNEL, crate::constrain::DEFAULT_SEAM_TAIL)
+                .unwrap(),
         }
     }
 
@@ -1963,13 +1976,16 @@ mod tests {
         );
     }
 
-    /// #70 acceptance: one ledger row per scheduled airing — no more, no fewer.
-    /// The row count is what makes the cursor's projection correct, so a
-    /// duplicate or a dropped row is a scheduling bug, not a bookkeeping one.
+    /// #70 acceptance: one play-history row per scheduled airing — no more, no
+    /// fewer. The row count is what makes the cursor's projection correct, so
+    /// a duplicate or a dropped row is a scheduling bug, not a bookkeeping
+    /// one.
     #[test]
     fn every_scheduled_airing_records_exactly_one_row() {
-        use crate::history::{Ledger, PlayRecord};
+        use crate::history::{HistoryDb, PlayRecord};
         use time::OffsetDateTime;
+
+        const CHANNEL: &str = "test";
 
         let cat = interleave_catalog();
         let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
@@ -1987,24 +2003,29 @@ mod tests {
 
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         let show_ids = cat.show_ids_for(&ids).unwrap();
-        let mut ledger = Ledger::new();
-        ledger.extend(ids.iter().enumerate().map(|(i, id)| PlayRecord {
-            entry_id: id.clone(),
-            show_id: show_ids.get(id).cloned(),
-            start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
-            played_at: OffsetDateTime::UNIX_EPOCH,
-            error_card: false,
-        }));
+        let db = HistoryDb::open_in_memory().unwrap();
+        let records: Vec<PlayRecord> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| PlayRecord {
+                entry_id: id.clone(),
+                show_id: show_ids.get(id).cloned(),
+                start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
+                played_at: OffsetDateTime::UNIX_EPOCH,
+                error_card: false,
+            })
+            .collect();
+        db.record(CHANNEL, &records).unwrap();
 
         assert_eq!(
-            ledger.len(),
+            db.count(CHANNEL).unwrap(),
             items.len(),
             "one row per airing — the generation aired {} items",
             items.len()
         );
         // A repeat under `wrap = "loop"` is a genuine second airing and gets
         // its own row; the cursor still resolves to the latest one.
-        let cursor = ledger.series_cursor();
+        let cursor = db.series_cursor(CHANNEL).unwrap();
         assert_eq!(cursor.get("show:got").unwrap(), "got-e2");
     }
 

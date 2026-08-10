@@ -46,9 +46,12 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
 }
 
 /// Reject two channels that write to the same `output_folder`. A shared folder
-/// silently misbehaves: both channels fight over the `.resume` and `.history`
-/// sidecars and each startup prunes the other's `.durations.json` cache,
-/// forcing re-probes on every restart.
+/// silently misbehaves: both channels fight over the `.resume` sidecar and
+/// each startup prunes the other's `.durations.json` cache, forcing re-probes
+/// on every restart. Play history no longer lives in this folder (#111) —
+/// it is keyed by channel name in the shared `history.db`, so two channels
+/// only collide on it if their *names* also collide, which is rejected
+/// elsewhere.
 ///
 /// Folders are compared exactly as the daemon uses them — verbatim, relative to
 /// the single process CWD (see `daemon::channel_loop`, which uses
