@@ -8,21 +8,34 @@ ErsatzTV (next) is a Rust rewrite of ErsatzTV — a self-hosted IPTV server that
 channels over HTTP/HLS. It intentionally excludes library management and scheduling; it consumes pre-defined playout
 JSON files and handles transcoding/streaming.
 
-## Git remotes — FORK SAFETY (read before any push)
+## Where this checkout lives
 
-This checkout is a private fork, named the conventional way round:
+This is not a standalone repository. It is [ErsatzTV/next](https://github.com/ErsatzTV/next)
+vendored into `etv-station` at `vendor/etv-next/`, together with that project's
+changes to it, as ordinary tracked files. There is no fork repository. A change
+here is a normal commit in `etv-station`.
 
-- `origin`   → `git@github.com:McBrideMusings/etv-next-private.git` — the private fork. **All pushes go here.**
-- `upstream` → `https://github.com/ErsatzTV/next` — **Jason Dove's public repo. NEVER push here.**
+- **`origin`** is `McBrideMusings/etv-station` — pushes go there, like any other
+  change to that repo.
+- **`etv-upstream`** is `https://github.com/ErsatzTV/next` — **never push there.**
+  Pulling from it is the entire point; the user is not a maintainer of that repo.
 
-Hard rules for any agent working in this repo:
+Upstream is absorbed with a real merge, run from the `etv-station` root:
 
-- **NEVER `git push upstream …`.** Not `main`, not any feature branch, not anything. The user is not a maintainer of `ErsatzTV/next` and would not have permission anyway, but the rule is "do not even try" — a failed push is still a leak of intent and of branch names.
-- **Pushes go to `origin`** — `git push origin <branch>`, or a bare `git push`. Default working branch is `pierce-main`, which tracks `origin/pierce-main`.
-- **`git pull upstream main`** *is* fine — that's how upstream changes are absorbed. Pull from `upstream`, push to `origin`. Never the other way around.
-- **If you ever need to upstream a change to Jason** (e.g., open a PR against `ErsatzTV/next`), that is a deliberate, separate workflow that must be initiated by the user — typically by creating a clean branch from `upstream/main`, cherry-picking the specific change, and using the GitHub UI / `gh pr create` against the upstream repo. Agents do not initiate that flow without explicit instruction.
+```sh
+git subtree pull --prefix=vendor/etv-next etv-upstream main --squash
+```
 
-These names were swapped deliberately (they used to be `origin` = ErsatzTV, `mine` = the fork). Tooling overwhelmingly assumes `origin` is the repo you write to — a guard that resolved the push target from `origin` blocked every legitimate push here and vouched for nothing, and any script reading `origin` was pointed at the one remote that must never be written. With the conventional layout, the default assumption is simply correct. If you find a doc or script still saying `mine`, it predates the swap and is wrong.
+Keep a change under `vendor/etv-next/` in its own commit, separate from
+station-side changes — the next upstream merge is far easier to read when the
+two are not mixed. See `.claude/skills/upstream-sync/SKILL.md` in `etv-station`
+for the survey, the two files that need special handling, and the conflict
+doctrine.
+
+**If a change here belongs upstream** (a plain bug fix rather than something
+specific to this station), that is a deliberate, separate workflow the user
+initiates: branch from `etv-upstream/main` in a clean checkout, apply just that
+change, and open a PR against `ErsatzTV/next`. Do not start that flow unasked.
 
 ## Build & Development Commands
 
