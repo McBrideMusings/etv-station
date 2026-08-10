@@ -757,6 +757,37 @@ pools:
     expr: 'item.cast.contains("Jackie Chan")'
 ```
 
+**`no_repeat_within` has two spellings, and they mean different things.** A bare
+number (`no_repeat_within: 3`) is **positional** — three list positions (on a
+pool, three of that pool's own draws), full stop, whatever runs in between. A
+quoted duration (`no_repeat_within: "24h"`) is **temporal** — the same
+`entry_id` may not recur within that much wall-clock time, measured against the
+emitted schedule's item runtimes rather than counted as items. `separate_by` /
+`separate_min_gap` stay positional only; #185 gave the temporal spelling to
+`no_repeat_within` alone.
+
+The positional spelling means what it says on a uniform pool — a show whose
+episodes all run the same length — where ten positions is also a fixed span of
+time. It stops meaning that on a pool mixing durations: 22-minute episodes and
+3-hour films in one pool give `no_repeat_within: 10` a real span anywhere from
+three and a half hours to thirty, decided by whatever gets drawn. "Not twice in
+a day" wants the temporal spelling instead:
+
+```yaml
+pools:
+  - name: mixed
+    expr: 'item.type == "movie" || item.type == "episode"'
+    constraints:
+      no_repeat_within: "24h"   # not twice in a 24-hour span, however that plays out in items
+```
+
+The temporal form is measured against each item's *estimated* runtime — the
+same catalog-derived estimate (falling back to the mean of what is known, then
+the channel's nominal item length) the station already uses to size a
+generation — not a value probed to the second. It holds across the generation
+seam the same way the positional form does, via the play-history ledger's
+tail.
+
 **The pattern's shape cannot move.** A pass over the finished list knows item ids
 and gaps and nothing else — in particular not which pattern step an item came
 from — so repairing a repeat swapped an episode into a movie slot and silently
