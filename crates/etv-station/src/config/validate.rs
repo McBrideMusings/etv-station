@@ -274,6 +274,14 @@ fn validate_pattern_block<'a>(
                 .into(),
         ));
     }
+    if include.fallback.is_some() {
+        return Err(bad(
+            "fallback conflicts with `pattern` — a pattern block's pools already have their \
+             own empty-pool policy (`on_short`); block-level `fallback` only applies to an \
+             entries block"
+                .into(),
+        ));
+    }
     if let Some(n) = include.cycles {
         if n == 0 {
             return Err(bad("cycles must be > 0".into()));
@@ -470,6 +478,7 @@ mod tests {
             duplicates: None,
             constraints: None,
             entries,
+            fallback: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
@@ -939,6 +948,28 @@ mod tests {
         b.duplicates = Some(Duplicates::Collapse);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("collapse"), "err = {err}");
+    }
+
+    /// A pattern block's pools already have their own empty-pool policy
+    /// (`on_short`) — block-level `fallback` is entries-block only.
+    #[test]
+    fn rejects_fallback_on_a_pattern_block() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.fallback = Some(crate::config::Fallback::Item(Box::new(
+            crate::config::ItemEntry {
+                source: crate::config::SourceConfig::Lavfi {
+                    params: "standby".into(),
+                },
+                in_point: None,
+                out_point: Some(std::time::Duration::from_secs(30)),
+                program: None,
+            },
+        )));
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("conflicts with `pattern`"),
+            "err = {err}"
+        );
     }
 
     #[test]
