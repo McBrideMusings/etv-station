@@ -25,6 +25,12 @@
 //!     //                          `order` / `bucket_order` / `constraints`
 //!     //                          left them (full item maps: entry_id,
 //!     //                          title, duration_ms, show, season, tags, …)
+//!     // ctx.pool_config.<name> — that pool's own `config:` block, passed
+//!     //                          through unread, same as a scorer's
+//!     //                          `ctx.config` (empty map when unset) — a
+//!     //                          daypart script's "which hours/weekdays does
+//!     //                          this pool claim" table lives here, not in
+//!     //                          the schema (#14, ADR 0004)
 //!     // ctx.window.from        — unix seconds this generation begins airing
 //!     // ctx.window.fill_secs   — how many seconds of airtime this
 //!     //                          generation should cover, or () when
@@ -34,6 +40,16 @@
 //!     // ctx.cursor.<series>    — the last entry_id the play-history ledger
 //!     //                          recorded for that series, or absent
 //!     // ctx.now                — unix seconds at generation time
+//!
+//!     // local_time(unix_secs) -> #{ weekday, hour, minute } — the station's
+//!     // configured tz (ADR 0004) applied to any unix-second instant, not
+//!     // just ctx.window.from: a daypart script walks its own cursor forward
+//!     // by each item's duration and re-reads the clock at the new instant to
+//!     // find the next boundary. `weekday` is one of "mon".."sun"; `hour` is
+//!     // 0-23; both roll on the same local-midnight grid `chunk_hours` does.
+//!     // Global function, not a ctx field — registered on the engine this
+//!     // script runs under, nowhere else.
+//!     let t = local_time(ctx.window.from);
 //! }
 //! ```
 //!
@@ -64,6 +80,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use rhai::{Array, Dynamic, Map, Scope};
+use time::{OffsetDateTime, Weekday};
+use time_tz::{OffsetDateTimeExt, Tz};
 
 use crate::catalog::Catalog;
 use crate::config::{Constraints, Pool, ShowGroup};
@@ -117,6 +135,7 @@ pub fn build(
     let mut item_location: HashMap<String, (usize, usize)> = HashMap::new();
     let mut union_ids: HashSet<String> = HashSet::new();
     let mut pools_ctx = Map::new();
+    let mut pool_config_ctx = Map::new();
 
     for (cfg, ids) in pools.iter().zip(pool_id_lists) {
         let own: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -140,6 +159,19 @@ pub fn build(
             .map_err(|e| format!("pool {:?}: {e}", cfg.name))?;
         pools_ctx.insert(cfg.name.clone().into(), Dynamic::from_array(items));
 
+        // This pool's own `config:` block, passed through unread exactly as a
+        // scorer's `ctx.config` is — the existing generic pool carrier (ADR
+        // 0002), now doubling as where a daypart script's hour/weekday table
+        // lives, so #14 needs no new schema field to say what hours a pool
+        // claims.
+        let config = crate::score::pool_config_dynamic(
+            cfg.config.as_ref(),
+            "sequencer",
+            sequencer,
+            &cfg.name,
+        )?;
+        pool_config_ctx.insert(cfg.name.clone().into(), config);
+
         let pool_idx = series_by_pool.len();
         for (si, s) in series.iter().enumerate() {
             for id in &s.ids {
@@ -150,7 +182,15 @@ pub fn build(
         series_by_pool.push((cfg.name.clone(), series));
     }
 
-    let arranged_raw = call_arrange(sequencer, &pools_ctx, pools, state, score_env, window)?;
+    let arranged_raw = call_arrange(
+        sequencer,
+        &pools_ctx,
+        &pool_config_ctx,
+        pools,
+        state,
+        score_env,
+        window,
+    )?;
 
     for id in &arranged_raw {
         if !union_ids.contains(id) {
@@ -197,6 +237,7 @@ pub fn build(
 fn call_arrange(
     sequencer: &Path,
     pools_ctx: &Map,
+    pool_config_ctx: &Map,
     pools: &[Pool],
     state: &GenerationState,
     score_env: crate::score::ScoreEnv<'_>,
@@ -204,7 +245,14 @@ fn call_arrange(
 ) -> Result<Vec<String>, String> {
     let source = std::fs::read_to_string(sequencer)
         .map_err(|e| format!("read sequencer plugin {}: {e}", sequencer.display()))?;
-    let engine = crate::score::engine();
+    // The station's configured tz (ADR 0004), or UTC at the stateless entry
+    // points that carry no station config — see the doc note on
+    // `ScoreInputs::tz`. Baked into `local_time` via closure rather than
+    // threaded through `ctx`, so a script reads the clock at any instant it
+    // computes (a running cursor), not only at `ctx.window.from`.
+    let tz = score_env.inputs.tz.unwrap_or(time_tz::timezones::db::UTC);
+    let mut engine = crate::score::engine();
+    engine.register_fn("local_time", move |secs: i64| local_time_map(secs, tz));
     let ast = engine
         .compile(&source)
         .map_err(|e| format!("compile sequencer plugin {}: {e}", sequencer.display()))?;
@@ -243,6 +291,10 @@ fn call_arrange(
 
     let mut ctx = Map::new();
     ctx.insert("pools".into(), Dynamic::from_map(pools_ctx.clone()));
+    ctx.insert(
+        "pool_config".into(),
+        Dynamic::from_map(pool_config_ctx.clone()),
+    );
     ctx.insert("window".into(), Dynamic::from_map(window_map));
     ctx.insert("resume".into(), Dynamic::from_map(resume_map));
     ctx.insert("cursor".into(), Dynamic::from_map(cursor_map));
@@ -264,6 +316,41 @@ fn call_arrange(
         out.push(id);
     }
     Ok(out)
+}
+
+/// `local_time(unix_secs)` — the Rhai global function registered onto the
+/// engine every `arrange()` call runs under (ADR 0004). Converts any
+/// unix-second instant to the station's configured tz, so a daypart script
+/// can re-read the clock at a cursor it has advanced by summed item
+/// durations, not only at `ctx.window.from`.
+///
+/// `weekday` is a lowercase three-letter abbreviation (`"mon"` .. `"sun"`) —
+/// vocabulary this hook owns outright, since no other part of the schema
+/// names a weekday today. Rolls on the same local-midnight grid
+/// [`crate::tz::add_chunk`] does, via the same `to_timezone` conversion.
+///
+/// An out-of-range `unix_secs` (a script computing nonsense) falls back to
+/// the Unix epoch rather than panicking — the resulting weekday/hour is
+/// visibly wrong to whoever reads the script's output, which is a better
+/// failure than crashing the generation over an integer a script built by
+/// arithmetic.
+fn local_time_map(secs: i64, tz: &'static Tz) -> Map {
+    let utc = OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let local = utc.to_timezone(tz);
+    let weekday = match local.weekday() {
+        Weekday::Monday => "mon",
+        Weekday::Tuesday => "tue",
+        Weekday::Wednesday => "wed",
+        Weekday::Thursday => "thu",
+        Weekday::Friday => "fri",
+        Weekday::Saturday => "sat",
+        Weekday::Sunday => "sun",
+    };
+    let mut m = Map::new();
+    m.insert("weekday".into(), weekday.into());
+    m.insert("hour".into(), (local.hour() as i64).into());
+    m.insert("minute".into(), (local.minute() as i64).into());
+    m
 }
 
 /// Truncate `ids` so their summed catalog duration does not exceed `fill` —
@@ -751,6 +838,127 @@ fn arrange(ctx) {
                 from: 0,
                 fill: None,
             },
+        )
+        .unwrap();
+        assert_eq!(ids, vec!["mov-1"]);
+    }
+
+    /// A pool's `config:` block reaches the script as `ctx.pool_config.<name>`
+    /// — the existing generic pool carrier (ADR 0002), not a new schema
+    /// field, doubling as where a daypart script's hour/weekday table lives
+    /// (#14, ADR 0004).
+    #[test]
+    fn pool_config_reaches_arrange_as_ctx_pool_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write(
+            &dir,
+            r#"
+fn hooks() { ["sequencer"] }
+fn arrange(ctx) {
+    if ctx.pool_config.movies.hour_start != 20 { throw "pool_config missing"; }
+    ["mov-1"]
+}
+"#,
+        );
+        let cat = catalog();
+        let mut movies = pool("movies", "item.type == \"movie\"");
+        movies.config = Some(serde_json::json!({"hour_start": 20}));
+        let (ids, _) = build(
+            &cat,
+            &[movies],
+            &[],
+            None,
+            &script,
+            &GenerationState::empty(),
+            test_env(),
+            Window {
+                from: 0,
+                fill: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, vec!["mov-1"]);
+    }
+
+    /// A pool with no `config:` reads back an empty map, same convention a
+    /// scorer's `ctx.config` follows — a script can read
+    /// `ctx.pool_config.<name>.anything` unconditionally and get unit back
+    /// rather than handling a missing key specially.
+    #[test]
+    fn an_unset_pool_config_is_an_empty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write(
+            &dir,
+            r#"
+fn hooks() { ["sequencer"] }
+fn arrange(ctx) {
+    if ctx.pool_config.movies.anything != () { throw "expected unit"; }
+    ["mov-1"]
+}
+"#,
+        );
+        let cat = catalog();
+        let pools = vec![pool("movies", "item.type == \"movie\"")];
+        let (ids, _) = build(
+            &cat,
+            &pools,
+            &[],
+            None,
+            &script,
+            &GenerationState::empty(),
+            test_env(),
+            Window {
+                from: 0,
+                fill: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, vec!["mov-1"]);
+    }
+
+    /// `local_time()` resolves against the station's configured tz
+    /// (`ScoreInputs::tz`), not UTC — the fact a daypart script depends on to
+    /// place its pools against the local clock rather than whatever zone the
+    /// generation happened to run in (#14, ADR 0004).
+    #[test]
+    fn local_time_resolves_in_the_stations_configured_tz() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write(
+            &dir,
+            r#"
+fn hooks() { ["sequencer"] }
+fn arrange(ctx) {
+    let t = local_time(ctx.window.from);
+    if t.weekday != "mon" { throw "weekday wrong: " + t.weekday; }
+    if t.hour != 7 { throw "hour wrong: " + t.hour; }
+    if t.minute != 0 { throw "minute wrong: " + t.minute; }
+    ["mov-1"]
+}
+"#,
+        );
+        let cat = catalog();
+        let pools = vec![pool("movies", "item.type == \"movie\"")];
+        let chicago = crate::tz::parse("America/Chicago").unwrap();
+        // 2026-04-13 12:00 UTC is a Monday, and equals 07:00 CDT — the same
+        // instant `crate::tz`'s own tests anchor on.
+        let from = time::macros::datetime!(2026-04-13 12:00:00 UTC).unix_timestamp();
+        let inputs = crate::score::ScoreInputs {
+            tz: Some(chicago),
+            ..Default::default()
+        };
+        let env = crate::score::ScoreEnv {
+            inputs: &inputs,
+            base_dir: std::path::Path::new("."),
+        };
+        let (ids, _) = build(
+            &cat,
+            &pools,
+            &[],
+            None,
+            &script,
+            &GenerationState::empty(),
+            env,
+            Window { from, fill: None },
         )
         .unwrap();
         assert_eq!(ids, vec!["mov-1"]);

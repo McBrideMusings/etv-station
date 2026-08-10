@@ -283,6 +283,7 @@ fn watch_history_changes_what_plays() {
         .into(),
         recent: Vec::new(),
         now: 900_000 + 3600,
+        tz: None,
     };
 
     let a = ids(&resolve(&cat, &GenerationState::default(), &watched("mov-dune")).0);
@@ -327,6 +328,7 @@ fn a_pool_config_value_changes_the_scripts_ranking() {
         .into(),
         recent: Vec::new(),
         now,
+        tz: None,
     };
 
     let resolve_with = |config: Option<serde_json::Value>| {

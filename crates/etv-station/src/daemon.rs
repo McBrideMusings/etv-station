@@ -1712,6 +1712,9 @@ async fn pattern_catch_up(
             history: Arc::clone(&history),
             recent: ctx.history_db.tail(&channel.name, recent_depth)?,
             now: now.unix_timestamp(),
+            // The station's configured tz — a sequencer block (#169) reads
+            // this to place its pools against the local clock (ADR 0004).
+            tz: Some(ctx.tz),
         };
 
         // This channel's own reader, borrowed for the synchronous resolve and

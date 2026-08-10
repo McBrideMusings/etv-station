@@ -127,6 +127,11 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         history: Arc::from(Vec::new()),
         recent: Vec::new(),
         now: OffsetDateTime::now_utc().unix_timestamp(),
+        // Same station tz a real generation hands a sequencer block — a
+        // daypart script that reads `local_time()` is exactly the kind of
+        // wall-clock read this check exists to catch, so both passes need the
+        // real zone rather than the UTC fallback.
+        tz: Some(crate::tz::parse(&station.station.tz)?),
     };
     // Read once and handed to both passes, for the same reason `now` is: a
     // sequencer block (#169) reads this as `ctx.window.from`, so a daypart
