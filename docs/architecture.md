@@ -99,6 +99,14 @@ The failure separation that two containers used to provide is kept by the entryp
 
 What is genuinely given up: independent resource limits and independent restart cadence for the two halves.
 
+## The media has to be mounted, not streamed
+
+The catalog is read from Plex over HTTP, but the *media* never is. Every `entry_sources` row carries a `playback_path`, and the station hands it to the player as a local file — 86,232 of 86,232 rows in the production catalog are Plex-sourced paths under `/media`, resolved because the same share is mounted into the container at the same prefix.
+
+So a Plex library this station carries must be reachable as a filesystem path inside the container. Where the two disagree — Plex reporting `/mnt/user/media/…` while the container sees `/media/…` — the ingester's `path_from` / `path_to` prefix remap covers it, matching only at a path boundary so `/media` never rewrites `/mediabackup`.
+
+There is deliberately no streaming fallback. A Plex entry whose path does not resolve is not silently skipped: the duration probe fails, the item gets an error card reading "file not found", and the daemon logs `item.error_card` with a count in its probe stats. Adding an HTTP/stream `SourceConfig` for Plex content would serve a deployment where the media is not mounted, which is not the shape this runs in (#98). `SourceConfig::Http` remains for hand-authored `http` items.
+
 ## Why filesystem-only IPC
 
 Matches ETV-next's existing process model — it already uses files (`.ready`, `.heartbeat`) for signaling between server and channel subprocesses. No new protocol surface. `ls` shows you the state. Atomic emission via `rename(2)` means the consumer can't observe a half-written file.
