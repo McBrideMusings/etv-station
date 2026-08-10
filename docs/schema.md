@@ -596,6 +596,68 @@ the things called once, like reading a tunable out of `ctx.config`.
 `examples/plugins/taste-engine.rhai` is written to both rules and says so in its
 comments.
 
+### Named show groups — `groups:` on the channel and on a pool
+
+Plex stores a franchise's spin-offs as unrelated shows — *RuPaul's Drag Race*
+and *RuPaul's Drag Race All Stars* share no `show_id` — so a pool grouped or
+rotated by show treats them as unrelated series. A **show group** makes their
+union one rotation domain: declare it once on the channel, then have a pool
+draw from it by name instead of an `expr` or `plugin`.
+
+```yaml
+groups:
+  - name: rupaul
+    shows:
+      - "RuPaul's Drag Race"
+      - "RuPaul's Drag Race All Stars"
+
+rule:
+  blocks:
+    - pools:
+        - name: rupaul
+          groups: ["rupaul"]
+          group_by: season
+          bucket_order: "release_date:asc"
+      pattern:
+        - pool: rupaul
+          take: all
+```
+
+`group_by: season` still cuts at each member show's own season boundaries —
+`take: all` on the pattern step airs whichever season a visit picked, end to
+end — but the series it produces now come from every member show, so
+`rotate: visit` (the default) cycles the franchise: Drag Race season 9, then
+All Stars season 3, then Drag Race season 10, rather than marching through
+one show's whole run before starting the other's. `bucket_order` is what
+decides that sequence — sort it by whatever field puts the seasons in the
+order you want them to cycle; a show's own `season` number is not
+comparable across different shows, so a franchise group needs a field that
+is, such as a populated `release_date`. Without a `bucket_order`, seasons
+come up in each show's own catalog order, one show fully before the next.
+
+A member show is named by its Plex title, matched exactly against the
+catalog's `show` column — the same string an `expr`'s `item.show` would
+compare against. `groups` on a pool is a list because a pool may combine more
+than one franchise (a general "Bravo" pool where RuPaul and Below Deck each
+stay their own rotation domain); it is otherwise exactly like `expr` and
+`plugin` — mutually exclusive with both, and a pool that sets two of the
+three, or none, fails at load.
+
+**No new field for a sibling's resume position.** Every pool's series already
+seeds its resume cursor from a channel-wide ledger keyed on the item's own
+`show_id` (#155) — grouping across shows changes nothing about that. A
+sibling show coming back around resumes exactly where it left off; a season
+nobody has started sits at its own top.
+
+**Error cases**, both caught before the schedule is generated:
+
+- A group naming a show with no episodes in the catalog fails, naming the
+  show and the group.
+- A pool combining two groups that share a member show fails, naming the
+  show — its episodes would otherwise belong to two rotation domains at
+  once. (A show may belong to two groups; only combining both in *one* pool
+  is rejected.)
+
 ### Pool `config` — the script's own tunables, authored in YAML
 
 A plugin pool may carry a `config:` block. **The station passes it to the script

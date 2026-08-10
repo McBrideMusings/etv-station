@@ -76,7 +76,7 @@ use std::time::Duration;
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{
     Advance, Constraints, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate, Select,
-    Take, TakeFrom,
+    ShowGroup, Take, TakeFrom,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
 use crate::resume::{GenerationState, PoolResume};
@@ -544,6 +544,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 pub fn build(
     catalog: &Catalog,
     pools: &[Pool],
+    groups: &[ShowGroup],
     pattern: &[PatternStep],
     cycles: Option<usize>,
     block_constraints: Option<&Constraints>,
@@ -573,8 +574,8 @@ pub fn build(
     let mut score_cache = crate::score::ScoreCache::default();
     let mut pool_ids: Vec<Option<Vec<String>>> = Vec::with_capacity(pools.len());
     for cfg in pools {
-        match (&cfg.expr, &cfg.plugin) {
-            (Some(expr), None) => {
+        match (&cfg.expr, &cfg.plugin, !cfg.groups.is_empty()) {
+            (Some(expr), None, false) => {
                 let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
                 if let Some(order) = &cfg.order {
                     // Seed 0: a pool's internal `order` is its own stable sort.
@@ -585,18 +586,28 @@ pub fn build(
                 }
                 pool_ids.push(Some(ids));
             }
-            (None, Some(plugin)) => {
+            (None, Some(plugin), false) => {
                 let path = score_env.resolve_path(plugin);
                 score_cache
                     .prepare(catalog, &path)
                     .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
                 pool_ids.push(None);
             }
-            // Both, or neither, is rejected at load; a pool that reaches here in
-            // either state is a validation gap, not a config the user can hit.
+            (None, None, true) => {
+                let mut ids = resolve_group_pool(catalog, cfg, groups)?;
+                if let Some(order) = &cfg.order {
+                    ids = catalog
+                        .resolve_order(&ids, order, 0)
+                        .map_err(|e| e.to_string())?;
+                }
+                pool_ids.push(Some(ids));
+            }
+            // Two sources, or none, is rejected at load; a pool that reaches
+            // here in either state is a validation gap, not a config the user
+            // can hit.
             _ => {
                 return Err(format!(
-                    "pool {:?} must set exactly one of `expr` or `plugin`",
+                    "pool {:?} must set exactly one of `expr`, `plugin`, or `groups`",
                     cfg.name
                 ));
             }
@@ -710,6 +721,60 @@ pub fn build(
         .map(|rt| (rt.cfg.name.clone(), rt.to_resume()))
         .collect();
     Ok((out, resume_out))
+}
+
+/// Resolve a `groups`-sourced pool's item list (#165): the union of every
+/// member show's episodes, across every named group the pool lists.
+///
+/// Which show belongs to which named group is settled once this reads —
+/// nothing about *how* the resulting ids get grouped into series changes.
+/// [`pool_runtime`] below still reads each item's own `show_id` off the
+/// catalog to build its series and to seed the resume cursor, exactly as it
+/// does for an `expr` pool; a sibling show's episodes simply arrive already
+/// mixed into the one list, and the season/show grouping downstream treats
+/// them precisely as it would items an author's own CEL `||` chain had
+/// matched. That is what makes a sibling's resume position need no dedicated
+/// support (#165's "no new field") — the code path is the same one #155
+/// already proved keyed each series' cursor on its own show, not on how the
+/// pool that drew it was scoped.
+///
+/// Every member show is validated against the catalog before generation
+/// reaches this (`resolve::validate_groups_against_catalog`), and every group
+/// name a pool lists is validated against the channel's declarations at load
+/// (`config::validate`) — both defensively re-checked here too, since this
+/// also runs from pattern's own unit tests, which build pools without going
+/// through either pass.
+fn resolve_group_pool(
+    catalog: &Catalog,
+    cfg: &Pool,
+    groups: &[ShowGroup],
+) -> Result<Vec<String>, String> {
+    let mut shows: Vec<String> = Vec::new();
+    for gname in &cfg.groups {
+        let group = groups.iter().find(|g| &g.name == gname).ok_or_else(|| {
+            format!(
+                "pool {:?} references group {:?}, which this channel does not declare",
+                cfg.name, gname
+            )
+        })?;
+        shows.extend(group.shows.iter().cloned());
+    }
+    let by_show = catalog
+        .episode_ids_for_shows(&shows)
+        .map_err(|e| e.to_string())?;
+    let mut ids = Vec::new();
+    for show in &shows {
+        match by_show.get(show) {
+            Some(found) if !found.is_empty() => ids.extend(found.iter().cloned()),
+            _ => {
+                return Err(format!(
+                    "pool {:?}: show {show:?} is not in the catalog",
+                    cfg.name
+                ));
+            }
+        }
+    }
+    Ok(ids)
 }
 
 /// Enough cycles for the largest pool to drain once. Each pool needs
@@ -1109,6 +1174,7 @@ mod tests {
             name: "movies".into(),
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
+            groups: Vec::new(),
             order: Some(Order::parse("title:asc").unwrap()),
             bucket_order: None,
             group_by: GroupBy::Show,
@@ -1126,6 +1192,7 @@ mod tests {
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
+            groups: Vec::new(),
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             bucket_order: None,
             group_by: GroupBy::Show,
@@ -1207,6 +1274,7 @@ mod tests {
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
+            groups: Vec::new(),
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             bucket_order: None,
             group_by,
@@ -1229,6 +1297,7 @@ mod tests {
         build(
             &cat,
             &[pool],
+            &[],
             &pattern,
             cycles,
             None,
@@ -1451,6 +1520,242 @@ mod tests {
         assert_eq!(ids.len(), 9, "all three seasons aired once: {ids:?}");
     }
 
+    // ---- named show groups (#165) ------------------------------------------
+
+    /// Drag Race season 9, All Stars season 3, Drag Race season 10 — the
+    /// issue's own worked example. Titles are prefixed `"1 "`/`"2 "`/`"3 "`
+    /// purely so `bucket_order: "title:asc"` reproduces broadcast order
+    /// deterministically in a test fixture; a real channel would sort its
+    /// `bucket_order` by the catalog's own air-date field instead.
+    fn franchise_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        let add = |id: &str, show: &str, season: i64, episode: i64, title_rank: &str| {
+            let mut e = CatEntry::new(id, "episode", format!("{title_rank} {id}"), Source::Plex);
+            e.show = Some(show.to_string());
+            e.show_id = Some(format!("show:{show}"));
+            e.season = Some(season);
+            e.episode = Some(episode);
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        };
+        add("dr-s9e1", "RuPaul's Drag Race", 9, 1, "1");
+        add("dr-s9e2", "RuPaul's Drag Race", 9, 2, "1");
+        add("as-s3e1", "RuPaul's Drag Race All Stars", 3, 1, "2");
+        add("as-s3e2", "RuPaul's Drag Race All Stars", 3, 2, "2");
+        add("dr-s10e1", "RuPaul's Drag Race", 10, 1, "3");
+        add("dr-s10e2", "RuPaul's Drag Race", 10, 2, "3");
+        c
+    }
+
+    fn rupaul_group() -> ShowGroup {
+        ShowGroup {
+            name: "rupaul".into(),
+            shows: vec![
+                "RuPaul's Drag Race".into(),
+                "RuPaul's Drag Race All Stars".into(),
+            ],
+        }
+    }
+
+    fn rupaul_pool() -> Pool {
+        Pool {
+            name: "rupaul".into(),
+            expr: None,
+            plugin: None,
+            groups: vec!["rupaul".into()],
+            order: None,
+            bucket_order: Some(Order::parse("title:asc").unwrap()),
+            group_by: GroupBy::Season,
+            select: Select::RoundRobin,
+            rotate: Rotate::Visit,
+            advance: Advance::Restart,
+            on_short: OnShort::Next,
+            constraints: None,
+            config: None,
+        }
+    }
+
+    /// Build once against [`franchise_catalog`], returning the ids and the
+    /// state a following window would be handed — the `groups`-sourced
+    /// counterpart to [`build_with`].
+    fn build_grouped(
+        pools: Vec<Pool>,
+        groups: Vec<ShowGroup>,
+        pattern: Vec<PatternStep>,
+        cycles: Option<usize>,
+        state_in: &GenerationState,
+        seed: u64,
+    ) -> (Vec<String>, GenerationState) {
+        let cat = franchise_catalog();
+        let (ids, pool_state) = build(
+            &cat,
+            &pools,
+            &groups,
+            &pattern,
+            cycles,
+            None,
+            state_in,
+            seed,
+            test_env(),
+            None,
+        )
+        .expect("pattern builds");
+
+        let mut resume = ResumeMap::new();
+        resume.pools = pool_state;
+
+        let mut cursor = state_in.cursor.clone();
+        let show_ids = cat.show_ids_for(&ids).unwrap();
+        for id in &ids {
+            let key = show_ids.get(id).cloned().unwrap_or_else(|| id.clone());
+            cursor.insert(key, id.clone());
+        }
+        let tail = ids.clone();
+        (
+            ids,
+            GenerationState {
+                resume,
+                cursor,
+                tail,
+            },
+        )
+    }
+
+    /// The issue's own worked example: a season airs end to end, then
+    /// rotation moves to the next season from a sibling show rather than the
+    /// same show's next run — Drag Race season 9, then All Stars season 3,
+    /// then Drag Race season 10, cycling the franchise instead of marching
+    /// through one show's whole run before the other's.
+    #[test]
+    fn a_named_group_rotates_seasons_across_sibling_shows() {
+        let (ids, _) = build_grouped(
+            vec![rupaul_pool()],
+            vec![rupaul_group()],
+            vec![step_all("rupaul")],
+            Some(3),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "dr-s9e1", "dr-s9e2", //
+                "as-s3e1", "as-s3e2", //
+                "dr-s10e1", "dr-s10e2",
+            ],
+            "rotate: visit must move to the sibling show's season next, not \
+             back to the same show's next season: {ids:?}"
+        );
+    }
+
+    /// #165's explicit regression requirement: grouping shows into one
+    /// rotation domain must not disturb the per-show resume cursor each
+    /// sibling already had before grouping existed (#155, #109) — no new
+    /// field, because [`pool_runtime`]'s resume seek already keys on each
+    /// item's own `show_id`, regardless of which pool or group drew the item.
+    ///
+    /// One visit of `take: 3` against Drag Race season 9 (2 episodes) rolls
+    /// onto All Stars season 3 for the third — so All Stars' own cursor now
+    /// sits mid-season while Drag Race's has drained its season. The next
+    /// window must resume All Stars at its own second episode and find Drag
+    /// Race season 10 — a season nobody has started — sitting at its own top,
+    /// not disturbed by where Drag Race season 9 left off.
+    #[test]
+    fn a_sibling_returning_around_the_group_resumes_at_its_own_position() {
+        fn resuming_pool() -> Pool {
+            let mut p = rupaul_pool();
+            p.advance = Advance::Resume;
+            p
+        }
+
+        let (first, resume) = build_grouped(
+            vec![resuming_pool()],
+            vec![rupaul_group()],
+            vec![step("rupaul", 3)],
+            Some(1),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(first, vec!["dr-s9e1", "dr-s9e2", "as-s3e1"]);
+
+        let (second, _) = build_grouped(
+            vec![resuming_pool()],
+            vec![rupaul_group()],
+            vec![step("rupaul", 3)],
+            Some(1),
+            &resume,
+            0,
+        );
+        assert_eq!(
+            second,
+            vec!["as-s3e2", "dr-s10e1", "dr-s10e2"],
+            "All Stars must resume at its own next episode, and Drag Race \
+             season 10 — never touched — at its own top: {second:?}"
+        );
+    }
+
+    /// A group name a pool references but the channel never declared is a
+    /// validation gap by the time generation reaches here (`config::validate`
+    /// already refuses it structurally) — but pattern's own tests build pools
+    /// directly, bypassing that pass, so this is checked again defensively.
+    #[test]
+    fn a_pool_referencing_an_undeclared_group_is_an_error() {
+        let cat = franchise_catalog();
+        let mut pool = rupaul_pool();
+        pool.groups = vec!["nonesuch".into()];
+        let err = build(
+            &cat,
+            &[pool],
+            &[], // no groups declared at all
+            &[step_all("rupaul")],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            0,
+            test_env(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("nonesuch"), "err = {err}");
+    }
+
+    /// A declared group naming a show absent from the catalog is a load
+    /// failure the normal path catches earlier
+    /// (`resolve::validate_groups_against_catalog`, run once against every
+    /// declared group before any pool resolves) — checked again here
+    /// defensively for the same reason as the test above.
+    #[test]
+    fn a_group_naming_a_show_not_in_the_catalog_is_an_error() {
+        let cat = franchise_catalog();
+        let group = ShowGroup {
+            name: "rupaul".into(),
+            shows: vec!["RuPaul's Drag Race".into(), "A Show Nobody Ingested".into()],
+        };
+        let mut pool = rupaul_pool();
+        pool.groups = vec!["rupaul".into()];
+        let err = build(
+            &cat,
+            &[pool],
+            &[group],
+            &[step_all("rupaul")],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            0,
+            test_env(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("A Show Nobody Ingested"), "err = {err}");
+    }
+
     /// Build once, returning the ids and the state a following window would be
     /// handed: the pools' rotation from the resolver, and the cursor projected
     /// from the airings just produced — which is what the daemon does with the
@@ -1466,6 +1771,7 @@ mod tests {
         let (ids, pool_state) = build(
             &cat,
             &pools,
+            &[],
             &pattern,
             cycles,
             None,
@@ -1908,6 +2214,7 @@ mod tests {
         let err = build(
             &cat,
             &[movies_pool()],
+            &[],
             &[step("shows", 1)],
             Some(1),
             None,
@@ -1926,6 +2233,7 @@ mod tests {
         let err = build(
             &cat,
             &[movies_pool()],
+            &[],
             &[step("movies", 1)],
             Some(MAX_CYCLES + 1),
             None,
@@ -1948,6 +2256,7 @@ mod tests {
         let (ids, _) = build(
             &cat,
             &[p],
+            &[],
             &[step("movies", 1)],
             None,
             None,
@@ -2000,6 +2309,7 @@ mod tests {
         build(
             cat,
             &[movies],
+            &[],
             &[step("movies", 1)],
             cycles,
             None,
@@ -2148,6 +2458,7 @@ mod tests {
         build(
             &cat,
             pools,
+            &[],
             pattern,
             cycles,
             block,
@@ -2246,6 +2557,7 @@ mod tests {
         let (ids, _) = build(
             &cat,
             &[movies],
+            &[],
             &[step("movies", 1)],
             Some(3),
             None,

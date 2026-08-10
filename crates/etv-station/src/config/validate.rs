@@ -5,7 +5,7 @@ use super::block::Duplicates;
 use super::channel::{ChannelConfig, TasteScope};
 use super::constraints::{Constraints, NoRepeatWithin};
 use super::order::Order;
-use super::pool::{Rotate, Take, TakeFrom};
+use super::pool::{Pool, Rotate, ShowGroup, Take, TakeFrom};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
@@ -114,6 +114,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     }
 
     validate_taste_scope(path, channel)?;
+    validate_show_groups(path, &channel.groups)?;
 
     // Pool names key the `.resume` sidecar, so they must be unique across the
     // whole channel — that is what lets the sidecar survive blocks being
@@ -134,7 +135,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         validate_constraints(&include.constraints(), &bad)?;
 
         if include.is_pattern() {
-            validate_pattern_block(include, &mut pool_names, &bad)?;
+            validate_pattern_block(include, &mut pool_names, &channel.groups, &bad)?;
             continue;
         }
 
@@ -191,6 +192,41 @@ fn validate_taste_scope(path: &Path, channel: &ChannelConfig) -> Result<(), Conf
         }
         _ => Ok(()),
     }
+}
+
+/// Structural checks for a channel's `groups:` declarations (#165) — name
+/// hygiene only. Whether a declared member show actually exists is a catalog
+/// question, checked at generation time in `resolve::validate_groups_against_catalog`
+/// rather than here, since this pass runs with no catalog at all.
+fn validate_show_groups(path: &Path, groups: &[ShowGroup]) -> Result<(), ConfigError> {
+    let bad = |message: String| ConfigError::Validation {
+        path: path.to_path_buf(),
+        message,
+    };
+    let mut names: HashSet<&str> = HashSet::new();
+    for group in groups {
+        if group.name.trim().is_empty() {
+            return Err(bad("a show group has an empty name".into()));
+        }
+        if !names.insert(group.name.as_str()) {
+            return Err(bad(format!(
+                "group name {:?} is declared more than once",
+                group.name
+            )));
+        }
+        if group.shows.is_empty() {
+            return Err(bad(format!("group {:?} names no shows", group.name)));
+        }
+        for show in &group.shows {
+            if show.trim().is_empty() {
+                return Err(bad(format!(
+                    "group {:?} has an empty show name",
+                    group.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Semantic checks for one `[constraints]` table (#73) — a block's, for either
@@ -252,6 +288,7 @@ fn validate_constraints(
 fn validate_pattern_block<'a>(
     include: &'a BlockInclude,
     pool_names: &mut HashSet<&'a str>,
+    channel_groups: &[ShowGroup],
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
     if !include.entries().is_empty() {
@@ -304,56 +341,65 @@ fn validate_pattern_block<'a>(
         if pool.name.trim().is_empty() {
             return Err(bad("a pool has an empty name".into()));
         }
-        // A pool names exactly one source of items. Both is ambiguous about
-        // which one wins; neither leaves the pool with nothing to resolve.
-        match (&pool.expr, &pool.plugin) {
-            (Some(expr), None) => {
-                if expr.trim().is_empty() {
-                    return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
-                }
-            }
-            (None, Some(plugin)) => {
-                if plugin.as_os_str().is_empty() {
-                    return Err(bad(format!(
-                        "pool {:?} has an empty plugin path",
-                        pool.name
-                    )));
-                }
-                // The plugin returns its set already ranked; a re-sort would
-                // discard the ranking it exists to produce.
-                if pool.order.is_some() {
-                    return Err(bad(format!(
-                        "pool {:?} sets both `plugin` and `order` — a plugin returns its \
-                         set already ranked, so ordering it again would discard the \
-                         ranking; drop `order`",
-                        pool.name
-                    )));
-                }
-                // Same reasoning one level up: the series sequence a plugin
-                // pool gets is the ranking's, and re-sequencing it throws the
-                // ranking away just as surely as re-sorting the items would.
-                if pool.bucket_order.is_some() {
-                    return Err(bad(format!(
-                        "pool {:?} sets both `plugin` and `bucket_order` — the order its \
-                         series come up in is the plugin's ranking, so re-sequencing them \
-                         would discard it; drop `bucket_order`",
-                        pool.name
-                    )));
-                }
-            }
-            (Some(_), Some(_)) => {
+        // A pool names exactly one source of items. Two is ambiguous about
+        // which one wins; none leaves the pool with nothing to resolve.
+        let source_count = [
+            pool.expr.is_some(),
+            pool.plugin.is_some(),
+            !pool.groups.is_empty(),
+        ]
+        .into_iter()
+        .filter(|&set| set)
+        .count();
+        if source_count == 0 {
+            return Err(bad(format!(
+                "pool {:?} sets none of `expr`, `plugin`, or `groups` — it has no items to draw",
+                pool.name
+            )));
+        }
+        if source_count > 1 {
+            return Err(bad(format!(
+                "pool {:?} sets more than one of `expr`, `plugin`, `groups` — a pool draws \
+                 its items from exactly one",
+                pool.name
+            )));
+        }
+        if let Some(expr) = &pool.expr
+            && expr.trim().is_empty()
+        {
+            return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
+        }
+        if let Some(plugin) = &pool.plugin {
+            if plugin.as_os_str().is_empty() {
                 return Err(bad(format!(
-                    "pool {:?} sets both `expr` and `plugin` — a pool draws its items \
-                     from one or the other",
+                    "pool {:?} has an empty plugin path",
                     pool.name
                 )));
             }
-            (None, None) => {
+            // The plugin returns its set already ranked; a re-sort would
+            // discard the ranking it exists to produce.
+            if pool.order.is_some() {
                 return Err(bad(format!(
-                    "pool {:?} sets neither `expr` nor `plugin` — it has no items to draw",
+                    "pool {:?} sets both `plugin` and `order` — a plugin returns its \
+                     set already ranked, so ordering it again would discard the \
+                     ranking; drop `order`",
                     pool.name
                 )));
             }
+            // Same reasoning one level up: the series sequence a plugin
+            // pool gets is the ranking's, and re-sequencing it throws the
+            // ranking away just as surely as re-sorting the items would.
+            if pool.bucket_order.is_some() {
+                return Err(bad(format!(
+                    "pool {:?} sets both `plugin` and `bucket_order` — the order its \
+                     series come up in is the plugin's ranking, so re-sequencing them \
+                     would discard it; drop `bucket_order`",
+                    pool.name
+                )));
+            }
+        }
+        if !pool.groups.is_empty() {
+            validate_pool_groups(pool, channel_groups, &bad)?;
         }
         // A pool's own `[constraints]` replaces the block's wholesale, so it has
         // to stand on its own — and the error names the pool, since that is the
@@ -452,6 +498,49 @@ fn validate_pattern_block<'a>(
     Ok(())
 }
 
+/// A pool's `groups` (#165) must each name a channel-declared group, and the
+/// groups a single pool combines must be disjoint — a show belonging to two
+/// of them would have no single rotation domain to land in. (A show
+/// belonging to two groups is fine on its own; only combining both in one
+/// pool is rejected, and only here, since that is where the ambiguity would
+/// actually bite.)
+fn validate_pool_groups(
+    pool: &Pool,
+    channel_groups: &[ShowGroup],
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let mut seen_names: HashSet<&str> = HashSet::new();
+    let mut owner: HashMap<&str, &str> = HashMap::new();
+    for gname in &pool.groups {
+        if !seen_names.insert(gname.as_str()) {
+            return Err(bad(format!(
+                "pool {:?} references group {:?} more than once",
+                pool.name, gname
+            )));
+        }
+        let group = channel_groups
+            .iter()
+            .find(|g| g.name == *gname)
+            .ok_or_else(|| {
+                bad(format!(
+                    "pool {:?} references group {:?}, which this channel does not declare",
+                    pool.name, gname
+                ))
+            })?;
+        for show in &group.shows {
+            if let Some(&prev) = owner.get(show.as_str()) {
+                return Err(bad(format!(
+                    "pool {:?} references groups {:?} and {:?}, which both list show {:?} — \
+                     a pool's groups must not overlap",
+                    pool.name, prev, gname, show
+                )));
+            }
+            owner.insert(show.as_str(), gname.as_str());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +588,7 @@ mod tests {
             name: name.into(),
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
+            groups: Vec::new(),
             order: None,
             bucket_order: None,
             group_by: Default::default(),
@@ -547,6 +637,7 @@ mod tests {
             seed: None,
             anchor: None,
             rule: RuleConfig { blocks },
+            groups: Vec::new(),
             overlay: None,
         }
     }
@@ -1127,5 +1218,146 @@ mod tests {
             &[("a", Path::new("/srv/a")), ("b", Path::new("/srv/b"))],
         )
         .unwrap();
+    }
+
+    // ---- named show groups (#165) ------------------------------------------
+
+    fn grouped_pool(name: &str, groups: Vec<&str>) -> Pool {
+        let mut p = pool(name);
+        p.expr = None;
+        p.groups = groups.into_iter().map(String::from).collect();
+        p
+    }
+
+    fn channel_with_groups(groups: Vec<ShowGroup>, blocks: Vec<BlockInclude>) -> ChannelConfig {
+        let mut c = channel_with(blocks);
+        c.groups = groups;
+        c
+    }
+
+    fn show_group(name: &str, shows: Vec<&str>) -> ShowGroup {
+        ShowGroup {
+            name: name.into(),
+            shows: shows.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn a_pool_sourced_from_a_declared_group_validates() {
+        let block = pattern_block(
+            vec![grouped_pool("rupaul", vec!["rupaul"])],
+            vec![step_all("rupaul")],
+        );
+        let cfg = channel_with_groups(
+            vec![show_group("rupaul", vec!["Drag Race", "All Stars"])],
+            vec![block],
+        );
+        assert!(validate_channel(&dummy_path(), &cfg).is_ok());
+    }
+
+    #[test]
+    fn a_pool_referencing_an_undeclared_group_is_rejected() {
+        let block = pattern_block(
+            vec![grouped_pool("rupaul", vec!["nonesuch"])],
+            vec![step_all("rupaul")],
+        );
+        let cfg = channel_with_groups(vec![], vec![block]);
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("nonesuch"), "msg = {msg}");
+        assert!(msg.contains("does not declare"), "msg = {msg}");
+    }
+
+    #[test]
+    fn a_pool_combining_two_groups_that_share_a_show_is_rejected() {
+        let block = pattern_block(
+            vec![grouped_pool("bravo", vec!["rupaul", "below_deck"])],
+            vec![step_all("bravo")],
+        );
+        let cfg = channel_with_groups(
+            vec![
+                show_group("rupaul", vec!["Drag Race", "Shared Show"]),
+                show_group("below_deck", vec!["Below Deck", "Shared Show"]),
+            ],
+            vec![block],
+        );
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Shared Show"), "msg = {msg}");
+        assert!(
+            msg.contains("rupaul") && msg.contains("below_deck"),
+            "msg = {msg}"
+        );
+    }
+
+    /// A show naming a franchise in two *different* pools (or unreferenced
+    /// groups) is fine — only combining two overlapping groups in *one* pool
+    /// is rejected, per the issue's own error case.
+    #[test]
+    fn two_groups_sharing_a_show_are_fine_until_one_pool_combines_them() {
+        let a = grouped_pool("rupaul", vec!["rupaul"]);
+        let b = grouped_pool("below_deck", vec!["below_deck"]);
+        let block = pattern_block(vec![a, b], vec![step_all("rupaul"), step_all("below_deck")]);
+        let cfg = channel_with_groups(
+            vec![
+                show_group("rupaul", vec!["Drag Race", "Shared Show"]),
+                show_group("below_deck", vec!["Below Deck", "Shared Show"]),
+            ],
+            vec![block],
+        );
+        assert!(validate_channel(&dummy_path(), &cfg).is_ok());
+    }
+
+    #[test]
+    fn a_pool_setting_both_expr_and_groups_is_rejected() {
+        let mut p = grouped_pool("rupaul", vec!["rupaul"]);
+        p.expr = Some("item.type == \"episode\"".into());
+        let block = pattern_block(vec![p], vec![step_all("rupaul")]);
+        let cfg = channel_with_groups(vec![show_group("rupaul", vec!["Drag Race"])], vec![block]);
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("more than one"), "msg = {msg}");
+    }
+
+    #[test]
+    fn a_pool_setting_none_of_expr_plugin_or_groups_is_rejected() {
+        let mut p = pool("rupaul");
+        p.expr = None;
+        let block = pattern_block(vec![p], vec![step_all("rupaul")]);
+        let cfg = channel_with_groups(vec![], vec![block]);
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("none of"), "msg = {msg}");
+    }
+
+    #[test]
+    fn a_group_declared_twice_is_rejected() {
+        let cfg = channel_with_groups(
+            vec![
+                show_group("rupaul", vec!["Drag Race"]),
+                show_group("rupaul", vec!["All Stars"]),
+            ],
+            vec![pattern_block(
+                vec![pool("movies")],
+                vec![step_all("movies")],
+            )],
+        );
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("more than once"), "msg = {msg}");
+    }
+
+    #[test]
+    fn a_group_with_no_shows_is_rejected() {
+        let cfg = channel_with_groups(
+            vec![show_group("empty", vec![])],
+            vec![pattern_block(
+                vec![pool("movies")],
+                vec![step_all("movies")],
+            )],
+        );
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("empty"), "msg = {msg}");
     }
 }

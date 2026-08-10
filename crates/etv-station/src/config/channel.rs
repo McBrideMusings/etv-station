@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::pool::ShowGroup;
 use super::rule::RuleConfig;
 use crate::tautulli::HistoryScope;
 
@@ -66,6 +67,12 @@ pub struct ChannelConfig {
     pub scoring: Option<ScoringConfig>,
 
     pub rule: RuleConfig,
+
+    /// Named show groups (#165), declared once and referenced by name from
+    /// any pool's `groups:` field — see [`ShowGroup`]. Empty on every channel
+    /// written before this, which is what an absent `groups:` key means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ShowGroup>,
 
     /// Optional live overlay. When set, the station daemon supervises an
     /// `etv-overlay` subprocess that writes RGBA frames to a fifo per
