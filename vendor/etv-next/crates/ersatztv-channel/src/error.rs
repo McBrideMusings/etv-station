@@ -63,6 +63,9 @@ pub enum ChannelError {
     #[error("channel {0} terminated after producing no segments while being watched")]
     SegmentStall(String),
 
+    #[error("channel {0} terminated after ffmpeg stall")]
+    Stalled(String),
+
     #[error("failed to capture ffmpeg stderr")]
     CaptureFFmpegStderrFailure,
 

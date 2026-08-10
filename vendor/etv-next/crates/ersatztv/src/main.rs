@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use axum::body::HttpBody as _;
 use axum::extract::{ConnectInfo, Path, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use clap::{Parser, Subcommand};
@@ -253,7 +254,7 @@ async fn stream(
         log::warn!("failed to refresh heartbeat for channel {number}: {err}");
     }
 
-    let content = get_multi_variant(channel, request);
+    let content = get_multi_variant(channel, request.headers());
 
     Ok((
         [(
@@ -393,7 +394,7 @@ async fn fix_content_types(
     response
 }
 
-fn get_multi_variant(channel: &ChannelModel, request: axum::extract::Request) -> String {
+fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> String {
     let mut result = String::new();
     result.push_str("#EXTM3U\n");
     result.push_str("#EXT-X-VERSION:6\n");
@@ -407,7 +408,7 @@ fn get_multi_variant(channel: &ChannelModel, request: axum::extract::Request) ->
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"{}\",URI=\"{}/session/{}/live_sub.m3u8\"\n",
             channel.subtitle_language_name(),
             channel.subtitle_language_tag(),
-            get_scheme_host(&request),
+            get_scheme_host(headers),
             channel.number()
         ));
         result.push_str(&format!(
@@ -422,7 +423,7 @@ fn get_multi_variant(channel: &ChannelModel, request: axum::extract::Request) ->
     }
     result.push_str(&format!(
         "{}/session/{}/live.m3u8",
-        get_scheme_host(&request),
+        get_scheme_host(headers),
         channel.number()
     ));
 
@@ -434,7 +435,8 @@ async fn channel_playlist(
     request: axum::extract::Request,
 ) -> Result<impl IntoResponse, LineupError> {
     let mut content = String::new();
-    let xmltv_url = format!("{}/xmltv.xml", get_scheme_host(&request));
+    let scheme_host = get_scheme_host(request.headers());
+    let xmltv_url = format!("{}/xmltv.xml", scheme_host);
     content.push_str(&format!(
         "#EXTM3U url-tvg=\"{xmltv_url}\" x-tvg-url=\"{xmltv_url}\"\n"
     ));
@@ -473,7 +475,7 @@ async fn channel_playlist(
 fn stream_url(request: &axum::extract::Request, channel: &ChannelModel) -> String {
     format!(
         "{}/channel/{}.m3u8",
-        get_scheme_host(request),
+        get_scheme_host(request.headers()),
         channel.number()
     )
 }
@@ -484,7 +486,7 @@ async fn hdhr_discover(
     State(state): State<Arc<LineupState>>,
     request: axum::extract::Request,
 ) -> impl IntoResponse {
-    let base = get_scheme_host(&request);
+    let base = get_scheme_host(request.headers());
     axum::Json(serde_json::json!({
         "FriendlyName": "ErsatzTV-next",
         "Manufacturer": "ErsatzTV",
@@ -535,15 +537,29 @@ async fn hdhr_lineup_status() -> impl IntoResponse {
     }))
 }
 
-fn get_scheme_host(request: &axum::extract::Request) -> String {
-    // TODO: need scheme, host from reverse proxy
-    let host = request
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
+fn get_scheme_host(headers: &HeaderMap) -> String {
+    let scheme = get_first_header_value(headers, "x-forwarded-proto")
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "http".to_string());
+
+    let host = get_first_header_value(headers, "x-forwarded-host")
+        .or_else(|| get_first_header_value(headers, axum::http::header::HOST.as_str()))
         .unwrap_or("localhost");
 
-    format!("http://{host}")
+    format!("{scheme}://{host}")
+}
+
+// headers set by chained proxies may contain multiple comma-separated values;
+// the first value is the one set by the proxy closest to the client
+fn get_first_header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 /// The channel's last written media playlist with `#EXT-X-ENDLIST` appended, or

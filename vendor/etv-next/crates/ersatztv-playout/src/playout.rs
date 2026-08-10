@@ -247,6 +247,7 @@ impl PlayoutItemSource {
             out_point_ms,
             headers,
             user_agent,
+            is_live: None,
             timeout_us: None,
             reconnect: None,
             reconnect_delay_max: None,
@@ -364,6 +365,10 @@ pub enum PlayoutItemSource {
     Http {
         /// URI template, e.g. "https://example.com/file.mkv?token={{MY_SECRET}}"
         uri: String,
+        /// Whether the content is live and therefore cannot seek or work
+        /// ahead (default: false)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_live: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         in_point_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]

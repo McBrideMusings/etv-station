@@ -234,6 +234,8 @@
         "subtitle": {
           "$ref": "#/$defs/SubtitleNormalizationConfig",
           "default": {
+            "fonts_folder": null,
+            "force_style": null,
             "language": {
               "name": "English",
               "tag": "en"
@@ -304,6 +306,20 @@
     "SubtitleNormalizationConfig": {
       "type": "object",
       "properties": {
+        "fonts_folder": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "force_style": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "language": {
           "description": "Language the channel's converted subtitle track is announced as. HLS\nallows one language per subtitle rendition for the whole session, so a\nchannel whose schedule mixes languages has to declare the one it\nadvertises rather than reading it off whichever item is playing.",
           "$ref": "#/$defs/SubtitleLanguageConfig",

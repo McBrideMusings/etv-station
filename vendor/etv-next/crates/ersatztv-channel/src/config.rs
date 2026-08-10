@@ -14,6 +14,7 @@ pub const PATH_FIELDS: &[&str] = &[
     "/ffmpeg/ffmpeg_path",
     "/ffmpeg/ffprobe_path",
     "/ffmpeg/reports_folder",
+    "/normalization/subtitle/fonts_folder",
 ];
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -466,6 +467,10 @@ pub struct SubtitleNormalizationConfig {
     /// advertises rather than reading it off whichever item is playing.
     #[serde(default)]
     pub language: SubtitleLanguageConfig,
+    #[serde(default)]
+    pub fonts_folder: Option<String>,
+    #[serde(default)]
+    pub force_style: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]

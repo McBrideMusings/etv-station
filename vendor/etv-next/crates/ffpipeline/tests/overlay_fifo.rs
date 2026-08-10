@@ -27,7 +27,7 @@ async fn overlay_spec_adds_rawvideo_input_and_filter() {
     let source = common::fixture_path("480p_h264.ts");
     let probe = common::probe_file(&env.ffmpeg, &env.ffprobe, &source).await;
 
-    let mut input = common::build_input(&source, probe, Duration::from_secs(2));
+    let mut input = common::build_input(&source, probe, Duration::from_secs(2), None);
     input.overlay_input = Some(OverlayInput {
         fifo_path: String::from("/tmp/etv-overlay-test.fifo"),
         pixel_format: String::from("rgba"),
