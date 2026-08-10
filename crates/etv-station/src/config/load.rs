@@ -284,7 +284,9 @@ fn resolve_blocks(
         let has_path = include.block.is_some();
         let has_inline = include.program.is_some()
             || include.duplicates.is_some()
-            || !include.entries.is_empty();
+            || !include.entries.is_empty()
+            || !include.pools.is_empty()
+            || !include.pattern.is_empty();
         match (has_path, has_inline) {
             (true, true) => {
                 return Err(ConfigError::Validation {
@@ -297,7 +299,9 @@ fn resolve_blocks(
             (false, false) => {
                 return Err(ConfigError::Validation {
                     path: channel_path.to_path_buf(),
-                    message: format!("block #{idx} has neither a `block` path nor inline entries"),
+                    message: format!(
+                        "block #{idx} has none of: a `block` path, `entries`, or `pools` + `pattern`"
+                    ),
                 });
             }
             _ => {}
@@ -537,6 +541,28 @@ mod tests {
         let inc = &config.rule.blocks[0];
         assert_eq!(inc.entries().len(), 1);
         assert!(matches!(inc.entries()[0], Entry::Item(_)));
+    }
+
+    #[test]
+    fn pattern_block_without_program_is_not_empty() {
+        // Regression for #149: a pattern block (pools + pattern) with no
+        // `program:` metadata was rejected as if it had no content, because
+        // the emptiness check only looked at `program`, `duplicates`, and
+        // `entries` — never `pools` or `pattern`. Exact shape from the issue.
+        let dir = tempfile::tempdir().unwrap();
+        let channel_path = dir.path().join("channel.yaml");
+        std::fs::write(
+            &channel_path,
+            "rule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          expr: 'kind == \"episode\"'\n      pattern:\n        - pool: \"shows\"\n          take: 1\n",
+        )
+        .unwrap();
+
+        let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
+        resolve_blocks(&mut config, &channel_path, &no_env)
+            .expect("a block with pools + pattern has content and must load");
+        let inc = &config.rule.blocks[0];
+        assert_eq!(inc.pools.len(), 1);
+        assert_eq!(inc.pattern.len(), 1);
     }
 
     #[test]
