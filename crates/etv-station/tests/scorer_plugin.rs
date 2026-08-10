@@ -245,6 +245,7 @@ fn pick(ctx) {
         .into(),
         recent: vec!["mov-c".into()],
         now: 3000,
+        tz: None,
     };
     let got = resolve_with(&plugin_channel(&p, 1, 1), &catalog(), inputs);
     assert_eq!(
@@ -308,6 +309,7 @@ fn the_committed_example_plugin_runs() {
         // mov-d aired most recently, so the example's replay TTL drops it.
         recent: vec!["mov-d".into()],
         now: 900_000 + 3600,
+        tz: None,
     };
     // The two halves, in the order the daemon runs them: `prepare` reads the
     // catalog, `pick` ranks what it found and never sees a database handle.

@@ -386,6 +386,12 @@ pub struct Pool {
     /// arrays, strings, numbers, booleans, nested to any depth — and no key is
     /// reserved.
     ///
+    /// On a `sequencer` block (#169) this pool's `config:` also reaches the
+    /// block's own script, as `ctx.pool_config.<name>` — whether or not this
+    /// pool names a `plugin` of its own. A daypart sequencer's "which hours
+    /// and weekdays does this pool claim" table lives here (#14, ADR 0004),
+    /// reusing this carrier rather than adding a schema field for it.
+    ///
     /// **The station never reads it.** It is converted and passed through, and
     /// that is the whole of the contract: nothing here is validated, no key is
     /// known, no default is injected, and an unrecognised key is not an error.

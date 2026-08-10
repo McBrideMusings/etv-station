@@ -1,0 +1,72 @@
+# Sample — Adult Swim: a network-mirror channel built end to end for #14.
+#
+# One block, two dayparts plus a default, all pointing `sequencer:` at the
+# reusable `examples/plugins/daypart-sequencer.rhai` (#14, ADR 0004). Adult
+# Swim is the network mirror this repo can build first: its Plex source is a
+# *smart* collection, which ingests zero members (#139), so its shows are
+# listed here by name instead of resolved from the collection — the same
+# workaround every other network mirror (HBO, Bravo) will need until #139
+# lands.
+#
+# Hand-approximated, deliberately (#14 "out of scope" — network-mirror
+# fidelity is later enrichment, not this slice):
+#   - `primetime` — the block's real identity: the flagship adult-animation
+#     lineup, nightly 21:00-24:00.
+#   - `toonami` — the Saturday-night anime block, 00:00-03:00 (i.e. the
+#     three hours after Saturday begins, matching how the real Adult Swim
+#     schedule places it).
+#   - `default` — every hour neither claims, reusing the library's older
+#     adult-animation titles as a daytime rerun wheel rather than leaving the
+#     channel dark. The real Adult Swim's daytime hours belong to Cartoon
+#     Network, which this library does not carry and which #14 does not ask
+#     for — a rerun wheel of the same brand's own catalog is the honest
+#     approximation, and (unlike reusing `primetime`'s own list verbatim)
+#     it keeps the 21:00/24:00 boundary visible in the air-order rather than
+#     two identically-sourced pools blending into one continuous block.
+#
+# Registered in examples/station.yaml via the `samples/*.yaml` glob. Resolves
+# to nothing unless the station's `catalog_path` points at a populated
+# catalog with these shows in it.
+window_days: 1
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      program:
+        title: "Adult Swim"
+
+      pools:
+        - name: primetime
+          expr: >
+            item.type == "episode" && item.show in [
+              "Rick and Morty", "Robot Chicken", "The Boondocks",
+              "Harley Quinn", "The Eric Andre Show", "Smiling Friends"
+            ]
+          order: "random"
+          config:
+            hour_start: 21
+            hour_end: 24
+
+        - name: toonami
+          expr: >
+            item.type == "episode" && item.show in [
+              "Cowboy Bebop", "Samurai Jack", "Fullmetal Alchemist: Brotherhood",
+              "Rick and Morty: The Anime", "Primal"
+            ]
+          order: "random"
+          config:
+            hour_start: 0
+            hour_end: 3
+            weekdays: [sat]
+
+        - name: default
+          expr: >
+            item.type == "episode" && item.show in [
+              "Aqua Teen Hunger Force", "Metalocalypse", "The Venture Bros.",
+              "Home Movies", "Joe Pera Talks with You"
+            ]
+          order: "random"
+
+      sequencer: "../plugins/daypart-sequencer.rhai"

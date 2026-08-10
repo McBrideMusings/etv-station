@@ -122,6 +122,16 @@ pub struct ScoreInputs {
     /// Unix seconds at generation time. Passed in rather than read inside the
     /// script so a generation is reproducible from its inputs.
     pub now: i64,
+    /// The station's configured tz (ADR 0004) — how a `sequencer` block
+    /// ([`crate::sequence`]) converts `ctx.window.from` and other unix-second
+    /// instants into the local weekday/hour/minute a daypart script places its
+    /// pools against. Unused by a `pool_provider` scorer, which reads no
+    /// clock. `None` at the stateless entry points
+    /// ([`crate::resolve::resolve_channel`], [`crate::determinism`]'s own
+    /// snapshot before this field existed) falls back to UTC inside
+    /// [`crate::sequence`] — the same "least surprising" tolerance
+    /// `resolve_channel` already gives an unpinned `window_start`.
+    pub tz: Option<&'static time_tz::Tz>,
 }
 
 /// The tag namespaces exposed to a plugin, each as an array under its own key.
@@ -564,20 +574,7 @@ pub fn pick(
         )
     });
 
-    // The pool's own `config`, handed over verbatim. The station reads nothing
-    // out of it: whatever the author wrote is whatever the script sees, nested
-    // to any depth. An absent config becomes an empty map rather than a missing
-    // key, so a script can read `ctx.config.whatever` unconditionally and get
-    // unit for anything unset — which is also why a mistyped key is silent.
-    let config = match pool_config {
-        Some(value) => rhai::serde::to_dynamic(value).map_err(|e| {
-            format!(
-                "scorer plugin {}: pool {pool_name:?} config is not representable in Rhai: {e}",
-                script_path.display()
-            )
-        })?,
-        None => Dynamic::from_map(Map::new()),
-    };
+    let config = pool_config_dynamic(pool_config, "scorer", script_path, pool_name)?;
 
     let ctx = ScoreCtx {
         sets,
@@ -683,6 +680,34 @@ fn compile_and_resolve(
         // rather than a deep copy of every item map.
         sets: Dynamic::from_map(sets).into_shared(),
     })
+}
+
+/// A pool's own `config`, handed over verbatim. The station reads nothing out
+/// of it: whatever the author wrote is whatever the script sees, nested to any
+/// depth. An absent config becomes an empty map rather than a missing key, so a
+/// script can read `ctx.config.whatever` unconditionally and get unit for
+/// anything unset — which is also why a mistyped key is silent.
+///
+/// `plugin_kind` names the hook in the error (`"scorer"` / `"sequencer"`), the
+/// only thing that differs between a scorer's `ctx.config` and a sequencer's
+/// `ctx.pool_config.<name>` (#169) — both marshal the same carrier (ADR 0002)
+/// through this one function rather than a second, driftable copy.
+pub(crate) fn pool_config_dynamic(
+    pool_config: Option<&serde_json::Value>,
+    plugin_kind: &str,
+    script_path: &Path,
+    pool_name: &str,
+) -> Result<Dynamic, String> {
+    match pool_config {
+        Some(value) => rhai::serde::to_dynamic(value).map_err(|e| {
+            format!(
+                "{plugin_kind} plugin {}: pool {pool_name:?} config is not representable in \
+                 Rhai: {e}",
+                script_path.display()
+            )
+        }),
+        None => Ok(Dynamic::from_map(Map::new())),
+    }
 }
 
 /// Load each id as a Rhai map: every column on `entries`, plus every exposed

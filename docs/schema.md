@@ -1015,9 +1015,12 @@ pool's `expr` or `plugin`, then its `order`, `bucket_order`, and `constraints`
 | `ctx` field | What it holds |
 |---|---|
 | `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a daypart script has to prefer items that fit the time left before its next boundary, and ids carry no durations. |
+| `ctx.pool_config.<name>` | that pool's own `config:` block, passed through unread — the same generic carrier a scorer's `ctx.config` reaches (ADR 0002), not a new schema field. A daypart script's "which hours/weekdays does this pool claim" table lives here (#14, ADR 0004). Empty map when the pool declares no `config:`. |
 | `ctx.window.from` | the instant this generation begins airing — the hour a daypart script asks about, not the hour the daemon happens to be computing in |
 | `ctx.resume.<pool>.next` | the series whose turn is next in that pool's rotation |
 | `ctx.cursor` | the per-show cursors from the play-history db |
+
+`local_time(unix_secs)` is a **global function**, not a `ctx` field — registered on the engine every `arrange()` call runs under, so a script can re-read the clock at any instant it computes (a running cursor advanced by summed item durations), not only at `ctx.window.from`. It resolves against the station's configured `tz` (`UTC` at the stateless entry point, which carries no station config) and returns `#{ weekday, hour, minute }`, where `weekday` is one of `"mon"`.."sun"` and `hour` is `0`-`23` — both rolling on the same local-midnight grid `chunk_hours` does.
 
 Resume state is **read-only input**. The script returns only a timeline, and
 the station derives the new state from which items actually came back — the
@@ -1036,6 +1039,39 @@ Error cases:
   how the pattern walk is bounded.
 
 Worked sample: `examples/plugins/foryou-sequencer.rhai`.
+
+#### Dayparting (#14)
+
+`examples/plugins/daypart-sequencer.rhai` is the reusable dayparting
+sequencer — a network-mirror channel is **one block** whose pools are its
+dayparts plus a default pool, all pointing `sequencer:` at this one script.
+Nothing about which hours a pool claims lives in the schema; it is authored
+entirely in that pool's `config:`:
+
+```yaml
+rule:
+  blocks:
+    - pools:
+        - name: latenight
+          expr: 'item.show in ["Rick and Morty", "The Boondocks"]'
+          config:
+            hour_start: 21   # local hour, 0-23
+            hour_end: 6      # < hour_start wraps past local midnight
+            weekdays: [sun, mon, tue, wed, thu, fri, sat]  # default: every day
+        - name: default
+          expr: 'item.type == "movie"'
+          # No hour_start/hour_end: this is the pool that fills every hour
+          # no daypart claims. Exactly one pool in the block must be it.
+      sequencer: "../plugins/daypart-sequencer.rhai"
+```
+
+Boundaries drift rather than truncating an item or leaving a gap (#14
+decision 3, ADR 0004): the script prefers, from the active daypart's own
+pool, whichever item fits the time left before the next boundary; when
+nothing fits, the next item plays anyway and the following daypart starts
+late by that overrun. The exact grid is not the goal — see ADR 0004 for why
+holding it exactly would need filler the library does not have. Two pools
+whose declared hours and weekdays overlap fail `arrange()`, naming both.
 
 ### Pool `constraints` — spacing counted in a pool's own draw order
 
