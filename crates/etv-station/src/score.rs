@@ -182,10 +182,14 @@ pub struct ScoreCache {
     entries: HashMap<PathBuf, CachedScript>,
     /// The metadata/take-override half of what a plugin pool's `pick()` just
     /// returned (#166), keyed by `(pool name, entry_id)`. `resolve_pool_sources`
-    /// still returns bare ids — `crate::sequence` shares that function and
-    /// reads none of this — so [`crate::pattern::build`] reads it back from
-    /// here once pool resolution finishes, which is what lets an id's record
-    /// data survive without widening a signature `crate::sequence` also calls.
+    /// still returns bare ids, so widening it would ripple into every caller.
+    /// Instead [`crate::pattern::build`] and [`crate::sequence::build`] (#201)
+    /// each read the metadata half back from here once pool resolution
+    /// finishes and flatten their own copy for their own return.
+    ///
+    /// The take-override half has only one reader, `pattern::PoolRuntime`
+    /// (#173) — see the sequencer's own "Out of scope" note (#201) on why a
+    /// per-entry take has no meaning there yet.
     ///
     /// Keyed on the pool too, not on `entry_id` alone: two plugin pools in one
     /// block may resolve the same id from overlapping catalog queries, and
