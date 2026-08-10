@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
-use etv_station::config::{ChannelConfig, read_channel};
+use etv_station::config::{ChannelConfig, NoRepeatWithin, read_channel};
 use etv_station::history::{Ledger, PlayRecord};
 use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
 use etv_station::resume::{GenerationState, ResumeMap};
@@ -221,7 +221,7 @@ fn two_movies_then_three_episodes_from_disjoint_pools() {
 fn a_block_level_constraint_is_inherited_without_reordering_the_pattern() {
     let mut cfg = config();
     cfg.rule.blocks[0].constraints = Some(etv_station::config::Constraints {
-        no_repeat_within: Some(10),
+        no_repeat_within: Some(NoRepeatWithin::Positions(10)),
         separate_by: None,
         separate_min_gap: None,
     });

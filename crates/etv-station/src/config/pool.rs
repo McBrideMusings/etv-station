@@ -418,6 +418,7 @@ fn default_chance() -> f64 {
 mod tests {
     use super::*;
     use crate::config::Dir;
+    use crate::config::NoRepeatWithin;
 
     #[test]
     fn parses_a_pool_with_defaults_from_yaml() {
@@ -543,7 +544,10 @@ on_short: short
     fn parses_pool_constraints() {
         let yaml = "name: movies\nexpr: 'x'\nconstraints:\n  no_repeat_within: 5\n";
         let pool: Pool = serde_norway::from_str(yaml).unwrap();
-        assert_eq!(pool.constraints.as_ref().unwrap().no_repeat_within, Some(5));
+        assert_eq!(
+            pool.constraints.as_ref().unwrap().no_repeat_within,
+            Some(NoRepeatWithin::Positions(5))
+        );
     }
 
     fn bare(name: &str) -> Pool {
@@ -553,7 +557,7 @@ on_short: short
     #[test]
     fn a_pool_declaring_nothing_inherits_the_block() {
         let block = Constraints {
-            no_repeat_within: Some(3),
+            no_repeat_within: Some(NoRepeatWithin::Positions(3)),
             separate_by: None,
             separate_min_gap: None,
         };
@@ -571,7 +575,7 @@ on_short: short
     #[test]
     fn a_pool_declaring_its_own_replaces_the_block_wholesale() {
         let block = Constraints {
-            no_repeat_within: Some(3),
+            no_repeat_within: Some(NoRepeatWithin::Positions(3)),
             separate_by: None,
             separate_min_gap: None,
         };
@@ -582,7 +586,7 @@ on_short: short
             separate_min_gap: Some(2),
         });
         let effective = pool.constraints(Some(&block));
-        assert_eq!(effective.no_repeat_gap(), 0);
+        assert_eq!(effective.no_repeat_gap(), NoRepeatWithin::Positions(0));
         assert_eq!(effective.separate_gap(), 2);
     }
 

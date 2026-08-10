@@ -723,6 +723,7 @@ dependencies = [
  "ersatztv-playout",
  "etv-overlay",
  "glob",
+ "humantime",
  "humantime-serde",
  "nix",
  "regex",
