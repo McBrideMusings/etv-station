@@ -235,17 +235,12 @@ pub fn build(
         })
         .collect();
 
-    // The metadata half of what plugin pools picked (#166), read back exactly
-    // as `pattern::build` does (#201) — `arrange()` sees a pool's `pick()`
-    // record only as the bare `entry_id`s in `ctx.pools`, with the record's
-    // `metadata` stashed on the side by `crate::score::pick` and recovered
-    // here by id. Flattening `(pool, id)` down to `entry_id` carries over the
-    // same "blind across pools" collision `pattern::build` documents.
-    let metadata_out: HashMap<String, serde_json::Value> = score_cache
-        .picked_extras
-        .into_iter()
-        .filter_map(|((_pool, id), extra)| extra.metadata.map(|m| (id, m)))
-        .collect();
+    // The metadata half of what plugin pools picked (#166) — `arrange()` sees
+    // a pool's `pick()` record only as the bare `entry_id`s in `ctx.pools`,
+    // with the record's `metadata` stashed on the side by `crate::score::pick`
+    // and recovered here by id, through the same shared helper `pattern::build`
+    // uses (#203) so this path can't drop a field the pattern path keeps.
+    let metadata_out = crate::pattern::flatten_picked_extras(score_cache.picked_extras);
 
     Ok((arranged, resume_out, metadata_out))
 }

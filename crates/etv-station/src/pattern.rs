@@ -718,20 +718,33 @@ pub fn build(
         .collect();
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
-    // #173 to read. Flattened back to a plain `entry_id` key here, dropping
-    // the pool half of `picked_extras`' key: the caller (`resolve::resolve_block`)
-    // has only a flat drawn-id list to match against, with no pool label left
-    // on any one of them. Two pools that both draw the same id into `out` and
-    // both attach metadata therefore collide here exactly as they already do
-    // for `Pool::constraints` — the same "blind across pools" limit, not a
-    // new one, and not fixable without giving every drawn id a pool label all
-    // the way out to `resolve::resolve_block`.
-    let metadata_out: HashMap<String, serde_json::Value> = score_cache
-        .picked_extras
+    // #173 to read. See [`flatten_picked_extras`] (#203) for why the pool
+    // half of the key is dropped here.
+    let metadata_out = flatten_picked_extras(score_cache.picked_extras);
+    Ok((out, resume_out, metadata_out))
+}
+
+/// Flatten `ScoreCache::picked_extras`'s metadata half down to a plain
+/// `entry_id`-keyed map — the shape both [`build`] (the pattern walk) and
+/// `sequence::build` return to their shared caller, `resolve::resolve_block`,
+/// which only ever sees a flat drawn-id list with no pool label left on any
+/// one of them. Two pools that both draw the same id and both attach
+/// metadata therefore collide here exactly as they already do for
+/// `Pool::constraints` — the same "blind across pools" limit, not a new one,
+/// and not fixable without giving every drawn id a pool label all the way
+/// out to `resolve::resolve_block`.
+///
+/// Kept as one shared helper (#203) so a future per-drawn-item field only
+/// has to be handled once — the flattening used to be written out twice,
+/// once here and once in `sequence::build`, which is exactly the shape that
+/// let #201 drop `metadata` silently on the sequencer path.
+pub(crate) fn flatten_picked_extras(
+    picked_extras: HashMap<(String, String), crate::score::PickedExtra>,
+) -> HashMap<String, serde_json::Value> {
+    picked_extras
         .into_iter()
         .filter_map(|((_pool, id), extra)| extra.metadata.map(|m| (id, m)))
-        .collect();
-    Ok((out, resume_out, metadata_out))
+        .collect()
 }
 
 /// Resolve every pool's raw ordered id list — its `expr`/`plugin`/`groups`
