@@ -146,7 +146,7 @@ A series that reaches its last item starts over. That is the only behaviour ther
 
 Channels **materialize forward**. Generation is a pure function of `(catalog, config, resume_in) → (items, resume_out)`. Each pass lays its sequence end-to-end after the last thing already written and stores where it got to in a `.resume` sidecar; already-written chunk JSON is never rewritten, so the emitted files are the durable timeline and the sidecar holds only the seam. There is no live cursor anywhere.
 
-Two files carry that state, and they hold different things. The **play-history ledger** (`.history`) is one JSONL line per scheduled airing — `entry_id`, `show_id`, the scheduled `start`, and when the row was written. It is a dumb record: no taste logic, no TTL, no relevance. Where each series left off is a **projection** of it ("the last airing per `show_id`"), so there is exactly one place that knows a show's position and nothing to drift out of sync. A future taste scorer reads the same lines the other way — all of them, with timestamps. One structure, two read shapes.
+State is split between a per-channel sidecar and a station-wide database, and they hold different things. The **play-history ledger** is one row per scheduled airing — `channel`, `entry_id`, `show_id`, the scheduled `start`, and when the row was written — held in `history.db`, a sqlite database of its own next to (not inside) the catalog, since play history is not rebuildable the way the catalog is (#111). It is a dumb record: no taste logic, no TTL, no relevance. Where each series left off is a **projection** of it ("the last airing per `show_id`, on this channel"), so there is exactly one place that knows a show's position and nothing to drift out of sync. A taste scorer reads the same rows the other way — recent ones, with timestamps — and a `show_id`-keyed query answers where a series last aired *across every channel*, which no per-channel file could ever serve. Several read shapes over one table.
 
 A series' position is recorded as the **last-played `entry_id`**, never an index: a pool's resolved set churns as the catalog and the query behind it change, and an index would silently mean something else after any change. An id that has vanished restarts its own series and no other, and a show that leaves the resolved set entirely and later returns resumes where it stopped, because the ledger is never pruned to the current set. A torn line is skipped rather than failing the channel.
 
@@ -158,7 +158,7 @@ It also carries **checkpoints**: the scheduling state — pool rotation and list
 
 There is no exhausted state. A channel cannot play its way to an empty list, because every series loops — so resolving to zero items always means the resolved *set* is empty (an expression that matches nothing, an empty catalog), which is a config error and is reported as one.
 
-Both halves of the generation model are now in place: the resume map (#72) and the play-history ledger (#70). What remains open is what reads the ledger the *other* way — the taste scorers of #74 and #82.
+Both halves of the generation model are now in place: the resume map (#72) and the play-history ledger (#70, sqlite-backed since #111). What reads the ledger the *other* way — the taste scorers of #74 and #82 — has also shipped.
 
 ### Future rules (designed for, not implemented)
 
@@ -260,7 +260,7 @@ Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffect
 | # | Question | Current answer |
 |---|---|---|
 | 1 | Daemon vs. cron-invoked one-shot? | Daemon. Roll cadence + reload watcher both want a long-lived process. |
-| 2 | Scheduling-state persistence | Sidecar files per channel: `.resume` (rotation + checkpoints) and `.history` (the play ledger). |
+| 2 | Scheduling-state persistence | A `.resume` sidecar per channel (rotation + checkpoints) plus the station-wide `history.db` sqlite table (the play ledger, keyed by channel). |
 | 3 | Source-media duration probing | `ffprobe` at config-load time; cache durations in the `.durations.json` sidecar. Re-probe on file mtime change. |
 | 4 | What if an item file is missing at probe time? | Fail loudly at config load (don't silently substitute). v1 is explicit about its inputs. |
 | 5 | Logging/observability | stdout structured logs (JSON lines). Container runtime captures them. No metrics endpoint v1. |
