@@ -128,6 +128,12 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         recent: Vec::new(),
         now: OffsetDateTime::now_utc().unix_timestamp(),
     };
+    // Read once and handed to both passes, for the same reason `now` is: a
+    // sequencer block (#169) reads this as `ctx.window.from`, so a daypart
+    // script asks what hour the generation starts at. Reading the clock
+    // separately per pass would straddle an hour boundary now and then and
+    // report a correct daypart script as non-reproducible.
+    let window_start = OffsetDateTime::now_utc();
 
     let a = generate_once(
         channel,
@@ -136,6 +142,7 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         &state,
         &scoring,
         fill,
+        window_start,
     )?;
     let b = generate_once(
         channel,
@@ -144,6 +151,7 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         &state,
         &scoring,
         fill,
+        window_start,
     )?;
 
     Ok(diff_report(channel_name, &a, &b))
@@ -160,6 +168,7 @@ fn generate_once(
     state: &GenerationState,
     scoring: &ScoreInputs,
     fill: Option<std::time::Duration>,
+    window_start: OffsetDateTime,
 ) -> Result<Vec<String>, StationError> {
     let (items, _resume_out) = resolve_channel_with_resume(
         &channel.config,
@@ -170,6 +179,7 @@ fn generate_once(
         state,
         scoring,
         fill,
+        window_start,
     )?;
     Ok(items.into_iter().map(|item| item.id).collect())
 }
@@ -293,6 +303,7 @@ mod tests {
                 .map(|id| ConfigEntry::Item(item_entry(id)))
                 .collect(),
             fallback: None,
+            sequencer: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
@@ -326,6 +337,7 @@ mod tests {
                 .map(|(id, secs)| ConfigEntry::Item(item_entry_secs(id, *secs)))
                 .collect(),
             fallback: None,
+            sequencer: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
@@ -385,6 +397,7 @@ mod tests {
                 .map(|id| ConfigEntry::Item(item_entry(id)))
                 .collect(),
             fallback: None,
+            sequencer: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
@@ -578,6 +591,7 @@ fn pick(ctx) {
             constraints: None,
             entries: Vec::new(),
             fallback: None,
+            sequencer: None,
             pools: vec![plugin_pool(script)],
             pattern: vec![PatternStep {
                 pool: "movies".into(),

@@ -102,20 +102,27 @@ const FROM_STRIDE: u64 = 1 << 48;
 
 /// One series inside a pool: a show's episodes, one season of them, or a single
 /// movie.
+///
+/// `pub(crate)` so [`crate::sequence`] (#169) can read `ids` back off
+/// [`resolve_pool_series`] — a sequencer flattens the same series list this
+/// module builds for its own walk, rather than a second implementation of
+/// `constraints` + `bucket_order` grouping.
 #[derive(Debug)]
-struct Series {
+pub(crate) struct Series {
     /// What this series is called in the rotation and in the `.resume` sidecar.
     /// `show_id` under `group_by = "show"`, `"{show_id}|S{season}"` under
     /// `group_by = "season"`, and the item's own `entry_id` when it has no
     /// `show_id` at all.
-    key: String,
+    pub(crate) key: String,
     /// The key the play-history ledger files this series' airings under —
     /// always the `show_id`, never the season. Equal to [`Self::key`] except
     /// under `group_by = "season"`, where several series share one show's
     /// history and each finds its own place in it.
-    show_key: String,
-    ids: Vec<String>,
-    /// Index of the next item to play.
+    pub(crate) show_key: String,
+    pub(crate) ids: Vec<String>,
+    /// Index of the next item to play. Meaningless to a sequencer, which owns
+    /// no rotation of its own — always `0` on a series [`resolve_pool_series`]
+    /// hands back.
     cursor: usize,
 }
 
@@ -131,7 +138,7 @@ impl Series {
 /// on and `durations`/`mean_duration` are empty/zero when nothing here is
 /// measured in time, so the common case needs no catalog lookup for either.
 #[derive(Debug, Default)]
-struct PoolKeys {
+pub(crate) struct PoolKeys {
     groups: HashMap<String, Vec<String>>,
     durations: HashMap<String, Duration>,
     mean_duration: Duration,
@@ -557,96 +564,14 @@ pub fn build(
     // window does not get to argue with it. Only a derived count is bounded.
     let budget = fill.filter(|_| cycles.is_none());
 
-    // Three passes, split by whether they read the database.
-    //
-    // The middle one is why: a scorer plugin's `pick()` is unbounded work owned
-    // by whoever wrote the script, and it must not run with a database handle
-    // alive. Ranking a large library can take minutes, and for as long as it
-    // does, anything sharing that handle is stopped dead. Keeping the plugin
-    // calls in their own pass — between two that do read the catalog, and taking
-    // no catalog themselves — is what makes that structurally impossible rather
-    // than a rule someone has to remember.
-
-    // Pass 1, reads the catalog: resolve every expression pool's ids, and
-    // compile + materialize every plugin pool's declared sources. One cache for
-    // the whole generation, so pools pointed at the same script share its AST
-    // and its resolved sets instead of each re-running every query it declares.
+    // Two passes, split by whether they read the database — see
+    // [`resolve_pool_sources`], which does both.
     let mut score_cache = crate::score::ScoreCache::default();
-    let mut pool_ids: Vec<Option<Vec<String>>> = Vec::with_capacity(pools.len());
-    for cfg in pools {
-        match (&cfg.expr, &cfg.plugin, !cfg.groups.is_empty()) {
-            (Some(expr), None, false) => {
-                let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
-                if let Some(order) = &cfg.order {
-                    // Seed 0: a pool's internal `order` is its own stable sort.
-                    // A shuffled pool is `select = "random"`, seeded per visit.
-                    ids = catalog
-                        .resolve_order(&ids, order, 0)
-                        .map_err(|e| e.to_string())?;
-                }
-                pool_ids.push(Some(ids));
-            }
-            (None, Some(plugin), false) => {
-                let path = score_env.resolve_path(plugin);
-                score_cache
-                    .prepare(catalog, &path)
-                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
-                pool_ids.push(None);
-            }
-            (None, None, true) => {
-                let mut ids = resolve_group_pool(catalog, cfg, groups)?;
-                if let Some(order) = &cfg.order {
-                    ids = catalog
-                        .resolve_order(&ids, order, 0)
-                        .map_err(|e| e.to_string())?;
-                }
-                pool_ids.push(Some(ids));
-            }
-            // Two sources, or none, is rejected at load; a pool that reaches
-            // here in either state is a validation gap, not a config the user
-            // can hit.
-            _ => {
-                return Err(format!(
-                    "pool {:?} must set exactly one of `expr`, `plugin`, or `groups`",
-                    cfg.name
-                ));
-            }
-        }
-    }
-
-    // Pass 2, reads nothing: run each plugin's ranking against the snapshot pass
-    // 1 took. A plugin returns its set already ranked — gathering and ranking are
-    // the same judgment for a taste algorithm — so the `order` step above applies
-    // only to the expression case (ADR 0002).
-    for (slot, cfg) in pool_ids.iter_mut().zip(pools) {
-        if slot.is_none() {
-            let plugin = cfg
-                .plugin
-                .as_ref()
-                .expect("pass 1 leaves a hole only for a plugin pool");
-            let path = score_env.resolve_path(plugin);
-            // Load-time validation already proved this pool's `capabilities`
-            // match exactly what the plugin declares (#167) — this just reads
-            // the same grant back to decide what `ctx.sets`/`ctx.history`
-            // resolve to for this call.
-            let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities);
-            let ids = crate::score::pick(
-                &score_cache,
-                &path,
-                score_env.inputs,
-                &cfg.name,
-                cfg.config.as_ref(),
-                granted,
-            )
-            .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
-            *slot = Some(ids);
-        }
-    }
+    let pool_id_lists = resolve_pool_sources(catalog, pools, groups, &mut score_cache, score_env)?;
 
     // Pass 3, reads the catalog again: turn each pool's ids into its runtime.
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
-    for (cfg, ids) in pools.iter().zip(pool_ids) {
-        let ids = ids.expect("pass 2 fills every hole pass 1 left");
+    for (cfg, ids) in pools.iter().zip(pool_id_lists) {
         runtimes.push(pool_runtime(
             catalog,
             cfg,
@@ -727,6 +652,105 @@ pub fn build(
         .map(|rt| (rt.cfg.name.clone(), rt.to_resume()))
         .collect();
     Ok((out, resume_out))
+}
+
+/// Resolve every pool's raw ordered id list — its `expr`/`plugin`/`groups`
+/// source, plus internal `order` for the non-plugin cases. A pool's *source*
+/// means the same thing regardless of which hook draws from the result, so
+/// this is shared between [`build`] (#72's pattern walk) and a sequencer
+/// block (`crate::sequence`, #169).
+///
+/// Two passes, split by whether they read the database — see [`build`]'s own
+/// doc for why: a plugin's `pick()` is unbounded work owned by the script
+/// author and must not run with a database handle alive. `score_cache` is
+/// threaded in from the caller so a pool pointed at the same script as
+/// another gets a cache hit rather than a second compile.
+///
+/// Returns one id list per pool, in `pools` order.
+pub(crate) fn resolve_pool_sources(
+    catalog: &Catalog,
+    pools: &[Pool],
+    groups: &[ShowGroup],
+    score_cache: &mut crate::score::ScoreCache,
+    score_env: crate::score::ScoreEnv<'_>,
+) -> Result<Vec<Vec<String>>, String> {
+    // Pass 1, reads the catalog: resolve every expression pool's ids, and
+    // compile + materialize every plugin pool's declared sources.
+    let mut pool_ids: Vec<Option<Vec<String>>> = Vec::with_capacity(pools.len());
+    for cfg in pools {
+        match (&cfg.expr, &cfg.plugin, !cfg.groups.is_empty()) {
+            (Some(expr), None, false) => {
+                let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
+                if let Some(order) = &cfg.order {
+                    // Seed 0: a pool's internal `order` is its own stable sort.
+                    // A shuffled pool is `select = "random"`, seeded per visit.
+                    ids = catalog
+                        .resolve_order(&ids, order, 0)
+                        .map_err(|e| e.to_string())?;
+                }
+                pool_ids.push(Some(ids));
+            }
+            (None, Some(plugin), false) => {
+                let path = score_env.resolve_path(plugin);
+                score_cache
+                    .prepare(catalog, &path)
+                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+                pool_ids.push(None);
+            }
+            (None, None, true) => {
+                let mut ids = resolve_group_pool(catalog, cfg, groups)?;
+                if let Some(order) = &cfg.order {
+                    ids = catalog
+                        .resolve_order(&ids, order, 0)
+                        .map_err(|e| e.to_string())?;
+                }
+                pool_ids.push(Some(ids));
+            }
+            // Two sources, or none, is rejected at load; a pool that reaches
+            // here in either state is a validation gap, not a config the user
+            // can hit.
+            _ => {
+                return Err(format!(
+                    "pool {:?} must set exactly one of `expr`, `plugin`, or `groups`",
+                    cfg.name
+                ));
+            }
+        }
+    }
+
+    // Pass 2, reads nothing: run each plugin's ranking against the snapshot pass
+    // 1 took. A plugin returns its set already ranked — gathering and ranking are
+    // the same judgment for a taste algorithm — so the `order` step above applies
+    // only to the expression case (ADR 0002).
+    for (slot, cfg) in pool_ids.iter_mut().zip(pools) {
+        if slot.is_none() {
+            let plugin = cfg
+                .plugin
+                .as_ref()
+                .expect("pass 1 leaves a hole only for a plugin pool");
+            let path = score_env.resolve_path(plugin);
+            // Load-time validation already proved this pool's `capabilities`
+            // match exactly what the plugin declares (#167) — this just reads
+            // the same grant back to decide what `ctx.sets`/`ctx.history`
+            // resolve to for this call.
+            let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities);
+            let ids = crate::score::pick(
+                score_cache,
+                &path,
+                score_env.inputs,
+                &cfg.name,
+                cfg.config.as_ref(),
+                granted,
+            )
+            .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+            *slot = Some(ids);
+        }
+    }
+
+    Ok(pool_ids
+        .into_iter()
+        .map(|ids| ids.expect("pass 2 fills every hole pass 1 left"))
+        .collect())
 }
 
 /// Resolve a `groups`-sourced pool's item list (#165): the union of every
@@ -830,29 +854,45 @@ fn derive_cycles(
     cycles
 }
 
-/// Turn one pool's resolved ids into the runtime the pattern draws from: split
-/// them into series, then seat each series' cursor from the resume map when the
-/// pool asks to continue.
+/// One pool's items, grouped into rotation series and — when the pool asks
+/// for one — resequenced by `bucket_order`. Everything a caller needs before
+/// it either wraps this in a [`PoolRuntime`] (the pattern walk, which also
+/// seats `advance = "resume"`'s cursor — see [`pool_runtime`]) or flattens it
+/// straight back into an ordered id list with no rotation state at all — a
+/// sequencer block (`crate::sequence`, #169) owns its own draw order, so
+/// nothing here is seated for it.
 ///
-/// Where the ids came from — a CEL expression or a scorer plugin — is settled
-/// before this is called (see the three passes in [`build`]), which is what
-/// keeps plugin execution out of any scope holding a database handle.
-///
-/// `want_runtimes` asks for the per-item lengths the walk needs to know when
-/// the window is covered. It is a whole extra query per pool, so it is only
+/// `seam` is the channel's aired tail already narrowed to ids this pool could
+/// have supplied — the only part of it that says anything about this pool's
+/// next draw. `want_runtimes` asks for the per-item lengths a caller needs to
+/// know when the window is covered; it is a whole extra query, so it is only
 /// asked for when something is actually going to read the answer.
-fn pool_runtime<'a>(
+///
+/// Returns the series (bucket_order-sequenced if the pool sets one), this
+/// pool's adjacency limits, its separation keys (durations populated), its
+/// per-item runtimes, and their mean.
+#[allow(clippy::type_complexity)]
+pub(crate) fn resolve_pool_series(
     catalog: &Catalog,
-    cfg: &'a Pool,
+    cfg: &Pool,
     ids: Vec<String>,
     block_constraints: Option<&Constraints>,
-    state: &GenerationState,
+    seam: &[String],
     want_runtimes: bool,
-) -> Result<PoolRuntime<'a>, String> {
+) -> Result<
+    (
+        Vec<Series>,
+        Limits,
+        PoolKeys,
+        HashMap<String, Duration>,
+        Duration,
+    ),
+    String,
+> {
     // Adjacency constraints (#115). Two halves, both scoped to this pool and
     // both running before anything is interleaved, so the pattern's slots are
-    // never reordered: the list order below, and the draw-time eligibility check
-    // in `serve` that this seeds `recent` for.
+    // never reordered: the list order below, and (for the pattern walk) the
+    // draw-time eligibility check that the caller seeds `recent` for.
     let constraints = cfg.constraints(block_constraints);
     let no_repeat = match constraints.no_repeat_gap() {
         NoRepeatWithin::Positions(n) => RepeatGap::Positions(n),
@@ -875,18 +915,7 @@ fn pool_runtime<'a>(
     let mut keys = pool_keys(catalog, &ids, constraints.separate_by.as_deref(), &cfg.name)?;
     keys.durations = pool_durations.clone();
     keys.mean_duration = mean_duration;
-    // What this pool aired most recently: the channel's tail, narrowed to items
-    // this pool could have supplied. Same projection the list pass reads, and
-    // it carries the same cross-pool blindness — an id two pools share cannot be
-    // attributed to one of them.
-    let own: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    let seam: Vec<String> = state
-        .tail
-        .iter()
-        .filter(|id| own.contains(id.as_str()))
-        .cloned()
-        .collect();
-    let ids = constrain_pool(cfg, limits, &keys, &seam, ids);
+    let ids = constrain_pool(cfg, limits, &keys, seam, ids);
 
     // Group into series, preserving first-appearance order so the pool's
     // `order` fixes the rotation order too. One query for every `show_id` up
@@ -972,6 +1001,43 @@ fn pool_runtime<'a>(
             .map(|i| taken[i].take().expect("each series placed once"))
             .collect();
     }
+
+    Ok((series, limits, keys, pool_durations, mean_duration))
+}
+
+/// Turn one pool's resolved ids into the runtime the pattern draws from: split
+/// them into series (via [`resolve_pool_series`]), then seat each series'
+/// cursor from the resume map when the pool asks to continue.
+///
+/// Where the ids came from — a CEL expression or a scorer plugin — is settled
+/// before this is called (see the three passes in [`build`]), which is what
+/// keeps plugin execution out of any scope holding a database handle.
+///
+/// `want_runtimes` asks for the per-item lengths the walk needs to know when
+/// the window is covered. It is a whole extra query per pool, so it is only
+/// asked for when something is actually going to read the answer.
+fn pool_runtime<'a>(
+    catalog: &Catalog,
+    cfg: &'a Pool,
+    ids: Vec<String>,
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    want_runtimes: bool,
+) -> Result<PoolRuntime<'a>, String> {
+    // What this pool aired most recently: the channel's tail, narrowed to items
+    // this pool could have supplied. Same projection the list pass reads, and
+    // it carries the same cross-pool blindness — an id two pools share cannot be
+    // attributed to one of them.
+    let own: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let seam: Vec<String> = state
+        .tail
+        .iter()
+        .filter(|id| own.contains(id.as_str()))
+        .cloned()
+        .collect();
+
+    let (series, limits, keys, pool_durations, mean_duration) =
+        resolve_pool_series(catalog, cfg, ids, block_constraints, &seam, want_runtimes)?;
 
     let mut rt = PoolRuntime {
         cfg,

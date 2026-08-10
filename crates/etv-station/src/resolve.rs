@@ -42,6 +42,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
+use time::OffsetDateTime;
 
 use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
@@ -109,6 +110,11 @@ pub fn resolve_channel(
         &GenerationState::empty(),
         &crate::score::ScoreInputs::default(),
         None,
+        // A sequencer block (#169) reads this as the window's absolute
+        // start; the stateless entry point has no generation seam to anchor
+        // to, so "now" is the least surprising answer — the same tolerance
+        // this entry point already gives an unpinned `seed`.
+        OffsetDateTime::now_utc(),
     )?;
     Ok(items)
 }
@@ -132,6 +138,14 @@ pub fn resolve_channel(
 /// largest pool drains (#140); a flat `entries` channel cuts its list at the
 /// same span and resumes there next time (#118). `None` means "however long the
 /// channel naturally runs" — the stateless callers and the tests.
+///
+/// `window_start` is the absolute wall-clock instant this generation begins
+/// airing at — the daemon's own `from`, not the tick's "now". A sequencer
+/// block (#169, [`crate::sequence`]) reads it as `ctx.window.from`, which is
+/// what lets a daypart script ask "what hour does this generation start at"
+/// rather than "what hour is it while the daemon happens to be computing
+/// this". Nothing else in the resolve pipeline reads a live clock (see this
+/// module's own doc), so a `pattern` or `entries` block ignores it entirely.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_channel_with_resume(
     config: &ChannelConfig,
@@ -142,6 +156,7 @@ pub fn resolve_channel_with_resume(
     state: &GenerationState,
     scoring: &crate::score::ScoreInputs,
     fill: Option<Duration>,
+    window_start: OffsetDateTime,
 ) -> Result<(Vec<ResolvedItem>, ResumeMap), ConfigError> {
     // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
     // one draws fresh entropy so an unseeded `random` block reshuffles each
@@ -191,14 +206,18 @@ pub fn resolve_channel_with_resume(
             state,
             scoring,
             fill,
+            window_start,
             &mut resume_out,
         )?;
-        let block_is_pattern = include.is_pattern();
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished
         // list would reorder the pattern's slots and destroy the shape the
         // pattern was written to build; its `[constraints]` table is the default
-        // its pools inherit, not a rule over the block's output.
+        // its pools inherit, not a rule over the block's output. A sequencer
+        // block (#169) is the same story one level up: its pools are
+        // constrained inside `crate::sequence::build`, never over the
+        // finished timeline the script returned.
+        let block_is_pattern = include.is_pattern() || include.is_sequencer();
         let c = if block_is_pattern {
             Constraints::default()
         } else {
@@ -691,6 +710,7 @@ fn resolve_block(
     state: &GenerationState,
     scoring: &crate::score::ScoreInputs,
     fill: Option<Duration>,
+    window_start: OffsetDateTime,
     resume_out: &mut ResumeMap,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
@@ -754,6 +774,67 @@ fn resolve_block(
         // and one of them being unplayable: there is no spare to slide up, and
         // asking the pattern for more would mean advancing its cursors past
         // items this block never airs. Say so rather than quietly under-filling.
+        if let Mode::Count(n) = include.mode {
+            if items.len() < n {
+                tracing::warn!(
+                    event = "block.count_short",
+                    block = idx,
+                    asked = n,
+                    got = items.len(),
+                    "block asked for more items than the catalog could play; see the item-level warnings above",
+                );
+            }
+            items.truncate(n);
+        }
+        return Ok(items);
+    }
+
+    // A sequencer block resolves its pools exactly as a pattern block does —
+    // same source resolution, same `order`/`bucket_order`/`constraints` — and
+    // hands them to the named script instead of walking a pattern (#169).
+    if include.is_sequencer() {
+        let cat = catalog.ok_or_else(|| {
+            unsupported(format!(
+                "block #{idx}: a sequencer block needs the catalog, which is not available"
+            ))
+        })?;
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let score_env = crate::score::ScoreEnv {
+            inputs: scoring,
+            base_dir,
+        };
+        let sequencer = include
+            .sequencer
+            .as_ref()
+            .expect("resolve_block reaches this branch only when `sequencer` is set");
+        let script_path = crate::score::resolve_plugin_path(base_dir, sequencer);
+        let (ids, pools) = crate::sequence::build(
+            cat,
+            &include.pools,
+            groups,
+            include.constraints.as_ref(),
+            &script_path,
+            state,
+            score_env,
+            crate::sequence::Window {
+                from: window_start.unix_timestamp(),
+                fill,
+            },
+        )
+        .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+        resume_out.pools.extend(pools);
+
+        let mut items: Vec<ResolvedItem> = ids
+            .iter()
+            .map(|id| catalog_item(cat, id, defaults))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
+            .into_iter()
+            .flatten()
+            .collect();
+        // Same shortfall reporting a pattern block gives `mode: count` — an
+        // unplayable row has no spare to slide up without asking the script
+        // for more than it decided to draw.
         if let Mode::Count(n) = include.mode {
             if items.len() < n {
                 tracing::warn!(
@@ -1240,6 +1321,7 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
+            sequencer: None,
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
@@ -1264,6 +1346,13 @@ mod tests {
 
     fn path() -> &'static Path {
         Path::new("/tmp/channel.toml")
+    }
+
+    /// A fixed window-start for tests that don't exercise a sequencer block's
+    /// `ctx.window.from` (#169) — any instant does, since nothing else in the
+    /// resolve pipeline reads a live clock.
+    fn t0() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
     }
 
     #[test]
@@ -1376,6 +1465,7 @@ mod tests {
             &state,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -1449,6 +1539,7 @@ mod tests {
             &state,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -2261,6 +2352,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -2298,6 +2390,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let first_ids: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
@@ -2316,6 +2409,7 @@ mod tests {
             &next,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let second_ids: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
@@ -2342,6 +2436,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let state = advance_state(&cat, &GenerationState::empty(), next, &first);
@@ -2355,6 +2450,7 @@ mod tests {
             &state,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let (b, rb) = resolve_channel_with_resume(
@@ -2366,6 +2462,7 @@ mod tests {
             &state,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let ids_a: Vec<&str> = a.iter().map(|i| i.id.as_str()).collect();
@@ -2396,6 +2493,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let state = advance_state(&cat, &GenerationState::empty(), next, &first);
@@ -2419,6 +2517,7 @@ mod tests {
             &state,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         assert!(
@@ -2437,6 +2536,7 @@ mod tests {
             &state,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         let first_got = back
@@ -2472,6 +2572,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
 
@@ -2530,6 +2631,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         assert!(next.pools.is_empty(), "a flat channel has no pools");
@@ -2562,6 +2664,7 @@ mod tests {
             &state,
             &Default::default(),
             fill.map(|d| d.unsigned_abs()),
+            t0(),
         )
         .unwrap();
         (items.into_iter().map(|i| i.id).collect(), next.position)
@@ -2656,6 +2759,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         assert!(!played.is_empty());
@@ -2671,6 +2775,7 @@ mod tests {
             &state,
             &Default::default(),
             None,
+            t0(),
         )
         .unwrap();
         assert!(
@@ -2747,6 +2852,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             Some(Duration::from_secs(90)),
+            t0(),
         )
         .unwrap();
 
@@ -2788,6 +2894,7 @@ mod tests {
                 &state,
                 &Default::default(),
                 Some(Duration::from_secs(90)),
+                t0(),
             )
             .unwrap()
         };
@@ -2829,6 +2936,7 @@ mod tests {
             &GenerationState::empty(),
             &Default::default(),
             Some(Duration::from_secs(90)),
+            t0(),
         )
         .unwrap_err();
         assert!(format!("{err}").contains("entries blocks"), "err = {err}");

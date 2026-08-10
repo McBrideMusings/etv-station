@@ -58,6 +58,14 @@ pub struct BlockFile {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycles: Option<usize>,
+
+    /// Sequencer form (#169): a plugin script that draws this block's
+    /// timeline from `pools` itself, instead of walking `pattern`. Path is
+    /// relative to the channel config's directory, exactly like a pool's own
+    /// `plugin:`. Mutually exclusive with `pattern` — a block authors one or
+    /// the other, enforced in validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencer: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]

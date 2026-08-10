@@ -109,6 +109,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     chance: 1.0,
                 }],
                 cycles: Some(cycles),
+                sequencer: None,
             }],
         },
     }
@@ -125,6 +126,7 @@ fn resolve_with(cfg: &ChannelConfig, cat: &Catalog, inputs: ScoreInputs) -> Vec<
         &state,
         &inputs,
         None,
+        time::OffsetDateTime::now_utc(),
     )
     .unwrap();
     items.into_iter().map(|i| i.id).collect()
@@ -362,6 +364,7 @@ fn pick(ctx) { ["mov-a"] }
         &state,
         &ScoreInputs::default(),
         None,
+        time::OffsetDateTime::now_utc(),
     )
     .expect("a relative plugin path must resolve against the channel config's directory");
 
@@ -391,6 +394,7 @@ fn a_plugin_that_picks_nothing_is_an_error() {
         &state,
         &Default::default(),
         None,
+        time::OffsetDateTime::now_utc(),
     )
     .unwrap_err();
     assert!(err.to_string().contains("picked nothing"), "got {err}");

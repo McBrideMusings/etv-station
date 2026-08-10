@@ -76,6 +76,13 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycles: Option<usize>,
 
+    /// Sequencer form (#169): a plugin script that draws this block's
+    /// timeline from `pools` itself, instead of interleaving them via
+    /// `pattern`. Mutually exclusive with `pattern` — a block authors one or
+    /// the other, enforced in validation. See [`crate::sequence`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencer: Option<PathBuf>,
+
     #[serde(default)]
     pub mode: Mode,
 
@@ -105,11 +112,12 @@ impl BlockInclude {
     }
 
     /// The effective duplicate policy. An entries block defaults to `collapse`;
-    /// a pattern block is always `keep`, because collapse would delete every
-    /// repeat a looping pool deliberately produces (validation rejects an
-    /// explicit `collapse` on a pattern block rather than silently overriding).
+    /// a pattern or sequencer block is always `keep`, because collapse would
+    /// delete every repeat the pool interleave — or the sequencer script —
+    /// deliberately produces (validation rejects an explicit `collapse` on
+    /// either rather than silently overriding).
     pub fn duplicates(&self) -> Duplicates {
-        if self.is_pattern() {
+        if self.is_pattern() || self.is_sequencer() {
             return Duplicates::Keep;
         }
         self.duplicates.unwrap_or_default()
@@ -137,6 +145,24 @@ impl BlockInclude {
     /// one cycle emits — because a tail sized in pool positions would let a wide
     /// window hold inside a generation and quietly lapse across the seam.
     pub fn adjacency_reach(&self) -> usize {
+        if self.is_sequencer() {
+            // A sequencer draws no fixed count per cycle — there is no cycle
+            // — so there is no way to convert "N draws of this pool" into "N
+            // channel positions" the way a pattern block's `take` counts
+            // allow above (#169). Reporting the pool's own reach directly, in
+            // pool-draw units, is a safe floor: it can undersize the tail
+            // when the script draws this pool more than once per aired
+            // position, which is unknowable here, but it never oversizes it,
+            // and it is exactly what a pool with no `constraints` at all
+            // already reports (zero).
+            let block = self.constraints.as_ref();
+            return self
+                .pools
+                .iter()
+                .map(|pool| pool.constraints(block).reach())
+                .max()
+                .unwrap_or(0);
+        }
         if !self.is_pattern() {
             return self.constraints().reach();
         }
@@ -175,11 +201,20 @@ impl BlockInclude {
     }
 
     /// Whether this block interleaves pools via a pattern rather than playing a
-    /// flat `entries` list. True as soon as either pattern field is present, so
-    /// a half-specified block (pools without pattern) reaches validation and
-    /// gets a clear error instead of being read as an empty entries block.
+    /// flat `entries` list. True as soon as either pattern field is present
+    /// AND no `sequencer` is named (#169: a block naming a sequencer sets
+    /// `pools` too, but is not a pattern block — see [`Self::is_sequencer`]),
+    /// so a half-specified block (pools without pattern or sequencer) still
+    /// reaches validation and gets a clear error instead of being read as an
+    /// empty entries block.
     pub fn is_pattern(&self) -> bool {
-        !self.pools.is_empty() || !self.pattern.is_empty()
+        (!self.pools.is_empty() || !self.pattern.is_empty()) && self.sequencer.is_none()
+    }
+
+    /// Whether this block draws its timeline from a `sequencer` plugin rather
+    /// than interleaving pools via `pattern` (#169). See [`crate::sequence`].
+    pub fn is_sequencer(&self) -> bool {
+        self.sequencer.is_some()
     }
 
     /// Splice a loaded block-file body into this include's inline fields and
@@ -192,6 +227,7 @@ impl BlockInclude {
         self.entries = body.entries;
         self.fallback = body.fallback;
         self.pools = body.pools;
+        self.sequencer = body.sequencer;
         self.pattern = body.pattern;
         self.cycles = body.cycles;
         self.block = None;
