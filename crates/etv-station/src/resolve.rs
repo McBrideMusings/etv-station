@@ -24,10 +24,18 @@
 //! optional.
 //!
 //! Still rejected with a clear `unsupported` error (later issues): `include`
-//! entries, a non-empty block `filter`, and a block `fallback` (its schema is a
-//! follow-up). The catalog is not yet opened by the daemon — until that lands,
-//! query entries / non-`manual` order only resolve when a catalog is supplied
-//! (tests), and error at runtime.
+//! entries and a non-empty block `filter`. The catalog is not yet opened by
+//! the daemon — until that lands, query entries / non-`manual` order only
+//! resolve when a catalog is supplied (tests), and error at runtime.
+//!
+//! A block's optional `fallback` (#97) resolves **instead of** `entries` when
+//! `entries` resolves to nothing eligible — the empty-set case a 24/7 channel
+//! must not dead-air or error on. It runs through the exact same machinery as
+//! a primary entry (`resolve_query` / `resolve_item`), never a parallel path,
+//! and then through the block's own duplicates/order/mode exactly like a
+//! primary entry's result would. Entries-block only — a pattern block's pools
+//! already have their own empty-pool policy (`on_short`), so `fallback` is
+//! rejected there at validation.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -37,8 +45,8 @@ use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
 use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, ItemEntry, Mode,
-    Order, QueryEntry, SourceConfig,
+    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, Fallback,
+    ItemEntry, Mode, Order, QueryEntry, SourceConfig,
 };
 use crate::constrain::{ItemKeys, Limits};
 use crate::errors::ConfigError;
@@ -666,6 +674,22 @@ fn resolve_block(
         }
     }
 
+    // 1.5. Fallback (#97) — a 24/7 channel must not dead-air or error just
+    //    because this generation's `entries` resolved to nothing (an empty
+    //    `query` match is how a Plex collection being momentarily empty
+    //    actually surfaces here). Substitutes for `entries`' output through
+    //    the same machinery a primary entry uses, then falls straight into
+    //    the same duplicates/order/mode steps below — never a parallel path.
+    //    Opt-in only: a block with no `fallback` still resolves to empty
+    //    exactly as before this existed, and a fallback that also resolves to
+    //    nothing leaves the block empty exactly the same way.
+    if items.is_empty()
+        && let Some(fallback) = &include.fallback
+    {
+        items = resolve_fallback(catalog, fallback, defaults, seed, source_roots, path_index)
+            .map_err(|m| unsupported(format!("block #{idx}: fallback: {m}")))?;
+    }
+
     // 2. Duplicates — collapse (default) runs BEFORE order so which occurrence
     //    survives is deterministic even under a `random` shuffle.
     if matches!(include.duplicates(), Duplicates::Collapse) {
@@ -734,6 +758,30 @@ fn resolve_query(
         .into_iter()
         .flatten()
         .collect())
+}
+
+/// Resolve a block's `fallback` (#97) — through the exact same machinery as a
+/// primary entry, never a parallel path: a `query` fallback runs
+/// [`resolve_query`], exactly like a primary `kind: query` entry; a static
+/// item fallback runs [`resolve_item`], exactly like a primary `kind: item`
+/// entry (always exactly one item, so it can never itself resolve to empty).
+fn resolve_fallback(
+    catalog: Option<&Catalog>,
+    fallback: &Fallback,
+    defaults: Option<&ProgramMetadata>,
+    seed: u64,
+    source_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
+) -> Result<Vec<ResolvedItem>, String> {
+    match fallback {
+        Fallback::Query(query) => {
+            let cat = catalog.ok_or_else(|| {
+                "a query fallback needs the catalog, which is not available".to_string()
+            })?;
+            resolve_query(cat, query, defaults, seed)
+        }
+        Fallback::Item(item) => Ok(vec![resolve_item(item, defaults, source_roots, path_index)]),
+    }
 }
 
 /// Resolve a `collection` entry: look the collection up by name and emit its
@@ -1048,6 +1096,7 @@ mod tests {
             duplicates: None,
             constraints: None,
             entries,
+            fallback: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
@@ -1460,6 +1509,89 @@ mod tests {
             SourceConfig::Local { path } => assert!(path.ends_with("tt0120737.mkv")),
             other => panic!("expected local source, got {other:?}"),
         }
+    }
+
+    // ---- block fallback (#97) ----------------------------------------------
+
+    fn empty_query(order: Option<Order>) -> Entry {
+        Entry::Query(QueryEntry {
+            query: "item.title == \"Nonesuch\"".into(),
+            order,
+        })
+    }
+
+    #[test]
+    fn item_fallback_resolves_when_primary_entries_match_nothing() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![empty_query(None)]);
+        inc.fallback = Some(Fallback::Item(Box::new(item_entry("standby"))));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["lavfi:standby"]);
+    }
+
+    #[test]
+    fn query_fallback_resolves_and_keeps_its_own_order() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![empty_query(None)]);
+        inc.fallback = Some(Fallback::Query(QueryEntry {
+            query: "item.title.contains(\"Ring\") || item.title.contains(\"Tower\") \
+                     || item.title.contains(\"King\")"
+                .into(),
+            order: Some(Order::parse("release_date:asc").unwrap()),
+        }));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0120737", "imdb:tt0167261", "imdb:tt0167260"]
+        );
+    }
+
+    #[test]
+    fn fallback_is_ignored_when_primary_entries_resolve_to_something() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.year >= 2001".into(),
+            order: None,
+        })]);
+        inc.fallback = Some(Fallback::Item(Box::new(item_entry("standby"))));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(items.len(), 3);
+        assert!(
+            !ids.contains(&"lavfi:standby"),
+            "fallback aired despite non-empty primary entries: {ids:?}"
+        );
+    }
+
+    /// #97's opt-in guarantee: a block that names no `fallback` must behave
+    /// exactly as it did before this field existed, including still failing
+    /// the channel when its entries resolve to nothing.
+    #[test]
+    fn a_block_with_no_fallback_still_resolves_to_empty() {
+        let cat = seeded_catalog();
+        let inc = include_with(vec![empty_query(None)]);
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("zero items"), "err = {err}");
+    }
+
+    /// The fallback runs through the block's own duplicates/order/mode exactly
+    /// like a primary entry's result would — `mode = { count: 2 }` still
+    /// truncates a fallback that matched three items.
+    #[test]
+    fn fallback_result_still_goes_through_the_blocks_mode_and_order() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![empty_query(None)]);
+        inc.mode = Mode::Count(2);
+        inc.order = Some(Order::parse("release_date:asc").unwrap());
+        inc.fallback = Some(Fallback::Query(QueryEntry {
+            query: "item.year >= 2001".into(),
+            order: None,
+        }));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["imdb:tt0120737", "imdb:tt0167261"]);
     }
 
     // ---- episode default order (#95) --------------------------------------

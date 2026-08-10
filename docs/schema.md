@@ -32,6 +32,7 @@ flat list of entries. Source: `config/block.rs` (`BlockFile`).
 | `program` | no | [`ProgramMetadata`](#programmetadata) — block-wide defaults |
 | `duplicates` | no — default `collapse` | `collapse` \| `keep` |
 | `entries` | **yes** | list of [`Entry`](#entry) |
+| `fallback` | no | [`Fallback`](#fallback) — resolved instead of `entries` when `entries` resolves to nothing |
 
 ```yaml
 # blocks/starwars-timeline.yaml
@@ -337,6 +338,53 @@ same physical file collapse regardless of how they entered the block. Source:
 | `collapse` *(default)* | drop repeats of the same derived identity |
 | `keep` | keep every occurrence |
 
+### Fallback
+
+Resolved **instead of** a block's `entries` when `entries` resolves to nothing
+eligible — a 24/7 channel must not dead-air or error just because a query
+matched nothing this generation (an empty Plex collection surfaces here as a
+`query` that matches zero items). Optional and opt-in: a block with no
+`fallback` still resolves to empty exactly as it did before this field
+existed. Source: `config/entry.rs` (`Fallback`).
+
+Tagged by `kind`, same as [`Entry`](#entry) — two kinds:
+
+| `kind` | Fields |
+|---|---|
+| `query` | same as [`kind: query`](#kind-query-—-resolve-against-the-catalog): `query` (**yes**), `order` (no) |
+| `item` | same as [`kind: item`](#kind-item-—-an-authored-file): `source` (**yes**), `in_point` / `out_point` / `program` (no) |
+
+```yaml
+entries:
+  - kind: query
+    query: 'item.collections.contains("Now Airing")'
+fallback:
+  kind: query
+  query: 'item.type == "movie"'
+  order: "random"
+```
+
+```yaml
+entries:
+  - kind: query
+    query: 'item.collections.contains("Now Airing")'
+fallback:
+  kind: item
+  source:
+    kind: local
+    path: "${ETV_TEST_MEDIA_DIR}/standby/please-stand-by.mkv"
+```
+
+The fallback resolves through the exact same code path as a primary entry —
+`kind: query` runs the same CEL grammar and carries its own `order`, exactly
+like a primary query entry; `kind: item` resolves exactly like a primary item
+entry (always exactly one item). Once resolved, it goes through the block's
+own `duplicates` / `order` / `mode` exactly like `entries`' output would.
+
+Entries-block only: a pattern block (`pools` + `pattern`) already gives each
+pool its own empty-pool policy via `on_short`, so a pattern block declaring
+`fallback` is rejected at load.
+
 ## Station file
 
 Top-level registry. Source: `config/station.rs`.
@@ -443,10 +491,10 @@ rule:
 ```
 
 The two forms are interchangeable: at load, a referenced file's body
-(`program` / `duplicates` / `entries`) is copied into the include, so a
-reference and an equivalent inline block resolve identically. `mode`, `order`,
-and `filter` are **composition fields on the include** — they never live in the
-block file body.
+(`program` / `duplicates` / `entries` / `fallback`) is copied into the include,
+so a reference and an equivalent inline block resolve identically. `mode`,
+`order`, and `filter` are **composition fields on the include** — they never
+live in the block file body.
 
 ### Pool `plugin` — items chosen by a scorer script
 

@@ -94,6 +94,37 @@ pub struct CollectionEntry {
     pub name: String,
 }
 
+/// A block-level fallback (#97): resolved **instead of** the block's primary
+/// entries when those resolve to nothing eligible — the empty-set case a 24/7
+/// channel must not dead-air or error on (an empty Plex collection is the
+/// motivating case; see [`crate::resolve::resolve_block`]). Optional and
+/// opt-in: a block with no `fallback` still resolves to empty exactly as
+/// before this field existed.
+///
+/// Either a `query`, resolved through the exact same CEL grammar and the exact
+/// same [`crate::resolve::resolve_query`] a primary `kind: query` entry uses,
+/// or a static item reference, resolved through
+/// [`crate::resolve::resolve_item`] like a primary `kind: item` entry — never
+/// a parallel resolve path. Whichever kind resolves, the result then runs
+/// through the block's own duplicates/order/mode exactly like a primary
+/// entry's result would.
+///
+/// Entries-block only. A pattern block's pools already have their own
+/// empty-pool policy (`on_short`), so a pattern block declaring `fallback` is
+/// rejected at validation.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Fallback {
+    /// The same CEL grammar as a primary `kind: query` entry, including its
+    /// own optional `order`.
+    Query(QueryEntry),
+    /// A single static item, resolved exactly like a primary `kind: item`
+    /// entry. Boxed: `ItemEntry` is far larger than `QueryEntry`, and an
+    /// unboxed variant would size every `Fallback` — most of which are the
+    /// `Query` kind — to the biggest one.
+    Item(Box<ItemEntry>),
+}
+
 /// Include another block, with its own cursor; play-through then advance
 /// (#46 include semantics). Resolution is the order/resolution engine (#69).
 #[derive(Debug, Deserialize, Serialize)]

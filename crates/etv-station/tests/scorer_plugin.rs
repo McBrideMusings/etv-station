@@ -77,6 +77,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                 duplicates: None,
                 constraints: None,
                 entries: Vec::new(),
+                fallback: None,
                 filter: None,
                 mode: Mode::All,
                 order: Default::default(),
