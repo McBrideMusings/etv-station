@@ -324,6 +324,15 @@ fn resolve_blocks(
                 *path = expand_env(path, channel_path, env)?;
             }
         }
+
+        // A pool's datastore grants (#167) name their location the same way —
+        // `${VAR}`, never a literal — expanded here before validation ever
+        // tries to open one.
+        for pool in &mut include.pools {
+            for grant in &mut pool.datastores {
+                grant.path = expand_env(&grant.path, channel_path, env)?;
+            }
+        }
     }
 
     Ok(())
@@ -563,6 +572,26 @@ mod tests {
         let inc = &config.rule.blocks[0];
         assert_eq!(inc.pools.len(), 1);
         assert_eq!(inc.pattern.len(), 1);
+    }
+
+    /// A pool's datastore grant (#167) names its location as `${VAR}`, never
+    /// a literal — expanded the same way an item's local `source.path` is,
+    /// so validation's open-check sees a real filesystem path.
+    #[test]
+    fn resolve_blocks_expands_a_pool_datastore_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel_path = dir.path().join("channel.yaml");
+        std::fs::write(
+            &channel_path,
+            "rule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          plugin: \"scorer.rhai\"\n          datastores:\n            - name: \"taste_db\"\n              path: \"${TASTE_DB_PATH}\"\n      pattern:\n        - pool: \"shows\"\n          take: 1\n",
+        )
+        .unwrap();
+
+        let env = env_map(&[("TASTE_DB_PATH", "/srv/taste.db")]);
+        let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
+        resolve_blocks(&mut config, &channel_path, &env).unwrap();
+        let inc = &config.rule.blocks[0];
+        assert_eq!(inc.pools[0].datastores[0].path, "/srv/taste.db");
     }
 
     #[test]

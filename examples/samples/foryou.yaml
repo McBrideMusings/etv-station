@@ -93,6 +93,9 @@ rule:
         # suppression in the script. See #116 and ADR 0002.
         - name: movies
           plugin: "../plugins/taste-engine.rhai"
+          # taste-engine.rhai declares both (#167) — the pool must grant
+          # exactly what it declares, or the channel fails to load.
+          capabilities: [catalog_read, watch_history]
           select: round_robin
           advance: restart
 
@@ -103,6 +106,7 @@ rule:
         # picks up where it left off.
         - name: shows
           plugin: "../plugins/taste-engine.rhai"
+          capabilities: [catalog_read, watch_history]
           select: round_robin
           rotate: visit
           advance: resume

@@ -430,6 +430,51 @@ pub struct Pool {
         skip_serializing_if = "Option::is_none"
     )]
     pub config: Option<serde_json::Value>,
+
+    /// Simple capabilities (#167) granted to this pool's `plugin` — currently
+    /// `"catalog_read"` and `"watch_history"`. Every capability the script's
+    /// `capabilities()` declares must appear here (else the load fails,
+    /// naming the plugin and the capability), and every name listed here must
+    /// be one the script declares (else the load fails the other way,
+    /// naming both). See [`crate::score::declared_capabilities`].
+    ///
+    /// A named external datastore is not listed here — see
+    /// [`Pool::datastores`]. Meaningless on an `expr` or `groups` pool, on
+    /// the same terms as [`Pool::config`]: there is no script to grant
+    /// anything to, so it is ignored rather than rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+
+    /// Named external datastore handles (#167) granted to this pool's
+    /// `plugin` — one entry per datastore name the plugin's `capabilities()`
+    /// declares via `#{ datastore: "name" }`. Cross-checked against the
+    /// declaration the same way [`Pool::capabilities`] is: a name declared
+    /// but not granted, or granted but not declared, fails the load naming
+    /// both.
+    ///
+    /// What is actually reachable through the opened handle is not this
+    /// station's concern — `plex-db-ex` is a separate project (#181, out of
+    /// scope here). This only proves the location is openable before any
+    /// plugin ever runs, so a station whose channels grant none opens no
+    /// connection at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datastores: Vec<DatastoreGrant>,
+}
+
+/// One named external datastore grant (#167) — see [`Pool::datastores`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatastoreGrant {
+    /// Matches the name the plugin's `capabilities()` declares for this
+    /// datastore.
+    pub name: String,
+
+    /// Filesystem path to the datastore. Written as an env var reference
+    /// (`${VAR}`) and expanded at load exactly like an item's local
+    /// `source.path` (see `config::load::resolve_blocks`) — per the project
+    /// rule, a store location never appears as a literal in a committed
+    /// config.
+    pub path: String,
 }
 
 impl Pool {
@@ -621,6 +666,23 @@ on_short: short
             pool.constraints.as_ref().unwrap().no_repeat_within,
             Some(NoRepeatWithin::Positions(5))
         );
+    }
+
+    #[test]
+    fn parses_capabilities_and_datastores() {
+        let yaml = "name: taste\nplugin: taste.rhai\ncapabilities: [catalog_read, watch_history]\ndatastores:\n  - name: taste_db\n    path: \"${TASTE_DB_PATH}\"\n";
+        let pool: Pool = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(pool.capabilities, vec!["catalog_read", "watch_history"]);
+        assert_eq!(pool.datastores.len(), 1);
+        assert_eq!(pool.datastores[0].name, "taste_db");
+        assert_eq!(pool.datastores[0].path, "${TASTE_DB_PATH}");
+    }
+
+    #[test]
+    fn capabilities_and_datastores_default_empty() {
+        let bare = bare("movies");
+        assert!(bare.capabilities.is_empty());
+        assert!(bare.datastores.is_empty());
     }
 
     #[test]

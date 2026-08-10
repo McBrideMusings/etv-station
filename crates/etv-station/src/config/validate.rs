@@ -408,6 +408,7 @@ fn validate_pattern_block<'a>(
             // that reads the script off disk, so the cheaper structural checks
             // above get to report first when more than one thing is wrong.
             validate_plugin_declares_pool_provider(pool, plugin, base_dir, &bad)?;
+            validate_plugin_capabilities(pool, plugin, base_dir, &bad)?;
         }
         if !pool.groups.is_empty() {
             validate_pool_groups(pool, channel_groups, &bad)?;
@@ -538,6 +539,83 @@ fn validate_plugin_declares_pool_provider(
     Ok(())
 }
 
+/// A pool naming a script for `plugin:` grants it exactly the capabilities
+/// (#167) the script's `capabilities()` declares — no more, no less.
+///
+/// Symmetry is enforced both ways: a capability the script declares that this
+/// pool does not grant fails the load naming the plugin and the capability
+/// (the config is missing a grant); a capability this pool grants that the
+/// script never declared also fails, the other way round (the grant is
+/// unasked-for — a typo or a stale config, either of which silently doing
+/// nothing would hide). A named datastore grant that survives both checks is
+/// then proven openable here, before any plugin ever runs — a station whose
+/// channels grant none never reaches this code at all, and so opens no
+/// connection.
+fn validate_plugin_capabilities(
+    pool: &Pool,
+    plugin: &Path,
+    base_dir: &Path,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let script_path = crate::score::resolve_plugin_path(base_dir, plugin);
+    let capabilities = crate::score::declared_capabilities(&script_path)
+        .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
+
+    for cap in &pool.capabilities {
+        if !crate::score::KNOWN_CAPABILITIES.contains(&cap.as_str()) {
+            return Err(bad(format!(
+                "pool {:?} grants unknown capability {cap:?} — known capabilities are: {}",
+                pool.name,
+                crate::score::KNOWN_CAPABILITIES.join(", ")
+            )));
+        }
+    }
+
+    // Simple capabilities and named datastores are spelled out of one
+    // namespace on both sides, so the two-way symmetry check is one set
+    // difference each way.
+    let declared: HashSet<&str> = capabilities
+        .iter()
+        .map(crate::score::Capability::name)
+        .collect();
+    let granted: HashSet<&str> = pool
+        .capabilities
+        .iter()
+        .map(String::as_str)
+        .chain(pool.datastores.iter().map(|d| d.name.as_str()))
+        .collect();
+
+    if let Some(cap) = declared.difference(&granted).next() {
+        return Err(bad(format!(
+            "pool {:?} names plugin {}, which declares capability {cap:?} that this \
+             pool's `capabilities`/`datastores` does not grant",
+            pool.name,
+            script_path.display()
+        )));
+    }
+    if let Some(cap) = granted.difference(&declared).next() {
+        return Err(bad(format!(
+            "pool {:?} grants capability {cap:?} that plugin {} never declares — \
+             a grant nobody asked for is a typo or a stale config",
+            pool.name,
+            script_path.display()
+        )));
+    }
+
+    // Both sets agree now, so every grant here is also declared — prove each
+    // named datastore is actually openable before any plugin ever runs.
+    for grant in &pool.datastores {
+        std::fs::File::open(&grant.path).map_err(|e| {
+            bad(format!(
+                "pool {:?}: datastore {:?} at {:?} could not be opened: {e}",
+                pool.name, grant.name, grant.path
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
 /// A pool's `groups` (#165) must each name a channel-declared group, and the
 /// groups a single pool combines must be disjoint — a show belonging to two
 /// of them would have no single rotation domain to land in. (A show
@@ -638,6 +716,8 @@ mod tests {
             on_short: OnShort::default(),
             constraints: None,
             config: None,
+            capabilities: Vec::new(),
+            datastores: Vec::new(),
         }
     }
 
@@ -1298,6 +1378,140 @@ fn pick(ctx) { throw "pick must not run at load time"; }
 "#,
         )
         .unwrap();
+    }
+
+    // ---- plugin capability declaration (#167) ------------------------------
+
+    /// A channel whose one pool grants exactly what the plugin declares.
+    fn validate_plugin_script_with_capabilities(
+        body: &str,
+        capabilities: Vec<&str>,
+        datastores: Vec<(&str, &str)>,
+    ) -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("scorer.rhai");
+        std::fs::write(&script, body).unwrap();
+        let mut pool = plugin_pool("shows", script);
+        pool.capabilities = capabilities.into_iter().map(String::from).collect();
+        pool.datastores = datastores
+            .into_iter()
+            .map(|(name, path)| crate::config::DatastoreGrant {
+                name: name.into(),
+                path: path.into(),
+            })
+            .collect();
+        let block = pattern_block(vec![pool], vec![step("shows", 1)]);
+        validate_channel(&dir.path().join("channel.yaml"), &channel_with(vec![block]))
+    }
+
+    #[test]
+    fn a_plugin_declaring_no_capabilities_needs_no_grant() {
+        validate_plugin_script_with_capabilities(
+            r#"fn hooks() { ["pool_provider"] }"#,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_plugin_declaring_capabilities_the_pool_grants_validates() {
+        validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read", "watch_history"] }
+"#,
+            vec!["catalog_read", "watch_history"],
+            vec![],
+        )
+        .unwrap();
+    }
+
+    /// Error case: a plugin declares a capability the config does not grant —
+    /// fails at load, naming both the plugin and the capability.
+    #[test]
+    fn a_declared_capability_the_pool_does_not_grant_is_rejected() {
+        let err = validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read", "watch_history"] }
+"#,
+            vec!["catalog_read"],
+            vec![],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("watch_history"), "msg = {msg}");
+        assert!(msg.contains("scorer.rhai"), "msg = {msg}");
+    }
+
+    /// Error case, the other way: the pool grants a capability the plugin
+    /// never declared — a typo or stale config, refused rather than ignored.
+    #[test]
+    fn a_granted_capability_the_plugin_never_declared_is_rejected() {
+        let err = validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read"] }
+"#,
+            vec!["catalog_read", "watch_history"],
+            vec![],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("watch_history"), "msg = {msg}");
+        assert!(msg.contains("never declares"), "msg = {msg}");
+    }
+
+    #[test]
+    fn a_pool_granting_an_unknown_capability_name_is_rejected() {
+        let err = validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { [] }
+"#,
+            vec!["telepathy"],
+            vec![],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("telepathy"));
+    }
+
+    /// A declared-and-granted datastore whose path opens cleanly validates,
+    /// and the acceptance bar for #167: a station with no datastore grant
+    /// anywhere never even reaches the open call.
+    #[test]
+    fn a_datastore_grant_that_opens_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("taste.db");
+        std::fs::write(&db, b"").unwrap();
+        validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { [#{ datastore: "taste_db" }] }
+"#,
+            vec![],
+            vec![("taste_db", db.to_str().unwrap())],
+        )
+        .unwrap();
+    }
+
+    /// Error case: a grant naming a datastore that cannot be opened fails at
+    /// load, naming the datastore and the underlying error.
+    #[test]
+    fn a_datastore_grant_that_cannot_be_opened_is_rejected() {
+        let err = validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { [#{ datastore: "taste_db" }] }
+"#,
+            vec![],
+            vec![("taste_db", "/nonexistent/path/does/not/exist.db")],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("taste_db"), "msg = {msg}");
+        assert!(msg.contains("could not be opened"), "msg = {msg}");
     }
 
     #[test]

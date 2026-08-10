@@ -21,7 +21,8 @@ pub use load::{LoadedChannel, Station, load, read_channel};
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};
 pub use pool::{
-    Advance, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, ShowGroup, Take, TakeFrom,
+    Advance, DatastoreGrant, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, ShowGroup, Take,
+    TakeFrom,
 };
 pub use rule::{BlockInclude, RuleConfig};
 pub use source::SourceConfig;

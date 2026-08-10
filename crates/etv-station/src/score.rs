@@ -23,6 +23,17 @@
 //! // or none, fails to load rather than failing mid-generation.
 //! fn hooks() { ["pool_provider"] }
 //!
+//! // Which host capabilities this script needs (#167). Also read at config
+//! // load time, alongside hooks(). Omitting capabilities() declares none —
+//! // a script that only reads ctx.recent/ctx.config/ctx.target_count/ctx.now
+//! // needs nothing here. `ctx.sets` and `ctx.history` below are the two
+//! // gated inputs: reaching for either without declaring (and being
+//! // granted) the matching capability fails the pick() call that reaches
+//! // for it, naming the capability. A named external datastore is declared
+//! // as `#{ datastore: "name" }` instead of a bare string; see
+//! // `config::Pool::datastores`.
+//! fn capabilities() { ["catalog_read", "watch_history"] }
+//!
 //! // Every catalog query this plugin will read, named. Run once, up front.
 //! fn sources() {
 //!     #{
@@ -62,7 +73,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rhai::{Array, Dynamic, Engine, Map, Scope};
+use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Scope};
 
 use crate::catalog::{Catalog, TagNs};
 
@@ -237,6 +248,202 @@ pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
     Ok(hooks)
 }
 
+/// A host capability a plugin script can declare via `capabilities()` (#167).
+/// `CatalogRead` gates `ctx.sets`; `WatchHistory` gates `ctx.history`.
+/// `Datastore` names an external handle the channel config must separately
+/// grant — what is behind that handle is out of scope for this station (see
+/// [`crate::config::Pool::datastores`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Capability {
+    CatalogRead,
+    WatchHistory,
+    Datastore(String),
+}
+
+impl Capability {
+    /// The one name this capability answers to — the string a script's
+    /// `capabilities()` returns and the string a pool grants under
+    /// `capabilities:` or as a `datastores:` entry name. Simple capabilities
+    /// and datastore names share a single namespace, which is what lets the
+    /// load-time cross-check ([`crate::config::validate`]) compare the two
+    /// sides as plain sets of names.
+    pub fn name(&self) -> &str {
+        match self {
+            Capability::CatalogRead => "catalog_read",
+            Capability::WatchHistory => "watch_history",
+            Capability::Datastore(name) => name,
+        }
+    }
+}
+
+/// The simple (non-parameterized) capability names `capabilities()` may
+/// return as bare strings. A named datastore is declared separately, as
+/// `#{ datastore: "name" }` — see [`declared_capabilities`].
+pub const KNOWN_CAPABILITIES: &[&str] = &["catalog_read", "watch_history"];
+
+/// Read the capabilities a plugin script declares, without running its
+/// scoring path or touching the catalog — the same load-time-only shape as
+/// [`declared_hooks`].
+///
+/// Unlike `hooks()`, `capabilities()` is optional: a script with no such
+/// function declares nothing, which is a valid answer for a plugin that only
+/// reads the ambient inputs (`ctx.pool`, `ctx.config`, `ctx.target_count`,
+/// `ctx.now`, `ctx.recent`). Presence is checked against the compiled AST
+/// rather than by calling and catching a "function not found" error, so a
+/// script whose `capabilities()` genuinely throws still fails loudly instead
+/// of being read as "declares nothing".
+///
+/// Every failure names the script: an unreadable or uncompilable file, a
+/// throwing `capabilities()`, an entry that is neither a string nor a
+/// `#{ datastore: "name" }` map, an unknown string capability, or a datastore
+/// entry with an empty or non-string name.
+pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, String> {
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
+    let engine = engine();
+    let ast = engine
+        .compile(&source)
+        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
+
+    if !ast.iter_functions().any(|f| f.name == "capabilities") {
+        return Ok(Vec::new());
+    }
+
+    let mut scope = Scope::new();
+    let declared: Array = engine
+        .call_fn(&mut scope, &ast, "capabilities", ())
+        .map_err(|e| format!("plugin {}: capabilities(): {e}", script_path.display()))?;
+
+    let mut out = Vec::with_capacity(declared.len());
+    for value in declared {
+        if value.is_map() {
+            let map = value.cast::<Map>();
+            let ds_value = map.get("datastore").ok_or_else(|| {
+                format!(
+                    "plugin {}: capabilities() entry {map:?} is not a recognized capability — \
+                     expected a string or `#{{ datastore: \"name\" }}`",
+                    script_path.display()
+                )
+            })?;
+            let ds_name = ds_value.clone().into_string().map_err(|actual| {
+                format!(
+                    "plugin {}: capabilities() datastore name must be a string, got {actual}",
+                    script_path.display()
+                )
+            })?;
+            if ds_name.trim().is_empty() {
+                return Err(format!(
+                    "plugin {}: capabilities() declares a datastore with an empty name",
+                    script_path.display()
+                ));
+            }
+            out.push(Capability::Datastore(ds_name));
+            continue;
+        }
+
+        let name = value.into_string().map_err(|actual| {
+            format!(
+                "plugin {}: capabilities() must return an array of strings or \
+                 `#{{ datastore: \"name\" }}` maps, got {actual}",
+                script_path.display()
+            )
+        })?;
+        match name.as_str() {
+            "catalog_read" => out.push(Capability::CatalogRead),
+            "watch_history" => out.push(Capability::WatchHistory),
+            _ => {
+                return Err(format!(
+                    "plugin {} declares unknown capability {name:?} — known capabilities \
+                     are: {}, or `#{{ datastore: \"name\" }}`",
+                    script_path.display(),
+                    KNOWN_CAPABILITIES.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Which capabilities a channel config granted a plugin pool (#167),
+/// resolved from [`crate::config::Pool::capabilities`] before [`pick`] runs.
+/// Datastore grants carry no runtime handle in this slice — a grant only
+/// proves at load time that its location is openable
+/// ([`crate::config::validate`]); nothing here exposes it to the script.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GrantedCapabilities {
+    pub catalog_read: bool,
+    pub watch_history: bool,
+}
+
+impl GrantedCapabilities {
+    /// Read a pool's granted capability names back into the two flags [`pick`]
+    /// acts on, so a caller never has to know how a capability is spelled.
+    /// Names that are not simple capabilities — a datastore grant — are
+    /// ignored: nothing in this slice hands a script a datastore handle.
+    pub fn from_names(names: &[String]) -> Self {
+        let has = |want: &str| names.iter().any(|n| n == want);
+        Self {
+            catalog_read: has("catalog_read"),
+            watch_history: has("watch_history"),
+        }
+    }
+}
+
+/// The `ctx` argument handed to a plugin's `pick()`.
+///
+/// A registered custom type rather than a plain map, so that `ctx.sets` and
+/// `ctx.history` — the two capability-gated fields (#167) — can refuse a
+/// script that reaches for either without having declared and been granted
+/// it, at the moment of the read, with a message that names the capability.
+/// Every other field is an ordinary infallible getter; nothing about their
+/// values or names changes from before this existed, so a script that never
+/// touches a gated field is unaffected.
+#[derive(Debug, Clone)]
+struct ScoreCtx {
+    /// Filled only when `catalog_read` was granted; `None` is what turns a
+    /// read of `ctx.sets` into the error [`ungranted`] words.
+    sets: Option<Dynamic>,
+    pool: String,
+    config: Dynamic,
+    target_count: i64,
+    now: i64,
+    /// Filled only when `watch_history` was granted — same gate as `sets`.
+    history: Option<Dynamic>,
+    recent: Dynamic,
+}
+
+/// What a script gets back for reading a `ctx` field its pool was not granted
+/// (#167) — one place, so both gated fields refuse in the same words.
+fn ungranted(capability: &str) -> Box<EvalAltResult> {
+    format!("capability `{capability}` not declared").into()
+}
+
+impl ScoreCtx {
+    fn get_sets(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
+        self.sets.clone().ok_or_else(|| ungranted("catalog_read"))
+    }
+    fn get_pool(&mut self) -> String {
+        self.pool.clone()
+    }
+    fn get_config(&mut self) -> Dynamic {
+        self.config.clone()
+    }
+    fn get_target_count(&mut self) -> i64 {
+        self.target_count
+    }
+    fn get_now(&mut self) -> i64 {
+        self.now
+    }
+    fn get_history(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
+        self.history
+            .clone()
+            .ok_or_else(|| ungranted("watch_history"))
+    }
+    fn get_recent(&mut self) -> Dynamic {
+        self.recent.clone()
+    }
+}
+
 /// The Rhai engine every plugin call uses.
 ///
 /// The nesting limits are set explicitly because Rhai's defaults are lower in a
@@ -248,9 +455,23 @@ pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
 ///
 /// Compiling and calling must use the same configuration, which is the whole
 /// reason this is one function rather than two call sites that drifted.
+///
+/// [`ScoreCtx`] is registered here unconditionally, including for the
+/// `hooks()`/`capabilities()`-only compiles in [`declared_hooks`] and
+/// [`declared_capabilities`] — harmless, since nothing there ever constructs
+/// one, and it keeps every plugin call sharing one engine configuration.
 fn engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
+    engine
+        .register_type_with_name::<ScoreCtx>("ScoreCtx")
+        .register_get("sets", ScoreCtx::get_sets)
+        .register_get("pool", ScoreCtx::get_pool)
+        .register_get("config", ScoreCtx::get_config)
+        .register_get("target_count", ScoreCtx::get_target_count)
+        .register_get("now", ScoreCtx::get_now)
+        .register_get("history", ScoreCtx::get_history)
+        .register_get("recent", ScoreCtx::get_recent);
     engine
 }
 
@@ -287,12 +508,18 @@ impl ScoreCache {
 /// that returns nothing is an error too — an empty pool would silently shorten
 /// the channel, and a scorer that finds nothing worth playing is a broken
 /// scorer, not an empty schedule.
+///
+/// `granted` (#167) is trusted as already reconciled against what the script
+/// declares — [`crate::config::validate`] rejects a mismatch at config load —
+/// so this only decides what `ctx.sets` / `ctx.history` resolve to for *this*
+/// call; it never re-reads `capabilities()`.
 pub fn pick(
     cache: &ScoreCache,
     script_path: &Path,
     inputs: &ScoreInputs,
     pool_name: &str,
     pool_config: Option<&serde_json::Value>,
+    granted: GrantedCapabilities,
 ) -> Result<Vec<String>, String> {
     let engine = engine();
 
@@ -304,38 +531,14 @@ pub fn pick(
         )
     })?;
     let ast = &cached.ast;
-    let sets = cached.sets.clone();
 
     let mut scope = Scope::new();
 
-    let mut ctx = Map::new();
-    ctx.insert("sets".into(), sets);
-    // Which pool is asking. One script commonly serves several pools of the
-    // same channel — a "movies" pool and a "shows" pool ranked by the same
-    // taste — and without this the script cannot tell them apart, so both
-    // would get the same list.
-    ctx.insert("pool".into(), pool_name.to_string().into());
-    // The pool's own `config`, handed over verbatim. The station reads nothing
-    // out of it: whatever the author wrote is whatever the script sees, nested
-    // to any depth. An absent config becomes an empty map rather than a missing
-    // key, so a script can read `ctx.config.whatever` unconditionally and get
-    // unit for anything unset — which is also why a mistyped key is silent.
-    ctx.insert(
-        "config".into(),
-        match pool_config {
-            Some(value) => rhai::serde::to_dynamic(value).map_err(|e| {
-                format!(
-                    "scorer plugin {}: pool {pool_name:?} config is not representable in Rhai: {e}",
-                    script_path.display()
-                )
-            })?,
-            None => Dynamic::from_map(Map::new()),
-        },
-    );
-    ctx.insert("target_count".into(), (inputs.target_count as i64).into());
-    ctx.insert("now".into(), inputs.now.into());
-    ctx.insert(
-        "history".into(),
+    // Capability-gated (#167): filled only when granted, so a reach for
+    // `ctx.sets` or `ctx.history` fails the moment the script reads it,
+    // naming the capability. An ungranted field is also never built.
+    let sets = granted.catalog_read.then(|| cached.sets.clone());
+    let history = granted.watch_history.then(|| {
         Dynamic::from_array(
             inputs
                 .history
@@ -353,21 +556,46 @@ pub fn pick(
                     Dynamic::from_map(m)
                 })
                 .collect(),
-        ),
-    );
-    ctx.insert(
-        "recent".into(),
-        Dynamic::from_array(
+        )
+    });
+
+    // The pool's own `config`, handed over verbatim. The station reads nothing
+    // out of it: whatever the author wrote is whatever the script sees, nested
+    // to any depth. An absent config becomes an empty map rather than a missing
+    // key, so a script can read `ctx.config.whatever` unconditionally and get
+    // unit for anything unset — which is also why a mistyped key is silent.
+    let config = match pool_config {
+        Some(value) => rhai::serde::to_dynamic(value).map_err(|e| {
+            format!(
+                "scorer plugin {}: pool {pool_name:?} config is not representable in Rhai: {e}",
+                script_path.display()
+            )
+        })?,
+        None => Dynamic::from_map(Map::new()),
+    };
+
+    let ctx = ScoreCtx {
+        sets,
+        // Which pool is asking. One script commonly serves several pools of
+        // the same channel — a "movies" pool and a "shows" pool ranked by the
+        // same taste — and without this the script cannot tell them apart, so
+        // both would get the same list.
+        pool: pool_name.to_string(),
+        config,
+        target_count: inputs.target_count as i64,
+        now: inputs.now,
+        history,
+        recent: Dynamic::from_array(
             inputs
                 .recent
                 .iter()
                 .map(|id| Dynamic::from(id.clone()))
                 .collect(),
         ),
-    );
+    };
 
     let picked: Array = engine
-        .call_fn(&mut scope, ast, "pick", (Dynamic::from_map(ctx),))
+        .call_fn(&mut scope, ast, "pick", (Dynamic::from(ctx),))
         .map_err(|e| format!("scorer plugin {}: pick(): {e}", script_path.display()))?;
 
     let mut out = Vec::with_capacity(picked.len());
@@ -515,6 +743,10 @@ mod tests {
     use crate::catalog::{Entry, Source};
 
     /// `prepare` then `pick`, the two halves a caller always runs in order.
+    /// Grants both gated capabilities (#167) — every test in this module
+    /// predates capability gating and reads `ctx.sets`/`ctx.history`
+    /// unconditionally, so this preserves that. Tests exercising the gate
+    /// itself call [`pick`] directly with a narrower [`GrantedCapabilities`].
     ///
     /// Test-only on purpose. The daemon deliberately has no such function: the
     /// whole point of the split is that the catalog-reading half and the
@@ -530,7 +762,17 @@ mod tests {
         cache: &mut ScoreCache,
     ) -> Result<Vec<String>, String> {
         cache.prepare(catalog, script_path)?;
-        pick(cache, script_path, inputs, pool_name, pool_config)
+        pick(
+            cache,
+            script_path,
+            inputs,
+            pool_name,
+            pool_config,
+            GrantedCapabilities {
+                catalog_read: true,
+                watch_history: true,
+            },
+        )
     }
 
     fn catalog() -> Catalog {
@@ -975,5 +1217,204 @@ fn pick(ctx) { throw "pick must not run"; }
 "#,
         );
         assert_eq!(declared_hooks(&p).unwrap(), vec!["pool_provider"]);
+    }
+
+    // ---- capability declaration (#167) -------------------------------------
+
+    #[test]
+    fn declared_capabilities_reads_simple_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"fn capabilities() { ["catalog_read", "watch_history"] }"#,
+        );
+        assert_eq!(
+            declared_capabilities(&p).unwrap(),
+            vec![Capability::CatalogRead, Capability::WatchHistory]
+        );
+    }
+
+    #[test]
+    fn declared_capabilities_reads_a_named_datastore() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"fn capabilities() { ["catalog_read", #{ datastore: "taste_db" }] }"#,
+        );
+        assert_eq!(
+            declared_capabilities(&p).unwrap(),
+            vec![
+                Capability::CatalogRead,
+                Capability::Datastore("taste_db".into())
+            ]
+        );
+    }
+
+    /// A script with no `capabilities()` at all declares nothing — the field
+    /// is optional, unlike `hooks()`. A plugin that only reads the ambient
+    /// inputs (`ctx.recent`, `ctx.config`, …) needs no declaration.
+    #[test]
+    fn declared_capabilities_defaults_to_empty_when_the_function_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn hooks() { ["pool_provider"] }"#);
+        assert_eq!(declared_capabilities(&p).unwrap(), Vec::new());
+    }
+
+    /// Unlike an empty `hooks()`, an empty `capabilities()` is not an error —
+    /// it is the explicit way to say "needs nothing gated".
+    #[test]
+    fn declared_capabilities_accepts_an_explicit_empty_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "fn capabilities() { [] }");
+        assert_eq!(declared_capabilities(&p).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn declared_capabilities_rejects_an_unknown_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn capabilities() { ["telepathy"] }"#);
+        let e = declared_capabilities(&p).unwrap_err();
+        assert!(e.contains("telepathy"), "got {e}");
+        assert!(e.contains("catalog_read"), "got {e}");
+        assert!(e.contains("watch_history"), "got {e}");
+    }
+
+    #[test]
+    fn declared_capabilities_rejects_a_datastore_entry_with_an_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn capabilities() { [#{ datastore: "" }] }"#);
+        let e = declared_capabilities(&p).unwrap_err();
+        assert!(e.contains("empty"), "got {e}");
+    }
+
+    #[test]
+    fn declared_capabilities_rejects_an_unrecognized_map_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn capabilities() { [#{ wat: "taste_db" }] }"#);
+        let e = declared_capabilities(&p).unwrap_err();
+        assert!(e.contains("not a recognized capability"), "got {e}");
+    }
+
+    /// `declared_capabilities` never runs `sources()` or `pick()`, exactly
+    /// like `declared_hooks` — a load-time check must not need a catalog.
+    #[test]
+    fn declared_capabilities_never_runs_sources_or_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn capabilities() { ["catalog_read"] }
+fn sources() { throw "sources must not run"; }
+fn pick(ctx) { throw "pick must not run"; }
+"#,
+        );
+        assert_eq!(
+            declared_capabilities(&p).unwrap(),
+            vec![Capability::CatalogRead]
+        );
+    }
+
+    // ---- runtime capability gate (#167) ------------------------------------
+
+    /// A script that reaches for `ctx.history` without being granted
+    /// `watch_history` fails at the `pick()` call, naming the capability —
+    /// the "reach" error case the issue describes as only catchable at run
+    /// time.
+    #[test]
+    fn reaching_for_an_ungranted_watch_history_fails_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) {
+    let out = [];
+    for e in ctx.history { out.push(e.entry_id); }
+    out
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("watch_history"), "got {err}");
+    }
+
+    /// Same shape, for `ctx.sets` gated behind `catalog_read`.
+    #[test]
+    fn reaching_for_ungranted_catalog_read_fails_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let out = [];
+    for item in ctx.sets.movies { out.push(item.entry_id); }
+    out
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("catalog_read"), "got {err}");
+    }
+
+    /// The ambient fields — `ctx.recent`, `ctx.config`, `ctx.target_count`,
+    /// `ctx.now`, `ctx.pool` — stay available with no grant at all; only
+    /// `sets` and `history` are gated.
+    #[test]
+    fn ungated_fields_stay_available_with_no_capabilities_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) {
+    if ctx.pool != "test" { throw "pool wrong"; }
+    if ctx.target_count != 3 { throw "target_count wrong"; }
+    if ctx.now != 42 { throw "now wrong"; }
+    if ctx.recent.len != 1 { throw "recent wrong"; }
+    if ctx.config.want != "m1" { throw "config wrong"; }
+    [ctx.config.want]
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let inputs = ScoreInputs {
+            target_count: 3,
+            recent: vec!["m2".into()],
+            now: 42,
+            ..Default::default()
+        };
+        let cfg = yaml("want: m1\n");
+        let got = pick(
+            &cache,
+            &p,
+            &inputs,
+            "test",
+            Some(&cfg),
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(got, vec!["m1"]);
     }
 }
