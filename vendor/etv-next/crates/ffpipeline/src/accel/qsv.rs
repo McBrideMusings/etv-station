@@ -1,0 +1,235 @@
+use serde::Serialize;
+
+use crate::ArgVec;
+use crate::capabilities::qsv::QsvCapabilities;
+use crate::ffmpeg_info::{FfmpegInfo, KnownHardwareAccel, KnownVideoFilter};
+use crate::frame_size::FrameSize;
+use crate::hw_accel::{HwAccel, HwDecoder};
+use crate::output_settings::VideoFilterOptions;
+use crate::pipeline::{FrameState, FrameSurface, PixelFormat, SurfaceSet, VideoFormat};
+use crate::probe::ProbeResultVideoStream;
+use crate::video_codec::VideoCodec;
+use crate::video_filter::{DeinterlaceFilter, ScaleFilter, VideoFilter, VideoFilterOp};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Qsv {
+    pub capabilities: QsvCapabilities,
+}
+
+impl HwAccel for Qsv {
+    fn best_filter(
+        &self,
+        video_filter: &VideoFilter,
+        ffmpeg_info: &FfmpegInfo,
+        _current_state: &FrameState,
+        filter_options: &VideoFilterOptions,
+    ) -> VideoFilter {
+        match video_filter {
+            VideoFilter::Scale(ScaleFilter {
+                size,
+                input_is_anamorphic,
+                ..
+            }) if ffmpeg_info.has_video_filter(&KnownVideoFilter::VppQsv) => ScaleQsv {
+                size: *size,
+                input_is_anamorphic: *input_is_anamorphic,
+            }
+            .into(),
+            VideoFilter::Deinterlace(DeinterlaceFilter { .. })
+                if ffmpeg_info.has_video_filter(&KnownVideoFilter::DeinterlaceQsv) =>
+            {
+                DeinterlaceQsv {
+                    mode: filter_options.deinterlace_qsv.mode.clone(),
+                }
+                .into()
+            }
+            _ => video_filter.clone(),
+        }
+    }
+
+    fn can_decode(&self, codec: &str, _profile: &str, pixel_format: &PixelFormat) -> bool {
+        let format = match codec {
+            "h264" => Some(VideoFormat::H264),
+            "hevc" => Some(VideoFormat::Hevc),
+            _ => None,
+        };
+
+        if let Some(format) = format {
+            self.capabilities
+                .can_decode(&format, pixel_format.bit_depth())
+        } else {
+            false
+        }
+    }
+
+    fn can_encode(&self, format: &VideoFormat, bit_depth: u8) -> bool {
+        self.capabilities.can_encode(format, bit_depth)
+    }
+
+    fn codec_for_format(
+        &self,
+        format: &VideoFormat,
+        _bit_depth: u8,
+        _video_size: Option<FrameSize>,
+    ) -> Option<VideoCodec> {
+        match format {
+            VideoFormat::H264 => Some(VideoCodec {
+                codec_name: "h264_qsv",
+                options: args!["-low_power", "0", "-look_ahead", "0", "-forced_idr", "1"],
+                preferred_pixel_format_8bit: Some(PixelFormat::Nv12),
+                preferred_pixel_format_10bit: Some(PixelFormat::P010le),
+                preferred_surface: FrameSurface::Qsv,
+            }),
+            VideoFormat::Hevc => Some(VideoCodec {
+                codec_name: "hevc_qsv",
+                options: args![
+                    "-low_power",
+                    "0",
+                    "-look_ahead",
+                    "0",
+                    "-forced_idr",
+                    "1",
+                    "-tag:v",
+                    "hvc1",
+                ],
+                preferred_pixel_format_8bit: Some(PixelFormat::Nv12),
+                preferred_pixel_format_10bit: Some(PixelFormat::P010le),
+                preferred_surface: FrameSurface::Qsv,
+            }),
+            _ => None,
+        }
+    }
+
+    fn format_filter(&self, pixel_format: &PixelFormat) -> Option<VideoFilter> {
+        Some(
+            FormatQsv {
+                format: *pixel_format,
+            }
+            .into(),
+        )
+    }
+
+    fn init_hw_device(&self, _surfaces: &SurfaceSet) -> ArgVec {
+        args!["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw",]
+    }
+
+    fn known_accel(&self) -> Option<&KnownHardwareAccel> {
+        Some(&KnownHardwareAccel::Qsv)
+    }
+
+    fn make_decoder(
+        &self,
+        _ffmpeg_info: &FfmpegInfo,
+        video_stream: &ProbeResultVideoStream,
+    ) -> Option<HwDecoder> {
+        if self.can_decode(
+            &video_stream.codec,
+            &video_stream.profile,
+            &PixelFormat::parse(&video_stream.pix_fmt),
+        ) {
+            Some(HwDecoder {
+                args: args!["-hwaccel", "qsv", "-hwaccel_output_format", "qsv",],
+                surface: FrameSurface::Qsv,
+                filters: Vec::new(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn accepts_upload_format(&self, pixel_format: &PixelFormat) -> bool {
+        self.capabilities.vpp_supports_format(pixel_format)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScaleQsv {
+    pub(crate) size: Option<FrameSize>,
+    pub(crate) input_is_anamorphic: bool,
+}
+
+impl VideoFilterOp for ScaleQsv {
+    fn evaluate(&self, _state: &FrameState, _ffmpeg_info: &FfmpegInfo) -> Option<VideoFilter> {
+        None
+    }
+
+    fn apply_to(&self, state: &mut FrameState) {
+        if let Some(size) = &self.size {
+            state.size = *size;
+            state.surface = FrameSurface::Qsv;
+            state.is_anamorphic = false;
+            state.sample_aspect_ratio = Some(String::from("1:1"));
+            state.display_aspect_ratio = None;
+        }
+    }
+
+    fn required_surface(&self) -> Option<FrameSurface> {
+        Some(FrameSurface::Qsv)
+    }
+
+    fn as_arg(&self) -> Option<String> {
+        if let Some(size) = &self.size {
+            if self.input_is_anamorphic {
+                Some(format!(
+                    "vpp_qsv=w=iw*sar:h=ih,vpp_qsv=w={}:h={},setsar=1",
+                    size.width, size.height
+                ))
+            } else {
+                Some(format!(
+                    "vpp_qsv=w={}:h={},setsar=1",
+                    size.width, size.height
+                ))
+            }
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FormatQsv {
+    pub(crate) format: PixelFormat,
+}
+
+impl VideoFilterOp for FormatQsv {
+    fn evaluate(&self, _state: &FrameState, _ffmpeg_info: &FfmpegInfo) -> Option<VideoFilter> {
+        None
+    }
+
+    fn apply_to(&self, state: &mut FrameState) {
+        state.pixel_format = self.format;
+        state.surface = FrameSurface::Qsv;
+    }
+
+    fn required_surface(&self) -> Option<FrameSurface> {
+        Some(FrameSurface::Qsv)
+    }
+
+    fn as_arg(&self) -> Option<String> {
+        Some(format!("vpp_qsv=format={}", self.format.as_arg()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeinterlaceQsv {
+    pub mode: Option<String>,
+}
+
+impl VideoFilterOp for DeinterlaceQsv {
+    fn evaluate(&self, _state: &FrameState, _ffmpeg_info: &FfmpegInfo) -> Option<VideoFilter> {
+        None
+    }
+
+    fn apply_to(&self, state: &mut FrameState) {
+        state.is_interlaced = false;
+        state.surface = FrameSurface::Qsv;
+    }
+
+    fn required_surface(&self) -> Option<FrameSurface> {
+        Some(FrameSurface::Qsv)
+    }
+
+    fn as_arg(&self) -> Option<String> {
+        let mode = self.mode.as_deref().unwrap_or("2");
+        Some(format!("deinterlace_qsv=mode={mode}"))
+    }
+}

@@ -1,0 +1,282 @@
+name: Build Artifacts
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Release tag'
+        required: true
+        type: string
+      release_version:
+        description: 'Release version number (e.g. v0.1.0)'
+        required: true
+        type: string
+      info_version:
+        description: 'Informational version number (e.g. 0.1.0)'
+        required: true
+        type: string
+    secrets:
+      apple_developer_certificate_p12_base64:
+        required: true
+      apple_developer_certificate_password:
+        required: true
+      ac_username:
+        required: true
+      ac_password:
+        required: true
+      gh_token:
+        required: true
+      azure_client_id:
+        required: true
+      azure_tenant_id:
+        required: true
+      azure_subscription_id:
+        required: true
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Update Rust
+        run: rustup update stable
+      - name: Update Nightly Rust
+        run: rustup update nightly
+      - name: Show Toolchain
+        run: rustup show active-toolchain
+      - name: Add Clippy
+        run: rustup component add clippy
+      - name: Add Rustfmt
+        run: rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+
+      - name: Check Formatting
+        run: cargo +nightly fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D clippy::all
+
+  build:
+    name: Build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+            rust_target: x86_64-pc-windows-msvc
+            exe_ext: .exe
+            archive_ext: .zip
+            should_run_tests: true
+          - os: ubuntu-22.04
+            target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
+            exe_ext: ""
+            archive_ext: .tar.gz
+            should_run_tests: true
+          - os: ubuntu-latest
+            target: linux-musl-x64
+            rust_target: x86_64-unknown-linux-musl
+            exe_ext: ""
+            archive_ext: .tar.gz
+            should_run_tests: false
+          - os: ubuntu-22.04
+            target: linux-arm
+            rust_target: armv7-unknown-linux-gnueabihf
+            exe_ext: ""
+            archive_ext: .tar.gz
+            should_run_tests: false
+          - os: ubuntu-22.04-arm
+            target: linux-arm64
+            rust_target: aarch64-unknown-linux-gnu
+            exe_ext: ""
+            archive_ext: .tar.gz
+            should_run_tests: true
+          - os: macos-15-intel
+            target: macos-x64
+            rust_target: x86_64-apple-darwin
+            exe_ext: ""
+            archive_ext: .tar.gz
+            should_run_tests: true
+          - os: macos-15
+            target: macos-arm64
+            rust_target: aarch64-apple-darwin
+            exe_ext: ""
+            archive_ext: .tar.gz
+            should_run_tests: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Update Rust
+        run: rustup update stable
+      - name: Show Toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-ubuntu22
+          # Workaround for https://github.com/Swatinem/rust-cache/issues/341:
+          # on the updated macOS runner image, cache-bin's restored cargo/rustc
+          # dispatches as rustup-init and fails with "unexpected argument".
+          cache-bin: ${{ runner.os == 'macOS' && 'false' || 'true' }}
+
+      - name: Install Cross-Compilation Tools
+        if: runner.os == 'Linux'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.rust_target }}
+
+      - name: Install Rust target
+        if: runner.os == 'macOS'
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Compile Tests
+        run: cargo test --locked --no-run --workspace --all-features --target ${{ matrix.rust_target }}
+
+      - name: Run Tests
+        if: matrix.should_run_tests
+        run: cargo test --locked --workspace --all-features --target ${{ matrix.rust_target }}
+
+      - name: Build
+        shell: bash
+        env:
+          ETV_VERSION: ${{ inputs.info_version }}
+        run: |
+          # Define some variables for things we need
+          release_name="ersatztv-next-${{ inputs.release_version }}-${{ matrix.target }}"
+          echo "RELEASE_NAME=${release_name}" >> $GITHUB_ENV
+
+          # Build everything
+          cargo build --release --all-features --target ${{ matrix.rust_target }}
+          mkdir "$release_name"
+          mv "target/${{ matrix.rust_target }}/release/ersatztv-playout-generator${{ matrix.exe_ext }}" "$release_name/"
+          mv "target/${{ matrix.rust_target }}/release/ersatztv-channel${{ matrix.exe_ext }}" "$release_name/"
+          mv "target/${{ matrix.rust_target }}/release/ersatztv${{ matrix.exe_ext }}" "$release_name/"
+
+      - name: Azure login
+        if: runner.os == 'Windows'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.azure_client_id }}
+          tenant-id: ${{ secrets.azure_tenant_id }}
+          subscription-id: ${{ secrets.azure_subscription_id }}
+          enable-AzPSSession: true
+
+      - name: Sign Windows executables
+        if: runner.os == 'Windows'
+        uses: azure/artifact-signing-action@v1
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: ArtifactSigning
+          certificate-profile-name: ErsatzTV
+          files-folder: ${{ github.workspace }}/${{ env.RELEASE_NAME }}
+          files-folder-recurse: false
+          files-folder-filter: ersatztv.exe,ersatztv-channel.exe,ersatztv-playout-generator.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Import Code-Signing Certificates
+        if: runner.os == 'macOS'
+        uses: Apple-Actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.apple_developer_certificate_p12_base64 }}
+          p12-password: ${{ secrets.apple_developer_certificate_password }}
+
+      - name: Sign macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          release_name="${{ env.RELEASE_NAME }}"
+          for bin in ersatztv ersatztv-channel ersatztv-playout-generator; do
+            codesign --force --verbose --timestamp --options=runtime \
+              --sign "Developer ID Application" "$release_name/$bin"
+          done
+
+      - name: Notarize macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          AC_USERNAME: ${{ secrets.ac_username }}
+          AC_PASSWORD: ${{ secrets.ac_password }}
+        run: |
+          release_name="${{ env.RELEASE_NAME }}"
+          ditto -c -k --keepParent "$release_name" "${release_name}-notarize.zip"
+          xcrun notarytool submit "${release_name}-notarize.zip" \
+            --apple-id "$AC_USERNAME" \
+            --password "$AC_PASSWORD" \
+            --team-id 32MB98Q32R \
+            --wait
+          rm "${release_name}-notarize.zip"
+
+      - name: Archive
+        shell: bash
+        run: |
+          release_name="${{ env.RELEASE_NAME }}"
+          if [ "${{ matrix.archive_ext }}" = ".zip" ]; then
+            7z a "${release_name}.zip" "${release_name}"
+          else
+            tar czvf "${release_name}.tar.gz" "$release_name"
+          fi
+
+          # Delete output directory
+          rm -r "$release_name"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: "*${{ matrix.archive_ext }}"
+
+  publish:
+    name: Publish
+    needs: [lint, build]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: windows-x64
+            archive_ext: .zip
+          - target: linux-x64
+            archive_ext: .tar.gz
+          - target: linux-musl-x64
+            archive_ext: .tar.gz
+          - target: linux-arm
+            archive_ext: .tar.gz
+          - target: linux-arm64
+            archive_ext: .tar.gz
+          - target: macos-x64
+            archive_ext: .tar.gz
+          - target: macos-arm64
+            archive_ext: .tar.gz
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.target }}
+
+      - name: Delete old release assets
+        if: ${{ inputs.release_tag == 'develop' }}
+        env:
+          GH_TOKEN: ${{ secrets.gh_token }}
+        run: |
+          gh release view ${{ inputs.release_tag }} --json assets --jq '.assets[].name' --repo ${{ github.repository }} \
+            | grep '${{ matrix.target }}${{ matrix.archive_ext }}' \
+            | xargs -r -I{} gh release delete-asset ${{ inputs.release_tag }} {} --yes --repo ${{ github.repository }}
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.gh_token }}
+        run: gh release upload ${{ inputs.release_tag }} "*${{ matrix.archive_ext }}" --repo ${{ github.repository }}

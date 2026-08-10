@@ -1,0 +1,25 @@
+[package]
+name = "ersatztv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+ersatztv-core = { workspace = true }
+filetime = { workspace = true }
+log = { workspace = true }
+quick-xml = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simple-expand-tilde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+[[bin]]
+name = "gen-lineup-config-schema"
+path = "src/bin/gen_lineup_config_schema.rs"
