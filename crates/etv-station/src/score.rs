@@ -11,9 +11,18 @@
 //!
 //! # The contract
 //!
-//! A plugin declares two functions:
+//! A plugin declares which hooks it implements (#159) and, for each one it
+//! claims, the functions that hook requires. `pool_provider` — everything
+//! below except `hooks()` itself — is what a `plugin:` pool has always meant;
+//! `sequencer` is declarable today so a channel author's script can name it,
+//! but nothing calls it yet (that lands in a later slice).
 //!
 //! ```rhai
+//! // Which hooks this script implements. Read at config load time, without
+//! // running sources() or pick() — so a script that declares the wrong hook,
+//! // or none, fails to load rather than failing mid-generation.
+//! fn hooks() { ["pool_provider"] }
+//!
 //! // Every catalog query this plugin will read, named. Run once, up front.
 //! fn sources() {
 //!     #{
@@ -151,13 +160,81 @@ pub struct ScoreEnv<'a> {
 impl ScoreEnv<'_> {
     /// Where a `plugin:` path actually lives. An absolute path is used as
     /// written; a relative one hangs off the channel config's directory.
-    pub fn resolve_path(&self, plugin: &Path) -> std::path::PathBuf {
-        if plugin.is_absolute() {
-            plugin.to_path_buf()
-        } else {
-            self.base_dir.join(plugin)
-        }
+    pub fn resolve_path(&self, plugin: &Path) -> PathBuf {
+        resolve_plugin_path(self.base_dir, plugin)
     }
+}
+
+/// Where a `plugin:` path actually lives relative to `base_dir` (the channel
+/// config file's directory). An absolute path is used as written.
+///
+/// Free rather than only a `ScoreEnv` method because load-time hook validation
+/// ([`declared_hooks`]) needs the same resolution with no [`ScoreInputs`] to
+/// build a `ScoreEnv` around.
+pub fn resolve_plugin_path(base_dir: &Path, plugin: &Path) -> PathBuf {
+    if plugin.is_absolute() {
+        plugin.to_path_buf()
+    } else {
+        base_dir.join(plugin)
+    }
+}
+
+/// Hook names the station understands (#159). `pool_provider` is wired up —
+/// it is what a `plugin:` pool has always meant. `sequencer` is declarable
+/// only; nothing calls it yet, so a script may claim it but the station does
+/// not act on it until a later slice implements the hook itself.
+pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer"];
+
+/// Read the hook names a plugin script declares, without running its scoring
+/// path or touching the catalog.
+///
+/// Compiles the script and calls `hooks()` alone — `sources()` and `pick()`
+/// are never invoked here, which is what lets a load-time refusal happen
+/// without a catalog handle or a full generation.
+///
+/// Every failure names the script: an unreadable or uncompilable file, a
+/// missing or throwing `hooks()`, a non-string entry, an empty array (a plugin
+/// must declare at least one hook), or a name outside [`KNOWN_HOOKS`].
+pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
+    let engine = engine();
+    let ast = engine
+        .compile(&source)
+        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
+
+    let mut scope = Scope::new();
+    let declared: Array = engine
+        .call_fn(&mut scope, &ast, "hooks", ())
+        .map_err(|e| format!("plugin {}: hooks(): {e}", script_path.display()))?;
+
+    if declared.is_empty() {
+        return Err(format!(
+            "plugin {} declares no hooks — a plugin must declare at least one \
+             of: {}",
+            script_path.display(),
+            KNOWN_HOOKS.join(", ")
+        ));
+    }
+
+    let mut hooks = Vec::with_capacity(declared.len());
+    for value in declared {
+        let name = value.into_string().map_err(|actual| {
+            format!(
+                "plugin {}: hooks() must return an array of strings, got {actual}",
+                script_path.display()
+            )
+        })?;
+        if !KNOWN_HOOKS.contains(&name.as_str()) {
+            return Err(format!(
+                "plugin {} declares unknown hook {name:?} — known hooks are: {}",
+                script_path.display(),
+                KNOWN_HOOKS.join(", ")
+            ));
+        }
+        hooks.push(name);
+    }
+    Ok(hooks)
 }
 
 /// The Rhai engine every plugin call uses.
@@ -828,5 +905,75 @@ fn pick(ctx) {
         )
         .unwrap_err();
         assert!(e.contains("pick()"), "got {e}");
+    }
+
+    // ---- hook declaration (#159) -------------------------------------------
+
+    #[test]
+    fn declared_hooks_reads_pool_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn hooks() { ["pool_provider"] }"#);
+        assert_eq!(declared_hooks(&p).unwrap(), vec!["pool_provider"]);
+    }
+
+    #[test]
+    fn declared_hooks_reads_more_than_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn hooks() { ["pool_provider", "sequencer"] }"#);
+        assert_eq!(
+            declared_hooks(&p).unwrap(),
+            vec!["pool_provider", "sequencer"]
+        );
+    }
+
+    /// A script declaring no hooks fails to load, saying at least one is
+    /// required — one of the issue's three named error cases.
+    #[test]
+    fn declared_hooks_rejects_an_empty_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "fn hooks() { [] }");
+        let e = declared_hooks(&p).unwrap_err();
+        assert!(e.contains("declares no hooks"), "got {e}");
+        assert!(e.contains("pool_provider"), "got {e}");
+    }
+
+    /// A script naming a hook the station has never heard of fails to load,
+    /// and the error lists the hook names that do exist — the second named
+    /// error case.
+    #[test]
+    fn declared_hooks_rejects_an_unknown_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn hooks() { ["scoreboard"] }"#);
+        let e = declared_hooks(&p).unwrap_err();
+        assert!(e.contains("scoreboard"), "got {e}");
+        assert!(e.contains("pool_provider"), "got {e}");
+        assert!(e.contains("sequencer"), "got {e}");
+    }
+
+    #[test]
+    fn declared_hooks_names_the_script_when_hooks_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "fn sources() { #{} }\n");
+        let e = declared_hooks(&p).unwrap_err();
+        assert!(e.contains("hooks()"), "got {e}");
+        assert!(e.contains(&p.display().to_string()), "got {e}");
+    }
+
+    /// `declared_hooks` never runs `sources()` or `pick()` — a script whose
+    /// scoring path would blow up (reads the catalog, throws, whatever) still
+    /// answers `hooks()` cleanly, which is what lets this run with no catalog
+    /// at config-load time.
+    #[test]
+    fn declared_hooks_never_runs_sources_or_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn hooks() { ["pool_provider"] }
+fn sources() { throw "sources must not run"; }
+fn pick(ctx) { throw "pick must not run"; }
+"#,
+        );
+        assert_eq!(declared_hooks(&p).unwrap(), vec!["pool_provider"]);
     }
 }

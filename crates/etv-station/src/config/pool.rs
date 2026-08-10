@@ -237,6 +237,11 @@ pub struct Pool {
     /// expression — it runs its own queries, ranks what it finds, and returns
     /// the ordered set. Path is relative to the channel config's directory.
     ///
+    /// The script named here must declare the `pool_provider` hook (#159) —
+    /// that is what `plugin:` has always meant, and a script that declares
+    /// some other hook instead is rejected at load, naming the script and the
+    /// hook that was wanted. See [`crate::score::declared_hooks`].
+    ///
     /// It replaces `expr` rather than `order` because picking the candidates
     /// and ranking them are the same judgment: a "For You" pool cannot be
     /// written as a hand-authored expression plus a sort, since the expression

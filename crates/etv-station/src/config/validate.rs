@@ -116,6 +116,12 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     validate_taste_scope(path, channel)?;
     validate_show_groups(path, &channel.groups)?;
 
+    // A `plugin:` path means what it means relative to the channel config
+    // file (see `score::ScoreEnv::resolve_path`, which every generation-time
+    // resolution goes through) — matched here so a load-time hook refusal
+    // names the same script a running channel would actually load.
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
     // Pool names key the `.resume` sidecar, so they must be unique across the
     // whole channel — that is what lets the sidecar survive blocks being
     // reordered without a block index in the key.
@@ -135,7 +141,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         validate_constraints(&include.constraints(), &bad)?;
 
         if include.is_pattern() {
-            validate_pattern_block(include, &mut pool_names, &channel.groups, &bad)?;
+            validate_pattern_block(include, &mut pool_names, &channel.groups, base_dir, &bad)?;
             continue;
         }
 
@@ -289,6 +295,7 @@ fn validate_pattern_block<'a>(
     include: &'a BlockInclude,
     pool_names: &mut HashSet<&'a str>,
     channel_groups: &[ShowGroup],
+    base_dir: &Path,
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
     if !include.entries().is_empty() {
@@ -397,6 +404,10 @@ fn validate_pattern_block<'a>(
                     pool.name
                 )));
             }
+            // Checked last among this pool's plugin checks — it is the one
+            // that reads the script off disk, so the cheaper structural checks
+            // above get to report first when more than one thing is wrong.
+            validate_plugin_declares_pool_provider(pool, plugin, base_dir, &bad)?;
         }
         if !pool.groups.is_empty() {
             validate_pool_groups(pool, channel_groups, &bad)?;
@@ -495,6 +506,35 @@ fn validate_pattern_block<'a>(
         }
     }
 
+    Ok(())
+}
+
+/// A pool naming a script for `plugin:` must be able to say the script does
+/// that job (#159). The declaration lives in the script (`hooks()`), read
+/// without running `sources()` or `pick()`, so this never touches the
+/// catalog — a refusal here does not require a full generation.
+///
+/// Every refusal `declared_hooks` makes on its own — no hooks at all, an
+/// unrecognized name — surfaces here too, named against the pool that reached
+/// the script.
+fn validate_plugin_declares_pool_provider(
+    pool: &Pool,
+    plugin: &Path,
+    base_dir: &Path,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let script_path = crate::score::resolve_plugin_path(base_dir, plugin);
+    let hooks = crate::score::declared_hooks(&script_path)
+        .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
+    if !hooks.iter().any(|h| h == "pool_provider") {
+        return Err(bad(format!(
+            "pool {:?} names plugin {} via `plugin:`, which requires the plugin to \
+             declare the `pool_provider` hook, but it only declares: {}",
+            pool.name,
+            script_path.display(),
+            hooks.join(", ")
+        )));
+    }
     Ok(())
 }
 
@@ -1166,6 +1206,98 @@ mod tests {
         let b = pattern_block(vec![p], vec![step("shows", 3)]);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("bucket_order"), "err = {err}");
+    }
+
+    // ---- plugin hook declaration (#159) ------------------------------------
+
+    fn plugin_pool(name: &str, plugin: PathBuf) -> Pool {
+        let mut p = pool(name);
+        p.expr = None;
+        p.plugin = Some(plugin);
+        p
+    }
+
+    fn plugin_channel(plugin: PathBuf) -> ChannelConfig {
+        let block = pattern_block(vec![plugin_pool("shows", plugin)], vec![step("shows", 1)]);
+        channel_with(vec![block])
+    }
+
+    /// Validate a channel whose one pool draws from a script with this body,
+    /// written next to the channel config in a fresh temp directory.
+    fn validate_plugin_script(body: &str) -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("scorer.rhai");
+        std::fs::write(&script, body).unwrap();
+        validate_channel(&dir.path().join("channel.yaml"), &plugin_channel(script))
+    }
+
+    #[test]
+    fn a_plugin_declaring_pool_provider_validates() {
+        validate_plugin_script(r#"fn hooks() { ["pool_provider"] }"#).unwrap();
+    }
+
+    /// A relative `plugin:` path is checked against the channel config's own
+    /// directory, exactly like generation-time resolution
+    /// (`score::ScoreEnv::resolve_path`) — not the process CWD.
+    #[test]
+    fn a_relative_plugin_path_is_checked_against_the_channel_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("plugins")).unwrap();
+        std::fs::write(
+            dir.path().join("plugins/scorer.rhai"),
+            r#"fn hooks() { ["pool_provider"] }"#,
+        )
+        .unwrap();
+        let channel = plugin_channel(PathBuf::from("plugins/scorer.rhai"));
+        validate_channel(&dir.path().join("channel.yaml"), &channel).unwrap();
+    }
+
+    /// Error case 1 from the issue: a pool names a script for a hook the
+    /// script does not declare — refused at load, naming both the script and
+    /// the hook that was wanted.
+    #[test]
+    fn a_pool_naming_a_script_that_does_not_declare_pool_provider_is_rejected() {
+        let err = validate_plugin_script(r#"fn hooks() { ["sequencer"] }"#).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pool_provider"), "msg = {msg}");
+        assert!(msg.contains("scorer.rhai"), "msg = {msg}");
+        assert!(msg.contains("sequencer"), "msg = {msg}");
+    }
+
+    /// Error case 2: a script declaring a hook name that does not exist fails
+    /// at load, and the error lists the hook names that do.
+    #[test]
+    fn a_script_declaring_an_unknown_hook_is_rejected_and_lists_known_hooks() {
+        let err = validate_plugin_script(r#"fn hooks() { ["scoreboard"] }"#).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("scoreboard"), "msg = {msg}");
+        assert!(msg.contains("pool_provider"), "msg = {msg}");
+        assert!(msg.contains("sequencer"), "msg = {msg}");
+    }
+
+    /// Error case 3: a script declaring no hooks at all fails at load, saying
+    /// at least one is required.
+    #[test]
+    fn a_script_declaring_no_hooks_is_rejected() {
+        let err = validate_plugin_script("fn hooks() { [] }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("at least one"), "msg = {msg}");
+    }
+
+    /// The declaration is read without running the script's item loop — a
+    /// `sources()`/`pick()` that would blow up (reads the catalog, throws)
+    /// still validates cleanly, because load-time validation never calls
+    /// either.
+    #[test]
+    fn hook_validation_never_runs_the_scoring_path() {
+        validate_plugin_script(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn sources() { throw "sources must not run at load time"; }
+fn pick(ctx) { throw "pick must not run at load time"; }
+"#,
+        )
+        .unwrap();
     }
 
     #[test]
