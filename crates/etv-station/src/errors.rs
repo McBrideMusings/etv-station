@@ -56,6 +56,9 @@ pub enum StationError {
     #[error("catalog error: {0}")]
     Catalog(#[from] crate::catalog::CatalogError),
 
+    #[error("history db error: {0}")]
+    History(#[from] crate::history::HistoryError),
+
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,

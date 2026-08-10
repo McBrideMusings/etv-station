@@ -13,7 +13,7 @@ use std::path::Path;
 
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source, TagNs};
 use etv_station::config::{ChannelConfig, read_channel};
-use etv_station::history::{Ledger, PlayRecord};
+use etv_station::history::{HistoryDb, PlayRecord};
 use etv_station::resolve::{ResolvedItem, resolve_channel, resolve_channel_with_resume};
 use etv_station::resume::{GenerationState, ResumeMap};
 use time::OffsetDateTime;
@@ -101,27 +101,39 @@ fn advance_state(
     resume: ResumeMap,
     items: &[ResolvedItem],
 ) -> GenerationState {
+    const CHANNEL: &str = "test";
     let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
     let show_ids = cat.show_ids_for(&ids).unwrap();
-    let mut ledger = Ledger::new();
-    ledger.extend(prev.tail.iter().map(|entry_id| PlayRecord {
-        entry_id: entry_id.clone(),
-        show_id: None,
-        start: OffsetDateTime::UNIX_EPOCH,
-        played_at: OffsetDateTime::UNIX_EPOCH,
-        error_card: false,
-    }));
-    ledger.extend(ids.iter().map(|id| PlayRecord {
-        entry_id: id.clone(),
-        show_id: show_ids.get(id).cloned(),
-        start: OffsetDateTime::UNIX_EPOCH,
-        played_at: OffsetDateTime::UNIX_EPOCH,
-        error_card: false,
-    }));
+    let db = HistoryDb::open_in_memory().unwrap();
+    let seed: Vec<PlayRecord> = prev
+        .tail
+        .iter()
+        .map(|entry_id| PlayRecord {
+            entry_id: entry_id.clone(),
+            show_id: None,
+            start: OffsetDateTime::UNIX_EPOCH,
+            played_at: OffsetDateTime::UNIX_EPOCH,
+            error_card: false,
+        })
+        .collect();
+    db.record(CHANNEL, &seed).unwrap();
+    let airings: Vec<PlayRecord> = ids
+        .iter()
+        .map(|id| PlayRecord {
+            entry_id: id.clone(),
+            show_id: show_ids.get(id).cloned(),
+            start: OffsetDateTime::UNIX_EPOCH,
+            played_at: OffsetDateTime::UNIX_EPOCH,
+            error_card: false,
+        })
+        .collect();
+    db.record(CHANNEL, &airings).unwrap();
     GenerationState {
         resume,
-        cursor: ledger.series_cursor(),
-        tail: ledger.tail(etv_station::constrain::DEFAULT_SEAM_TAIL),
+        cursor: db.series_cursor(CHANNEL).unwrap(),
+        tail: db
+            .tail(CHANNEL, etv_station::constrain::DEFAULT_SEAM_TAIL)
+            .unwrap(),
     }
 }
 
