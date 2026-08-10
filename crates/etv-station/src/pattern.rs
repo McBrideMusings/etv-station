@@ -62,6 +62,15 @@
 //! that only partially served — so a short visit's filler continues next time
 //! rather than being replayed from its start.
 //!
+//! A plugin pool's per-entry `take` (#166) overrides the step's own `take` for
+//! whichever series the overridden id belongs to (#173) — read, never
+//! computed, by [`PoolRuntime::take_override_for`]. Everything above still
+//! applies once the count is settled: `on_short` still decides who fills a
+//! visit an override left short, and the rotation still parks the same way.
+//! Only `rotate = "visit"` honours it; a `rotate = "slot"` draw never asks for
+//! the step's own `take` in the first place, so there is nothing for an
+//! override to stand in for.
+//!
 //! # Determinism
 //!
 //! Every random decision — `select = "random"`, a step's `chance` — is a keyed
@@ -189,14 +198,9 @@ struct PoolRuntime<'a> {
     runtimes: HashMap<String, Duration>,
     mean_runtime: Duration,
 
-    /// Per-id take overrides a plugin pool attached to its picks (#166),
-    /// surfaced here so the draw (`visit`/`serve`) can reach them. Empty for
-    /// every non-plugin pool.
-    ///
-    /// `#[allow(dead_code)]`: honouring one instead of the step's own `take`
-    /// is #173, a separate slice — this one's job is only to get the value
-    /// this far without dropping it. Remove the allow when #173 reads it.
-    #[allow(dead_code)]
+    /// Per-id take overrides a plugin pool attached to its picks (#166), read
+    /// back by the draw (#173) in place of the step's own `take` for whichever
+    /// series the override's id belongs to. Empty for every non-plugin pool.
     take_overrides: HashMap<String, usize>,
 }
 
@@ -355,6 +359,26 @@ impl PoolRuntime<'_> {
         out
     }
 
+    /// The take override attached to any id in this series (#166's plugin
+    /// record shape). A plugin attaches its record to one entry, so this scans
+    /// every id the series holds rather than assuming which one carries it.
+    /// Pool resolution already narrowed `take_overrides` to this pool's own
+    /// ids (`pool_runtime`'s `picked_extras` filter).
+    ///
+    /// If more than one id in the series carries an override, the first in
+    /// list order wins and the rest are silently unread — the pattern does
+    /// not reconcile them, the same way it does not compute one. And the
+    /// value read here is not a one-shot sample: `take_overrides` is fixed
+    /// for the life of this `PoolRuntime`, built once from the generation's
+    /// single `pick()` call, so every visit to this series for the rest of
+    /// the build honours the same override, not only its first.
+    fn take_override_for(&self, si: usize) -> Option<usize> {
+        self.series[si]
+            .ids
+            .iter()
+            .find_map(|id| self.take_overrides.get(id).copied())
+    }
+
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
     fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Vec<String> {
         if take == Take::Count(0) || self.is_dry() {
@@ -364,6 +388,11 @@ impl PoolRuntime<'_> {
             // A new series every item is just `take` one-item visits. `all` is
             // refused here at load — a step that changes series every item has
             // no one series to empty — so the count is always present.
+            //
+            // A per-entry take override (#173) has nothing to stand in for
+            // here: a slot step's `take` counts slots, not a per-series draw,
+            // so the one item each slot asks for was never the step's own
+            // `take`.
             Rotate::Slot => {
                 let n = take.count().unwrap_or(1);
                 let mut out = Vec::with_capacity(n);
@@ -382,17 +411,30 @@ impl PoolRuntime<'_> {
     /// Serve `take` items starting from one picked series, rolling onto others
     /// per `on_short` when it comes up short, then park the rotation where the
     /// next visit should resume.
+    ///
+    /// A series' own take override (#173) stands in for `want` only under
+    /// `rotate = "visit"` — the one draw that asks for the step's own `take`
+    /// (see the comment in `visit`).
     fn serve(&mut self, want: Take, from: TakeFrom, roll: &RollKey, nonce: u64) -> Vec<String> {
         let first = self.eligible_pick(roll, nonce);
+        let override_take = match self.cfg.rotate {
+            Rotate::Visit => first.and_then(|si| self.take_override_for(si)),
+            Rotate::Slot => None,
+        };
         // `all` is sized from the series the visit just picked, so it has to be
         // resolved after the pick and not before: it means "empty *this* one",
         // and which one that is was the pick's decision. A series is never
         // parked past its own end — `take_from` wraps the cursor — so its
         // remaining count is the whole rest of it.
-        let take = match (want, first) {
-            (Take::Count(n), _) => n,
-            (Take::All, Some(si)) => self.series[si].remaining(),
-            (Take::All, None) => return Vec::new(),
+        //
+        // An override beats both a count and `all` for the series it names
+        // (#173) — the plugin's per-entry `take` stands in for the step's own,
+        // whatever the step wrote.
+        let take = match (override_take, want, first) {
+            (Some(n), _, _) => n,
+            (None, Take::Count(n), _) => n,
+            (None, Take::All, Some(si)) => self.series[si].remaining(),
+            (None, Take::All, None) => return Vec::new(),
         };
         // `end` and `random` name an absolute place in the series, so they set
         // the cursor before the first draw — which is exactly why they ignore
@@ -3064,5 +3106,243 @@ fn pick(ctx) { [#{ entry_id: "mov-1", take: 7 }] }
 
         assert_eq!(runtimes[0].take_overrides.get("mov-1"), Some(&3));
         assert_eq!(runtimes[1].take_overrides.get("mov-1"), Some(&7));
+    }
+
+    // ---- the draw honours a per-entry take override (#173) ----------------
+
+    /// A plugin pool named `shows` whose script picks `picks` — the body of a
+    /// Rhai array, plain ids and `#{ entry_id, take }` records mixed as the
+    /// test needs. `sources()` is empty: every id these tests draw comes from
+    /// the pick list itself.
+    fn override_pool(dir: &std::path::Path, picks: &str) -> Pool {
+        let script = dir.join("foryou.rhai");
+        std::fs::write(
+            &script,
+            format!("fn sources() {{ #{{}} }}\nfn pick(ctx) {{ [{picks}] }}\n"),
+        )
+        .unwrap();
+        let mut pool = plugin_pool(&script);
+        pool.name = "shows".into();
+        pool
+    }
+
+    /// A show pool with one series overridden and one not: `got` carries no
+    /// override and empties in full under `take: "all"`; `inv` carries one
+    /// and stops at it instead — the worked example from #173 itself, an
+    /// unwatched show sampling three (well, two) while a watched one plays on.
+    #[test]
+    fn a_take_override_beats_take_all_for_its_own_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = override_pool(
+            dir.path(),
+            r#""got-e1", "got-e2", "got-e3", "got-e4", "got-e5", "got-e6",
+               #{ entry_id: "inv-e1", take: 2 }, "inv-e2", "inv-e3""#,
+        );
+
+        let (ids, _) = build_with(
+            vec![pool],
+            vec![step_all("shows")],
+            Some(2),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "got-e1", "got-e2", "got-e3", "got-e4", "got-e5", "got-e6", // got: no
+                // override, `all` empties the whole show
+                "inv-e1", "inv-e2", // inv: overridden to 2, stops short of e3
+            ]
+        );
+    }
+
+    /// A truncated series falls through to `on_short` exactly as a genuinely
+    /// short one does: the override (5) outruns `inv`'s 3 episodes, so
+    /// `next` (the default) rolls onto `got` to fill the rest of the visit.
+    #[test]
+    fn on_short_next_rolls_onto_the_next_series_when_an_override_falls_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = override_pool(
+            dir.path(),
+            r#"#{ entry_id: "inv-e1", take: 5 }, "inv-e2", "inv-e3",
+               "got-e1", "got-e2", "got-e3", "got-e4", "got-e5", "got-e6""#,
+        );
+
+        let (ids, _) = build_with(
+            vec![pool],
+            vec![step("shows", 1)],
+            Some(1),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(
+            ids,
+            vec!["inv-e1", "inv-e2", "inv-e3", "got-e1", "got-e2"],
+            "the step's own take=1 never shows: the override (5) drove the \
+             visit, and on_short=next filled what inv could not"
+        );
+    }
+
+    /// `on_short = "wrap"` keeps a short, overridden visit on the same
+    /// series, looping it back to its own start to fill out the override.
+    #[test]
+    fn on_short_wrap_loops_the_overridden_series_to_fill_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = override_pool(
+            dir.path(),
+            r#"#{ entry_id: "inv-e1", take: 5 }, "inv-e2", "inv-e3""#,
+        );
+        pool.on_short = OnShort::Wrap;
+
+        let (ids, _) = build_with(
+            vec![pool],
+            vec![step("shows", 1)],
+            Some(1),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(ids, vec!["inv-e1", "inv-e2", "inv-e3", "inv-e1", "inv-e2"]);
+    }
+
+    /// `on_short = "short"` emits fewer than the override asked for rather
+    /// than pulling anyone else in.
+    #[test]
+    fn on_short_short_emits_fewer_than_the_override_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = override_pool(
+            dir.path(),
+            r#"#{ entry_id: "inv-e1", take: 5 }, "inv-e2", "inv-e3""#,
+        );
+        pool.on_short = OnShort::Short;
+
+        let (ids, _) = build_with(
+            vec![pool],
+            vec![step("shows", 1)],
+            Some(1),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(ids, vec!["inv-e1", "inv-e2", "inv-e3"]);
+    }
+
+    /// `advance = "resume"` resumes an overridden series at the item after
+    /// the last one it aired — airing e1-e3 under an override of 3 means the
+    /// next visit starts at e4, not back at e1 (#173's own worked example).
+    #[test]
+    fn advance_resume_continues_after_the_last_item_an_override_aired() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_pool = || {
+            let mut p = override_pool(
+                dir.path(),
+                r#"#{ entry_id: "got-e1", take: 3 },
+                   "got-e2", "got-e3", "got-e4", "got-e5", "got-e6""#,
+            );
+            p.advance = Advance::Resume;
+            p
+        };
+
+        let (first, resume) = build_with(
+            vec![make_pool()],
+            vec![step("shows", 1)],
+            Some(1),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(first, vec!["got-e1", "got-e2", "got-e3"]);
+
+        let (second, _) = build_with(
+            vec![make_pool()],
+            vec![step("shows", 1)],
+            Some(1),
+            &resume,
+            0,
+        );
+        assert_eq!(
+            second,
+            vec!["got-e4", "got-e5", "got-e6"],
+            "resumes after e3, not back at e1"
+        );
+    }
+
+    /// The override sets how many; `from: end` still sets where the cut
+    /// starts. The step itself asks for one item from the end — if the
+    /// override were ignored here, this would air only `got-e6`.
+    #[test]
+    fn from_end_with_an_override_still_takes_the_overrides_count_from_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = override_pool(
+            dir.path(),
+            r#"#{ entry_id: "got-e1", take: 3 },
+               "got-e2", "got-e3", "got-e4", "got-e5", "got-e6""#,
+        );
+
+        let (ids, _) = build_with(
+            vec![pool],
+            vec![step_from("shows", 1, TakeFrom::End)],
+            Some(1),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(ids, vec!["got-e4", "got-e5", "got-e6"]);
+    }
+
+    /// The override also sets the window size a `from: random` cut lands
+    /// inside: three consecutive, in-order episodes, reproducible for a
+    /// pinned seed — same guarantee `take_from_random_is_consecutive_in_order_and_reproducible`
+    /// makes for a step's own `take`, now driven by the override instead.
+    #[test]
+    fn from_random_with_an_override_still_sizes_the_window_by_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let picks = r#"#{ entry_id: "got-e1", take: 3 },
+                       "got-e2", "got-e3", "got-e4", "got-e5", "got-e6""#;
+        let run = || {
+            build_with(
+                vec![override_pool(dir.path(), picks)],
+                vec![step_from("shows", 1, TakeFrom::Random)],
+                Some(1),
+                &GenerationState::empty(),
+                0,
+            )
+            .0
+        };
+
+        let ids = run();
+        assert_eq!(ids.len(), 3, "sized by the override, not the step's own 1");
+        assert_eq!(ids, run(), "same seed, same cut");
+        let triples = [
+            ["got-e1", "got-e2", "got-e3"],
+            ["got-e2", "got-e3", "got-e4"],
+            ["got-e3", "got-e4", "got-e5"],
+            ["got-e4", "got-e5", "got-e6"],
+        ];
+        assert!(
+            triples.iter().any(|t| t[..] == ids[..]),
+            "not a consecutive in-order triple: {ids:?}"
+        );
+    }
+
+    /// `rotate = "slot"` never sees the step's own `take` in the first place
+    /// — each slot always asks for exactly one item — so there is nothing
+    /// for a series' override to stand in for. Four slots still means four
+    /// items, alternating series exactly as an unoverridden pool would,
+    /// even though `got-e1` carries an override of 5.
+    #[test]
+    fn a_rotate_slot_step_ignores_the_take_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = override_pool(
+            dir.path(),
+            r#"#{ entry_id: "got-e1", take: 5 }, "got-e2", "got-e3",
+               "inv-e1", "inv-e2", "inv-e3""#,
+        );
+        pool.rotate = Rotate::Slot;
+
+        let (ids, _) = build_with(
+            vec![pool],
+            vec![step("shows", 4)],
+            Some(1),
+            &GenerationState::empty(),
+            0,
+        );
+        assert_eq!(ids, vec!["got-e1", "inv-e1", "got-e2", "inv-e2"]);
     }
 }

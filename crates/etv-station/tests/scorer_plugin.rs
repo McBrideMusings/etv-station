@@ -544,3 +544,76 @@ async fn a_records_metadata_is_readable_in_the_emitted_playout_json() {
     let raw = String::from_utf8(bytes).unwrap();
     assert_eq!(raw.matches("\"metadata\"").count(), 1, "raw JSON: {raw}");
 }
+
+// ---- per-entry take override reaches the draw (#173) -----------------------
+
+/// A two-episode show whose first episode's record overrides the step's own
+/// `take` down to 1, so `ep-2` never airs.
+const TAKE_OVERRIDE: &str = r#"
+fn sources() { #{} }
+fn pick(ctx) { [#{ entry_id: "ep-1", take: 1 }, "ep-2"] }
+"#;
+
+/// The acceptance criterion, driven through the real resolve path: a
+/// plugin's per-entry `take` override caps what airs for that series,
+/// beating the step's own `take`. The step asks for 2 — the show's whole
+/// two-episode run — but `ep-1`'s record overrides it to 1, so `ep-2` never
+/// airs this visit.
+#[test]
+fn a_take_override_caps_the_series_through_the_real_resolve_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_plugin(&dir, "sampler.rhai", TAKE_OVERRIDE);
+    let got = resolve_with(
+        &plugin_channel(&p, 2, 1),
+        &catalog(),
+        ScoreInputs::default(),
+    );
+    assert_eq!(
+        got,
+        vec!["ep-1"],
+        "the override, not the step's take=2, decided how many aired"
+    );
+}
+
+/// The same override, driven all the way to the emitted playout JSON on
+/// disk — exactly as the `metadata` acceptance test above proves #166's
+/// carrier, this proves #173's spend of it: `ep-2` must never reach disk,
+/// because the visit that would have carried it stopped at the override.
+#[tokio::test]
+async fn a_take_override_caps_what_the_emitted_playout_json_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_plugin(&dir, "sampler.rhai", TAKE_OVERRIDE);
+    let items = resolve_items(&plugin_channel(&p, 2, 1), &catalog(), &Default::default()).unwrap();
+    assert_eq!(
+        items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec!["ep-1"],
+        "the override, not the step's take=2, decided how many aired"
+    );
+
+    let durations = vec![std::time::Duration::from_secs(60); items.len()];
+    let rule = etv_station::rule::Sequential::new(&items, &durations);
+    let start = time::OffsetDateTime::now_utc();
+    let out_dir = dir.path().join("output");
+    let tz = etv_station::tz::parse("UTC").unwrap();
+    let written = etv_station::emit::emit_window(
+        &out_dir,
+        &rule,
+        start,
+        tz,
+        6,
+        start,
+        start + rule.total_duration(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.len(), 1, "one chunk file for this short a window");
+
+    let bytes = tokio::fs::read(&written[0]).await.unwrap();
+    let playout: ersatztv_playout::playout::Playout = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<&str> = playout.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["ep-1"],
+        "ep-2 must never reach disk: the override cut the visit short"
+    );
+}
