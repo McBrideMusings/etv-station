@@ -423,8 +423,11 @@ catalog's recorded last-ingest time against the two knobs above. Age below
 `catalog_refresh_secs` → skip, no HTTP at all. Age at or beyond
 `full_sweep_after_secs` (or no prior ingest, or a clock that moved backwards) →
 full re-read. Anything between → delta: each library section is queried with
-`updatedAt>=<last ingest>`, and a collection whose own `updatedAt` predates the
-cursor skips its per-collection children request. The full-sweep check is
+`updatedAt>=<last ingest>` OR `addedAt>=<last ingest>` — the OR reaches an item
+Plex reports with no `updatedAt` at all, which would otherwise fail the
+comparison identically to a stale one and be invisible to every delta until the
+next full sweep. A collection whose own `updatedAt` predates the cursor skips
+its per-collection children request. The full-sweep check is
 applied *before* the refresh window, so a constantly-restarted station still
 gets its periodic deletion-catching pass. The timestamp is recorded inside the
 ingest transaction and taken before the fetch begins, so a failed pass never
