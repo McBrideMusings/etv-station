@@ -337,6 +337,14 @@ fn validate_pattern_block<'a>(
                 .into(),
         ));
     }
+    if include.filter.as_ref().is_some_and(|f| !f.is_empty()) {
+        return Err(bad(
+            "filter conflicts with `pattern` — the resolve pipeline applies a block's \
+             `filter` to a flat `entries` list, never to a pattern's interleaved pools; \
+             narrow a pool's own draw instead"
+                .into(),
+        ));
+    }
     if let Some(n) = include.cycles {
         if n == 0 {
             return Err(bad("cycles must be > 0".into()));
@@ -498,6 +506,14 @@ fn validate_sequencer_block<'a>(
             "fallback conflicts with `sequencer` — a short sequencer timeline falls through to \
              the channel's normal short-generation handling; block-level `fallback` only \
              applies to an entries block"
+                .into(),
+        ));
+    }
+    if include.filter.as_ref().is_some_and(|f| !f.is_empty()) {
+        return Err(bad(
+            "filter conflicts with `sequencer` — the resolve pipeline applies a block's \
+             `filter` to a flat `entries` list, never to a script's own timeline; narrow a \
+             pool's own draw instead"
                 .into(),
         ));
     }
@@ -870,6 +886,13 @@ mod tests {
         let mut b = inline_block(vec![]);
         b.pools = pools;
         b.pattern = pattern;
+        b
+    }
+
+    fn sequencer_block(pools: Vec<Pool>) -> BlockInclude {
+        let mut b = inline_block(vec![]);
+        b.pools = pools;
+        b.sequencer = Some(PathBuf::from("script.rhai"));
         b
     }
 
@@ -1314,6 +1337,50 @@ mod tests {
             format!("{err}").contains("conflicts with `pattern`"),
             "err = {err}"
         );
+    }
+
+    /// #197: the resolve pipeline only ever runs `filter` over a flat
+    /// `entries` list — a pattern block's list is an interleaved pool draw,
+    /// so a `filter` here would otherwise sit unapplied (see resolve.rs).
+    #[test]
+    fn rejects_filter_on_a_pattern_block() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.filter = Some(crate::config::Filter {
+            seasons: Some(vec![1]),
+            episode_ids: None,
+        });
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("conflicts with `pattern`"),
+            "err = {err}"
+        );
+    }
+
+    /// Same guard, same reason, on a `sequencer` block (#197).
+    #[test]
+    fn rejects_filter_on_a_sequencer_block() {
+        let mut b = sequencer_block(vec![pool("movies")]);
+        b.filter = Some(crate::config::Filter {
+            seasons: Some(vec![1]),
+            episode_ids: None,
+        });
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("conflicts with `sequencer`"),
+            "err = {err}"
+        );
+    }
+
+    /// An empty `[filter]` table is treated as absent — same rule the
+    /// resolver applies — so it must not trip the pattern/sequencer guard.
+    #[test]
+    fn an_empty_filter_table_does_not_conflict_with_a_pattern_block() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.filter = Some(crate::config::Filter {
+            seasons: None,
+            episode_ids: None,
+        });
+        validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap();
     }
 
     #[test]

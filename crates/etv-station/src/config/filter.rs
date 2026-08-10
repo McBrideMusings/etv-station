@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 
 /// Structured filter applied to a block's resolved items before mode/order.
 ///
-/// The fields are intentionally narrow for now — the broader field set and the
-/// actual filtering pass live with the resolution engine (#69) and query field
-/// set (#68). This issue (#46) only fixes the on-disk shape so dependent issues
-/// parse against a settled type. The resolver rejects a present filter as
-/// not-yet-implemented.
+/// The fields are intentionally narrow for now — a broader field set lives
+/// with the query field set (#68), if one is ever needed here too. The
+/// resolver applies both fields as a narrowing set: an item survives only
+/// when it satisfies every field that is set (see `resolve::apply_filter`,
+/// #197).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Filter {

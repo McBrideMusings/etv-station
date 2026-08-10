@@ -1,8 +1,8 @@
 //! Resolve a channel's block composition into a flat, ordered item list.
 //!
 //! The Phase C resolve pipeline (#71): for each `[[rule.blocks]]` it
-//! **resolves entries → applies `duplicates` → applies `order` → (mode)**,
-//! producing the flat [`ResolvedItem`] list the sequencer
+//! **resolves entries → applies `filter` → applies `duplicates` → applies
+//! `order` → (mode)**, producing the flat [`ResolvedItem`] list the sequencer
 //! ([`crate::rule::Sequential`]) lays across the chunk window. Collapse runs
 //! *before* order, so which duplicate survives is deterministic regardless of a
 //! `random` shuffle. The blocks concatenate, then the adjacency constraint pass
@@ -23,10 +23,21 @@
 //! catalog-backed entries and `manual` order needs no catalog, so `catalog` is
 //! optional.
 //!
-//! Still rejected with a clear `unsupported` error (later issues): `include`
-//! entries and a non-empty block `filter`. The catalog is not yet opened by
-//! the daemon — until that lands, query entries / non-`manual` order only
+//! Still rejected with a clear `unsupported` error (later issue #69):
+//! `include` entries. The catalog is not yet opened by the daemon — until
+//! that lands, query entries / non-`manual` order / `filter.seasons` only
 //! resolve when a catalog is supplied (tests), and error at runtime.
+//!
+//! A block's `filter` (#197) narrows the resolved list right after entries
+//! (and any `fallback` substitution) settle, before `duplicates`/`order` see
+//! it: `seasons` keeps items whose catalog season is in the list (needs the
+//! catalog), `episode_ids` keeps items whose id is in the list (no catalog
+//! needed — it matches the same `entry_id`/derived id every other step keys
+//! on). Setting both narrows further, never wider — an item survives only
+//! when it satisfies every field the author set. Entries-block only, on the
+//! same terms as `fallback` below: a pattern/sequencer block's list is an
+//! interleaved pool draw, not a flat `entries` resolution this step could
+//! run over, so `filter` is rejected there at validation.
 //!
 //! A block's optional `fallback` (#97) resolves **instead of** `entries` when
 //! `entries` resolves to nothing eligible — the empty-set case a 24/7 channel
@@ -46,7 +57,7 @@ use time::OffsetDateTime;
 
 use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, Fallback,
+    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, Fallback, Filter,
     ItemEntry, Mode, NoRepeatWithin, Order, QueryEntry, ShowGroup, SourceConfig,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap};
@@ -723,13 +734,6 @@ fn resolve_block(
         message,
     };
 
-    // Honesty gates for features whose runtime lives in later Phase C issues.
-    if include.filter.as_ref().is_some_and(|f| !f.is_empty()) {
-        return Err(unsupported(format!(
-            "block #{idx}: [filter] resolution is not implemented yet (#69)"
-        )));
-    }
-
     let defaults = include.program();
 
     // A pattern block builds its list by interleaving pools instead of playing
@@ -853,6 +857,16 @@ fn resolve_block(
     {
         items = resolve_fallback(catalog, fallback, defaults, seed, source_roots, path_index)
             .map_err(|m| unsupported(format!("block #{idx}: fallback: {m}")))?;
+    }
+
+    // 1.6. Filter (#197) — narrow the resolved list before duplicates/order
+    //    see it, so a `random` order shuffles only the survivors and
+    //    `duplicates` collapses only within them.
+    if let Some(filter) = &include.filter
+        && !filter.is_empty()
+    {
+        items = apply_filter(catalog, items, filter)
+            .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
     }
 
     // 2. Duplicates — collapse (default) runs BEFORE order so which occurrence
@@ -1057,6 +1071,55 @@ fn resolve_collection(
         .collect::<Result<Vec<_>, String>>()?
         .into_iter()
         .flatten()
+        .collect())
+}
+
+/// Narrow a block's resolved list to `filter`'s restrictions (#197): `seasons`
+/// keeps only items whose catalog season is in the list, `episode_ids` keeps
+/// only items whose id is in the list, and with both set an item must satisfy
+/// both — two "restrict to" fields combine as a narrower set, not a union.
+///
+/// `episode_ids` matches the same id every other resolve step keys on (a
+/// catalog `entry_id`, or an inline item's derived id), so it needs no catalog
+/// round trip. `seasons` does, since season is catalog metadata a resolved
+/// item carries no copy of.
+fn apply_filter(
+    catalog: Option<&Catalog>,
+    items: Vec<ResolvedItem>,
+    filter: &Filter,
+) -> Result<Vec<ResolvedItem>, String> {
+    // The wanted seasons and the id -> season map they are checked against
+    // both exist only when `filter.seasons` is set, so they travel as one
+    // value instead of a set plus a map that means nothing without it.
+    let season_filter: Option<(HashSet<i64>, HashMap<String, i64>)> = match &filter.seasons {
+        Some(wanted) => {
+            let cat = catalog.ok_or_else(|| {
+                "filter.seasons needs the catalog, which is not available".to_string()
+            })?;
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            let by_id = cat.seasons_for(&ids).map_err(|e| e.to_string())?;
+            Some((wanted.iter().map(|&n| i64::from(n)).collect(), by_id))
+        }
+        None => None,
+    };
+    let episode_ids: Option<HashSet<&str>> = filter
+        .episode_ids
+        .as_ref()
+        .map(|list| list.iter().map(String::as_str).collect());
+
+    Ok(items
+        .into_iter()
+        .filter(|item| {
+            let season_ok = season_filter.as_ref().is_none_or(|(wanted, by_id)| {
+                by_id
+                    .get(&item.id)
+                    .is_some_and(|season| wanted.contains(season))
+            });
+            let episode_ok = episode_ids
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(item.id.as_str()));
+            season_ok && episode_ok
+        })
         .collect())
 }
 
@@ -2031,6 +2094,95 @@ mod tests {
                 "lavfi:bumper"
             ]
         );
+    }
+
+    // ---- block filter (#197) -----------------------------------------------
+
+    #[test]
+    fn filter_seasons_keeps_only_the_matching_season() {
+        let cat = out_of_order_episodes_catalog(); // id-c/id-a season 1, id-b season 2
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.type == \"episode\"".into(),
+            order: None,
+        })]);
+        inc.order = None; // let the season/episode default (#95) order the survivors
+        inc.filter = Some(Filter {
+            seasons: Some(vec![1]),
+            episode_ids: None,
+        });
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["id-a", "id-c"],
+            "season 2's id-b must be filtered out before the season/episode default \
+             orders the rest ({ids:?})"
+        );
+    }
+
+    #[test]
+    fn filter_episode_ids_keeps_only_the_named_ids_with_no_catalog() {
+        // episode_ids matches the same derived id every other step keys on, so
+        // it needs no catalog at all — exercised entirely with inline items.
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry("a")),
+            Entry::Item(item_entry("b")),
+            Entry::Item(item_entry("c")),
+        ]);
+        inc.filter = Some(Filter {
+            seasons: None,
+            episode_ids: Some(vec!["lavfi:b".into()]),
+        });
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["lavfi:b"]);
+    }
+
+    #[test]
+    fn filter_seasons_without_a_catalog_errors() {
+        let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        inc.filter = Some(Filter {
+            seasons: Some(vec![1]),
+            episode_ids: None,
+        });
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("filter.seasons needs the catalog"),
+            "err = {err}"
+        );
+    }
+
+    /// Both filter fields set narrows to their intersection, not their union —
+    /// naming an id from a season the `seasons` field excludes matches nothing.
+    #[test]
+    fn filter_seasons_and_episode_ids_combine_as_an_intersection() {
+        let cat = out_of_order_episodes_catalog();
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.type == \"episode\"".into(),
+            order: None,
+        })]);
+        inc.filter = Some(Filter {
+            seasons: Some(vec![1]),                 // id-a, id-c
+            episode_ids: Some(vec!["id-b".into()]), // season 2 — disjoint from the above
+        });
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("zero items"), "err = {err}");
+    }
+
+    #[test]
+    fn empty_filter_table_is_not_applied() {
+        let cat = out_of_order_episodes_catalog();
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.type == \"episode\"".into(),
+            order: None,
+        })]);
+        inc.order = None;
+        inc.filter = Some(Filter {
+            seasons: None,
+            episode_ids: None,
+        });
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        assert_eq!(items.len(), 3, "an empty [filter] table restricts nothing");
     }
 
     // ---- collection entries (#107) ----------------------------------------
