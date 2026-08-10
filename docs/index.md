@@ -22,5 +22,5 @@ features:
   - title: Composable sequencing
     details: Blocks of entries or pool/pattern interleaves resolve into one ordered list per generation, materialized forward. Recurring grids and live-event injection follow in v2+.
   - title: Schema-locked to ETV-next
-    details: Depends on ETV-next's `ersatztv-playout` Rust crate via a git submodule. Schema drift becomes a compile-time question, not a runtime surprise.
+    details: Depends on ETV-next's `ersatztv-playout` Rust crate, vendored into this repo. Schema drift becomes a compile-time question, not a runtime surprise.
 ---

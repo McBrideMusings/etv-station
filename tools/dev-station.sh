@@ -16,17 +16,6 @@ set -u
 STATION_CONFIG="${1:-examples/station.yaml}"
 [ "$#" -gt 0 ] && shift
 
-# The etv-next submodule supplies the `ersatztv-playout` crate this build needs.
-# A fresh clone or new worktree has the directory but not the contents, and
-# cargo's error never mentions submodules — same check dev-run.sh makes.
-if [ ! -f etv-next/crates/ersatztv-playout/Cargo.toml ]; then
-  echo "[station] etv-next submodule is not checked out; running git submodule update --init --recursive"
-  if ! git submodule update --init --recursive; then
-    echo "[station] submodule checkout failed; cannot build" >&2
-    exit 1
-  fi
-fi
-
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091

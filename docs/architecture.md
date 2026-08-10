@@ -22,7 +22,7 @@ Quick reference. The full rationale lives in [PRD §Architecture](/PRD#architect
 
 - **etv-station** has read/write on the playout volume. Computes "what plays when," writes JSON.
 - **etv-next** has read-only on the same volume. Loads the JSON file whose `[start, finish)` covers "now," produces HLS + XMLTV.
-- Coupling is exactly two things: the playout JSON schema (pinned via the `etv-next` submodule + Rust path-dep) and the directory layout convention.
+- Coupling is exactly two things: the playout JSON schema (a Rust path-dep on the vendored ETV-next source) and the directory layout convention.
 - The directory layout is single-sourced from the station config: each channel's output folder is derived as `{output_base}/{identity}` (see [schema](/schema#station-file)), and `etv-station --render-etv-next <dir>` generates ETV-next's `lineup.json` + `channelN.json` from that same config — so ETV-next reads exactly where the station writes, with no folder path authored twice. The container entrypoint runs that render at every start, so the two can only ever agree.
 
 ## Subtitles
@@ -76,13 +76,17 @@ Two things are worth knowing before flipping it:
   English is not. HLS announces this once per playlist and has no way to vary it
   per programme, so one label covers the whole channel either way.
 
-## Why a submodule
+## Why ETV-next is vendored, not pinned
 
-`etv-station` depends on `etv-next-station/crates/ersatztv-playout` as a Rust path dependency through a git submodule pinned to a specific commit:
+`etv-station` depends on `vendor/etv-next/crates/ersatztv-playout` as a Rust path dependency. The whole ETV-next source sits in this repo as ordinary tracked files, upstream plus this project's modifications to it:
 
 - Schema drift becomes a compile-time question. If upstream renames a field, `cargo build` fails before any test runs.
-- Adopting an upstream schema change is a deliberate two-step: pull `origin/main` into the submodule, bump the submodule SHA in `etv-station`, rebuild.
-- No vendoring (which would re-introduce drift), no crates.io dependency on Jason Dove (which he hasn't published).
+- Adopting an upstream change is one merge in one repo: `git subtree pull --prefix=vendor/etv-next etv-upstream main --squash`, resolve whatever conflicts, rebuild.
+- No crates.io dependency on Jason Dove (which he hasn't published).
+
+This replaced a git submodule pointing at a fork (`McBrideMusings/etv-next-station`). The submodule made sense while the delta was small, but it grew to 3,056 added and 457 removed lines across 35 files — 30 of them files upstream actively edits. A separate repo for that meant a change to one program landing in two repos with a SHA bump between them, and the diff being invisible to anyone reading `etv-station`'s history. Vendoring puts the code and the changes in the same place; the merge conflicts are identical either way, because they come from the delta, not from where it is stored.
+
+The cost: nothing enforces the separation any more. A single commit can now mix a station change and an ETV-next change, which makes the next upstream merge harder to read. Keep them in separate commits.
 
 ## Why a separate program (not a fork of etv-next)
 
@@ -113,7 +117,7 @@ Matches ETV-next's existing process model — it already uses files (`.ready`, `
 
 ## Why Rust
 
-Because ETV-next is Rust and the submodule + path-dep approach is essentially free in Rust. Any other language would either re-implement the schema models (drift risk) or codegen them (added build complexity, weaker typing). Sharing serde models on the producer and consumer side is the fastest path to "schema drift is impossible at compile time."
+Because ETV-next is Rust and the vendored path-dep approach is essentially free in Rust. Any other language would either re-implement the schema models (drift risk) or codegen them (added build complexity, weaker typing). Sharing serde models on the producer and consumer side is the fastest path to "schema drift is impossible at compile time."
 
 ## Determinism and reload
 

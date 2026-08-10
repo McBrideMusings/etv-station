@@ -4,23 +4,27 @@
 
 ## Architecture in one sentence
 
-One container running two programs over one folder, with one shared schema: `etv-station` writes `{start}_{finish}.json` files; ETV-next reads them, produces HLS + XMLTV. The schema is pinned via the `etv-next/` git submodule so drift is a compile-time error.
+One container running two programs over one folder, with one shared schema: `etv-station` writes `{start}_{finish}.json` files; ETV-next reads them, produces HLS + XMLTV. The schema is a path dependency on the vendored ETV-next source under `vendor/etv-next/`, so drift is a compile-time error.
 
 See `docs/architecture.md` for the full picture and `docs/PRD.md` for the spec.
 
-## Submodule rules — DO NOT EDIT FROM THIS REPO
+## `vendor/etv-next/` — vendored upstream, ours to modify
 
-`etv-next/` is a submodule pointing at `McBrideMusings/etv-next-station`. **Never make changes to files under `etv-next/` from this repo.** Schema / pipeline changes are made in the etv-next checkout proper, then absorbed here by bumping the submodule SHA. Touching `etv-next/` from inside `etv-station` will silently lose work on the next submodule update.
+`vendor/etv-next/` holds [ErsatzTV/next](https://github.com/ErsatzTV/next) plus this project's modifications to it, as ordinary tracked files. It is not a submodule and there is no fork repository — edit it here like any other code.
+
+Upstream is absorbed with a real merge:
+
+```sh
+git subtree pull --prefix=vendor/etv-next etv-upstream main --squash
+```
+
+`etv-upstream` is `https://github.com/ErsatzTV/next`; add it with `git remote add etv-upstream https://github.com/ErsatzTV/next` if a fresh clone lacks it. Conflicts land in whichever files upstream and this project both touched. See `.claude/skills/upstream-sync/SKILL.md` for the survey, the two files that need special handling, and the conflict doctrine.
+
+Keep a change that touches `vendor/etv-next/` in its own commit, separate from station-side changes — the next upstream merge is far easier to read when the two aren't mixed.
 
 ## Build & run
 
-This is a Cargo workspace with three crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer).
-
-**A fresh clone or a new git worktree must check out the submodule first** — the `ersatztv-playout` crate every build depends on lives in `etv-next/`, and without it cargo fails with an unreadable-`Cargo.toml` error that never mentions submodules:
-
-```sh
-git submodule update --init --recursive
-```
+This is a Cargo workspace with three crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer). `vendor/etv-next` is its own workspace, excluded from this one and consumed as a path dependency.
 
 The common operations:
 
@@ -49,7 +53,7 @@ Keep these in sync as you work:
 |---|---|
 | `docs/PRD.md` | Product behavior, scope, or surface area changes |
 | `docs/roadmap.md` | Direction shifts, an initiative ships, or a decision is deferred |
-| `docs/architecture.md` | The container/submodule/IPC story changes |
+| `docs/architecture.md` | The container/vendoring/IPC story changes |
 | `docs/file-map.md` | Major files/folders are added, removed, renamed, or moved |
 
 Don't write new top-level planning / phase / feature docs in `docs/` — file a GitHub issue instead. `roadmap.md` is the only forward-looking doc.

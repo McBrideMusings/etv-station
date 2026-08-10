@@ -6,18 +6,18 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 
 | Path | What |
 |---|---|
-| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-query-test`, `crates/etv-overlay`. Excludes `etv-next/`. |
+| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-query-test`, `crates/etv-overlay`. Excludes `vendor/etv-next`. |
 | `Cargo.lock` | Workspace lockfile. |
 | `package.json` | VitePress devDep + `docs:dev` / `docs:build` scripts. Docs-only; no runtime JS. |
 | `bun.lock` | Bun lockfile for the docs `package.json`. |
 | `rustfmt.toml` | Workspace formatting config. |
-| `CLAUDE.md` | Repo-level agent guidance: build/run, submodule rules, docs convention. |
-| `Dockerfile` | Multi-stage build of the whole stack: one Rust builder compiles release `etv-station` + `etv-overlay`, a second compiles the submodule's `ersatztv` + `ersatztv-channel`, and the runtime stage (ErsatzTV's own ffmpeg image) carries all four plus a software-Vulkan stack for headless overlay rendering and `iproute2` for `ss` — asking whether a frozen player still holds a connection open is a question only the server's own network namespace can answer, and without it the shell answers "command not found" on stderr and exits 0, which reads as "no connections". Same reasoning carries `tcpdump`, `python3`, and the two stream diagnostics, which the runtime stage copies to `/usr/local/bin` and `ETV_DIAG_CAPTURE` switches on. `tcpdump` is given `cap_net_raw+eip` so uid 1000 can capture: NET_RAW is already in docker's default capability set, so nothing has to be added to the run config, and the capture stays non-promiscuous (`-p`) because going promiscuous would need NET_ADMIN, which is not. |
+| `CLAUDE.md` | Repo-level agent guidance: build/run, the vendored-ETV-next rules, docs convention. |
+| `Dockerfile` | Multi-stage build of the whole stack: one Rust builder compiles release `etv-station` + `etv-overlay`, a second compiles the vendored tree's `ersatztv` + `ersatztv-channel`, and the runtime stage (ErsatzTV's own ffmpeg image) carries all four plus a software-Vulkan stack for headless overlay rendering and `iproute2` for `ss` — asking whether a frozen player still holds a connection open is a question only the server's own network namespace can answer, and without it the shell answers "command not found" on stderr and exits 0, which reads as "no connections". Same reasoning carries `tcpdump`, `python3`, and the two stream diagnostics, which the runtime stage copies to `/usr/local/bin` and `ETV_DIAG_CAPTURE` switches on. `tcpdump` is given `cap_net_raw+eip` so uid 1000 can capture: NET_RAW is already in docker's default capability set, so nothing has to be added to the run config, and the capture stays non-promiscuous (`-p`) because going promiscuous would need NET_ADMIN, which is not. |
 | `docker/entrypoint.sh` | Container PID 1 (under tini). Renders ETV-next's config from the station config, creates every channel's playout folder, optionally starts the two diagnostics, starts the daemon, waits for its first playout files, then starts `ersatztv`. Restarts a crashed daemon in place; exits when ETV-next dies. A diagnostic dying is ignored — the wait loop only ends the container for its two real children. |
 | `.dockerignore` | Keeps `target/`, `.git/`, docs build output, and scratch out of the Docker build context. |
 | `.env.example` | Template for the deploy-related env vars (`APP_IMAGE`, `UNRAID_HOST`, …). Real `.env` is gitignored. |
 | `LICENSE` | Boilerplate. |
-| `README.md` | Project intro: tagline, status (what exists vs. planned), clone-with-submodules, build/run commands, docs links. |
+| `README.md` | Project intro: tagline, status (what exists vs. planned), clone, build/run commands, docs links. |
 
 ## Source
 
@@ -167,15 +167,15 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `.claude/skills/check-epg.md` | Skill: fetch `/xmltv.xml`, validate XMLTV structure, cross-check titles against playout JSON on disk. |
 | `.claude/skills/frame-grab.md` | Skill: `ffmpeg` frame capture from a live HLS stream; reads image inline so Claude can see the frame. |
 | `.claude/skills/read-logs.md` | Skill: locate and read the most recent `tmp/<cmd>.*.log` file from a dev run. |
-| `.claude/skills/upstream-sync/SKILL.md` | Skill: absorb upstream ErsatzTV/next into the private `etv-next` fork and land it here via the submodule pointer — the survey, the schema and ffmpeg-pin checks that reach into this repo, and the conflict doctrine for files the fork rewrote. |
+| `.claude/skills/upstream-sync/SKILL.md` | Skill: absorb upstream ErsatzTV/next into `vendor/etv-next` — the survey, the schema and ffmpeg-pin checks, and the conflict doctrine for the files this project rewrote. |
 
-## Submodule
+## Vendored ETV-next
 
 | Path | What |
 |---|---|
-| `etv-next/` | Submodule → `McBrideMusings/etv-next-station`. **Do not edit from this repo.** Bumped deliberately to absorb upstream schema changes. |
-| `etv-next/crates/ersatztv-playout/` | The schema crate `etv-station` depends on via path. Compile-time check for schema drift. |
-| `etv-next/schema/playout.json` | The JSON Schema for emitted playout files. |
+| `vendor/etv-next/` | [ErsatzTV/next](https://github.com/ErsatzTV/next) plus this project's modifications to it, as tracked files. Its own Cargo workspace, excluded from the station's. Upstream absorbed with `git subtree pull --prefix=vendor/etv-next etv-upstream main --squash`. |
+| `vendor/etv-next/crates/ersatztv-playout/` | The schema crate `etv-station` depends on via path. Compile-time check for schema drift. |
+| `vendor/etv-next/schema/playout.json` | The JSON Schema for emitted playout files. |
 
 ## Operational
 

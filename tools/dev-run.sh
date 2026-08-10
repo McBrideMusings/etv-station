@@ -12,18 +12,6 @@ set -m
 # shellcheck source=tools/dev-procs.sh
 . "$(dirname "$0")/dev-procs.sh"
 
-# The etv-next submodule supplies the `ersatztv-playout` crate every build here
-# depends on. A fresh clone or a new git worktree has the directory but not the
-# contents, and cargo's failure ("failed to read etv-next/crates/.../Cargo.toml")
-# says nothing about submodules — so check it explicitly and fix it in place.
-if [ ! -f etv-next/crates/ersatztv-playout/Cargo.toml ]; then
-  echo "[dev] etv-next submodule is not checked out; running git submodule update --init --recursive"
-  if ! git submodule update --init --recursive; then
-    echo "[dev] submodule checkout failed; cannot build without etv-next" >&2
-    exit 1
-  fi
-fi
-
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091
@@ -179,7 +167,7 @@ EOF
 # Build both etv-next binaries up-front so the channel subprocess exists when
 # the server's `ChannelSession::spawn` looks for it as a sibling executable.
 echo "[dev] building etv-next binaries..."
-cargo build --manifest-path etv-next/Cargo.toml --bin ersatztv --bin ersatztv-channel 2>&1 \
+cargo build --manifest-path vendor/etv-next/Cargo.toml --bin ersatztv --bin ersatztv-channel 2>&1 \
   | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 
 # Wait (up to 60s) for the station to emit its first playout JSON in every
@@ -224,7 +212,7 @@ if [ "${#output_folders[@]}" -gt 0 ]; then
 fi
 
 (
-  etv-next/target/debug/ersatztv examples/etv-next/lineup.json 2>&1 \
+  vendor/etv-next/target/debug/ersatztv examples/etv-next/lineup.json 2>&1 \
     | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 ) &
 

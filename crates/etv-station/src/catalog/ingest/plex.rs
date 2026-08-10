@@ -653,7 +653,7 @@ const NO_METADATA_AGENT: &str = "tv.plex.agents.none";
 /// The same word ErsatzTV uses for the same idea — its search surface has
 /// `other_video` as a media kind of its own alongside `movie` and `episode`
 /// (<https://ersatztv.org/docs/search/>) — rather than a second vocabulary for
-/// a project this one is pinned to by submodule.
+/// a project whose source this one vendors.
 pub const OTHER_VIDEO: &str = "other_video";
 
 /// The `type` items from `section` should carry, when it differs from the one

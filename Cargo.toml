@@ -1,12 +1,12 @@
 [workspace]
 members = ["crates/etv-station", "crates/etv-query-test", "crates/etv-overlay"]
-exclude = ["etv-next"]
+exclude = ["vendor/etv-next"]
 resolver = "3"
 
 [workspace.dependencies]
-ersatztv = { path = "etv-next/crates/ersatztv" }
-ersatztv-core = { path = "etv-next/crates/ersatztv-core" }
-ersatztv-playout = { path = "etv-next/crates/ersatztv-playout" }
+ersatztv = { path = "vendor/etv-next/crates/ersatztv" }
+ersatztv-core = { path = "vendor/etv-next/crates/ersatztv-core" }
+ersatztv-playout = { path = "vendor/etv-next/crates/ersatztv-playout" }
 etv-station = { path = "crates/etv-station" }
 etv-overlay = { path = "crates/etv-overlay" }
 anyhow = "1"

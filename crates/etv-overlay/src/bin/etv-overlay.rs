@@ -74,8 +74,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 // The ordering above is load-bearing, so check it against the real constant
 // rather than the "(90s)" written in the comment. If the overlay ever tolerated
 // a reader gap for longer than etv-next keeps a channel warm, it would still be
-// waiting when the worker that feeds it has already gone — and a bump on either
-// side of the submodule boundary could introduce that silently. Assert it here
+// waiting when the worker that feeds it has already gone — and a change on
+// either side of the vendor boundary could introduce that silently. Assert it here
 // so the drift is a build failure instead of a channel that quietly stops
 // rendering its overlay.
 const _: () = assert!(

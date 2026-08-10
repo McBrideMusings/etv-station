@@ -267,7 +267,7 @@ source:
 ## ProgramMetadata
 
 The metadata written into each playout item's `program` block (populates
-ETV-next's XMLTV). Defined in the `etv-next/` submodule
+ETV-next's XMLTV). Defined in `vendor/etv-next/`
 (`ersatztv_playout::playout::ProgramMetadata`). Every field is optional.
 
 | Field | Type |

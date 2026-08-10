@@ -18,14 +18,14 @@ Therefore anyone running ETV-next must produce playout JSON externally. The bund
 2. **Composable sequencing.** A channel is defined by blocks — flat entry lists or pool/pattern interleaves — resolved into one ordered list per generation. Architecture supports adding composition primitives without rewriting the core.
 3. **Embed program metadata.** Items carry title / description / season / episode / categories / rating / artwork — written into the `program` block of each playout item so ETV-next's XMLTV is populated.
 4. **Stay decoupled from ETV-next.** Filesystem-only contract. No IPC, no shared process, no schema fork. ETV-next's `schema/playout.json` is the boundary.
-5. **Track ETV-next's schema without drifting.** Achieved by depending on ETV-next's `ersatztv-playout` Rust crate at the source level, via a git submodule (see Architecture below).
+5. **Track ETV-next's schema without drifting.** Achieved by depending on ETV-next's `ersatztv-playout` Rust crate at the source level, vendored into this repo (see Architecture below).
 
 ## Non-goals
 
 - **Library management.** No NFO scraping, no online metadata providers, no media DB. Items are declared explicitly in config; the operator is responsible for accurate paths and metadata. (If they want richer metadata, that's another program upstream of this one.)
 - **Real-time control plane.** v1 is config-file driven, not network-driven. No web UI, no REST API, no live-event injection endpoint. Config edits + reload signal are sufficient for v1.
 - **Encoding decisions.** This program never invokes ffmpeg for encoding, never renders frames. It only reads media metadata it needs to produce playout entries (e.g. duration via `ffprobe`). Track selection / normalization / hwaccel is ETV-next's job.
-- **Modifying ETV-next.** No PRs against `etv-next-station` originate from this repo as a side-effect of station work. If a schema change is needed, that's a deliberate, separate effort against the submodule.
+- **Modifying ETV-next.** Station work does not change `vendor/etv-next/` as a side-effect. If a schema change is needed, that's a deliberate, separately committed change to the vendored tree.
 
 ## Architecture
 
@@ -53,26 +53,27 @@ Two programs, one shared filesystem, one shared schema.
 
 ### Repository layout
 
-`etv-station` is its own private GitHub repo (`McBrideMusings/etv-station`). It pulls ETV-next in as a **git submodule** for build-time access to the playout schema:
+`etv-station` is its own GitHub repo (`McBrideMusings/etv-station`). ETV-next's source is **vendored into it**, upstream plus this project's modifications, giving build-time access to the playout schema:
 
 ```
 etv-station/                                 ← this repo (Cargo workspace root)
-├── Cargo.toml                               ← workspace
+├── Cargo.toml                               ← workspace; excludes vendor/etv-next
 ├── crates/
 │   └── etv-station/
-│       ├── Cargo.toml                       ← path-dep on ../../etv-next/crates/ersatztv-playout
+│       ├── Cargo.toml                       ← path-dep on vendor/etv-next/crates/ersatztv-playout
 │       └── src/
-├── etv-next/                                ← submodule → McBrideMusings/etv-next-station
-│   └── crates/ersatztv-playout/             ← schema source of truth
+├── vendor/
+│   └── etv-next/                            ← ErsatzTV/next + this project's changes to it
+│       └── crates/ersatztv-playout/         ← schema source of truth
 ├── docs/
 │   └── PRD.md
 └── README.md
 ```
 
-The submodule pinning means:
-- `etv-station` always builds against a known, reviewed commit of ETV-next's schema crate. No schema drift is even *expressible* — they share serde models.
-- Adopting an upstream schema change is a deliberate two-step: pull `origin/main` into the submodule, bump the submodule SHA in `etv-station`, rebuild. If the schema change is incompatible, you find out immediately at compile time — not at runtime, not in production.
-- `etv-next-station` itself has two upstreams: `origin` = `ErsatzTV/next` (Jason Dove), `mine` = `McBrideMusings/etv-next-station`. Standard fork pattern; lets you carry private patches against Jason's tree if ever needed.
+Vendoring means:
+- `etv-station` always builds against the exact ETV-next source in the tree. No schema drift is even *expressible* — they share serde models.
+- Adopting an upstream change is one merge in one repo: `git subtree pull --prefix=vendor/etv-next etv-upstream main --squash`, where `etv-upstream` is `https://github.com/ErsatzTV/next`. If the change is schema-incompatible, you find out immediately at compile time — not at runtime, not in production.
+- Modifications to ETV-next live here, reviewable in this repo's history, rather than in a fork whose diff is invisible from the station.
 
 ### Deployment
 
@@ -88,7 +89,7 @@ docker run -d --name etv-station \
   etv-station:latest
 ```
 
-The image is built from this repo's `Dockerfile`: one builder stage for the station workspace, one for the ETV-next submodule, and a runtime stage on ErsatzTV's own ffmpeg image carrying `etv-station`, `etv-overlay`, `ersatztv`, and `ersatztv-channel`. `docker/entrypoint.sh` renders ETV-next's config from `station.yaml`, creates every channel's playout folder, then runs both processes.
+The image is built from this repo's `Dockerfile`: one builder stage for the station workspace, one for the vendored ETV-next workspace, and a runtime stage on ErsatzTV's own ffmpeg image carrying `etv-station`, `etv-overlay`, `ersatztv`, and `ersatztv-channel`. `docker/entrypoint.sh` renders ETV-next's config from `station.yaml`, creates every channel's playout folder, then runs both processes.
 
 Key properties:
 - The playout folder is a plain directory inside the container that the daemon writes and ETV-next reads. Lock-free producer/consumer; the OS guarantees atomicity for `rename(2)`.
@@ -266,7 +267,7 @@ Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffect
 | 3 | Source-media duration probing | `ffprobe` at config-load time; cache durations in the `.durations.json` sidecar. Re-probe on file mtime change. |
 | 4 | What if an item file is missing at probe time? | Fail loudly at config load (don't silently substitute). v1 is explicit about its inputs. |
 | 5 | Logging/observability | stdout structured logs (JSON lines). Container runtime captures them. No metrics endpoint v1. |
-| 6 | What if `etv-next-station` updates `ersatztv-playout` in a breaking way? | Compile-time error on submodule bump. PR cycle on `etv-station` to absorb the change. Considered a feature. |
+| 6 | What if upstream updates `ersatztv-playout` in a breaking way? | Compile-time error on the upstream merge. The absorb is not finished until the station's emitter moves with it. Considered a feature. |
 
 ## Verification (v1 acceptance)
 
@@ -275,7 +276,7 @@ Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffect
 - At every probe (hourly): ETV-next's `/channel/1.m3u8` returns valid HLS, `/xmltv.xml` includes correctly populated `<programme>` entries for the next ≥7 days, and ETV-next's logs contain zero `unable to find playout JSON file for time …` errors.
 - Killing the `etv-station` process mid-run: the entrypoint restarts it, and ETV-next serves without interruption throughout; even with the restart suppressed, the failure mode is graceful degradation (back to synthetic black + silence once the materialized window ends), not an immediate outage.
 - Restarting `etv-station`: the next roll tick refills the window without rewriting past files.
-- Bumping the `etv-next` submodule by one commit: `cargo build` either still succeeds (schema-compatible change) or fails with a clear compiler diagnostic (schema-incompatible change). Either outcome is acceptable; silent runtime drift is not.
+- Absorbing one upstream commit into `vendor/etv-next`: `cargo build` either still succeeds (schema-compatible change) or fails with a clear compiler diagnostic (schema-incompatible change). Either outcome is acceptable; silent runtime drift is not.
 
 ## Out of scope for v1, candidate for v2+
 
@@ -304,7 +305,7 @@ Live content sourcing requires a query language. ErsatzTV's Lucene variant had d
 
 Inspired by [ErsatzTV's graphics engine](https://ersatztv.org/docs/advanced/graphics-engine/), but authored in a real scripting language ([Rhai](https://rhai.rs/)) rather than YAML. Two tracks:
 
-- **Static.** Hardcoded channel watermark via [Vello](https://github.com/linebender/vello). Establishes overlay rendering inside etv-next's output pipeline and extends `PlayoutItem` with overlay config (etv-next submodule change).
+- **Static.** Hardcoded channel watermark via [Vello](https://github.com/linebender/vello). Establishes overlay rendering inside etv-next's output pipeline and extends `PlayoutItem` with overlay config (a change to `vendor/etv-next/`).
 - **Scripted.** Rhai-driven dynamic behavior — visibility, corner, size, opacity, fade-on-interval, now-playing / up-next text.
 
 Deliverable: a working overlay pipeline with a small declarative + scripted primitive set. Lottie / `velato` integration is a side project, not a blocker.
@@ -339,7 +340,7 @@ This phase reverses two v1 non-goals explicitly:
 
 - **Encoding decisions** stay etv-next's job. etv-station never invokes ffmpeg for transcoding; only ffprobe for duration.
 - **Real-time control plane** is still deferred — v2+ remains config-file driven with reload signal / file watcher.
-- **Modifying ETV-next** for non-schema reasons. The graphics overlay cascade *does* require an `PlayoutItem` schema extension on the etv-next side; that is a deliberate, planned submodule change, not drift.
+- **Modifying ETV-next** for non-schema reasons. The graphics overlay cascade *does* require an `PlayoutItem` schema extension on the etv-next side; that is a deliberate, planned change to `vendor/etv-next/`, not drift.
 
 ---
 
@@ -350,7 +351,7 @@ This section captures decisions made *during PRD authoring* so future readers kn
 - **Why not extend ETV-next directly with scheduling?** Upstream README explicitly excludes scheduling from scope. Adding it would mean a permanent fork, eating merge conflicts on every pipeline-side PR. Rejected in favor of separate-program approach.
 - **Why not use the existing `ersatztv-playout-generator`?** Documented as "development and testing only," writes a single window, has no rule abstraction. Could be extended, but it lives inside the upstream repo — extending it = same fork problem. Rejected.
 - **Why a separate repo (not a crate inside `etv-next-station`)?** Two reasons. (1) Clean independent release cadence and CI; the station program iterates on rules and metadata workflows that are unrelated to ETV-next's pipeline work. (2) Possible eventual public release as a standalone companion project — `etv-next-station` will always be private (it's a personal fork), but `etv-station` could be open-sourced cleanly without disentangling.
-- **Why submodule rather than a vendored copy or a Cargo registry crate?** Submodule is the only option that gives source-level dependency on `ersatztv-playout` without forcing Jason to publish it on crates.io. Schema drift becomes a compile-time question. Vendoring duplicates the file and reintroduces drift risk.
+- **Why a vendored copy rather than a submodule or a Cargo registry crate?** Both vendoring and a submodule give a source-level dependency on `ersatztv-playout` without forcing Jason to publish it on crates.io, and either makes schema drift a compile-time question. Vendoring wins because this project modifies ETV-next substantially (3,056 added / 457 removed lines across 35 files); a submodule puts those changes in a second repository, so one change to one program lands in two repos and its diff is invisible to anyone reading this one. The merge conflicts on an upstream absorb are identical either way — they come from the size of the delta, not from where it lives.
 - **Why filesystem-only IPC?** Matches ETV-next's existing process model (it already uses files for ready/heartbeat signaling between server and channel subprocesses). No new protocol surface. Easy to debug — `ls` shows you the state. Also: never builds in any assumption Jason has not himself adopted, so upstream evolution can't break the contract.
 - **Why one container, not two?** *(Supersedes the original two-container decision.)* The playout folder is the entire interface between the two programs, so two containers meant sharing that folder, keeping two configs in step, and ordering their startup — machinery whose only purpose was separating two processes that are useless apart. One image makes the folder an ordinary directory and the deploy one image plus one config mount. The failure separation that motivated two containers is kept in `docker/entrypoint.sh`, which restarts a crashed daemon in place while ETV-next keeps streaming, and ends the container when ETV-next itself dies. What is actually given up: per-half resource limits and per-half restart cadence.
-- **Why Rust?** Already chosen language for ETV-next, but the deciding factor is the submodule + path-dep approach: depending on `ersatztv-playout` as a Rust crate from inside the submodule is essentially free, and any other language would need to either re-implement the schema models (drift risk) or codegen them from `schema/playout.json` (added build complexity, weaker type safety than serde-on-the-shared-types).
+- **Why Rust?** Already chosen language for ETV-next, but the deciding factor is the vendored path-dep approach: depending on `ersatztv-playout` as a Rust crate from inside the vendored tree is essentially free, and any other language would need to either re-implement the schema models (drift risk) or codegen them from `schema/playout.json` (added build complexity, weaker type safety than serde-on-the-shared-types).

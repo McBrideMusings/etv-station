@@ -1,11 +1,10 @@
 # Build artifacts — rebuilt inside the image.
 target/
-etv-next/target/
+vendor/etv-next/target/
 
 # VCS and CI metadata.
 .git/
 .gitignore
-.gitmodules
 .github/
 
 # Docs site and its build output.
@@ -20,7 +19,7 @@ admin.toml
 admin
 
 # Ephemeral / scratch and example fixtures. The build compiles only crates/ +
-# the etv-next submodule; examples/ (sample configs, assets, a nested etv-next
+# vendor/etv-next; examples/ (sample configs, assets, a nested etv-next output
 # copy ~45M) is never referenced at build time.
 tmp/
 examples/

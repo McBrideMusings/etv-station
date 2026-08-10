@@ -11,8 +11,8 @@ channel always has JSON on disk whose `[start, finish)` window covers "now" and
 extends N days into the future.
 
 The two ship in one container over one playout folder. The only coupling is
-the playout JSON schema (pinned via the `etv-next` git submodule, so schema drift
-is a compile-time error) and the directory-layout convention, which is derived
+the playout JSON schema (a path dependency on the vendored ETV-next source, so
+schema drift is a compile-time error) and the directory-layout convention, derived
 from the station config rather than authored twice.
 
 ```
@@ -54,22 +54,20 @@ resolution).
 
 ## Clone
 
-This repo is private and pulls ETV-next in as a submodule for build-time access to
-the playout schema. Clone with submodules:
+Everything needed to build is in the one repo — no submodules:
 
 ```sh
-git clone --recurse-submodules git@github.com:McBrideMusings/etv-station.git
+git clone git@github.com:McBrideMusings/etv-station.git
 ```
 
-If you already cloned without `--recurse-submodules`:
+[ErsatzTV/next](https://github.com/ErsatzTV/next) is vendored under
+`vendor/etv-next/`, along with this project's modifications to it, as ordinary
+tracked files. Edit them here; upstream is absorbed with a real merge:
 
 ```sh
-git submodule update --init --recursive
+git remote add etv-upstream https://github.com/ErsatzTV/next   # once per clone
+git subtree pull --prefix=vendor/etv-next etv-upstream main --squash
 ```
-
-> **Do not edit files under `etv-next/`** from this repo — it's a submodule
-> pointing at the ETV-next source. Schema changes are made upstream, then absorbed
-> by bumping the submodule SHA.
 
 ## Build & run
 
@@ -94,5 +92,5 @@ HLS or `/channels.m3u` for the lineup.
 Full docs are a VitePress site under `docs/` (`bun run docs:dev`). Start here:
 
 - [PRD](docs/PRD.md) — what it does, scope, verification bar.
-- [Architecture](docs/architecture.md) — the container / submodule / IPC story.
+- [Architecture](docs/architecture.md) — the container / vendoring / IPC story.
 - [Roadmap](docs/roadmap.md) — direction and what's deferred.

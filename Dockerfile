@@ -22,8 +22,8 @@ RUN cargo install cargo-chef --locked
 WORKDIR /build
 
 # ---- planner ----
-# Reads the whole workspace (including the ersatztv-playout path dep under the
-# etv-next submodule) and writes recipe.json — the dependency graph, no sources.
+# Reads the whole workspace (including the ersatztv-playout path dep under
+# vendor/etv-next) and writes recipe.json — the dependency graph, no sources.
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
@@ -48,19 +48,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --locked cooks against the committed Cargo.lock; the -p filters match the real
 # build below so only the deployed crates' dependencies are compiled.
 #
-# ersatztv-playout is a path dependency under the etv-next submodule, which the
+# ersatztv-playout is a path dependency under vendor/etv-next, which the
 # top-level Cargo.toml excludes from this workspace. cargo-chef only reconstructs
-# skeleton crates for workspace members, so it does NOT recreate the etv-next
-# path dep — cook would fail to resolve it. Copy the real submodule in first so
-# cargo can resolve and build it. The submodule is pinned by SHA and changes
-# rarely, so it belongs in this cached dependency layer; a submodule bump is the
-# only thing besides a Cargo.lock change that busts the cache.
+# skeleton crates for workspace members, so it does NOT recreate the vendored
+# path dep — cook would fail to resolve it. Copy the real tree in first so cargo
+# can resolve and build it. The vendored tree only moves when upstream is
+# absorbed, so it belongs in this cached dependency layer; an upstream absorb is
+# the only thing besides a Cargo.lock change that busts the cache.
 COPY --from=planner /build/recipe.json recipe.json
-COPY etv-next etv-next
+COPY vendor/etv-next vendor/etv-next
 RUN cargo chef cook --release --locked --recipe-path recipe.json -p etv-station -p etv-overlay
 
 # Now the real build. The whole workspace is needed: ersatztv-playout is a path
-# dependency under the etv-next submodule, and etv-overlay is a sibling crate.
+# dependency under vendor/etv-next, and etv-overlay is a sibling crate.
 # .dockerignore keeps the context small (no target/, .git/, docs build output).
 # The dependency layer cooked above is reused, so this recompiles only the
 # workspace crates. etv-query-test (the Phase A CEL harness) is a dev tool and
@@ -69,13 +69,13 @@ COPY . .
 RUN cargo build --release --locked -p etv-station -p etv-overlay
 
 # ---- etv-builder ----
-# ErsatzTV-next is its own cargo workspace under the submodule, so it builds on
-# its own here rather than as part of the station workspace above. The layer is
-# keyed on the submodule contents, so it only recompiles when the pinned SHA
-# moves. `ersatztv-channel` is built alongside the server because the server
-# looks for it as a sibling executable when it spawns a channel session.
+# ErsatzTV-next is its own cargo workspace under vendor/, so it builds on its own
+# here rather than as part of the station workspace above. The layer is keyed on
+# the vendored tree, so it only recompiles when that tree moves.
+# `ersatztv-channel` is built alongside the server because the server looks for
+# it as a sibling executable when it spawns a channel session.
 FROM chef AS etv-builder
-COPY etv-next /build/etv-next
+COPY vendor/etv-next /build/etv-next
 WORKDIR /build/etv-next
 RUN cargo build --release --locked --bin ersatztv --bin ersatztv-channel
 
