@@ -620,7 +620,28 @@ fn section_list_params<'a>(
     };
     params.push(("includeGuids", "1"));
     if let Some(s) = since_param {
+        // `updatedAt>` alone misses any item with no `updatedAt` attribute at
+        // all (#134: 478 episodes on the live server, null rather than zero,
+        // so they fail the comparison identically and wait for the daily full
+        // sweep). Every item has an `addedAt`, so OR-ing it in reaches the
+        // whole section.
+        //
+        // `or=1` MUST sit between the two filters it joins, not after both —
+        // this is a Plex query-parsing quirk, not a documented API contract.
+        // Verified against the live server (TV section, 73,835 items):
+        // `updatedAt>=1 or=1
+        // addedAt>=1` (or=1 between) returns 73,835 — the whole section, as
+        // intended. `updatedAt>=1 addedAt>=1 or=1` (or=1 last, same three
+        // params, only reordered) returns 73,333 — identical to `updatedAt>=1`
+        // alone, i.e. `addedAt>` and `or=1` are silently ignored. At a real
+        // cursor (1700000000) `or=1` last does worse than doing nothing:
+        // 71,155 vs. 73,333 for `updatedAt>` alone — so this is not a
+        // no-op-if-wrong mistake, it silently narrows the result. `type` and
+        // `includeGuids` are view/output params, not attribute filters, so
+        // their position is unaffected and they stay first.
         params.push(("updatedAt>", s));
+        params.push(("or", "1"));
+        params.push(("addedAt>", s));
     }
     params
 }
@@ -686,14 +707,18 @@ impl PlexClient {
     /// every entry falling back to a path-hash `fs:` id.
     ///
     /// `since` (unix seconds) narrows each section to items Plex has touched
-    /// after that moment, via the server-side `updatedAt>=` filter. On a library
-    /// of ~86k items that is the difference between 20s of transfer and a
-    /// fraction of a second. `None` fetches everything.
+    /// after that moment, via the server-side `updatedAt>=` filter OR'd with
+    /// `addedAt>=` (#134) — see [`section_list_params`]. On a library of ~86k
+    /// items that is the difference between 20s of transfer and a fraction of
+    /// a second. `None` fetches everything.
     ///
     /// A delta cannot report a *deletion* — an item removed from Plex simply
     /// stops appearing, which is indistinguishable from "unchanged" here. The
     /// caller is responsible for periodically running a full pass; see
-    /// `full_sweep_after_secs` in the station config.
+    /// `full_sweep_after_secs` in the station config. The full sweep is also
+    /// the only thing that catches an item whose `updatedAt` never moves
+    /// (null, not zero) and whose metadata later changes: `addedAt` doesn't
+    /// move either, so a delta can't see the change, only the initial add.
     fn fetch_all(&self, since: Option<i64>) -> Result<Vec<PlexItem>, PlexIngestError> {
         let sections: SectionListResp = self.get("/library/sections", &[])?;
         let mut items = Vec::new();
@@ -708,7 +733,9 @@ impl PlexClient {
         //
         // Since the comparison is strict, step the cursor back a second: an item
         // touched during the very second the previous pass recorded would
-        // otherwise fall between the two runs and never be seen.
+        // otherwise fall between the two runs and never be seen. The same
+        // stepped-back value feeds both halves of the `updatedAt>`/`addedAt>`
+        // disjunction below, so the step-back covers both.
         let since_param = since.map(|s| (s - 1).to_string());
         for section in &sections.media_container.directory {
             let Some(id) = section.key.as_deref() else {
@@ -717,6 +744,27 @@ impl PlexClient {
             let params = section_list_params(section.kind.as_deref(), since_param.as_deref());
             let endpoint = format!("/library/sections/{id}/all");
             let resp: MediaContainerResp = self.get(&endpoint, &params)?;
+            // Size of the #134 class: items this section reports with no
+            // `updatedAt` at all, and so would be invisible to an
+            // `updatedAt>`-only delta. Logged unconditionally (not just on a
+            // delta pass) so the class is visible rather than discovered by
+            // accident.
+            let missing_updated_at = resp
+                .media_container
+                .metadata
+                .iter()
+                .filter(|m| m.updated_at.is_none())
+                .count();
+            if missing_updated_at > 0 {
+                tracing::info!(
+                    event = "catalog.ingest.plex_missing_updated_at",
+                    section = section.title.as_deref().unwrap_or(""),
+                    section_id = %id,
+                    missing_updated_at,
+                    total = resp.media_container.metadata.len(),
+                    "items in this section have no updatedAt; reached via addedAt on delta, full sweep otherwise",
+                );
+            }
             for m in &resp.media_container.metadata {
                 if let Some(item) = to_plex_item(m, section.title.as_deref(), |p| self.translate(p))
                 {
@@ -888,8 +936,11 @@ struct PlexMetadata {
     duration: Option<i64>,
     #[serde(default)]
     content_rating: Option<String>,
-    /// Unix seconds Plex last touched this record. Only read for collections, to
-    /// skip the per-collection children request when nothing has changed.
+    /// Unix seconds Plex last touched this record. Read for collections, to
+    /// skip the per-collection children request when nothing has changed, and
+    /// for library items in [`PlexClient::fetch_all`] to count how many carry
+    /// no `updatedAt` at all (#134) — that class is invisible to a delta's
+    /// `updatedAt>` filter and depends on `addedAt>` to be reached.
     #[serde(default)]
     updated_at: Option<i64>,
     /// Only read for collections: `"show"` for a TV collection (whose children
@@ -1041,8 +1092,44 @@ mod tests {
                 ("type", "4"),
                 ("includeGuids", "1"),
                 ("updatedAt>", "1700000000"),
+                ("or", "1"),
+                ("addedAt>", "1700000000"),
             ]
         );
+    }
+
+    /// #134: an item with no `updatedAt` at all fails `updatedAt>` no matter
+    /// what the cursor is, so the delta filter must reach it through
+    /// `addedAt>` instead — every item has one. `or=1` is what makes Plex OR
+    /// the two attribute filters instead of AND-ing them (which would demand
+    /// both and still exclude the item) — but only when it sits *between*
+    /// them. Asserting exact order, not just presence, is the point: a build
+    /// with `or=1` moved to the end still contains all three params and
+    /// passes a `.contains` check, but silently stops widening anything
+    /// (verified live — see [`section_list_params`]'s doc comment).
+    #[test]
+    fn section_list_params_widens_the_delta_filter_to_added_at() {
+        for kind in [Some("show"), Some("movie"), None] {
+            let params = section_list_params(kind, Some("1700000000"));
+            assert!(
+                params.ends_with(&[
+                    ("updatedAt>", "1700000000"),
+                    ("or", "1"),
+                    ("addedAt>", "1700000000"),
+                ]),
+                "delta filter must end with updatedAt>, or=1, addedAt> in that order \
+                 for kind={kind:?}: {params:?}"
+            );
+        }
+    }
+
+    /// A full pass (`since_param = None`) has nothing to widen — there is no
+    /// delta filter to OR against, so neither `addedAt>` nor `or=1` should
+    /// appear.
+    #[test]
+    fn section_list_params_full_pass_has_no_delta_filter() {
+        let params = section_list_params(Some("show"), None);
+        assert_eq!(params, vec![("type", "4"), ("includeGuids", "1")]);
     }
 
     #[test]
