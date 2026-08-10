@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 /// SHA-256 of `tests/fixtures/entry_id.json`. `plex-db-ex` pins the same value
 /// in `tests/test_identity.py`. Changing the fixture means changing both repos
 /// in the same breath and updating this constant in both.
-const FIXTURE_SHA256: &str = "73fd792cb8e84a88fd577f4d7c0966db1c0240b88db7c939f54c9374fdbb4daf";
+const FIXTURE_SHA256: &str = "e2bb9bb35e9d33924bf2bf0c48fffd84c8704da6bc3bdd7f6cf971b3a1adcb88";
 
 /// Resolved from `CARGO_MANIFEST_DIR`, so the test reads nothing outside this
 /// repository and passes in a checkout with no sibling `plex-db-ex`.
@@ -195,6 +195,22 @@ fn an_unusable_guid_value_is_absent_rather_than_an_identity() {
         ),
         "imdb:tt1375666"
     );
+
+    // U+001C-U+001F count as blank, because Python's `str.isspace()` does and
+    // Rust's `char::is_whitespace` does not. Comparing the two definitions over
+    // all of Unicode, those four are the complete disagreement — without this,
+    // "\u{1c}" would be `imdb:\u{1c}` here and a path hash in Python.
+    for sep in ['\u{1c}', '\u{1d}', '\u{1e}', '\u{1f}'] {
+        let got = derive_entry_id(
+            &[(ExternalNs::Imdb, sep.to_string())],
+            "movies/separator.mkv",
+        );
+        assert!(
+            got.starts_with("fs:"),
+            "U+{:04X} must be blank, got {got}",
+            sep as u32
+        );
+    }
 
     // An otherwise-usable value is used verbatim; whitespace is not trimmed.
     assert_eq!(

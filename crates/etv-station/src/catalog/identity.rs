@@ -43,12 +43,36 @@ pub fn derive_entry_id(external_ids: &[(ExternalNs, String)], canonical_path: &s
         // namespace still counts. Matching the Python's nested loop exactly.
         if let Some((_, value)) = external_ids
             .iter()
-            .find(|(n, v)| *n == ns && !v.trim().is_empty())
+            .find(|(n, v)| *n == ns && !is_blank_guid_value(v))
         {
             return format!("{}:{}", ns.as_str(), value);
         }
     }
     format!("fs:{:016x}", fnv1a_64(canonical_path))
+}
+
+/// Whether a GUID value is blank, and therefore not an identity.
+///
+/// **This is deliberately not `str::trim().is_empty()`.** The Python half of this
+/// rule (`plex-db-ex`, `plexdb/identity.py`) tests `not value.strip()`, and
+/// Python's `str.isspace()` treats four characters as whitespace that Rust's
+/// `char::is_whitespace` does not: U+001C FILE SEPARATOR through U+001F UNIT
+/// SEPARATOR. Comparing the two definitions across the whole of Unicode, those
+/// four are the *complete* disagreement, in one direction — Rust considers 25
+/// characters whitespace, Python 29, and Python's set is a strict superset.
+///
+/// Left as `trim()`, a GUID value of `"\u{1c}"` would be an identity here
+/// (`imdb:\u{1c}`) and absent in Python, so the two implementations would derive
+/// different ids for the same title — the exact silent divergence the shared
+/// fixture exists to catch, and one no fixture case covered.
+///
+/// Rust is the side that moved because Python's rule is the safer one: treating
+/// more values as blank means more titles fall through to the path hash, which
+/// separates them, where the alternative merges them.
+pub fn is_blank_guid_value(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'))
 }
 
 /// Canonicalise a raw filesystem path for identity/dedup: strip the configured

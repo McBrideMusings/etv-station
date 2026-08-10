@@ -106,6 +106,18 @@
       "external_ids": [["imdb", " tt1375666 "]],
       "canonical_path": "movies/inception.mkv",
       "expect": "imdb: tt1375666 "
+    },
+    {
+      "name": "a separator-only value is absent — Python's str.isspace covers U+001C-U+001F and Rust's char::is_whitespace does not, so both sides must special-case them",
+      "external_ids": [["imdb", "\u001c"]],
+      "canonical_path": "movies/separator-guid.mkv",
+      "expect": "fs:ab28b2f8d4c22ada"
+    },
+    {
+      "name": "a separator-only value is skipped so the next namespace wins",
+      "external_ids": [["imdb", "\u001f"], ["tmdb", "27205"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "tmdb:27205"
     }
   ],
 

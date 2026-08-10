@@ -32,7 +32,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::config::Order;
 
 pub use error::CatalogError;
-pub use identity::{canonical_path, derive_entry_id};
+pub use identity::{canonical_path, derive_entry_id, is_blank_guid_value};
 pub use model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
 
 /// `catalog_meta` key holding the unix-seconds timestamp of the last completed

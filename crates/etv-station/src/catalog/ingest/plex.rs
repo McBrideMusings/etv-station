@@ -32,7 +32,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::catalog::identity::{canonical_path, derive_entry_id};
+use crate::catalog::identity::{canonical_path, derive_entry_id, is_blank_guid_value};
 use crate::catalog::model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
 use crate::catalog::{Catalog, CatalogError};
 
@@ -495,10 +495,13 @@ fn or_existing(primary: Option<String>, existing: Option<String>) -> Option<Stri
 /// collapse #184 is about, arriving one scan later through the reconciliation
 /// path. Dropping it once, here, keeps all three consumers agreeing.
 ///
-/// "Blank" matches [`derive_entry_id`]'s rule — empty or whitespace-only. This
-/// is deliberately a filter on what Plex ingestion builds, not a change to the
-/// derivation itself, so the byte-for-byte parity with `plex-db-ex` that the
-/// shared fixture pins is untouched.
+/// "Blank" is [`is_blank_guid_value`] — the *same* predicate `derive_entry_id`
+/// uses, not a second definition of it. That matters: this filter and the
+/// derivation disagreeing is how the collapse stayed reachable in the first
+/// place, so they share one function rather than two matching implementations.
+/// Note it is deliberately **not** the general-purpose `non_empty` used for
+/// titles and studios below, whose `trim` semantics are right for those fields
+/// and wrong here.
 fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
     let (scheme, value) = id.split_once("://")?;
     let ns = match scheme {
@@ -508,7 +511,10 @@ fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
         "plex" => ExternalNs::Plex,
         _ => return None,
     };
-    Some((ns, non_empty(value)?.to_string()))
+    if is_blank_guid_value(value) {
+        return None;
+    }
+    Some((ns, value.to_string()))
 }
 
 /// Convert one Plex metadata record into a [`PlexItem`], applying `translate` to
