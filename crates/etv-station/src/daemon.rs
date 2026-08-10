@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
+use ersatztv_playout::playout::Playout;
 use time::OffsetDateTime;
 use time_tz::Tz;
 use tokio::select;
@@ -1226,6 +1227,158 @@ async fn wipe_playout_from(
     Ok(removed)
 }
 
+/// The earliest instant it is safe to wipe and regenerate from, given a raw
+/// `from` (a chunk boundary or checkpoint instant with no guarantee of
+/// landing on an item boundary).
+///
+/// `emit_window` deliberately emits a boundary-straddling item whole into
+/// both neighbouring chunks so either side can play across the seam (see its
+/// doc comment), and `wipe_playout_from` correctly leaves the chunk file
+/// immediately before `from` in place — it also holds earlier items that are
+/// still valid. But the straddling item survives with it, still airing past
+/// `from`, so wiping and regenerating at the raw `from` lays a fresh item
+/// over one that is already scheduled there (#153). Advancing to the
+/// straddling item's real finish is what keeps the two from overlapping.
+/// Returns `from` unchanged when nothing straddles it.
+async fn regen_floor(
+    channel: &LoadedChannel,
+    from: OffsetDateTime,
+) -> Result<OffsetDateTime, StationError> {
+    let files = scan::scan_output_folder(&channel.output_folder).await?;
+    let Some(preceding) = files
+        .iter()
+        .filter(|f| f.start < from)
+        .max_by_key(|f| f.start)
+    else {
+        return Ok(from);
+    };
+    let bytes = tokio::fs::read(&preceding.path)
+        .await
+        .map_err(|source| StationError::Io {
+            path: preceding.path.clone(),
+            source,
+        })?;
+    let playout: Playout =
+        serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
+            path: preceding.path.clone(),
+            source,
+        })?;
+    let content_finish = playout.items.last().map(|item| item.finish).unwrap_or(from);
+    Ok(content_finish.max(from))
+}
+
+#[cfg(test)]
+mod regen_floor_tests {
+    use super::*;
+    use crate::rule::Sequential;
+    use tempfile::tempdir;
+    use time::macros::datetime;
+
+    fn ch(dir: &tempfile::TempDir) -> LoadedChannel {
+        let config: ChannelConfig = toml::from_str(
+            "window_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n[rule]\nblocks = []\n",
+        )
+        .expect("fixture channel config parses");
+        LoadedChannel {
+            name: "testch".into(),
+            config_path: PathBuf::from("testch.toml"),
+            output_folder: dir.path().to_path_buf(),
+            config,
+        }
+    }
+
+    fn film(id: &str, secs: u64) -> crate::resolve::ResolvedItem {
+        crate::resolve::ResolvedItem {
+            id: id.into(),
+            source: crate::config::SourceConfig::Lavfi {
+                params: format!("src={id}"),
+            },
+            in_point: Some(Duration::ZERO),
+            out_point: Some(Duration::from_secs(secs)),
+            program: None,
+            catalog_duration: None,
+            error_card: false,
+        }
+    }
+
+    /// The exact #153 shape: an 8-hour film starting an hour before a 6-hour
+    /// chunk boundary, so it is emitted whole into the chunk ending at that
+    /// boundary (per `emit_window`'s doc comment) with the boundary as its
+    /// filename finish — even though the film really runs another 7 hours past
+    /// it. A wipe at the boundary correctly leaves that chunk file alone, but
+    /// `regen_floor` must still read past the filename to the film's real end.
+    #[tokio::test]
+    async fn advances_past_a_film_straddling_the_wipe_point() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let boundary = datetime!(2026-01-01 06:00 UTC);
+        let anchor = boundary - time::Duration::hours(1);
+        let items = vec![film("fellowship", 8 * 3600)];
+        let durations = vec![Duration::from_secs(8 * 3600)];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        // What a #153 regeneration does before this fix: wipe everything at or
+        // after the boundary, stranding the boundary-named chunk as the only
+        // survivor.
+        wipe_playout_from(&channel, boundary).await.unwrap();
+
+        let floor = regen_floor(&channel, boundary).await.unwrap();
+        assert_eq!(
+            floor,
+            anchor + time::Duration::hours(8),
+            "must not land inside the still-airing film"
+        );
+    }
+
+    /// A chunk whose content fills it exactly, with nothing straddling the
+    /// boundary, must not be pushed forward — there is nothing to protect.
+    #[tokio::test]
+    async fn leaves_a_clean_boundary_untouched() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let anchor = datetime!(2026-01-01 00:00 UTC);
+        let items = vec![film("a", 6 * 3600)];
+        let durations = vec![Duration::from_secs(6 * 3600)];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        let boundary = datetime!(2026-01-01 06:00 UTC);
+        assert_eq!(regen_floor(&channel, boundary).await.unwrap(), boundary);
+    }
+
+    /// Nothing written yet: regen_floor is a no-op, not an error.
+    #[tokio::test]
+    async fn returns_from_unchanged_with_no_existing_files() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let from = datetime!(2026-01-01 06:00 UTC);
+        assert_eq!(regen_floor(&channel, from).await.unwrap(), from);
+    }
+}
+
 /// The emission loop for every channel: **materialize forward**.
 ///
 /// Each pass resolves the channel, lays the resulting sequence end-to-end after
@@ -1321,6 +1474,7 @@ async fn forward_channel_loop(
     // played out (#53).
     let now = OffsetDateTime::now_utc();
     if let Some(regen_from) = resume.rewind_to_unaired(now) {
+        let regen_from = regen_floor(channel, regen_from).await?;
         let removed = wipe_playout_from(channel, regen_from).await?;
         // Those airings are no longer scheduled, so they are no longer history.
         // Because the resume position is a projection of the store, dropping
@@ -1455,8 +1609,8 @@ async fn pattern_catch_up(
         now + time::Duration::seconds_f64(channel.config.roll_interval.as_secs_f64() * 2.0)
     };
     if let Some(gap) = scan::first_coverage_gap(output, now, heal_horizon).await? {
-        let regen_from =
-            tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, ctx.tz);
+        let boundary = tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, ctx.tz);
+        let regen_from = regen_floor(channel, boundary).await?;
         let removed = wipe_playout_from(channel, regen_from).await?;
         // Best-effort pool alignment: rewind to the checkpoint covering the hole
         // if it survives, else leave the pools as they are and accept a possible
