@@ -21,13 +21,12 @@
 # pool then splits the result by `type`, which is why one curated idea can drive
 # both halves of the pattern.
 #
-# The `shows` pool resolves to nothing today, and not because of anything here:
-# Plex files TV collections with members that are shows, and the catalog stores
-# only movies and episodes, so a TV collection's memberships are dropped at
-# ingest and no episode is a collection member. Until #119 lands this channel
-# plays its movies half only. Each item with no `show_id` — every movie — is
-# its own series of one, so `movies` needs no special configuration: rotating
-# through one-item series is simply playing the movies in order.
+# Plex files TV collections with members that are shows; the catalog stores
+# only movies and episodes, not shows, so ingest expands each member show to
+# its episode ratingKeys (#119) — that is what lets the `shows` pool resolve
+# at all. Each item with no `show_id` — every movie — is its own series of
+# one, so `movies` needs no special configuration: rotating through
+# one-item series is simply playing the movies in order.
 #
 # `order` on the `shows` pool does double duty: it sorts each show's episodes
 # into broadcast order AND fixes the rotation order of the shows themselves
