@@ -73,6 +73,13 @@ the same file collapse to one. (Collapsing a manual item against a catalog
 `query` result for that same file is future work — it needs the catalog ingester
 to assign the file a matching id.) There is no `id` field to set.
 
+An `http` source's identity is its **`uri` alone** — `headers` and `user_agent` are
+deliberately excluded. Two `http` items with the same URI collapse to one under the
+default `duplicates: collapse`, even if their headers differ. This is intentional:
+identity feeds the play-history ledger and the resume cursors, and headers are where
+rotating credentials live, so folding them in would give an item a new identity every
+time its token was refreshed and lose its position and history with it (#99).
+
 ```yaml
 - kind: item
   source:
