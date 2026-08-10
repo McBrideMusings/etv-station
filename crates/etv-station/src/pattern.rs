@@ -625,12 +625,18 @@ pub fn build(
                 .as_ref()
                 .expect("pass 1 leaves a hole only for a plugin pool");
             let path = score_env.resolve_path(plugin);
+            // Load-time validation already proved this pool's `capabilities`
+            // match exactly what the plugin declares (#167) — this just reads
+            // the same grant back to decide what `ctx.sets`/`ctx.history`
+            // resolve to for this call.
+            let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities);
             let ids = crate::score::pick(
                 &score_cache,
                 &path,
                 score_env.inputs,
                 &cfg.name,
                 cfg.config.as_ref(),
+                granted,
             )
             .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
             *slot = Some(ids);
@@ -1184,6 +1190,8 @@ mod tests {
             on_short: OnShort::Next,
             constraints: None,
             config: None,
+            capabilities: Vec::new(),
+            datastores: Vec::new(),
         }
     }
 
@@ -1202,6 +1210,8 @@ mod tests {
             on_short: OnShort::Next,
             constraints: None,
             config: None,
+            capabilities: Vec::new(),
+            datastores: Vec::new(),
         }
     }
 
@@ -1284,6 +1294,8 @@ mod tests {
             on_short: OnShort::Next,
             constraints: None,
             config: None,
+            capabilities: Vec::new(),
+            datastores: Vec::new(),
         }
     }
 
@@ -1579,6 +1591,8 @@ mod tests {
             on_short: OnShort::Next,
             constraints: None,
             config: None,
+            capabilities: Vec::new(),
+            datastores: Vec::new(),
         }
     }
 

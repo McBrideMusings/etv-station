@@ -5,15 +5,23 @@
 // aired. Every number below is this script's opinion, not the station's: swap
 // this file for another and nothing in etv-station changes.
 //
-// Three functions make up the contract:
-//   hooks()   -> [hook_name, …]              which hooks this script implements
-//   sources() -> #{ name: cel_expression }   run once, up front
-//   pick(ctx) -> [entry_id, …]               most-wanted first
+// Four functions make up the contract:
+//   hooks()         -> [hook_name, …]              which hooks this script implements
+//   capabilities()  -> [capability_name, …]        which host capabilities this script needs
+//   sources()       -> #{ name: cel_expression }   run once, up front
+//   pick(ctx)       -> [entry_id, …]               most-wanted first
 //
 // hooks() is read at config load time, before the catalog exists — it names
 // this script a pool_provider, which is the only hook a `plugin:` pool has
 // ever meant (#159). Declaring it is what lets a channel that misuses this
 // script (wants a hook it doesn't implement) fail at load instead of on air.
+//
+// capabilities() is read at the same time, alongside hooks() (#167). This
+// script reaches for ctx.sets (via sources()) and ctx.history below, so it
+// declares catalog_read and watch_history — and the channel pointing a pool
+// at this file must grant both under that pool's `capabilities:`, or the
+// load fails naming whichever is missing. Nothing else changed to add this:
+// pick() and sources() are exactly what they were before #167.
 //
 // ctx carries:
 //   ctx.sets.<name>   the items each source matched (every catalog column,
@@ -53,6 +61,8 @@ fn affinity_window_days(ctx) { tunable(ctx, "affinity_window_days", 14) }
 fn replay_ttl_days(ctx) { tunable(ctx, "replay_ttl_days", 30) }
 
 fn hooks() { ["pool_provider"] }
+
+fn capabilities() { ["catalog_read", "watch_history"] }
 
 fn sources() {
     #{

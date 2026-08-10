@@ -96,6 +96,11 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     on_short: Default::default(),
                     constraints: None,
                     config: None,
+                    // Every fixture script in this file reads `ctx.sets` /
+                    // `ctx.history` unconditionally (#167 predates this file),
+                    // so this helper grants both for every test that uses it.
+                    capabilities: vec!["catalog_read".into(), "watch_history".into()],
+                    datastores: Vec::new(),
                 }],
                 pattern: vec![PatternStep {
                     pool: "foryou".into(),
@@ -306,7 +311,12 @@ fn the_committed_example_plugin_runs() {
     // catalog, `pick` ranks what it found and never sees a database handle.
     let mut cache = etv_station::score::ScoreCache::default();
     cache.prepare(&cat, &path).unwrap();
-    let picked = etv_station::score::pick(&cache, &path, &inputs, "movies", None).unwrap();
+    // The committed example declares both (#167) — grant both here to match.
+    let granted = etv_station::score::GrantedCapabilities {
+        catalog_read: true,
+        watch_history: true,
+    };
+    let picked = etv_station::score::pick(&cache, &path, &inputs, "movies", None, granted).unwrap();
 
     assert!(
         !picked.contains(&"mov-d".to_string()),

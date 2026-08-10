@@ -2154,6 +2154,8 @@ mod tests {
                 on_short: OnShort::Next,
                 constraints: None,
                 config: None,
+                capabilities: Vec::new(),
+                datastores: Vec::new(),
             },
             Pool {
                 name: "shows".into(),
@@ -2169,6 +2171,8 @@ mod tests {
                 on_short: OnShort::Next,
                 constraints: None,
                 config: None,
+                capabilities: Vec::new(),
+                datastores: Vec::new(),
             },
         ];
         inc.pattern = vec![
@@ -2873,6 +2877,8 @@ mod tests {
             on_short: OnShort::Next,
             constraints: None,
             config: None,
+            capabilities: Vec::new(),
+            datastores: Vec::new(),
         }];
         inc.pattern = vec![PatternStep {
             pool: "shows".into(),
