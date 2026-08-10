@@ -771,7 +771,7 @@ impl PlexClient {
                 {
                     continue;
                 }
-                let members_ep = format!("/library/metadata/{collection_id}/children");
+                let members_ep = format!("/library/collections/{collection_id}/children");
                 let members: MediaContainerResp = self.get(&members_ep, &[])?;
                 let member_keys: Vec<String> = members
                     .media_container
@@ -794,9 +794,13 @@ impl PlexClient {
                 };
                 // Plex's own child count says this collection has members, but
                 // the children fetch (or, for a show collection, every member
-                // show's leaf fetch) came back with none to record — a smart
-                // collection is the known case (its `/children` reliably
-                // returns zero regardless of subtype). Log it with the name
+                // show's leaf fetch) came back with none to record. This used
+                // to fire for every smart collection, because
+                // `/library/metadata/{id}/children` always returned zero for
+                // them (#191); the `/library/collections/{id}/children` fetch
+                // above is the `key` Plex's own collection metadata reports and
+                // returns real members for smart and regular collections alike,
+                // so it should now only fire on a genuine anomaly. Log the name
                 // rather than let the collection sit silently empty.
                 if member_rating_keys.is_empty() && c.child_count.unwrap_or(0) > 0 {
                     tracing::warn!(
