@@ -5,9 +5,15 @@
 // aired. Every number below is this script's opinion, not the station's: swap
 // this file for another and nothing in etv-station changes.
 //
-// Two functions make up the contract:
+// Three functions make up the contract:
+//   hooks()   -> [hook_name, …]              which hooks this script implements
 //   sources() -> #{ name: cel_expression }   run once, up front
 //   pick(ctx) -> [entry_id, …]               most-wanted first
+//
+// hooks() is read at config load time, before the catalog exists — it names
+// this script a pool_provider, which is the only hook a `plugin:` pool has
+// ever meant (#159). Declaring it is what lets a channel that misuses this
+// script (wants a hook it doesn't implement) fail at load instead of on air.
 //
 // ctx carries:
 //   ctx.sets.<name>   the items each source matched (every catalog column,
@@ -45,6 +51,8 @@ fn affinity_window_days(ctx) { tunable(ctx, "affinity_window_days", 14) }
 // How long an airing suppresses a repeat. Nothing this channel played inside
 // this window comes back.
 fn replay_ttl_days(ctx) { tunable(ctx, "replay_ttl_days", 30) }
+
+fn hooks() { ["pool_provider"] }
 
 fn sources() {
     #{
