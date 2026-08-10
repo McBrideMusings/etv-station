@@ -115,6 +115,7 @@ pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration
         }),
         catalog_duration: None,
         error_card: true,
+        metadata: None,
     }
 }
 

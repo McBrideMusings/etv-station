@@ -138,6 +138,10 @@ fn build_playout_item(
         PlayoutItem::scheduled(item.id.clone(), start, finish, item.to_playout_source());
     playout_item.program = item.program.as_ref().map(clone_program);
     playout_item.overlay = overlay.cloned();
+    // A plugin pool's metadata blob (#166), carried untouched from
+    // `ResolvedItem::metadata`. `PlayoutItem::scheduled` already defaults this
+    // to `None`, so an item nothing attached to changes no output.
+    playout_item.metadata = item.metadata.clone();
     playout_item
 }
 
@@ -172,6 +176,7 @@ mod tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         }
     }
 
@@ -365,5 +370,39 @@ mod tests {
         assert_eq!(result[0].id, "a");
         assert_eq!(result[0].start, anchor);
         assert_eq!(result[0].finish, datetime!(2026-04-13 00:01 UTC));
+    }
+
+    // ---- metadata (#166) ---------------------------------------------------
+
+    /// A `ResolvedItem`'s metadata blob — a plugin pool's record shape,
+    /// carried this far by `resolve::resolve_block` — reaches the emitted
+    /// `PlayoutItem` untouched.
+    #[test]
+    fn a_resolved_items_metadata_reaches_the_playout_item() {
+        let mut a = lavfi("a", 60);
+        a.metadata = Some(serde_json::json!({ "reason": "won an Oscar" }));
+        let items = vec![a];
+        let durs = vec![Duration::from_secs(60)];
+        let rule = Sequential::new(&items, &durs);
+        let start = datetime!(2026-04-13 00:00 UTC);
+        let result = rule.items_covering(start, start, datetime!(2026-04-13 00:01 UTC));
+        assert_eq!(
+            result[0].metadata,
+            Some(serde_json::json!({ "reason": "won an Oscar" }))
+        );
+    }
+
+    /// An item with no metadata — every item before #166, and a plugin pick
+    /// that attached nothing — reaches the `PlayoutItem` with `metadata: None`,
+    /// which is what keeps the emitted JSON free of the key entirely
+    /// (`PlayoutItem::metadata` is `skip_serializing_if = "Option::is_none"`).
+    #[test]
+    fn no_metadata_on_the_resolved_item_means_none_on_the_playout_item() {
+        let items = vec![lavfi("a", 60)];
+        let durs = vec![Duration::from_secs(60)];
+        let rule = Sequential::new(&items, &durs);
+        let start = datetime!(2026-04-13 00:00 UTC);
+        let result = rule.items_covering(start, start, datetime!(2026-04-13 00:01 UTC));
+        assert!(result[0].metadata.is_none());
     }
 }

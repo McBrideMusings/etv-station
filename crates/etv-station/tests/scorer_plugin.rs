@@ -14,7 +14,8 @@ use etv_station::catalog::{Catalog, Entry, EntrySource, Source, TagNs};
 use etv_station::config::{
     Advance, BlockInclude, ChannelConfig, Mode, PatternStep, Pool, RuleConfig,
 };
-use etv_station::resolve::resolve_channel_with_resume;
+use etv_station::errors::ConfigError;
+use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreInputs, WatchEvent};
 
@@ -115,21 +116,35 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
     }
 }
 
-fn resolve_with(cfg: &ChannelConfig, cat: &Catalog, inputs: ScoreInputs) -> Vec<String> {
+/// Every resolved airing for `cfg` — what a test that reads a field other
+/// than `id` needs, and what [`resolve_with`] narrows for the tests that only
+/// care about the order.
+fn resolve_items(
+    cfg: &ChannelConfig,
+    cat: &Catalog,
+    inputs: &ScoreInputs,
+) -> Result<Vec<ResolvedItem>, ConfigError> {
     let state = GenerationState::default();
-    let (items, _) = resolve_channel_with_resume(
+    resolve_channel_with_resume(
         cfg,
         Path::new("foryou.yaml"),
         &[],
         None,
         Some(cat),
         &state,
-        &inputs,
+        inputs,
         None,
         time::OffsetDateTime::now_utc(),
     )
-    .unwrap();
-    items.into_iter().map(|i| i.id).collect()
+    .map(|(items, _)| items)
+}
+
+fn resolve_with(cfg: &ChannelConfig, cat: &Catalog, inputs: ScoreInputs) -> Vec<String> {
+    resolve_items(cfg, cat, &inputs)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect()
 }
 
 /// Ranking by `year` descending is a judgment that lives entirely in the
@@ -319,15 +334,16 @@ fn the_committed_example_plugin_runs() {
         watch_history: true,
     };
     let picked = etv_station::score::pick(&cache, &path, &inputs, "movies", None, granted).unwrap();
+    let ids: Vec<String> = picked.into_iter().map(|p| p.id).collect();
 
     assert!(
-        !picked.contains(&"mov-d".to_string()),
-        "a just-aired item must be suppressed: {picked:?}"
+        !ids.contains(&"mov-d".to_string()),
+        "a just-aired item must be suppressed: {ids:?}"
     );
     assert_eq!(
-        picked.first().map(String::as_str),
+        ids.first().map(String::as_str),
         Some("mov-a"),
-        "the freshly-watched item should rank first: {picked:?}"
+        "the freshly-watched item should rank first: {ids:?}"
     );
 }
 
@@ -398,4 +414,131 @@ fn a_plugin_that_picks_nothing_is_an_error() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("picked nothing"), "got {err}");
+}
+
+// ---- record return shape (#166) --------------------------------------------
+
+/// One record carrying a `metadata` blob and one bare id — the two return
+/// shapes side by side in a single `pick()`.
+const MIXED_SHAPES: &str = r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    [
+        #{ entry_id: "mov-a", metadata: #{ reason: "won an Oscar" } },
+        "mov-b",
+    ]
+}
+"#;
+
+/// The whole point of the widening: a plugin can mix bare ids with records
+/// naming a `metadata` blob, and only the records' airings carry one all the
+/// way to `ResolvedItem::metadata` — the field `crate::rule::build_playout_item`
+/// copies onto `PlayoutItem::metadata` for the emitted playout JSON. An id
+/// with no record attaches nothing, which is what keeps a plugin that only
+/// ever returns bare ids (`taste-engine.rhai`) producing byte-identical
+/// output to before this existed.
+#[test]
+fn a_records_metadata_reaches_the_resolved_item_and_a_bare_id_carries_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_plugin(&dir, "metadata.rhai", MIXED_SHAPES);
+    let items = resolve_items(&plugin_channel(&p, 2, 1), &catalog(), &Default::default()).unwrap();
+
+    let a = items.iter().find(|i| i.id == "mov-a").expect("mov-a airs");
+    assert_eq!(
+        a.metadata,
+        Some(serde_json::json!({ "reason": "won an Oscar" })),
+        "the record's metadata must reach the resolved item"
+    );
+    let b = items.iter().find(|i| i.id == "mov-b").expect("mov-b airs");
+    assert!(
+        b.metadata.is_none(),
+        "a bare id must attach no metadata — the widening is additive"
+    );
+}
+
+/// A non-finite float anywhere inside a record's `metadata` fails the whole
+/// channel resolution and names the key, in the same wording `Pool::config`
+/// uses (#130) — the metadata carrier refuses the value it cannot hold rather
+/// than let it silently reach the playout JSON as unit.
+#[test]
+fn a_non_finite_float_in_metadata_fails_channel_resolution_and_names_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_plugin(
+        &dir,
+        "bad_metadata.rhai",
+        r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { [#{ entry_id: "mov-a", metadata: #{ weight: 1.0 / 0.0 } }] }
+"#,
+    );
+    let err = resolve_items(&plugin_channel(&p, 1, 1), &catalog(), &Default::default())
+        .expect_err("a non-finite float must fail the resolve");
+    let msg = err.to_string();
+    assert!(msg.contains("weight"), "got {msg}");
+    assert!(msg.contains("finite"), "got {msg}");
+    assert!(msg.contains("mov-a"), "got {msg}");
+}
+
+/// The acceptance criterion, driven end to end through the real emission
+/// path: resolve a plugin pool's record through `resolve_channel_with_resume`,
+/// lay the result with the real `Sequential` rule (`crate::rule::build_playout_item`
+/// is what copies `ResolvedItem::metadata` onto `PlayoutItem::metadata`), and
+/// write it with the real `emit::emit_window` — then read the actual bytes
+/// back off disk. `mov-a`'s airing carries the blob; `mov-b`'s carries no
+/// `metadata` key at all, which is what keeps a plugin that only ever
+/// returns bare ids producing byte-identical playout JSON to before #166.
+#[tokio::test]
+async fn a_records_metadata_is_readable_in_the_emitted_playout_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_plugin(&dir, "metadata.rhai", MIXED_SHAPES);
+    let items = resolve_items(&plugin_channel(&p, 2, 1), &catalog(), &Default::default()).unwrap();
+
+    // Fixed durations rather than probed ones — this proves the metadata
+    // plumbing through `Sequential`/`emit_window`, not ffprobe against fake
+    // paths, which is a different concern this test does not own.
+    let durations = vec![std::time::Duration::from_secs(60); items.len()];
+    let rule = etv_station::rule::Sequential::new(&items, &durations);
+    let start = time::OffsetDateTime::now_utc();
+    let out_dir = dir.path().join("output");
+    let tz = etv_station::tz::parse("UTC").unwrap();
+    let written = etv_station::emit::emit_window(
+        &out_dir,
+        &rule,
+        start,
+        tz,
+        6,
+        start,
+        start + rule.total_duration(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.len(), 1, "one chunk file for this short a window");
+
+    let bytes = tokio::fs::read(&written[0]).await.unwrap();
+    let playout: ersatztv_playout::playout::Playout = serde_json::from_slice(&bytes).unwrap();
+    let a = playout
+        .items
+        .iter()
+        .find(|i| i.id == "mov-a")
+        .expect("mov-a's airing is in the emitted file");
+    assert_eq!(
+        a.metadata,
+        Some(serde_json::json!({ "reason": "won an Oscar" })),
+        "the record's metadata must be readable in the emitted playout JSON"
+    );
+    let b = playout
+        .items
+        .iter()
+        .find(|i| i.id == "mov-b")
+        .expect("mov-b's airing is in the emitted file");
+    assert!(
+        b.metadata.is_none(),
+        "a bare id's airing must carry no metadata key at all"
+    );
+
+    // The raw bytes make the same point the struct assertion does, in the
+    // words of the acceptance criterion: the key is present once, for the
+    // one airing that earned it.
+    let raw = String::from_utf8(bytes).unwrap();
+    assert_eq!(raw.matches("\"metadata\"").count(), 1, "raw JSON: {raw}");
 }

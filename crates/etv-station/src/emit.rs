@@ -167,6 +167,7 @@ mod tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         }
     }
 

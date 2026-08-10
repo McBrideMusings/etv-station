@@ -1071,6 +1071,7 @@ mod supervisor_tests {
                 program: None,
                 catalog_duration: None,
                 error_card: false,
+                metadata: None,
             })
             .collect();
         let durations = vec![slot; count];
@@ -1298,6 +1299,7 @@ mod regen_floor_tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         }
     }
 

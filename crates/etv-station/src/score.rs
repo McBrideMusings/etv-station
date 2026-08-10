@@ -44,7 +44,9 @@
 //!     }
 //! }
 //!
-//! // Returns entry_ids, most-wanted first.
+//! // Returns entry_ids, most-wanted first — or, per entry, a record
+//! // widening what a bare id can say (#166). Both shapes may appear in the
+//! // same returned array.
 //! fn pick(ctx) {
 //!     // ctx.sets.movies   — array of item maps, one per match
 //!     // ctx.pool          — the name of the pool asking
@@ -53,8 +55,25 @@
 //!     // ctx.history       — recent server-wide watch events
 //!     // ctx.recent        — entry_ids this channel aired most recently
 //!     // ctx.now           — unix seconds at generation time
+//!
+//!     // A bare id — everything before #166 already means this:
+//!     // "ghost"
+//!     //
+//!     // A record — same id, plus why it was picked and how much of its
+//!     // series to take. `entry_id` is required; `metadata` and `take` are
+//!     // each optional and independent of one another.
+//!     // #{ entry_id: "ghost", metadata: #{ reason: "won an Oscar" }, take: 3 }
 //! }
 //! ```
+//!
+//! `metadata` rides `serde_json::Value` (#166), reaches
+//! `PlayoutItem::metadata` in the emitted playout JSON untouched, and refuses
+//! a non-finite float at the moment it is picked, naming the key — the same
+//! refusal [`crate::config::Pool::config`] makes at load, reusing
+//! `etv_overlay::config_carrier` rather than a second implementation of that
+//! rule. `take` overrides the pattern step's own `take` for that entry's
+//! series; carrying it through pool resolution is this slice's job, honouring
+//! it in the pattern walk is #173's.
 //!
 //! `ctx.config` is the one input the station does not construct: it is whatever
 //! the channel author wrote under that pool, converted and handed over with
@@ -75,6 +94,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use etv_overlay::config_carrier;
+use rhai::serde::DynamicDeserializer;
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Scope};
 
 use crate::catalog::{Catalog, TagNs};
@@ -149,6 +170,37 @@ const EXPOSED_TAGS: &[(&str, TagNs)] = &[
 #[derive(Debug, Default)]
 pub struct ScoreCache {
     entries: HashMap<PathBuf, CachedScript>,
+    /// The metadata/take-override half of what a plugin pool's `pick()` just
+    /// returned (#166), keyed by `(pool name, entry_id)`. `resolve_pool_sources`
+    /// still returns bare ids — `crate::sequence` shares that function and
+    /// reads none of this — so [`crate::pattern::build`] reads it back from
+    /// here once pool resolution finishes, which is what lets an id's record
+    /// data survive without widening a signature `crate::sequence` also calls.
+    ///
+    /// Keyed on the pool too, not on `entry_id` alone: two plugin pools in one
+    /// block may resolve the same id from overlapping catalog queries, and
+    /// without the pool half of the key, the second pool's record would
+    /// silently overwrite the first's in this map (a corruption that could
+    /// bite whichever pool actually draws the id, whether or not it was the
+    /// one that wrote here last). [`pattern::PoolRuntime::take_overrides`]
+    /// reads its own pool's slice only, so this closes that hole for takes;
+    /// the flattened `entry_id -> metadata` map [`pattern::build`] returns is
+    /// necessarily flat again by the time two pools' *outputs* — not just
+    /// their candidate sets — collide on one id, which is the same "blind
+    /// across pools" limit `Pool::constraints` already documents.
+    ///
+    /// Only ids that actually attached something get an entry — a plugin
+    /// returning bare ids leaves this empty, which is the whole point of the
+    /// widening being additive.
+    pub(crate) picked_extras: HashMap<(String, String), PickedExtra>,
+}
+
+/// The metadata blob and/or take override one `entry_id` carried in a plugin
+/// pool's returned record (#166). See [`ScoreCache::picked_extras`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PickedExtra {
+    pub metadata: Option<serde_json::Value>,
+    pub take_override: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -500,19 +552,60 @@ impl ScoreCache {
         self.entries.insert(script_path.to_path_buf(), cached);
         Ok(())
     }
+
+    /// Stash the metadata/take-override half of what a plugin pool's `pick()`
+    /// just returned (#166) — see [`Self::picked_extras`]. Ids that attached
+    /// neither are skipped, so a plugin returning only bare ids leaves this
+    /// untouched. `pool_name` is part of the key, not just the id, so a
+    /// second pool resolving the same id from an overlapping query cannot
+    /// overwrite the first pool's record.
+    pub(crate) fn record_picked(&mut self, pool_name: &str, picked: &[PickedItem]) {
+        for item in picked {
+            if item.metadata.is_some() || item.take_override.is_some() {
+                self.picked_extras.insert(
+                    (pool_name.to_string(), item.id.clone()),
+                    PickedExtra {
+                        metadata: item.metadata.clone(),
+                        take_override: item.take_override,
+                    },
+                );
+            }
+        }
+    }
 }
 
-/// Run a prepared script's `pick()` and return the `entry_id`s it chose, in the
-/// order it chose them.
+/// One entry a plugin's `pick()` returned, in the widened record shape
+/// (#166). A bare `entry_id` string arrives as one of these with both
+/// extras `None` — the whole point of the widening being additive, and why
+/// `taste-engine.rhai` needs no edit to keep returning what it always has.
+#[derive(Debug, Clone)]
+pub struct PickedItem {
+    pub id: String,
+    /// Opaque per-airing data the plugin attached, carried untouched to
+    /// `PlayoutItem::metadata`. A non-finite float anywhere inside is
+    /// refused at the moment it is picked, naming the key — the same
+    /// refusal [`crate::config::Pool::config`] makes at load, reusing
+    /// `etv_overlay::config_carrier` rather than a second implementation of
+    /// that rule.
+    pub metadata: Option<serde_json::Value>,
+    /// A take override for this entry's series (#166), carried through pool
+    /// resolution to the pattern draw but not yet honoured there — that is
+    /// #173. Refused at pick time if zero or negative, naming the entry.
+    pub take_override: Option<usize>,
+}
+
+/// Run a prepared script's `pick()` and return what it chose, in the order it
+/// chose them.
 ///
 /// Takes no catalog: everything the script reads was materialized by
 /// [`ScoreCache::prepare`]. Ranking is pure computation over that snapshot.
 ///
 /// Every failure is a config error phrased against the script: a missing
-/// function, a runtime error, or a returned id that is not a string. A plugin
-/// that returns nothing is an error too — an empty pool would silently shorten
-/// the channel, and a scorer that finds nothing worth playing is a broken
-/// scorer, not an empty schedule.
+/// function, a runtime error, or a returned item that is neither an
+/// `entry_id` string nor a record naming one. A plugin that returns nothing
+/// is an error too — an empty pool would silently shorten the channel, and a
+/// scorer that finds nothing worth playing is a broken scorer, not an empty
+/// schedule.
 ///
 /// `granted` (#167) is trusted as already reconciled against what the script
 /// declares — [`crate::config::validate`] rejects a mismatch at config load —
@@ -525,7 +618,7 @@ pub fn pick(
     pool_name: &str,
     pool_config: Option<&serde_json::Value>,
     granted: GrantedCapabilities,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<PickedItem>, String> {
     let engine = engine();
 
     let cached = cache.entries.get(script_path).ok_or_else(|| {
@@ -606,21 +699,17 @@ pub fn pick(
     let mut out = Vec::with_capacity(picked.len());
     let mut seen = std::collections::HashSet::new();
     for (i, value) in picked.into_iter().enumerate() {
-        let id = value.into_string().map_err(|actual| {
-            format!(
-                "scorer plugin {}: pick() item #{i} must be an entry_id string, got {actual}",
-                script_path.display()
-            )
-        })?;
+        let item = parse_picked_item(script_path, i, value)?;
         // A duplicate would give one item two positions in the same pool and
         // two cursors under one series key. Cheaper to reject than to explain.
-        if !seen.insert(id.clone()) {
+        if !seen.insert(item.id.clone()) {
+            let id = item.id;
             return Err(format!(
                 "scorer plugin {}: pick() returned {id:?} more than once",
                 script_path.display()
             ));
         }
-        out.push(id);
+        out.push(item);
     }
 
     if out.is_empty() {
@@ -631,6 +720,93 @@ pub fn pick(
         ));
     }
     Ok(out)
+}
+
+/// Parse one array element `pick()` returned into the widened record shape
+/// (#166): a bare `entry_id` string — unchanged from before this existed —
+/// or a record naming `entry_id` plus an optional `metadata` blob and/or
+/// `take` override. Anything else names the index and what arrived instead.
+fn parse_picked_item(
+    script_path: &Path,
+    index: usize,
+    value: Dynamic,
+) -> Result<PickedItem, String> {
+    if !value.is_map() {
+        let id = value.into_string().map_err(|actual| {
+            format!(
+                "scorer plugin {}: pick() item #{index} must be an entry_id string or a \
+                 record naming one, got {actual}",
+                script_path.display()
+            )
+        })?;
+        return Ok(PickedItem {
+            id,
+            metadata: None,
+            take_override: None,
+        });
+    }
+
+    let map = value.cast::<Map>();
+    let entry_id = map
+        .get("entry_id")
+        .ok_or_else(|| {
+            format!(
+                "scorer plugin {}: pick() item #{index} is a record but names no `entry_id`",
+                script_path.display()
+            )
+        })?
+        .clone()
+        .into_string()
+        .map_err(|actual| {
+            format!(
+                "scorer plugin {}: pick() item #{index}'s `entry_id` must be a string, got \
+                 {actual}",
+                script_path.display()
+            )
+        })?;
+
+    // Reuses the exact non-finite-float refusal `Pool::config` makes at load
+    // (#130) rather than a second implementation of that rule — the record's
+    // `metadata` is the same opaque-config carrier wearing a Rhai front end
+    // instead of YAML/TOML.
+    let metadata = match map.get("metadata") {
+        Some(v) => {
+            config_carrier::deserialize_config(DynamicDeserializer::new(v)).map_err(|e| {
+                format!(
+                    "scorer plugin {}: pick() item #{index} ({entry_id:?}) metadata: {e}",
+                    script_path.display()
+                )
+            })?
+        }
+        None => None,
+    };
+
+    let take_override = match map.get("take") {
+        Some(v) => {
+            let n = v.as_int().map_err(|actual| {
+                format!(
+                    "scorer plugin {}: pick() item #{index} ({entry_id:?})'s `take` must be a \
+                     whole number, got {actual}",
+                    script_path.display()
+                )
+            })?;
+            if n <= 0 {
+                return Err(format!(
+                    "scorer plugin {}: pick() item #{index} ({entry_id:?}) names a take \
+                     override of {n}, which must be positive",
+                    script_path.display()
+                ));
+            }
+            Some(n as usize)
+        }
+        None => None,
+    };
+
+    Ok(PickedItem {
+        id: entry_id,
+        metadata,
+        take_override,
+    })
 }
 
 /// Compile a script and resolve every query its `sources()` declares.
@@ -783,6 +959,9 @@ mod tests {
                 watch_history: true,
             },
         )
+        // Tests written before #166 assert against bare ids; unwrap the
+        // record shape back down to that for them.
+        .map(|items| items.into_iter().map(|p| p.id).collect())
     }
 
     fn catalog() -> Catalog {
@@ -1425,6 +1604,202 @@ fn pick(ctx) {
             GrantedCapabilities::default(),
         )
         .unwrap();
-        assert_eq!(got, vec!["m1"]);
+        assert_eq!(
+            got.into_iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec!["m1"]
+        );
+    }
+
+    // ---- record return shape (#166) ----------------------------------------
+
+    /// A plugin returning bare ids works exactly as before the record shape
+    /// existed — the widening is additive.
+    #[test]
+    fn a_bare_id_carries_no_metadata_or_take_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [\"m1\"] }\n");
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let got = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "m1");
+        assert!(got[0].metadata.is_none());
+        assert!(got[0].take_override.is_none());
+    }
+
+    /// A record's `metadata` lands on the returned item, nested and typed
+    /// exactly like `Pool::config` (#166) — the same carrier, reached from
+    /// the other side.
+    #[test]
+    fn a_records_metadata_arrives_nested_with_types_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) {
+    [#{ entry_id: "m1", metadata: #{ reason: "won an Oscar", score: 3.5, tags: ["a", "b"] } }]
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let got = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        let meta = got[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["reason"], serde_json::json!("won an Oscar"));
+        assert_eq!(meta["score"], serde_json::json!(3.5));
+        assert_eq!(meta["tags"][1], serde_json::json!("b"));
+    }
+
+    /// A record's `take` survives onto the returned item, and bare-id
+    /// entries in the same array carry none — both shapes may mix freely.
+    #[test]
+    fn a_records_take_override_arrives_and_bare_ids_still_carry_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { [#{ entry_id: "m1", take: 3 }, "m2"] }
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let got = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(got[0].take_override, Some(3));
+        assert!(got[0].metadata.is_none());
+        assert_eq!(got[1].id, "m2");
+        assert!(got[1].take_override.is_none());
+    }
+
+    /// A non-finite float anywhere inside a record's `metadata` fails the
+    /// pick and names the key, in the same wording `Pool::config` uses
+    /// (#130) — reusing `etv_overlay::config_carrier` rather than a second
+    /// implementation of the rule.
+    #[test]
+    fn a_non_finite_float_in_a_records_metadata_fails_and_names_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("weight"), "got {err}");
+        assert!(err.contains("finite"), "got {err}");
+        assert!(err.contains("m1"), "got {err}");
+    }
+
+    /// A take override of zero or negative fails the pick and names the
+    /// entry.
+    #[test]
+    fn a_zero_or_negative_take_override_fails_and_names_the_entry() {
+        for take in ["0", "-1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write(
+                &dir,
+                &format!(
+                    "fn sources() {{ #{{}} }}\nfn pick(ctx) {{ [#{{ entry_id: \"m1\", take: {take} }}] }}\n"
+                ),
+            );
+            let mut cache = ScoreCache::default();
+            cache.prepare(&catalog(), &p).unwrap();
+            let err = pick(
+                &cache,
+                &p,
+                &ScoreInputs::default(),
+                "test",
+                None,
+                GrantedCapabilities::default(),
+            )
+            .unwrap_err();
+            assert!(err.contains("m1"), "take={take}, got {err}");
+            assert!(err.contains("positive"), "take={take}, got {err}");
+        }
+    }
+
+    /// A record naming no `entry_id` fails and says so, naming the index.
+    #[test]
+    fn a_record_with_no_entry_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            "fn sources() { #{} }\nfn pick(ctx) { [#{ metadata: #{ x: 1 } }] }\n",
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("#0"), "got {err}");
+        assert!(err.contains("entry_id"), "got {err}");
+    }
+
+    /// The same id twice is still refused when the two mentions wear
+    /// different shapes — a bare id and a record naming it are the same
+    /// entry, and one entry cannot hold two positions in a pool.
+    #[test]
+    fn duplicate_detection_still_works_across_mixed_bare_and_record_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"fn sources() { #{} }
+fn pick(ctx) { ["m1", #{ entry_id: "m1" }] }
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("more than once"), "got {err}");
     }
 }

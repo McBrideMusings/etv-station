@@ -77,6 +77,11 @@ pub struct ResolvedItem {
     /// to an on-screen error card. Carried so the play-history ledger can record
     /// that the slot aired without claiming the film was watched.
     pub error_card: bool,
+    /// Opaque per-airing data a `plugin:` pool attached to this pick (#166),
+    /// carried untouched to `PlayoutItem::metadata` by
+    /// `crate::rule::build_playout_item`. `None` for every item with no pool
+    /// or plugin behind it, and for a plugin pick that attached nothing.
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl ResolvedItem {
@@ -745,7 +750,7 @@ fn resolve_block(
             inputs: scoring,
             base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
         };
-        let (ids, pools) = crate::pattern::build(
+        let (ids, pools, metadata) = crate::pattern::build(
             cat,
             &include.pools,
             groups,
@@ -768,6 +773,12 @@ fn resolve_block(
             .into_iter()
             .flatten()
             .collect();
+        // A plugin pool's metadata blob (#166), attached after the catalog
+        // lookup above so it lands on the airing even though `catalog_item`
+        // itself has no pool/plugin context to draw one from.
+        for item in &mut items {
+            item.metadata = metadata.get(&item.id).cloned();
+        }
         // Skipping happens before the truncate, so an unplayable row normally
         // costs nothing — the next playable item slides up into its place. The
         // one case it cannot cover is the pattern handing back exactly `n` ids
@@ -1186,6 +1197,11 @@ fn catalog_item(
             .filter(|ms| *ms > 0 && *ms <= MAX_CATALOG_DURATION_MS)
             .map(|ms| Duration::from_millis(ms as u64)),
         error_card: false,
+        // Set afterward, by the pattern block's own post-pass (#166), for an
+        // id a plugin pool attached a blob to. Every other caller of this
+        // function has no pool/plugin context at all, so `None` here is the
+        // whole answer for them.
+        metadata: None,
     }))
 }
 
@@ -1205,6 +1221,8 @@ fn resolve_item(
         // no catalog row behind it to fall back to.
         catalog_duration: None,
         error_card: false,
+        // No pool, no plugin — nothing could have attached a blob.
+        metadata: None,
     }
 }
 
