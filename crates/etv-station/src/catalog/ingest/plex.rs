@@ -136,6 +136,9 @@ pub struct PlexItem {
     /// deferred slice (needs a per-show catalog pass — see #104).
     pub absolute_episode: Option<i64>,
     pub year: Option<i64>,
+    /// Plex `originallyAvailableAt` (`YYYY-MM-DD`); `None` when Plex has no
+    /// value for this item.
+    pub release_date: Option<String>,
     pub content_rating: Option<String>,
     /// Plex `editionTitle`; `None`/empty = theatrical.
     pub edition: Option<String>,
@@ -239,6 +242,10 @@ pub fn ingest_items(
             .absolute_episode
             .or_else(|| existing.as_ref().and_then(|e| e.absolute_episode));
         entry.year = item.year.or_else(|| existing.as_ref().and_then(|e| e.year));
+        entry.release_date = or_existing(
+            item.release_date.clone(),
+            existing.as_ref().and_then(|e| e.release_date.clone()),
+        );
         entry.content_rating = or_existing(
             item.content_rating.clone(),
             existing.as_ref().and_then(|e| e.content_rating.clone()),
@@ -571,6 +578,7 @@ fn to_plex_item(
         episode: is_episode.then_some(m.index).flatten(),
         absolute_episode: is_episode.then_some(m.absolute_index).flatten(),
         year: m.year,
+        release_date: m.originally_available_at.clone(),
         kind,
         content_rating: m.content_rating.clone(),
         // Absent/blank `editionTitle` means theatrical — normalise to `None` so
@@ -884,6 +892,11 @@ struct PlexMetadata {
     absolute_index: Option<i64>,
     #[serde(default)]
     year: Option<i64>,
+    /// `YYYY-MM-DD`, present on both movies and episodes — maps straight onto
+    /// `entries.release_date` (a `TEXT` column ordered lexically, which this
+    /// format sorts chronologically).
+    #[serde(default)]
+    originally_available_at: Option<String>,
     #[serde(default)]
     duration: Option<i64>,
     #[serde(default)]
@@ -995,6 +1008,7 @@ mod tests {
             episode: None,
             absolute_episode: None,
             year: Some(1988),
+            release_date: Some("1988-07-15".into()),
             content_rating: None,
             edition: None,
             studio: None,
@@ -1150,6 +1164,7 @@ mod tests {
         let e = cat.entry("imdb:tt0095016").unwrap().unwrap();
         assert_eq!(e.kind, "movie");
         assert_eq!(e.year, Some(1988));
+        assert_eq!(e.release_date.as_deref(), Some("1988-07-15"));
         assert_eq!(e.duration_ms, Some(7_920_000));
         assert_eq!(
             cat.tags_for("imdb:tt0095016", TagNs::Genre).unwrap(),
@@ -1218,6 +1233,7 @@ mod tests {
             "type": "movie",
             "title": "Die Hard",
             "year": 1988,
+            "originallyAvailableAt": "1988-07-15",
             "duration": 7920000,
             "Guid": [{"id": "imdb://tt0095016"}, {"id": "tmdb://562"}],
             "Genre": [{"tag": "Action"}],
@@ -1235,6 +1251,24 @@ mod tests {
         );
         assert_eq!(item.rating_key, "12345");
         assert_eq!(item.duration_ms, Some(7_920_000));
+        assert_eq!(item.release_date.as_deref(), Some("1988-07-15"));
+    }
+
+    /// A record with no `originallyAvailableAt` (Plex omits it for some
+    /// library items — #135's live-catalog numbers: 6 of 12,292 movies, 405
+    /// of 72,434 episodes) must map to `None` — the same missing-means-null
+    /// contract `year` already has.
+    #[test]
+    fn to_plex_item_leaves_release_date_none_when_plex_omits_it() {
+        let json = r#"{
+            "ratingKey": "12345",
+            "type": "movie",
+            "title": "Die Hard",
+            "Media": [{"Part": [{"file": "/media/Movies/Die Hard.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        assert_eq!(item.release_date, None);
     }
 
     #[test]
