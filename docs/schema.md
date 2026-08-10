@@ -587,9 +587,12 @@ pools that must not collide have to be disjoint by construction.
 `take` overrides the pattern step's own `take` for that entry's series — a
 "For You" pool asking an unseen show to sample its first three episodes
 while a watched one plays its full run. It travels through pool resolution
-to the pattern draw; a step still spends its own `take` unless a later
-release wires the override in (#173). Zero or negative fails the
-generation, naming the entry.
+to the pattern draw, which reads it in place of the step's own `take` for
+that series (#173) — every other id in the step still spends the step's own
+`take`, unchanged. An override is only honoured under `rotate: "visit"`;
+a `rotate: "slot"` draw never asks for the step's own `take` in the first
+place (each slot is always one item), so there is nothing for an override
+to replace there. Zero or negative fails the generation, naming the entry.
 
 The widening is additive: a script returning only bare ids, like `taste-engine.rhai`, needs no edit. A `sequencer:` block's plugin pool record shape parses the same way as a `pattern:` block's, and its `metadata` reaches the emitted JSON identically (#201). The per-entry `take` override remains out of scope for a sequencer block: `arrange()` already decides its own order, so what a `take` override would even mean there is a separate design question, not a plumbing gap (#201).
 
