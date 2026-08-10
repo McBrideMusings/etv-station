@@ -765,39 +765,7 @@ fn resolve_block(
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(pools);
 
-        let mut items: Vec<ResolvedItem> = ids
-            .iter()
-            .map(|id| catalog_item(cat, id, defaults))
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
-            .into_iter()
-            .flatten()
-            .collect();
-        // A plugin pool's metadata blob (#166), attached after the catalog
-        // lookup above so it lands on the airing even though `catalog_item`
-        // itself has no pool/plugin context to draw one from.
-        for item in &mut items {
-            item.metadata = metadata.get(&item.id).cloned();
-        }
-        // Skipping happens before the truncate, so an unplayable row normally
-        // costs nothing — the next playable item slides up into its place. The
-        // one case it cannot cover is the pattern handing back exactly `n` ids
-        // and one of them being unplayable: there is no spare to slide up, and
-        // asking the pattern for more would mean advancing its cursors past
-        // items this block never airs. Say so rather than quietly under-filling.
-        if let Mode::Count(n) = include.mode {
-            if items.len() < n {
-                tracing::warn!(
-                    event = "block.count_short",
-                    block = idx,
-                    asked = n,
-                    got = items.len(),
-                    "block asked for more items than the catalog could play; see the item-level warnings above",
-                );
-            }
-            items.truncate(n);
-        }
-        return Ok(items);
+        return resolve_pool_block_items(cat, &ids, defaults, &metadata, include.mode, idx, path);
     }
 
     // A sequencer block resolves its pools exactly as a pattern block does —
@@ -819,7 +787,7 @@ fn resolve_block(
             .as_ref()
             .expect("resolve_block reaches this branch only when `sequencer` is set");
         let script_path = crate::score::resolve_plugin_path(base_dir, sequencer);
-        let (ids, pools) = crate::sequence::build(
+        let (ids, pools, metadata) = crate::sequence::build(
             cat,
             &include.pools,
             groups,
@@ -835,30 +803,7 @@ fn resolve_block(
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(pools);
 
-        let mut items: Vec<ResolvedItem> = ids
-            .iter()
-            .map(|id| catalog_item(cat, id, defaults))
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
-            .into_iter()
-            .flatten()
-            .collect();
-        // Same shortfall reporting a pattern block gives `mode: count` — an
-        // unplayable row has no spare to slide up without asking the script
-        // for more than it decided to draw.
-        if let Mode::Count(n) = include.mode {
-            if items.len() < n {
-                tracing::warn!(
-                    event = "block.count_short",
-                    block = idx,
-                    asked = n,
-                    got = items.len(),
-                    "block asked for more items than the catalog could play; see the item-level warnings above",
-                );
-            }
-            items.truncate(n);
-        }
-        return Ok(items);
+        return resolve_pool_block_items(cat, &ids, defaults, &metadata, include.mode, idx, path);
     }
 
     // 1. Resolve entries to a flat item list (authored order).
@@ -951,6 +896,60 @@ fn resolve_block(
         items.truncate(n);
     }
 
+    Ok(items)
+}
+
+/// Turn a pool block's drawn `entry_id` list into its [`ResolvedItem`]s:
+/// catalog lookup, the plugin-pool `metadata` attach (#166, #201), and the
+/// `mode: count` shortfall truncate/warn. A `pattern:` block and a
+/// `sequencer:` block do all three identically once each has its own ids in
+/// hand, so any future per-drawn-item field added here reaches both at once.
+fn resolve_pool_block_items(
+    cat: &Catalog,
+    ids: &[String],
+    defaults: Option<&ProgramMetadata>,
+    metadata: &HashMap<String, serde_json::Value>,
+    mode: Mode,
+    idx: usize,
+    path: &Path,
+) -> Result<Vec<ResolvedItem>, ConfigError> {
+    let unsupported = |message: String| ConfigError::Unsupported {
+        path: path.to_path_buf(),
+        message,
+    };
+    let mut items: Vec<ResolvedItem> = ids
+        .iter()
+        .map(|id| catalog_item(cat, id, defaults))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
+        .into_iter()
+        .flatten()
+        .collect();
+    // A plugin pool's metadata blob (#166), attached after the catalog
+    // lookup above so it lands on the airing even though `catalog_item`
+    // itself has no pool/plugin context to draw one from. Empty for a block
+    // whose plugin(s) only ever returned bare ids.
+    for item in &mut items {
+        item.metadata = metadata.get(&item.id).cloned();
+    }
+    // Skipping happens before the truncate, so an unplayable row normally
+    // costs nothing — the next playable item slides up into its place. The
+    // one case it cannot cover is the draw handing back exactly `n` ids and
+    // one of them being unplayable: there is no spare to slide up, and
+    // asking for more would mean advancing cursors past items this block
+    // never airs. Say so rather than quietly under-filling.
+    if let Mode::Count(n) = mode {
+        if items.len() < n {
+            tracing::warn!(
+                event = "block.count_short",
+                block = idx,
+                asked = n,
+                got = items.len(),
+                "block asked for more items than the catalog could play; see the item-level warnings above",
+            );
+        }
+        items.truncate(n);
+    }
     Ok(items)
 }
 
@@ -1197,10 +1196,11 @@ fn catalog_item(
             .filter(|ms| *ms > 0 && *ms <= MAX_CATALOG_DURATION_MS)
             .map(|ms| Duration::from_millis(ms as u64)),
         error_card: false,
-        // Set afterward, by the pattern block's own post-pass (#166), for an
-        // id a plugin pool attached a blob to. Every other caller of this
-        // function has no pool/plugin context at all, so `None` here is the
-        // whole answer for them.
+        // Set afterward, by `resolve_pool_block_items`'s post-pass (#166,
+        // #201) — shared by a pattern block and a sequencer block alike —
+        // for an id a plugin pool attached a blob to. Every other caller of
+        // this function has no pool/plugin context at all, so `None` here is
+        // the whole answer for them.
         metadata: None,
     }))
 }

@@ -8,10 +8,13 @@
 //! cursor, and a `discovery` pool that restarts fresh every generation — the
 //! case a single `pattern` block cannot express.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
-use etv_station::config::{GroupBy, Order, Pool, Select};
+use etv_station::config::{
+    BlockInclude, ChannelConfig, GroupBy, Mode, Order, Pool, RuleConfig, Select,
+};
+use etv_station::resolve::resolve_channel_with_resume;
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreEnv, ScoreInputs};
 use etv_station::sequence::{Window, build};
@@ -131,7 +134,7 @@ fn the_committed_example_interleaves_a_resuming_and_a_restarting_pool() {
     let mut state = GenerationState::empty();
     state.cursor.insert("show:pilot".into(), "ep-1".to_string());
 
-    let (ids, resume) = build(
+    let (ids, resume, _) = build(
         &cat,
         &pools,
         &[],
@@ -168,7 +171,7 @@ fn the_committed_example_starts_spotlight_at_the_top_with_no_cursor() {
     let pools = vec![spotlight_pool(), discovery_pool()];
     let inputs = ScoreInputs::default();
 
-    let (ids, _) = build(
+    let (ids, _, _) = build(
         &cat,
         &pools,
         &[],
@@ -184,4 +187,213 @@ fn the_committed_example_starts_spotlight_at_the_top_with_no_cursor() {
     .unwrap();
 
     assert_eq!(ids[0], "ep-1", "no cursor yet, so spotlight opens at S1E1");
+}
+
+// ---- plugin record shape reaches a sequencer block's output (#166 gap, #201) ----
+
+fn write_plugin(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// A `plugin:` pool feeding a sequencer block — same pool contract as a
+/// pattern block's, only the block draws its final order from `arrange()`
+/// instead of a `pattern:` template.
+fn foryou_pool(plugin: &Path) -> Pool {
+    Pool {
+        name: "foryou".into(),
+        expr: None,
+        plugin: Some(plugin.to_path_buf()),
+        groups: Vec::new(),
+        order: None,
+        bucket_order: None,
+        group_by: GroupBy::Show,
+        select: Select::default(),
+        rotate: Default::default(),
+        advance: Default::default(),
+        on_short: Default::default(),
+        constraints: None,
+        config: None,
+        // The fixture scripts below never read `ctx.sets`/`ctx.history`, so no
+        // capability grant is needed (#167).
+        capabilities: Vec::new(),
+        datastores: Vec::new(),
+    }
+}
+
+/// A one-pool sequencer block whose `arrange()` just forwards the pool's
+/// resolved ids in order — the minimum a sequencer needs to exist, so the
+/// test is only exercising the plugin-record plumbing, not any arrangement
+/// logic.
+fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
+    ChannelConfig {
+        name: None,
+        scoring: None,
+        anchor: None,
+        window_days: 1,
+        chunk_hours: 6,
+        roll_interval: std::time::Duration::from_secs(60),
+        retention_days: 1,
+        seed: Some(7),
+        overlay: None,
+        groups: Vec::new(),
+        rule: RuleConfig {
+            blocks: vec![BlockInclude {
+                block: None,
+                program: None,
+                duplicates: None,
+                constraints: None,
+                entries: Vec::new(),
+                fallback: None,
+                filter: None,
+                mode: Mode::All,
+                order: Default::default(),
+                pools: vec![pool],
+                pattern: Vec::new(),
+                cycles: None,
+                sequencer: Some(sequencer.to_path_buf()),
+            }],
+        },
+    }
+}
+
+const FORWARD_ARRANGE: &str = r#"
+fn hooks() { ["sequencer"] }
+fn arrange(ctx) {
+    let out = [];
+    for item in ctx.pools.foryou { out.push(item.entry_id); }
+    out
+}
+"#;
+
+/// One record carrying a `metadata` blob and one bare id — the same mixed
+/// shape `tests/scorer_plugin.rs` proves reaches a `pattern:` block's output
+/// (#166), now proved for a `sequencer:` block. Before #201 this metadata
+/// vanished silently: `sequence::build` never read `ScoreCache::picked_extras`
+/// back, so `mov-a`'s `ResolvedItem::metadata` was always `None` regardless
+/// of what the plugin returned.
+const MIXED_SHAPES: &str = r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    [
+        #{ entry_id: "mov-a", metadata: #{ reason: "won an Oscar" } },
+        "mov-b",
+    ]
+}
+"#;
+
+/// The acceptance criterion: a `sequencer:` block whose plugin pool returns a
+/// record with `metadata` has that blob land on the resolved airing, exactly
+/// as a `pattern:` block already does — and a bare id's airing carries none,
+/// which is what keeps a sequencer plugin that only ever returns bare ids
+/// (`foryou-sequencer.rhai`) producing byte-identical output to before #201.
+#[test]
+fn a_records_metadata_reaches_the_resolved_item_on_a_sequencer_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = write_plugin(&dir, "metadata.rhai", MIXED_SHAPES);
+    let arrange = write_plugin(&dir, "arrange.rhai", FORWARD_ARRANGE);
+    let cfg = forwarding_sequencer_channel(&arrange, foryou_pool(&plugin));
+
+    let state = GenerationState::default();
+    let (items, _) = resolve_channel_with_resume(
+        &cfg,
+        Path::new("foryou.yaml"),
+        &[],
+        None,
+        Some(&catalog()),
+        &state,
+        &ScoreInputs::default(),
+        None,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+
+    let a = items.iter().find(|i| i.id == "mov-a").expect("mov-a airs");
+    assert_eq!(
+        a.metadata,
+        Some(serde_json::json!({ "reason": "won an Oscar" })),
+        "the record's metadata must reach the resolved item on a sequencer block"
+    );
+    let b = items.iter().find(|i| i.id == "mov-b").expect("mov-b airs");
+    assert!(
+        b.metadata.is_none(),
+        "a bare id must attach no metadata — the widening is additive"
+    );
+}
+
+/// The acceptance criterion driven end to end through the real emission path
+/// — the actual product surface etv-station exists to write: resolve a
+/// sequencer block's plugin record through `resolve_channel_with_resume`, lay
+/// the result with the real `Sequential` rule, and write it with the real
+/// `emit::emit_window` — then read the actual bytes back off disk, exactly as
+/// `tests/scorer_plugin.rs` proves for a `pattern:` block (#166). `mov-a`'s
+/// airing carries the blob in the `{start}_{finish}.json` chunk file; `mov-b`'s
+/// carries no `metadata` key at all.
+#[tokio::test]
+async fn a_records_metadata_is_readable_in_the_emitted_playout_json_for_a_sequencer_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = write_plugin(&dir, "metadata.rhai", MIXED_SHAPES);
+    let arrange = write_plugin(&dir, "arrange.rhai", FORWARD_ARRANGE);
+    let cfg = forwarding_sequencer_channel(&arrange, foryou_pool(&plugin));
+
+    let state = GenerationState::default();
+    let (items, _) = resolve_channel_with_resume(
+        &cfg,
+        Path::new("foryou.yaml"),
+        &[],
+        None,
+        Some(&catalog()),
+        &state,
+        &ScoreInputs::default(),
+        None,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+
+    // Fixed durations rather than probed ones — this proves the metadata
+    // plumbing through `Sequential`/`emit_window`, not ffprobe against fake
+    // paths, which is a different concern this test does not own.
+    let durations = vec![std::time::Duration::from_secs(60); items.len()];
+    let rule = etv_station::rule::Sequential::new(&items, &durations);
+    let start = time::OffsetDateTime::now_utc();
+    let out_dir = dir.path().join("output");
+    let tz = etv_station::tz::parse("UTC").unwrap();
+    let written = etv_station::emit::emit_window(
+        &out_dir,
+        &rule,
+        start,
+        tz,
+        6,
+        start,
+        start + rule.total_duration(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.len(), 1, "one chunk file for this short a window");
+
+    let bytes = tokio::fs::read(&written[0]).await.unwrap();
+    let playout: ersatztv_playout::playout::Playout = serde_json::from_slice(&bytes).unwrap();
+    let a = playout
+        .items
+        .iter()
+        .find(|i| i.id == "mov-a")
+        .expect("mov-a's airing is in the emitted file");
+    assert_eq!(
+        a.metadata,
+        Some(serde_json::json!({ "reason": "won an Oscar" })),
+        "the record's metadata must be readable in the emitted playout JSON for a sequencer block"
+    );
+    let b = playout
+        .items
+        .iter()
+        .find(|i| i.id == "mov-b")
+        .expect("mov-b's airing is in the emitted file");
+    assert!(
+        b.metadata.is_none(),
+        "a bare id's airing must carry no metadata key at all"
+    );
+
+    let raw = String::from_utf8(bytes).unwrap();
+    assert_eq!(raw.matches("\"metadata\"").count(), 1, "raw JSON: {raw}");
 }
