@@ -591,10 +591,7 @@ to the pattern draw; a step still spends its own `take` unless a later
 release wires the override in (#173). Zero or negative fails the
 generation, naming the entry.
 
-The widening is additive: a script returning only bare ids, like
-`taste-engine.rhai`, needs no edit. On a `sequencer:` block instead of
-`pattern:`, the record shape parses the same way but `metadata` does not
-yet reach the emitted JSON — see #201.
+The widening is additive: a script returning only bare ids, like `taste-engine.rhai`, needs no edit. A `sequencer:` block's plugin pool record shape parses the same way as a `pattern:` block's, and its `metadata` reaches the emitted JSON identically (#201). The per-entry `take` override remains out of scope for a sequencer block: `arrange()` already decides its own order, so what a `take` override would even mean there is a separate design question, not a plumbing gap (#201).
 
 #### `hooks()` — what a script says it can do
 
