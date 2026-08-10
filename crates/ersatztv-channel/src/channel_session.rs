@@ -21,7 +21,7 @@ use ffpipeline::input::{
     LavfiInputSource, LocalInputSource, ProbedInput, RtspInputOptions, RtspInputSource,
     WatermarkInput,
 };
-use ffpipeline::output_settings::{AudioOutputSettings, OutputSettings};
+use ffpipeline::output_settings::{AudioOutputSettings, OutputSettings, SubtitleMode};
 use ffpipeline::pipeline::{AudioFormat, Hz, Kbps, PtsOffset, SEGMENT_SECONDS, VideoFormat};
 use ffpipeline::probe::{
     CodecType, ProbeResult, ProbeResultAudioStream, ProbeResultColorParams, ProbeResultStream,
@@ -41,6 +41,7 @@ use crate::playout_loader::PlayoutLoader;
 use crate::pts_scanner::{PtsScanner, PtsTime};
 
 const STDERR_RING_LINES: usize = 2_000;
+const STALL_THRESHOLD: Duration = Duration::from_secs(60);
 
 #[derive(Copy, Clone, PartialEq)]
 enum ChannelSessionState {
@@ -190,8 +191,8 @@ impl ChannelSession {
         })
     }
 
-    pub async fn run(&mut self) -> Result<(), ChannelError> {
-        self.prep_output_folder().await?;
+    pub async fn run(&mut self, troubleshoot: bool) -> Result<(), ChannelError> {
+        self.prep_output_folder(troubleshoot).await?;
 
         self.ffmpeg_info = FfmpegInfo::load(
             &self.ffmpeg_path,
@@ -228,7 +229,12 @@ impl ChannelSession {
 
         // always work ahead initially
         let realtime = false;
-        self.transcode(realtime).await?;
+        self.transcode(realtime, troubleshoot).await?;
+
+        if troubleshoot {
+            log::debug!("troubleshooting complete; terminating.");
+            return Ok(());
+        }
 
         let pm = self.playlist_manager.clone();
         let tn = self.timeout_notify.clone();
@@ -252,19 +258,21 @@ impl ChannelSession {
             if transcoded_buffer <= time::Duration::minutes(1) {
                 // only use realtime when we're at least 30 seconds ahead
                 let realtime = transcoded_buffer >= time::Duration::seconds(30);
-                self.transcode(realtime).await?;
+                self.transcode(realtime, troubleshoot).await?;
             } else {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                     _ = tn.notified() => {
-                        return Err(ChannelError::IdleTimeout(self.channel_config.number().to_owned()));
+                        return Err(ChannelError::IdleTimeout(
+                            self.channel_config.number().to_owned()
+                        )                        );
                     }
                 }
             }
         }
     }
 
-    async fn prep_output_folder(&self) -> Result<(), ChannelError> {
+    async fn prep_output_folder(&self, troubleshoot: bool) -> Result<(), ChannelError> {
         let output_folder = self.channel_config.expanded_output_folder();
 
         if self.ready_file.exists() {
@@ -272,9 +280,11 @@ impl ChannelSession {
         }
 
         if output_folder.exists() {
-            empty_folder(output_folder)
-                .await
-                .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+            if !troubleshoot {
+                empty_folder(output_folder)
+                    .await
+                    .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+            }
         } else {
             tokio::fs::create_dir(output_folder)
                 .await
@@ -284,7 +294,7 @@ impl ChannelSession {
         Ok(())
     }
 
-    async fn transcode(&mut self, realtime: bool) -> Result<(), ChannelError> {
+    async fn transcode(&mut self, realtime: bool, troubleshoot: bool) -> Result<(), ChannelError> {
         if !realtime {
             log::debug!("channel session will work ahead");
 
@@ -362,16 +372,18 @@ impl ChannelSession {
         let pts_duration = pts_time.map(|p| p.duration);
 
         let result = self
-            .transcode_item(&current_item, realtime, pts_duration)
+            .transcode_item(&current_item, realtime, troubleshoot, pts_duration)
             .await;
 
         let (finish, is_complete) = match result {
             Ok(ok) => ok,
             Err(e @ ChannelError::IdleTimeout(_)) => return Err(e),
+            Err(e @ ChannelError::Stalled(_)) => return Err(e),
+            Err(e) if troubleshoot => return Err(e),
             Err(e) => {
                 log::error!("item failed, replacing with black/silence: {e}");
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
-                self.transcode_item(&fake_item, realtime, pts_duration)
+                self.transcode_item(&fake_item, realtime, troubleshoot, pts_duration)
                     .await?
             }
         };
@@ -388,6 +400,7 @@ impl ChannelSession {
         &mut self,
         current_item: &PlayoutItem,
         realtime: bool,
+        troubleshoot: bool,
         pts_duration: Option<Duration>,
     ) -> Result<(OffsetDateTime, bool), ChannelError> {
         // prioritize source from audio tracks, then default source
@@ -519,6 +532,7 @@ impl ChannelSession {
             format: ffpipeline::output_format::OutputFormat::Hls {
                 playlist: self.output_file.clone(),
                 segment_template: self.output_segment_template.clone(),
+                troubleshoot,
             },
             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
             realtime,
@@ -529,6 +543,18 @@ impl ChannelSession {
                 None
             },
             subtitle_mode: self.channel_config.normalization.subtitle.mode.into(),
+            fonts_folder: self
+                .channel_config
+                .normalization
+                .subtitle
+                .fonts_folder
+                .clone(),
+            subtitle_force_style: self
+                .channel_config
+                .normalization
+                .subtitle
+                .force_style
+                .clone(),
             reports_folder: self.channel_config.ffmpeg.reports_folder.clone(),
             report_id: Some(self.channel_config.number().to_owned()),
         };
@@ -589,7 +615,7 @@ impl ChannelSession {
             _ => None,
         };
 
-        let input_settings = InputSettings {
+        let mut input_settings = InputSettings {
             start: current_item.start,
             audio_input: ProbedInput {
                 input_source: audio_input_source,
@@ -614,7 +640,7 @@ impl ChannelSession {
         };
 
         let mut subtitle_source: Option<SubtitleSource> = None;
-        if output_settings.subtitle_mode == ffpipeline::output_settings::SubtitleMode::Convert
+        if output_settings.subtitle_mode == SubtitleMode::Convert
             && let Some(subtitle_stream) = input_settings.select_subtitle_stream()
             && !subtitle_stream.is_subtitle_image()
             && let Some(input) = input_settings.subtitle_input.as_ref()
@@ -631,6 +657,23 @@ impl ChannelSession {
                 cursor: 0,
                 next_segment_source_offset: input.in_point,
             });
+        }
+
+        let skip_embedded_text_subtitles = output_settings.subtitle_mode == SubtitleMode::Burn
+            && input_settings
+                .subtitle_input
+                .as_ref()
+                .is_some_and(|i| i.probe_result.streams.len() > 1)
+            && input_settings
+                .select_subtitle_stream()
+                .is_some_and(|s| !s.is_subtitle_image());
+
+        if skip_embedded_text_subtitles {
+            log::warn!(
+                "skipping embedded text subtitles for item {}; scheduler must extract to a sidecar file",
+                current_item.id
+            );
+            input_settings.subtitle_input = None;
         }
 
         let pts_offset = output_settings.pts_offset;
@@ -688,38 +731,18 @@ impl ChannelSession {
                 let status = status.map_err(|e| ChannelError::StreamFailure(e.to_string()))?;
                 let _ = reader_handle.await;
                 if !status.success() {
-                    let stderr_tail: Vec<_> = ring
-                        .lock()
-                        .map(|r| r.iter().cloned().collect())
-                        .unwrap_or_default();
-
-                    let mut builder = DossierBuilder::new(&self.channel_config, &self.ffmpeg_info)
-                        .item(current_item)
-                        .stderr(stderr_tail)
-                        .video(&video_probe_result)
-                        .audio(&audio_probe_result);
-
-                    if let Some(accel) = &self.hw_accel {
-                        builder = builder.accel(accel);
-                    }
-
-                    if let Some(subtitle_probe_result) = &subtitle_probe_result {
-                        builder = builder.subtitle(subtitle_probe_result);
-                    }
-
-                    if let Some(report_source_file) = self.channel_config.ffmpeg.reports_folder.as_ref().map(|folder| {
-                        PathBuf::from(folder).join(format!(".in-flight-{}.log", self.channel_config.number()))
-                    }) {
-                        builder = builder.report_source(report_source_file);
-                    }
-
-                    let dossier = builder.build();
-                    if let Err(err) = dossier.write().await {
-                        log::error!("failed to save dossier: {err}");
-                    }
+                    self.write_dossier(                        current_item,
+                        &video_probe_result,                        &audio_probe_result,
+                        subtitle_probe_result.as_ref(),
+                        &ring,
+                        format!("ffmpeg exited with code {status}")).await;
                     return Err(ChannelError::StreamFailure(format!(
                         "ffmpeg exited {status}"
                     )));
+                } else if troubleshoot {
+                    self.write_dossier(current_item, &video_probe_result,
+                        &audio_probe_result, subtitle_probe_result.as_ref(),
+                        &ring, "ffmpeg exited successfully".to_string()).await;
                 } else {
                     self.cleanup_old_report().await;
                 }
@@ -729,6 +752,22 @@ impl ChannelSession {
                 let _ = reader_handle.await;
                 self.cleanup_old_report().await;
                 return Err(ChannelError::IdleTimeout(self.channel_config.number().to_owned()));
+            }
+            _ = async {
+                    loop {
+                        let playlist_manager = self.playlist_manager.lock().await;
+                        if OffsetDateTime::now_utc() - *playlist_manager.last_progress() > STALL_THRESHOLD {
+                            break;
+                        }
+                        drop(playlist_manager);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                } => {
+                ffmpeg_child.kill().await.ok();
+                let _ = reader_handle.await;
+                self.write_dossier(current_item, &video_probe_result, &audio_probe_result,
+                    subtitle_probe_result.as_ref(), &ring, "ffmpeg stalled".to_string()).await;
+                return Err(ChannelError::Stalled(self.channel_config.number().to_owned()));
             }
         }
 
@@ -740,7 +779,8 @@ impl ChannelSession {
 
     fn next_state(state: ChannelSessionState, is_complete: bool) -> ChannelSessionState {
         let result = match state {
-            // after seeking and NOT completing the item, seek again, transcode will accelerate if needed
+            // after seeking and NOT completing the item, seek again,
+            // transcode will accelerate if needed
             ChannelSessionState::SeekAndWorkAhead if !is_complete => {
                 ChannelSessionState::SeekAndRealtime
             }
@@ -748,12 +788,14 @@ impl ChannelSession {
             // after seeking and completing the item, start at zero
             ChannelSessionState::SeekAndWorkAhead => ChannelSessionState::ZeroAndWorkAhead,
 
-            // after starting at zero and NOT completing the item, seek, transcode will accelerate if needed
+            // after starting at zero and NOT completing the item, seek,
+            // transcode will accelerate if needed
             ChannelSessionState::ZeroAndWorkAhead if !is_complete => {
                 ChannelSessionState::SeekAndRealtime
             }
 
-            // after starting at zero and completing the item, start at zero again, transcode method will throttle if needed
+            // after starting at zero and completing the item, start at zero again,
+            // transcode method will throttle if needed
             ChannelSessionState::ZeroAndWorkAhead => ChannelSessionState::ZeroAndWorkAhead,
 
             // realtime will always complete items, so start next at zero
@@ -1192,6 +1234,54 @@ impl ChannelSession {
             }
         }
     }
+
+    async fn write_dossier(
+        &self,
+        current_item: &PlayoutItem,
+        video_probe_result: &ProbeResult,
+        audio_probe_result: &ProbeResult,
+        subtitle_probe_result: Option<&ProbeResult>,
+        ring: &Arc<std::sync::Mutex<VecDeque<String>>>,
+        outcome: String,
+    ) {
+        let stderr_tail: Vec<_> = ring
+            .lock()
+            .map(|r| r.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut builder = DossierBuilder::new(&self.channel_config, &self.ffmpeg_info)
+            .item(current_item)
+            .stderr(stderr_tail)
+            .video(video_probe_result)
+            .audio(audio_probe_result)
+            .outcome(outcome);
+
+        if let Some(accel) = &self.hw_accel {
+            builder = builder.accel(accel);
+        }
+
+        if let Some(subtitle_probe_result) = subtitle_probe_result {
+            builder = builder.subtitle(subtitle_probe_result);
+        }
+
+        if let Some(report_source_file) =
+            self.channel_config
+                .ffmpeg
+                .reports_folder
+                .as_ref()
+                .map(|folder| {
+                    PathBuf::from(folder)
+                        .join(format!(".in-flight-{}.log", self.channel_config.number()))
+                })
+        {
+            builder = builder.report_source(report_source_file);
+        }
+
+        let dossier = builder.build();
+        if let Err(err) = dossier.write().await {
+            log::error!("failed to save dossier: {err}");
+        }
+    }
 }
 
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
@@ -1242,7 +1332,10 @@ fn playout_timing_to_pipeline(
 fn source_is_live(source: &PlayoutItemSource) -> bool {
     matches!(
         source,
-        PlayoutItemSource::Script {
+        PlayoutItemSource::Http {
+            is_live: Some(true),
+            ..
+        } | PlayoutItemSource::Script {
             is_live: Some(true),
             ..
         } | PlayoutItemSource::Rtsp { .. }
