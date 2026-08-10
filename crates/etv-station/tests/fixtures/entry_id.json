@@ -1,0 +1,198 @@
+{
+  "_comment": [
+    "SHARED FIXTURE — this file exists twice, on purpose.",
+    "Copy 1: plex-db-ex, tests/fixtures/entry_id.json (Python, item_id).",
+    "Copy 2: etv-station, crates/etv-station/tests/fixtures/entry_id.json (Rust, entry_id).",
+    "Both sides run every case below and both pin this file's SHA-256, so editing one copy",
+    "without the other turns both test suites red. See plex-db-ex ADR-0006.",
+    "Changing this file means changing both repos in the same breath, and updating the",
+    "recorded hash in both."
+  ],
+  "version": 1,
+
+  "entry_id_cases": [
+    {
+      "name": "imdb beats every other guid",
+      "external_ids": [["plex", "abc"], ["tvdb", "111"], ["imdb", "tt1375666"], ["tmdb", "27205"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "imdb:tt1375666"
+    },
+    {
+      "name": "input order does not matter — same set, reversed",
+      "external_ids": [["tmdb", "27205"], ["imdb", "tt1375666"], ["tvdb", "111"], ["plex", "abc"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "imdb:tt1375666"
+    },
+    {
+      "name": "tmdb beats tvdb and plex",
+      "external_ids": [["plex", "abc"], ["tvdb", "111"], ["tmdb", "27205"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "tmdb:27205"
+    },
+    {
+      "name": "tvdb beats plex",
+      "external_ids": [["plex", "k"], ["tvdb", "5"]],
+      "canonical_path": "shows/x/s01e01.mkv",
+      "expect": "tvdb:5"
+    },
+    {
+      "name": "plex alone is still an id, not a fallback",
+      "external_ids": [["plex", "k9"]],
+      "canonical_path": "shows/x/s01e01.mkv",
+      "expect": "plex:k9"
+    },
+    {
+      "name": "an unrecognised namespace is ignored, not ranked",
+      "external_ids": [["letterboxd", "inception"], ["tmdb", "27205"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "tmdb:27205"
+    },
+    {
+      "name": "an unrecognised namespace alone falls through to the path hash",
+      "external_ids": [["letterboxd", "inception"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "fs:6abcfec508f575cc"
+    },
+    {
+      "name": "a duplicated namespace takes the first value seen",
+      "external_ids": [["tmdb", "27205"], ["tmdb", "99999"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "tmdb:27205"
+    },
+    {
+      "name": "no guids at all — path hash",
+      "external_ids": [],
+      "canonical_path": "movies/home-video-2004.mkv",
+      "expect": "fs:742e07e36734e671"
+    },
+    {
+      "name": "no guids, empty canonical path — still deterministic",
+      "external_ids": [],
+      "canonical_path": "",
+      "expect": "fs:cbf29ce484222325"
+    },
+    {
+      "name": "a value containing a colon survives intact",
+      "external_ids": [["plex", "local://a:b"]],
+      "canonical_path": "movies/x.mkv",
+      "expect": "plex:local://a:b"
+    },
+    {
+      "name": "non-ascii in the path hashes over utf-8 bytes",
+      "external_ids": [],
+      "canonical_path": "movies/amélie.mkv",
+      "expect": "fs:6fc7bb383bcb49ef"
+    },
+    {
+      "name": "an empty guid value is treated as absent, so the next namespace wins",
+      "external_ids": [["imdb", ""], ["tmdb", "27205"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "tmdb:27205"
+    },
+    {
+      "name": "a whitespace-only guid value is treated as absent, so the next namespace wins",
+      "external_ids": [["imdb", "   "], ["tmdb", "27205"]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "tmdb:27205"
+    },
+    {
+      "name": "a title whose only guid is empty falls through to the path hash",
+      "external_ids": [["imdb", ""]],
+      "canonical_path": "movies/blank-guid.mkv",
+      "expect": "fs:6c4178a0a255eaf1"
+    },
+    {
+      "name": "surrounding whitespace on an otherwise-usable value is not trimmed",
+      "external_ids": [["imdb", " tt1375666 "]],
+      "canonical_path": "movies/inception.mkv",
+      "expect": "imdb: tt1375666 "
+    }
+  ],
+
+  "canonical_path_cases": [
+    {
+      "name": "the configured root is stripped",
+      "raw": "/Volumes/media/movies/x.mkv",
+      "source_roots": ["/Volumes/media"],
+      "expect": "movies/x.mkv"
+    },
+    {
+      "name": "a second mount for the same file canonicalises identically",
+      "raw": "/mnt/media/movies/x.mkv",
+      "source_roots": ["/Volumes/media", "/mnt/media"],
+      "expect": "movies/x.mkv"
+    },
+    {
+      "name": "a root only matches at a path boundary",
+      "raw": "/Volumes/mediacache/x.mkv",
+      "source_roots": ["/Volumes/media", "/Volumes"],
+      "expect": "mediacache/x.mkv"
+    },
+    {
+      "name": "the longest matching root wins",
+      "raw": "/Volumes/media/movies/x.mkv",
+      "source_roots": ["/Volumes", "/Volumes/media"],
+      "expect": "movies/x.mkv"
+    },
+    {
+      "name": "a trailing slash on the configured root is ignored",
+      "raw": "/Volumes/media/movies/x.mkv",
+      "source_roots": ["/Volumes/media/"],
+      "expect": "movies/x.mkv"
+    },
+    {
+      "name": "backslashes normalise to forward slashes",
+      "raw": "\\Volumes\\media\\movies\\x.mkv",
+      "source_roots": ["/Volumes/media"],
+      "expect": "movies/x.mkv"
+    },
+    {
+      "name": "a path under no configured root is left alone",
+      "raw": "/elsewhere/x.mkv",
+      "source_roots": ["/Volumes/media"],
+      "expect": "/elsewhere/x.mkv"
+    },
+    {
+      "name": "the root itself canonicalises to empty",
+      "raw": "/Volumes/media",
+      "source_roots": ["/Volumes/media"],
+      "expect": ""
+    },
+    {
+      "name": "no roots configured at all",
+      "raw": "/Volumes/media/movies/x.mkv",
+      "source_roots": [],
+      "expect": "/Volumes/media/movies/x.mkv"
+    }
+  ],
+
+  "_end_to_end_comment": [
+    "raw path + roots, canonicalised and then derived, in one step.",
+    "This is the pairing that matters: the same file reached through two different",
+    "mounts must land on ONE id. Canonicalisation feeding the hash is the mechanism,",
+    "and only an end-to-end case actually checks the two are wired together."
+  ],
+  "end_to_end_cases": [
+    {
+      "name": "guid-less file seen through the mac mount",
+      "raw": "/Volumes/media/movies/no-guids.mkv",
+      "source_roots": ["/Volumes/media", "/mnt/media"],
+      "external_ids": [],
+      "expect": "fs:821b039fe5c7c10d"
+    },
+    {
+      "name": "the same guid-less file seen through the linux mount — same id",
+      "raw": "/mnt/media/movies/no-guids.mkv",
+      "source_roots": ["/Volumes/media", "/mnt/media"],
+      "external_ids": [],
+      "expect": "fs:821b039fe5c7c10d"
+    },
+    {
+      "name": "a guid wins over the path, so the mount is irrelevant",
+      "raw": "/mnt/media/movies/inception.mkv",
+      "source_roots": ["/Volumes/media", "/mnt/media"],
+      "external_ids": [["imdb", "tt1375666"]],
+      "expect": "imdb:tt1375666"
+    }
+  ]
+}

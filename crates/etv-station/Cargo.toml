@@ -33,6 +33,8 @@ tracing-subscriber = { workspace = true }
 # through that type in tests is what makes a renamed or mistyped key a build
 # failure here instead of a wrong value nobody sees until Plex is confused.
 ersatztv = { workspace = true }
+# Guards the identity fixture shared with plex-db-ex; see tests/entry_id_fixture.rs.
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 # `test-util` gates tokio's pausable clock, which is how the shared watch
 # history's refresh window is tested without a real sleep.

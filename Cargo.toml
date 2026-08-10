@@ -24,6 +24,9 @@ rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
+# Dev-only: pins the SHA-256 of the identity fixture shared with plex-db-ex, so
+# editing one repo's copy without the other turns both suites red (#184).
+sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 time-tz = "2"

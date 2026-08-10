@@ -18,9 +18,33 @@ use super::model::ExternalNs;
 /// `external_ids` may be in any order and contain duplicates/unknowns; only the
 /// strongest recognised namespace is used. `canonical_path` must already be
 /// canonicalised (see [`canonical_path`]).
+///
+/// **An empty or whitespace-only value is not an identity — it is absent.** Such
+/// a pair is skipped, so the next pair in that same namespace is considered, and
+/// then the next namespace in priority order, reaching the path hash when
+/// nothing usable remains. Before this, a present-but-empty IMDb GUID derived
+/// the literal id `imdb:`, and every title in that state collapsed onto it —
+/// one catalog row, with the watch history and everything else keyed on it
+/// merging silently (#184).
+///
+/// A value that is otherwise usable is used **verbatim**: surrounding whitespace
+/// is deliberately not trimmed, so `" tt1375666 "` and `"tt1375666"` remain
+/// distinct. That keeps the id a byte-for-byte echo of what the source supplied.
+/// See McBrideMusings/plex-db-ex#17, which settled both halves.
+///
+/// This rule exists twice — the other copy is Python, in `plex-db-ex` at
+/// `plexdb/identity.py`. The two must agree byte for byte or every join between
+/// that store and this catalog silently returns nothing, so both sides run
+/// `tests/fixtures/entry_id.json` and both pin its SHA-256.
 pub fn derive_entry_id(external_ids: &[(ExternalNs, String)], canonical_path: &str) -> String {
     for ns in ExternalNs::PRIORITY {
-        if let Some((_, value)) = external_ids.iter().find(|(n, _)| *n == ns) {
+        // Scan every pair for this namespace, not just the first one carrying
+        // it: an unusable value means "absent", so a later pair in the same
+        // namespace still counts. Matching the Python's nested loop exactly.
+        if let Some((_, value)) = external_ids
+            .iter()
+            .find(|(n, v)| *n == ns && !v.trim().is_empty())
+        {
             return format!("{}:{}", ns.as_str(), value);
         }
     }

@@ -483,6 +483,22 @@ fn or_existing(primary: Option<String>, existing: Option<String>) -> Option<Stri
 
 /// Parse a Plex `Guid.id` (`imdb://tt0095016`, `tmdb://562`) into a recognised
 /// namespace + value. Unknown schemes (and malformed ids) return `None`.
+///
+/// **A blank value is dropped here, not merely downstream (#184).** It is not
+/// enough for [`crate::catalog::derive_entry_id`] to treat an unusable value as
+/// absent, because that only governs the id a *fresh* entry is minted under.
+/// Every pair that survives this function is also written to
+/// `entry_external_ids` by the ingest loop and read back by `resolve_existing`
+/// on the next scan — so a blank value that got this far would store
+/// `(imdb, "   ") -> entry_A`, and the next title carrying the same blank value
+/// would resolve onto `entry_A` and merge into it. That is the same silent
+/// collapse #184 is about, arriving one scan later through the reconciliation
+/// path. Dropping it once, here, keeps all three consumers agreeing.
+///
+/// "Blank" matches [`derive_entry_id`]'s rule — empty or whitespace-only. This
+/// is deliberately a filter on what Plex ingestion builds, not a change to the
+/// derivation itself, so the byte-for-byte parity with `plex-db-ex` that the
+/// shared fixture pins is untouched.
 fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
     let (scheme, value) = id.split_once("://")?;
     let ns = match scheme {
@@ -492,10 +508,7 @@ fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
         "plex" => ExternalNs::Plex,
         _ => return None,
     };
-    if value.is_empty() {
-        return None;
-    }
-    Some((ns, value.to_string()))
+    Some((ns, non_empty(value)?.to_string()))
 }
 
 /// Convert one Plex metadata record into a [`PlexItem`], applying `translate` to
@@ -885,6 +898,27 @@ mod tests {
         assert_eq!(parse_guid("nonsense://x"), None);
         assert_eq!(parse_guid("imdb://"), None);
         assert_eq!(parse_guid("garbage"), None);
+    }
+
+    /// A blank GUID must not survive parsing (#184).
+    ///
+    /// Dropping it in `derive_entry_id` alone is not enough: a pair that gets
+    /// past here is written to `entry_external_ids` by the ingest loop and read
+    /// back by `resolve_existing` on the next scan, so a stored
+    /// `(imdb, "   ") -> entry_A` would pull the next blank-GUID title onto
+    /// `entry_A` and merge two unrelated films into one entry.
+    #[test]
+    fn a_blank_guid_value_does_not_survive_parsing() {
+        assert_eq!(parse_guid("imdb://"), None, "empty value");
+        assert_eq!(parse_guid("imdb://   "), None, "spaces only");
+        assert_eq!(parse_guid("imdb://\t"), None, "tab only");
+        assert_eq!(parse_guid("tmdb://\n"), None, "newline only");
+        // A usable value keeps its surrounding whitespace verbatim — the id is a
+        // byte-for-byte echo of the source, matching `derive_entry_id`.
+        assert_eq!(
+            parse_guid("imdb:// tt0095016 "),
+            Some((ExternalNs::Imdb, " tt0095016 ".into()))
+        );
     }
 
     /// Every episode of a show has to land on one `show_id`, because that is
