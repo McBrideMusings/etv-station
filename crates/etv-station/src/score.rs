@@ -99,6 +99,7 @@ use rhai::serde::DynamicDeserializer;
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Scope};
 
 use crate::catalog::{Catalog, TagNs};
+use crate::pattern::MAX_TAKE;
 
 /// One watch event from the server's history, as handed to a plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -795,6 +796,13 @@ fn parse_picked_item(
                 return Err(format!(
                     "scorer plugin {}: pick() item #{index} ({entry_id:?}) names a take \
                      override of {n}, which must be positive",
+                    script_path.display()
+                ));
+            }
+            if n as usize > MAX_TAKE {
+                return Err(format!(
+                    "scorer plugin {}: pick() item #{index} ({entry_id:?}) names a take \
+                     override of {n}, which exceeds the maximum of {MAX_TAKE}",
                     script_path.display()
                 ));
             }
@@ -1781,6 +1789,34 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
             assert!(err.contains("m1"), "take={take}, got {err}");
             assert!(err.contains("positive"), "take={take}, got {err}");
         }
+    }
+
+    /// A take override past `MAX_TAKE` fails the pick and names the entry,
+    /// rather than reaching the pattern draw's `Vec::with_capacity(take)`
+    /// (#202).
+    #[test]
+    fn a_take_override_past_the_maximum_fails_and_names_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            &format!(
+                "fn sources() {{ #{{}} }}\nfn pick(ctx) {{ [#{{ entry_id: \"m1\", take: {} }}] }}\n",
+                MAX_TAKE + 1
+            ),
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            &ScoreInputs::default(),
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("m1"), "got {err}");
+        assert!(err.contains("maximum"), "got {err}");
     }
 
     /// A record naming no `entry_id` fails and says so, naming the index.
