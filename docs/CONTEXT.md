@@ -33,3 +33,19 @@ A playout file whose filename span is wider than the items inside it cover. Ersa
 ## Window materialization
 
 How far ahead a channel's schedule is written: the roll tick keeps the folder covered to `now + window_days`. Distinct from a [[chunk]] (the file-slicing unit) and a [[generation]] (one playlist pass) — materialization is the horizon, chunks and generations are how it gets filled.
+
+## Dated block
+
+A block declaring the calendar dates it airs on. Read once per [[generation]] when the channel's blocks are composed, so it decides whether the block takes part at all — not where in the day it lands. Among a channel's dated blocks only the first whose dates match is kept, and "first" means first in the file. Contrast a [[daypart]], which is a clock-time concept and lives somewhere else entirely. See ADR 0004.
+
+## Undated block
+
+A block with no calendar declaration. It always airs, which is what makes it the default a channel falls back to when no [[dated block]] matches. A channel that declares dated blocks and no undated block fails at load, because it could otherwise go dark on an unmatched day.
+
+## Daypart
+
+A stretch of the day with a declared character — late-night animation, prime-time films. Not a schema concept: a channel wanting dayparts is one block whose pools are its dayparts, arranged by a sequencer plugin that reads the clock. Distinct from a [[dated block]], which is calendar-conditional and resolved before any clock exists. See ADR 0004 and #169.
+
+## Drift
+
+The gap between when a [[daypart]] was meant to start and when it actually does, because the item before it ran past the boundary. Accepted rather than corrected: closing it would mean cutting an item short or leaving dead air, and padding it out is impossible while the library has no interstitials (#85). Bounded by the longest item in the pool.
