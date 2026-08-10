@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::block::Duplicates;
 use super::channel::{ChannelConfig, TasteScope};
-use super::constraints::Constraints;
+use super::constraints::{Constraints, NoRepeatWithin};
 use super::order::Order;
 use super::pool::{Rotate, Take, TakeFrom};
 use super::rule::BlockInclude;
@@ -204,8 +204,14 @@ fn validate_constraints(
     c: &Constraints,
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
-    // An explicit `0` reads as "on" but spaces nothing apart.
-    if c.no_repeat_within == Some(0) {
+    // An explicit `0` — positions or duration — reads as "on" but spaces
+    // nothing apart.
+    let zero = match c.no_repeat_within {
+        Some(NoRepeatWithin::Positions(0)) => true,
+        Some(NoRepeatWithin::Duration(d)) => d.is_zero(),
+        _ => false,
+    };
+    if zero {
         return Err(bad(
             "no_repeat_within must be > 0 (omit it to leave the block unconstrained)".into(),
         ));
@@ -701,7 +707,7 @@ mod tests {
     fn rejects_zero_no_repeat_within() {
         let mut block = inline_block(vec![item_entry("a")]);
         block.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(0),
+            no_repeat_within: Some(NoRepeatWithin::Positions(0)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -774,7 +780,7 @@ mod tests {
         validate_channel(
             &dummy_path(),
             &with_constraints(crate::config::Constraints {
-                no_repeat_within: Some(1),
+                no_repeat_within: Some(NoRepeatWithin::Positions(1)),
                 separate_by: Some("cast".into()),
                 separate_min_gap: Some(3),
             }),
@@ -786,7 +792,7 @@ mod tests {
     fn adjacency_reach_is_the_widest_gap_across_blocks() {
         let mut a = inline_block(vec![item_entry("a")]);
         a.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(2),
+            no_repeat_within: Some(NoRepeatWithin::Positions(2)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -807,7 +813,7 @@ mod tests {
     fn adjacency_reach_converts_a_pool_gap_into_channel_positions() {
         let mut movies = pool("movies");
         movies.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(5),
+            no_repeat_within: Some(NoRepeatWithin::Positions(5)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -827,7 +833,7 @@ mod tests {
             vec![step("movies", 2), step("shows", 3)],
         );
         block.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(2),
+            no_repeat_within: Some(NoRepeatWithin::Positions(2)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -843,7 +849,7 @@ mod tests {
     fn rejects_a_pool_constraint_that_constrains_nothing() {
         let mut movies = pool("movies");
         movies.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(0),
+            no_repeat_within: Some(NoRepeatWithin::Positions(0)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -876,7 +882,7 @@ mod tests {
     fn accepts_a_positive_no_repeat_within() {
         let mut block = inline_block(vec![item_entry("a"), item_entry("b")]);
         block.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(1),
+            no_repeat_within: Some(NoRepeatWithin::Positions(1)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -1022,7 +1028,7 @@ mod tests {
     #[test]
     fn rejects_take_all_beside_constraints() {
         let gap = Constraints {
-            no_repeat_within: Some(3),
+            no_repeat_within: Some(NoRepeatWithin::Positions(3)),
             separate_by: None,
             separate_min_gap: None,
         };

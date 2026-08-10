@@ -46,9 +46,9 @@ use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
     BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, Fallback,
-    ItemEntry, Mode, Order, QueryEntry, SourceConfig,
+    ItemEntry, Mode, NoRepeatWithin, Order, QueryEntry, SourceConfig,
 };
-use crate::constrain::{ItemKeys, Limits};
+use crate::constrain::{ItemKeys, Limits, RepeatGap};
 use crate::errors::ConfigError;
 use crate::resume::{GenerationState, ResumeMap};
 
@@ -191,11 +191,15 @@ pub fn resolve_channel_with_resume(
         } else {
             include.constraints()
         };
+        let no_repeat = match c.no_repeat_gap() {
+            NoRepeatWithin::Positions(n) => RepeatGap::Positions(n),
+            NoRepeatWithin::Duration(d) => RepeatGap::Duration(d),
+        };
         let span_start = out.len();
         limits.resize(
             limits.len() + block_items.len(),
             Limits {
-                no_repeat: c.no_repeat_gap(),
+                no_repeat,
                 separate: c.separate_gap(),
             },
         );
@@ -312,9 +316,22 @@ pub fn resolve_channel_with_resume(
     //    own list, so it reorders a settled sequence rather than fighting the
     //    order engine.
     if crate::constrain::any_constrained(&limits) {
+        // A temporal `no_repeat_within` (#185) needs to know how long each
+        // item runs to measure distance in time; a purely positional pass
+        // never reads it, so the catalog is only asked when something here is
+        // actually spelled as a duration.
+        let need_durations = limits
+            .iter()
+            .any(|l| matches!(l.no_repeat, RepeatGap::Duration(_)));
+        let out_durations: Vec<Duration> = if need_durations {
+            estimated_runtimes(&out, catalog, nominal_item_runtime(config))
+        } else {
+            Vec::new()
+        };
         let keys = adjacency_keys(
             &out.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
             &separate_fields,
+            &out_durations,
             catalog,
             path,
         )?;
@@ -323,9 +340,21 @@ pub fn resolve_channel_with_resume(
         // previous generation's own blocks are gone, so every tail item is read
         // under this channel's first separating field.
         let tail_field = separate_fields.iter().flatten().next().cloned();
+        let tail_durations: Vec<Duration> = if need_durations {
+            let estimated =
+                estimated_durations_for_ids(&state.tail, catalog, nominal_item_runtime(config));
+            state
+                .tail
+                .iter()
+                .map(|id| estimated.get(id).copied().unwrap_or_default())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let preceding = adjacency_keys(
             &state.tail,
             &vec![tail_field; state.tail.len()],
+            &tail_durations,
             catalog,
             path,
         )?;
@@ -350,25 +379,35 @@ pub fn resolve_channel_with_resume(
     Ok((out, resume_out))
 }
 
-/// Build the per-item keys the adjacency pass compares: the `entry_id`, plus
-/// the values of whatever field that item's block separates on.
+/// Build the per-item keys the adjacency pass compares: the `entry_id`, the
+/// values of whatever field that item's block separates on, and — when
+/// `durations` has an entry for its position — its estimated runtime (#185).
 ///
 /// The field values come from the catalog's tags, read with the same vocabulary
 /// an expression uses — `separate_by: "cast"` reads exactly what `item.cast`
 /// reads. An item with no values for the field simply never triggers the
 /// separation, which is why a catalog-free channel can still use
-/// `no_repeat_within`.
+/// `no_repeat_within`. `durations` is empty whenever nothing here is measured
+/// in time, so a purely positional pass never pays for it and every item's
+/// duration is the zero it does not need.
 fn adjacency_keys(
     ids: &[String],
     separate_fields: &[Option<String>],
+    durations: &[Duration],
     catalog: Option<&Catalog>,
     path: &Path,
 ) -> Result<Vec<ItemKeys>, ConfigError> {
     ids.iter()
         .zip(separate_fields.iter())
-        .map(|(id, field)| {
+        .enumerate()
+        .map(|(i, (id, field))| {
+            let duration = durations.get(i).copied().unwrap_or_default();
             let Some(field) = field else {
-                return Ok(ItemKeys::new(id.clone()));
+                return Ok(ItemKeys {
+                    id: id.clone(),
+                    group: Vec::new(),
+                    duration,
+                });
             };
             let ns = TagNs::for_separate_by(field).map_err(|message| ConfigError::Validation {
                 path: path.to_path_buf(),
@@ -388,6 +427,7 @@ fn adjacency_keys(
                     path: path.to_path_buf(),
                     message: format!("reading {field:?} for {id}: {e}"),
                 })?,
+                duration,
             })
         })
         .collect()
@@ -464,6 +504,36 @@ fn estimated_runtimes(
         measured.iter().sum::<Duration>() / measured.len() as u32
     };
     known.into_iter().map(|d| d.unwrap_or(stand_in)).collect()
+}
+
+/// [`estimated_runtimes`]'s fallback ladder, minus the top rung: the
+/// play-history tail (#185's seam) is bare `entry_id`s, not [`ResolvedItem`]s,
+/// so there is no in/out point or carried `catalog_duration` to read first —
+/// only the catalog's own record, the mean of what it has for these ids, and
+/// the channel's nominal length when it has none of them.
+fn estimated_durations_for_ids(
+    ids: &[String],
+    catalog: Option<&Catalog>,
+    nominal: Duration,
+) -> HashMap<String, Duration> {
+    let mut known: HashMap<String, Duration> = HashMap::new();
+    if let Some(cat) = catalog
+        && let Ok(raw) = cat.durations_for(ids)
+    {
+        for (id, ms) in raw {
+            if ms > 0 && ms <= MAX_CATALOG_DURATION_MS {
+                known.insert(id, Duration::from_millis(ms as u64));
+            }
+        }
+    }
+    let stand_in = if known.is_empty() {
+        nominal
+    } else {
+        known.values().sum::<Duration>() / known.len() as u32
+    };
+    ids.iter()
+        .map(|id| (id.clone(), known.get(id).copied().unwrap_or(stand_in)))
+        .collect()
 }
 
 /// How many items from the top it takes to cover `fill`.
@@ -1079,6 +1149,18 @@ mod tests {
         }
     }
 
+    /// A lavfi test item with an explicit runtime, for exercising a temporal
+    /// `no_repeat_within` (#185) without a catalog: `estimated_runtimes` reads
+    /// `out_point - in_point` as its most authoritative source.
+    fn item_entry_secs(id: &str, secs: u64) -> ItemEntry {
+        ItemEntry {
+            source: SourceConfig::Lavfi { params: id.into() },
+            in_point: None,
+            out_point: Some(Duration::from_secs(secs)),
+            program: None,
+        }
+    }
+
     /// A local-file test item (no authored id — identity derives from the path).
     fn local_entry(path: &str) -> ItemEntry {
         ItemEntry {
@@ -1150,7 +1232,17 @@ mod tests {
     /// ways an id legitimately appears twice in a resolved channel.
     fn constrained(mut inc: BlockInclude, n: usize) -> BlockInclude {
         inc.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(n),
+            no_repeat_within: Some(NoRepeatWithin::Positions(n)),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        inc
+    }
+
+    /// The temporal spelling of [`constrained`] (#185).
+    fn constrained_within(mut inc: BlockInclude, within: Duration) -> BlockInclude {
+        inc.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(NoRepeatWithin::Duration(within)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -1231,6 +1323,79 @@ mod tests {
         assert_ne!(
             ids[0], "lavfi:a",
             "repeated the previously-aired item across the seam: {ids:?}"
+        );
+    }
+
+    // ---- no_repeat_within: temporal spelling (#185) -------------------------
+
+    /// Two 30s items sandwiching another 30s item stays within a 40s window —
+    /// a single item never covers it — so, like the positional gap = 1 case,
+    /// the pass must still separate the back-to-back repeat.
+    #[test]
+    fn no_repeat_within_temporal_separates_short_items() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry_secs("a", 30)),
+            Entry::Item(item_entry_secs("a", 30)),
+            Entry::Item(item_entry_secs("b", 30)),
+            Entry::Item(item_entry_secs("c", 30)),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained_within(inc, Duration::from_secs(40))]);
+        assert_eq!(ids.len(), 4);
+        for i in 1..ids.len() {
+            assert_ne!(ids[i - 1], ids[i], "{ids:?}");
+        }
+    }
+
+    /// Each item alone already runs longer than the configured window, so an
+    /// adjacent repeat is legal and the list must come back untouched — the
+    /// exact case a positional `no_repeat_within = 1` cannot express, since it
+    /// would force separation regardless of how long each item runs.
+    #[test]
+    fn no_repeat_within_temporal_allows_adjacency_when_items_are_long_enough() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry_secs("a", 600)),
+            Entry::Item(item_entry_secs("a", 600)),
+            Entry::Item(item_entry_secs("b", 600)),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained_within(inc, Duration::from_secs(300))]);
+        assert_eq!(
+            ids,
+            vec!["lavfi:a", "lavfi:a", "lavfi:b"],
+            "each item alone already covers the 300s window; a legal list was reordered"
+        );
+    }
+
+    /// The seam holds in wall-clock time too: with no catalog behind it, the
+    /// previously-aired tail item is estimated at the channel's nominal item
+    /// length (1800s, the untouched default), which a 2h window still reaches
+    /// past — so the new list must not open on the same id.
+    #[test]
+    fn no_repeat_within_temporal_holds_across_the_generation_seam() {
+        let inc = include_with(vec![
+            Entry::Item(item_entry_secs("a", 600)),
+            Entry::Item(item_entry_secs("b", 600)),
+        ]);
+        let state = crate::resume::GenerationState {
+            tail: vec!["lavfi:a".to_string()],
+            ..Default::default()
+        };
+        let (items, _) = resolve_channel_with_resume(
+            &channel(vec![constrained_within(inc, Duration::from_secs(7200))]),
+            path(),
+            &[],
+            None,
+            None,
+            &state,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_ne!(
+            ids[0], "lavfi:a",
+            "repeated the previously-aired item within the temporal window: {ids:?}"
         );
     }
 
