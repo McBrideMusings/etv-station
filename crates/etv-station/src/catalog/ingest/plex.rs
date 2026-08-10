@@ -576,6 +576,32 @@ fn tagged(fields: &[TaggedField]) -> Vec<String> {
     fields.iter().filter_map(|f| f.tag.clone()).collect()
 }
 
+/// Query parameters for one section's bulk listing request in [`PlexClient::fetch_all`].
+///
+/// `includeGuids=1` is always present (#183): Plex omits `<Guid>` elements
+/// from a bulk section listing unless explicitly asked, which left every
+/// production catalog entry identified by a path hash instead of its
+/// `imdb`/`tmdb`/`tvdb` id. Verified against the live server to compose with
+/// the delta filter — `type=4&includeGuids=1&updatedAt>=X` returns the same
+/// `totalSize` as the same query without `includeGuids`.
+fn section_list_params<'a>(
+    kind: Option<&str>,
+    since_param: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    // Movies come back directly; a show section is expanded to its episode
+    // leaves (type=4).
+    let mut params: Vec<(&str, &str)> = match kind {
+        Some("show") => vec![("type", "4")],
+        Some("movie") => vec![("type", "1")],
+        _ => Vec::new(),
+    };
+    params.push(("includeGuids", "1"));
+    if let Some(s) = since_param {
+        params.push(("updatedAt>", s));
+    }
+    params
+}
+
 // ---- HTTP client (thin outer layer) --------------------------------------
 
 struct PlexClient {
@@ -631,6 +657,11 @@ impl PlexClient {
 
     /// Every movie and episode across all library sections, as [`PlexItem`]s.
     ///
+    /// Every request carries `includeGuids=1` (#183) — see
+    /// [`section_list_params`] — so `<Guid>` elements are present and
+    /// [`to_plex_item`] has external ids to hand `derive_entry_id`, instead of
+    /// every entry falling back to a path-hash `fs:` id.
+    ///
     /// `since` (unix seconds) narrows each section to items Plex has touched
     /// after that moment, via the server-side `updatedAt>=` filter. On a library
     /// of ~86k items that is the difference between 20s of transfer and a
@@ -660,16 +691,7 @@ impl PlexClient {
             let Some(id) = section.key.as_deref() else {
                 continue;
             };
-            // Movies come back directly; a show section is expanded to its
-            // episode leaves (type=4).
-            let mut params: Vec<(&str, &str)> = match section.kind.as_deref() {
-                Some("show") => vec![("type", "4")],
-                Some("movie") => vec![("type", "1")],
-                _ => Vec::new(),
-            };
-            if let Some(s) = since_param.as_deref() {
-                params.push(("updatedAt>", s));
-            }
+            let params = section_list_params(section.kind.as_deref(), since_param.as_deref());
             let endpoint = format!("/library/sections/{id}/all");
             let resp: MediaContainerResp = self.get(&endpoint, &params)?;
             for m in &resp.media_container.metadata {
@@ -881,6 +903,42 @@ mod tests {
             producers: vec![],
             countries: vec![],
         }
+    }
+
+    /// #183: every section-listing request must carry `includeGuids=1`, or
+    /// Plex omits `<Guid>` elements from the bulk response and every entry
+    /// falls back to a path-hash `fs:` id instead of `imdb`/`tmdb`/`tvdb`.
+    /// Covers every section kind (`show`, `movie`, unknown) crossed with
+    /// both a full pass (`since_param = None`) and a delta pass, so the
+    /// parameter can never quietly go missing from one combination.
+    #[test]
+    fn section_list_params_always_requests_guids() {
+        for kind in [Some("show"), Some("movie"), None] {
+            for since_param in [None, Some("1700000000")] {
+                let params = section_list_params(kind, since_param);
+                assert!(
+                    params.contains(&("includeGuids", "1")),
+                    "missing includeGuids=1 for kind={kind:?}, since={since_param:?}: {params:?}"
+                );
+            }
+        }
+    }
+
+    /// `includeGuids=1` must compose with the delta filter rather than
+    /// replace it — a delta pass still needs `updatedAt>` alongside it, or a
+    /// warm restart would silently re-ingest the whole library (see
+    /// `fetch_all`'s doc comment on the `updatedAt>` vs `updatedAt>=` bug).
+    #[test]
+    fn section_list_params_composes_guids_with_the_delta_filter() {
+        let params = section_list_params(Some("show"), Some("1700000000"));
+        assert_eq!(
+            params,
+            vec![
+                ("type", "4"),
+                ("includeGuids", "1"),
+                ("updatedAt>", "1700000000"),
+            ]
+        );
     }
 
     #[test]
