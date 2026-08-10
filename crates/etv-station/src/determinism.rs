@@ -513,6 +513,7 @@ mod tests {
     /// never going to coincidentally pass.
     const WALL_CLOCK_PLUGIN: &str = r#"
 fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read"] }
 fn sources() { #{ movies: `item.type == "movie"` } }
 fn pick(ctx) {
     let ids = [];
@@ -559,6 +560,13 @@ fn pick(ctx) {
             on_short: OnShort::Next,
             constraints: None,
             config: None,
+            // The test script reads `ctx.sets`, which #167 gates behind a
+            // granted `catalog_read`. This pool is built directly rather than
+            // loaded, so nothing cross-checks the grant against the script's
+            // own `capabilities()` here — the script declares it too, so the
+            // pair matches what a real config would have to write.
+            capabilities: vec!["catalog_read".into()],
+            datastores: Vec::new(),
         }
     }
 
