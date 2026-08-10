@@ -23,6 +23,9 @@ regex = "1"
 rhai = { version = "1.20", features = ["sync", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
+# Reports the keys a config file carried that the types do not know, so an
+# unrecognised key can be a warning instead of a refusal to start.
+serde_ignored = "0.1"
 serde_json = "1"
 serde_norway = "0.9"
 # Dev-only: pins the SHA-256 of the identity fixture shared with plex-db-ex, so

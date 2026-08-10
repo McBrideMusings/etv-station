@@ -40,7 +40,6 @@ use super::order::Order;
 /// load, naming the show — folding it into two rotation domains at once has
 /// no single answer.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ShowGroup {
     /// Group name, referenced by [`Pool::groups`]. Unique within a channel
     /// (validated).
@@ -219,7 +218,6 @@ pub enum OnShort {
 
 /// One named resolved set inside a pattern block.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Pool {
     /// Pool name, referenced by [`PatternStep::pool`]. Unique within a channel
     /// (validated), which is what lets the `.resume` sidecar key on the name
@@ -476,7 +474,6 @@ pub struct Pool {
 
 /// One named external datastore grant (#167) — see [`Pool::datastores`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct DatastoreGrant {
     /// Matches the name the plugin's `capabilities()` declares for this
     /// datastore.
@@ -503,7 +500,6 @@ impl Pool {
 
 /// One step of the repeating pattern template.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct PatternStep {
     /// Name of the [`Pool`] this step draws from.
     pub pool: String,
@@ -749,10 +745,24 @@ on_short: short
         assert_eq!(effective.separate_gap(), 2);
     }
 
+    /// An unknown pool key parses rather than failing the channel, and
+    /// is reported by name so the misspelling stays visible. `selekt` is the
+    /// case that matters: it reads as `select` being unset, so the pool quietly
+    /// takes the `round_robin` default instead of the `random` that was
+    /// written — which is why `config::load` logs every ignored key against the
+    /// file it came from.
     #[test]
-    fn rejects_an_unknown_pool_field() {
+    fn an_unknown_pool_field_is_ignored_and_named() {
         let yaml = "name: shows\nexpr: 'x'\nselekt: random\n";
-        assert!(serde_norway::from_str::<Pool>(yaml).is_err());
+        let pool: Pool =
+            serde_norway::from_str(yaml).expect("an unknown key must not fail the channel");
+        assert_eq!(pool.select, Select::RoundRobin, "selekt set nothing");
+
+        let mut ignored = Vec::new();
+        let de = serde_norway::Deserializer::from_str(yaml);
+        let _: Pool = serde_ignored::deserialize(de, |p| ignored.push(p.to_string()))
+            .expect("parses with the key reported");
+        assert_eq!(ignored, vec!["selekt".to_string()]);
     }
 
     /// The channel YAML parses straight into the carrier type with no

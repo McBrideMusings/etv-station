@@ -8,7 +8,6 @@ use super::rule::RuleConfig;
 use crate::tautulli::HistoryScope;
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
     /// Optional channel identity override. When unset, the channel's identity
     /// is its config file's stem (e.g. `diehard.yaml` -> `diehard`). The
@@ -182,7 +181,6 @@ pub struct ChannelOverlayConfig {
 
 /// What a scorer plugin is told about, per channel.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ScoringConfig {
     /// How many recently-aired entries the plugin sees in `ctx.recent`. This is
     /// the window a script suppresses repeats over, so it belongs to the

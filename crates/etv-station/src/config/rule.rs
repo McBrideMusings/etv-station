@@ -28,7 +28,6 @@ pub struct RuleConfig {
 /// into `program` / `duplicates` / `entries` and `block` is cleared, so all
 /// consumers downstream of load see a normalized inline shape.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct BlockInclude {
     /// Path form: a reusable block file, relative to the channel file.
     #[serde(default, skip_serializing_if = "Option::is_none")]

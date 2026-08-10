@@ -59,7 +59,15 @@ fn main() -> ExitCode {
         return list_folders(&cli.config);
     }
 
+    // Tracing comes up before this one, unlike `--list-folders` above: the
+    // container entrypoint runs `--render-etv-next` on every start, and config
+    // loading now *warns* about a key it does not recognise rather than
+    // refusing the file. Without a subscriber that warning goes nowhere, so the
+    // one path a rollback actually takes would drop a key in silence. Rendering
+    // writes files rather than a machine-parsed list, so nothing here is
+    // reading its stdout.
     if let Some(dir) = cli.render_etv_next.as_deref() {
+        init_tracing(cli.log_format);
         return render_etv_next(&cli.config, dir);
     }
 

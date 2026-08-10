@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 /// when it satisfies every field that is set (see `resolve::apply_filter`,
 /// #197).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct Filter {
     /// Restrict to these season numbers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,8 +53,19 @@ mod tests {
         assert!(h.filter.is_empty());
     }
 
+    /// An unknown key parses rather than failing the file, and is
+    /// reported by name so a misspelling is still visible. The reporting is
+    /// `config::load`'s job — this proves the type no longer refuses.
     #[test]
-    fn rejects_unknown_field() {
-        assert!(toml::from_str::<Holder>("[filter]\nbogus = 1").is_err());
+    fn an_unknown_field_is_ignored_and_named() {
+        let holder: Holder =
+            toml::from_str("[filter]\nbogus = 1").expect("an unknown key must not fail the file");
+        assert!(holder.filter.is_empty(), "the unknown key set nothing");
+
+        let mut ignored = Vec::new();
+        let de = toml::Deserializer::new("[filter]\nbogus = 1");
+        let _: Holder =
+            serde_ignored::deserialize(de, |p| ignored.push(p.to_string())).expect("parses");
+        assert_eq!(ignored, vec!["filter.bogus".to_string()]);
     }
 }

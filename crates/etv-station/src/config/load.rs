@@ -382,6 +382,24 @@ pub fn read_channel(path: &Path) -> Result<ChannelConfig, ConfigError> {
 /// by extension: `.yaml`/`.yml` parse as YAML (`serde_norway`), everything else
 /// as TOML. The station, channel, and block serde types are format-agnostic, so
 /// the same file authored in either format produces identical output.
+///
+/// A key the types do not know is **reported, not refused**. The config
+/// types carried `#[serde(deny_unknown_fields)]` until a rollback proved what
+/// that costs: channel configs live in a bind-mounted volume that outlives the
+/// container, the parser that reads them ships inside the image, so rolling the
+/// image back to before a field was added left a newer config in front of an
+/// older parser. It refused every start — 11 crashloops — over `attribution:
+/// true`, a key the running image had understood minutes earlier. Any rollback
+/// across a config-schema addition failed the same way, which made the rollback
+/// path useless at exactly the moment it was reached for.
+///
+/// The reason for the old strictness is still real: a misspelled key that reads
+/// as a default airs the wrong thing and says nothing. So the key is not
+/// silently dropped — every unrecognised path is logged by name, against the
+/// file it came from, through the one funnel every config file already passes
+/// through. `serde_ignored` collects those paths from the deserializer itself,
+/// so nothing here keeps a second list of field names that could drift from the
+/// structs.
 fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
     let is_yaml = path
         .extension()
@@ -391,17 +409,38 @@ fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Co
         path: path.to_path_buf(),
         source,
     })?;
-    if is_yaml {
-        serde_norway::from_str(&contents).map_err(|source| ConfigError::ParseYaml {
-            path: path.to_path_buf(),
-            source,
-        })
+
+    let mut ignored: Vec<String> = Vec::new();
+    let parsed = if is_yaml {
+        let de = serde_norway::Deserializer::from_str(&contents);
+        serde_ignored::deserialize(de, |p| ignored.push(p.to_string())).map_err(|source| {
+            ConfigError::ParseYaml {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?
     } else {
-        toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })
+        let de = toml::Deserializer::new(&contents);
+        serde_ignored::deserialize(de, |p| ignored.push(p.to_string())).map_err(|source| {
+            ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?
+    };
+
+    if !ignored.is_empty() {
+        tracing::warn!(
+            event = "config.unknown_keys",
+            path = %path.display(),
+            keys = %ignored.join(", "),
+            "config keys this build does not know; they were ignored. A typo reads \
+             as the field being unset, so check the spelling if the channel does \
+             not behave as written"
+        );
     }
+
+    Ok(parsed)
 }
 
 #[cfg(test)]

@@ -104,7 +104,6 @@ impl Serialize for NoRepeatWithin {
 /// # no_repeat_within = "24h"  # or wall-clock time (#185)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Constraints {
     /// The same `entry_id` may not recur within N positions, or within a span
     /// of wall-clock time — see [`NoRepeatWithin`]. Absent leaves the block
@@ -268,8 +267,20 @@ mod tests {
         assert_eq!(c.reach(), 4);
     }
 
+    /// An unknown key parses rather than failing the file, and is
+    /// reported by name so a misspelling is still visible. `separate_bye` is
+    /// the misspelling that matters here: it reads as `separate_by` being
+    /// unset, so the spacing rule it was meant to set simply does not apply.
     #[test]
-    fn rejects_unknown_field() {
-        assert!(toml::from_str::<Constraints>("separate_bye = \"cast\"").is_err());
+    fn an_unknown_field_is_ignored_and_named() {
+        let parsed: Constraints = toml::from_str("separate_bye = \"cast\"")
+            .expect("an unknown key must not fail the file");
+        assert_eq!(parsed, Constraints::default());
+
+        let mut ignored = Vec::new();
+        let de = toml::Deserializer::new("separate_bye = \"cast\"");
+        let _: Constraints =
+            serde_ignored::deserialize(de, |p| ignored.push(p.to_string())).expect("parses");
+        assert_eq!(ignored, vec!["separate_bye".to_string()]);
     }
 }
