@@ -642,14 +642,55 @@ fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
     Some((ns, value.to_string()))
 }
 
+/// The agent Plex reports for a section it matches against nothing — its
+/// **Other Videos** library type, and a Movies library switched to the
+/// personal-media agent, both land here. See [`section_kind_override`].
+const NO_METADATA_AGENT: &str = "tv.plex.agents.none";
+
+/// The catalog `type` this station gives a video Plex files under no metadata
+/// agent (#214).
+///
+/// The same word ErsatzTV uses for the same idea — its search surface has
+/// `other_video` as a media kind of its own alongside `movie` and `episode`
+/// (<https://ersatztv.org/docs/search/>) — rather than a second vocabulary for
+/// a project this one is pinned to by submodule.
+pub const OTHER_VIDEO: &str = "other_video";
+
+/// The `type` items from `section` should carry, when it differs from the one
+/// Plex reports per item. `None` keeps whatever the item said.
+///
+/// **A Plex "Other Videos" library reports itself as a movie library.** Its
+/// section `type` is `movie` and every item inside reports `type="movie"`,
+/// which is how a Concerts section of 1,047 concert rips and a Power Hours
+/// section of 28 party videos became candidates for anything asking
+/// `item.type == "movie"` — a general movie channel, a genre channel, a taste
+/// scorer. Nothing in the item payload distinguishes them; the section's
+/// *agent* does, and it is the only thing that does.
+///
+/// So a movie-type section matched against no agent yields
+/// [`OTHER_VIDEO`] items instead of movies. Gated on the section being
+/// movie-type because the same agent on a *show* library means personal TV,
+/// whose items are episodes and should stay episodes.
+fn section_kind_override(section: &SectionEntry) -> Option<&'static str> {
+    let is_movie_section = section.kind.as_deref() == Some("movie");
+    let unmatched = section.agent.as_deref() == Some(NO_METADATA_AGENT);
+    (is_movie_section && unmatched).then_some(OTHER_VIDEO)
+}
+
 /// Convert one Plex metadata record into a [`PlexItem`], applying `translate` to
 /// the file path. `library` is the title of the section the record was fetched
 /// from — the API's per-item payload does not carry it, so the caller walking
 /// the sections supplies it. Returns `None` for a record with no playable file
 /// part.
+///
+/// `kind_override` is [`section_kind_override`]'s answer for that same section
+/// (#214). It replaces the `movie` Plex reports for an item in an Other Videos
+/// library, and only that: an item the section says is anything else keeps its
+/// own kind, so an override can never turn an episode into something it is not.
 fn to_plex_item(
     m: &PlexMetadata,
     library: Option<&str>,
+    kind_override: Option<&str>,
     translate: impl Fn(&str) -> String,
 ) -> Option<PlexItem> {
     let raw_path = m.media.first()?.part.first()?.file.as_deref()?;
@@ -658,7 +699,11 @@ fn to_plex_item(
         .iter()
         .filter_map(|g| g.id.as_deref().and_then(parse_guid))
         .collect();
-    let kind = m.kind.clone().unwrap_or_else(|| "video".into());
+    let reported = m.kind.clone().unwrap_or_else(|| "video".into());
+    let kind = match kind_override {
+        Some(over) if reported == "movie" => over.to_string(),
+        _ => reported,
+    };
     // Season/episode belong to episodes; a movie carrying a stray `index` must
     // not land `episode = Some(n)`.
     let is_episode = kind == "episode";
@@ -891,9 +936,13 @@ impl PlexClient {
                     "items in this section have no updatedAt; reached via addedAt on delta, full sweep otherwise",
                 );
             }
+            // Worked out once per section rather than per item — it is a fact
+            // about the library, not about anything inside it (#214).
+            let kind_override = section_kind_override(section);
             for m in &resp.media_container.metadata {
-                if let Some(item) = to_plex_item(m, section.title.as_deref(), |p| self.translate(p))
-                {
+                if let Some(item) = to_plex_item(m, section.title.as_deref(), kind_override, |p| {
+                    self.translate(p)
+                }) {
                     items.push(item);
                 }
             }
@@ -1286,6 +1335,11 @@ struct SectionEntry {
     /// section yields as `entries.library`.
     #[serde(default)]
     title: Option<String>,
+    /// The metadata agent Plex matches this section against. The one thing
+    /// that distinguishes a library of films from a library of concert rips,
+    /// since both report `type = "movie"` — see [`section_kind_override`].
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[cfg(test)]
@@ -1576,7 +1630,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/Movies/Die Hard.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.replace("/media", "/data/media")).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.replace("/media", "/data/media")).unwrap();
         assert_eq!(item.playback_path, "/data/media/Movies/Die Hard.mkv");
         assert_eq!(
             item.external_ids,
@@ -1603,7 +1657,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/Movies/Die Hard.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.release_date, None);
     }
 
@@ -1618,7 +1672,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/lotr.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.edition.as_deref(), Some("Extended Edition"));
         assert_eq!(item.studio.as_deref(), Some("New Line Cinema"));
     }
@@ -1635,7 +1689,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.edition, None);
         assert_eq!(item.studio, None);
     }
@@ -1680,14 +1734,14 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, Some("4K Movies"), |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, Some("4K Movies"), None, |p| p.to_string()).unwrap();
         assert_eq!(item.library.as_deref(), Some("4K Movies"));
 
         // A section with no title (or a blank one) yields no library rather than
         // an empty string, so the merge never overwrites a real value with "".
-        let blank = to_plex_item(&m, Some("   "), |p| p.to_string()).unwrap();
+        let blank = to_plex_item(&m, Some("   "), None, |p| p.to_string()).unwrap();
         assert_eq!(blank.library, None);
-        let none = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let none = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(none.library, None);
     }
 
@@ -1706,6 +1760,169 @@ mod tests {
             .map(|s| s.title.as_deref())
             .collect();
         assert_eq!(titles, vec![Some("Movies"), Some("4K Movies"), None]);
+    }
+
+    /// The real shape of this server's four sections, verbatim from
+    /// `/library/sections`: two libraries of films and two Other Videos
+    /// libraries, and the *only* thing separating them is the agent (#214).
+    #[test]
+    fn a_movie_section_matched_against_no_agent_yields_other_videos() {
+        let json = r#"{"MediaContainer": {"Directory": [
+            {"key": "1", "type": "movie", "title": "Movies", "agent": "tv.plex.agents.movie"},
+            {"key": "2", "type": "show", "title": "TV Shows", "agent": "tv.plex.agents.series"},
+            {"key": "4", "type": "movie", "title": "Concerts", "agent": "tv.plex.agents.none"},
+            {"key": "3", "type": "movie", "title": "Power Hours", "agent": "tv.plex.agents.none"}
+        ]}}"#;
+        let resp: SectionListResp = serde_json::from_str(json).unwrap();
+        let overrides: Vec<Option<&str>> = resp
+            .media_container
+            .directory
+            .iter()
+            .map(section_kind_override)
+            .collect();
+        assert_eq!(
+            overrides,
+            vec![None, None, Some(OTHER_VIDEO), Some(OTHER_VIDEO)],
+            "only the two agent-less movie sections are retyped"
+        );
+    }
+
+    /// Personal TV is still television. The same agent on a `show` section
+    /// means the items are episodes, and an episode retyped to `other_video`
+    /// would drop out of every show channel on the station.
+    #[test]
+    fn a_show_section_with_no_agent_keeps_its_episodes() {
+        let json = r#"{"MediaContainer": {"Directory": [
+            {"key": "9", "type": "show", "title": "Home TV", "agent": "tv.plex.agents.none"}
+        ]}}"#;
+        let resp: SectionListResp = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            section_kind_override(&resp.media_container.directory[0]),
+            None
+        );
+    }
+
+    /// A section Plex reports no agent for at all keeps every item's own kind,
+    /// rather than a missing field silently retyping a whole library.
+    #[test]
+    fn a_section_with_no_agent_field_overrides_nothing() {
+        let json = r#"{"MediaContainer": {"Directory": [
+            {"key": "1", "type": "movie", "title": "Movies"}
+        ]}}"#;
+        let resp: SectionListResp = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            section_kind_override(&resp.media_container.directory[0]),
+            None
+        );
+    }
+
+    /// The override replaces the `movie` Plex reports for an Other Videos
+    /// item — the item payload says `type: "movie"` for a concert rip exactly
+    /// as it does for a feature, so this is the only place the difference can
+    /// be applied.
+    #[test]
+    fn the_section_override_retypes_a_movie_and_nothing_else() {
+        let film = r#"{
+            "ratingKey": "1",
+            "type": "movie",
+            "title": "Live at Wembley",
+            "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(film).unwrap();
+        let plain = to_plex_item(&m, Some("Concerts"), None, |p| p.to_string()).unwrap();
+        assert_eq!(plain.kind, "movie");
+        let retyped =
+            to_plex_item(&m, Some("Concerts"), Some(OTHER_VIDEO), |p| p.to_string()).unwrap();
+        assert_eq!(retyped.kind, OTHER_VIDEO);
+        assert_eq!(retyped.library.as_deref(), Some("Concerts"));
+
+        // An episode carries its own kind through untouched, so the override
+        // can never reach one even if a section somehow yielded it.
+        let ep = r#"{
+            "ratingKey": "2",
+            "type": "episode",
+            "title": "Pilot",
+            "index": 1,
+            "parentIndex": 1,
+            "Media": [{"Part": [{"file": "/media/e.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(ep).unwrap();
+        let item = to_plex_item(&m, Some("Home TV"), Some(OTHER_VIDEO), |p| p.to_string()).unwrap();
+        assert_eq!(item.kind, "episode");
+        assert_eq!(item.episode, Some(1));
+    }
+
+    /// The point of the whole change, at the surface an author writes against:
+    /// a query for movies returns the film and not the concert.
+    #[test]
+    fn a_query_for_movies_does_not_return_other_videos() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+
+        let mut film = movie("rk-f", "/data/media/m/f.mkv", &[(ExternalNs::Imdb, "tt-f")]);
+        film.library = Some("Movies".into());
+        let mut concert = movie("rk-c", "/data/media/c/c.mkv", &[(ExternalNs::Imdb, "tt-c")]);
+        concert.library = Some("Concerts".into());
+        concert.kind = OTHER_VIDEO.into();
+
+        ingest_items(&cat, &[film, concert], &roots).unwrap();
+
+        assert_eq!(
+            cat.resolve_query(r#"item.type == "movie""#).unwrap(),
+            vec!["imdb:tt-f".to_string()],
+            "the concert is no longer a movie"
+        );
+        assert_eq!(
+            cat.resolve_query(r#"item.type == "other_video""#).unwrap(),
+            vec!["imdb:tt-c".to_string()]
+        );
+        // The concert channel scopes by library and is unaffected either way.
+        assert_eq!(
+            cat.resolve_query(r#"item.library == "Concerts""#).unwrap(),
+            vec!["imdb:tt-c".to_string()]
+        );
+    }
+
+    /// Retyping a library must **move** its entries, not fork them. The whole
+    /// of #214 is a re-ingest that changes `type` for 1,075 files that are
+    /// otherwise untouched — same server, same rating keys, same paths — and
+    /// if that mints fresh ids the catalog keeps a stale `movie` row per file
+    /// and every play-history and resume row still points at the dead one.
+    #[test]
+    fn changing_an_items_type_keeps_its_entry_id() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+
+        let mut before = movie("rk-1", "/data/media/powerhours/ph.mp4", &[]);
+        before.library = Some("Power Hours".into());
+        ingest_items(&cat, &[before.clone()], &roots).unwrap();
+        let first = cat
+            .resolve_query(r#"item.library == "Power Hours""#)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+
+        let mut after = before;
+        after.kind = OTHER_VIDEO.into();
+        ingest_items(&cat, &[after], &roots).unwrap();
+
+        let all = cat
+            .resolve_query(r#"item.library == "Power Hours""#)
+            .unwrap();
+        assert_eq!(
+            all, first,
+            "the retype reused the id rather than minting one"
+        );
+        assert_eq!(
+            cat.entry(&first[0]).unwrap().unwrap().kind,
+            OTHER_VIDEO,
+            "and the row itself carries the new type"
+        );
+        assert!(
+            cat.resolve_query(r#"item.type == "movie""#)
+                .unwrap()
+                .is_empty(),
+            "no stale movie row is left behind"
+        );
     }
 
     /// Two movie libraries are indistinguishable by `type` alone — separating
@@ -1825,7 +2042,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.cast, vec!["Bruce Willis", "Alan Rickman"]);
         assert_eq!(item.directors, vec!["John McTiernan"]);
         assert_eq!(item.writers, vec!["Jeb Stuart"]);
@@ -1874,7 +2091,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/dbz/e.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.absolute_episode, Some(154));
         assert_eq!(item.season, Some(1));
         assert_eq!(item.episode, Some(1));
@@ -1892,7 +2109,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.absolute_episode, None);
     }
 
@@ -1914,7 +2131,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/burbs/e.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.show_rating_key.as_deref(), Some("157472"));
     }
 
@@ -1931,7 +2148,7 @@ mod tests {
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.show_rating_key, None);
     }
 
@@ -2466,7 +2683,7 @@ mod tests {
     fn item_without_a_file_part_is_skipped() {
         let json = r#"{"ratingKey": "1", "type": "movie", "title": "x", "Media": []}"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
-        assert!(to_plex_item(&m, None, |p| p.to_string()).is_none());
+        assert!(to_plex_item(&m, None, None, |p| p.to_string()).is_none());
     }
 
     /// Plex authors the whole tag set per namespace, so a re-ingest has to

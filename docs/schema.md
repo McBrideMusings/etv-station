@@ -124,7 +124,7 @@ take `==` only — the one comparison that reads as "has one of".
 |---|---|---|
 | `title` | string | |
 | `show` | string | the series name on an episode |
-| `type` | string | `movie`, `episode`, `bumper`, … |
+| `type` | string | `movie`, `episode`, `other_video`, `bumper`, … |
 | `content_rating` | string | |
 | `edition` | string | empty = theatrical |
 | `studio` | string | one production company |
@@ -142,6 +142,32 @@ take `==` only — the one comparison that reads as "has one of".
 | `source` | membership | `item.source == "plex"` |
 | `collections` | membership | by collection name |
 | `fs_dir` | membership | `item.fs_dir == "bumpers"` — the folder a file sits in |
+
+`type` says what the item *is*; `library` says which shelf it sits on. They are
+separate questions and the schema keeps them separate — which matters most for
+**`other_video`** (#214).
+
+A Plex **Other Videos** library reports itself as a movie library: its section
+`type` is `movie` and every item inside reports `type = "movie"`, whether it
+holds feature films, concert recordings, or home videos. Taken at face value
+that makes `item.type == "movie"` match a concert rip and a home video, which is
+not what any channel asking for movies means. So the ingester reads the
+section's metadata *agent* — the only thing that distinguishes them — and gives
+every item from a movie-type library matched against no agent
+(`tv.plex.agents.none`) the type `other_video` instead:
+
+```yaml
+query: 'item.type == "movie"'          # feature films only
+query: 'item.type == "other_video"'    # concerts, home videos, party clips
+query: 'item.library == "Concerts"'    # one such library by name
+```
+
+The same word ErsatzTV uses for the same idea — its search surface has
+`other_video` as a media kind alongside `movie` and `episode`. The consequence
+to know: `item.type` is this station's vocabulary derived from Plex's, not a
+passthrough of Plex's own `type` attribute. A `show`-type library matched
+against no agent is *personal TV* and keeps its episodes, so `other_video` never
+swallows something a show channel needs.
 
 `library` is what scopes a channel to one library when a server keeps several:
 `item.library == "4K Movies"` selects that library and excludes "Movies" and
@@ -578,7 +604,7 @@ pools:
   - name: movies
     plugin: "../plugins/taste-engine.rhai"
     sources:
-      movies: 'item.type == "movie" && item.library != "Concerts"'
+      movies: 'item.type == "movie" && item.library == "4K Movies"'
     capabilities: [catalog_read, watch_history]
 ```
 
@@ -588,15 +614,21 @@ table **replaces** the script's `sources()` wholesale — that function is not
 called at all — on the same terms as a pool's `constraints` replacing the
 block's: what the pool wrote is the whole list of what it offers its scorer.
 
-This is what lets a channel say which library a taste pool draws from without
-editing the script. `taste-engine.rhai` declares `item.type == "movie"`, which
-is every movie-type Plex library on the server — a Concerts section and a Power
-Hours section included, each of which may already have its own channel. The
-script cannot narrow that for one channel without narrowing it for every channel
-pointed at it, and which libraries a station has is a fact about the station, not
-about how taste is computed. Picking the candidates is the config's half
-everywhere else (`expr`, `groups`); this is that half restored for a plugin pool,
-leaving the script the ranking (ADR 0002).
+This is what lets a channel say which slice of the library a taste pool draws
+from without editing the script. `taste-engine.rhai` declares
+`item.type == "movie"`, which spans every movie library on the server; a channel
+that should only surface one of them cannot say so any other way. The script
+cannot narrow it for one channel without narrowing it for every channel pointed
+at it, and which libraries a station keeps is a fact about the station, not about
+how taste is computed. Picking the candidates is the config's half everywhere
+else (`expr`, `groups`); this is that half restored for a plugin pool, leaving
+the script the ranking (ADR 0002).
+
+Reach for it when the narrowing really is station-specific. It is the wrong tool
+for a distinction the catalog should be drawing itself: concerts and home videos
+were once excluded here by name, and the fix was to stop calling them movies
+(#214, see [`type` above](#item-fields)), not to repeat an exclusion list in
+every query.
 
 The set **names** belong to the script, not to the schema: nothing checks that a
 name means anything to it, and one it does not recognise simply arrives as
