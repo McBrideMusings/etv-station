@@ -94,6 +94,13 @@ use crate::resume::{GenerationState, PoolResume};
 /// — it is bounded by the pools' own sizes.
 pub const MAX_CYCLES: usize = 10_000;
 
+/// Upper bound on an explicitly-authored `take` — a pattern step's own count
+/// and a plugin's per-entry override (#173) alike, since both feed the same
+/// `Vec::with_capacity(take)` in [`PoolRuntime::serve`]. `take = "all"` needs
+/// no cap — it is resolved from the series a visit picked, so it is bounded by
+/// the pools' own sizes rather than by anything an author or a script typed.
+pub const MAX_TAKE: usize = 10_000;
+
 /// How many times a constrained `select = "random"` pool redraws before giving
 /// up and walking the rotation instead. A constraint blocks at most `reach`
 /// series, so on any pool bigger than that a handful of draws finds a free one;

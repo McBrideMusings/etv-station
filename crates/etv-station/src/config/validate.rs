@@ -9,7 +9,7 @@ use super::pool::{Pool, Rotate, ShowGroup, Take, TakeFrom};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
-use crate::pattern::MAX_CYCLES;
+use crate::pattern::{MAX_CYCLES, MAX_TAKE};
 
 pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(), ConfigError> {
     if station.channels.is_empty() {
@@ -357,8 +357,16 @@ fn validate_pattern_block<'a>(
                 step.pool
             )));
         }
-        if step.take == Take::Count(0) {
-            return Err(bad(format!("pattern step #{step_idx} has take = 0")));
+        if let Take::Count(n) = step.take {
+            if n == 0 {
+                return Err(bad(format!("pattern step #{step_idx} has take = 0")));
+            }
+            if n > MAX_TAKE {
+                return Err(bad(format!(
+                    "pattern step #{step_idx} has take = {n}, which exceeds the maximum of \
+                     {MAX_TAKE}"
+                )));
+            }
         }
         // `all` empties the bucket the visit picked, and `rotate = "slot"` picks
         // a new bucket for every single item — so there is no one bucket for
@@ -1329,6 +1337,16 @@ mod tests {
         b.pattern[0].chance = 1.5;
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("chance"), "err = {err}");
+    }
+
+    /// A `take` past `MAX_TAKE` would otherwise reach `Vec::with_capacity(take)`
+    /// in the pattern draw — an allocation Rust aborts the whole daemon over
+    /// rather than returning an error (#202).
+    #[test]
+    fn rejects_take_past_the_maximum() {
+        let b = pattern_block(vec![pool("movies")], vec![step("movies", MAX_TAKE + 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(format!("{err}").contains("maximum"), "err = {err}");
     }
 
     /// `all` empties the series a visit picked; `rotate = "slot"` picks a new
