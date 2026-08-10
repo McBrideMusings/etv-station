@@ -642,6 +642,38 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Whether every requested entry is catalog type `"episode"`.
+    ///
+    /// Read by the resolve pipeline (#95) to decide whether a block's
+    /// resolved set gets the injected `(season, episode)` default order when
+    /// the author wrote no `order` at all. An id absent from the catalog —
+    /// an inline item, never ingested — counts as not-episode, on the same
+    /// terms as a row of a different type: a set containing one is not
+    /// wholly episode-typed and keeps today's authored-order behavior. An
+    /// empty request is vacuously not episode-typed, since there is nothing
+    /// to default order over.
+    pub fn all_episode_type(&self, entry_ids: &[String]) -> Result<bool, CatalogError> {
+        if entry_ids.is_empty() {
+            return Ok(false);
+        }
+        for chunk in entry_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT COUNT(*) FROM entries \
+                 WHERE type = 'episode' AND entry_id IN ({placeholders})"
+            );
+            let count: i64 =
+                self.conn
+                    .query_row(&sql, rusqlite::params_from_iter(chunk.iter()), |r| r.get(0))?;
+            if count as usize != chunk.len() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Every entry id, ascending — a stable enumeration for callers that scan.
     pub fn all_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])
@@ -1199,8 +1231,72 @@ mod tests {
     }
 
     #[test]
+    fn all_episode_type_is_true_only_when_every_id_is_an_episode() {
+        let c = cat();
+        c.upsert_entry(&Entry::new(
+            "ep1",
+            "episode",
+            "Winter Is Coming",
+            Source::Plex,
+        ))
+        .unwrap();
+        c.upsert_entry(&Entry::new("ep2", "episode", "The Kingsroad", Source::Plex))
+            .unwrap();
+        c.upsert_entry(&Entry::new("mov1", "movie", "Inception", Source::Plex))
+            .unwrap();
+
+        assert!(
+            c.all_episode_type(&["ep1".to_string(), "ep2".to_string()])
+                .unwrap(),
+            "a set of only episodes must be episode-typed"
+        );
+        assert!(
+            !c.all_episode_type(&["ep1".to_string(), "mov1".to_string()])
+                .unwrap(),
+            "a mixed set must not be episode-typed"
+        );
+        assert!(
+            !c.all_episode_type(&["ep1".to_string(), "missing".to_string()])
+                .unwrap(),
+            "an id absent from the catalog (an inline item) must not be episode-typed"
+        );
+        assert!(
+            !c.all_episode_type(&[]).unwrap(),
+            "an empty set is vacuously not episode-typed"
+        );
+    }
+
+    #[test]
     fn episode_ids_for_shows_handles_an_empty_request() {
         let c = cat();
         assert!(c.episode_ids_for_shows(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_episode_type_handles_large_batches() {
+        let c = cat();
+        let mut ids = Vec::new();
+        for n in 0..1200 {
+            let id = format!("ep{n}");
+            c.upsert_entry(&Entry::new(
+                &id,
+                "episode",
+                format!("Episode {n}"),
+                Source::Plex,
+            ))
+            .unwrap();
+            ids.push(id);
+        }
+        assert!(c.all_episode_type(&ids).unwrap());
+        // One movie past the 500-id chunk boundary flips the whole result.
+        ids.push("not-episode".to_string());
+        c.upsert_entry(&Entry::new(
+            "not-episode",
+            "movie",
+            "Odd One Out",
+            Source::Plex,
+        ))
+        .unwrap();
+        assert!(!c.all_episode_type(&ids).unwrap());
     }
 }

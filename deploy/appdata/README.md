@@ -35,6 +35,13 @@ What the container supplies, so these files stay host-agnostic:
 | `ETV_HLS_OUTPUT` | `/data/hls` | ETV-next's HLS working set |
 | `ETV_PORT` | `8409` | the port the lineup, `channels.m3u`, and `xmltv.xml` are served on |
 
+Under `ETV_STATION_OUTPUT_BASE` the daemon also keeps `history.db` — the
+play-history ledger, one sqlite database shared by every channel (#111).
+Unlike `catalog.db` it is **not** a rebuildable cache: it is the only record
+of what each channel has aired, migrated once from each channel's old
+`.history` file and appended to ever since. Back it up with the rest of the
+data volume; deleting it loses every channel's resume position.
+
 Media roots (`ETV_STATION_SOURCE_ROOTS`), Plex credentials (`PLEX_URL`,
 `PLEX_TOKEN`), and Tautulli credentials (`TAUTULLI_URL`, `TAUTULLI_API_KEY`)
 are per-host, so they come from the container's environment rather than from

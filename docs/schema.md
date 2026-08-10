@@ -32,6 +32,7 @@ flat list of entries. Source: `config/block.rs` (`BlockFile`).
 | `program` | no | [`ProgramMetadata`](#programmetadata) — block-wide defaults |
 | `duplicates` | no — default `collapse` | `collapse` \| `keep` |
 | `entries` | **yes** | list of [`Entry`](#entry) |
+| `fallback` | no | [`Fallback`](#fallback) — resolved instead of `entries` when `entries` resolves to nothing |
 
 ```yaml
 # blocks/starwars-timeline.yaml
@@ -198,7 +199,7 @@ collection as a set to filter or shuffle — use a `query` entry with
 |---|---|---|
 | `block` | **yes** | path to another block file |
 | `mode` | no — default `all` | [`Mode`](#mode) |
-| `order` | no — default `manual` | [`Order`](#order) |
+| `order` | no — unset takes the episode default (#95); see [`Order`](#order) |
 | `filter` | no | [`Filter`](#filter) |
 
 ```yaml
@@ -266,9 +267,18 @@ A string. Source: `config/order.rs`.
 
 | Value | Meaning |
 |---|---|
-| `manual` *(default)* | keep authored order |
+| `manual` | keep authored order |
 | `random` | shuffle (seeded by the channel `seed`) |
 | `field:dir,...` | sort by one or more fields; `dir` is `asc` or `desc` |
+
+`order` itself is optional everywhere it appears, and an **unset** `order` is
+not the same as an authored `manual` (#95): a
+[block include's or `kind: include`'s](#composing-blocks-—-rule-blocks) `order`
+left unset resolves to `season:asc,episode:asc` when every item the block
+resolved is catalog type `episode`, and to authored order otherwise — an
+author who writes `order: "manual"` explicitly always keeps authored order,
+regardless of item type. A `query` entry's or pool's `order` left unset simply
+applies no sort, leaving the catalog's or plugin's own order.
 
 Every value is computable from the items being ordered. Two former values were
 not, and are rejected by name at load rather than silently read as a field sort:
@@ -327,6 +337,53 @@ same physical file collapse regardless of how they entered the block. Source:
 |---|---|
 | `collapse` *(default)* | drop repeats of the same derived identity |
 | `keep` | keep every occurrence |
+
+### Fallback
+
+Resolved **instead of** a block's `entries` when `entries` resolves to nothing
+eligible — a 24/7 channel must not dead-air or error just because a query
+matched nothing this generation (an empty Plex collection surfaces here as a
+`query` that matches zero items). Optional and opt-in: a block with no
+`fallback` still resolves to empty exactly as it did before this field
+existed. Source: `config/entry.rs` (`Fallback`).
+
+Tagged by `kind`, same as [`Entry`](#entry) — two kinds:
+
+| `kind` | Fields |
+|---|---|
+| `query` | same as [`kind: query`](#kind-query-—-resolve-against-the-catalog): `query` (**yes**), `order` (no) |
+| `item` | same as [`kind: item`](#kind-item-—-an-authored-file): `source` (**yes**), `in_point` / `out_point` / `program` (no) |
+
+```yaml
+entries:
+  - kind: query
+    query: 'item.collections.contains("Now Airing")'
+fallback:
+  kind: query
+  query: 'item.type == "movie"'
+  order: "random"
+```
+
+```yaml
+entries:
+  - kind: query
+    query: 'item.collections.contains("Now Airing")'
+fallback:
+  kind: item
+  source:
+    kind: local
+    path: "${ETV_TEST_MEDIA_DIR}/standby/please-stand-by.mkv"
+```
+
+The fallback resolves through the exact same code path as a primary entry —
+`kind: query` runs the same CEL grammar and carries its own `order`, exactly
+like a primary query entry; `kind: item` resolves exactly like a primary item
+entry (always exactly one item). Once resolved, it goes through the block's
+own `duplicates` / `order` / `mode` exactly like `entries`' output would.
+
+Entries-block only: a pattern block (`pools` + `pattern`) already gives each
+pool its own empty-pool policy via `on_short`, so a pattern block declaring
+`fallback` is rejected at load.
 
 ## Station file
 
@@ -434,10 +491,10 @@ rule:
 ```
 
 The two forms are interchangeable: at load, a referenced file's body
-(`program` / `duplicates` / `entries`) is copied into the include, so a
-reference and an equivalent inline block resolve identically. `mode`, `order`,
-and `filter` are **composition fields on the include** — they never live in the
-block file body.
+(`program` / `duplicates` / `entries` / `fallback`) is copied into the include,
+so a reference and an equivalent inline block resolve identically. `mode`,
+`order`, and `filter` are **composition fields on the include** — they never
+live in the block file body.
 
 ### Pool `plugin` — items chosen by a scorer script
 
@@ -818,6 +875,37 @@ pools:
   - name: jackie
     expr: 'item.cast.contains("Jackie Chan")'
 ```
+
+**`no_repeat_within` has two spellings, and they mean different things.** A bare
+number (`no_repeat_within: 3`) is **positional** — three list positions (on a
+pool, three of that pool's own draws), full stop, whatever runs in between. A
+quoted duration (`no_repeat_within: "24h"`) is **temporal** — the same
+`entry_id` may not recur within that much wall-clock time, measured against the
+emitted schedule's item runtimes rather than counted as items. `separate_by` /
+`separate_min_gap` stay positional only; #185 gave the temporal spelling to
+`no_repeat_within` alone.
+
+The positional spelling means what it says on a uniform pool — a show whose
+episodes all run the same length — where ten positions is also a fixed span of
+time. It stops meaning that on a pool mixing durations: 22-minute episodes and
+3-hour films in one pool give `no_repeat_within: 10` a real span anywhere from
+three and a half hours to thirty, decided by whatever gets drawn. "Not twice in
+a day" wants the temporal spelling instead:
+
+```yaml
+pools:
+  - name: mixed
+    expr: 'item.type == "movie" || item.type == "episode"'
+    constraints:
+      no_repeat_within: "24h"   # not twice in a 24-hour span, however that plays out in items
+```
+
+The temporal form is measured against each item's *estimated* runtime — the
+same catalog-derived estimate (falling back to the mean of what is known, then
+the channel's nominal item length) the station already uses to size a
+generation — not a value probed to the second. It holds across the generation
+seam the same way the positional form does, via the play-history ledger's
+tail.
 
 **The pattern's shape cannot move.** A pass over the finished list knows item ids
 and gaps and nothing else — in particular not which pattern step an item came

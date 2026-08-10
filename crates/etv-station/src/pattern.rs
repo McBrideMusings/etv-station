@@ -75,10 +75,10 @@ use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{
-    Advance, Constraints, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, ShowGroup, Take,
-    TakeFrom,
+    Advance, Constraints, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate, Select,
+    ShowGroup, Take, TakeFrom,
 };
-use crate::constrain::{ItemKeys, Limits, order_constrained};
+use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
 use crate::resume::{GenerationState, PoolResume};
 
 /// Upper bound on an explicitly-authored `cycles`. A derived count needs no cap
@@ -126,11 +126,15 @@ impl Series {
 }
 
 /// Every id this pool can draw, paired with the values of the field it
-/// separates on. Empty when nothing is being separated on — the common case,
-/// where the adjacency rule is identity only and no catalog lookup is needed.
+/// separates on, and — when a temporal `no_repeat_within` needs it (#185) —
+/// its estimated runtime. `groups` is empty when nothing is being separated
+/// on and `durations`/`mean_duration` are empty/zero when nothing here is
+/// measured in time, so the common case needs no catalog lookup for either.
 #[derive(Debug, Default)]
 struct PoolKeys {
     groups: HashMap<String, Vec<String>>,
+    durations: HashMap<String, Duration>,
+    mean_duration: Duration,
 }
 
 impl PoolKeys {
@@ -138,6 +142,11 @@ impl PoolKeys {
         ItemKeys {
             id: id.to_string(),
             group: self.groups.get(id).cloned().unwrap_or_default(),
+            duration: self
+                .durations
+                .get(id)
+                .copied()
+                .unwrap_or(self.mean_duration),
         }
     }
 
@@ -303,15 +312,17 @@ impl PoolRuntime<'_> {
     /// same visit sees it — a visit's filler must not replay what the visit
     /// itself just aired.
     fn remember(&mut self, ids: &[String]) {
-        let reach = self.limits.reach();
-        if reach == 0 || ids.is_empty() {
+        if self.limits.is_unconstrained() || ids.is_empty() {
             return;
         }
         let fresh = self.keys.many(ids);
         self.recent.extend(fresh);
-        if self.recent.len() > reach {
-            self.recent.drain(..self.recent.len() - reach);
-        }
+        // Trim to exactly what a conflict check could still reach — on
+        // whichever axis, positions or elapsed time (#185) — so a long
+        // generation does not grow this window without bound.
+        let keep = crate::constrain::history_needed(&self.recent, self.limits);
+        let cut = self.recent.len() - keep;
+        self.recent.drain(..cut);
     }
 
     /// Take up to `want` items from `si`, advancing its cursor. A series that
@@ -837,11 +848,27 @@ fn pool_runtime<'a>(
     // never reordered: the list order below, and the draw-time eligibility check
     // in `serve` that this seeds `recent` for.
     let constraints = cfg.constraints(block_constraints);
+    let no_repeat = match constraints.no_repeat_gap() {
+        NoRepeatWithin::Positions(n) => RepeatGap::Positions(n),
+        NoRepeatWithin::Duration(d) => RepeatGap::Duration(d),
+    };
     let limits = Limits {
-        no_repeat: constraints.no_repeat_gap(),
+        no_repeat,
         separate: constraints.separate_gap(),
     };
-    let keys = pool_keys(catalog, &ids, constraints.separate_by.as_deref(), &cfg.name)?;
+    // A temporal `no_repeat_within` (#185) needs runtimes to measure distance
+    // in time even when nothing else here does — the list pass below reads
+    // them through `keys`, before `want_runtimes` would otherwise ask for
+    // them.
+    let want_runtimes = want_runtimes || matches!(limits.no_repeat, RepeatGap::Duration(_));
+    let (pool_durations, mean_duration) = if want_runtimes {
+        pool_runtimes(catalog, &ids)?
+    } else {
+        (HashMap::new(), Duration::ZERO)
+    };
+    let mut keys = pool_keys(catalog, &ids, constraints.separate_by.as_deref(), &cfg.name)?;
+    keys.durations = pool_durations.clone();
+    keys.mean_duration = mean_duration;
     // What this pool aired most recently: the channel's tail, narrowed to items
     // this pool could have supplied. Same projection the list pass reads, and
     // it carries the same cross-pool blindness — an id two pools share cannot be
@@ -940,12 +967,6 @@ fn pool_runtime<'a>(
             .collect();
     }
 
-    let (runtimes, mean_runtime) = if want_runtimes {
-        pool_runtimes(catalog, &series)?
-    } else {
-        (HashMap::new(), Duration::ZERO)
-    };
-
     let mut rt = PoolRuntime {
         cfg,
         series,
@@ -954,8 +975,8 @@ fn pool_runtime<'a>(
         keys,
         recent: Vec::new(),
         forced: 0,
-        runtimes,
-        mean_runtime,
+        runtimes: pool_durations,
+        mean_runtime: mean_duration,
     };
     // Seeded through the same path a draw takes, so the window is trimmed to
     // `reach` by one rule rather than two.
@@ -1000,12 +1021,16 @@ fn pool_runtime<'a>(
 /// size a slot: a non-positive figure is not a runtime, and anything past a day
 /// is a stray factor of a thousand in somebody's metadata. Letting one through
 /// would tell the walk a single film covered the whole window.
+///
+/// Takes the pool's flat id list rather than its grouped [`Series`] — this now
+/// has to run before series grouping, so a temporal `no_repeat_within` (#185)
+/// has runtimes to measure by in the list pass too, not only the draw-time
+/// one.
 fn pool_runtimes(
     catalog: &Catalog,
-    series: &[Series],
+    ids: &[String],
 ) -> Result<(HashMap<String, Duration>, Duration), String> {
-    let ids: Vec<String> = series.iter().flat_map(|s| s.ids.iter().cloned()).collect();
-    let raw = catalog.durations_for(&ids).map_err(|e| e.to_string())?;
+    let raw = catalog.durations_for(ids).map_err(|e| e.to_string())?;
     let runtimes: HashMap<String, Duration> = raw
         .into_iter()
         .filter(|(_, ms)| *ms > 0 && *ms <= crate::resolve::MAX_CATALOG_DURATION_MS)
@@ -1093,7 +1118,10 @@ fn pool_keys(
             .map_err(|e| format!("pool {pool:?}: reading {field:?} for {id}: {e}"))?;
         groups.insert(id.clone(), values);
     }
-    Ok(PoolKeys { groups })
+    Ok(PoolKeys {
+        groups,
+        ..PoolKeys::default()
+    })
 }
 
 #[cfg(test)]
@@ -2397,7 +2425,15 @@ mod tests {
 
     fn no_repeat(n: usize) -> crate::config::Constraints {
         crate::config::Constraints {
-            no_repeat_within: Some(n),
+            no_repeat_within: Some(crate::config::NoRepeatWithin::Positions(n)),
+            separate_by: None,
+            separate_min_gap: None,
+        }
+    }
+
+    fn no_repeat_within(d: Duration) -> crate::config::Constraints {
+        crate::config::Constraints {
+            no_repeat_within: Some(crate::config::NoRepeatWithin::Duration(d)),
             separate_by: None,
             separate_min_gap: None,
         }
@@ -2456,6 +2492,84 @@ mod tests {
             sorted,
             vec!["mov-1", "mov-2", "mov-3"],
             "the pass reorders, it does not drop: {ids:?}"
+        );
+    }
+
+    /// The temporal spelling (#185) holds at the same seam the positional one
+    /// does: `catalog()`'s movies carry no recorded runtime, so every item
+    /// estimates at zero and a temporal gap of any span still treats the tail
+    /// as unexpired — the same outcome as the positional test above, reached
+    /// through the duration axis instead of the position one.
+    #[test]
+    fn a_temporal_pool_constraint_holds_across_the_generation_seam() {
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat_within(Duration::from_secs(3600)));
+        let ids = build_pools(
+            &[movies],
+            &[step("movies", 1)],
+            Some(3),
+            None,
+            &aired(&["mov-1"]),
+        );
+        assert_ne!(ids[0], "mov-1", "the seam repeats: {ids:?}");
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["mov-1", "mov-2", "mov-3"],
+            "the pass reorders, it does not drop: {ids:?}"
+        );
+    }
+
+    /// Three movies where `mov-1` alone runs three hours; `mov-2`/`mov-3` are
+    /// unmeasured, same as everywhere else `catalog()` leaves duration blank.
+    fn movies_with_a_long_one() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        let add = |id: &str, duration_ms: Option<i64>| {
+            let mut e = CatEntry::new(id, "movie", format!("Title {id}"), Source::Plex);
+            e.duration_ms = duration_ms;
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        };
+        add("mov-1", Some(3 * 60 * 60 * 1000));
+        add("mov-2", None);
+        add("mov-3", None);
+        c
+    }
+
+    /// The exact case a positional `no_repeat_within` cannot express: the tail
+    /// item alone already covers the configured window, so — unlike
+    /// `no_repeat_within = 1`, which would forbid the very next position
+    /// regardless of how long that item ran — the same id may legally reopen
+    /// the list.
+    #[test]
+    fn a_temporal_gap_lets_the_seam_repeat_once_the_tail_item_alone_covers_it() {
+        let cat = movies_with_a_long_one();
+        let mut movies = movies_pool();
+        movies.constraints = Some(no_repeat_within(Duration::from_secs(90 * 60)));
+        let (ids, _) = build(
+            &cat,
+            &[movies],
+            &[],
+            &[step("movies", 1)],
+            Some(3),
+            None,
+            &aired(&["mov-1"]),
+            0,
+            test_env(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ids[0], "mov-1",
+            "the 3h tail item alone already covers a 90m window; the list was needlessly reordered: {ids:?}"
         );
     }
 

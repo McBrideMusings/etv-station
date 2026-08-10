@@ -24,10 +24,18 @@
 //! optional.
 //!
 //! Still rejected with a clear `unsupported` error (later issues): `include`
-//! entries, a non-empty block `filter`, and a block `fallback` (its schema is a
-//! follow-up). The catalog is not yet opened by the daemon — until that lands,
-//! query entries / non-`manual` order only resolve when a catalog is supplied
-//! (tests), and error at runtime.
+//! entries and a non-empty block `filter`. The catalog is not yet opened by
+//! the daemon — until that lands, query entries / non-`manual` order only
+//! resolve when a catalog is supplied (tests), and error at runtime.
+//!
+//! A block's optional `fallback` (#97) resolves **instead of** `entries` when
+//! `entries` resolves to nothing eligible — the empty-set case a 24/7 channel
+//! must not dead-air or error on. It runs through the exact same machinery as
+//! a primary entry (`resolve_query` / `resolve_item`), never a parallel path,
+//! and then through the block's own duplicates/order/mode exactly like a
+//! primary entry's result would. Entries-block only — a pattern block's pools
+//! already have their own empty-pool policy (`on_short`), so `fallback` is
+//! rejected there at validation.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -37,10 +45,10 @@ use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 
 use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, ItemEntry, Mode,
-    Order, QueryEntry, ShowGroup, SourceConfig,
+    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, Fallback,
+    ItemEntry, Mode, NoRepeatWithin, Order, QueryEntry, ShowGroup, SourceConfig,
 };
-use crate::constrain::{ItemKeys, Limits};
+use crate::constrain::{ItemKeys, Limits, RepeatGap};
 use crate::errors::ConfigError;
 use crate::resume::{GenerationState, ResumeMap};
 
@@ -165,6 +173,11 @@ pub fn resolve_channel_with_resume(
     // The field each block separates on, if any. Kept per block because two
     // blocks may separate on different fields.
     let mut separate_fields: Vec<Option<String>> = Vec::new();
+    // Each block's span in `out` (start, end, is_pattern) — what the window
+    // cut below needs to decide per block rather than once for the channel
+    // (#146): a pattern block already bounds itself inside `resolve_block`
+    // (#140), so only an entries block's own span still needs cutting here.
+    let mut block_spans: Vec<(usize, usize, bool)> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
         let block_items = resolve_block(
             include,
@@ -180,20 +193,26 @@ pub fn resolve_channel_with_resume(
             fill,
             &mut resume_out,
         )?;
+        let block_is_pattern = include.is_pattern();
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished
         // list would reorder the pattern's slots and destroy the shape the
         // pattern was written to build; its `[constraints]` table is the default
         // its pools inherit, not a rule over the block's output.
-        let c = if include.is_pattern() {
+        let c = if block_is_pattern {
             Constraints::default()
         } else {
             include.constraints()
         };
+        let no_repeat = match c.no_repeat_gap() {
+            NoRepeatWithin::Positions(n) => RepeatGap::Positions(n),
+            NoRepeatWithin::Duration(d) => RepeatGap::Duration(d),
+        };
+        let span_start = out.len();
         limits.resize(
             limits.len() + block_items.len(),
             Limits {
-                no_repeat: c.no_repeat_gap(),
+                no_repeat,
                 separate: c.separate_gap(),
             },
         );
@@ -202,14 +221,22 @@ pub fn resolve_channel_with_resume(
             c.separate_by.clone(),
         );
         out.extend(block_items);
+        block_spans.push((span_start, out.len(), block_is_pattern));
     }
 
-    // A channel with no pattern block is a flat authored list, played in a
-    // loop. Before the blocks are constrained, seat that list where the last
-    // generation left off and cut it to the airtime still wanted, so one
-    // generation covers the window instead of the whole list (#118) — a
-    // 950-item channel laid a month of playout in one pass and then sat idle
-    // for 29 days, during which an edit to its config changed nothing on air.
+    // An entries block is a flat authored list, played in a loop. Before the
+    // blocks are constrained, seat that list where the last generation left
+    // off and cut it to the airtime still wanted, so one generation covers
+    // the window instead of the whole list (#118) — a 950-item channel laid a
+    // month of playout in one pass and then sat idle for 29 days, during
+    // which an edit to its config changed nothing on air. A pattern block
+    // needs none of this — it already bounded itself to `fill` inside
+    // `resolve_block` (#140) — so this only ever touches an entries block's
+    // own span, decided per block rather than once for the whole channel
+    // (#146): a channel with one pattern block and one entries block used to
+    // skip this cut entirely on its entries half, because `is_pattern()` was
+    // answered once for the channel and any pattern block made it answer
+    // `true`.
     //
     // Cutting here rather than after emission is what keeps the cut lossless:
     // the adjacency pass below, and the ledger the daemon writes, both see
@@ -223,25 +250,67 @@ pub fn resolve_channel_with_resume(
     // sooner or later than it otherwise would. That is what an unseeded shuffle
     // already promises; what it gains is that a month of random schedule is no
     // longer decided a month in advance.
-    if !config.is_pattern() && !out.is_empty() {
-        let total = out.len();
-        let start = state.resume.position % total;
-        out.rotate_left(start);
-        limits.rotate_left(start);
-        separate_fields.rotate_left(start);
-
-        let laid = match fill {
-            Some(fill) => {
-                let runtimes = estimated_runtimes(&out, catalog, nominal_item_runtime(config));
-                items_covering(&runtimes, fill)
-            }
-            // The stateless entry point wants the list whole.
-            None => total,
-        };
-        out.truncate(laid);
-        limits.truncate(laid);
-        separate_fields.truncate(laid);
-        resume_out.position = (start + laid) % total;
+    let entries_spans: Vec<(usize, usize)> = block_spans
+        .iter()
+        .filter(|(_, _, is_pattern)| !is_pattern)
+        .map(|(start, end, _)| (*start, *end))
+        .collect();
+    let has_pattern_block = block_spans.iter().any(|(_, _, is_pattern)| *is_pattern);
+    if !entries_spans.is_empty() {
+        if !has_pattern_block {
+            // No pattern block in the channel: every item in `out` belongs to
+            // an entries block, so this is exactly #118's original whole-list
+            // cut — unchanged.
+            let whole = 0..out.len();
+            resume_out.position = cut_entries_window(
+                &mut out,
+                &mut limits,
+                &mut separate_fields,
+                whole,
+                state.resume.position,
+                fill,
+                catalog,
+                nominal_item_runtime(config),
+            );
+        } else if entries_spans.len() == 1 {
+            // Exactly one entries block shares the channel with pattern
+            // block(s): cut that block's own span in place, leaving the
+            // pattern blocks' already-bounded output untouched.
+            let (start, end) = entries_spans[0];
+            resume_out.position = cut_entries_window(
+                &mut out,
+                &mut limits,
+                &mut separate_fields,
+                start..end,
+                state.resume.position,
+                fill,
+                catalog,
+                nominal_item_runtime(config),
+            );
+        } else {
+            // Two or more entries blocks sharing a channel with a pattern
+            // block: #118 deliberately made `.resume.position` one cursor for
+            // the channel's whole entries list, not per block, because the
+            // adjacency pass below permutes the concatenated list and a
+            // per-block cursor would not survive it. That reasoning covers a
+            // channel with only entries blocks (they fuse into the one span
+            // above) — it does not say what a *fused* cursor spanning several
+            // non-contiguous entries spans should splice back to once a
+            // pattern block's span sits between them, and picking an answer
+            // here would be deciding new resume-position semantics rather
+            // than applying the two that already exist. Refuse rather than
+            // silently mis-schedule; see #190.
+            return Err(ConfigError::Unsupported {
+                path: path.to_path_buf(),
+                message: format!(
+                    "channel mixes a pattern block with {} entries blocks: cutting several \
+                     entries blocks to the window is only supported today when no pattern \
+                     block shares the channel (see #190 on resume-position semantics for a \
+                     fused multi-block cursor)",
+                    entries_spans.len()
+                ),
+            });
+        }
     }
 
     if out.is_empty() {
@@ -260,9 +329,22 @@ pub fn resolve_channel_with_resume(
     //    own list, so it reorders a settled sequence rather than fighting the
     //    order engine.
     if crate::constrain::any_constrained(&limits) {
+        // A temporal `no_repeat_within` (#185) needs to know how long each
+        // item runs to measure distance in time; a purely positional pass
+        // never reads it, so the catalog is only asked when something here is
+        // actually spelled as a duration.
+        let need_durations = limits
+            .iter()
+            .any(|l| matches!(l.no_repeat, RepeatGap::Duration(_)));
+        let out_durations: Vec<Duration> = if need_durations {
+            estimated_runtimes(&out, catalog, nominal_item_runtime(config))
+        } else {
+            Vec::new()
+        };
         let keys = adjacency_keys(
             &out.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
             &separate_fields,
+            &out_durations,
             catalog,
             path,
         )?;
@@ -271,9 +353,21 @@ pub fn resolve_channel_with_resume(
         // previous generation's own blocks are gone, so every tail item is read
         // under this channel's first separating field.
         let tail_field = separate_fields.iter().flatten().next().cloned();
+        let tail_durations: Vec<Duration> = if need_durations {
+            let estimated =
+                estimated_durations_for_ids(&state.tail, catalog, nominal_item_runtime(config));
+            state
+                .tail
+                .iter()
+                .map(|id| estimated.get(id).copied().unwrap_or_default())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let preceding = adjacency_keys(
             &state.tail,
             &vec![tail_field; state.tail.len()],
+            &tail_durations,
             catalog,
             path,
         )?;
@@ -341,24 +435,35 @@ fn validate_groups_against_catalog(
 }
 
 /// Build the per-item keys the adjacency pass compares: the `entry_id`, plus
-/// the values of whatever field that item's block separates on.
+/// Build the per-item keys the adjacency pass compares: the `entry_id`, the
+/// values of whatever field that item's block separates on, and — when
+/// `durations` has an entry for its position — its estimated runtime (#185).
 ///
 /// The field values come from the catalog's tags, read with the same vocabulary
 /// an expression uses — `separate_by: "cast"` reads exactly what `item.cast`
 /// reads. An item with no values for the field simply never triggers the
 /// separation, which is why a catalog-free channel can still use
-/// `no_repeat_within`.
+/// `no_repeat_within`. `durations` is empty whenever nothing here is measured
+/// in time, so a purely positional pass never pays for it and every item's
+/// duration is the zero it does not need.
 fn adjacency_keys(
     ids: &[String],
     separate_fields: &[Option<String>],
+    durations: &[Duration],
     catalog: Option<&Catalog>,
     path: &Path,
 ) -> Result<Vec<ItemKeys>, ConfigError> {
     ids.iter()
         .zip(separate_fields.iter())
-        .map(|(id, field)| {
+        .enumerate()
+        .map(|(i, (id, field))| {
+            let duration = durations.get(i).copied().unwrap_or_default();
             let Some(field) = field else {
-                return Ok(ItemKeys::new(id.clone()));
+                return Ok(ItemKeys {
+                    id: id.clone(),
+                    group: Vec::new(),
+                    duration,
+                });
             };
             let ns = TagNs::for_separate_by(field).map_err(|message| ConfigError::Validation {
                 path: path.to_path_buf(),
@@ -378,6 +483,7 @@ fn adjacency_keys(
                     path: path.to_path_buf(),
                     message: format!("reading {field:?} for {id}: {e}"),
                 })?,
+                duration,
             })
         })
         .collect()
@@ -456,6 +562,36 @@ fn estimated_runtimes(
     known.into_iter().map(|d| d.unwrap_or(stand_in)).collect()
 }
 
+/// [`estimated_runtimes`]'s fallback ladder, minus the top rung: the
+/// play-history tail (#185's seam) is bare `entry_id`s, not [`ResolvedItem`]s,
+/// so there is no in/out point or carried `catalog_duration` to read first —
+/// only the catalog's own record, the mean of what it has for these ids, and
+/// the channel's nominal length when it has none of them.
+fn estimated_durations_for_ids(
+    ids: &[String],
+    catalog: Option<&Catalog>,
+    nominal: Duration,
+) -> HashMap<String, Duration> {
+    let mut known: HashMap<String, Duration> = HashMap::new();
+    if let Some(cat) = catalog
+        && let Ok(raw) = cat.durations_for(ids)
+    {
+        for (id, ms) in raw {
+            if ms > 0 && ms <= MAX_CATALOG_DURATION_MS {
+                known.insert(id, Duration::from_millis(ms as u64));
+            }
+        }
+    }
+    let stand_in = if known.is_empty() {
+        nominal
+    } else {
+        known.values().sum::<Duration>() / known.len() as u32
+    };
+    ids.iter()
+        .map(|id| (id.clone(), known.get(id).copied().unwrap_or(stand_in)))
+        .collect()
+}
+
 /// How many items from the top it takes to cover `fill`.
 ///
 /// The item that crosses the boundary is included, so the window is covered
@@ -471,6 +607,61 @@ fn items_covering(runtimes: &[Duration], fill: Duration) -> usize {
         }
     }
     runtimes.len().max(1)
+}
+
+/// Rotate-and-cut one contiguous span of `items` (and its parallel `limits` /
+/// `separate_fields`) to seat it where the last generation left off and trim
+/// it to the airtime still wanted (#118) — used both for an entries-only
+/// channel's whole list and, per block, for a single entries block sharing a
+/// channel with pattern block(s) (#146). `range` must index all three slices
+/// consistently; on return the three have shrunk (or stayed the same size, if
+/// `fill` is `None`) by the same amount, at the same position.
+///
+/// Returns the position the *next* generation should resume from. A `range`
+/// that names an empty span is a no-op, returning `position` unchanged — the
+/// division below would otherwise panic on an empty entries block.
+#[allow(clippy::too_many_arguments)]
+fn cut_entries_window(
+    items: &mut Vec<ResolvedItem>,
+    limits: &mut Vec<Limits>,
+    separate_fields: &mut Vec<Option<String>>,
+    range: std::ops::Range<usize>,
+    position: usize,
+    fill: Option<Duration>,
+    catalog: Option<&Catalog>,
+    nominal: Duration,
+) -> usize {
+    let total = range.len();
+    if total == 0 {
+        return position;
+    }
+    let insert_at = range.start;
+    let mut span_items: Vec<ResolvedItem> = items.drain(range.clone()).collect();
+    let mut span_limits: Vec<Limits> = limits.drain(range.clone()).collect();
+    let mut span_fields: Vec<Option<String>> = separate_fields.drain(range).collect();
+
+    let start = position % total;
+    span_items.rotate_left(start);
+    span_limits.rotate_left(start);
+    span_fields.rotate_left(start);
+
+    let laid = match fill {
+        Some(fill) => {
+            let runtimes = estimated_runtimes(&span_items, catalog, nominal);
+            items_covering(&runtimes, fill)
+        }
+        // The stateless entry point wants the list whole.
+        None => total,
+    };
+    span_items.truncate(laid);
+    span_limits.truncate(laid);
+    span_fields.truncate(laid);
+
+    items.splice(insert_at..insert_at, span_items);
+    limits.splice(insert_at..insert_at, span_limits);
+    separate_fields.splice(insert_at..insert_at, span_fields);
+
+    (start + laid) % total
 }
 
 /// Reorder `items` by `perm` (a permutation of `0..items.len()`).
@@ -611,22 +802,55 @@ fn resolve_block(
         }
     }
 
+    // 1.5. Fallback (#97) — a 24/7 channel must not dead-air or error just
+    //    because this generation's `entries` resolved to nothing (an empty
+    //    `query` match is how a Plex collection being momentarily empty
+    //    actually surfaces here). Substitutes for `entries`' output through
+    //    the same machinery a primary entry uses, then falls straight into
+    //    the same duplicates/order/mode steps below — never a parallel path.
+    //    Opt-in only: a block with no `fallback` still resolves to empty
+    //    exactly as before this existed, and a fallback that also resolves to
+    //    nothing leaves the block empty exactly the same way.
+    if items.is_empty()
+        && let Some(fallback) = &include.fallback
+    {
+        items = resolve_fallback(catalog, fallback, defaults, seed, source_roots, path_index)
+            .map_err(|m| unsupported(format!("block #{idx}: fallback: {m}")))?;
+    }
+
     // 2. Duplicates — collapse (default) runs BEFORE order so which occurrence
     //    survives is deterministic even under a `random` shuffle.
     if matches!(include.duplicates(), Duplicates::Collapse) {
         collapse_duplicates(&mut items);
     }
 
-    // 3. Order the block's resolved list. `manual` keeps authored order and
-    //    needs no catalog; every other order goes through the #69 engine.
-    if include.order != Order::Manual {
+    // 3. Order the block's resolved list. An authored order (`manual`
+    //    included) is used as written and needs no catalog. Unset takes the
+    //    episode default when every resolved item is catalog type "episode"
+    //    (#95) — a set the catalog cannot vouch for (no catalog, or any
+    //    non-episode / uningested item) keeps today's manual behavior.
+    let effective_order = if let Some(order) = &include.order {
+        order.clone()
+    } else if let Some(cat) = catalog {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let episode_typed = cat
+            .all_episode_type(&ids)
+            .map_err(|e| unsupported(format!("block #{idx}: {e}")))?;
+        if episode_typed {
+            Order::episode_default()
+        } else {
+            Order::Manual
+        }
+    } else {
+        Order::Manual
+    };
+    if effective_order != Order::Manual {
         let cat = catalog.ok_or_else(|| {
             unsupported(format!(
-                "block #{idx}: order {:?} needs the catalog, which is not available",
-                include.order
+                "block #{idx}: order {effective_order:?} needs the catalog, which is not available",
             ))
         })?;
-        items = apply_order(cat, items, &include.order, seed)
+        items = apply_order(cat, items, &effective_order, seed)
             .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
     }
 
@@ -662,6 +886,30 @@ fn resolve_query(
         .into_iter()
         .flatten()
         .collect())
+}
+
+/// Resolve a block's `fallback` (#97) — through the exact same machinery as a
+/// primary entry, never a parallel path: a `query` fallback runs
+/// [`resolve_query`], exactly like a primary `kind: query` entry; a static
+/// item fallback runs [`resolve_item`], exactly like a primary `kind: item`
+/// entry (always exactly one item, so it can never itself resolve to empty).
+fn resolve_fallback(
+    catalog: Option<&Catalog>,
+    fallback: &Fallback,
+    defaults: Option<&ProgramMetadata>,
+    seed: u64,
+    source_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
+) -> Result<Vec<ResolvedItem>, String> {
+    match fallback {
+        Fallback::Query(query) => {
+            let cat = catalog.ok_or_else(|| {
+                "a query fallback needs the catalog, which is not available".to_string()
+            })?;
+            resolve_query(cat, query, defaults, seed)
+        }
+        Fallback::Item(item) => Ok(vec![resolve_item(item, defaults, source_roots, path_index)]),
+    }
 }
 
 /// Resolve a `collection` entry: look the collection up by name and emit its
@@ -959,6 +1207,18 @@ mod tests {
         }
     }
 
+    /// A lavfi test item with an explicit runtime, for exercising a temporal
+    /// `no_repeat_within` (#185) without a catalog: `estimated_runtimes` reads
+    /// `out_point - in_point` as its most authoritative source.
+    fn item_entry_secs(id: &str, secs: u64) -> ItemEntry {
+        ItemEntry {
+            source: SourceConfig::Lavfi { params: id.into() },
+            in_point: None,
+            out_point: Some(Duration::from_secs(secs)),
+            program: None,
+        }
+    }
+
     /// A local-file test item (no authored id — identity derives from the path).
     fn local_entry(path: &str) -> ItemEntry {
         ItemEntry {
@@ -976,11 +1236,12 @@ mod tests {
             duplicates: None,
             constraints: None,
             entries,
+            fallback: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
             mode: Mode::All,
-            order: Order::Manual,
+            order: Some(Order::Manual),
             filter: None,
         }
     }
@@ -1030,7 +1291,17 @@ mod tests {
     /// ways an id legitimately appears twice in a resolved channel.
     fn constrained(mut inc: BlockInclude, n: usize) -> BlockInclude {
         inc.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(n),
+            no_repeat_within: Some(NoRepeatWithin::Positions(n)),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        inc
+    }
+
+    /// The temporal spelling of [`constrained`] (#185).
+    fn constrained_within(mut inc: BlockInclude, within: Duration) -> BlockInclude {
+        inc.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(NoRepeatWithin::Duration(within)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -1111,6 +1382,79 @@ mod tests {
         assert_ne!(
             ids[0], "lavfi:a",
             "repeated the previously-aired item across the seam: {ids:?}"
+        );
+    }
+
+    // ---- no_repeat_within: temporal spelling (#185) -------------------------
+
+    /// Two 30s items sandwiching another 30s item stays within a 40s window —
+    /// a single item never covers it — so, like the positional gap = 1 case,
+    /// the pass must still separate the back-to-back repeat.
+    #[test]
+    fn no_repeat_within_temporal_separates_short_items() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry_secs("a", 30)),
+            Entry::Item(item_entry_secs("a", 30)),
+            Entry::Item(item_entry_secs("b", 30)),
+            Entry::Item(item_entry_secs("c", 30)),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained_within(inc, Duration::from_secs(40))]);
+        assert_eq!(ids.len(), 4);
+        for i in 1..ids.len() {
+            assert_ne!(ids[i - 1], ids[i], "{ids:?}");
+        }
+    }
+
+    /// Each item alone already runs longer than the configured window, so an
+    /// adjacent repeat is legal and the list must come back untouched — the
+    /// exact case a positional `no_repeat_within = 1` cannot express, since it
+    /// would force separation regardless of how long each item runs.
+    #[test]
+    fn no_repeat_within_temporal_allows_adjacency_when_items_are_long_enough() {
+        let mut inc = include_with(vec![
+            Entry::Item(item_entry_secs("a", 600)),
+            Entry::Item(item_entry_secs("a", 600)),
+            Entry::Item(item_entry_secs("b", 600)),
+        ]);
+        inc.duplicates = Some(Duplicates::Keep);
+        let ids = resolved_ids(vec![constrained_within(inc, Duration::from_secs(300))]);
+        assert_eq!(
+            ids,
+            vec!["lavfi:a", "lavfi:a", "lavfi:b"],
+            "each item alone already covers the 300s window; a legal list was reordered"
+        );
+    }
+
+    /// The seam holds in wall-clock time too: with no catalog behind it, the
+    /// previously-aired tail item is estimated at the channel's nominal item
+    /// length (1800s, the untouched default), which a 2h window still reaches
+    /// past — so the new list must not open on the same id.
+    #[test]
+    fn no_repeat_within_temporal_holds_across_the_generation_seam() {
+        let inc = include_with(vec![
+            Entry::Item(item_entry_secs("a", 600)),
+            Entry::Item(item_entry_secs("b", 600)),
+        ]);
+        let state = crate::resume::GenerationState {
+            tail: vec!["lavfi:a".to_string()],
+            ..Default::default()
+        };
+        let (items, _) = resolve_channel_with_resume(
+            &channel(vec![constrained_within(inc, Duration::from_secs(7200))]),
+            path(),
+            &[],
+            None,
+            None,
+            &state,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_ne!(
+            ids[0], "lavfi:a",
+            "repeated the previously-aired item within the temporal window: {ids:?}"
         );
     }
 
@@ -1319,7 +1663,7 @@ mod tests {
     #[test]
     fn non_manual_order_without_catalog_errors() {
         let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
-        inc.order = Order::Random;
+        inc.order = Some(Order::Random);
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap_err();
         assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
@@ -1366,7 +1710,7 @@ mod tests {
             query: query.into(),
             order: None,
         })]);
-        inc.order = order;
+        inc.order = Some(order);
         inc
     }
 
@@ -1391,6 +1735,168 @@ mod tests {
         }
     }
 
+    // ---- block fallback (#97) ----------------------------------------------
+
+    fn empty_query(order: Option<Order>) -> Entry {
+        Entry::Query(QueryEntry {
+            query: "item.title == \"Nonesuch\"".into(),
+            order,
+        })
+    }
+
+    #[test]
+    fn item_fallback_resolves_when_primary_entries_match_nothing() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![empty_query(None)]);
+        inc.fallback = Some(Fallback::Item(Box::new(item_entry("standby"))));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["lavfi:standby"]);
+    }
+
+    #[test]
+    fn query_fallback_resolves_and_keeps_its_own_order() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![empty_query(None)]);
+        inc.fallback = Some(Fallback::Query(QueryEntry {
+            query: "item.title.contains(\"Ring\") || item.title.contains(\"Tower\") \
+                     || item.title.contains(\"King\")"
+                .into(),
+            order: Some(Order::parse("release_date:asc").unwrap()),
+        }));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0120737", "imdb:tt0167261", "imdb:tt0167260"]
+        );
+    }
+
+    #[test]
+    fn fallback_is_ignored_when_primary_entries_resolve_to_something() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.year >= 2001".into(),
+            order: None,
+        })]);
+        inc.fallback = Some(Fallback::Item(Box::new(item_entry("standby"))));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(items.len(), 3);
+        assert!(
+            !ids.contains(&"lavfi:standby"),
+            "fallback aired despite non-empty primary entries: {ids:?}"
+        );
+    }
+
+    /// #97's opt-in guarantee: a block that names no `fallback` must behave
+    /// exactly as it did before this field existed, including still failing
+    /// the channel when its entries resolve to nothing.
+    #[test]
+    fn a_block_with_no_fallback_still_resolves_to_empty() {
+        let cat = seeded_catalog();
+        let inc = include_with(vec![empty_query(None)]);
+        let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
+        assert!(format!("{err}").contains("zero items"), "err = {err}");
+    }
+
+    /// The fallback runs through the block's own duplicates/order/mode exactly
+    /// like a primary entry's result would — `mode = { count: 2 }` still
+    /// truncates a fallback that matched three items.
+    #[test]
+    fn fallback_result_still_goes_through_the_blocks_mode_and_order() {
+        let cat = seeded_catalog();
+        let mut inc = include_with(vec![empty_query(None)]);
+        inc.mode = Mode::Count(2);
+        inc.order = Some(Order::parse("release_date:asc").unwrap());
+        inc.fallback = Some(Fallback::Query(QueryEntry {
+            query: "item.year >= 2001".into(),
+            order: None,
+        }));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["imdb:tt0120737", "imdb:tt0167261"]);
+    }
+
+    // ---- episode default order (#95) --------------------------------------
+
+    /// Three episodes seeded so `entry_id` order (alphabetical), season/episode
+    /// order, and insertion order all disagree — a passing assertion for the
+    /// season/episode default can only come from reading `season`/`episode`,
+    /// not from the id or the seed order.
+    fn out_of_order_episodes_catalog() -> Catalog {
+        let cat = Catalog::open_in_memory().unwrap();
+        for (id, season, episode) in [("id-c", 1, 2), ("id-a", 1, 1), ("id-b", 2, 1)] {
+            let mut e = CatEntry::new(id, "episode", id, Source::Plex);
+            e.season = Some(season);
+            e.episode = Some(episode);
+            cat.upsert_entry(&e).unwrap();
+            cat.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        }
+        cat
+    }
+
+    #[test]
+    fn absent_block_order_over_an_all_episode_set_injects_the_season_episode_default() {
+        let cat = out_of_order_episodes_catalog();
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.type == \"episode\"".into(),
+            order: None,
+        })]);
+        inc.order = None; // the author wrote nothing at all
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["id-a", "id-c", "id-b"],
+            "season:asc,episode:asc, not entry_id order ({ids:?})"
+        );
+    }
+
+    #[test]
+    fn explicit_manual_order_over_an_all_episode_set_keeps_authored_order() {
+        let cat = out_of_order_episodes_catalog();
+        // `include_with`'s default order is `Some(Order::Manual)` — the author
+        // explicitly wrote `manual`, which must win even though every item is
+        // episode-typed.
+        let inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.type == \"episode\"".into(),
+            order: None,
+        })]);
+        assert_eq!(inc.order, Some(Order::Manual));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["id-a", "id-b", "id-c"],
+            "entry_id order from the query, unmoved by the episode default ({ids:?})"
+        );
+    }
+
+    #[test]
+    fn absent_block_order_over_a_non_episode_set_keeps_todays_manual_behavior() {
+        let cat = seeded_catalog(); // all "movie" type
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.year >= 2001".into(),
+            order: None,
+        })]);
+        inc.order = None; // the author wrote nothing at all
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0120737", "imdb:tt0167260", "imdb:tt0167261"],
+            "a non-episode-typed set stays in entry_id order, unaffected by #95 ({ids:?})"
+        );
+    }
+
     #[test]
     fn field_order_keeps_non_catalog_items_after_the_sorted_set() {
         let cat = seeded_catalog();
@@ -1404,7 +1910,7 @@ mod tests {
                 order: None,
             }),
         ]);
-        inc.order = Order::parse("release_date:asc").unwrap();
+        inc.order = Some(Order::parse("release_date:asc").unwrap());
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
@@ -1549,7 +2055,7 @@ mod tests {
             Entry::Item(item_entry("a")),
             Entry::Item(item_entry("b")),
         ]);
-        inc.order = Order::Random;
+        inc.order = Some(Order::Random);
         let cat = seeded_catalog();
         let mut cfg = channel(vec![inc]);
         cfg.seed = Some(7);
@@ -1685,40 +2191,53 @@ mod tests {
 
     /// Project the state a following window would be handed, exactly as the
     /// daemon does: the pools' rotation from this resolve, and the per-series
-    /// cursor read back out of the play-history ledger the airings were
-    /// recorded in (#70).
+    /// cursor read back out of the play-history store the airings were
+    /// recorded in (#70, sqlite-backed since #111).
     fn advance_state(
         cat: &Catalog,
         prev: &crate::resume::GenerationState,
         resume: ResumeMap,
         items: &[ResolvedItem],
     ) -> crate::resume::GenerationState {
-        use crate::history::{Ledger, PlayRecord};
+        use crate::history::{HistoryDb, PlayRecord};
         use time::OffsetDateTime;
+
+        const CHANNEL: &str = "test";
 
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         let show_ids = cat.show_ids_for(&ids).unwrap();
-        let mut ledger = Ledger::new();
+        let db = HistoryDb::open_in_memory().unwrap();
         // Seed with whatever the previous windows had already recorded, so the
         // projection sees the channel's whole history and not just this window.
-        ledger.extend(prev.cursor.iter().map(|(key, entry_id)| PlayRecord {
-            entry_id: entry_id.clone(),
-            show_id: Some(key.clone()),
-            start: OffsetDateTime::UNIX_EPOCH,
-            played_at: OffsetDateTime::UNIX_EPOCH,
-            error_card: false,
-        }));
-        ledger.extend(ids.iter().map(|id| PlayRecord {
-            entry_id: id.clone(),
-            show_id: show_ids.get(id).cloned(),
-            start: OffsetDateTime::UNIX_EPOCH,
-            played_at: OffsetDateTime::UNIX_EPOCH,
-            error_card: false,
-        }));
+        let seed: Vec<PlayRecord> = prev
+            .cursor
+            .iter()
+            .map(|(key, entry_id)| PlayRecord {
+                entry_id: entry_id.clone(),
+                show_id: Some(key.clone()),
+                start: OffsetDateTime::UNIX_EPOCH,
+                played_at: OffsetDateTime::UNIX_EPOCH,
+                error_card: false,
+            })
+            .collect();
+        db.record(CHANNEL, &seed).unwrap();
+        let airings: Vec<PlayRecord> = ids
+            .iter()
+            .map(|id| PlayRecord {
+                entry_id: id.clone(),
+                show_id: show_ids.get(id).cloned(),
+                start: OffsetDateTime::UNIX_EPOCH,
+                played_at: OffsetDateTime::UNIX_EPOCH,
+                error_card: false,
+            })
+            .collect();
+        db.record(CHANNEL, &airings).unwrap();
         crate::resume::GenerationState {
             resume,
-            cursor: ledger.series_cursor(),
-            tail: ledger.tail(crate::constrain::DEFAULT_SEAM_TAIL),
+            cursor: db.series_cursor(CHANNEL).unwrap(),
+            tail: db
+                .tail(CHANNEL, crate::constrain::DEFAULT_SEAM_TAIL)
+                .unwrap(),
         }
     }
 
@@ -1927,13 +2446,16 @@ mod tests {
         );
     }
 
-    /// #70 acceptance: one ledger row per scheduled airing — no more, no fewer.
-    /// The row count is what makes the cursor's projection correct, so a
-    /// duplicate or a dropped row is a scheduling bug, not a bookkeeping one.
+    /// #70 acceptance: one play-history row per scheduled airing — no more, no
+    /// fewer. The row count is what makes the cursor's projection correct, so
+    /// a duplicate or a dropped row is a scheduling bug, not a bookkeeping
+    /// one.
     #[test]
     fn every_scheduled_airing_records_exactly_one_row() {
-        use crate::history::{Ledger, PlayRecord};
+        use crate::history::{HistoryDb, PlayRecord};
         use time::OffsetDateTime;
+
+        const CHANNEL: &str = "test";
 
         let cat = interleave_catalog();
         let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
@@ -1951,24 +2473,29 @@ mod tests {
 
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         let show_ids = cat.show_ids_for(&ids).unwrap();
-        let mut ledger = Ledger::new();
-        ledger.extend(ids.iter().enumerate().map(|(i, id)| PlayRecord {
-            entry_id: id.clone(),
-            show_id: show_ids.get(id).cloned(),
-            start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
-            played_at: OffsetDateTime::UNIX_EPOCH,
-            error_card: false,
-        }));
+        let db = HistoryDb::open_in_memory().unwrap();
+        let records: Vec<PlayRecord> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| PlayRecord {
+                entry_id: id.clone(),
+                show_id: show_ids.get(id).cloned(),
+                start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
+                played_at: OffsetDateTime::UNIX_EPOCH,
+                error_card: false,
+            })
+            .collect();
+        db.record(CHANNEL, &records).unwrap();
 
         assert_eq!(
-            ledger.len(),
+            db.count(CHANNEL).unwrap(),
             items.len(),
             "one row per airing — the generation aired {} items",
             items.len()
         );
         // A repeat under `wrap = "loop"` is a genuine second airing and gets
         // its own row; the cursor still resolves to the latest one.
-        let cursor = ledger.series_cursor();
+        let cursor = db.series_cursor(CHANNEL).unwrap();
         assert_eq!(cursor.get("show:got").unwrap(), "got-e2");
     }
 
@@ -2175,6 +2702,132 @@ mod tests {
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["mov-1", "got-e1", "got-e2"]);
+    }
+
+    // ---- a channel mixing a pattern block with an entries block (#146) ----
+    //
+    // No channel in `examples/` mixes block kinds, which is why neither #118's
+    // nor #140's acceptance run caught this: `config.is_pattern()` was
+    // answered once for the whole channel, so a channel with any pattern
+    // block skipped the entries-window cut entirely on its entries half.
+
+    /// A ten-item, 30s-each entries block alongside the two-pool interleave
+    /// used by the pattern-block tests above. `interleave_block` authors an
+    /// explicit `cycles`, so its output ignores `fill` and is deterministic —
+    /// exactly the list `pattern_block_resolves_through_the_channel` asserts.
+    fn mixed_channel() -> ChannelConfig {
+        let pattern_inc = interleave_block(crate::config::Advance::Restart);
+        let entries_inc = include_with(
+            (0..10)
+                .map(|i| Entry::Item(item_entry(&i.to_string())))
+                .collect(),
+        );
+        channel(vec![pattern_inc, entries_inc])
+    }
+
+    const MIXED_PATTERN_IDS: [&str; 6] = ["mov-1", "got-e1", "got-e2", "mov-2", "inv-e1", "inv-e2"];
+
+    /// The acceptance bar's first line: a 90s window over ten 30s entries
+    /// items must take three of them, not all ten — even though the same
+    /// channel also carries a pattern block, which used to make the whole
+    /// channel skip this cut.
+    #[test]
+    fn a_mixed_channels_entries_block_is_cut_to_the_window_while_its_pattern_block_is_untouched() {
+        let cat = interleave_catalog();
+        let (items, resume) = resolve_channel_with_resume(
+            &mixed_channel(),
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            Some(Duration::from_secs(90)),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        let mut expected: Vec<&str> = MIXED_PATTERN_IDS.to_vec();
+        expected.extend(["lavfi:0", "lavfi:1", "lavfi:2"]);
+        assert_eq!(
+            ids, expected,
+            "the pattern block's full interleave, then only as much of the \
+             entries block as a 90s window covers — not its whole 10-item list"
+        );
+        assert_eq!(
+            resume.position, 3,
+            "the entries cursor advances by what it laid, same as a lone entries channel"
+        );
+        // The pattern block's own resume mechanism (#140) is untouched by the
+        // entries cut living alongside it.
+        assert!(resume.pool("movies").is_some());
+        assert!(resume.pool("shows").is_some());
+    }
+
+    /// The acceptance bar's second line: across two consecutive passes, the
+    /// entries half of a mixed channel skips no item and repeats none — and
+    /// the pattern half, unaffected by the entries cut, resolves the same
+    /// interleaved list each time (`Advance::Restart`'s own, separately
+    /// tested, contract — not something this fix touches).
+    #[test]
+    fn two_generations_of_a_mixed_channel_continue_its_entries_block_with_no_gap_or_repeat() {
+        let cat = interleave_catalog();
+        let generation = |at: usize| {
+            let mut state = GenerationState::empty();
+            state.resume.position = at;
+            resolve_channel_with_resume(
+                &mixed_channel(),
+                path(),
+                &[],
+                None,
+                Some(&cat),
+                &state,
+                &Default::default(),
+                Some(Duration::from_secs(90)),
+            )
+            .unwrap()
+        };
+
+        let (first, next) = generation(0);
+        let (second, _) = generation(next.position);
+
+        for (items, expected_entries_tail) in [
+            (&first, ["lavfi:0", "lavfi:1", "lavfi:2"]),
+            (&second, ["lavfi:3", "lavfi:4", "lavfi:5"]),
+        ] {
+            let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(&ids[..MIXED_PATTERN_IDS.len()], &MIXED_PATTERN_IDS[..]);
+            assert_eq!(&ids[MIXED_PATTERN_IDS.len()..], &expected_entries_tail[..]);
+        }
+    }
+
+    /// The shape #146 refuses rather than guesses at: two entries blocks
+    /// sharing a channel with a pattern block. #118 made `.resume.position`
+    /// one cursor for the channel's whole entries list on purpose, and there
+    /// is no non-arbitrary answer for what a fused cursor spanning two
+    /// non-contiguous entries spans should splice back to once a pattern
+    /// block's span sits between them — so this errors instead of silently
+    /// mis-scheduling either span.
+    #[test]
+    fn two_entries_blocks_alongside_a_pattern_block_errors_rather_than_guessing() {
+        let cat = interleave_catalog();
+        let pattern_inc = interleave_block(crate::config::Advance::Restart);
+        let entries_a = include_with(vec![Entry::Item(item_entry("a"))]);
+        let entries_b = include_with(vec![Entry::Item(item_entry("b"))]);
+        let cfg = channel(vec![entries_a, pattern_inc, entries_b]);
+
+        let err = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            Some(Duration::from_secs(90)),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("entries blocks"), "err = {err}");
     }
 
     #[test]

@@ -43,8 +43,14 @@ pub struct ResumeMap {
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
 
-    /// How far into a flat `entries` channel's list the next generation starts,
-    /// counted over the channel's blocks concatenated in config order (#118).
+    /// How far into a channel's entries list the next generation starts
+    /// (#118). For a channel with no pattern block, that list is every block
+    /// concatenated in config order. A channel that mixes a pattern block
+    /// with exactly one entries block (#146) instead counts over that one
+    /// block's own list — its pattern block(s) bound themselves separately,
+    /// through the pool resume state above, not through this field. Mixing a
+    /// pattern block with *several* entries blocks is unsupported rather than
+    /// guessing what a fused cursor across them should mean (#190).
     ///
     /// A channel with no pattern block has no pools and no rotation, so before
     /// this it persisted nothing at all: every generation re-resolved the same

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::block::Duplicates;
 use super::channel::{ChannelConfig, TasteScope};
-use super::constraints::Constraints;
+use super::constraints::{Constraints, NoRepeatWithin};
 use super::order::Order;
 use super::pool::{Pool, Rotate, ShowGroup, Take, TakeFrom};
 use super::rule::BlockInclude;
@@ -46,9 +46,12 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
 }
 
 /// Reject two channels that write to the same `output_folder`. A shared folder
-/// silently misbehaves: both channels fight over the `.resume` and `.history`
-/// sidecars and each startup prunes the other's `.durations.json` cache,
-/// forcing re-probes on every restart.
+/// silently misbehaves: both channels fight over the `.resume` sidecar and
+/// each startup prunes the other's `.durations.json` cache, forcing re-probes
+/// on every restart. Play history no longer lives in this folder (#111) —
+/// it is keyed by channel name in the shared `history.db`, so two channels
+/// only collide on it if their *names* also collide, which is rejected
+/// elsewhere.
 ///
 /// Folders are compared exactly as the daemon uses them — verbatim, relative to
 /// the single process CWD (see `daemon::channel_loop`, which uses
@@ -237,8 +240,14 @@ fn validate_constraints(
     c: &Constraints,
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
-    // An explicit `0` reads as "on" but spaces nothing apart.
-    if c.no_repeat_within == Some(0) {
+    // An explicit `0` — positions or duration — reads as "on" but spaces
+    // nothing apart.
+    let zero = match c.no_repeat_within {
+        Some(NoRepeatWithin::Positions(0)) => true,
+        Some(NoRepeatWithin::Duration(d)) => d.is_zero(),
+        _ => false,
+    };
+    if zero {
         return Err(bad(
             "no_repeat_within must be > 0 (omit it to leave the block unconstrained)".into(),
         ));
@@ -293,17 +302,26 @@ fn validate_pattern_block<'a>(
     if include.pattern.is_empty() {
         return Err(bad("`pools` needs a `pattern` to draw from them".into()));
     }
-    if include.order != Order::Manual {
+    if let Some(order) = &include.order
+        && *order != Order::Manual
+    {
         return Err(bad(format!(
-            "order {:?} conflicts with `pattern` — the pattern IS the ordering; \
+            "order {order:?} conflicts with `pattern` — the pattern IS the ordering; \
              sort inside a pool with its own `order` instead",
-            include.order
         )));
     }
     if include.duplicates == Some(Duplicates::Collapse) {
         return Err(bad(
             "duplicates = \"collapse\" conflicts with `pattern` — collapse would delete \
              the repeats a looping pool produces; a pattern block is always \"keep\""
+                .into(),
+        ));
+    }
+    if include.fallback.is_some() {
+        return Err(bad(
+            "fallback conflicts with `pattern` — a pattern block's pools already have their \
+             own empty-pool policy (`on_short`); block-level `fallback` only applies to an \
+             entries block"
                 .into(),
         ));
     }
@@ -555,11 +573,12 @@ mod tests {
             duplicates: None,
             constraints: None,
             entries,
+            fallback: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
             mode: Mode::All,
-            order: Order::Manual,
+            order: Some(Order::Manual),
             filter: None,
         }
     }
@@ -779,7 +798,7 @@ mod tests {
     fn rejects_zero_no_repeat_within() {
         let mut block = inline_block(vec![item_entry("a")]);
         block.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(0),
+            no_repeat_within: Some(NoRepeatWithin::Positions(0)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -852,7 +871,7 @@ mod tests {
         validate_channel(
             &dummy_path(),
             &with_constraints(crate::config::Constraints {
-                no_repeat_within: Some(1),
+                no_repeat_within: Some(NoRepeatWithin::Positions(1)),
                 separate_by: Some("cast".into()),
                 separate_min_gap: Some(3),
             }),
@@ -864,7 +883,7 @@ mod tests {
     fn adjacency_reach_is_the_widest_gap_across_blocks() {
         let mut a = inline_block(vec![item_entry("a")]);
         a.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(2),
+            no_repeat_within: Some(NoRepeatWithin::Positions(2)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -885,7 +904,7 @@ mod tests {
     fn adjacency_reach_converts_a_pool_gap_into_channel_positions() {
         let mut movies = pool("movies");
         movies.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(5),
+            no_repeat_within: Some(NoRepeatWithin::Positions(5)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -905,7 +924,7 @@ mod tests {
             vec![step("movies", 2), step("shows", 3)],
         );
         block.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(2),
+            no_repeat_within: Some(NoRepeatWithin::Positions(2)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -921,7 +940,7 @@ mod tests {
     fn rejects_a_pool_constraint_that_constrains_nothing() {
         let mut movies = pool("movies");
         movies.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(0),
+            no_repeat_within: Some(NoRepeatWithin::Positions(0)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -954,7 +973,7 @@ mod tests {
     fn accepts_a_positive_no_repeat_within() {
         let mut block = inline_block(vec![item_entry("a"), item_entry("b")]);
         block.constraints = Some(crate::config::Constraints {
-            no_repeat_within: Some(1),
+            no_repeat_within: Some(NoRepeatWithin::Positions(1)),
             separate_by: None,
             separate_min_gap: None,
         });
@@ -1012,7 +1031,7 @@ mod tests {
         // The pattern IS the ordering — a block-level sort would silently
         // un-pattern the block.
         let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
-        b.order = Order::Random;
+        b.order = Some(Order::Random);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(
             format!("{err}").contains("conflicts with `pattern`"),
@@ -1026,6 +1045,28 @@ mod tests {
         b.duplicates = Some(Duplicates::Collapse);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("collapse"), "err = {err}");
+    }
+
+    /// A pattern block's pools already have their own empty-pool policy
+    /// (`on_short`) — block-level `fallback` is entries-block only.
+    #[test]
+    fn rejects_fallback_on_a_pattern_block() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.fallback = Some(crate::config::Fallback::Item(Box::new(
+            crate::config::ItemEntry {
+                source: crate::config::SourceConfig::Lavfi {
+                    params: "standby".into(),
+                },
+                in_point: None,
+                out_point: Some(std::time::Duration::from_secs(30)),
+                program: None,
+            },
+        )));
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("conflicts with `pattern`"),
+            "err = {err}"
+        );
     }
 
     #[test]
@@ -1078,7 +1119,7 @@ mod tests {
     #[test]
     fn rejects_take_all_beside_constraints() {
         let gap = Constraints {
-            no_repeat_within: Some(3),
+            no_repeat_within: Some(NoRepeatWithin::Positions(3)),
             separate_by: None,
             separate_min_gap: None,
         };

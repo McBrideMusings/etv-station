@@ -14,8 +14,8 @@ mod validate;
 
 pub use block::{BlockFile, Duplicates};
 pub use channel::{ChannelConfig, ChannelOverlayConfig, ScoringConfig};
-pub use constraints::Constraints;
-pub use entry::{CollectionEntry, Entry, IncludeEntry, ItemEntry, QueryEntry};
+pub use constraints::{Constraints, NoRepeatWithin};
+pub use entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
 pub use load::{LoadedChannel, Station, load, read_channel};
 pub use mode::Mode;
