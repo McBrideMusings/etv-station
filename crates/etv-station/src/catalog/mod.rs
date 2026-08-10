@@ -378,6 +378,28 @@ impl Catalog {
         Ok(())
     }
 
+    /// Drop every tag row in one namespace, across every entry (#136).
+    ///
+    /// [`Self::clear_tags`] reconciles one `(entry, namespace)` pair at a
+    /// time, which only works when a caller is visiting entries one at a time
+    /// with that entry's freshly-fetched values in hand — true for
+    /// genre/cast/director/…, which arrive on the per-item Plex record. A
+    /// Plex label does not: its members come back from a per-label
+    /// membership fetch (`ingest_labels` in `catalog::ingest::plex`), so
+    /// nothing ever visits "this entry's labels" as a unit, and an entry a
+    /// label was removed from in Plex would never be visited at all —
+    /// leaving its stale tag to survive forever. Since a label ingest pass
+    /// always re-fetches every label's complete current membership, clearing
+    /// the whole namespace before writing that pass back is the correct
+    /// wholesale reconcile, one level up from [`Self::clear_tags`].
+    pub fn clear_tag_namespace(&self, namespace: TagNs) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "DELETE FROM tags WHERE namespace = ?1",
+            params![namespace.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// Insert or rename a collection.
     pub fn upsert_collection(&self, c: &Collection) -> Result<(), CatalogError> {
         self.conn.execute(
@@ -1074,6 +1096,28 @@ mod tests {
             vec!["Villeneuve"]
         );
         assert!(c.tags_for("id1", TagNs::Cast).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_tag_namespace_drops_rows_for_every_entry_but_only_that_namespace() {
+        let c = cat();
+        c.upsert_entry(&Entry::new("id1", "movie", "X", Source::Plex))
+            .unwrap();
+        c.upsert_entry(&Entry::new("id2", "movie", "Y", Source::Plex))
+            .unwrap();
+        c.add_tag("id1", TagNs::Label, "Christmas").unwrap();
+        c.add_tag("id2", TagNs::Label, "Christmas").unwrap();
+        c.add_tag("id1", TagNs::Genre, "Action").unwrap();
+
+        c.clear_tag_namespace(TagNs::Label).unwrap();
+
+        assert!(c.tags_for("id1", TagNs::Label).unwrap().is_empty());
+        assert!(c.tags_for("id2", TagNs::Label).unwrap().is_empty());
+        assert_eq!(
+            c.tags_for("id1", TagNs::Genre).unwrap(),
+            vec!["Action".to_string()],
+            "clearing one namespace must not disturb another"
+        );
     }
 
     #[test]

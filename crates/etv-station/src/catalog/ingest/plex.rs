@@ -26,6 +26,18 @@
 //! generic: it always resolves membership ratingKeys straight to entries,
 //! regardless of what kind of container produced the list.
 //!
+//! [`ingest_labels`] is the third pure core, for the `label` tag namespace
+//! (#136). A Plex label cannot ride on the per-item record the way genre or
+//! cast do: Plex's bulk section listing omits `Label` entirely (it is only
+//! present on a single-item fetch, and even then only if the item has one),
+//! so [`PlexClient::fetch_labels`] instead walks each section's label list
+//! and, per label, asks for its members directly — the same
+//! list-then-fetch-members shape [`PlexClient::fetch_collections`] already
+//! uses. A label carries no `updatedAt` to delta against, so every ingest
+//! pass fetches every label's complete current membership and
+//! [`ingest_labels`] reconciles the whole `label` namespace wholesale rather
+//! than per entry.
+//!
 //! [`ingest`] takes a `since` cursor: when set, each section is asked
 //! only for records with `updatedAt>=since` and a collection whose own
 //! `updatedAt` predates it skips its children request. That is what keeps a
@@ -143,9 +155,10 @@ pub struct PlexItem {
     pub studio: Option<String>,
     pub duration_ms: Option<i64>,
     pub genres: Vec<String>,
-    /// Namespaced person/label tags: Plex `Label`, `Role` (cast), `Director`,
-    /// `Writer`, `Producer`, `Country`.
-    pub labels: Vec<String>,
+    /// Namespaced person tags: Plex `Role` (cast), `Director`, `Writer`,
+    /// `Producer`, `Country`. Labels are deliberately absent here — Plex's
+    /// bulk listing never carries them, so [`ingest_labels`] populates the
+    /// `label` tag namespace from a separate per-label fetch instead (#136).
     pub cast: Vec<String>,
     pub directors: Vec<String>,
     pub writers: Vec<String>,
@@ -288,7 +301,6 @@ pub fn ingest_items(
 
         for (ns, values) in [
             (TagNs::Genre, &item.genres),
-            (TagNs::Label, &item.labels),
             (TagNs::Cast, &item.cast),
             (TagNs::Director, &item.directors),
             (TagNs::Writer, &item.writers),
@@ -416,6 +428,71 @@ pub fn ingest_collections(
     Ok(stats)
 }
 
+/// One Plex label with its section-scoped members' ratingKeys, normalised
+/// out of the API shape. Produced by [`PlexClient::fetch_labels`]; consumed
+/// by [`ingest_labels`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedLabel {
+    /// The label's display name, e.g. "🎅 Christmas Movies" — this is the
+    /// value written into the `label` tag namespace, so it is also what
+    /// `item.labels.contains("…")` matches against.
+    pub name: String,
+    /// Member ratingKeys, section-scoped (a label fetched against a movie
+    /// section only ever returns movie ratingKeys, a show section only
+    /// episode ratingKeys — see [`label_member_type_param`]).
+    pub member_rating_keys: Vec<String>,
+}
+
+/// What one label ingest pass touched.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LabelIngestStats {
+    /// `(entry_id, label)` tag rows written.
+    pub members_written: usize,
+    /// Members whose ratingKey resolved to no catalog entry (not ingested, or
+    /// FS-only) — skipped, never tagged.
+    pub members_unresolved: usize,
+}
+
+/// Write the `label` tag namespace from already-fetched Plex labels (#136).
+/// Pure over the catalog, so tests exercise membership resolution and
+/// reconciliation directly — same shape as [`ingest_collections`].
+///
+/// Unlike the other tag namespaces (genre, cast, director, …), which
+/// [`ingest_items`] reconciles per entry because each item's own record
+/// carries its current values, a label cannot be reconciled that way: Plex's
+/// bulk listing never carries `Label`, so nothing visits "this entry's
+/// labels" as a unit. Instead every ingest pass fetches every label's
+/// *complete* current membership (see [`PlexClient::fetch_labels`]) and this
+/// function clears the whole `label` namespace before writing that pass back
+/// — the wholesale reconcile, taken one level up from per-entry because the
+/// fetch itself is already complete rather than delta'd. Without the clear, a
+/// label removed from an item in Plex would survive in the catalog forever
+/// and keep matching `item.labels.contains("…")` queries it shouldn't.
+pub fn ingest_labels(
+    catalog: &Catalog,
+    labels: &[ParsedLabel],
+) -> Result<LabelIngestStats, PlexIngestError> {
+    catalog.clear_tag_namespace(TagNs::Label)?;
+    let mut stats = LabelIngestStats::default();
+    for label in labels {
+        let mut seen = std::collections::HashSet::new();
+        for rating_key in &label.member_rating_keys {
+            match catalog.entry_id_for_source(Source::Plex, rating_key)? {
+                Some(entry_id) if seen.insert(entry_id.clone()) => {
+                    catalog.add_tag(&entry_id, TagNs::Label, &label.name)?;
+                    stats.members_written += 1;
+                }
+                // Already tagged for this label this pass (e.g. a 4K + 1080p
+                // dedupe onto one entry), or unresolved — either way, not a
+                // second write.
+                Some(_) => {}
+                None => stats.members_unresolved += 1,
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// Fetch every library's movies + episodes from Plex and ingest them.
 /// `source_roots` canonicalise paths for identity/path-match.
 ///
@@ -440,11 +517,21 @@ pub fn ingest(
     tracing::info!(
         event = "catalog.ingest.plex_collections_fetched",
         collections = collections.len(),
-        "fetched collections; writing to the catalog",
+        "fetched collections; fetching labels next",
+    );
+    // Labels carry no `updatedAt` to delta against (#136), so this is not
+    // gated on `since` — every pass fetches every label's complete current
+    // membership. See `ingest_labels`' doc comment for why that is what makes
+    // its wholesale-clear reconcile correct.
+    let labels = client.fetch_labels()?;
+    tracing::info!(
+        event = "catalog.ingest.plex_labels_fetched",
+        labels = labels.len(),
+        "fetched labels; writing to the catalog",
     );
     // One transaction for the whole write pass — a mid-ingest failure rolls back
     // rather than leaving a partial catalog. Entries are written before
-    // collections so member ratingKeys resolve to their entry ids.
+    // collections/labels so member ratingKeys resolve to their entry ids.
     //
     // The ingest timestamp is written inside the same transaction, so a failed
     // pass cannot advance the delta cursor past changes it never wrote. It is
@@ -457,6 +544,7 @@ pub fn ingest(
     let prune_absent = since.is_none();
     catalog.in_transaction(|c| {
         let stats = ingest_items(c, &items, source_roots)?;
+        ingest_labels(c, &labels)?;
         ingest_collections(c, &collections, prune_absent)?;
         c.set_last_plex_ingest(started)?;
         Ok(stats)
@@ -584,7 +672,6 @@ fn to_plex_item(
         // Plex `duration` is already milliseconds.
         duration_ms: m.duration,
         genres: tagged(&m.genre),
-        labels: tagged(&m.label),
         cast: tagged(&m.role),
         directors: tagged(&m.director),
         writers: tagged(&m.writer),
@@ -607,17 +694,29 @@ fn tagged(fields: &[TaggedField]) -> Vec<String> {
 /// `imdb`/`tmdb`/`tvdb` id. Verified against the live server to compose with
 /// the delta filter — `type=4&includeGuids=1&updatedAt>=X` returns the same
 /// `totalSize` as the same query without `includeGuids`.
+/// The Plex `type` query-param value for a section's own kind: a show
+/// section's *leaves* are episodes (`4`), a movie section's are movies (`1`).
+/// An unrecognised kind gets no type filter at all. Shared by
+/// [`section_list_params`] (a section's own bulk listing) and
+/// [`label_member_type_param`] (a label's section-scoped member listing) so
+/// the two never encode Plex's type codes independently and drift apart.
+fn plex_type_code(kind: Option<&str>) -> Option<&'static str> {
+    match kind {
+        Some("show") => Some("4"),
+        Some("movie") => Some("1"),
+        _ => None,
+    }
+}
+
 fn section_list_params<'a>(
     kind: Option<&str>,
     since_param: Option<&'a str>,
 ) -> Vec<(&'a str, &'a str)> {
     // Movies come back directly; a show section is expanded to its episode
     // leaves (type=4).
-    let mut params: Vec<(&str, &str)> = match kind {
-        Some("show") => vec![("type", "4")],
-        Some("movie") => vec![("type", "1")],
-        _ => Vec::new(),
-    };
+    let mut params: Vec<(&str, &str)> = plex_type_code(kind)
+        .map(|t| vec![("type", t)])
+        .unwrap_or_default();
     params.push(("includeGuids", "1"));
     if let Some(s) = since_param {
         // `updatedAt>` alone misses any item with no `updatedAt` attribute at
@@ -878,6 +977,68 @@ impl PlexClient {
             .filter_map(|e| e.rating_key.clone())
             .collect())
     }
+
+    /// Every Plex label across all library sections, with its section-scoped
+    /// members' ratingKeys (#136). Two requests per label — its own listing at
+    /// `/library/sections/{id}/label`, then its members at
+    /// `/library/sections/{id}/all?label=<key>` — the same list-then-fetch
+    /// shape [`Self::fetch_collections`] uses for a section's collections.
+    ///
+    /// A label carries no `updatedAt`, unlike a collection, so there is no
+    /// analogue of `fetch_collections`' `since` skip: every call re-fetches
+    /// every label's complete current membership. That is deliberate — see
+    /// [`ingest_labels`]' doc comment for why the wholesale reconcile depends
+    /// on this fetch always being complete, never delta'd.
+    ///
+    /// Verified directly against the live server (#136): the same label list
+    /// comes back for every section regardless of its `key` — Plex's labels
+    /// are server-wide — but a label's *member* listing is correctly scoped
+    /// to the section + type it is queried against (a movie-only label
+    /// returns zero episodes from a show section). So the label list itself
+    /// is refetched once per section (cheap — one request) purely to learn
+    /// which type filter its members need, per [`label_member_type_param`].
+    fn fetch_labels(&self) -> Result<Vec<ParsedLabel>, PlexIngestError> {
+        let sections: SectionListResp = self.get("/library/sections", &[])?;
+        let mut out = Vec::new();
+        for section in &sections.media_container.directory {
+            let Some(id) = section.key.as_deref() else {
+                continue;
+            };
+            let label_endpoint = format!("/library/sections/{id}/label");
+            let section_labels: SectionListResp = self.get(&label_endpoint, &[])?;
+            let type_param = label_member_type_param(section.kind.as_deref());
+            let members_endpoint = format!("/library/sections/{id}/all");
+            for label in &section_labels.media_container.directory {
+                let (Some(key), Some(name)) = (label.key.as_deref(), label.title.as_deref()) else {
+                    continue;
+                };
+                let mut params: Vec<(&str, &str)> = Vec::new();
+                if let Some((k, v)) = type_param {
+                    params.push((k, v));
+                }
+                params.push(("label", key));
+                let resp: MediaContainerResp = self.get(&members_endpoint, &params)?;
+                let member_rating_keys: Vec<String> = resp
+                    .media_container
+                    .metadata
+                    .iter()
+                    .filter_map(|m| m.rating_key.clone())
+                    .collect();
+                out.push(ParsedLabel {
+                    name: name.to_string(),
+                    member_rating_keys,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The `type` query param a label's member fetch needs, from the same
+/// [`plex_type_code`] mapping [`section_list_params`] uses for a section's own
+/// bulk listing.
+fn label_member_type_param(kind: Option<&str>) -> Option<(&'static str, &'static str)> {
+    plex_type_code(kind).map(|t| ("type", t))
 }
 
 /// Flatten a show-subtype collection's member shows to their episode
@@ -961,8 +1122,9 @@ struct PlexMetadata {
     guid: Vec<PlexGuid>,
     #[serde(default, rename = "Genre")]
     genre: Vec<TaggedField>,
-    #[serde(default, rename = "Label")]
-    label: Vec<TaggedField>,
+    // No `Label` field here (#136): Plex's bulk section listing never carries
+    // it, only a single-item fetch does — see `ingest_labels`' doc comment
+    // for where the `label` tag namespace actually comes from.
     #[serde(default, rename = "Role")]
     role: Vec<TaggedField>,
     #[serde(default, rename = "Director")]
@@ -1051,7 +1213,6 @@ mod tests {
             studio: None,
             duration_ms: Some(7_920_000),
             genres: vec!["Action".into()],
-            labels: vec![],
             cast: vec![],
             directors: vec![],
             writers: vec![],
@@ -1525,7 +1686,11 @@ mod tests {
     }
 
     #[test]
-    fn to_plex_item_promotes_crew_cast_and_label_tags() {
+    fn to_plex_item_promotes_crew_cast_and_country_tags() {
+        // No `Label` field here (#136): Plex's bulk listing never carries
+        // one, so `to_plex_item` has nothing to parse it from — see
+        // `ingest_labels_writes_the_label_tag_queryable` for how the `label`
+        // namespace actually gets populated.
         let json = r#"{
             "ratingKey": "1",
             "type": "movie",
@@ -1535,7 +1700,6 @@ mod tests {
             "Writer": [{"tag": "Jeb Stuart"}],
             "Producer": [{"tag": "Joel Silver"}],
             "Country": [{"tag": "United States"}],
-            "Label": [{"tag": "Christmas"}],
             "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
         }"#;
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
@@ -1545,11 +1709,10 @@ mod tests {
         assert_eq!(item.writers, vec!["Jeb Stuart"]);
         assert_eq!(item.producers, vec!["Joel Silver"]);
         assert_eq!(item.countries, vec!["United States"]);
-        assert_eq!(item.labels, vec!["Christmas"]);
     }
 
     #[test]
-    fn ingest_writes_crew_cast_and_label_tags_queryable() {
+    fn ingest_writes_crew_and_cast_tags_queryable() {
         let cat = Catalog::open_in_memory().unwrap();
         let mut item = movie(
             "plex-t",
@@ -1558,7 +1721,6 @@ mod tests {
         );
         item.cast = vec!["Jackie Chan".into()];
         item.directors = vec!["Stanley Tong".into()];
-        item.labels = vec!["Kung Fu".into()];
         ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
 
         assert_eq!(
@@ -1569,18 +1731,9 @@ mod tests {
             cat.tags_for("imdb:tt-t", TagNs::Director).unwrap(),
             vec!["Stanley Tong".to_string()]
         );
-        assert_eq!(
-            cat.tags_for("imdb:tt-t", TagNs::Label).unwrap(),
-            vec!["Kung Fu".to_string()]
-        );
         // Reachable through the CEL→SQL surface: dedicated fields and generic `tags`.
         assert_eq!(
             cat.resolve_query(r#"item.cast.contains("Jackie Chan")"#)
-                .unwrap(),
-            vec!["imdb:tt-t".to_string()]
-        );
-        assert_eq!(
-            cat.resolve_query(r#"item.labels.contains("Kung Fu")"#)
                 .unwrap(),
             vec!["imdb:tt-t".to_string()]
         );
@@ -1964,6 +2117,130 @@ mod tests {
                 .lock()
                 .unwrap()
                 .contains(&"catalog.ingest.plex_collection_unresolved".to_string())
+        );
+    }
+
+    #[test]
+    fn label_member_type_param_matches_section_kind() {
+        assert_eq!(label_member_type_param(Some("movie")), Some(("type", "1")));
+        assert_eq!(label_member_type_param(Some("show")), Some(("type", "4")));
+        assert_eq!(label_member_type_param(Some("other")), None);
+        assert_eq!(label_member_type_param(None), None);
+    }
+
+    /// #136: the actual bug — a channel querying `item.labels.contains(…)`
+    /// resolves the items Plex has that label on, sourced from a per-label
+    /// membership fetch rather than the (always-empty, for bulk) per-item
+    /// `Label` field.
+    #[test]
+    fn ingest_labels_writes_the_label_tag_queryable() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let item = movie(
+            "plex-x",
+            "/data/media/movies/Xmas.mkv",
+            &[(ExternalNs::Imdb, "tt-x")],
+        );
+        ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
+
+        let labels = [ParsedLabel {
+            name: "🎅 Christmas Movies".into(),
+            member_rating_keys: vec!["plex-x".into()],
+        }];
+        let stats = ingest_labels(&cat, &labels).unwrap();
+        assert_eq!(stats.members_written, 1);
+        assert_eq!(stats.members_unresolved, 0);
+        assert_eq!(
+            cat.tags_for("imdb:tt-x", TagNs::Label).unwrap(),
+            vec!["🎅 Christmas Movies".to_string()]
+        );
+        assert_eq!(
+            cat.resolve_query(r#"item.labels.contains("🎅 Christmas Movies")"#)
+                .unwrap(),
+            vec!["imdb:tt-x".to_string()]
+        );
+    }
+
+    /// A ratingKey a label reports that never resolved to a catalog entry
+    /// (not ingested, or FS-only) is skipped, not tagged — same shape as
+    /// `ingest_collections`' `members_unresolved`.
+    #[test]
+    fn ingest_labels_counts_an_unresolved_member() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let labels = [ParsedLabel {
+            name: "Christmas".into(),
+            member_rating_keys: vec!["plex-ghost".into()],
+        }];
+        let stats = ingest_labels(&cat, &labels).unwrap();
+        assert_eq!(stats.members_written, 0);
+        assert_eq!(stats.members_unresolved, 1);
+    }
+
+    /// A member ratingKey a dedupe already collapsed onto another entry (e.g.
+    /// 4K + 1080p) must not double-write the same `(entry, label)` tag row —
+    /// mirrors `ingest_collections_counts_a_deduped_member_once`.
+    #[test]
+    fn ingest_labels_counts_a_deduped_member_once() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let items = [
+            movie(
+                "plex-4k",
+                "/data/media/movies/X-4k.mkv",
+                &[(ExternalNs::Imdb, "tt-dup")],
+            ),
+            movie(
+                "plex-hd",
+                "/data/media/movies/X-1080.mkv",
+                &[(ExternalNs::Imdb, "tt-dup")],
+            ),
+        ];
+        ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+
+        let labels = [ParsedLabel {
+            name: "Christmas".into(),
+            member_rating_keys: vec!["plex-4k".into(), "plex-hd".into()],
+        }];
+        let stats = ingest_labels(&cat, &labels).unwrap();
+        assert_eq!(stats.members_written, 1, "one entry, tagged once");
+        assert_eq!(
+            cat.tags_for("imdb:tt-dup", TagNs::Label).unwrap(),
+            vec!["Christmas".to_string()]
+        );
+    }
+
+    /// The root cause this issue fixes, in reverse: a label removed from an
+    /// item in Plex must not survive a re-ingest. `ingest_labels` is not
+    /// handed a per-entry record to reconcile against (unlike genre/cast/…),
+    /// so it has to clear the whole `label` namespace up front — this proves
+    /// that clear actually reaches an entry absent from the new fetch
+    /// entirely, not just an entry whose label list shrank.
+    #[test]
+    fn ingest_labels_reconciles_wholesale_a_removed_label_does_not_survive() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let item = movie(
+            "plex-y",
+            "/data/media/movies/Y.mkv",
+            &[(ExternalNs::Imdb, "tt-y")],
+        );
+        ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
+
+        ingest_labels(
+            &cat,
+            &[ParsedLabel {
+                name: "Christmas".into(),
+                member_rating_keys: vec!["plex-y".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            cat.tags_for("imdb:tt-y", TagNs::Label).unwrap(),
+            vec!["Christmas".to_string()]
+        );
+
+        // Next pass: Plex reports this item under no label at all.
+        ingest_labels(&cat, &[]).unwrap();
+        assert!(
+            cat.tags_for("imdb:tt-y", TagNs::Label).unwrap().is_empty(),
+            "a label removed upstream must not survive a re-ingest"
         );
     }
 
