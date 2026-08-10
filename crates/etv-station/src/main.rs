@@ -33,6 +33,15 @@ struct Cli {
     /// playout folders it reads are always the ones the daemon writes.
     #[arg(long, value_name = "DIR")]
     render_etv_next: Option<PathBuf>,
+
+    /// Generate the named channel twice from identical inputs (same catalog
+    /// snapshot, seed, and resume state) and report whether the two
+    /// schedules match, then exit — a debug check for a plugin that breaks
+    /// reproducible generation silently (#168). Not part of normal
+    /// generation. Exit code is 0 for identical, 1 for a differing schedule
+    /// or a load/resolve failure.
+    #[arg(long, value_name = "CHANNEL")]
+    check_determinism: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -52,6 +61,10 @@ fn main() -> ExitCode {
 
     if let Some(dir) = cli.render_etv_next.as_deref() {
         return render_etv_next(&cli.config, dir);
+    }
+
+    if let Some(channel) = cli.check_determinism.as_deref() {
+        return check_determinism(&cli.config, channel);
     }
 
     init_tracing(cli.log_format);
@@ -151,6 +164,52 @@ fn render_etv_next(config_path: &Path, out_dir: &Path) -> ExitCode {
         }
         Err(err) => {
             eprintln!("render-etv-next: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Generate `channel_name` twice from identical inputs and print whether the
+/// two schedules match — see `etv_station::determinism::check` (#168) for
+/// what "identical inputs" means and what this can and cannot catch. Exit
+/// code carries the verdict as well as failure, so a script driving this in
+/// CI can rely on the exit code alone: 0 only for a proven-identical pair of
+/// passes.
+fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
+    let mut station = match config::load(config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("check-determinism: failed to load configuration: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    match etv_station::determinism::check(&mut station, channel_name) {
+        Ok(report) if report.is_identical() => {
+            println!(
+                "check-determinism: {} — identical ({} items)",
+                report.channel, report.pass_a_len,
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(report) => {
+            let diff = report
+                .difference
+                .as_ref()
+                .expect("checked above: identical branch already handled");
+            println!(
+                "check-determinism: {} — DIFFERS at position {}: pass A = {}, pass B = {} \
+                 (lengths {} vs {})",
+                report.channel,
+                diff.position,
+                diff.entry_a.as_deref().unwrap_or("<none — pass A ended>"),
+                diff.entry_b.as_deref().unwrap_or("<none — pass B ended>"),
+                report.pass_a_len,
+                report.pass_b_len,
+            );
+            ExitCode::from(1)
+        }
+        Err(err) => {
+            eprintln!("check-determinism: {err}");
             ExitCode::from(1)
         }
     }

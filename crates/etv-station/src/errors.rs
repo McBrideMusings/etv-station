@@ -116,6 +116,11 @@ pub enum StationError {
 
     #[error("task panicked: {0}")]
     Task(String),
+
+    /// No channel named `name` in the loaded station config — a
+    /// `check-determinism` request naming a channel that isn't one of them.
+    #[error("no channel named {name:?} in this station config")]
+    UnknownChannel { name: String },
 }
 
 impl StationError {

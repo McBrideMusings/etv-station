@@ -5,6 +5,7 @@ pub mod channel_card;
 pub mod config;
 pub mod constrain;
 pub mod daemon;
+pub mod determinism;
 pub mod duration;
 pub mod emit;
 pub mod error_card;
