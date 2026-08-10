@@ -560,9 +560,41 @@ fn sources() {
     #{ movies: `item.type == "movie"` }
 }
 
-// Returns entry_ids, most-wanted first.
+// Returns entry_ids, most-wanted first — or, per entry, a record widening
+// what a bare id can say (#166): `#{ entry_id: "…", metadata: #{…}, take: 3 }`.
 fn pick(ctx) { … }
 ```
+
+#### The record shape — `metadata` and a per-entry `take` (#166)
+
+Each element `pick()` returns may be a bare `entry_id` string — unchanged
+since #74 — or a record naming one plus two optional extras:
+
+```rhai
+#{ entry_id: "ghost", metadata: #{ reason: "won an Oscar" }, take: 3 }
+```
+
+`metadata` is opaque, exactly like [`Pool::config`](#pool-config-—-the-scripts-own-tunables-authored-in-yaml):
+the station converts it and carries it untouched to that airing's entry in
+the emitted playout JSON (`PlayoutItem::metadata`), reading nothing out of
+it. A non-finite float anywhere inside — `.inf`, `-.inf`, `.nan` — fails the
+generation and names the key, the same refusal `Pool::config` makes at load.
+An entry with no `metadata` emits no `metadata` key at all. Two plugin pools
+in one block that both resolve the same id and both attach metadata collide
+silently — the same 'blind across pools' limit `constraints` already has;
+pools that must not collide have to be disjoint by construction.
+
+`take` overrides the pattern step's own `take` for that entry's series — a
+"For You" pool asking an unseen show to sample its first three episodes
+while a watched one plays its full run. It travels through pool resolution
+to the pattern draw; a step still spends its own `take` unless a later
+release wires the override in (#173). Zero or negative fails the
+generation, naming the entry.
+
+The widening is additive: a script returning only bare ids, like
+`taste-engine.rhai`, needs no edit. On a `sequencer:` block instead of
+`pattern:`, the record shape parses the same way but `metadata` does not
+yet reach the emitted JSON — see #201.
 
 #### `hooks()` — what a script says it can do
 
