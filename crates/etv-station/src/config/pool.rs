@@ -19,6 +19,38 @@ use serde::{Deserialize, Serialize};
 use super::constraints::Constraints;
 use super::order::Order;
 
+/// A named set of sibling shows — a franchise — declared once on a channel
+/// and referenced by name from any pool's [`Pool::groups`] (#165).
+///
+/// Plex stores a franchise's spin-offs as unrelated shows (*RuPaul's Drag
+/// Race* and *RuPaul's Drag Race All Stars* share no `show_id`), so a pool
+/// grouped or rotated by show treats them as unrelated series. A group makes
+/// their union one rotation domain: `group_by = "season"` still cuts at each
+/// member's own season boundaries, but the series it produces come from every
+/// member show, so `rotate = "visit"` cycles the franchise instead of parking
+/// on one show's runs before moving to the next.
+///
+/// A member is named by its Plex show title, matched exactly against the
+/// catalog's `show` column — the same string a `query` entry's `item.show`
+/// would compare against. A title with no episodes on record fails the
+/// channel's generation, naming both the show and the group (validated
+/// against the catalog, since the structural load pass has no catalog to
+/// check against). A show may belong to more than one group; a pool whose own
+/// [`Pool::groups`] would combine two that share a member is rejected at
+/// load, naming the show — folding it into two rotation domains at once has
+/// no single answer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShowGroup {
+    /// Group name, referenced by [`Pool::groups`]. Unique within a channel
+    /// (validated).
+    pub name: String,
+
+    /// Member show titles, matched exactly against the catalog's `show`
+    /// column.
+    pub shows: Vec<String>,
+}
+
 /// Where a pool's items are cut into series — the buckets a draw picks between.
 ///
 /// The cut is the whole of the "play a season start to finish" feature (#155):
@@ -195,8 +227,9 @@ pub struct Pool {
     pub name: String,
 
     /// CEL expression resolved against the catalog, exactly like a `query`
-    /// entry. Mutually exclusive with [`Pool::plugin`]: a pool names one source
-    /// of items or the other, and validation rejects both or neither.
+    /// entry. Mutually exclusive with [`Pool::plugin`] and [`Pool::groups`]: a
+    /// pool names exactly one source of items, and validation rejects two or
+    /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expr: Option<String>,
 
@@ -236,6 +269,27 @@ pub struct Pool {
     /// and `examples/samples/foryou.yaml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PathBuf>,
+
+    /// Named show groups (#165) this pool draws its items from — every member
+    /// show's episodes, across every group listed, unioned. Mutually
+    /// exclusive with [`Pool::expr`] and [`Pool::plugin`]: a pool names
+    /// exactly one source of items.
+    ///
+    /// Each name is looked up in the channel's own `groups:` declarations
+    /// (unknown name: rejected at load, naming the pool and the group).
+    /// Everything downstream — `group_by`, `select`, `rotate`, `advance`,
+    /// `on_short`, `order`, and the pattern's `take` — treats the unioned set
+    /// exactly like a CEL-resolved one; a group only changes *which* items a
+    /// pool draws, never how the draw itself works.
+    ///
+    /// Naming more than one group is for combining separate franchises in one
+    /// pool (a general "Bravo" pool where RuPaul and Below Deck each stay
+    /// their own rotation domain rather than merging into one). The groups
+    /// named here must be disjoint: two that share a member show are rejected
+    /// at load, naming the show — its episodes would otherwise belong to two
+    /// rotation domains at once, and there is no rule for picking one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 
     /// Internal order of the pool's resolved set. Unset keeps the query's own
     /// order. This also fixes the series rotation order: series rotate in
@@ -429,11 +483,25 @@ expr: 'item.type == "episode"'
         assert_eq!(pool.name, "shows");
         assert!(pool.order.is_none());
         assert!(pool.plugin.is_none());
+        assert!(pool.groups.is_empty());
         // Every knob defaults to the stateless, least-surprising behavior.
         assert_eq!(pool.select, Select::RoundRobin);
         assert_eq!(pool.rotate, Rotate::Visit);
         assert_eq!(pool.advance, Advance::Restart);
         assert_eq!(pool.on_short, OnShort::Next);
+    }
+
+    #[test]
+    fn parses_a_pool_sourced_from_named_groups() {
+        let yaml = r#"
+name: rupaul
+groups: ["rupaul", "below_deck"]
+group_by: season
+"#;
+        let pool: Pool = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(pool.groups, vec!["rupaul", "below_deck"]);
+        assert!(pool.expr.is_none());
+        assert!(pool.plugin.is_none());
     }
 
     #[test]
@@ -544,6 +612,17 @@ on_short: short
         let yaml = "name: movies\nexpr: 'x'\nconstraints:\n  no_repeat_within: 5\n";
         let pool: Pool = serde_norway::from_str(yaml).unwrap();
         assert_eq!(pool.constraints.as_ref().unwrap().no_repeat_within, Some(5));
+    }
+
+    #[test]
+    fn parses_a_show_group() {
+        let yaml = "name: rupaul\nshows:\n  - \"RuPaul's Drag Race\"\n  - \"RuPaul's Drag Race All Stars\"\n";
+        let group: ShowGroup = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(group.name, "rupaul");
+        assert_eq!(
+            group.shows,
+            vec!["RuPaul's Drag Race", "RuPaul's Drag Race All Stars"]
+        );
     }
 
     fn bare(name: &str) -> Pool {

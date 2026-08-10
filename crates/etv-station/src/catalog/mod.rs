@@ -566,6 +566,46 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Every episode `entry_id` belonging to each of the given show titles, one
+    /// round trip, keyed by the title exactly as passed in.
+    ///
+    /// This is how a named show group (#165) turns its declared member shows
+    /// into the flat id list a pool draws from — the union of every member's
+    /// episodes — without building a CEL string from an authored title, which
+    /// would need escaping for any title containing a quote. It also doubles
+    /// as the existence check a group's declaration needs: a title with no
+    /// episodes on record is simply absent from the returned map, which the
+    /// caller reads as "not in the catalog".
+    pub fn episode_ids_for_shows(
+        &self,
+        shows: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, CatalogError> {
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        if shows.is_empty() {
+            return Ok(out);
+        }
+        for chunk in shows.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT entry_id, show FROM entries \
+                 WHERE type = 'episode' AND show IN ({placeholders}) \
+                 ORDER BY show, entry_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, show) = row?;
+                out.entry(show).or_default().push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every id's recorded runtime in milliseconds, in one statement.
     ///
     /// The pattern walk reads this to know how much airtime it has laid down,
@@ -1124,5 +1164,43 @@ mod tests {
         let map = c.show_ids_for(&ids).unwrap();
         assert_eq!(map.len(), 1200);
         assert_eq!(map.get("ep1199").unwrap(), "show:2");
+    }
+
+    #[test]
+    fn episode_ids_for_shows_groups_by_title_and_omits_a_show_with_no_episodes() {
+        let c = cat();
+        let mut ep1 = Entry::new("dr-s9e1", "episode", "Episode 1", Source::Plex);
+        ep1.show = Some("RuPaul's Drag Race".into());
+        c.upsert_entry(&ep1).unwrap();
+        let mut ep2 = Entry::new("as-s3e1", "episode", "Episode 1", Source::Plex);
+        ep2.show = Some("RuPaul's Drag Race All Stars".into());
+        c.upsert_entry(&ep2).unwrap();
+        // A movie with a `show` set (shouldn't happen, but proves the `type`
+        // filter, not the title match, is what excludes it).
+        let mut mov = Entry::new("mov1", "movie", "Untitled", Source::Plex);
+        mov.show = Some("RuPaul's Drag Race".into());
+        c.upsert_entry(&mov).unwrap();
+
+        let shows = vec![
+            "RuPaul's Drag Race".to_string(),
+            "RuPaul's Drag Race All Stars".to_string(),
+            "Untelevised Ghost Show".to_string(),
+        ];
+        let map = c.episode_ids_for_shows(&shows).unwrap();
+        assert_eq!(map.get("RuPaul's Drag Race").unwrap(), &vec!["dr-s9e1"]);
+        assert_eq!(
+            map.get("RuPaul's Drag Race All Stars").unwrap(),
+            &vec!["as-s3e1"]
+        );
+        assert!(
+            !map.contains_key("Untelevised Ghost Show"),
+            "a show with no episodes on record must be absent, not an empty vec"
+        );
+    }
+
+    #[test]
+    fn episode_ids_for_shows_handles_an_empty_request() {
+        let c = cat();
+        assert!(c.episode_ids_for_shows(&[]).unwrap().is_empty());
     }
 }

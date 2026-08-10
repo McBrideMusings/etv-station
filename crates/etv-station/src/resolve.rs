@@ -38,7 +38,7 @@ use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
     BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, ItemEntry, Mode,
-    Order, QueryEntry, SourceConfig,
+    Order, QueryEntry, ShowGroup, SourceConfig,
 };
 use crate::constrain::{ItemKeys, Limits};
 use crate::errors::ConfigError;
@@ -140,6 +140,18 @@ pub fn resolve_channel_with_resume(
     // generation (#46 "unset = fresh per generation").
     let seed = config.seed.unwrap_or_else(fresh_seed);
 
+    // Named show groups (#165) are declared once on the channel and can sit
+    // unreferenced by any pool, so this checks every declared member against
+    // the catalog up front rather than waiting for whichever pool first draws
+    // from it — one place a bad show name is caught, naming the group, rather
+    // than a different error depending on which pool happened to use it.
+    // Structural checks (name uniqueness, an unknown group referenced by a
+    // pool) already ran with no catalog in `config::validate`; this is the
+    // one check that needed one.
+    if let Some(cat) = catalog {
+        validate_groups_against_catalog(path, cat, &config.groups)?;
+    }
+
     // `path_index` is the catalog's canonical-path → entry_id map, built once by
     // the caller (the catalog is immutable after ingest). A manual `local` item
     // whose path is in it inherits that entry_id, so it collapses against a
@@ -161,6 +173,7 @@ pub fn resolve_channel_with_resume(
             source_roots,
             path_index,
             catalog,
+            &config.groups,
             seed,
             state,
             scoring,
@@ -283,6 +296,48 @@ pub fn resolve_channel_with_resume(
     }
 
     Ok((out, resume_out))
+}
+
+/// Every declared show group's member shows must have at least one episode on
+/// record (#165). Checked once, for every declared group, rather than once
+/// per pool that happens to reference one — the same bad title fails the same
+/// way whether or not something currently draws from it.
+///
+/// Structural checks — an unknown group name a pool references, two of a
+/// pool's own groups sharing a show — need no catalog and already ran in
+/// `config::validate`; this is the one check that does.
+fn validate_groups_against_catalog(
+    path: &Path,
+    catalog: &Catalog,
+    groups: &[ShowGroup],
+) -> Result<(), ConfigError> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let all_shows: Vec<String> = groups
+        .iter()
+        .flat_map(|g| g.shows.iter().cloned())
+        .collect();
+    let found = catalog
+        .episode_ids_for_shows(&all_shows)
+        .map_err(|e| ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!("checking show groups against the catalog: {e}"),
+        })?;
+    for group in groups {
+        for show in &group.shows {
+            if found.get(show).is_none_or(Vec::is_empty) {
+                return Err(ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "group {:?} names show {:?}, which is not in the catalog",
+                        group.name, show
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the per-item keys the adjacency pass compares: the `entry_id`, plus
@@ -440,6 +495,7 @@ fn resolve_block(
     source_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
+    groups: &[ShowGroup],
     seed: u64,
     state: &GenerationState,
     scoring: &crate::score::ScoreInputs,
@@ -481,6 +537,7 @@ fn resolve_block(
         let (ids, pools) = crate::pattern::build(
             cat,
             &include.pools,
+            groups,
             &include.pattern,
             include.cycles,
             include.constraints.as_ref(),
@@ -939,6 +996,7 @@ mod tests {
             seed: None,
             anchor: None,
             rule: RuleConfig { blocks },
+            groups: Vec::new(),
             overlay: None,
         }
     }
@@ -1580,6 +1638,7 @@ mod tests {
                 name: "movies".into(),
                 expr: Some("item.type == \"movie\"".into()),
                 plugin: None,
+                groups: Vec::new(),
                 order: Some(Order::parse("title:asc").unwrap()),
                 bucket_order: None,
                 group_by: Default::default(),
@@ -1594,6 +1653,7 @@ mod tests {
                 name: "shows".into(),
                 expr: Some("item.type == \"episode\"".into()),
                 plugin: None,
+                groups: Vec::new(),
                 order: Some(Order::parse("season:asc,episode:asc").unwrap()),
                 bucket_order: None,
                 group_by: Default::default(),
@@ -2131,5 +2191,78 @@ mod tests {
             ids,
             vec!["imdb:tt0167260", "imdb:tt0167261", "imdb:tt0120737"]
         );
+    }
+
+    // ---- named show groups (#165) -----------------------------------------
+
+    /// A `groups`-sourced pool draws every member show's episodes and resolves
+    /// through the whole pipeline exactly like an `expr` pool would, proving
+    /// the group is a source swap and nothing downstream had to change.
+    #[test]
+    fn a_groups_sourced_pool_resolves_through_the_whole_pipeline() {
+        use crate::config::{
+            Advance, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, Take, TakeFrom,
+        };
+
+        let cat = interleave_catalog();
+        let mut inc = include_with(vec![]);
+        inc.pools = vec![Pool {
+            name: "shows".into(),
+            expr: None,
+            plugin: None,
+            groups: vec!["franchise".into()],
+            order: None,
+            bucket_order: None,
+            group_by: GroupBy::Show,
+            select: Select::RoundRobin,
+            rotate: Rotate::Visit,
+            advance: Advance::Restart,
+            on_short: OnShort::Next,
+            constraints: None,
+            config: None,
+        }];
+        inc.pattern = vec![PatternStep {
+            pool: "shows".into(),
+            take: Take::All,
+            from: TakeFrom::Start,
+            chance: 1.0,
+        }];
+
+        let mut cfg = channel(vec![inc]);
+        cfg.groups = vec![ShowGroup {
+            name: "franchise".into(),
+            shows: vec!["got".into(), "inv".into()],
+        }];
+
+        let items = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["got-e1", "got-e2", "got-e3", "got-e4", "inv-e1", "inv-e2"],
+            "a `groups` pool must draw every member show's episodes"
+        );
+    }
+
+    #[test]
+    fn validate_groups_against_catalog_names_the_show_and_the_group() {
+        let cat = interleave_catalog();
+        let groups = vec![ShowGroup {
+            name: "franchise".into(),
+            shows: vec!["got".into(), "Nonexistent Show".into()],
+        }];
+        let err = validate_groups_against_catalog(path(), &cat, &groups).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("franchise"), "err = {msg}");
+        assert!(msg.contains("Nonexistent Show"), "err = {msg}");
+    }
+
+    #[test]
+    fn validate_groups_against_catalog_passes_when_every_member_has_episodes() {
+        let cat = interleave_catalog();
+        let groups = vec![ShowGroup {
+            name: "franchise".into(),
+            shows: vec!["got".into(), "inv".into()],
+        }];
+        assert!(validate_groups_against_catalog(path(), &cat, &groups).is_ok());
     }
 }

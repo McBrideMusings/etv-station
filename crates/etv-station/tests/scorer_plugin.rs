@@ -70,6 +70,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
         retention_days: 1,
         seed: Some(7),
         overlay: None,
+        groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
                 block: None,
@@ -84,6 +85,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     name: "foryou".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),
+                    groups: Vec::new(),
                     order: None,
                     bucket_order: None,
                     group_by: Default::default(),
