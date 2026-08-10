@@ -596,6 +596,12 @@ events, `#{entry_id, watched_at}`), `ctx.recent` (what this channel aired most
 recently, oldest first), `ctx.now` (unix seconds at generation time), and
 `ctx.config` (this pool's `config:` block — see below).
 
+### The determinism contract
+
+A plugin must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — the same inputs the station itself is pure over. Nothing in `ctx` is optional to use instead of an ambient read: `ctx.now` is unix seconds at generation time, handed in precisely so a script never has to call the clock itself, and `ctx.history` / `ctx.recent` are the only watch/replay state a script sees. A script that reads Rhai's own `timestamp()`/`elapsed()`, or ranks by anything else not reachable through `ctx`, produces a different schedule from the same inputs — and the schedule still looks completely valid, so nothing errors and nothing on screen says which run is "right".
+
+`etv-station --check-determinism <channel>` generates the named channel twice from identical inputs (config, catalog snapshot, seed, and — the empty, stateless kind — resume state) and diffs the two resulting schedules. It reports identical, or the first airing position where they disagree and both entry ids there, so the failure names a place to start rather than a bare "not reproducible". It measures only: it does not fix a plugin that fails it, and it is a debug check, not part of normal generation.
+
 ### Writing a plugin that finishes
 
 `pick()` runs once per generation, per pool, and the station waits for it. The

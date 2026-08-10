@@ -111,6 +111,8 @@ There is **one** model, not one per rule. An earlier design had a separate "Loop
 **Determinism**
 Generation is a pure function of `(catalog, config, resume_in)`: the same three inputs always produce the same items and the same `resume_out`. This is what makes regeneration after a config edit safe.
 
+Purity extends to plugins: a `plugin:` pool's script must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — no wall-clock read, no unseeded randomness, no iteration order a script cannot control. `etv-station --check-determinism <channel>` generates a channel twice from identical inputs and diffs the two schedules, naming the first differing position and both entry ids, so a plugin that breaks this silently is caught rather than shipped (#168). It measures only — it does not make anything deterministic that is not already.
+
 ### Pattern interleave (Phase C)
 
 A block declares named **pools** and a repeating **pattern** instead of a flat `entries` list — "1 movie, then 3 episodes, repeat", drawing each step from a different resolved set while every series progresses independently. A block is one or the other; a pattern block that also carries a block-level `order` or `duplicates: collapse` is rejected at load, because either would silently undo the interleave.
