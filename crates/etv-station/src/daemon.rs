@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
+use ersatztv_playout::playout::Playout;
 use time::OffsetDateTime;
 use time_tz::Tz;
 use tokio::select;
@@ -15,10 +16,16 @@ use crate::config::{ChannelConfig, LoadedChannel, ScoringConfig, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
 use crate::errors::{ConfigError, StationError};
+use crate::history::HistoryDb;
 use crate::overlay_supervisor;
 use crate::scan;
 use crate::tautulli::HistoryScope;
 use crate::tz as tzmod;
+
+/// The station-wide history database's filename, under `output_base` — a
+/// sibling of every channel's own output folder rather than inside one of
+/// them, since it is shared by all of them (#111).
+const HISTORY_DB_NAME: &str = "history.db";
 
 pub async fn run(station: Station) -> Result<(), StationError> {
     let config_path = station.config_path.clone();
@@ -43,6 +50,14 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // reopened on reload (#96), so a later reload that changes these diverges.
     let opened_catalog_path = station.station.catalog_path.clone();
     let opened_source_roots = station.station.source_roots.clone();
+    // The station-wide play-history database (#111): one file under
+    // `output_base`, shared by every channel and distinguished by a `channel`
+    // column, opened once for the same reason the catalog is — every channel
+    // task below gets a reference to this one handle rather than each
+    // managing its own.
+    let history_db = Arc::new(HistoryDb::open(
+        station.station.output_base.join(HISTORY_DB_NAME),
+    )?);
     // The last config that prepared cleanly. A `prepare_generation` failure on a
     // reload reverts to this instead of killing a daemon that's streaming fine.
     // See #90 and docs/adr/0001-reload-generation-revert.md.
@@ -74,8 +89,15 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         // Spawn the generation, run it until a signal, then tear it down. The
         // whole generation is joined before we return here, which is what lets
         // the `station` Arc be swapped safely below (no task still reads it).
-        let (do_reload, first_err) =
-            run_generation(&station, tz, catalog.as_ref(), &shutdown, &reload).await;
+        let (do_reload, first_err) = run_generation(
+            &station,
+            tz,
+            catalog.as_ref(),
+            &history_db,
+            &shutdown,
+            &reload,
+        )
+        .await;
 
         // On shutdown a channel that failed on its own becomes the daemon's exit
         // error. `channel_loop` only returns `Err` from its startup section
@@ -153,6 +175,11 @@ struct StationContext<'a> {
     source_roots: &'a [String],
     catalog: Option<&'a CatalogInfo>,
     history: &'a SharedHistory,
+    /// The station-wide play-history database (#111). Named distinctly from
+    /// `history` above — that field is the *watch* history a scorer plugin
+    /// reads (`ctx.history`); this one is the play-history ledger every
+    /// channel appends to and projects its resume cursor from.
+    history_db: &'a HistoryDb,
 }
 
 /// The station's copy of "what has been watched lately" — one per distinct
@@ -522,6 +549,7 @@ async fn run_generation(
     station: &Arc<Station>,
     tz: &'static Tz,
     catalog: Option<&Arc<CatalogInfo>>,
+    history_db: &Arc<HistoryDb>,
     shutdown: &Notify,
     reload: &Notify,
 ) -> (bool, Option<StationError>) {
@@ -568,6 +596,7 @@ async fn run_generation(
         let s = station.clone();
         let cat = catalog.cloned();
         let hist = history.clone();
+        let hdb = history_db.clone();
         let stop = Arc::new(Notify::new());
         stops.push(stop.clone());
         let channel_name = station.channels[idx].name.clone();
@@ -583,6 +612,7 @@ async fn run_generation(
                     source_roots: &s.station.source_roots,
                     catalog: cat.as_deref(),
                     history: &hist,
+                    history_db: &hdb,
                 };
                 let result = supervise_channel(ch, ctx, stop).await;
                 (ch.name.clone(), result)
@@ -1197,6 +1227,158 @@ async fn wipe_playout_from(
     Ok(removed)
 }
 
+/// The earliest instant it is safe to wipe and regenerate from, given a raw
+/// `from` (a chunk boundary or checkpoint instant with no guarantee of
+/// landing on an item boundary).
+///
+/// `emit_window` deliberately emits a boundary-straddling item whole into
+/// both neighbouring chunks so either side can play across the seam (see its
+/// doc comment), and `wipe_playout_from` correctly leaves the chunk file
+/// immediately before `from` in place — it also holds earlier items that are
+/// still valid. But the straddling item survives with it, still airing past
+/// `from`, so wiping and regenerating at the raw `from` lays a fresh item
+/// over one that is already scheduled there (#153). Advancing to the
+/// straddling item's real finish is what keeps the two from overlapping.
+/// Returns `from` unchanged when nothing straddles it.
+async fn regen_floor(
+    channel: &LoadedChannel,
+    from: OffsetDateTime,
+) -> Result<OffsetDateTime, StationError> {
+    let files = scan::scan_output_folder(&channel.output_folder).await?;
+    let Some(preceding) = files
+        .iter()
+        .filter(|f| f.start < from)
+        .max_by_key(|f| f.start)
+    else {
+        return Ok(from);
+    };
+    let bytes = tokio::fs::read(&preceding.path)
+        .await
+        .map_err(|source| StationError::Io {
+            path: preceding.path.clone(),
+            source,
+        })?;
+    let playout: Playout =
+        serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
+            path: preceding.path.clone(),
+            source,
+        })?;
+    let content_finish = playout.items.last().map(|item| item.finish).unwrap_or(from);
+    Ok(content_finish.max(from))
+}
+
+#[cfg(test)]
+mod regen_floor_tests {
+    use super::*;
+    use crate::rule::Sequential;
+    use tempfile::tempdir;
+    use time::macros::datetime;
+
+    fn ch(dir: &tempfile::TempDir) -> LoadedChannel {
+        let config: ChannelConfig = toml::from_str(
+            "window_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n[rule]\nblocks = []\n",
+        )
+        .expect("fixture channel config parses");
+        LoadedChannel {
+            name: "testch".into(),
+            config_path: PathBuf::from("testch.toml"),
+            output_folder: dir.path().to_path_buf(),
+            config,
+        }
+    }
+
+    fn film(id: &str, secs: u64) -> crate::resolve::ResolvedItem {
+        crate::resolve::ResolvedItem {
+            id: id.into(),
+            source: crate::config::SourceConfig::Lavfi {
+                params: format!("src={id}"),
+            },
+            in_point: Some(Duration::ZERO),
+            out_point: Some(Duration::from_secs(secs)),
+            program: None,
+            catalog_duration: None,
+            error_card: false,
+        }
+    }
+
+    /// The exact #153 shape: an 8-hour film starting an hour before a 6-hour
+    /// chunk boundary, so it is emitted whole into the chunk ending at that
+    /// boundary (per `emit_window`'s doc comment) with the boundary as its
+    /// filename finish — even though the film really runs another 7 hours past
+    /// it. A wipe at the boundary correctly leaves that chunk file alone, but
+    /// `regen_floor` must still read past the filename to the film's real end.
+    #[tokio::test]
+    async fn advances_past_a_film_straddling_the_wipe_point() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let boundary = datetime!(2026-01-01 06:00 UTC);
+        let anchor = boundary - time::Duration::hours(1);
+        let items = vec![film("fellowship", 8 * 3600)];
+        let durations = vec![Duration::from_secs(8 * 3600)];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        // What a #153 regeneration does before this fix: wipe everything at or
+        // after the boundary, stranding the boundary-named chunk as the only
+        // survivor.
+        wipe_playout_from(&channel, boundary).await.unwrap();
+
+        let floor = regen_floor(&channel, boundary).await.unwrap();
+        assert_eq!(
+            floor,
+            anchor + time::Duration::hours(8),
+            "must not land inside the still-airing film"
+        );
+    }
+
+    /// A chunk whose content fills it exactly, with nothing straddling the
+    /// boundary, must not be pushed forward — there is nothing to protect.
+    #[tokio::test]
+    async fn leaves_a_clean_boundary_untouched() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let anchor = datetime!(2026-01-01 00:00 UTC);
+        let items = vec![film("a", 6 * 3600)];
+        let durations = vec![Duration::from_secs(6 * 3600)];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        let boundary = datetime!(2026-01-01 06:00 UTC);
+        assert_eq!(regen_floor(&channel, boundary).await.unwrap(), boundary);
+    }
+
+    /// Nothing written yet: regen_floor is a no-op, not an error.
+    #[tokio::test]
+    async fn returns_from_unchanged_with_no_existing_files() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let from = datetime!(2026-01-01 06:00 UTC);
+        assert_eq!(regen_floor(&channel, from).await.unwrap(), from);
+    }
+}
+
 /// The emission loop for every channel: **materialize forward**.
 ///
 /// Each pass resolves the channel, lays the resulting sequence end-to-end after
@@ -1246,24 +1428,37 @@ async fn forward_channel_loop(
     }
     let mut resume = resume;
 
-    // The play-history ledger (#70) — the single record of what this channel
-    // has aired, and the thing each series' resume position is derived from.
-    // Loaded once here and carried across every tick, so a catch-up chaining
-    // many generations never re-reads it.
-    let (mut ledger, skipped) = crate::history::load(&channel.output_folder).await?;
-    if skipped > 0 {
+    // The play-history database (#70, promoted to sqlite by #111) — the
+    // single record of what this channel has aired, and the thing each
+    // series' resume position is derived from. A channel's old `.history`
+    // JSONL sidecar is migrated into it exactly once; every read after that
+    // is an indexed query against `ctx.history_db`, never a full-file parse.
+    let migration = ctx
+        .history_db
+        .migrate_channel(&channel.name, &channel.output_folder)
+        .await?;
+    if migration.skipped > 0 {
         tracing::warn!(
             event = "history.partial",
             channel = %channel.name,
-            skipped = skipped,
-            "skipped unparseable play-history lines; affected series resume from an earlier position",
+            skipped = migration.skipped,
+            "skipped unparseable play-history lines while migrating; affected series resume from an earlier position",
+        );
+    }
+    if !migration.already_done {
+        tracing::info!(
+            event = "history.migrated",
+            channel = %channel.name,
+            migrated = migration.migrated,
+            skipped = migration.skipped,
+            "migrated play history from the .history sidecar into the sqlite store",
         );
     }
     tracing::info!(
-        event = "history.load",
+        event = "history.ready",
         channel = %channel.name,
-        airings = ledger.len(),
-        "loaded play history",
+        airings = ctx.history_db.count(&channel.name)?,
+        "play history store ready",
     );
 
     // Startup: throw away the future this channel had already written and
@@ -1279,23 +1474,23 @@ async fn forward_channel_loop(
     // played out (#53).
     let now = OffsetDateTime::now_utc();
     if let Some(regen_from) = resume.rewind_to_unaired(now) {
+        let regen_from = regen_floor(channel, regen_from).await?;
         let removed = wipe_playout_from(channel, regen_from).await?;
         // Those airings are no longer scheduled, so they are no longer history.
-        // Because the resume position is a projection of the ledger, dropping
+        // Because the resume position is a projection of the store, dropping
         // them is also what rewinds each series — the two cannot disagree.
-        ledger.truncate_from(regen_from);
-        crate::history::save(&channel.output_folder, &mut ledger).await?;
+        ctx.history_db.truncate_from(&channel.name, regen_from)?;
         tracing::info!(
             event = "resume.rewind",
             channel = %channel.name,
             from = %regen_from,
             removed = removed,
-            airings = ledger.len(),
+            airings = ctx.history_db.count(&channel.name)?,
             "rewound to the earliest unaired generation; regenerating it from the current config",
         );
     }
 
-    resume = pattern_catch_up(channel, ctx, &mut catalog, resume, &mut ledger, "startup").await?;
+    resume = pattern_catch_up(channel, ctx, &mut catalog, resume, "startup").await?;
 
     let mut interval = tokio::time::interval(channel.config.roll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1309,7 +1504,7 @@ async fn forward_channel_loop(
             }
             _ = interval.tick() => {
                 let tick = async {
-                    match pattern_catch_up(channel, ctx, &mut catalog, resume.clone(), &mut ledger, "roll").await {
+                    match pattern_catch_up(channel, ctx, &mut catalog, resume.clone(), "roll").await {
                         Ok(next) => resume = next,
                         Err(err) => tracing::error!(
                             event = "roll.error",
@@ -1357,7 +1552,6 @@ async fn pattern_catch_up(
     ctx: StationContext<'_>,
     catalog: &mut Option<Catalog>,
     mut resume: crate::resume::ResumeMap,
-    ledger: &mut crate::history::Ledger,
     phase: &'static str,
 ) -> Result<crate::resume::ResumeMap, StationError> {
     let output = &channel.output_folder;
@@ -1375,13 +1569,12 @@ async fn pattern_catch_up(
     let swept = scan::sweep_window(output, channel.config.retention_days, unreachable, now).await;
     if swept.unreachable > 0 {
         // The deleted spans have records: pool checkpoints in the sidecar and
-        // airings in the ledger, both dated in the span just removed. Left
-        // standing, `ledger.tail()` would hand the scorer a "recently aired"
-        // list from years in the future. Same three calls the coverage-heal
-        // path makes below, at the same cutoff.
+        // airings in the play-history store, both dated in the span just
+        // removed. Left standing, `tail()` would hand the scorer a "recently
+        // aired" list from years in the future. Same two calls the
+        // coverage-heal path makes below, at the same cutoff.
         resume.rewind_to(unreachable);
-        ledger.truncate_from(unreachable);
-        crate::history::save(output, ledger).await?;
+        ctx.history_db.truncate_from(&channel.name, unreachable)?;
         crate::resume::save(output, &resume).await?;
     }
     if swept.total() > 0 {
@@ -1416,15 +1609,14 @@ async fn pattern_catch_up(
         now + time::Duration::seconds_f64(channel.config.roll_interval.as_secs_f64() * 2.0)
     };
     if let Some(gap) = scan::first_coverage_gap(output, now, heal_horizon).await? {
-        let regen_from =
-            tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, ctx.tz);
+        let boundary = tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, ctx.tz);
+        let regen_from = regen_floor(channel, boundary).await?;
         let removed = wipe_playout_from(channel, regen_from).await?;
         // Best-effort pool alignment: rewind to the checkpoint covering the hole
         // if it survives, else leave the pools as they are and accept a possible
         // seam glitch — either way the black is gone once the loop regenerates.
         resume.rewind_to(regen_from);
-        ledger.truncate_from(regen_from);
-        crate::history::save(output, ledger).await?;
+        ctx.history_db.truncate_from(&channel.name, regen_from)?;
         crate::resume::save(output, &resume).await?;
         tracing::warn!(
             event = "coverage.heal",
@@ -1501,12 +1693,15 @@ async fn pattern_catch_up(
         // still in the future.
         resume.checkpoint(from);
 
-        // Where each series left off comes from the ledger, not from a cursor
-        // of the sidecar's own (#70): one record, projected on demand.
+        // Where each series left off comes from the play-history store, not
+        // from a cursor of the sidecar's own (#70): one table, projected on
+        // demand via an indexed query, never a whole-file read.
         let state = crate::resume::GenerationState {
             resume: resume.clone(),
-            cursor: ledger.series_cursor(),
-            tail: ledger.tail(channel.config.adjacency_reach()),
+            cursor: ctx.history_db.series_cursor(&channel.name)?,
+            tail: ctx
+                .history_db
+                .tail(&channel.name, channel.config.adjacency_reach())?,
         };
 
         // Sized to one chunk, not to the whole remaining window: the generation
@@ -1515,7 +1710,7 @@ async fn pattern_catch_up(
         let scoring = crate::score::ScoreInputs {
             target_count: target_count(&channel.config, from, target),
             history: Arc::clone(&history),
-            recent: ledger.tail(recent_depth),
+            recent: ctx.history_db.tail(&channel.name, recent_depth)?,
             now: now.unix_timestamp(),
         };
 
@@ -1677,10 +1872,11 @@ async fn pattern_catch_up(
         .await?;
         log_emission(&channel.name, phase, &written, from, to);
 
-        // One ledger row per scheduled airing, in schedule order. The times are
-        // the same walk `Sequential` just emitted: items laid end to end from
-        // `from`, which is why the whole generation is emitted rather than
-        // clamped — a row must correspond to something actually on disk.
+        // One play-history row per scheduled airing, in schedule order. The
+        // times are the same walk `Sequential` just emitted: items laid end
+        // to end from `from`, which is why the whole generation is emitted
+        // rather than clamped — a row must correspond to something actually
+        // on disk.
         //
         // `written_at` is read per generation rather than reusing the tick's
         // `now`: a catch-up can chain many generations, and stamping them all
@@ -1706,8 +1902,7 @@ async fn pattern_catch_up(
                 }
             })
             .collect();
-        ledger.extend(records);
-        crate::history::save(output, ledger).await?;
+        ctx.history_db.record(&channel.name, &records)?;
 
         // `resume_out` carries only pool state; the checkpoint trail is the
         // daemon's, so it rides across rather than being replaced.

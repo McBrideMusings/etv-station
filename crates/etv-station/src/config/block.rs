@@ -2,7 +2,7 @@ use ersatztv_playout::playout::ProgramMetadata;
 use serde::{Deserialize, Serialize};
 
 use super::constraints::Constraints;
-use super::entry::Entry;
+use super::entry::{Entry, Fallback};
 use super::pool::{PatternStep, Pool};
 
 /// Within-block duplicate policy (#46 locked decision). Block-scoped:
@@ -43,6 +43,12 @@ pub struct BlockFile {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<Entry>,
+
+    /// Resolved instead of `entries` when `entries` resolves to nothing
+    /// eligible (#97). `None` keeps today's behavior — an empty resolution
+    /// stays empty. See [`Fallback`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Fallback>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<Pool>,
@@ -97,6 +103,71 @@ params = "testsrc"
         // Unset on disk stays unset; `BlockInclude::duplicates()` applies the
         // per-block-kind default.
         assert_eq!(block.duplicates, None);
+    }
+
+    #[test]
+    fn fallback_defaults_to_none() {
+        let toml = r#"
+[[entries]]
+kind = "item"
+[entries.source]
+kind = "lavfi"
+params = "testsrc"
+"#;
+        let block: BlockFile = toml::from_str(toml).unwrap();
+        assert!(block.fallback.is_none());
+    }
+
+    #[test]
+    fn parses_a_query_fallback() {
+        use crate::config::{Fallback, Order};
+
+        let yaml = r#"
+entries:
+  - kind: item
+    source:
+      kind: lavfi
+      params: testsrc
+fallback:
+  kind: query
+  query: "item.type == 'movie'"
+  order: "random"
+"#;
+        let block: BlockFile = serde_norway::from_str(yaml).unwrap();
+        match block.fallback {
+            Some(Fallback::Query(q)) => {
+                assert_eq!(q.query, "item.type == 'movie'");
+                assert_eq!(q.order, Some(Order::Random));
+            }
+            other => panic!("expected a query fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_an_item_fallback() {
+        use crate::config::{Fallback, SourceConfig};
+
+        let toml = r#"
+[[entries]]
+kind = "item"
+[entries.source]
+kind = "lavfi"
+params = "testsrc"
+
+[fallback]
+kind = "item"
+[fallback.source]
+kind = "lavfi"
+params = "standby"
+"#;
+        let block: BlockFile = toml::from_str(toml).unwrap();
+        match block.fallback {
+            Some(Fallback::Item(item)) => match item.source {
+                SourceConfig::Lavfi { params } => assert_eq!(params, "standby"),
+                other => panic!("expected a lavfi source, got {other:?}"),
+            },
+            other => panic!("expected an item fallback, got {other:?}"),
+        }
     }
 
     #[test]

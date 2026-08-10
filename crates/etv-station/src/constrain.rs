@@ -48,8 +48,8 @@
 //! fresh list after it, so the constraints reach *backwards across that
 //! boundary*: the first item of this list airs immediately after the last item
 //! of the previous one. `preceding` carries that tail — the most recently aired
-//! items, oldest first — projected from the play-history ledger
-//! ([`crate::history::Ledger::tail`]).
+//! items, oldest first — projected from the play-history store
+//! ([`crate::history::HistoryDb::tail`]).
 //!
 //! The list is emphatically **not** circular. Position `n-1` and position `0` of
 //! one generation never air next to each other; `n-1` is followed by whatever

@@ -18,6 +18,14 @@
 //! `collections` + ordered `collection_items`, with each member's ratingKey
 //! resolved back to its `entry_id` via the `plex` provenance row.
 //!
+//! Plex files TV collections with `subtype="show"` — their children are
+//! *shows*, which the catalog never stores (only `movie` and `episode`
+//! entries exist). [`PlexClient::fetch_collections`] expands any
+//! show-subtype container's member shows to their episode ratingKeys before
+//! [`ingest_collections`] ever sees them (#119), so the pure core stays
+//! generic: it always resolves membership ratingKeys straight to entries,
+//! regardless of what kind of container produced the list.
+//!
 //! [`ingest`] takes a `since` cursor: when set, each section is asked
 //! only for records with `updatedAt>=since` and a collection whose own
 //! `updatedAt` predates it skips its children request. That is what keeps a
@@ -389,6 +397,21 @@ pub fn ingest_collections(
                 None => stats.members_unresolved += 1,
             }
         }
+        // Plex reported members for this collection, but every one of them
+        // failed to resolve to a catalog entry — the collection is about to
+        // sit empty in the catalog exactly like the 54 in #119, just for a
+        // different reason (e.g. every member show has no ingested
+        // episodes). Log it with the name so it is findable rather than a
+        // silent zero, matching the no-playback-source warning in resolve.rs.
+        if position == 0 && !coll.member_rating_keys.is_empty() {
+            tracing::warn!(
+                event = "catalog.ingest.plex_collection_unresolved",
+                collection = %coll.name,
+                collection_id = %coll.collection_id,
+                reported_members = coll.member_rating_keys.len(),
+                "Plex reported members for this collection but none resolved to a catalog entry; collection will be empty",
+            );
+        }
     }
     Ok(stats)
 }
@@ -576,6 +599,32 @@ fn tagged(fields: &[TaggedField]) -> Vec<String> {
     fields.iter().filter_map(|f| f.tag.clone()).collect()
 }
 
+/// Query parameters for one section's bulk listing request in [`PlexClient::fetch_all`].
+///
+/// `includeGuids=1` is always present (#183): Plex omits `<Guid>` elements
+/// from a bulk section listing unless explicitly asked, which left every
+/// production catalog entry identified by a path hash instead of its
+/// `imdb`/`tmdb`/`tvdb` id. Verified against the live server to compose with
+/// the delta filter — `type=4&includeGuids=1&updatedAt>=X` returns the same
+/// `totalSize` as the same query without `includeGuids`.
+fn section_list_params<'a>(
+    kind: Option<&str>,
+    since_param: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    // Movies come back directly; a show section is expanded to its episode
+    // leaves (type=4).
+    let mut params: Vec<(&str, &str)> = match kind {
+        Some("show") => vec![("type", "4")],
+        Some("movie") => vec![("type", "1")],
+        _ => Vec::new(),
+    };
+    params.push(("includeGuids", "1"));
+    if let Some(s) = since_param {
+        params.push(("updatedAt>", s));
+    }
+    params
+}
+
 // ---- HTTP client (thin outer layer) --------------------------------------
 
 struct PlexClient {
@@ -631,6 +680,11 @@ impl PlexClient {
 
     /// Every movie and episode across all library sections, as [`PlexItem`]s.
     ///
+    /// Every request carries `includeGuids=1` (#183) — see
+    /// [`section_list_params`] — so `<Guid>` elements are present and
+    /// [`to_plex_item`] has external ids to hand `derive_entry_id`, instead of
+    /// every entry falling back to a path-hash `fs:` id.
+    ///
     /// `since` (unix seconds) narrows each section to items Plex has touched
     /// after that moment, via the server-side `updatedAt>=` filter. On a library
     /// of ~86k items that is the difference between 20s of transfer and a
@@ -660,16 +714,7 @@ impl PlexClient {
             let Some(id) = section.key.as_deref() else {
                 continue;
             };
-            // Movies come back directly; a show section is expanded to its
-            // episode leaves (type=4).
-            let mut params: Vec<(&str, &str)> = match section.kind.as_deref() {
-                Some("show") => vec![("type", "4")],
-                Some("movie") => vec![("type", "1")],
-                _ => Vec::new(),
-            };
-            if let Some(s) = since_param.as_deref() {
-                params.push(("updatedAt>", s));
-            }
+            let params = section_list_params(section.kind.as_deref(), since_param.as_deref());
             let endpoint = format!("/library/sections/{id}/all");
             let resp: MediaContainerResp = self.get(&endpoint, &params)?;
             for m in &resp.media_container.metadata {
@@ -692,12 +737,22 @@ impl PlexClient {
     /// children request for any collection whose own `updatedAt` predates it,
     /// which is what makes a warm restart cheap. A collection omitted this way
     /// keeps the membership already in the catalog.
+    ///
+    /// A show-subtype collection's children are shows, not episodes (#119):
+    /// [`Self::episodes_of`] is called once per distinct member show to expand
+    /// each one to its episode ratingKeys, and [`expand_show_members`] flattens
+    /// the result back into authored order. `episode_cache` is shared across
+    /// every collection in this one `fetch_collections` call, because a show
+    /// commonly belongs to more than one collection and its ~45-episode leaf
+    /// list is not worth re-fetching for each.
     fn fetch_collections(
         &self,
         since: Option<i64>,
     ) -> Result<Vec<ParsedCollection>, PlexIngestError> {
         let sections: SectionListResp = self.get("/library/sections", &[])?;
         let mut out = Vec::new();
+        let mut episode_cache: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for section in &sections.media_container.directory {
             let Some(id) = section.key.as_deref() else {
                 continue;
@@ -718,21 +773,82 @@ impl PlexClient {
                 }
                 let members_ep = format!("/library/metadata/{collection_id}/children");
                 let members: MediaContainerResp = self.get(&members_ep, &[])?;
-                let member_rating_keys = members
+                let member_keys: Vec<String> = members
                     .media_container
                     .metadata
                     .iter()
                     .filter_map(|m| m.rating_key.clone())
                     .collect();
+                let name = c.title.clone().unwrap_or_default();
+                let member_rating_keys = if c.subtype.as_deref() == Some("show") {
+                    for show_key in &member_keys {
+                        if episode_cache.contains_key(show_key) {
+                            continue;
+                        }
+                        let keys = self.episodes_of(show_key)?;
+                        episode_cache.insert(show_key.clone(), keys);
+                    }
+                    expand_show_members(&member_keys, &episode_cache)
+                } else {
+                    member_keys
+                };
+                // Plex's own child count says this collection has members, but
+                // the children fetch (or, for a show collection, every member
+                // show's leaf fetch) came back with none to record — a smart
+                // collection is the known case (its `/children` reliably
+                // returns zero regardless of subtype). Log it with the name
+                // rather than let the collection sit silently empty.
+                if member_rating_keys.is_empty() && c.child_count.unwrap_or(0) > 0 {
+                    tracing::warn!(
+                        event = "catalog.ingest.plex_collection_no_members_fetched",
+                        collection = %name,
+                        collection_id = %collection_id,
+                        plex_child_count = c.child_count.unwrap_or(0),
+                        "Plex reports members for this collection but the API returned none",
+                    );
+                }
                 out.push(ParsedCollection {
                     collection_id,
-                    name: c.title.clone().unwrap_or_default(),
+                    name,
                     member_rating_keys,
                 });
             }
         }
         Ok(out)
     }
+
+    /// A show's episode ratingKeys in broadcast order, via Plex's `allLeaves`
+    /// endpoint (all episodes across all seasons, recursively). Empty if the
+    /// show has none.
+    fn episodes_of(&self, show_rating_key: &str) -> Result<Vec<String>, PlexIngestError> {
+        let endpoint = format!("/library/metadata/{show_rating_key}/allLeaves");
+        let resp: MediaContainerResp = self.get(&endpoint, &[])?;
+        Ok(resp
+            .media_container
+            .metadata
+            .iter()
+            .filter_map(|e| e.rating_key.clone())
+            .collect())
+    }
+}
+
+/// Flatten a show-subtype collection's member shows to their episode
+/// ratingKeys: shows in `show_rating_keys`' order, each show's own episodes in
+/// the order `episodes` recorded them. A show absent from `episodes` (no
+/// leaves, or never fetched) contributes nothing rather than erroring — the
+/// caller who populates `episodes` decides whether that is worth a warning.
+///
+/// Pure so the fan-out/flatten order is unit-tested without a live Plex
+/// server; [`PlexClient::fetch_collections`] is the only caller and is the one
+/// that populates `episodes` over HTTP.
+fn expand_show_members(
+    show_rating_keys: &[String],
+    episodes: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    show_rating_keys
+        .iter()
+        .flat_map(|show_key| episodes.get(show_key).into_iter().flatten().cloned())
+        .collect()
 }
 
 // ---- Plex API JSON shapes -------------------------------------------------
@@ -776,6 +892,16 @@ struct PlexMetadata {
     /// skip the per-collection children request when nothing has changed.
     #[serde(default)]
     updated_at: Option<i64>,
+    /// Only read for collections: `"show"` for a TV collection (whose children
+    /// are shows), `"movie"` for a movie collection (#119).
+    #[serde(default)]
+    subtype: Option<String>,
+    /// Only read for collections: Plex's own member count, independent of
+    /// whatever the children endpoint actually returns. Used solely to tell
+    /// "genuinely empty" from "Plex says N members but the children fetch came
+    /// back with none" so the latter can be logged instead of silently eaten.
+    #[serde(default)]
+    child_count: Option<i64>,
     #[serde(default)]
     edition_title: Option<String>,
     #[serde(default)]
@@ -881,6 +1007,42 @@ mod tests {
             producers: vec![],
             countries: vec![],
         }
+    }
+
+    /// #183: every section-listing request must carry `includeGuids=1`, or
+    /// Plex omits `<Guid>` elements from the bulk response and every entry
+    /// falls back to a path-hash `fs:` id instead of `imdb`/`tmdb`/`tvdb`.
+    /// Covers every section kind (`show`, `movie`, unknown) crossed with
+    /// both a full pass (`since_param = None`) and a delta pass, so the
+    /// parameter can never quietly go missing from one combination.
+    #[test]
+    fn section_list_params_always_requests_guids() {
+        for kind in [Some("show"), Some("movie"), None] {
+            for since_param in [None, Some("1700000000")] {
+                let params = section_list_params(kind, since_param);
+                assert!(
+                    params.contains(&("includeGuids", "1")),
+                    "missing includeGuids=1 for kind={kind:?}, since={since_param:?}: {params:?}"
+                );
+            }
+        }
+    }
+
+    /// `includeGuids=1` must compose with the delta filter rather than
+    /// replace it — a delta pass still needs `updatedAt>` alongside it, or a
+    /// warm restart would silently re-ingest the whole library (see
+    /// `fetch_all`'s doc comment on the `updatedAt>` vs `updatedAt>=` bug).
+    #[test]
+    fn section_list_params_composes_guids_with_the_delta_filter() {
+        let params = section_list_params(Some("show"), Some("1700000000"));
+        assert_eq!(
+            params,
+            vec![
+                ("type", "4"),
+                ("includeGuids", "1"),
+                ("updatedAt>", "1700000000"),
+            ]
+        );
     }
 
     #[test]
@@ -1553,6 +1715,168 @@ mod tests {
         assert_eq!(
             cat.collection_members("coll-1").unwrap(),
             vec!["imdb:tt-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn expand_show_members_preserves_show_then_episode_order() {
+        let episodes: std::collections::HashMap<String, Vec<String>> = [
+            ("show-b".to_string(), vec!["b-e1".into(), "b-e2".into()]),
+            ("show-a".to_string(), vec!["a-e1".into()]),
+        ]
+        .into_iter()
+        .collect();
+        // Shows in their Plex-authored order (b before a); each show's own
+        // episodes in the order its leaf fetch recorded them.
+        let show_keys = vec!["show-b".to_string(), "show-a".to_string()];
+        assert_eq!(
+            expand_show_members(&show_keys, &episodes),
+            vec!["b-e1".to_string(), "b-e2".to_string(), "a-e1".to_string()]
+        );
+    }
+
+    #[test]
+    fn expand_show_members_skips_a_show_with_no_recorded_episodes() {
+        let episodes: std::collections::HashMap<String, Vec<String>> =
+            [("show-a".to_string(), vec!["a-e1".to_string()])]
+                .into_iter()
+                .collect();
+        // "show-never-fetched" is absent from the map — a show with no
+        // leaves, or one the caller never looked up — and must contribute
+        // nothing rather than a gap or an error.
+        let show_keys = vec!["show-a".to_string(), "show-never-fetched".to_string()];
+        assert_eq!(
+            expand_show_members(&show_keys, &episodes),
+            vec!["a-e1".to_string()]
+        );
+    }
+
+    /// A show-subtype container's members are expanded to episode ratingKeys
+    /// before `ingest_collections` ever runs, so a fan-out where every member
+    /// show has no ingested episodes looks, from here, exactly like a
+    /// collection whose reported ratingKeys resolve to nothing — the same
+    /// warning path a movie collection with all-uningested members would hit.
+    #[test]
+    fn ingest_collections_warns_when_reported_members_all_fail_to_resolve() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct WarnFields {
+            event: Option<String>,
+            collection: Option<String>,
+            reported_members: Option<u64>,
+        }
+        impl Visit for WarnFields {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "reported_members" {
+                    self.reported_members = Some(value);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.event = Some(value.to_string());
+                }
+            }
+            // `%coll.name` records via `record_debug` (a `Display` value is
+            // wrapped so its `Debug` impl delegates to `Display`), not
+            // `record_str` — only a literal `&str` field goes through that.
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "collection" {
+                    self.collection = Some(format!("{value:?}"));
+                }
+            }
+        }
+
+        struct CaptureWarn(Arc<Mutex<Vec<(String, u64)>>>);
+        impl<S: tracing::Subscriber> Layer<S> for CaptureWarn {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = WarnFields::default();
+                event.record(&mut fields);
+                if fields.event.as_deref() != Some("catalog.ingest.plex_collection_unresolved") {
+                    return;
+                }
+                self.0.lock().unwrap().push((
+                    fields.collection.unwrap_or_default(),
+                    fields.reported_members.unwrap_or_default(),
+                ));
+            }
+        }
+
+        let cat = Catalog::open_in_memory().unwrap();
+        // Plex reported two episode ratingKeys, but neither was ever ingested
+        // (no `plex` provenance row exists for them).
+        let coll = ParsedCollection {
+            collection_id: "coll-1".into(),
+            name: "New Episodes".into(),
+            member_rating_keys: vec!["ep-1".into(), "ep-2".into()],
+        };
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureWarn(Arc::clone(&seen)));
+        let stats = tracing::subscriber::with_default(subscriber, || {
+            ingest_collections(&cat, std::slice::from_ref(&coll), false).unwrap()
+        });
+
+        assert_eq!(stats.members_written, 0);
+        assert_eq!(stats.members_unresolved, 2);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [("New Episodes".to_string(), 2)]
+        );
+    }
+
+    /// A collection Plex genuinely reports zero members for must not trip the
+    /// same warning — only a *reported-but-unresolved* member list should.
+    #[test]
+    fn ingest_collections_does_not_warn_for_a_genuinely_empty_collection() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct SeenEvent(Option<String>);
+        impl Visit for SeenEvent {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.0 = Some(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+        }
+
+        struct CaptureAny(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for CaptureAny {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut seen = SeenEvent::default();
+                event.record(&mut seen);
+                if let Some(event) = seen.0 {
+                    self.0.lock().unwrap().push(event);
+                }
+            }
+        }
+
+        let cat = Catalog::open_in_memory().unwrap();
+        let coll = ParsedCollection {
+            collection_id: "coll-1".into(),
+            name: "Streaming Collections".into(),
+            member_rating_keys: vec![],
+        };
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureAny(Arc::clone(&seen)));
+        tracing::subscriber::with_default(subscriber, || {
+            ingest_collections(&cat, std::slice::from_ref(&coll), false).unwrap()
+        });
+
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .contains(&"catalog.ingest.plex_collection_unresolved".to_string())
         );
     }
 

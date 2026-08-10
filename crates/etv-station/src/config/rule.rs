@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::block::{BlockFile, Duplicates};
 use super::constraints::Constraints;
-use super::entry::Entry;
+use super::entry::{Entry, Fallback};
 use super::filter::Filter;
 use super::mode::Mode;
 use super::order::Order;
@@ -52,6 +52,14 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<Entry>,
 
+    /// Resolved instead of `entries` when `entries` resolves to nothing
+    /// eligible (#97). `None` keeps today's behavior — an empty resolution
+    /// stays empty. Entries-block only; rejected on a pattern block at
+    /// validation, since a pool's own `on_short` already covers a pattern
+    /// block going short. See [`Fallback`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Fallback>,
+
     /// Pattern form: the named resolved sets this block interleaves (#72).
     /// Mutually exclusive with `entries` — a block is either an entries block
     /// or a pattern block, enforced in validation.
@@ -71,8 +79,14 @@ pub struct BlockInclude {
     #[serde(default)]
     pub mode: Mode,
 
-    #[serde(default)]
-    pub order: Order,
+    /// Sort applied to this block's resolved list. `None` means the author
+    /// wrote nothing, which is distinct from an authored `order = "manual"`
+    /// (`Some(Order::Manual)`): an unset order over an episode-typed
+    /// resolved set takes the `(season, episode)` default at resolution
+    /// (#95), while an explicit `manual` always keeps authored order
+    /// regardless of item type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
@@ -176,6 +190,7 @@ impl BlockInclude {
         self.duplicates = body.duplicates;
         self.constraints = body.constraints;
         self.entries = body.entries;
+        self.fallback = body.fallback;
         self.pools = body.pools;
         self.pattern = body.pattern;
         self.cycles = body.cycles;

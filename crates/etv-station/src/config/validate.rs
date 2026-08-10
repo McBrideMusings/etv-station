@@ -46,9 +46,12 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
 }
 
 /// Reject two channels that write to the same `output_folder`. A shared folder
-/// silently misbehaves: both channels fight over the `.resume` and `.history`
-/// sidecars and each startup prunes the other's `.durations.json` cache,
-/// forcing re-probes on every restart.
+/// silently misbehaves: both channels fight over the `.resume` sidecar and
+/// each startup prunes the other's `.durations.json` cache, forcing re-probes
+/// on every restart. Play history no longer lives in this folder (#111) —
+/// it is keyed by channel name in the shared `history.db`, so two channels
+/// only collide on it if their *names* also collide, which is rejected
+/// elsewhere.
 ///
 /// Folders are compared exactly as the daemon uses them — verbatim, relative to
 /// the single process CWD (see `daemon::channel_loop`, which uses
@@ -262,17 +265,26 @@ fn validate_pattern_block<'a>(
     if include.pattern.is_empty() {
         return Err(bad("`pools` needs a `pattern` to draw from them".into()));
     }
-    if include.order != Order::Manual {
+    if let Some(order) = &include.order
+        && *order != Order::Manual
+    {
         return Err(bad(format!(
-            "order {:?} conflicts with `pattern` — the pattern IS the ordering; \
+            "order {order:?} conflicts with `pattern` — the pattern IS the ordering; \
              sort inside a pool with its own `order` instead",
-            include.order
         )));
     }
     if include.duplicates == Some(Duplicates::Collapse) {
         return Err(bad(
             "duplicates = \"collapse\" conflicts with `pattern` — collapse would delete \
              the repeats a looping pool produces; a pattern block is always \"keep\""
+                .into(),
+        ));
+    }
+    if include.fallback.is_some() {
+        return Err(bad(
+            "fallback conflicts with `pattern` — a pattern block's pools already have their \
+             own empty-pool policy (`on_short`); block-level `fallback` only applies to an \
+             entries block"
                 .into(),
         ));
     }
@@ -472,11 +484,12 @@ mod tests {
             duplicates: None,
             constraints: None,
             entries,
+            fallback: None,
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
             mode: Mode::All,
-            order: Order::Manual,
+            order: Some(Order::Manual),
             filter: None,
         }
     }
@@ -927,7 +940,7 @@ mod tests {
         // The pattern IS the ordering — a block-level sort would silently
         // un-pattern the block.
         let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
-        b.order = Order::Random;
+        b.order = Some(Order::Random);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(
             format!("{err}").contains("conflicts with `pattern`"),
@@ -941,6 +954,28 @@ mod tests {
         b.duplicates = Some(Duplicates::Collapse);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("collapse"), "err = {err}");
+    }
+
+    /// A pattern block's pools already have their own empty-pool policy
+    /// (`on_short`) — block-level `fallback` is entries-block only.
+    #[test]
+    fn rejects_fallback_on_a_pattern_block() {
+        let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
+        b.fallback = Some(crate::config::Fallback::Item(Box::new(
+            crate::config::ItemEntry {
+                source: crate::config::SourceConfig::Lavfi {
+                    params: "standby".into(),
+                },
+                in_point: None,
+                out_point: Some(std::time::Duration::from_secs(30)),
+                program: None,
+            },
+        )));
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        assert!(
+            format!("{err}").contains("conflicts with `pattern`"),
+            "err = {err}"
+        );
     }
 
     #[test]
