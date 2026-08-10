@@ -537,21 +537,45 @@ fn pick(ctx) {
     let ids = [];
     for item in ctx.sets.movies { ids.push(item.entry_id); }
 
+    // Spin until the clock has demonstrably moved, and seed from how many
+    // iterations that took rather than from the reading itself. A fixed-size
+    // busy loop plus `elapsed()` was the first shape of this and it is not
+    // reliable: on an idle machine the loop finishes inside one tick of the
+    // clock's resolution, both passes read the same elapsed value, and the
+    // fixture is then perfectly deterministic - which fails this test for the
+    // opposite of the reason it is checking. The spin count over a fixed wall
+    // window varies with load and scheduling and is essentially never equal
+    // twice.
     let t0 = timestamp();
-    let busy = 0;
-    for i in range(0, 300000) { busy += i; }
-    let e = elapsed(t0);
-    let seed = (e * 1000000000.0).to_int();
+    let spins = 0;
+    while elapsed(t0) < 0.02 { spins += 1; }
+    // The spin count carries essentially all of the entropy here: this clock's
+    // resolution is coarse enough that the reading at loop exit is the same
+    // number every run, so folding it in costs nothing and removes nothing.
+    // The 20ms window is what makes the count reliable — at 2ms the counts
+    // repeated outright about one run in fifteen, and an identical count is an
+    // identical schedule, which fails this test for the opposite of the reason
+    // it checks.
+    // Reduced into the modulus immediately: unbounded, this reaches ~1e11,
+    // and the key below then multiplies it past what an i64 holds.
+    let seed = (spins * 1000003 + (elapsed(t0) * 1000000000.0).to_int()) % 999999937;
 
     // A per-item key that wraps around a large modulus as `idx` grows, so its
     // sort order is not just "seed's magnitude shifted by a constant" — two
     // different seeds land the wraparounds at different items and produce a
     // genuinely different permutation, not merely a different starting
     // rotation of the same one.
+    //
+    // The multiplier is what makes that true. Without it — plain
+    // `seed * (idx + 1)` — nothing wraps until `seed` exceeds an eighth of the
+    // modulus, so for every realistic seed the keys rise monotonically with
+    // `idx` and the sort is the identity permutation no matter what the clock
+    // said. That made this fixture perfectly deterministic on an idle machine,
+    // which fails this test for the exact opposite of the reason it checks.
     let scored = [];
     let idx = 0;
     for id in ids {
-        let key = (seed * (idx + 1)) % 999999937;
+        let key = ((seed + 1) * (idx + 1) * 7919) % 999999937;
         scored.push(#{ id: id, key: key });
         idx += 1;
     }
