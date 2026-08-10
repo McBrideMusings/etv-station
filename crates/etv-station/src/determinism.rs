@@ -592,6 +592,7 @@ fn pick(ctx) {
             name: "movies".into(),
             expr: None,
             plugin: Some(script.to_path_buf()),
+            sources: None,
             groups: Vec::new(),
             order: None,
             bucket_order: None,

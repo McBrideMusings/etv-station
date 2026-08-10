@@ -9,6 +9,7 @@
 //! Every knob defaults to the stateless, least-surprising behavior, so a pool
 //! that names only `expr` behaves like today's `query` entry.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -235,6 +236,11 @@ pub struct Pool {
     /// expression — it runs its own queries, ranks what it finds, and returns
     /// the ordered set. Path is relative to the channel config's directory.
     ///
+    /// The queries are the script's `sources()` unless this pool authors
+    /// [`Pool::sources`], which replaces them (#210) — that is how a channel
+    /// narrows *which* items a shared script is allowed to rank without editing
+    /// the script.
+    ///
     /// The script named here must declare the `pool_provider` hook (#159) —
     /// that is what `plugin:` has always meant, and a script that declares
     /// some other hook instead is rejected at load, naming the script and the
@@ -279,6 +285,49 @@ pub struct Pool {
     /// and `examples/samples/foryou.yaml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PathBuf>,
+
+    /// The candidate sets this pool's [`Pool::plugin`] ranks, authored here
+    /// instead of by the script's own `sources()` (#210). Each key is a set
+    /// name the script reads back as `ctx.sets.<name>`; each value is a CEL
+    /// expression resolved against the catalog exactly like [`Pool::expr`], and
+    /// a bad one fails the channel's generation naming the pool and the set.
+    ///
+    /// Present, it **replaces** the script's `sources()` wholesale — that
+    /// function is never called — on the same terms as [`Pool::constraints`]
+    /// replacing the block's: this table reads as the complete list of what the
+    /// pool offers its scorer, rather than something the author has to diff
+    /// against a script they may not have open.
+    ///
+    /// This is what lets a channel say *which library* a taste pool draws from
+    /// without touching the script. `taste-engine.rhai` declares
+    /// `movies: item.type == "movie"`, which is every movie-type Plex library
+    /// on the server — a "Concerts" section and a "Power Hours" section
+    /// included, 1,079 entries that each have their own channel already. The
+    /// script cannot narrow that for one channel without narrowing it for every
+    /// channel pointed at it, and which libraries a station has is a fact about
+    /// the station rather than about how taste is computed. Picking the
+    /// candidates has always been the config's half everywhere else (`expr`,
+    /// `groups`); this is that half restored for a plugin pool, leaving the
+    /// script the half it exists for — the ranking (ADR 0002).
+    ///
+    /// The set *names* are the script's vocabulary, not the schema's: nothing
+    /// here checks that a name means anything to the script, and one it does not
+    /// recognise simply arrives as another entry in `ctx.sets`.
+    /// `taste-engine.rhai` looks for `movies` and `episodes` and falls back to
+    /// every set it was handed, so an override written for it keeps those two
+    /// names.
+    ///
+    /// Two pools naming the same script with different `sources` each resolve
+    /// their own set — [`crate::score::ScoreCache`] keys on the pair, not the
+    /// path — so narrowing one pool cannot narrow its sibling.
+    ///
+    /// Meaningless without a `plugin`: an `expr` or `groups` pool has no script
+    /// to hand sets to. Rejected at load rather than ignored (unlike
+    /// [`Pool::config`], whose keys belong to a script that may not read them
+    /// all), because a table of CEL expressions that never runs looks exactly
+    /// like one that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<BTreeMap<String, String>>,
 
     /// Named show groups (#165) this pool draws its items from — every member
     /// show's episodes, across every group listed, unioned. Mutually
@@ -675,6 +724,32 @@ on_short: short
             pool.constraints.as_ref().unwrap().no_repeat_within,
             Some(NoRepeatWithin::Positions(5))
         );
+    }
+
+    /// The candidate table a channel writes for its scorer (#210) — set name to
+    /// CEL expression, exactly the shape the script's own `sources()` returns.
+    #[test]
+    fn parses_channel_authored_sources() {
+        let yaml = r#"
+name: movies
+plugin: taste.rhai
+sources:
+  movies: 'item.type == "movie" && item.library != "Concerts"'
+  episodes: 'item.type == "episode"'
+"#;
+        let pool: Pool = serde_norway::from_str(yaml).unwrap();
+        let sources = pool.sources.as_ref().unwrap();
+        assert_eq!(
+            sources["movies"],
+            r#"item.type == "movie" && item.library != "Concerts""#
+        );
+        assert_eq!(sources["episodes"], r#"item.type == "episode""#);
+    }
+
+    #[test]
+    fn sources_defaults_to_the_scripts_own() {
+        let pool: Pool = serde_norway::from_str("name: movies\nplugin: taste.rhai\n").unwrap();
+        assert!(pool.sources.is_none());
     }
 
     #[test]

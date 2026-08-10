@@ -568,6 +568,53 @@ fn sources() {
 fn pick(ctx) { … }
 ```
 
+#### Pool `sources` — the channel says which items the script may rank (#210)
+
+A pool can write the candidate queries itself, instead of taking whatever the
+script's `sources()` declares:
+
+```yaml
+pools:
+  - name: movies
+    plugin: "../plugins/taste-engine.rhai"
+    sources:
+      movies: 'item.type == "movie" && item.library != "Concerts"'
+    capabilities: [catalog_read, watch_history]
+```
+
+Each key is a set name the script reads back as `ctx.sets.<name>`; each value is
+a CEL expression resolved against the catalog exactly like a pool's `expr`. The
+table **replaces** the script's `sources()` wholesale — that function is not
+called at all — on the same terms as a pool's `constraints` replacing the
+block's: what the pool wrote is the whole list of what it offers its scorer.
+
+This is what lets a channel say which library a taste pool draws from without
+editing the script. `taste-engine.rhai` declares `item.type == "movie"`, which
+is every movie-type Plex library on the server — a Concerts section and a Power
+Hours section included, each of which may already have its own channel. The
+script cannot narrow that for one channel without narrowing it for every channel
+pointed at it, and which libraries a station has is a fact about the station, not
+about how taste is computed. Picking the candidates is the config's half
+everywhere else (`expr`, `groups`); this is that half restored for a plugin pool,
+leaving the script the ranking (ADR 0002).
+
+The set **names** belong to the script, not to the schema: nothing checks that a
+name means anything to it, and one it does not recognise simply arrives as
+another entry in `ctx.sets`. `taste-engine.rhai` looks for `movies` and
+`episodes` and falls back to every set it was handed, so an override written for
+it keeps those two names.
+
+Two pools naming the same script with different `sources` each resolve their own
+set, so narrowing one pool never narrows its sibling. Two that wrote the same
+table share one resolution.
+
+Rejected at load: `sources` on a pool with no `plugin` (an `expr` or `groups`
+pool has no script to hand sets to — narrow it with `expr` instead), an empty
+table, an empty set name, and an empty expression. A CEL expression that fails to
+resolve fails the channel's generation naming the pool and the set, and says
+`channel-authored source` rather than naming the script, so the error points at
+the file the expression is actually written in.
+
 #### The record shape — `metadata` and a per-entry `take` (#166)
 
 Each element `pick()` returns may be a bare `entry_id` string — unchanged

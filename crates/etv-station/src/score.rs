@@ -36,7 +36,10 @@
 //! // `config::Pool::datastores`.
 //! fn capabilities() { ["catalog_read", "watch_history"] }
 //!
-//! // Every catalog query this plugin will read, named. Run once, up front.
+//! // Every catalog query this plugin will read, named. Run once, up front —
+//! // unless the pool authored its own `sources:` table (#210), which replaces
+//! // this wholesale and leaves the function uncalled. Either way the script
+//! // reads the results back the same way, as `ctx.sets.<name>`.
 //! fn sources() {
 //!     #{
 //!         movies:   `item.type == "movie"`,
@@ -167,20 +170,40 @@ const EXPOSED_TAGS: &[(&str, TagNs)] = &[
     ("countries", TagNs::Country),
 ];
 
+/// The catalog queries one prepared script was resolved against, when the pool
+/// authored them itself (#210) — set name to CEL expression. `None` anywhere
+/// this appears means "whatever the script's own `sources()` declares".
+///
+/// A `BTreeMap` rather than a `HashMap` so it can key [`ScoreCache`]: two pools
+/// that wrote the same table in a different order are the same table, and share
+/// one resolved set.
+pub type PoolSources = std::collections::BTreeMap<String, String>;
+
 /// One generation's compiled scripts and resolved query sets, keyed by script
-/// path.
+/// path and the sources it was resolved against.
 ///
 /// A channel commonly points several pools at the same script — a `movies` pool
-/// and a `shows` pool ranked by the same taste — and `sources()` takes no
-/// arguments, so what it declares cannot vary by pool. Without this each pool
-/// would recompile the script and re-run every declared query, materializing
-/// the same slice of the library once per pool.
+/// and a `shows` pool ranked by the same taste — and a script's `sources()`
+/// takes no arguments, so what *it* declares cannot vary by pool. Without this
+/// each pool would recompile the script and re-run every declared query,
+/// materializing the same slice of the library once per pool.
+///
+/// The sources are half the key because a pool may now author its own table
+/// (#210), and then the resolved sets are that pool's, not the script's. Keyed
+/// on the path alone, a `movies` pool narrowed to one Plex library would hand
+/// its narrowed sets to every sibling pool naming the same script — the
+/// `episodes` half of a For You channel would silently inherit
+/// `library != "Concerts"` and, worse, whichever pool resolved second would
+/// rank the *other* pool's candidates. Two pools that authored nothing, or
+/// authored the same table, still share one entry — the extra compile and the
+/// extra catalog pass are paid only by a pool that asked for something
+/// different, which is exactly the pool that needs them.
 ///
 /// Scoped to a single generation and dropped with it, so a catalog that changes
 /// between generations is picked up on the next one.
 #[derive(Debug, Default)]
 pub struct ScoreCache {
-    entries: HashMap<PathBuf, CachedScript>,
+    entries: HashMap<(PathBuf, Option<PoolSources>), CachedScript>,
     /// The metadata/take-override half of what a plugin pool's `pick()` just
     /// returned (#166), keyed by `(pool name, entry_id)`. `resolve_pool_sources`
     /// still returns bare ids, so widening it would ripple into every caller.
@@ -548,8 +571,13 @@ pub(crate) fn engine() -> Engine {
 }
 
 impl ScoreCache {
-    /// Compile `script_path` and resolve every query its `sources()` declares,
-    /// if this cache has not already done so.
+    /// Compile `script_path` and resolve every query it will read, if this
+    /// cache has not already done so for this `sources` table.
+    ///
+    /// `sources` is the pool's own table when it authored one (#210) and `None`
+    /// when it did not, in which case the script's `sources()` is called for
+    /// them. [`pick`] must be handed the same value, since the two together are
+    /// the cache key.
     ///
     /// **This is the only half of scoring that touches the catalog.** Callers
     /// run every pool's `prepare` up front, while the catalog handle is in
@@ -559,12 +587,18 @@ impl ScoreCache {
     /// a scorer that took six minutes to rank a library held the station's only
     /// database connection for all six of them and every other channel queued
     /// behind it.
-    pub fn prepare(&mut self, catalog: &Catalog, script_path: &Path) -> Result<(), String> {
-        if self.entries.contains_key(script_path) {
+    pub fn prepare(
+        &mut self,
+        catalog: &Catalog,
+        script_path: &Path,
+        sources: Option<&PoolSources>,
+    ) -> Result<(), String> {
+        let key = (script_path.to_path_buf(), sources.cloned());
+        if self.entries.contains_key(&key) {
             return Ok(());
         }
-        let cached = compile_and_resolve(catalog, &engine(), script_path)?;
-        self.entries.insert(script_path.to_path_buf(), cached);
+        let cached = compile_and_resolve(catalog, &engine(), script_path, sources)?;
+        self.entries.insert(key, cached);
         Ok(())
     }
 
@@ -629,6 +663,7 @@ pub struct PickedItem {
 pub fn pick(
     cache: &ScoreCache,
     script_path: &Path,
+    sources: Option<&PoolSources>,
     inputs: &ScoreInputs,
     pool_name: &str,
     pool_config: Option<&serde_json::Value>,
@@ -636,7 +671,11 @@ pub fn pick(
 ) -> Result<Vec<PickedItem>, String> {
     let engine = engine();
 
-    let cached = cache.entries.get(script_path).ok_or_else(|| {
+    // `sources` is half the cache key (#210), so the same value the pool handed
+    // `prepare` has to come back here — a mismatch would find no entry and
+    // report the bug below rather than quietly ranking another pool's set.
+    let key = (script_path.to_path_buf(), sources.cloned());
+    let cached = cache.entries.get(&key).ok_or_else(|| {
         format!(
             "scorer plugin {}: pick() called before prepare() — this is a bug in \
              etv-station, not in the script",
@@ -818,15 +857,20 @@ fn parse_picked_item(
     })
 }
 
-/// Compile a script and resolve every query its `sources()` declares.
+/// Compile a script and resolve every query it will read — the pool's own
+/// `sources` table when it authored one (#210), otherwise the script's
+/// `sources()`.
 ///
-/// Runs once per script per generation. A bad expression fails here — before
-/// any ranking work, and before any pool has drawn — naming the source it came
-/// from rather than surfacing as a mystery empty pool later.
+/// Runs once per script-and-sources pair per generation. A bad expression fails
+/// here — before any ranking work, and before any pool has drawn — naming the
+/// source it came from rather than surfacing as a mystery empty pool later, and
+/// saying which file that source was written in so the author knows whether to
+/// open the channel or the script.
 fn compile_and_resolve(
     catalog: &Catalog,
     engine: &Engine,
     script_path: &Path,
+    pool_sources: Option<&PoolSources>,
 ) -> Result<CachedScript, String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
@@ -834,32 +878,51 @@ fn compile_and_resolve(
         .compile(&source)
         .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
 
-    let mut scope = Scope::new();
-    let sources: Map = engine
-        .call_fn(&mut scope, &ast, "sources", ())
-        .map_err(|e| format!("scorer plugin {}: sources(): {e}", script_path.display()))?;
+    // The pool's table replaces the script's function wholesale, which is also
+    // why `sources()` is not called at all when one is present: a script that
+    // declares none, or whose own would fail, is still usable by a pool that
+    // brought its own queries.
+    let declared: Vec<(String, String)> = match pool_sources {
+        Some(table) => table
+            .iter()
+            .map(|(name, cel)| (name.clone(), cel.clone()))
+            .collect(),
+        None => {
+            let mut scope = Scope::new();
+            let from_script: Map = engine
+                .call_fn(&mut scope, &ast, "sources", ())
+                .map_err(|e| format!("scorer plugin {}: sources(): {e}", script_path.display()))?;
+            from_script
+                .into_iter()
+                .map(|(name, expr)| {
+                    let cel = expr.into_string().map_err(|actual| {
+                        format!(
+                            "scorer plugin {}: source {name:?} must be a CEL string, got {actual}",
+                            script_path.display()
+                        )
+                    })?;
+                    Ok((name.to_string(), cel))
+                })
+                .collect::<Result<_, String>>()?
+        }
+    };
+
+    // Names the file the author has to go and edit. A channel-authored source
+    // that fails is the channel's line, not the script's, and saying "scorer
+    // plugin taste-engine.rhai" about an expression that is not in
+    // taste-engine.rhai sends them to the wrong file.
+    let whose = match pool_sources {
+        Some(_) => "channel-authored source".to_string(),
+        None => format!("scorer plugin {}: source", script_path.display()),
+    };
 
     let mut sets = Map::new();
-    for (name, expr) in sources {
-        let cel = expr.into_string().map_err(|actual| {
-            format!(
-                "scorer plugin {}: source {name:?} must be a CEL string, got {actual}",
-                script_path.display()
-            )
-        })?;
-        let ids = catalog.resolve_query(&cel).map_err(|e| {
-            format!(
-                "scorer plugin {}: source {name:?} ({cel}): {e}",
-                script_path.display()
-            )
-        })?;
-        let items = load_items(catalog, &ids).map_err(|e| {
-            format!(
-                "scorer plugin {}: source {name:?}: {e}",
-                script_path.display()
-            )
-        })?;
-        sets.insert(name, Dynamic::from_array(items));
+    for (name, cel) in declared {
+        let ids = catalog
+            .resolve_query(&cel)
+            .map_err(|e| format!("{whose} {name:?} ({cel}): {e}"))?;
+        let items = load_items(catalog, &ids).map_err(|e| format!("{whose} {name:?}: {e}"))?;
+        sets.insert(name.into(), Dynamic::from_array(items));
     }
 
     Ok(CachedScript {
@@ -984,10 +1047,11 @@ mod tests {
         pool_config: Option<&serde_json::Value>,
         cache: &mut ScoreCache,
     ) -> Result<Vec<String>, String> {
-        cache.prepare(catalog, script_path)?;
+        cache.prepare(catalog, script_path, None)?;
         pick(
             cache,
             script_path,
+            None,
             inputs,
             pool_name,
             pool_config,
@@ -1561,10 +1625,11 @@ fn pick(ctx) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let err = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1590,10 +1655,11 @@ fn pick(ctx) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let err = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1624,7 +1690,7 @@ fn pick(ctx) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let inputs = ScoreInputs {
             target_count: 3,
             recent: vec!["m2".into()],
@@ -1635,6 +1701,7 @@ fn pick(ctx) {
         let got = pick(
             &cache,
             &p,
+            None,
             &inputs,
             "test",
             Some(&cfg),
@@ -1656,10 +1723,11 @@ fn pick(ctx) {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [\"m1\"] }\n");
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let got = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1688,10 +1756,11 @@ fn pick(ctx) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let got = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1717,10 +1786,11 @@ fn pick(ctx) { [#{ entry_id: "m1", take: 3 }, "m2"] }
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let got = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1748,10 +1818,11 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let err = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1776,10 +1847,11 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
                 ),
             );
             let mut cache = ScoreCache::default();
-            cache.prepare(&catalog(), &p).unwrap();
+            cache.prepare(&catalog(), &p, None).unwrap();
             let err = pick(
                 &cache,
                 &p,
+                None,
                 &ScoreInputs::default(),
                 "test",
                 None,
@@ -1805,10 +1877,11 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
             ),
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let err = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1828,10 +1901,11 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
             "fn sources() { #{} }\nfn pick(ctx) { [#{ metadata: #{ x: 1 } }] }\n",
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let err = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1855,10 +1929,11 @@ fn pick(ctx) { ["m1", #{ entry_id: "m1" }] }
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p).unwrap();
+        cache.prepare(&catalog(), &p, None).unwrap();
         let err = pick(
             &cache,
             &p,
+            None,
             &ScoreInputs::default(),
             "test",
             None,
@@ -1866,5 +1941,177 @@ fn pick(ctx) { ["m1", #{ entry_id: "m1" }] }
         )
         .unwrap_err();
         assert!(err.contains("more than once"), "got {err}");
+    }
+
+    /// Four movies across three Plex libraries — the shape that made #210 a
+    /// bug. `item.type == "movie"` is true of all four, so a script that
+    /// declares only that hands a taste channel the concert film and the power
+    /// hour along with the two features.
+    fn library_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        for (id, title, library) in [
+            ("m1", "Alpha", "Movies"),
+            ("m2", "Beta", "Movies"),
+            ("c1", "Live at Wembley", "Concerts"),
+            ("p1", "Power Hour Vol. 1", "Power Hours"),
+        ] {
+            let mut e = Entry::new(id, "movie", title, Source::Plex);
+            e.library = Some(library.into());
+            c.upsert_entry(&e).unwrap();
+        }
+        c
+    }
+
+    /// A script that returns every id it was handed, so the assertion is
+    /// directly about which items reached `ctx.sets` — the one thing #210
+    /// moves.
+    const ECHO_SET: &str = r#"fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read"] }
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let out = [];
+    for item in ctx.sets.movies { out.push(item.entry_id); }
+    out
+}
+"#;
+
+    fn sources(pairs: &[(&str, &str)]) -> PoolSources {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn echo(cache: &ScoreCache, path: &Path, src: Option<&PoolSources>) -> Vec<String> {
+        pick(
+            cache,
+            path,
+            src,
+            &ScoreInputs::default(),
+            "movies",
+            None,
+            GrantedCapabilities {
+                catalog_read: true,
+                watch_history: false,
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect()
+    }
+
+    /// The pool's table replaces the script's `sources()` rather than adding to
+    /// it: the script still declares `item.type == "movie"`, and the pool still
+    /// gets only what its own expression matched.
+    #[test]
+    fn a_pool_authored_sources_table_replaces_the_scripts_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let cat = library_catalog();
+        let narrowed = sources(&[(
+            "movies",
+            r#"item.type == "movie" && item.library != "Concerts" && item.library != "Power Hours""#,
+        )]);
+
+        let mut cache = ScoreCache::default();
+        cache.prepare(&cat, &p, Some(&narrowed)).unwrap();
+        assert_eq!(
+            echo(&cache, &p, Some(&narrowed)),
+            vec!["m1", "m2"],
+            "the concert and the power hour are not candidates"
+        );
+    }
+
+    /// The script's own `sources()` is not even called when the pool brought
+    /// its own — so a set name the script never declares still arrives, and a
+    /// script whose `sources()` would fail is still usable.
+    #[test]
+    fn a_pool_authored_table_leaves_the_scripts_sources_uncalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"fn sources() { throw "sources() must not run when the pool authored its own" }
+fn pick(ctx) {
+    let out = [];
+    for item in ctx.sets.features { out.push(item.entry_id); }
+    out
+}
+"#,
+        );
+        let cat = library_catalog();
+        let table = sources(&[("features", r#"item.library == "Movies""#)]);
+
+        let mut cache = ScoreCache::default();
+        cache.prepare(&cat, &p, Some(&table)).unwrap();
+        assert_eq!(echo(&cache, &p, Some(&table)), vec!["m1", "m2"]);
+    }
+
+    /// The cache is keyed on the script *and* its sources. Two pools naming one
+    /// script with different tables each rank their own candidates — without
+    /// the sources half of the key, whichever prepared first would hand its set
+    /// to the other, and a channel that narrowed one pool would silently narrow
+    /// its sibling.
+    #[test]
+    fn two_pools_naming_one_script_keep_their_own_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let cat = library_catalog();
+        let features = sources(&[("movies", r#"item.library == "Movies""#)]);
+        let concerts = sources(&[("movies", r#"item.library == "Concerts""#)]);
+
+        let mut cache = ScoreCache::default();
+        cache.prepare(&cat, &p, Some(&features)).unwrap();
+        cache.prepare(&cat, &p, Some(&concerts)).unwrap();
+        // And a third pool that authored nothing still gets the script's own.
+        cache.prepare(&cat, &p, None).unwrap();
+
+        assert_eq!(echo(&cache, &p, Some(&features)), vec!["m1", "m2"]);
+        assert_eq!(echo(&cache, &p, Some(&concerts)), vec!["c1"]);
+        // Catalog order, not the narrowed pools' — all four libraries.
+        assert_eq!(echo(&cache, &p, None), vec!["c1", "m1", "m2", "p1"]);
+    }
+
+    /// Two pools that wrote the same table share one resolved set, whatever
+    /// order they wrote the keys in — the reason the key is a `BTreeMap`.
+    #[test]
+    fn the_same_table_written_twice_resolves_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let cat = library_catalog();
+        let one = sources(&[
+            ("movies", r#"item.library == "Movies""#),
+            ("extra", r#"item.library == "Concerts""#),
+        ]);
+        let other = sources(&[
+            ("extra", r#"item.library == "Concerts""#),
+            ("movies", r#"item.library == "Movies""#),
+        ]);
+
+        let mut cache = ScoreCache::default();
+        cache.prepare(&cat, &p, Some(&one)).unwrap();
+        cache.prepare(&cat, &p, Some(&other)).unwrap();
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    /// A broken expression the *channel* wrote must not be reported as the
+    /// script's — the author has to know which file to open.
+    #[test]
+    fn a_bad_channel_authored_source_names_the_set_and_not_the_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let err = ScoreCache::default()
+            .prepare(
+                &library_catalog(),
+                &p,
+                Some(&sources(&[("movies", "item.library ==== 3")])),
+            )
+            .expect_err("a malformed CEL expression must fail preparation");
+        assert!(err.contains("channel-authored source"), "got {err}");
+        assert!(err.contains("\"movies\""), "got {err}");
+        assert!(
+            !err.contains("plugin.rhai"),
+            "the channel wrote this expression, not the script: {err}"
+        );
     }
 }

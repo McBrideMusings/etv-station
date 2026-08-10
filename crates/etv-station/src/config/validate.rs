@@ -603,11 +603,54 @@ fn validate_block_pools<'a>(
                     pool.name
                 )));
             }
+            // The pool's own candidate queries (#210), when it wrote any. They
+            // replace the script's `sources()` rather than adding to it, so an
+            // empty table is not "the script's, plus nothing" — it is a pool
+            // with no candidates at all, and saying so here beats a plugin
+            // failing on an empty `ctx.sets` mid-generation.
+            if let Some(sources) = &pool.sources {
+                if sources.is_empty() {
+                    return Err(bad(format!(
+                        "pool {:?} has an empty `sources` table — it replaces the plugin's \
+                         own `sources()` wholesale, so an empty one leaves the plugin \
+                         nothing to rank; drop the key to use the script's, or name at \
+                         least one set",
+                        pool.name
+                    )));
+                }
+                for (name, cel) in sources {
+                    if name.trim().is_empty() {
+                        return Err(bad(format!(
+                            "pool {:?} has a `sources` entry with an empty name — the name \
+                             is what the plugin reads the set back as (`ctx.sets.<name>`)",
+                            pool.name
+                        )));
+                    }
+                    if cel.trim().is_empty() {
+                        return Err(bad(format!(
+                            "pool {:?} has an empty `sources` expression for {name:?}",
+                            pool.name
+                        )));
+                    }
+                }
+            }
             // Checked last among this pool's plugin checks — it is the one
             // that reads the script off disk, so the cheaper structural checks
             // above get to report first when more than one thing is wrong.
             validate_plugin_declares_pool_provider(pool, plugin, base_dir, bad)?;
             validate_plugin_capabilities(pool, plugin, base_dir, bad)?;
+        }
+        // Refused rather than ignored: an `expr` or `groups` pool has no script
+        // to hand sets to, so these expressions would never run, and a table of
+        // CEL that silently does nothing looks exactly like one that works.
+        if pool.plugin.is_none() && pool.sources.is_some() {
+            return Err(bad(format!(
+                "pool {:?} sets `sources` without a `plugin` — `sources` names the \
+                 candidate sets a scorer plugin ranks, and a pool drawing from `expr` \
+                 or `groups` has no script to hand them to; use `expr` to narrow this \
+                 pool instead",
+                pool.name
+            )));
         }
         if !pool.groups.is_empty() {
             validate_pool_groups(pool, channel_groups, bad)?;
@@ -849,6 +892,7 @@ mod tests {
             name: name.into(),
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
+            sources: None,
             groups: Vec::new(),
             order: None,
             bucket_order: None,
@@ -1254,6 +1298,63 @@ mod tests {
     fn accepts_valid_channel() {
         let ch = channel_with(vec![inline_block(vec![item_entry("a"), item_entry("b")])]);
         validate_channel(&dummy_path(), &ch).unwrap();
+    }
+
+    // ---- pool `sources` (#210) --------------------------------------------
+
+    /// A pool with a `sources` table but no script to hand the sets to. The
+    /// expressions would never run, and a table of CEL that silently does
+    /// nothing looks exactly like one that works — so it is refused, and the
+    /// message points at `expr`, which is how an expression pool narrows itself.
+    #[test]
+    fn rejects_sources_without_a_plugin() {
+        let mut movies = pool("movies");
+        movies.sources = Some(
+            [("movies".to_string(), "item.type == \"movie\"".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pool \"movies\""), "msg = {msg}");
+        assert!(msg.contains("without a `plugin`"), "msg = {msg}");
+        assert!(msg.contains("`expr`"), "msg = {msg}");
+    }
+
+    /// An empty table is not "the script's sources, plus nothing" — it replaces
+    /// them, so it leaves the scorer with nothing to rank. Caught at load
+    /// rather than as an empty `ctx.sets` mid-generation. This is refused
+    /// before the script is read off disk, which is why the path need not
+    /// exist.
+    #[test]
+    fn rejects_an_empty_sources_table() {
+        let mut movies = pool("movies");
+        movies.expr = None;
+        movies.plugin = Some("taste.rhai".into());
+        movies.sources = Some(std::collections::BTreeMap::new());
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("empty `sources` table"), "msg = {msg}");
+        assert!(msg.contains("nothing to rank"), "msg = {msg}");
+    }
+
+    #[test]
+    fn rejects_an_empty_sources_expression() {
+        let mut movies = pool("movies");
+        movies.expr = None;
+        movies.plugin = Some("taste.rhai".into());
+        movies.sources = Some(
+            [("movies".to_string(), "   ".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("empty `sources` expression"), "msg = {msg}");
+        assert!(msg.contains("\"movies\""), "msg = {msg}");
     }
 
     // ---- pattern blocks (#72) ---------------------------------------------

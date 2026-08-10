@@ -43,6 +43,7 @@ fn pool(name: &str, expr: &str, config: Option<serde_json::Value>) -> Pool {
         name: name.into(),
         expr: Some(expr.into()),
         plugin: None,
+        sources: None,
         groups: Vec::new(),
         order: Some(Order::parse("title:asc").unwrap()),
         bucket_order: None,

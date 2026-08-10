@@ -87,6 +87,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     name: "foryou".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),
+                    sources: None,
                     groups: Vec::new(),
                     order: None,
                     bucket_order: None,
@@ -329,13 +330,14 @@ fn the_committed_example_plugin_runs() {
     // The two halves, in the order the daemon runs them: `prepare` reads the
     // catalog, `pick` ranks what it found and never sees a database handle.
     let mut cache = etv_station::score::ScoreCache::default();
-    cache.prepare(&cat, &path).unwrap();
+    cache.prepare(&cat, &path, None).unwrap();
     // The committed example declares both (#167) — grant both here to match.
     let granted = etv_station::score::GrantedCapabilities {
         catalog_read: true,
         watch_history: true,
     };
-    let picked = etv_station::score::pick(&cache, &path, &inputs, "movies", None, granted).unwrap();
+    let picked =
+        etv_station::score::pick(&cache, &path, None, &inputs, "movies", None, granted).unwrap();
     let ids: Vec<String> = picked.into_iter().map(|p| p.id).collect();
 
     assert!(

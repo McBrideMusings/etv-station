@@ -93,6 +93,23 @@ rule:
         # suppression in the script. See #116 and ADR 0002.
         - name: movies
           plugin: "../plugins/taste-engine.rhai"
+          # The candidates this pool offers the scorer, authored here instead of
+          # by the script's `sources()` (#210). Written out in full it says
+          # exactly what taste-engine.rhai's own table says, so this pool behaves
+          # identically — what it demonstrates is *where the line lives*: which
+          # items are candidates is the channel's half, the ranking is the
+          # script's (ADR 0002).
+          #
+          # It replaces the script's table wholesale rather than adding to it,
+          # and the set name has to stay `movies` because that is what
+          # taste-engine.rhai reads back as `ctx.sets.movies`. Narrowing this
+          # line is how a real station keeps a taste channel out of a library it
+          # has a dedicated channel for — `&& item.library != "Concerts"` — and
+          # doing it here rather than in the script leaves every other channel
+          # pointed at that script untouched. The `shows` pool below declines
+          # the field, so it still gets whatever the script declares.
+          sources:
+            movies: 'item.type == "movie"'
           # taste-engine.rhai declares both (#167) — the pool must grant
           # exactly what it declares, or the channel fails to load.
           capabilities: [catalog_read, watch_history]

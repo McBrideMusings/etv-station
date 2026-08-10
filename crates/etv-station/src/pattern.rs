@@ -792,8 +792,12 @@ pub(crate) fn resolve_pool_sources(
             }
             (None, Some(plugin), false) => {
                 let path = score_env.resolve_path(plugin);
+                // `cfg.sources` (#210) replaces whatever the script's own
+                // `sources()` declares, and is half the cache key — so two
+                // pools naming this script resolve together only when they
+                // asked for the same candidates.
                 score_cache
-                    .prepare(catalog, &path)
+                    .prepare(catalog, &path, cfg.sources.as_ref())
                     .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
                 pool_ids.push(None);
             }
@@ -837,6 +841,7 @@ pub(crate) fn resolve_pool_sources(
             let picked = crate::score::pick(
                 score_cache,
                 &path,
+                cfg.sources.as_ref(),
                 score_env.inputs,
                 &cfg.name,
                 cfg.config.as_ref(),
@@ -1369,6 +1374,7 @@ mod tests {
             name: "movies".into(),
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
+            sources: None,
             groups: Vec::new(),
             order: Some(Order::parse("title:asc").unwrap()),
             bucket_order: None,
@@ -1389,6 +1395,7 @@ mod tests {
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
+            sources: None,
             groups: Vec::new(),
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             bucket_order: None,
@@ -1413,6 +1420,7 @@ mod tests {
             name: "movies".into(),
             expr: None,
             plugin: Some(script.to_path_buf()),
+            sources: None,
             groups: Vec::new(),
             order: None,
             bucket_order: None,
@@ -1499,6 +1507,7 @@ mod tests {
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
+            sources: None,
             groups: Vec::new(),
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             bucket_order: None,
@@ -1796,6 +1805,7 @@ mod tests {
             name: "rupaul".into(),
             expr: None,
             plugin: None,
+            sources: None,
             groups: vec!["rupaul".into()],
             order: None,
             bucket_order: Some(Order::parse("title:asc").unwrap()),

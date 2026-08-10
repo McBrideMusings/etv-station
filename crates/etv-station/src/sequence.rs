@@ -468,6 +468,7 @@ mod tests {
             name: name.into(),
             expr: Some(expr.into()),
             plugin: None,
+            sources: None,
             groups: Vec::new(),
             order: Some(Order::parse("title:asc").unwrap()),
             bucket_order: None,
