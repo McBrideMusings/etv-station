@@ -198,7 +198,7 @@ collection as a set to filter or shuffle — use a `query` entry with
 |---|---|---|
 | `block` | **yes** | path to another block file |
 | `mode` | no — default `all` | [`Mode`](#mode) |
-| `order` | no — default `manual` | [`Order`](#order) |
+| `order` | no — unset takes the episode default (#95); see [`Order`](#order) |
 | `filter` | no | [`Filter`](#filter) |
 
 ```yaml
@@ -266,9 +266,18 @@ A string. Source: `config/order.rs`.
 
 | Value | Meaning |
 |---|---|
-| `manual` *(default)* | keep authored order |
+| `manual` | keep authored order |
 | `random` | shuffle (seeded by the channel `seed`) |
 | `field:dir,...` | sort by one or more fields; `dir` is `asc` or `desc` |
+
+`order` itself is optional everywhere it appears, and an **unset** `order` is
+not the same as an authored `manual` (#95): a
+[block include's or `kind: include`'s](#composing-blocks-—-rule-blocks) `order`
+left unset resolves to `season:asc,episode:asc` when every item the block
+resolved is catalog type `episode`, and to authored order otherwise — an
+author who writes `order: "manual"` explicitly always keeps authored order,
+regardless of item type. A `query` entry's or pool's `order` left unset simply
+applies no sort, leaving the catalog's or plugin's own order.
 
 Every value is computable from the items being ordered. Two former values were
 not, and are rejected by name at load rather than silently read as a field sort:

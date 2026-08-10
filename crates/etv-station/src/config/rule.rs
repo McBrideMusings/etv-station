@@ -71,8 +71,14 @@ pub struct BlockInclude {
     #[serde(default)]
     pub mode: Mode,
 
-    #[serde(default)]
-    pub order: Order,
+    /// Sort applied to this block's resolved list. `None` means the author
+    /// wrote nothing, which is distinct from an authored `order = "manual"`
+    /// (`Some(Order::Manual)`): an unset order over an episode-typed
+    /// resolved set takes the `(season, episode)` default at resolution
+    /// (#95), while an explicit `manual` always keeps authored order
+    /// regardless of item type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,

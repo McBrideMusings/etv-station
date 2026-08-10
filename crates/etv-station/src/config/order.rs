@@ -59,6 +59,25 @@ pub enum Order {
 }
 
 impl Order {
+    /// The order injected for an episode-typed resolved set whose `order` was
+    /// not authored (#95): season, then episode. Distinct from an authored
+    /// `order = "manual"`, which stays `Order::Manual` regardless of item
+    /// type. [`super::super::catalog::Catalog::resolve_order`] appends the
+    /// implicit `entry_id` tiebreaker as it already does for any `Fields`
+    /// order.
+    pub fn episode_default() -> Order {
+        Order::Fields(vec![
+            FieldSort {
+                field: "season".to_string(),
+                dir: Dir::Asc,
+            },
+            FieldSort {
+                field: "episode".to_string(),
+                dir: Dir::Asc,
+            },
+        ])
+    }
+
     /// Parse the `order = "..."` string form.
     pub fn parse(s: &str) -> Result<Order, String> {
         match s {
@@ -210,6 +229,23 @@ mod tests {
     fn compound() {
         assert_eq!(
             parse("season:asc,episode:asc"),
+            Order::Fields(vec![
+                FieldSort {
+                    field: "season".into(),
+                    dir: Dir::Asc,
+                },
+                FieldSort {
+                    field: "episode".into(),
+                    dir: Dir::Asc,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn episode_default_is_season_then_episode() {
+        assert_eq!(
+            Order::episode_default(),
             Order::Fields(vec![
                 FieldSort {
                     field: "season".into(),
