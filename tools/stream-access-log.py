@@ -27,14 +27,16 @@ filter keeps server-to-client packets whose payload begins with "HTTP", so the
 this process. (That payload test is IPv4-only — libpcap cannot index past IPv6
 extension headers — which matches the IPv4-only address parsing below.)
 
-Runs ON the Unraid host, not in the container — the container never sees the
-client's address, only the docker bridge's. Install and start it with
-tools/diag-install.sh rather than by hand.
+Runs inside the container, started by docker/entrypoint.sh when
+ETV_DIAG_CAPTURE is set. It used to run on the Unraid host instead, on the
+belief that a container could only ever see the docker bridge's address; it
+sees the client's, which is where every address in ETV-next's own access log
+comes from.
 
 Usage::
 
     tools/stream-access-log.py
-    PORT=8419 LOG_FILE=/mnt/user/appdata/etv-station/data/diag/access.log \
+    PORT=8409 LOG_FILE=/data/diag/access.log \
         MAX_BYTES=52428800 tools/stream-access-log.py
 """
 

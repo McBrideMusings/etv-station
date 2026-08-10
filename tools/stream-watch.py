@@ -32,13 +32,15 @@ Events:
     recovered       it advanced again
     discontinuity   the discontinuity counter rose (an encoder handoff)
 
-Runs ON the Unraid host. Install and start it with tools/diag-install.sh.
+Runs inside the container, started by docker/entrypoint.sh when
+ETV_DIAG_CAPTURE is set. Reads the playlist files off disk rather than over
+HTTP, because a request under /session makes the server spawn a worker.
 
 Usage::
 
     tools/stream-watch.py
-    HLS_ROOT=/mnt/user/appdata/etv-station/data/hls INTERVAL=2 STALL_SECS=20 \
-        LOG_FILE=/mnt/user/appdata/etv-station/data/diag/stream-events.log \
+    HLS_ROOT=/data/hls INTERVAL=2 STALL_SECS=20 \
+        LOG_FILE=/data/diag/stream-events.log \
         tools/stream-watch.py
 """
 
