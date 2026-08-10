@@ -14,6 +14,7 @@ use crate::error::FFPipelineError;
 use crate::frame_rate::FrameRate;
 use crate::input::LavfiInputSource;
 use crate::input::LocalInputSource;
+use crate::input::RawVideoInputSource;
 use crate::input::{FfmpegInputArgs, HttpInputSource};
 use crate::input::{InputSource, RtspInputSource};
 
@@ -262,58 +263,25 @@ impl Probeable for LocalInputSource {
 
 impl Probeable for LavfiInputSource {
     async fn probe(&self, probe_deps: &ProbeDeps<'_>) -> Result<ProbeResult, FFPipelineError> {
-        let mut ffmpeg = Command::new(probe_deps.ffmpeg_path)
-            .args([
-                "-f",
-                "lavfi",
-                "-i",
-                self.params.as_str(),
-                "-t",
-                "1",
-                "-f",
-                "nut",
-                "pipe:1",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|_| FFPipelineError::ProbeFailed)?;
-
-        let ffmpeg_stdout: std::process::Stdio = ffmpeg
-            .stdout
-            .take()
-            .ok_or(FFPipelineError::ProbeFailed)?
-            .try_into()
-            .map_err(|_| FFPipelineError::ProbeFailed)?;
-
-        let output = Command::new(probe_deps.ffprobe_path)
-            .args([
-                "-hide_banner",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-                "-show_chapters",
-                "-i",
-                "pipe:0",
-            ])
-            .stdin(ffmpeg_stdout)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|_| FFPipelineError::ProbeFailed)?;
-
-        let _ = ffmpeg.wait().await;
-
-        if !output.status.success() {
-            return Err(FFPipelineError::ProbeFailed);
-        }
-
-        parse_ffprobe_stdout(
-            self.input_path().ok_or(FFPipelineError::ProbeFailed)?,
-            output.stdout,
-        )
+        // Probe lavfi sources directly via ffprobe instead of piping through ffmpeg.
+        // The pipe approach (ffmpeg -f lavfi ... -f nut pipe:1 | ffprobe -i pipe:0) deadlocks
+        // on computationally expensive filters like mandelbrot: ffmpeg fills the pipe buffer
+        // before ffprobe can read enough to complete analysis, and both processes hang.
+        // ffprobe can probe lavfi directly — stream info comes from filter graph parameters
+        // without decoding any frames.
+        let args = args![
+            "-hide_banner",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            "-show_chapters",
+            "-f",
+            "lavfi",
+            "-i",
+            self.params.clone(),
+        ];
+        probe_with_args(probe_deps.ffprobe_path, self.params.as_str(), &args).await
     }
 }
 
@@ -350,6 +318,14 @@ impl Probeable for RtspInputSource {
         args.extend(args!["-i", path.clone()]);
 
         probe_with_args(probe_deps.ffprobe_path, &path, &args).await
+    }
+}
+
+impl Probeable for RawVideoInputSource {
+    async fn probe(&self, _: &ProbeDeps<'_>) -> Result<ProbeResult, FFPipelineError> {
+        // RawVideo sources are overlay-only and never selected as a primary
+        // audio/video input, so they should not flow through the probe path.
+        Err(FFPipelineError::ProbeFailed)
     }
 }
 

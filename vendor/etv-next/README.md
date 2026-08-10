@@ -18,6 +18,10 @@ Unlike [the legacy version](https://github.com/ErsatzTV/legacy), this version is
 
 Platform-specific quickstart guides and reference documentation live at **<https://ersatztv.org/next-docs/>**.
 
+In-repo reference for behaviour this fork changed:
+
+- [docs/subtitles.md](docs/subtitles.md): burning subtitles into the picture vs. serving them as a selectable WebVTT track, which source track gets picked, and how the language is declared.
+
 ## Contents
 
 This project contains the following crates:

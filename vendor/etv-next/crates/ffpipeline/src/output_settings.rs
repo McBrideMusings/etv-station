@@ -2,7 +2,7 @@ use crate::frame_rate::FrameRate;
 use crate::frame_size::FrameSize;
 use crate::hw_accel::HardwareAccel;
 use crate::output_format::OutputFormat;
-use crate::pipeline::{AudioFormat, Hz, Kbps, PtsOffset, VideoFormat};
+use crate::pipeline::{AudioFormat, Hz, Kbps, PtsOffset, ReadRate, VideoFormat};
 
 #[derive(Debug)]
 pub struct OutputSettings {
@@ -18,8 +18,10 @@ pub struct OutputSettings {
     pub accel: Option<HardwareAccel>,
     pub format: OutputFormat,
     pub pts_offset: Option<PtsOffset>,
-    pub realtime: bool,
-    pub is_live: bool,
+    /// How fast the one ffmpeg process reads its input: unthrottled for live
+    /// sources and for a one-shot transcode nobody is watching, wall-clock speed
+    /// with a leading burst for a channel feeding players right now.
+    pub read_rate: ReadRate,
     pub frame_rate: Option<FrameRate>,
     pub subtitle_mode: SubtitleMode,
     pub reports_folder: Option<String>,

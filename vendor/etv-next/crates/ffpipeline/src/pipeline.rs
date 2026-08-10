@@ -16,12 +16,14 @@ use crate::frame_rate::FrameRate;
 use crate::frame_size::FrameSize;
 use crate::global_option::{GlobalOption, LogLevel};
 use crate::hw_accel::{HardwareAccel, HwAccel};
-use crate::input::{FfmpegInputArgs, InputSettings, InputSource, WatermarkInput};
+use crate::input::{
+    FfmpegInputArgs, InputSettings, InputSource, RawVideoInputSource, WatermarkInput,
+};
 use crate::output_option::OutputOption;
 use crate::output_settings::{
     OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions, YadifOptions,
 };
-use crate::overlay_filter::{OverlayFilter, OverlaySource, SoftwareOverlay};
+use crate::overlay_filter::{FramePoint, OverlayFilter, OverlaySource, SoftwareOverlay};
 use crate::video_codec::VideoCodec;
 use crate::video_decoder::VideoDecoder;
 use crate::video_filter::{
@@ -56,6 +58,42 @@ pub enum VideoFormat {
     Vc1,
     Vp8,
     Vp9,
+}
+
+/// How fast ffmpeg is allowed to read an input.
+///
+/// A channel needs both speeds out of one process. It has to get segments onto
+/// disk fast enough that a player joining now has something to play, and it then
+/// has to slow to wall-clock speed or it would race to the end of the file. Two
+/// processes cannot do this: handing over mid-item breaks the timestamp run and
+/// forces an `EXT-X-DISCONTINUITY` into the playlist, which some players treat
+/// as the end of the stream.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ReadRate {
+    /// No limit. Live inputs arrive at their own speed and must not be throttled.
+    Unthrottled,
+    /// Wall-clock speed, after reading `initial_burst` at full speed to fill the
+    /// segment buffer. A zero burst throttles from the first frame.
+    Realtime { initial_burst: Duration },
+}
+
+impl ReadRate {
+    /// The ffmpeg input arguments for this rate, in order.
+    fn as_args(&self) -> ArgVec {
+        match self {
+            ReadRate::Unthrottled => ArgVec::new(),
+            ReadRate::Realtime { initial_burst } => {
+                let mut result = args!["-readrate", "1.0"];
+                if !initial_burst.is_zero() {
+                    result.extend(args![
+                        "-readrate_initial_burst",
+                        format!("{}", initial_burst.as_secs())
+                    ]);
+                }
+                result
+            }
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -213,7 +251,7 @@ pub enum PipelineInput {
         index: u32,
         path: String,
         seek: Duration,
-        realtime: bool,
+        read_rate: ReadRate,
         decoder: VideoDecoder,
     },
     Subtitle {
@@ -228,6 +266,10 @@ pub enum PipelineInput {
         path: String,
         extra_input_args: ArgVec,
     },
+    Overlay {
+        input_source: InputSource,
+        path: String,
+    },
 }
 
 impl PipelineInput {
@@ -237,6 +279,7 @@ impl PipelineInput {
             PipelineInput::Audio { .. } => 1,
             PipelineInput::Subtitle { .. } => 2,
             PipelineInput::Watermark { .. } => 3,
+            PipelineInput::Overlay { .. } => 4,
         }
     }
 }
@@ -438,7 +481,7 @@ impl Pipeline {
                 } else {
                     input_settings.video_input.in_point
                 },
-                realtime: final_output_settings.realtime && !final_output_settings.is_live,
+                read_rate: final_output_settings.read_rate,
                 decoder: video_decoder,
             },
         ];
@@ -489,6 +532,56 @@ impl Pipeline {
                     .into(),
                 ))
             }
+        } else if let Some(overlay) = input_settings.overlay_input.as_ref() {
+            // Live overlay (Vello fifo etc). Gated on no image-subtitle being
+            // present so the two overlay paths don't collide. Reuses the same
+            // OverlayFilter machinery image subtitles use.
+            inputs.push(PipelineInput::Overlay {
+                input_source: InputSource::RawVideo(RawVideoInputSource {
+                    pixel_format: overlay.pixel_format.clone(),
+                    width: overlay.width,
+                    height: overlay.height,
+                    framerate: overlay.framerate,
+                }),
+                path: overlay.fifo_path.clone(),
+            });
+
+            let secondary_initial_state = FrameState {
+                size: FrameSize {
+                    width: overlay.width,
+                    height: overlay.height,
+                },
+                is_anamorphic: false,
+                is_interlaced: false,
+                sample_aspect_ratio: None,
+                display_aspect_ratio: None,
+                surface: FrameSurface::System,
+                pixel_format: PixelFormat::Bgra,
+                is_hdr: false,
+            };
+
+            filters.push(PipelineFilter::Overlay(OverlayFilter {
+                kind: SoftwareOverlay::default().into(),
+                secondary: vec![
+                    ScaleFilter {
+                        size: final_output_settings.video_size,
+                        scaling_mode: ScalingMode::ScaleAndPad,
+                        input_is_anamorphic: false,
+                        force_original_aspect_ratio: None,
+                    }
+                    .into(),
+                ],
+                secondary_initial_state,
+                // The live overlay reuses the subtitle label/secondary input slot,
+                // so the filter draws from `subtitle_label` (set in the Overlay
+                // pipeline-input arm). Honor the OverlaySpec's top-left x/y; the
+                // FramePoint is u32 so negative offsets clamp to 0 (on-screen).
+                secondary_source: OverlaySource::Subtitle,
+                location: Some(FramePoint {
+                    x: overlay.x.max(0) as u32,
+                    y: overlay.y.max(0) as u32,
+                }),
+            }));
         }
 
         if let Some(watermark_stream) = watermark_stream
@@ -774,7 +867,7 @@ impl Pipeline {
                     index,
                     path,
                     seek,
-                    realtime,
+                    read_rate,
                     decoder,
                     ..
                 } => {
@@ -790,9 +883,7 @@ impl Pipeline {
                         result.extend(args!["-ss", format!("{}ms", seek.as_millis())]);
                     }
 
-                    if *realtime {
-                        result.extend(args!["-readrate", "1.0"]);
-                    }
+                    result.extend(read_rate.as_args());
 
                     result.extend(input_source.args_for_input());
                     // TODO: if audio has same input and args, should use here
@@ -862,6 +953,26 @@ impl Pipeline {
                         distinct_paths.iter().position(|p| p == path).unwrap_or(0);
                     watermark_label = Some(format!("{}:{}", watermark_input_index, index))
                 }
+                PipelineInput::Overlay {
+                    input_source, path, ..
+                } => {
+                    if !distinct_paths.contains(&path.as_str()) {
+                        distinct_paths.push(path.as_str());
+                        result.extend(input_source.args_for_input());
+                        result.extend(args!["-i", path.to_owned()]);
+                    }
+
+                    let overlay_input_index =
+                        distinct_paths.iter().position(|p| p == path).unwrap_or(0);
+                    // The overlay filter machinery uses `subtitle_label` for
+                    // whichever secondary input the OverlayFilter draws from.
+                    // For now overlay and image-subtitle are mutually exclusive
+                    // (gated at the channel session layer); when overlay is in
+                    // use we hand its label here.
+                    if subtitle_label.is_none() {
+                        subtitle_label = Some(format!("{}:0", overlay_input_index));
+                    }
+                }
             }
         }
 
@@ -928,5 +1039,37 @@ mod tests {
             Some("videotoolbox")
         );
         assert_eq!(FrameSurface::System.device_name(), None);
+    }
+
+    /// A channel has to fill its segment buffer fast and then hold wall-clock
+    /// speed, and it has to do both in one process. Splitting it across two used
+    /// to put an `EXT-X-DISCONTINUITY` in the middle of an episode, which stopped
+    /// the picture dead on players that treat the tag as the end of the stream.
+    #[test]
+    fn realtime_read_rate_bursts_then_throttles_in_one_process() {
+        let args = ReadRate::Realtime {
+            initial_burst: Duration::from_secs(44),
+        }
+        .as_args();
+
+        assert_eq!(
+            args,
+            vec!["-readrate", "1.0", "-readrate_initial_burst", "44"]
+        );
+    }
+
+    #[test]
+    fn a_full_buffer_needs_no_burst() {
+        let args = ReadRate::Realtime {
+            initial_burst: Duration::ZERO,
+        }
+        .as_args();
+
+        assert_eq!(args, vec!["-readrate", "1.0"]);
+    }
+
+    #[test]
+    fn live_input_is_never_throttled() {
+        assert!(ReadRate::Unthrottled.as_args().is_empty());
     }
 }

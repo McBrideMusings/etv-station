@@ -420,6 +420,7 @@ dependencies = [
  "clap",
  "env_logger",
  "ersatztv-core",
+ "ersatztv-playout",
  "filetime",
  "log",
  "quick-xml",
@@ -427,10 +428,13 @@ dependencies = [
  "serde",
  "serde_json",
  "simple-expand-tilde",
+ "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "tower",
  "tower-http",
+ "uuid",
 ]
 
 [[package]]
@@ -444,6 +448,7 @@ dependencies = [
  "ersatztv-playout",
  "ffpipeline",
  "futures-core",
+ "libc",
  "log",
  "reqwest",
  "schemars",

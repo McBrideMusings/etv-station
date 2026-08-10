@@ -23,6 +23,22 @@ pub struct ServerConfig {
     pub bind_address: String,
     #[serde(default = "port_default")]
     pub port: u16,
+    /// How Plex tells this tuner apart from every other one it has seen. Plex
+    /// keys a DVR's whole channel mapping on it, so a value that changes
+    /// between restarts reads as a brand-new tuner and the mapping has to be
+    /// redone by hand.
+    ///
+    /// Read, never generated: whatever writes this file owns the value and owns
+    /// keeping it stable.
+    ///
+    /// Deliberately has no serde default. A default would make every way of
+    /// getting this key wrong — a rename here, a typo in the generator, a
+    /// hand-written lineup that omits it — fail by quietly substituting one
+    /// shared constant, so every deployment would report the same DeviceID and
+    /// Plex would treat unrelated servers as the same tuner. Missing is an
+    /// error instead, which is loud and happens at startup. `scaffold` writes
+    /// one, so a generated lineup always has it.
+    pub device_id: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, JsonSchema)]
@@ -70,6 +86,10 @@ fn server_config_default() -> ServerConfig {
     ServerConfig {
         bind_address: bind_address_default(),
         port: port_default(),
+        // Only reached when the lineup omits the whole `server` block. Minted
+        // rather than constant, so two servers in that state are still distinct
+        // tuners to Plex.
+        device_id: uuid::Uuid::new_v4().to_string(),
     }
 }
 
@@ -77,7 +97,10 @@ fn bind_address_default() -> String {
     String::from("0.0.0.0")
 }
 fn port_default() -> u16 {
-    8409
+    std::env::var("ETV_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8409)
 }
 
 pub async fn from_file(path: &PathBuf) -> Result<LineupConfig, LineupError> {

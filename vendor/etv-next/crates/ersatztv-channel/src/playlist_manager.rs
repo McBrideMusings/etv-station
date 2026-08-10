@@ -12,6 +12,30 @@ use time::macros::format_description;
 
 const MIN_SEGMENTS: usize = 4;
 
+/// How far the newest segment's end may fall behind wall clock — in multiples of
+/// the playlist's target duration — before a session that a viewer is actively
+/// polling is declared stalled.
+///
+/// A healthy session keeps roughly a minute of transcoded content *ahead* of
+/// wall clock, so this measure normally sits deeply negative and never
+/// approaches zero, including during the work-ahead idle gap where no ffmpeg is
+/// running at all. Sixty seconds of starvation is well past any legitimate
+/// transient: the server gives a cold session only [`READY_FILE_TIMEOUT`] (30s)
+/// to produce its first segments before it gives up on the client's behalf.
+///
+/// [`READY_FILE_TIMEOUT`]: ersatztv_core::READY_FILE_TIMEOUT
+const STALL_TARGET_DURATIONS: u32 = 15;
+
+/// Why a session should stop transcoding and let the process exit.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum SessionAbort {
+    /// No viewer has requested anything for [`HEARTBEAT_FILE_TIMEOUT`].
+    IdleTimeout,
+    /// A viewer is still requesting, but the encoder has stopped producing
+    /// segments — see [`STALL_TARGET_DURATIONS`].
+    SegmentStall,
+}
+
 #[derive(Clone)]
 pub struct SubtitleSource {
     pub cues: Arc<Vec<Cue>>,
@@ -25,7 +49,9 @@ pub struct PlaylistManager {
     ready_file: PathBuf,
     heartbeat_file: PathBuf,
     generated_playlist_file: String,
-    generated_subtitle_playlist_file: String,
+    /// `None` on a channel that burns subtitles into the picture — there are no
+    /// `.vtt` files for a subtitle playlist to point at, so none is written.
+    generated_subtitle_playlist_file: Option<String>,
     ffmpeg_playlist_file: String,
     ready: bool,
 
@@ -44,6 +70,7 @@ pub struct PlaylistManager {
     subtitle_source: Option<SubtitleSource>,
 
     timeout: bool,
+    stalled: bool,
 }
 
 #[derive(Clone)]
@@ -56,7 +83,7 @@ struct Segment {
 pub struct PlaylistManagerOutputFiles {
     pub generated_playlist_file: String,
     pub ffmpeg_playlist_file: String,
-    pub generated_subtitle_playlist_file: String,
+    pub generated_subtitle_playlist_file: Option<String>,
 }
 
 impl PlaylistManager {
@@ -93,11 +120,20 @@ impl PlaylistManager {
             subtitle_source: None,
 
             timeout: false,
+            stalled: false,
         }
     }
 
-    pub fn timeout(&self) -> &bool {
-        &self.timeout
+    /// Whether this session should stop transcoding, and why. `None` while it is
+    /// healthy.
+    pub fn abort(&self) -> Option<SessionAbort> {
+        if self.timeout {
+            Some(SessionAbort::IdleTimeout)
+        } else if self.stalled {
+            Some(SessionAbort::SegmentStall)
+        } else {
+            None
+        }
     }
 
     pub async fn before_new_pipeline(
@@ -231,23 +267,55 @@ impl PlaylistManager {
         tokio::fs::rename(temp.path(), &self.generated_playlist_file).await?;
 
         // generate and atomically save subtitle playlist
-        let generated_subtitle_playlist = self.generate_playlist(
-            |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
-            Some(10),
-        )?;
-        let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
-        tokio::fs::write(temp.path(), generated_subtitle_playlist).await?;
-        tokio::fs::rename(temp.path(), &self.generated_subtitle_playlist_file).await?;
+        if let Some(subtitle_playlist_file) = self.generated_subtitle_playlist_file.clone() {
+            let generated_subtitle_playlist = self.generate_playlist(
+                |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
+                Some(10),
+            )?;
+            let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
+            tokio::fs::write(temp.path(), generated_subtitle_playlist).await?;
+            tokio::fs::rename(temp.path(), &subtitle_playlist_file).await?;
+        }
 
         if !self.ready && self.segments.len() >= MIN_SEGMENTS {
             tokio::fs::write(&self.ready_file, b"").await?;
             self.ready = true;
         }
 
+        let mut viewer_is_watching = false;
         if self.heartbeat_file.exists() {
             let metadata = tokio::fs::metadata(&self.heartbeat_file).await?;
             let modified = metadata.modified()?;
             self.timeout = modified.elapsed().unwrap_or(Duration::MAX) > HEARTBEAT_FILE_TIMEOUT;
+            viewer_is_watching = !self.timeout;
+        }
+
+        // The heartbeat proves the worker process is alive and that a viewer is
+        // still asking for the playlist. It does not prove the encoder emitted
+        // any bytes, and those are the two things that can come apart: a session
+        // wedged on a blocked ffmpeg keeps its heartbeat advancing while
+        // producing nothing, and once the trim above drains the last segment the
+        // viewer is served an empty playlist indefinitely.
+        //
+        // `last_segment_end` is the wall-clock end of the newest segment, so
+        // `now - last_segment_end` is how long the viewer has been past the end
+        // of the content we hold. It starts at the session start time and only
+        // advances when a segment is added, so a session that has never produced
+        // a single segment is measured the same way as one that stopped
+        // mid-stream — no separate never-started case.
+        if viewer_is_watching {
+            let starved_for = OffsetDateTime::now_utc() - self.last_segment_end;
+            let limit =
+                time::Duration::seconds((self.target_duration * STALL_TARGET_DURATIONS) as i64);
+            if starved_for > limit && !self.stalled {
+                log::error!(
+                    "no segments produced for {}s while a viewer is watching ({} segments held); \
+                     tearing down the session so it can re-tune",
+                    starved_for.whole_seconds(),
+                    self.segments.len()
+                );
+                self.stalled = true;
+            }
         }
 
         Ok(())
@@ -395,4 +463,101 @@ fn render_subtitle_segment(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use ffpipeline::pipeline::SEGMENT_SECONDS;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// Seconds of starvation the watchdog tolerates at the default target
+    /// duration.
+    const THRESHOLD_SECONDS: i64 = (SEGMENT_SECONDS * STALL_TARGET_DURATIONS) as i64;
+
+    /// A manager whose newest segment ends at `last_segment_end`. Passing that as
+    /// the channel start time is how a session that has never produced a segment
+    /// looks too — the field only ever advances when one is added.
+    fn manager(dir: &Path, last_segment_end: OffsetDateTime) -> PlaylistManager {
+        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+
+        PlaylistManager::new(
+            last_segment_end,
+            SEGMENT_SECONDS,
+            dir.to_path_buf(),
+            dir.join(".ready"),
+            PlaylistManagerOutputFiles {
+                generated_playlist_file: file("live.m3u8"),
+                generated_subtitle_playlist_file: Some(file("live_sub.m3u8")),
+                ffmpeg_playlist_file: file("ffmpeg.m3u8"),
+            },
+        )
+    }
+
+    async fn watch(dir: &Path) {
+        tokio::fs::write(dir.join(HEARTBEAT_FILE_NAME), b"")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_session_working_ahead_does_not_stall() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        // The run loop keeps roughly a minute of transcoded content ahead of wall
+        // clock, and produces no segments at all while it waits for that buffer
+        // to drain. That gap must never read as a stall.
+        let mut pm = manager(
+            dir.path(),
+            OffsetDateTime::now_utc() + time::Duration::minutes(1),
+        );
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), None);
+    }
+
+    #[tokio::test]
+    async fn starvation_just_under_the_threshold_does_not_stall() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(
+            dir.path(),
+            OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS - 5),
+        );
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), None);
+    }
+
+    #[tokio::test]
+    async fn watched_session_past_the_threshold_stalls() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(
+            dir.path(),
+            OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS + 5),
+        );
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), Some(SessionAbort::SegmentStall));
+    }
+
+    #[tokio::test]
+    async fn unwatched_session_past_the_threshold_does_not_stall() {
+        // No heartbeat file: nobody is asking for the playlist, so there is no
+        // viewer to starve. The idle timeout owns this case.
+        let dir = TempDir::new().unwrap();
+
+        let mut pm = manager(
+            dir.path(),
+            OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS + 5),
+        );
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), None);
+    }
 }

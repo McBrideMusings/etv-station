@@ -1,3 +1,7 @@
 /target
 .idea
 .serena
+CLAUDE.local.md
+tmp/
+.env
+*.local.*

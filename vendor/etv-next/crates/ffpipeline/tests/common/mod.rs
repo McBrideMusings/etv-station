@@ -12,7 +12,9 @@ use ffpipeline::output_settings::{
     AudioLoudnessSettings, AudioOutputSettings, OutputSettings, ScalingMode, SubtitleMode,
     VideoFilterOptions,
 };
-use ffpipeline::pipeline::{AudioFormat, Hz, Kbps, Pipeline, VideoFormat, generate_pipeline};
+use ffpipeline::pipeline::{
+    AudioFormat, Hz, Kbps, Pipeline, ReadRate, VideoFormat, generate_pipeline,
+};
 use ffpipeline::probe::{ProbeDeps, ProbeResult, ProbeResultStream, Probeable};
 use time::OffsetDateTime;
 use tokio::sync::OnceCell;
@@ -162,6 +164,7 @@ pub fn build_input(path: &Path, probe: ProbeResult, duration: Duration) -> Input
         },
         subtitle_input: None,
         watermark_input: None,
+        overlay_input: None,
     }
 }
 
@@ -226,8 +229,9 @@ pub fn build_output(dir: &Path, params: TestOutputParams) -> OutputSettings {
             segment_template: dir.join("segment_%03d.ts").to_string_lossy().into_owned(),
         },
         pts_offset: None,
-        realtime: false,
-        is_live: false,
+        // these tests transcode a fixture as fast as the machine allows; nothing
+        // is reading segments off a clock
+        read_rate: ReadRate::Unthrottled,
         frame_rate: params.frame_rate,
         subtitle_mode: SubtitleMode::Burn,
         reports_folder: None,

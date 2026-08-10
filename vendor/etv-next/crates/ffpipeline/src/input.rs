@@ -18,6 +18,21 @@ pub struct InputSettings {
     pub video_input: ProbedInput,
     pub subtitle_input: Option<ProbedInput>,
     pub watermark_input: Option<WatermarkInput>,
+    pub overlay_input: Option<OverlayInput>,
+}
+
+/// Live overlay source feeding the secondary input of an ffmpeg `overlay`
+/// filter. The producer writes rawvideo bytes to `fifo_path`; ffmpeg reads
+/// from that path like any other file.
+#[derive(Clone, Debug)]
+pub struct OverlayInput {
+    pub fifo_path: String,
+    pub pixel_format: String,
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub x: i32,
+    pub y: i32,
 }
 
 impl InputSettings {
@@ -146,18 +161,18 @@ impl InputSettings {
             }
         }
 
-        // at this point, select a subtitle if the input is *only* a subtitle
-        if all_subtitle_streams.len() == 1
-            && self
-                .subtitle_input
-                .as_ref()
-                .map(|i| i.probe_result.streams.len() == 1)
-                .unwrap_or(false)
-        {
-            Some(all_subtitle_streams[0])
-        } else {
-            None
-        }
+        // No track was named, so fall back to what the file actually carries.
+        // Text beats image: text can either be burned in or converted to WebVTT,
+        // while an image subtitle can only be burned, so preferring text keeps
+        // both output modes open. Ordinary media files reach this path — a
+        // playout item that names no subtitle track is the common case, not an
+        // unusual one.
+        all_subtitle_streams
+            .iter()
+            .copied()
+            .find(|s| !s.is_subtitle_image())
+            .or_else(|| all_subtitle_streams.first().copied())
+            .map(|s| &**s)
     }
 
     pub fn select_watermark_stream(&self) -> Option<&ProbeResultVideoStream> {
@@ -255,6 +270,17 @@ pub struct RtspInputSource {
     pub options: RtspInputOptions,
 }
 
+/// Raw RGBA-or-similar pixel stream fed via a regular file path (typically a
+/// fifo). ffmpeg consumes it as `-f rawvideo -pixel_format X -video_size WxH
+/// -framerate N -i {path}`.
+#[derive(Debug, Clone)]
+pub struct RawVideoInputSource {
+    pub pixel_format: String,
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+}
+
 #[derive(Debug, Clone)]
 #[enum_dispatch(Probeable)]
 #[enum_dispatch(FfmpegInputArgs)]
@@ -263,6 +289,7 @@ pub enum InputSource {
     Lavfi(LavfiInputSource),
     Http(HttpInputSource),
     Rtsp(RtspInputSource),
+    RawVideo(RawVideoInputSource),
 }
 
 #[enum_dispatch]
@@ -286,6 +313,27 @@ impl FfmpegInputArgs for LavfiInputSource {
     }
     fn input_path(&self) -> Option<String> {
         Some(self.params.clone())
+    }
+}
+
+impl FfmpegInputArgs for RawVideoInputSource {
+    fn args_for_input(&self) -> ArgVec {
+        args![
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            self.pixel_format.clone(),
+            "-video_size",
+            format!("{}x{}", self.width, self.height),
+            "-framerate",
+            self.framerate.to_string(),
+        ]
+    }
+
+    fn input_path(&self) -> Option<String> {
+        // The fifo path is supplied separately by the pipeline (as `-i {path}`),
+        // not carried on the source itself.
+        None
     }
 }
 impl FfmpegInputArgs for HttpInputSource {
@@ -517,4 +565,143 @@ pub enum WatermarkLocation {
     BottomLeft,
     BottomCenter,
     BottomRight,
+}
+
+#[cfg(test)]
+mod tests {
+    use time::OffsetDateTime;
+
+    use super::*;
+    use crate::frame_rate::FrameRate;
+    use crate::probe::ProbeResultColorParams;
+
+    fn stream(stream_index: u32, codec_type: CodecType, codec: &str) -> ProbeResultStream {
+        ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
+            stream_index,
+            codec: String::from(codec),
+            codec_type,
+            profile: String::new(),
+            height: None,
+            width: None,
+            frame_rate: FrameRate::default(),
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            pix_fmt: String::new(),
+            color_params: ProbeResultColorParams {
+                color_range: None,
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+            },
+            field_order: None,
+        }))
+    }
+
+    fn probed(streams: Vec<ProbeResultStream>, stream_index: Option<u32>) -> ProbedInput {
+        ProbedInput {
+            input_source: InputSource::Local(LocalInputSource {
+                path: String::from("/tmp/example.mkv"),
+            }),
+            probe_result: ProbeResult {
+                path: String::from("/tmp/example.mkv"),
+                streams,
+                duration: None,
+                format_name: None,
+            },
+            in_point: Duration::ZERO,
+            out_point: Duration::from_secs(60),
+            stream_index,
+        }
+    }
+
+    fn settings(subtitle_input: Option<ProbedInput>) -> InputSettings {
+        InputSettings {
+            start: OffsetDateTime::UNIX_EPOCH,
+            audio_input: probed(vec![stream(0, CodecType::Video, "h264")], None),
+            video_input: probed(vec![stream(0, CodecType::Video, "h264")], None),
+            subtitle_input,
+            watermark_input: None,
+            overlay_input: None,
+        }
+    }
+
+    /// An ordinary media file: video, audio, and a subtitle track, with no
+    /// track number named by the playout item. This is the common case, and
+    /// before the fallback existed it selected nothing at all.
+    #[test]
+    fn picks_the_subtitle_track_out_of_an_ordinary_file() {
+        let input = settings(Some(probed(
+            vec![
+                stream(0, CodecType::Video, "h264"),
+                stream(1, CodecType::Audio, "aac"),
+                stream(2, CodecType::Subtitle, "subrip"),
+            ],
+            None,
+        )));
+
+        let selected = input.select_subtitle_stream().expect("a subtitle stream");
+        assert_eq!(selected.stream_index, 2);
+    }
+
+    /// Text can be burned in or converted to WebVTT; a picture can only be
+    /// burned in. Preferring the text track keeps both output modes available.
+    #[test]
+    fn prefers_a_text_track_over_a_picture_one() {
+        let input = settings(Some(probed(
+            vec![
+                stream(0, CodecType::Video, "h264"),
+                stream(1, CodecType::Subtitle, "hdmv_pgs_subtitle"),
+                stream(2, CodecType::Subtitle, "subrip"),
+            ],
+            None,
+        )));
+
+        let selected = input.select_subtitle_stream().expect("a subtitle stream");
+        assert_eq!(selected.stream_index, 2);
+    }
+
+    /// A disc rip whose only subtitles are pictures still gets selected, so
+    /// burn mode has something to draw.
+    #[test]
+    fn falls_back_to_a_picture_track_when_that_is_all_there_is() {
+        let input = settings(Some(probed(
+            vec![
+                stream(0, CodecType::Video, "h264"),
+                stream(1, CodecType::Subtitle, "hdmv_pgs_subtitle"),
+            ],
+            None,
+        )));
+
+        let selected = input.select_subtitle_stream().expect("a subtitle stream");
+        assert_eq!(selected.stream_index, 1);
+    }
+
+    /// The playout item naming a track number still wins over the fallback.
+    #[test]
+    fn a_named_track_number_wins() {
+        let input = settings(Some(probed(
+            vec![
+                stream(0, CodecType::Video, "h264"),
+                stream(1, CodecType::Subtitle, "subrip"),
+                stream(2, CodecType::Subtitle, "subrip"),
+            ],
+            Some(2),
+        )));
+
+        let selected = input.select_subtitle_stream().expect("a subtitle stream");
+        assert_eq!(selected.stream_index, 2);
+    }
+
+    #[test]
+    fn a_file_with_no_subtitles_selects_nothing() {
+        let input = settings(Some(probed(
+            vec![
+                stream(0, CodecType::Video, "h264"),
+                stream(1, CodecType::Audio, "aac"),
+            ],
+            None,
+        )));
+
+        assert!(input.select_subtitle_stream().is_none());
+    }
 }

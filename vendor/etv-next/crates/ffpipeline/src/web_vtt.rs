@@ -27,6 +27,7 @@ pub async fn convert_to_vtt(
         InputSource::Http(http) => Ok(http.uri.clone()),
         InputSource::Rtsp(_) => Err(FFPipelineError::FailedToConvertSubtitle),
         InputSource::Lavfi(_) => Err(FFPipelineError::FailedToConvertSubtitle),
+        InputSource::RawVideo(_) => Err(FFPipelineError::FailedToConvertSubtitle),
     }?;
 
     // find index of subtitle *within subtitle streams*

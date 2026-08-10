@@ -77,6 +77,149 @@
               "type": "null"
             }
           ]
+        },
+        "program": {
+          "description": "Optional EPG metadata. Whatever is provided here is emitted in the XMLTV guide; missing fields are simply omitted. Producers of playout JSON are responsible for populating these — the server never sources them externally.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/ProgramMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "overlay": {
+          "description": "Optional live overlay. When present, the channel reads RGBA frames from `fifo_path` and composites them on top of the video using ffmpeg's overlay filter. The producer of the playout JSON is responsible for making sure something is writing to that fifo while this item plays.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/OverlaySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "OverlaySpec": {
+      "type": "object",
+      "description": "Spec for a live overlay source feeding the secondary input of an ffmpeg `overlay` filter. The channel worker opens the fifo itself, on a deadline, and hands ffmpeg the already-open descriptor — ffmpeg's own open() on a fifo with no writer never returns, which would wedge the channel forever.",
+      "required": [
+        "fifo_path",
+        "width",
+        "height",
+        "framerate"
+      ],
+      "properties": {
+        "fifo_path": {
+          "type": "string",
+          "description": "Filesystem path the channel opens for reading. Must exist as a fifo (or regular file) by the time the channel starts the item."
+        },
+        "pixel_format": {
+          "type": "string",
+          "default": "rgba",
+          "description": "ffmpeg pixel-format name for the rawvideo stream (default \"rgba\")."
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Width of the overlay raster in pixels."
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Height of the overlay raster in pixels."
+        },
+        "framerate": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Framerate of the rawvideo stream produced by the overlay process."
+        },
+        "x": {
+          "type": "integer",
+          "default": 0,
+          "description": "Overlay top-left x position relative to the main video (default 0)."
+        },
+        "y": {
+          "type": "integer",
+          "default": 0,
+          "description": "Overlay top-left y position relative to the main video (default 0)."
+        }
+      }
+    },
+    "ProgramMetadata": {
+      "type": "object",
+      "description": "Per-program metadata used to populate the XMLTV EPG. Every field is optional.",
+      "properties": {
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Program title, e.g. the movie or series name."
+        },
+        "sub_title": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Episode title or secondary heading."
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Long-form description / synopsis."
+        },
+        "season": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Season number (1-based for series; omit for non-serial content)."
+        },
+        "episode": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Episode number (1-based)."
+        },
+        "categories": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Genre / category labels, e.g. [\"Drama\", \"Sci-Fi\"]."
+        },
+        "content_rating": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Content rating string, e.g. \"TV-14\" or \"PG-13\"."
+        },
+        "artwork_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "URL to a poster / thumbnail image. Surfaced as `<icon src=...>` in the XMLTV programme."
+        },
+        "year": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Release / air year."
         }
       }
     },

@@ -89,14 +89,17 @@ impl OverlayKindOp for SoftwareOverlay {
             10 => "1",
             _ => "0",
         };
-
+        // eof_action=pass lets the main video continue if the secondary input
+        // (image subtitle stream, watermark, or live overlay fifo) ends or fails midway.
         if let Some(location) = location {
             Some(format!(
-                "overlay=x={}:y={}:format={fmt}",
+                "overlay=x={}:y={}:format={fmt}:eof_action=pass",
                 location.x, location.y
             ))
         } else {
-            Some(format!("overlay=x=(W-w)/2:y=(H-h)/2:format={fmt}"))
+            Some(format!(
+                "overlay=x=(W-w)/2:y=(H-h)/2:format={fmt}:eof_action=pass"
+            ))
         }
     }
 

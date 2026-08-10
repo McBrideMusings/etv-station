@@ -460,6 +460,30 @@ impl From<VideoFormat> for ffpipeline::pipeline::VideoFormat {
 pub struct SubtitleNormalizationConfig {
     #[serde(default)]
     pub mode: SubtitleMode,
+    /// Language the channel's converted subtitle track is announced as. HLS
+    /// allows one language per subtitle rendition for the whole session, so a
+    /// channel whose schedule mixes languages has to declare the one it
+    /// advertises rather than reading it off whichever item is playing.
+    #[serde(default)]
+    pub language: SubtitleLanguageConfig,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+pub struct SubtitleLanguageConfig {
+    /// BCP 47 tag written to `LANGUAGE=` in the HLS playlist.
+    pub tag: String,
+    /// Human-readable label written to `NAME=`; this is what a player shows in
+    /// its subtitle menu.
+    pub name: String,
+}
+
+impl Default for SubtitleLanguageConfig {
+    fn default() -> Self {
+        SubtitleLanguageConfig {
+            tag: String::from("en"),
+            name: String::from("English"),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default, Copy)]

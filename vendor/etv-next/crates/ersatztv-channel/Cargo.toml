@@ -24,6 +24,9 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [[bin]]
 name = "gen-channel-config-schema"
 path = "src/bin/gen_channel_config_schema.rs"

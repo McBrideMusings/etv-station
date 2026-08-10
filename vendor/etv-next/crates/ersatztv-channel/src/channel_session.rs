@@ -7,7 +7,11 @@ use std::time::Duration;
 
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
-use ersatztv_core::{READY_FILE_NAME, empty_folder};
+use ersatztv_core::{
+    HEARTBEAT_FILE_NAME, OVERLAY_READY_FILE_NAME, OVERLAY_READY_TIMEOUT, OVERLAY_WANTED_FILE_NAME,
+    OVERLAY_WRITER_POLL_INTERVAL, OVERLAY_WRITER_TIMEOUT, READY_FILE_NAME, empty_folder,
+    wait_for_file,
+};
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
     TrackSelection, VideoHint, WatermarkLocation, WatermarkTiming,
@@ -18,11 +22,13 @@ use ffpipeline::frame_rate::FrameRate;
 use ffpipeline::frame_size::FrameSize;
 use ffpipeline::input::{
     FfmpegInputArgs, HttpInputOptions, HttpInputSource, InputSettings, InputSource,
-    LavfiInputSource, LocalInputSource, ProbedInput, RtspInputOptions, RtspInputSource,
-    WatermarkInput,
+    LavfiInputSource, LocalInputSource, OverlayInput, ProbedInput, RtspInputOptions,
+    RtspInputSource, WatermarkInput,
 };
 use ffpipeline::output_settings::{AudioOutputSettings, OutputSettings};
-use ffpipeline::pipeline::{AudioFormat, Hz, Kbps, PtsOffset, SEGMENT_SECONDS, VideoFormat};
+use ffpipeline::pipeline::{
+    AudioFormat, Hz, Kbps, PtsOffset, ReadRate, SEGMENT_SECONDS, VideoFormat,
+};
 use ffpipeline::probe::{
     CodecType, ProbeResult, ProbeResultAudioStream, ProbeResultColorParams, ProbeResultStream,
     ProbeResultVideoStream, Probeable,
@@ -36,27 +42,58 @@ use tokio::sync::Mutex;
 
 use crate::dossier::DossierBuilder;
 use crate::local_proxy::{LocalProxyServer, ScriptCommand};
-use crate::playlist_manager::{PlaylistManager, PlaylistManagerOutputFiles, SubtitleSource};
+use crate::playlist_manager::{
+    PlaylistManager, PlaylistManagerOutputFiles, SessionAbort, SubtitleSource,
+};
 use crate::playout_loader::PlayoutLoader;
 use crate::pts_scanner::{PtsScanner, PtsTime};
 
 const STDERR_RING_LINES: usize = 2_000;
 
+/// How far ahead of wall clock the session keeps its transcode. A player that
+/// tunes in has to be handed several segments at once or it has nothing to play,
+/// so ffmpeg reads this much at full speed before slowing to wall-clock speed.
+const TARGET_BUFFER: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 11);
+
+/// Read end of the overlay rawvideo fifo, held open by this process and handed
+/// to ffmpeg as an inherited fd. There are no fifos off unix, so the type is
+/// uninhabited there and the overlay path fails instead of being constructed.
+#[cfg(unix)]
+type OverlayFifoReader = std::fs::File;
+#[cfg(not(unix))]
+type OverlayFifoReader = std::convert::Infallible;
+
+/// The `-i` argument naming an already-open overlay fifo. ffmpeg reads the
+/// descriptor this process opened rather than opening the fifo itself — see
+/// [`open_overlay_fifo`] for why. The descriptor keeps its own number across
+/// the fork, so name that number rather than moving it onto a fixed one.
+#[cfg(unix)]
+fn overlay_fifo_input_path(fifo: &OverlayFifoReader) -> String {
+    use std::os::unix::io::AsRawFd;
+
+    format!("pipe:{}", fifo.as_raw_fd())
+}
+
+#[cfg(not(unix))]
+fn overlay_fifo_input_path(fifo: &OverlayFifoReader) -> String {
+    match *fifo {}
+}
+
+/// Where in the item this session's next ffmpeg starts reading.
+///
+/// Only the first item of a session starts partway in — the viewer joined while
+/// it was already playing. Every item after it is played from its beginning.
 #[derive(Copy, Clone, PartialEq)]
 enum ChannelSessionState {
-    SeekAndWorkAhead,
-    ZeroAndWorkAhead,
-    SeekAndRealtime,
-    ZeroAndRealtime,
+    Seek,
+    Zero,
 }
 
 impl std::fmt::Display for ChannelSessionState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChannelSessionState::SeekAndWorkAhead => write!(f, "SeekAndWorkAhead"),
-            ChannelSessionState::ZeroAndWorkAhead => write!(f, "ZeroAndWorkAhead"),
-            ChannelSessionState::SeekAndRealtime => write!(f, "SeekAndRealtime"),
-            ChannelSessionState::ZeroAndRealtime => write!(f, "ZeroAndRealtime"),
+            ChannelSessionState::Seek => write!(f, "Seek"),
+            ChannelSessionState::Zero => write!(f, "Zero"),
         }
     }
 }
@@ -65,7 +102,6 @@ struct TimingResult {
     in_point: Duration,
     out_point: Duration,
     finish: OffsetDateTime,
-    is_complete: bool,
 }
 
 pub struct ChannelSession {
@@ -112,11 +148,18 @@ impl ChannelSession {
             .into_string()
             .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
 
-        let generated_subtitle_output_file = output_folder
-            .join("live_sub.m3u8")
-            .into_os_string()
-            .into_string()
-            .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+        // Burned-in subtitles live inside the video picture, so the channel has
+        // no separate subtitle playlist to serve.
+        let generated_subtitle_output_file = match channel_config.normalization.subtitle.mode {
+            ersatztv_channel::config::SubtitleMode::Convert => Some(
+                output_folder
+                    .join("live_sub.m3u8")
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?,
+            ),
+            ersatztv_channel::config::SubtitleMode::Burn => None,
+        };
 
         let ffmpeg_output_file = output_folder
             .join("ffmpeg.m3u8")
@@ -183,7 +226,7 @@ impl ChannelSession {
             output_file: ffmpeg_output_file,
             output_segment_template,
             start_time_offset,
-            state: ChannelSessionState::SeekAndWorkAhead,
+            state: ChannelSessionState::Seek,
             timeout_notify: Arc::new(tokio::sync::Notify::new()),
             cached_subtitles: None,
             dynamic_http_client,
@@ -217,7 +260,7 @@ impl ChannelSession {
             loop {
                 let mut playlist_manager = pm.lock().await;
                 let _ = playlist_manager.update().await;
-                if *playlist_manager.timeout() {
+                if playlist_manager.abort().is_some() {
                     tn.notify_one();
                     break;
                 }
@@ -226,19 +269,17 @@ impl ChannelSession {
             }
         });
 
-        // always work ahead initially
-        let realtime = false;
-        self.transcode(realtime).await?;
+        // nothing is on disk yet, so the first process bursts the full buffer
+        self.transcode(TARGET_BUFFER).await?;
 
         let pm = self.playlist_manager.clone();
         let tn = self.timeout_notify.clone();
 
         loop {
-            if *pm.lock().await.timeout() {
+            let abort = pm.lock().await.abort();
+            if let Some(abort) = abort {
                 tn.notify_one();
-                return Err(ChannelError::IdleTimeout(
-                    self.channel_config.number().to_owned(),
-                ));
+                return Err(self.abort_error(abort));
             }
 
             let now = OffsetDateTime::now_local()? + self.start_time_offset;
@@ -250,14 +291,17 @@ impl ChannelSession {
                 transcoded_buffer.whole_seconds() % 60
             );
             if transcoded_buffer <= time::Duration::minutes(1) {
-                // only use realtime when we're at least 30 seconds ahead
-                let realtime = transcoded_buffer >= time::Duration::seconds(30);
-                self.transcode(realtime).await?;
+                // top the buffer back up to TARGET_BUFFER, no more; bursting a
+                // full buffer every item would push the lead up by that much
+                // again each time
+                self.transcode(TARGET_BUFFER.saturating_sub(transcoded_buffer))
+                    .await?;
             } else {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                     _ = tn.notified() => {
-                        return Err(ChannelError::IdleTimeout(self.channel_config.number().to_owned()));
+                        let abort = pm.lock().await.abort().unwrap_or(SessionAbort::IdleTimeout);
+                        return Err(self.abort_error(abort));
                     }
                 }
             }
@@ -281,48 +325,82 @@ impl ChannelSession {
                 .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
         }
 
+        // Stamp the heartbeat here, after the wipe above, because both timers
+        // that can end this worker read it and BOTH are inert while it is
+        // absent: PlaylistManager evaluates the idle timeout and the stall
+        // watchdog only inside `if heartbeat_file.exists()`, so with no file it
+        // never times out and never sees a viewer it could be stalled on.
+        //
+        // Until now only the server's session route wrote it, and a viewer
+        // reaches that route only after this channel is ready. A worker that
+        // wedged before its first segment therefore never got a heartbeat at
+        // all and ran forever, holding its ffmpeg, with nothing able to reap it.
+        //
+        // It belongs here rather than in the server before spawn: the wipe above
+        // would delete anything written beforehand. Stamping it is honest, not a
+        // convenient lie — a worker only ever starts because a request arrived,
+        // so at this instant someone is genuinely waiting. If they leave, nobody
+        // refreshes it and the ordinary idle timeout collects this worker.
+        let heartbeat_file = output_folder.join(HEARTBEAT_FILE_NAME);
+        if let Err(err) = tokio::fs::write(&heartbeat_file, b"").await {
+            log::warn!("failed to stamp initial heartbeat: {err}");
+        }
+
         Ok(())
     }
 
-    async fn transcode(&mut self, realtime: bool) -> Result<(), ChannelError> {
-        if !realtime {
-            log::debug!("channel session will work ahead");
-
-            let next_state = match self.state {
-                ChannelSessionState::SeekAndRealtime => ChannelSessionState::SeekAndWorkAhead,
-                ChannelSessionState::ZeroAndRealtime => ChannelSessionState::ZeroAndWorkAhead,
-                _ => self.state,
-            };
-
-            if next_state != self.state {
-                log::debug!(
-                    "channel session is accelerating {} => {}",
-                    self.state,
-                    next_state
-                );
-                self.state = next_state;
-            }
-        } else {
-            log::debug!("channel session will NOT work ahead");
-
-            // throttle to realtime if needed
-            let next_state = match self.state {
-                ChannelSessionState::SeekAndWorkAhead => ChannelSessionState::SeekAndRealtime,
-                ChannelSessionState::ZeroAndWorkAhead => ChannelSessionState::ZeroAndRealtime,
-                _ => self.state,
-            };
-
-            if next_state != self.state {
-                log::debug!(
-                    "channel session is throttling {} => {}",
-                    self.state,
-                    next_state
-                );
-                self.state = next_state;
-            }
+    /// Signal the overlay producer (the separate etv-station daemon) that this
+    /// channel is now being watched — so it spawns the channel's overlay
+    /// process — then open the rawvideo fifo and wait, bounded, for a writer to
+    /// attach. Returns the open read end, which is handed to ffmpeg as an
+    /// inherited fd so ffmpeg never opens the fifo itself.
+    ///
+    /// Every failure here returns `Err`, including a slow or absent overlay:
+    /// the caller's item then fails and is replaced with black/silence. That is
+    /// deliberate. The old best-effort posture let every failure path fall
+    /// through to ffmpeg's own blocking `open()`, which parks forever when no
+    /// writer is attached — producing zero segments, a structurally valid but
+    /// permanently empty HLS playlist, and no error at any layer.
+    async fn signal_overlay_wanted_and_wait_ready(
+        &self,
+        fifo_path: &str,
+    ) -> Result<OverlayFifoReader, ChannelError> {
+        // The overlay markers and fifo live in the PLAYOUT folder — the folder
+        // shared with the etv-station daemon (where it writes playout JSON and
+        // the overlay fifo) — not the HLS output folder.
+        let playout_folder = self.channel_config.expanded_playout_folder();
+        let wanted = playout_folder.join(OVERLAY_WANTED_FILE_NAME);
+        // Write empty content: creates the marker, or refreshes its mtime so the
+        // producer treats it as a fresh watch request.
+        if let Err(e) = tokio::fs::write(&wanted, b"").await {
+            // Not fatal on its own — the producer may already be running from an
+            // earlier request. If it isn't, the bounded wait below reports it.
+            log::warn!(
+                "failed to touch overlay-wanted marker {}: {e}",
+                wanted.display()
+            );
+        }
+        let ready = playout_folder.join(OVERLAY_READY_FILE_NAME);
+        if !wait_for_file(&ready, OVERLAY_READY_TIMEOUT).await {
+            log::debug!(
+                "overlay-ready not observed within {OVERLAY_READY_TIMEOUT:?}; waiting for a fifo writer anyway"
+            );
         }
 
-        log::debug!("channel session state: {}", self.state);
+        let path = PathBuf::from(fifo_path);
+        tokio::task::spawn_blocking(move || open_overlay_fifo(&path, OVERLAY_WRITER_TIMEOUT))
+            .await
+            .map_err(|e| {
+                ChannelError::StreamFailure(format!("overlay fifo open task failed: {e}"))
+            })?
+    }
+
+    async fn transcode(&mut self, initial_burst: time::Duration) -> Result<(), ChannelError> {
+        log::debug!(
+            "channel session state: {}, bursting {}s before wall-clock speed",
+            self.state,
+            initial_burst.whole_seconds()
+        );
 
         // get last pts offset
         let mut pts_time: Option<PtsTime> = None;
@@ -362,16 +440,18 @@ impl ChannelSession {
         let pts_duration = pts_time.map(|p| p.duration);
 
         let result = self
-            .transcode_item(&current_item, realtime, pts_duration)
+            .transcode_item(&current_item, initial_burst, pts_duration)
             .await;
 
-        let (finish, is_complete) = match result {
+        let finish = match result {
             Ok(ok) => ok,
-            Err(e @ ChannelError::IdleTimeout(_)) => return Err(e),
+            Err(e @ (ChannelError::IdleTimeout(_) | ChannelError::SegmentStall(_))) => {
+                return Err(e);
+            }
             Err(e) => {
                 log::error!("item failed, replacing with black/silence: {e}");
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
-                self.transcode_item(&fake_item, realtime, pts_duration)
+                self.transcode_item(&fake_item, initial_burst, pts_duration)
                     .await?
             }
         };
@@ -379,7 +459,8 @@ impl ChannelSession {
         self.transcoded_until = finish;
         log::debug!("transcoded until: {}", self.transcoded_until);
 
-        self.state = Self::next_state(self.state, is_complete);
+        // this item was played to its end, so the next one starts at its own
+        self.state = ChannelSessionState::Zero;
 
         Ok(())
     }
@@ -387,9 +468,9 @@ impl ChannelSession {
     async fn transcode_item(
         &mut self,
         current_item: &PlayoutItem,
-        realtime: bool,
+        initial_burst: time::Duration,
         pts_duration: Option<Duration>,
-    ) -> Result<(OffsetDateTime, bool), ChannelError> {
+    ) -> Result<OffsetDateTime, ChannelError> {
         // prioritize source from audio tracks, then default source
         let audio_source = Self::resolve_source(current_item, |t| t.audio.as_ref())
             .ok_or(ChannelError::PlayoutJsonAudioSourceRequired)?;
@@ -521,8 +602,15 @@ impl ChannelSession {
                 segment_template: self.output_segment_template.clone(),
             },
             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
-            realtime,
-            is_live,
+            read_rate: if is_live {
+                // a live source arrives at its own speed; throttling it would
+                // fall behind and never catch up
+                ReadRate::Unthrottled
+            } else {
+                ReadRate::Realtime {
+                    initial_burst: Duration::from_secs(initial_burst.whole_seconds().max(0) as u64),
+                }
+            },
             frame_rate: if video_probe_result.is_still_image() {
                 Some(FrameRate::default())
             } else {
@@ -533,28 +621,13 @@ impl ChannelSession {
             report_id: Some(self.channel_config.number().to_owned()),
         };
 
-        let start_at_zero = matches!(
-            self.state,
-            ChannelSessionState::ZeroAndWorkAhead | ChannelSessionState::ZeroAndRealtime
-        );
+        let start_at_zero = matches!(self.state, ChannelSessionState::Zero);
 
-        let audio_timing = self.input_timing(
-            current_item,
-            &audio_source,
-            start_at_zero,
-            realtime,
-            is_live,
-        );
-        let video_timing = self.input_timing(
-            current_item,
-            &video_source,
-            start_at_zero,
-            realtime,
-            is_live,
-        );
+        let audio_timing = self.input_timing(current_item, &audio_source, start_at_zero, is_live);
+        let video_timing = self.input_timing(current_item, &video_source, start_at_zero, is_live);
         let subtitle_timing = subtitle_source
             .as_ref()
-            .map(|s| self.input_timing(current_item, s, start_at_zero, realtime, is_live));
+            .map(|s| self.input_timing(current_item, s, start_at_zero, is_live));
 
         let video_index = current_item
             .tracks
@@ -589,6 +662,33 @@ impl ChannelSession {
             _ => None,
         };
 
+        let (overlay_input, mut overlay_fifo) = if let Some(spec) = current_item.overlay.as_ref() {
+            // Tell the overlay producer (the etv-station daemon) this channel is
+            // now watched so it spawns the overlay process, then open the fifo
+            // ourselves and wait (bounded) for that producer to attach. Failing
+            // here fails the item, which the caller replaces with black/silence.
+            let fifo = self
+                .signal_overlay_wanted_and_wait_ready(&spec.fifo_path)
+                .await?;
+            (
+                Some(OverlayInput {
+                    // ffmpeg reads the descriptor we already opened, never the
+                    // fifo path — an open it performed itself could not be
+                    // bounded, and an unbounded one wedges the channel.
+                    fifo_path: overlay_fifo_input_path(&fifo),
+                    pixel_format: spec.pixel_format.clone(),
+                    width: spec.width,
+                    height: spec.height,
+                    framerate: spec.framerate,
+                    x: spec.x,
+                    y: spec.y,
+                }),
+                Some(fifo),
+            )
+        } else {
+            (None, None)
+        };
+
         let input_settings = InputSettings {
             start: current_item.start,
             audio_input: ProbedInput {
@@ -611,6 +711,7 @@ impl ChannelSession {
             },
             subtitle_input,
             watermark_input,
+            overlay_input,
         };
 
         let mut subtitle_source: Option<SubtitleSource> = None;
@@ -648,16 +749,51 @@ impl ChannelSession {
             .await?;
 
         // stream current item
-        let mut ffmpeg_child = tokio::process::Command::new(&self.ffmpeg_path)
+        let mut command = tokio::process::Command::new(&self.ffmpeg_path);
+        command
             .args(args.iter().map(Cow::as_ref))
             .envs(
                 envs.iter()
                     .map(|env| (env.key.as_str(), env.value.as_str())),
             )
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        #[cfg(unix)]
+        if let Some(fifo) = overlay_fifo.as_ref() {
+            use std::os::unix::io::AsRawFd;
+
+            let fd = fifo.as_raw_fd();
+            // SAFETY: the closure calls only fcntl, which is async-signal-safe —
+            // the whole requirement on a pre_exec body. `fd` stays open in the
+            // parent until after spawn returns, and fork duplicates it into the
+            // child under the same number, so it is valid when this runs.
+            unsafe {
+                command.pre_exec(move || {
+                    // Rust opens files close-on-exec, so the descriptor would
+                    // vanish at exec. Clear the flag in place rather than
+                    // dup2-ing onto a fixed number like 3: that number may
+                    // already hold something std set up for this very spawn —
+                    // a duplicate of the child's stdio, or the pipe it reports
+                    // exec failures on — and clobbering it corrupts the spawn.
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        let mut ffmpeg_child = command
             .spawn()
             .map_err(|_| ChannelError::StreamFailure(String::from("failed to spawn ffmpeg")))?;
+
+        // Drop our copy of the fifo read end now that ffmpeg holds its own.
+        // Holding it would hide ffmpeg's exit from the producer, whose
+        // reopen-on-BrokenPipe is what hands each new reader a fresh frame
+        // boundary — without that it would render a torn, tiled overlay.
+        drop(overlay_fifo.take());
 
         let stderr = ffmpeg_child
             .stderr
@@ -728,44 +864,20 @@ impl ChannelSession {
                 ffmpeg_child.kill().await.ok();
                 let _ = reader_handle.await;
                 self.cleanup_old_report().await;
-                return Err(ChannelError::IdleTimeout(self.channel_config.number().to_owned()));
+                let abort = self.playlist_manager.lock().await.abort().unwrap_or(SessionAbort::IdleTimeout);
+                return Err(self.abort_error(abort));
             }
         }
 
-        let finish = std::cmp::min(audio_timing.finish, video_timing.finish);
-        let is_complete = is_live || (audio_timing.is_complete && video_timing.is_complete);
-
-        Ok((finish, is_complete))
+        Ok(std::cmp::min(audio_timing.finish, video_timing.finish))
     }
 
-    fn next_state(state: ChannelSessionState, is_complete: bool) -> ChannelSessionState {
-        let result = match state {
-            // after seeking and NOT completing the item, seek again, transcode will accelerate if needed
-            ChannelSessionState::SeekAndWorkAhead if !is_complete => {
-                ChannelSessionState::SeekAndRealtime
-            }
-
-            // after seeking and completing the item, start at zero
-            ChannelSessionState::SeekAndWorkAhead => ChannelSessionState::ZeroAndWorkAhead,
-
-            // after starting at zero and NOT completing the item, seek, transcode will accelerate if needed
-            ChannelSessionState::ZeroAndWorkAhead if !is_complete => {
-                ChannelSessionState::SeekAndRealtime
-            }
-
-            // after starting at zero and completing the item, start at zero again, transcode method will throttle if needed
-            ChannelSessionState::ZeroAndWorkAhead => ChannelSessionState::ZeroAndWorkAhead,
-
-            // realtime will always complete items, so start next at zero
-            ChannelSessionState::SeekAndRealtime => ChannelSessionState::ZeroAndRealtime,
-
-            // realtime will always complete items, so start next at zero
-            ChannelSessionState::ZeroAndRealtime => ChannelSessionState::ZeroAndRealtime,
-        };
-
-        log::debug!("channel session state {} => {}", state, result);
-
-        result
+    fn abort_error(&self, abort: SessionAbort) -> ChannelError {
+        let number = self.channel_config.number().to_owned();
+        match abort {
+            SessionAbort::IdleTimeout => ChannelError::IdleTimeout(number),
+            SessionAbort::SegmentStall => ChannelError::SegmentStall(number),
+        }
     }
 
     async fn resolve_probe(
@@ -869,11 +981,8 @@ impl ChannelSession {
         current_item: &PlayoutItem,
         source: &PlayoutItemSource,
         start_at_zero: bool,
-        realtime: bool,
         is_live: bool,
     ) -> TimingResult {
-        let mut is_complete = true;
-
         let item_start = current_item.start;
         let item_finish = current_item.finish;
         let item_duration = current_item.finish - current_item.start;
@@ -889,13 +998,12 @@ impl ChannelSession {
             _ => item_in_point_base_ms + item_duration.whole_milliseconds() as u64,
         };
 
-        // live content never seeks and is always a complete transcode
+        // live content never seeks
         if is_live {
             return TimingResult {
                 in_point: Duration::ZERO,
                 out_point: Duration::from_millis(item_duration.whole_milliseconds() as u64),
                 finish: item_finish,
-                is_complete: true,
             };
         }
 
@@ -912,29 +1020,13 @@ impl ChannelSession {
         };
         let effective_in_point = Duration::from_millis(item_in_point_base_ms + progress_ms);
 
-        let duration =
-            Duration::from_millis((item_finish - effective_now).whole_milliseconds() as u64);
-
-        let limit = if realtime {
-            Duration::ZERO
-        } else {
-            Duration::from_secs(SEGMENT_SECONDS as u64 * 11u64)
-        };
-
-        let mut finish = item_finish;
-        let mut out_point = Duration::from_millis(item_out_point_ms);
-
-        if limit > Duration::ZERO && duration > limit {
-            finish = effective_now + limit;
-            out_point = effective_in_point + limit;
-            is_complete = false;
-        }
-
+        // One process plays the item all the way out. Cutting it short here and
+        // letting the next process pick up the remainder is what used to stamp
+        // an EXT-X-DISCONTINUITY into the middle of an item.
         TimingResult {
             in_point: effective_in_point,
-            out_point,
-            finish,
-            is_complete,
+            out_point: Duration::from_millis(item_out_point_ms),
+            finish: item_finish,
         }
     }
 
@@ -999,6 +1091,9 @@ impl ChannelSession {
                 subtitle: None,
             }),
             watermark: None,
+            program: None,
+            overlay: None,
+            metadata: None,
         }
     }
 
@@ -1194,6 +1289,117 @@ impl ChannelSession {
     }
 }
 
+/// Open the overlay rawvideo fifo for read and wait — bounded by `timeout` —
+/// for the producer to attach and start writing.
+///
+/// This exists because a plain blocking `open()` on a fifo with no writer never
+/// returns. Letting ffmpeg do that open is what wedges a channel permanently:
+/// ffmpeg parks in `open()`, emits no segments, and nothing anywhere reports an
+/// error. Owning the open here is the only way to put a deadline on it.
+///
+/// Note the asymmetry with the producer side (`FifoWriter::open_for_writing` in
+/// etv-station): a *writer*'s nonblocking open returns `ENXIO` while no reader
+/// is present, so that end can retry on the open call itself. A *reader*'s
+/// nonblocking open always succeeds immediately, writer or not, so there is
+/// nothing to retry on here. Writer presence is detected by polling the fd for
+/// `POLLIN` instead: the producer writes its first frame as soon as its own
+/// open succeeds, and polling — unlike reading — does not consume the bytes
+/// ffmpeg needs in order to stay frame-aligned.
+#[cfg(unix)]
+fn open_overlay_fifo(path: &Path, timeout: Duration) -> Result<OverlayFifoReader, ChannelError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            ChannelError::StreamFailure(format!(
+                "failed to open overlay fifo {}: {e}",
+                path.display()
+            ))
+        })?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ChannelError::StreamFailure(format!(
+                "no writer attached to overlay fifo {} within {timeout:?}",
+                path.display()
+            )));
+        }
+
+        let wait = remaining.min(OVERLAY_WRITER_POLL_INTERVAL);
+        let mut fds = [libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: `fds` is a valid, correctly-sized pollfd array and `file` owns
+        // the descriptor it names for the whole call.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, wait.as_millis() as libc::c_int) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ChannelError::StreamFailure(format!(
+                "poll on overlay fifo {}: {e}",
+                path.display()
+            )));
+        }
+
+        if fds[0].revents & libc::POLLIN != 0 {
+            // A writer is attached and has produced data. Hand ffmpeg a
+            // blocking fd so a slow producer applies back-pressure instead of
+            // making ffmpeg spin on EAGAIN.
+            clear_nonblocking(&file)?;
+            return Ok(file);
+        }
+
+        if rc > 0 {
+            // Revents without POLLIN means POLLHUP: no writer yet. poll returns
+            // instantly in that state, so pace the retry rather than spin.
+            std::thread::sleep(wait);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn open_overlay_fifo(path: &Path, _timeout: Duration) -> Result<OverlayFifoReader, ChannelError> {
+    Err(ChannelError::StreamFailure(format!(
+        "live overlay input {} requires a unix fifo",
+        path.display()
+    )))
+}
+
+/// Clear `O_NONBLOCK` on a descriptor opened nonblocking, so subsequent reads
+/// block instead of returning `EAGAIN`.
+#[cfg(unix)]
+fn clear_nonblocking(file: &std::fs::File) -> Result<(), ChannelError> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is owned by `file` for the duration of both calls.
+    let result = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            -1
+        } else {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK)
+        }
+    };
+    if result < 0 {
+        return Err(ChannelError::StreamFailure(format!(
+            "failed to clear O_NONBLOCK on overlay fifo: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
     match value {
         WatermarkLocation::TopLeft => ffpipeline::input::WatermarkLocation::TopLeft,
@@ -1306,5 +1512,69 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+
+    fn make_fifo(dir: &Path) -> PathBuf {
+        let path = dir.join("overlay.fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        path
+    }
+
+    /// The wedge this guards against: with no writer attached, the read side
+    /// must give up on a deadline instead of parking forever the way ffmpeg's
+    /// own blocking `open()` does.
+    #[test]
+    fn open_overlay_fifo_gives_up_when_no_writer_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_fifo(dir.path());
+
+        let start = std::time::Instant::now();
+        let result = open_overlay_fifo(&path, Duration::from_millis(300));
+
+        assert!(result.is_err(), "expected a timeout, got an open fifo");
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "did not return promptly"
+        );
+    }
+
+    /// Waiting for the writer must not eat the stream: the probe polls rather
+    /// than reads, so every byte the producer wrote is still there for ffmpeg
+    /// and the first frame it sees starts at a frame boundary.
+    #[test]
+    fn open_overlay_fifo_waits_for_a_writer_without_consuming_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_fifo(dir.path());
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .unwrap();
+            file.write_all(b"frame").unwrap();
+            file.flush().unwrap();
+            // Hold the write end open until the reader has taken the bytes.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let mut file = open_overlay_fifo(&path, Duration::from_secs(5)).unwrap();
+        let mut buf = [0u8; 5];
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"frame");
+
+        writer.join().unwrap();
     }
 }

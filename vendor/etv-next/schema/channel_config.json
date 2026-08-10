@@ -234,6 +234,10 @@
         "subtitle": {
           "$ref": "#/$defs/SubtitleNormalizationConfig",
           "default": {
+            "language": {
+              "name": "English",
+              "tag": "en"
+            },
             "mode": "burn"
           }
         },
@@ -273,6 +277,23 @@
         "crop"
       ]
     },
+    "SubtitleLanguageConfig": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Human-readable label written to `NAME=`; this is what a player shows in\nits subtitle menu.",
+          "type": "string"
+        },
+        "tag": {
+          "description": "BCP 47 tag written to `LANGUAGE=` in the HLS playlist.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tag",
+        "name"
+      ]
+    },
     "SubtitleMode": {
       "type": "string",
       "enum": [
@@ -283,6 +304,14 @@
     "SubtitleNormalizationConfig": {
       "type": "object",
       "properties": {
+        "language": {
+          "description": "Language the channel's converted subtitle track is announced as. HLS\nallows one language per subtitle rendition for the whole session, so a\nchannel whose schedule mixes languages has to declare the one it\nadvertises rather than reading it off whichever item is playing.",
+          "$ref": "#/$defs/SubtitleLanguageConfig",
+          "default": {
+            "name": "English",
+            "tag": "en"
+          }
+        },
         "mode": {
           "$ref": "#/$defs/SubtitleMode",
           "default": "burn"

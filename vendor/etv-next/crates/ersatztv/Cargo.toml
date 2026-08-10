@@ -8,6 +8,7 @@ axum = { workspace = true }
 clap = { workspace = true }
 env_logger = { workspace = true }
 ersatztv-core = { workspace = true }
+ersatztv-playout = { workspace = true }
 filetime = { workspace = true }
 log = { workspace = true }
 quick-xml = { workspace = true }
@@ -16,9 +17,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 simple-expand-tilde = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [[bin]]
 name = "gen-lineup-config-schema"

@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use ersatztv::config::ChannelConfig;
 use ersatztv::error::LineupError;
 use serde::Deserialize;
+use simple_expand_tilde::expand_tilde;
 
 #[derive(Deserialize, Default)]
-struct BandwidthHint {
+struct ConfigHint {
     #[serde(default)]
     normalization: NormalizationHint,
 }
@@ -17,11 +18,57 @@ struct NormalizationHint {
     video: BitrateHint,
     #[serde(default)]
     audio: BitrateHint,
+    #[serde(default)]
+    subtitle: SubtitleHint,
 }
 
 #[derive(Deserialize, Default)]
 struct BitrateHint {
     bitrate_kbps: Option<u32>,
+}
+
+/// The channel's subtitle settings as this crate needs to read them. The
+/// authoritative definitions live in `ersatztv-channel`, which this crate does
+/// not depend on, so the shape is mirrored here the same way the bitrate hint is.
+#[derive(Deserialize, Default)]
+struct SubtitleHint {
+    #[serde(default)]
+    mode: SubtitleModeHint,
+    #[serde(default)]
+    language: SubtitleLanguageHint,
+}
+
+#[derive(Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum SubtitleModeHint {
+    #[default]
+    Burn,
+    Convert,
+}
+
+#[derive(Deserialize)]
+struct SubtitleLanguageHint {
+    #[serde(default = "default_language_tag")]
+    tag: String,
+    #[serde(default = "default_language_name")]
+    name: String,
+}
+
+fn default_language_tag() -> String {
+    String::from("en")
+}
+
+fn default_language_name() -> String {
+    String::from("English")
+}
+
+impl Default for SubtitleLanguageHint {
+    fn default() -> Self {
+        SubtitleLanguageHint {
+            tag: default_language_tag(),
+            name: default_language_name(),
+        }
+    }
 }
 
 pub struct ChannelModel {
@@ -31,9 +78,21 @@ pub struct ChannelModel {
     overlay_paths: Vec<PathBuf>,
     output_folder: PathBuf,
     tvg_id: String,
+    playout_folder: PathBuf,
     logo: Option<String>,
     group: Option<String>,
     bandwidth_bps: u32,
+    subtitle: SubtitleHint,
+}
+
+#[derive(Deserialize)]
+struct ChannelConfigPlayoutOnly {
+    playout: PlayoutFolder,
+}
+
+#[derive(Deserialize)]
+struct PlayoutFolder {
+    folder: String,
 }
 
 impl ChannelModel {
@@ -69,14 +128,15 @@ impl ChannelModel {
             }
         }
 
-        let bandwidth_bps = serde_json::from_value::<BandwidthHint>(merged)
-            .ok()
-            .map(|h| {
-                let video = h.normalization.video.bitrate_kbps.unwrap_or(4000);
-                let audio = h.normalization.audio.bitrate_kbps.unwrap_or(192);
-                (video + audio) * 1100 // kbps => bps + 10% for hls overhead
-            })
-            .unwrap_or((4000 + 192) * 1100);
+        let hint = serde_json::from_value::<ConfigHint>(merged).unwrap_or_default();
+
+        let video = hint.normalization.video.bitrate_kbps.unwrap_or(4000);
+        let audio = hint.normalization.audio.bitrate_kbps.unwrap_or(192);
+        let bandwidth_bps = (video + audio) * 1100; // kbps => bps + 10% for hls overhead
+
+        let subtitle = hint.normalization.subtitle;
+
+        let playout_folder = read_playout_folder(&channel_config)?;
 
         Ok(ChannelModel {
             number: channel.number.clone(),
@@ -87,9 +147,11 @@ impl ChannelModel {
             tvg_id: channel
                 .tvg_id
                 .unwrap_or_else(|| format!("ersatztv.{}", channel.number)),
+            playout_folder,
             logo: channel.logo.clone(),
             group: channel.group.clone(),
             bandwidth_bps,
+            subtitle,
         })
     }
 
@@ -117,6 +179,10 @@ impl ChannelModel {
         self.tvg_id.as_str()
     }
 
+    pub fn playout_folder(&self) -> &Path {
+        self.playout_folder.as_path()
+    }
+
     pub fn logo(&self) -> Option<&str> {
         self.logo.as_deref()
     }
@@ -128,4 +194,56 @@ impl ChannelModel {
     pub fn bandwidth_bps(&self) -> u32 {
         self.bandwidth_bps
     }
+
+    /// Whether this channel serves subtitles as their own selectable track.
+    /// Burned-in subtitles are part of the video picture, so there is nothing to
+    /// announce and no subtitle playlist to serve.
+    pub fn has_subtitle_track(&self) -> bool {
+        self.subtitle.mode == SubtitleModeHint::Convert
+    }
+
+    pub fn subtitle_language_tag(&self) -> &str {
+        self.subtitle.language.tag.as_str()
+    }
+
+    pub fn subtitle_language_name(&self) -> &str {
+        self.subtitle.language.name.as_str()
+    }
+}
+
+fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, LineupError> {
+    let body = std::fs::read_to_string(channel_config_path).map_err(|e| {
+        LineupError::ChannelConfigRead {
+            path: channel_config_path.display().to_string(),
+            source: e,
+        }
+    })?;
+
+    let parsed: ChannelConfigPlayoutOnly =
+        serde_json::from_str(&body).map_err(|e| LineupError::ChannelConfigParse {
+            path: channel_config_path.display().to_string(),
+            source: e,
+        })?;
+
+    let folder = PathBuf::from(&parsed.playout.folder);
+    let folder = expand_tilde(&folder)
+        .ok_or_else(|| LineupError::PlayoutFolderExpand(parsed.playout.folder.clone()))?;
+
+    let resolved = if folder.is_absolute() {
+        folder
+    } else {
+        let parent = channel_config_path
+            .parent()
+            .ok_or(LineupError::LineupConfigFailure(String::from(
+                "failed to find parent of channel config",
+            )))?;
+        parent.join(folder)
+    };
+
+    resolved
+        .canonicalize()
+        .map_err(|e| LineupError::PlayoutFolderResolve {
+            path: resolved.display().to_string(),
+            source: e,
+        })
 }

@@ -34,7 +34,11 @@
       "vaapi_driver": "iHD"
     },
     "subtitle": {
-      "mode": "burn"
+      "mode": "convert",
+      "language": {
+        "tag": "en",
+        "name": "English"
+      }
     }
   }
 }

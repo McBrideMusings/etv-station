@@ -74,6 +74,87 @@ pub struct PlayoutItem {
     pub tracks: Option<PlayoutItemTracks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark: Option<Watermark>,
+    /// Optional EPG metadata for this item. Whatever is present here is emitted in
+    /// the XMLTV guide; missing fields are simply omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<ProgramMetadata>,
+    /// Optional overlay spec — when present, the channel reads RGBA frames from
+    /// `fifo_path` and composites them on top of the video. The producer of the
+    /// playout JSON is responsible for arranging for something to be writing to
+    /// that fifo while this item is playing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<OverlaySpec>,
+    /// Arbitrary per-airing data attached by whatever produced this playout
+    /// JSON, carried through untouched.
+    ///
+    /// **Nothing in this repo reads it.** It is deserialized, held, and
+    /// re-serialized; no key is reserved, no shape is validated, and an
+    /// unrecognised key is not an error. It exists because the producer and
+    /// the overlay process on the other side of `overlay.fifo_path` both read
+    /// this file and need a channel between them that is per-item — the
+    /// overlay spec is per-item too, but its fields are all geometry, and
+    /// widening them for one producer's vocabulary would put that producer's
+    /// concepts into this schema.
+    ///
+    /// A producer that attaches nothing leaves this absent, which is the
+    /// common case and costs nothing on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Spec for a live overlay source feeding the secondary input of an ffmpeg
+/// `overlay` filter. The channel worker opens the fifo itself, on a deadline,
+/// and hands ffmpeg the already-open descriptor — ffmpeg's own `open()` on a
+/// fifo with no writer never returns, which would wedge the channel forever.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OverlaySpec {
+    /// Filesystem path the channel will open for reading. Must exist as a fifo
+    /// (or regular file) by the time the channel starts the item.
+    pub fifo_path: String,
+    /// Output pixel format of the overlay frames (default "rgba").
+    #[serde(default = "default_overlay_pixel_format")]
+    pub pixel_format: String,
+    /// Width of the overlay raster in pixels.
+    pub width: u32,
+    /// Height of the overlay raster in pixels.
+    pub height: u32,
+    /// Framerate of the rawvideo stream produced by the overlay process.
+    pub framerate: u32,
+    /// Overlay top-left x relative to the main video (default 0).
+    #[serde(default)]
+    pub x: i32,
+    /// Overlay top-left y relative to the main video (default 0).
+    #[serde(default)]
+    pub y: i32,
+}
+
+fn default_overlay_pixel_format() -> String {
+    String::from("rgba")
+}
+
+/// Program metadata used to populate the XMLTV EPG. Every field is optional; the
+/// server emits whatever is provided and skips the rest. Producers of playout JSON
+/// are responsible for filling these in — this repo never sources them externally.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct ProgramMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub categories: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_rating: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
 }
 
 impl PlayoutItem {
@@ -97,11 +178,81 @@ impl PlayoutItem {
             }),
             tracks: None,
             watermark: None,
+            program: None,
+            overlay: None,
+            metadata: None,
         })
     }
 
     pub fn finish(&self) -> OffsetDateTime {
         self.finish
+    }
+
+    /// Construct a scheduled item from an already-resolved source, defaulting
+    /// every optional field (`tracks`/`watermark`/`program`/`overlay`/`metadata`). Callers
+    /// set whichever optionals they drive afterward. New optional schema fields
+    /// default here, so producers that use this constructor don't need editing
+    /// when the schema grows.
+    pub fn scheduled(
+        id: String,
+        start: OffsetDateTime,
+        finish: OffsetDateTime,
+        source: PlayoutItemSource,
+    ) -> PlayoutItem {
+        PlayoutItem {
+            id,
+            start,
+            finish,
+            source: Some(source),
+            tracks: None,
+            watermark: None,
+            program: None,
+            overlay: None,
+            metadata: None,
+        }
+    }
+}
+
+impl PlayoutItemSource {
+    /// Local file source, defaulting `probe_hint`.
+    pub fn local(path: String, in_point_ms: Option<u64>, out_point_ms: Option<u64>) -> Self {
+        PlayoutItemSource::Local {
+            path,
+            in_point_ms,
+            out_point_ms,
+            probe_hint: None,
+        }
+    }
+
+    /// lavfi source, defaulting `probe_hint`.
+    pub fn lavfi(params: String) -> Self {
+        PlayoutItemSource::Lavfi {
+            params,
+            probe_hint: None,
+        }
+    }
+
+    /// HTTP source, defaulting the ffmpeg-tuning and `probe_hint` fields a
+    /// producer typically doesn't set.
+    pub fn http(
+        uri: String,
+        in_point_ms: Option<u64>,
+        out_point_ms: Option<u64>,
+        headers: Option<Vec<String>>,
+        user_agent: Option<String>,
+    ) -> Self {
+        PlayoutItemSource::Http {
+            uri,
+            in_point_ms,
+            out_point_ms,
+            headers,
+            user_agent,
+            timeout_us: None,
+            reconnect: None,
+            reconnect_delay_max: None,
+            keep_alive: None,
+            probe_hint: None,
+        }
     }
 }
 
