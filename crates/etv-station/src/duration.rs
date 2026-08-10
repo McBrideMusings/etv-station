@@ -312,6 +312,7 @@ mod tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         }
     }
 
@@ -338,6 +339,7 @@ mod tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -357,6 +359,7 @@ mod tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -372,6 +375,7 @@ mod tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         }
     }
 
@@ -445,6 +449,7 @@ mod tests {
             program: None,
             catalog_duration: None,
             error_card: false,
+            metadata: None,
         };
         let err = cache.resolve_all(vec![bad]).await.unwrap_err();
         assert!(matches!(err, StationError::MissingField { .. }));

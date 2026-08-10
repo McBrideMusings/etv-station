@@ -188,6 +188,16 @@ struct PoolRuntime<'a> {
     /// and an unbounded generation should not pay for the query.
     runtimes: HashMap<String, Duration>,
     mean_runtime: Duration,
+
+    /// Per-id take overrides a plugin pool attached to its picks (#166),
+    /// surfaced here so the draw (`visit`/`serve`) can reach them. Empty for
+    /// every non-plugin pool.
+    ///
+    /// `#[allow(dead_code)]`: honouring one instead of the step's own `take`
+    /// is #173, a separate slice — this one's job is only to get the value
+    /// this far without dropping it. Remove the allow when #173 reads it.
+    #[allow(dead_code)]
+    take_overrides: HashMap<String, usize>,
 }
 
 impl PoolRuntime<'_> {
@@ -523,7 +533,11 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 /// Resolve the pools and walk the pattern, returning the interleaved `entry_id`
-/// list and the resume state to persist for the next window.
+/// list, the resume state to persist for the next window, and every id's
+/// metadata blob (#166) — a plugin pool's `entry_id -> metadata` map, empty
+/// for every id no plugin attached anything to. The caller (`resolve::resolve_block`)
+/// reads it back to fill `ResolvedItem::metadata` for the ids that came out
+/// of this block.
 ///
 /// `state` is consulted only by pools declaring `advance = "resume"`; a
 /// `restart` pool ignores it entirely and replays from the top, which is what
@@ -548,6 +562,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// cycle boundary and already hands back each pool's rotation, so the next
 /// generation resumes from where this one stopped exactly as it does today.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn build(
     catalog: &Catalog,
     pools: &[Pool],
@@ -559,7 +574,14 @@ pub fn build(
     seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
     fill: Option<Duration>,
-) -> Result<(Vec<String>, BTreeMap<String, PoolResume>), String> {
+) -> Result<
+    (
+        Vec<String>,
+        BTreeMap<String, PoolResume>,
+        HashMap<String, serde_json::Value>,
+    ),
+    String,
+> {
     // An authored `cycles` is the author saying how long a pass runs, and the
     // window does not get to argue with it. Only a derived count is bounded.
     let budget = fill.filter(|_| cycles.is_none());
@@ -579,6 +601,7 @@ pub fn build(
             block_constraints,
             state,
             budget.is_some(),
+            &score_cache.picked_extras,
         )?);
     }
 
@@ -651,7 +674,22 @@ pub fn build(
         .iter()
         .map(|rt| (rt.cfg.name.clone(), rt.to_resume()))
         .collect();
-    Ok((out, resume_out))
+    // The metadata half of what plugin pools picked (#166) — narrowed from
+    // the take-override half, which stays behind on each `PoolRuntime` for
+    // #173 to read. Flattened back to a plain `entry_id` key here, dropping
+    // the pool half of `picked_extras`' key: the caller (`resolve::resolve_block`)
+    // has only a flat drawn-id list to match against, with no pool label left
+    // on any one of them. Two pools that both draw the same id into `out` and
+    // both attach metadata therefore collide here exactly as they already do
+    // for `Pool::constraints` — the same "blind across pools" limit, not a
+    // new one, and not fixable without giving every drawn id a pool label all
+    // the way out to `resolve::resolve_block`.
+    let metadata_out: HashMap<String, serde_json::Value> = score_cache
+        .picked_extras
+        .into_iter()
+        .filter_map(|((_pool, id), extra)| extra.metadata.map(|m| (id, m)))
+        .collect();
+    Ok((out, resume_out, metadata_out))
 }
 
 /// Resolve every pool's raw ordered id list — its `expr`/`plugin`/`groups`
@@ -734,7 +772,7 @@ pub(crate) fn resolve_pool_sources(
             // the same grant back to decide what `ctx.sets`/`ctx.history`
             // resolve to for this call.
             let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities);
-            let ids = crate::score::pick(
+            let picked = crate::score::pick(
                 score_cache,
                 &path,
                 score_env.inputs,
@@ -743,7 +781,13 @@ pub(crate) fn resolve_pool_sources(
                 granted,
             )
             .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
-            *slot = Some(ids);
+            // `resolve_pool_sources` keeps returning bare ids — `crate::sequence`
+            // shares this function and reads none of the record shape (#166) —
+            // so the metadata/take-override half is stashed on the cache instead
+            // of widening this function's return type. `pattern::build` reads it
+            // back once resolution finishes.
+            score_cache.record_picked(&cfg.name, &picked);
+            *slot = Some(picked.into_iter().map(|p| p.id).collect());
         }
     }
 
@@ -1016,6 +1060,12 @@ pub(crate) fn resolve_pool_series(
 /// `want_runtimes` asks for the per-item lengths the walk needs to know when
 /// the window is covered. It is a whole extra query per pool, so it is only
 /// asked for when something is actually going to read the answer.
+///
+/// `picked_extras` is the whole generation's metadata/take-override map
+/// (#166), keyed by `(pool name, entry_id)` — narrowed here to `cfg`'s own
+/// entries, so a second pool that happens to resolve the same id from an
+/// overlapping query can never leak its take override into this pool's draw.
+#[allow(clippy::too_many_arguments)]
 fn pool_runtime<'a>(
     catalog: &Catalog,
     cfg: &'a Pool,
@@ -1023,6 +1073,7 @@ fn pool_runtime<'a>(
     block_constraints: Option<&Constraints>,
     state: &GenerationState,
     want_runtimes: bool,
+    picked_extras: &HashMap<(String, String), crate::score::PickedExtra>,
 ) -> Result<PoolRuntime<'a>, String> {
     // What this pool aired most recently: the channel's tail, narrowed to items
     // this pool could have supplied. Same projection the list pass reads, and
@@ -1034,6 +1085,15 @@ fn pool_runtime<'a>(
         .iter()
         .filter(|id| own.contains(id.as_str()))
         .cloned()
+        .collect();
+    let take_overrides: HashMap<String, usize> = ids
+        .iter()
+        .filter_map(|id| {
+            picked_extras
+                .get(&(cfg.name.clone(), id.clone()))
+                .and_then(|e| e.take_override)
+                .map(|t| (id.clone(), t))
+        })
         .collect();
 
     let (series, limits, keys, pool_durations, mean_duration) =
@@ -1049,6 +1109,7 @@ fn pool_runtime<'a>(
         forced: 0,
         runtimes: pool_durations,
         mean_runtime: mean_duration,
+        take_overrides,
     };
     // Seeded through the same path a draw takes, so the window is trimmed to
     // `reach` by one rule rather than two.
@@ -1281,8 +1342,34 @@ mod tests {
         }
     }
 
-    /// No pool in these tests draws from a plugin, so the inputs are empty and
-    /// the base dir never gets read — it only has to exist.
+    /// A plugin pool pointed at `script`. `expr`/`order` are meaningless on a
+    /// plugin pool (validation rejects the pair at config load, which this
+    /// bypasses on purpose — these are unit tests of the resolver, not of
+    /// that check), so this leaves both unset.
+    fn plugin_pool(script: &std::path::Path) -> Pool {
+        Pool {
+            name: "movies".into(),
+            expr: None,
+            plugin: Some(script.to_path_buf()),
+            groups: Vec::new(),
+            order: None,
+            bucket_order: None,
+            group_by: GroupBy::Show,
+            select: Select::RoundRobin,
+            rotate: Rotate::Visit,
+            advance: Advance::Restart,
+            on_short: OnShort::Next,
+            constraints: None,
+            config: None,
+            capabilities: Vec::new(),
+            datastores: Vec::new(),
+        }
+    }
+
+    /// Most tests here draw from `expr`/`groups` pools, so the inputs are
+    /// empty and the base dir never gets read for them. A plugin-pool test
+    /// passes its script as an absolute temp path, which resolves the same
+    /// way regardless of what this returns.
     fn test_env() -> crate::score::ScoreEnv<'static> {
         static EMPTY: std::sync::LazyLock<crate::score::ScoreInputs> =
             std::sync::LazyLock::new(crate::score::ScoreInputs::default);
@@ -1674,7 +1761,7 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = franchise_catalog();
-        let (ids, pool_state) = build(
+        let (ids, pool_state, _metadata) = build(
             &cat,
             &pools,
             &groups,
@@ -1848,7 +1935,7 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = catalog();
-        let (ids, pool_state) = build(
+        let (ids, pool_state, _metadata) = build(
             &cat,
             &pools,
             &[],
@@ -2333,7 +2420,7 @@ mod tests {
         let mut p = movies_pool();
         p.expr = Some("item.type == \"nonesuch\"".into());
         let cat = catalog();
-        let (ids, _) = build(
+        let (ids, _, _metadata) = build(
             &cat,
             &[p],
             &[],
@@ -2386,7 +2473,7 @@ mod tests {
     ) -> (Vec<String>, BTreeMap<String, PoolResume>) {
         let mut movies = movies_pool();
         movies.advance = Advance::Resume;
-        build(
+        let (ids, resume, _metadata) = build(
             cat,
             &[movies],
             &[],
@@ -2398,7 +2485,8 @@ mod tests {
             test_env(),
             fill,
         )
-        .expect("pattern builds")
+        .expect("pattern builds");
+        (ids, resume)
     }
 
     /// The bug: a pool that takes a day to drain laid down the whole day even
@@ -2634,7 +2722,7 @@ mod tests {
         let cat = movies_with_a_long_one();
         let mut movies = movies_pool();
         movies.constraints = Some(no_repeat_within(Duration::from_secs(90 * 60)));
-        let (ids, _) = build(
+        let (ids, _, _metadata) = build(
             &cat,
             &[movies],
             &[],
@@ -2870,5 +2958,111 @@ mod tests {
             &aired(&["got-e1"]),
         );
         assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3"]);
+    }
+
+    // ---- plugin record shape: take override plumbing (#166) ---------------
+
+    /// A plugin's per-entry take override survives pool resolution and lands
+    /// on that pool's own runtime, which is what "visible to the pattern
+    /// draw" means for this slice — `visit`/`serve` do not honour it yet,
+    /// that is #173.
+    #[test]
+    fn a_plugins_take_override_reaches_the_pool_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("taste.rhai");
+        std::fs::write(
+            &script,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { [#{ entry_id: "mov-1", take: 3 }, "mov-2"] }
+"#,
+        )
+        .unwrap();
+
+        let cat = catalog();
+        let pool = plugin_pool(&script);
+        let mut score_cache = crate::score::ScoreCache::default();
+        let pool_id_lists = resolve_pool_sources(
+            &cat,
+            std::slice::from_ref(&pool),
+            &[],
+            &mut score_cache,
+            test_env(),
+        )
+        .unwrap();
+
+        let rt = pool_runtime(
+            &cat,
+            &pool,
+            pool_id_lists.into_iter().next().unwrap(),
+            None,
+            &GenerationState::empty(),
+            false,
+            &score_cache.picked_extras,
+        )
+        .unwrap();
+
+        assert_eq!(rt.take_overrides.get("mov-1"), Some(&3));
+        assert!(!rt.take_overrides.contains_key("mov-2"));
+    }
+
+    /// Two plugin pools whose catalog queries overlap may both resolve the
+    /// same id — nothing about the pool contract forbids it — and each may
+    /// attach its own, different take override to it. `ScoreCache::picked_extras`
+    /// is keyed by `(pool name, entry_id)`, not `entry_id` alone, precisely so
+    /// the second pool's record cannot silently overwrite the first's: each
+    /// pool's own `PoolRuntime` must read back exactly what its own script
+    /// attached, never its sibling's.
+    #[test]
+    fn two_pools_resolving_the_same_id_keep_their_own_take_overrides_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_a = dir.path().join("a.rhai");
+        std::fs::write(
+            &script_a,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { [#{ entry_id: "mov-1", take: 3 }] }
+"#,
+        )
+        .unwrap();
+        let script_b = dir.path().join("b.rhai");
+        std::fs::write(
+            &script_b,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { [#{ entry_id: "mov-1", take: 7 }] }
+"#,
+        )
+        .unwrap();
+
+        let cat = catalog();
+        let mut pool_a = plugin_pool(&script_a);
+        pool_a.name = "a".into();
+        let mut pool_b = plugin_pool(&script_b);
+        pool_b.name = "b".into();
+        let pools = [pool_a, pool_b];
+
+        let mut score_cache = crate::score::ScoreCache::default();
+        let pool_id_lists =
+            resolve_pool_sources(&cat, &pools, &[], &mut score_cache, test_env()).unwrap();
+
+        let mut runtimes = Vec::new();
+        for (cfg, ids) in pools.iter().zip(pool_id_lists) {
+            runtimes.push(
+                pool_runtime(
+                    &cat,
+                    cfg,
+                    ids,
+                    None,
+                    &GenerationState::empty(),
+                    false,
+                    &score_cache.picked_extras,
+                )
+                .unwrap(),
+            );
+        }
+
+        assert_eq!(runtimes[0].take_overrides.get("mov-1"), Some(&3));
+        assert_eq!(runtimes[1].take_overrides.get("mov-1"), Some(&7));
     }
 }

@@ -249,7 +249,14 @@ pub struct Pool {
     ///
     /// Everything downstream — `select`, `rotate`, `advance`, `on_short`, and
     /// the pattern's `take` — treats the returned list exactly like a
-    /// CEL-resolved one.
+    /// CEL-resolved one. This includes [`Pool::constraints`]: they apply to
+    /// whatever the script returned, whichever return shape it used.
+    ///
+    /// A returned entry may be a bare `entry_id` string, or a record naming
+    /// one plus an optional `metadata` blob and/or a `take` override for that
+    /// entry's series (#166) — see [`crate::score::pick`]. The widening is
+    /// additive: a script that returns only bare ids, like
+    /// `taste-engine.rhai`, needs no edit.
     ///
     /// **Replay is the plugin's, unless this pool claims it.** ETV computes no
     /// replay policy for a plugin pool: it hands the script `ctx.recent` and
