@@ -148,7 +148,9 @@ The query language (Phase A picks the off-the-shelf option, candidate: CEL) tran
 
 ### Graphics overlay cascade (Phase B)
 
-`etv-station` emits overlay configuration in the playout JSON; **etv-next is the actual renderer** in the existing output pipeline. This requires a deliberate `PlayoutItem` schema extension on the etv-next side — the only planned submodule change in v2+.
+`etv-station` emits overlay configuration in the playout JSON; **etv-next is the actual renderer** in the existing output pipeline.
+
+The schema extension this was once planned to need is **withdrawn**. `PlayoutItem.overlay` stays singular — one `OverlaySpec`, one fifo, one `etv-overlay` process per channel — because the cascade resolves *which config that process runs*, not a set of overlays to composite. A set would cost a fifo, a writer process, and an ffmpeg overlay filter per concurrent overlay, across every channel. Layering is the script's job instead: it is handed the playing item's metadata and decides what to draw, which is also the only thing that works in a query-driven block where nothing knows in advance which show fills a slot (#48).
 
 Cascade: channel default → block override → item override. Declarative primitives (corner watermark, time-interval fade, lower-third text) compose with [Rhai](https://rhai.rs/) scripts for dynamic behavior. Rendering uses [Vello](https://github.com/linebender/vello). Lottie / `velato` is a deferred side project.
 
