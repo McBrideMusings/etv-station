@@ -95,6 +95,12 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Order>,
 
+    /// Narrows the resolved `entries` list by `seasons`/`episode_ids`
+    /// (#197), applied right after `entries` (and any `fallback`
+    /// substitution) settle, before `duplicates`/`order` see the list.
+    /// Entries-block only; rejected on a `pattern` or `sequencer` block at
+    /// validation — the resolve pipeline only ever applies it to a flat
+    /// `entries` list, never to an interleaved pool draw. See [`Filter`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
 }
