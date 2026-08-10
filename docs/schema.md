@@ -543,9 +543,13 @@ the config is the only thing guarding replay; leave it unset when the script is.
 declines the field; `examples/samples/kungfu.yaml` is the sample that exercises
 it, on CEL pools.
 
-The script defines two functions:
+The script defines three functions:
 
 ```rhai
+// Which hooks this script implements. Read at config load time, before the
+// catalog exists and without running anything below.
+fn hooks() { ["pool_provider"] }
+
 // Every catalog query this plugin reads, named. Run once, up front, so a
 // malformed expression fails before any ranking work.
 fn sources() {
@@ -555,6 +559,33 @@ fn sources() {
 // Returns entry_ids, most-wanted first.
 fn pick(ctx) { … }
 ```
+
+#### `hooks()` — what a script says it can do
+
+A plugin declares its hooks and the station wires only the declared ones
+(#159). Two names exist:
+
+| Hook | What a script implementing it does |
+|---|---|
+| `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
+| `sequencer` | takes a block's resolved pools and emits the block's timeline in place of the pattern walk. Declarable today; nothing calls it yet (#169). |
+
+A script may declare one or both. The declaration lives in the script, not in
+the channel config, so swapping one scorer for another needs no YAML edit.
+
+`hooks()` is read by compiling the script and calling that one function —
+`sources()` and `pick()` never run — so all three refusals below happen at
+config load rather than mid-generation:
+
+- A `plugin:` pool naming a script that does not declare `pool_provider` is
+  refused, naming the script and the hook it lacked:
+  `pool "movies" names plugin …/taste-engine.rhai via `plugin:`, which requires
+  the plugin to declare the `pool_provider` hook, but it only declares: sequencer`
+- A script declaring a name outside the table is refused, and the message lists
+  the names that exist: `declares unknown hook "warp_drive" — known hooks are:
+  pool_provider, sequencer`
+- A script declaring an empty array is refused: `declares no hooks — a plugin
+  must declare at least one of: pool_provider, sequencer`
 
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
 `entries` plus genres / cast / labels / … as arrays), `ctx.pool` (the name of
