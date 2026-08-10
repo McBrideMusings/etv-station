@@ -104,8 +104,12 @@ pub struct IncludeEntry {
     #[serde(default)]
     pub mode: Mode,
 
-    #[serde(default)]
-    pub order: Order,
+    /// Sort applied to the included block's resolved list. `None` means the
+    /// author wrote nothing, distinct from an authored `order = "manual"`
+    /// (`Some(Order::Manual)`) on the same terms as
+    /// [`super::rule::BlockInclude::order`] (#95).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,

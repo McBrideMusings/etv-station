@@ -560,16 +560,33 @@ fn resolve_block(
         collapse_duplicates(&mut items);
     }
 
-    // 3. Order the block's resolved list. `manual` keeps authored order and
-    //    needs no catalog; every other order goes through the #69 engine.
-    if include.order != Order::Manual {
+    // 3. Order the block's resolved list. An authored order (`manual`
+    //    included) is used as written and needs no catalog. Unset takes the
+    //    episode default when every resolved item is catalog type "episode"
+    //    (#95) — a set the catalog cannot vouch for (no catalog, or any
+    //    non-episode / uningested item) keeps today's manual behavior.
+    let effective_order = if let Some(order) = &include.order {
+        order.clone()
+    } else if let Some(cat) = catalog {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let episode_typed = cat
+            .all_episode_type(&ids)
+            .map_err(|e| unsupported(format!("block #{idx}: {e}")))?;
+        if episode_typed {
+            Order::episode_default()
+        } else {
+            Order::Manual
+        }
+    } else {
+        Order::Manual
+    };
+    if effective_order != Order::Manual {
         let cat = catalog.ok_or_else(|| {
             unsupported(format!(
-                "block #{idx}: order {:?} needs the catalog, which is not available",
-                include.order
+                "block #{idx}: order {effective_order:?} needs the catalog, which is not available",
             ))
         })?;
-        items = apply_order(cat, items, &include.order, seed)
+        items = apply_order(cat, items, &effective_order, seed)
             .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
     }
 
@@ -923,7 +940,7 @@ mod tests {
             pattern: Vec::new(),
             cycles: None,
             mode: Mode::All,
-            order: Order::Manual,
+            order: Some(Order::Manual),
             filter: None,
         }
     }
@@ -1261,7 +1278,7 @@ mod tests {
     #[test]
     fn non_manual_order_without_catalog_errors() {
         let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
-        inc.order = Order::Random;
+        inc.order = Some(Order::Random);
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap_err();
         assert!(format!("{err}").contains("catalog"), "err = {err}");
     }
@@ -1308,7 +1325,7 @@ mod tests {
             query: query.into(),
             order: None,
         })]);
-        inc.order = order;
+        inc.order = Some(order);
         inc
     }
 
@@ -1333,6 +1350,85 @@ mod tests {
         }
     }
 
+    // ---- episode default order (#95) --------------------------------------
+
+    /// Three episodes seeded so `entry_id` order (alphabetical), season/episode
+    /// order, and insertion order all disagree — a passing assertion for the
+    /// season/episode default can only come from reading `season`/`episode`,
+    /// not from the id or the seed order.
+    fn out_of_order_episodes_catalog() -> Catalog {
+        let cat = Catalog::open_in_memory().unwrap();
+        for (id, season, episode) in [("id-c", 1, 2), ("id-a", 1, 1), ("id-b", 2, 1)] {
+            let mut e = CatEntry::new(id, "episode", id, Source::Plex);
+            e.season = Some(season);
+            e.episode = Some(episode);
+            cat.upsert_entry(&e).unwrap();
+            cat.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.to_string(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+            })
+            .unwrap();
+        }
+        cat
+    }
+
+    #[test]
+    fn absent_block_order_over_an_all_episode_set_injects_the_season_episode_default() {
+        let cat = out_of_order_episodes_catalog();
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.type == \"episode\"".into(),
+            order: None,
+        })]);
+        inc.order = None; // the author wrote nothing at all
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["id-a", "id-c", "id-b"],
+            "season:asc,episode:asc, not entry_id order ({ids:?})"
+        );
+    }
+
+    #[test]
+    fn explicit_manual_order_over_an_all_episode_set_keeps_authored_order() {
+        let cat = out_of_order_episodes_catalog();
+        // `include_with`'s default order is `Some(Order::Manual)` — the author
+        // explicitly wrote `manual`, which must win even though every item is
+        // episode-typed.
+        let inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.type == \"episode\"".into(),
+            order: None,
+        })]);
+        assert_eq!(inc.order, Some(Order::Manual));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["id-a", "id-b", "id-c"],
+            "entry_id order from the query, unmoved by the episode default ({ids:?})"
+        );
+    }
+
+    #[test]
+    fn absent_block_order_over_a_non_episode_set_keeps_todays_manual_behavior() {
+        let cat = seeded_catalog(); // all "movie" type
+        let mut inc = include_with(vec![Entry::Query(QueryEntry {
+            query: "item.year >= 2001".into(),
+            order: None,
+        })]);
+        inc.order = None; // the author wrote nothing at all
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["imdb:tt0120737", "imdb:tt0167260", "imdb:tt0167261"],
+            "a non-episode-typed set stays in entry_id order, unaffected by #95 ({ids:?})"
+        );
+    }
+
     #[test]
     fn field_order_keeps_non_catalog_items_after_the_sorted_set() {
         let cat = seeded_catalog();
@@ -1346,7 +1442,7 @@ mod tests {
                 order: None,
             }),
         ]);
-        inc.order = Order::parse("release_date:asc").unwrap();
+        inc.order = Some(Order::parse("release_date:asc").unwrap());
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
@@ -1491,7 +1587,7 @@ mod tests {
             Entry::Item(item_entry("a")),
             Entry::Item(item_entry("b")),
         ]);
-        inc.order = Order::Random;
+        inc.order = Some(Order::Random);
         let cat = seeded_catalog();
         let mut cfg = channel(vec![inc]);
         cfg.seed = Some(7);

@@ -256,11 +256,12 @@ fn validate_pattern_block<'a>(
     if include.pattern.is_empty() {
         return Err(bad("`pools` needs a `pattern` to draw from them".into()));
     }
-    if include.order != Order::Manual {
+    if let Some(order) = &include.order
+        && *order != Order::Manual
+    {
         return Err(bad(format!(
-            "order {:?} conflicts with `pattern` — the pattern IS the ordering; \
+            "order {order:?} conflicts with `pattern` — the pattern IS the ordering; \
              sort inside a pool with its own `order` instead",
-            include.order
         )));
     }
     if include.duplicates == Some(Duplicates::Collapse) {
@@ -470,7 +471,7 @@ mod tests {
             pattern: Vec::new(),
             cycles: None,
             mode: Mode::All,
-            order: Order::Manual,
+            order: Some(Order::Manual),
             filter: None,
         }
     }
@@ -921,7 +922,7 @@ mod tests {
         // The pattern IS the ordering — a block-level sort would silently
         // un-pattern the block.
         let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
-        b.order = Order::Random;
+        b.order = Some(Order::Random);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(
             format!("{err}").contains("conflicts with `pattern`"),
