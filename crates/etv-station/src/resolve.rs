@@ -153,6 +153,11 @@ pub fn resolve_channel_with_resume(
     // The field each block separates on, if any. Kept per block because two
     // blocks may separate on different fields.
     let mut separate_fields: Vec<Option<String>> = Vec::new();
+    // Each block's span in `out` (start, end, is_pattern) — what the window
+    // cut below needs to decide per block rather than once for the channel
+    // (#146): a pattern block already bounds itself inside `resolve_block`
+    // (#140), so only an entries block's own span still needs cutting here.
+    let mut block_spans: Vec<(usize, usize, bool)> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
         let block_items = resolve_block(
             include,
@@ -167,16 +172,18 @@ pub fn resolve_channel_with_resume(
             fill,
             &mut resume_out,
         )?;
+        let block_is_pattern = include.is_pattern();
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished
         // list would reorder the pattern's slots and destroy the shape the
         // pattern was written to build; its `[constraints]` table is the default
         // its pools inherit, not a rule over the block's output.
-        let c = if include.is_pattern() {
+        let c = if block_is_pattern {
             Constraints::default()
         } else {
             include.constraints()
         };
+        let span_start = out.len();
         limits.resize(
             limits.len() + block_items.len(),
             Limits {
@@ -189,14 +196,22 @@ pub fn resolve_channel_with_resume(
             c.separate_by.clone(),
         );
         out.extend(block_items);
+        block_spans.push((span_start, out.len(), block_is_pattern));
     }
 
-    // A channel with no pattern block is a flat authored list, played in a
-    // loop. Before the blocks are constrained, seat that list where the last
-    // generation left off and cut it to the airtime still wanted, so one
-    // generation covers the window instead of the whole list (#118) — a
-    // 950-item channel laid a month of playout in one pass and then sat idle
-    // for 29 days, during which an edit to its config changed nothing on air.
+    // An entries block is a flat authored list, played in a loop. Before the
+    // blocks are constrained, seat that list where the last generation left
+    // off and cut it to the airtime still wanted, so one generation covers
+    // the window instead of the whole list (#118) — a 950-item channel laid a
+    // month of playout in one pass and then sat idle for 29 days, during
+    // which an edit to its config changed nothing on air. A pattern block
+    // needs none of this — it already bounded itself to `fill` inside
+    // `resolve_block` (#140) — so this only ever touches an entries block's
+    // own span, decided per block rather than once for the whole channel
+    // (#146): a channel with one pattern block and one entries block used to
+    // skip this cut entirely on its entries half, because `is_pattern()` was
+    // answered once for the channel and any pattern block made it answer
+    // `true`.
     //
     // Cutting here rather than after emission is what keeps the cut lossless:
     // the adjacency pass below, and the ledger the daemon writes, both see
@@ -210,25 +225,67 @@ pub fn resolve_channel_with_resume(
     // sooner or later than it otherwise would. That is what an unseeded shuffle
     // already promises; what it gains is that a month of random schedule is no
     // longer decided a month in advance.
-    if !config.is_pattern() && !out.is_empty() {
-        let total = out.len();
-        let start = state.resume.position % total;
-        out.rotate_left(start);
-        limits.rotate_left(start);
-        separate_fields.rotate_left(start);
-
-        let laid = match fill {
-            Some(fill) => {
-                let runtimes = estimated_runtimes(&out, catalog, nominal_item_runtime(config));
-                items_covering(&runtimes, fill)
-            }
-            // The stateless entry point wants the list whole.
-            None => total,
-        };
-        out.truncate(laid);
-        limits.truncate(laid);
-        separate_fields.truncate(laid);
-        resume_out.position = (start + laid) % total;
+    let entries_spans: Vec<(usize, usize)> = block_spans
+        .iter()
+        .filter(|(_, _, is_pattern)| !is_pattern)
+        .map(|(start, end, _)| (*start, *end))
+        .collect();
+    let has_pattern_block = block_spans.iter().any(|(_, _, is_pattern)| *is_pattern);
+    if !entries_spans.is_empty() {
+        if !has_pattern_block {
+            // No pattern block in the channel: every item in `out` belongs to
+            // an entries block, so this is exactly #118's original whole-list
+            // cut — unchanged.
+            let whole = 0..out.len();
+            resume_out.position = cut_entries_window(
+                &mut out,
+                &mut limits,
+                &mut separate_fields,
+                whole,
+                state.resume.position,
+                fill,
+                catalog,
+                nominal_item_runtime(config),
+            );
+        } else if entries_spans.len() == 1 {
+            // Exactly one entries block shares the channel with pattern
+            // block(s): cut that block's own span in place, leaving the
+            // pattern blocks' already-bounded output untouched.
+            let (start, end) = entries_spans[0];
+            resume_out.position = cut_entries_window(
+                &mut out,
+                &mut limits,
+                &mut separate_fields,
+                start..end,
+                state.resume.position,
+                fill,
+                catalog,
+                nominal_item_runtime(config),
+            );
+        } else {
+            // Two or more entries blocks sharing a channel with a pattern
+            // block: #118 deliberately made `.resume.position` one cursor for
+            // the channel's whole entries list, not per block, because the
+            // adjacency pass below permutes the concatenated list and a
+            // per-block cursor would not survive it. That reasoning covers a
+            // channel with only entries blocks (they fuse into the one span
+            // above) — it does not say what a *fused* cursor spanning several
+            // non-contiguous entries spans should splice back to once a
+            // pattern block's span sits between them, and picking an answer
+            // here would be deciding new resume-position semantics rather
+            // than applying the two that already exist. Refuse rather than
+            // silently mis-schedule; see #190.
+            return Err(ConfigError::Unsupported {
+                path: path.to_path_buf(),
+                message: format!(
+                    "channel mixes a pattern block with {} entries blocks: cutting several \
+                     entries blocks to the window is only supported today when no pattern \
+                     block shares the channel (see #190 on resume-position semantics for a \
+                     fused multi-block cursor)",
+                    entries_spans.len()
+                ),
+            });
+        }
     }
 
     if out.is_empty() {
@@ -416,6 +473,61 @@ fn items_covering(runtimes: &[Duration], fill: Duration) -> usize {
         }
     }
     runtimes.len().max(1)
+}
+
+/// Rotate-and-cut one contiguous span of `items` (and its parallel `limits` /
+/// `separate_fields`) to seat it where the last generation left off and trim
+/// it to the airtime still wanted (#118) — used both for an entries-only
+/// channel's whole list and, per block, for a single entries block sharing a
+/// channel with pattern block(s) (#146). `range` must index all three slices
+/// consistently; on return the three have shrunk (or stayed the same size, if
+/// `fill` is `None`) by the same amount, at the same position.
+///
+/// Returns the position the *next* generation should resume from. A `range`
+/// that names an empty span is a no-op, returning `position` unchanged — the
+/// division below would otherwise panic on an empty entries block.
+#[allow(clippy::too_many_arguments)]
+fn cut_entries_window(
+    items: &mut Vec<ResolvedItem>,
+    limits: &mut Vec<Limits>,
+    separate_fields: &mut Vec<Option<String>>,
+    range: std::ops::Range<usize>,
+    position: usize,
+    fill: Option<Duration>,
+    catalog: Option<&Catalog>,
+    nominal: Duration,
+) -> usize {
+    let total = range.len();
+    if total == 0 {
+        return position;
+    }
+    let insert_at = range.start;
+    let mut span_items: Vec<ResolvedItem> = items.drain(range.clone()).collect();
+    let mut span_limits: Vec<Limits> = limits.drain(range.clone()).collect();
+    let mut span_fields: Vec<Option<String>> = separate_fields.drain(range).collect();
+
+    let start = position % total;
+    span_items.rotate_left(start);
+    span_limits.rotate_left(start);
+    span_fields.rotate_left(start);
+
+    let laid = match fill {
+        Some(fill) => {
+            let runtimes = estimated_runtimes(&span_items, catalog, nominal);
+            items_covering(&runtimes, fill)
+        }
+        // The stateless entry point wants the list whole.
+        None => total,
+    };
+    span_items.truncate(laid);
+    span_limits.truncate(laid);
+    span_fields.truncate(laid);
+
+    items.splice(insert_at..insert_at, span_items);
+    limits.splice(insert_at..insert_at, span_limits);
+    separate_fields.splice(insert_at..insert_at, span_fields);
+
+    (start + laid) % total
 }
 
 /// Reorder `items` by `perm` (a permutation of `0..items.len()`).
@@ -2211,6 +2323,132 @@ mod tests {
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["mov-1", "got-e1", "got-e2"]);
+    }
+
+    // ---- a channel mixing a pattern block with an entries block (#146) ----
+    //
+    // No channel in `examples/` mixes block kinds, which is why neither #118's
+    // nor #140's acceptance run caught this: `config.is_pattern()` was
+    // answered once for the whole channel, so a channel with any pattern
+    // block skipped the entries-window cut entirely on its entries half.
+
+    /// A ten-item, 30s-each entries block alongside the two-pool interleave
+    /// used by the pattern-block tests above. `interleave_block` authors an
+    /// explicit `cycles`, so its output ignores `fill` and is deterministic —
+    /// exactly the list `pattern_block_resolves_through_the_channel` asserts.
+    fn mixed_channel() -> ChannelConfig {
+        let pattern_inc = interleave_block(crate::config::Advance::Restart);
+        let entries_inc = include_with(
+            (0..10)
+                .map(|i| Entry::Item(item_entry(&i.to_string())))
+                .collect(),
+        );
+        channel(vec![pattern_inc, entries_inc])
+    }
+
+    const MIXED_PATTERN_IDS: [&str; 6] = ["mov-1", "got-e1", "got-e2", "mov-2", "inv-e1", "inv-e2"];
+
+    /// The acceptance bar's first line: a 90s window over ten 30s entries
+    /// items must take three of them, not all ten — even though the same
+    /// channel also carries a pattern block, which used to make the whole
+    /// channel skip this cut.
+    #[test]
+    fn a_mixed_channels_entries_block_is_cut_to_the_window_while_its_pattern_block_is_untouched() {
+        let cat = interleave_catalog();
+        let (items, resume) = resolve_channel_with_resume(
+            &mixed_channel(),
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            Some(Duration::from_secs(90)),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        let mut expected: Vec<&str> = MIXED_PATTERN_IDS.to_vec();
+        expected.extend(["lavfi:0", "lavfi:1", "lavfi:2"]);
+        assert_eq!(
+            ids, expected,
+            "the pattern block's full interleave, then only as much of the \
+             entries block as a 90s window covers — not its whole 10-item list"
+        );
+        assert_eq!(
+            resume.position, 3,
+            "the entries cursor advances by what it laid, same as a lone entries channel"
+        );
+        // The pattern block's own resume mechanism (#140) is untouched by the
+        // entries cut living alongside it.
+        assert!(resume.pool("movies").is_some());
+        assert!(resume.pool("shows").is_some());
+    }
+
+    /// The acceptance bar's second line: across two consecutive passes, the
+    /// entries half of a mixed channel skips no item and repeats none — and
+    /// the pattern half, unaffected by the entries cut, resolves the same
+    /// interleaved list each time (`Advance::Restart`'s own, separately
+    /// tested, contract — not something this fix touches).
+    #[test]
+    fn two_generations_of_a_mixed_channel_continue_its_entries_block_with_no_gap_or_repeat() {
+        let cat = interleave_catalog();
+        let generation = |at: usize| {
+            let mut state = GenerationState::empty();
+            state.resume.position = at;
+            resolve_channel_with_resume(
+                &mixed_channel(),
+                path(),
+                &[],
+                None,
+                Some(&cat),
+                &state,
+                &Default::default(),
+                Some(Duration::from_secs(90)),
+            )
+            .unwrap()
+        };
+
+        let (first, next) = generation(0);
+        let (second, _) = generation(next.position);
+
+        for (items, expected_entries_tail) in [
+            (&first, ["lavfi:0", "lavfi:1", "lavfi:2"]),
+            (&second, ["lavfi:3", "lavfi:4", "lavfi:5"]),
+        ] {
+            let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(&ids[..MIXED_PATTERN_IDS.len()], &MIXED_PATTERN_IDS[..]);
+            assert_eq!(&ids[MIXED_PATTERN_IDS.len()..], &expected_entries_tail[..]);
+        }
+    }
+
+    /// The shape #146 refuses rather than guesses at: two entries blocks
+    /// sharing a channel with a pattern block. #118 made `.resume.position`
+    /// one cursor for the channel's whole entries list on purpose, and there
+    /// is no non-arbitrary answer for what a fused cursor spanning two
+    /// non-contiguous entries spans should splice back to once a pattern
+    /// block's span sits between them — so this errors instead of silently
+    /// mis-scheduling either span.
+    #[test]
+    fn two_entries_blocks_alongside_a_pattern_block_errors_rather_than_guessing() {
+        let cat = interleave_catalog();
+        let pattern_inc = interleave_block(crate::config::Advance::Restart);
+        let entries_a = include_with(vec![Entry::Item(item_entry("a"))]);
+        let entries_b = include_with(vec![Entry::Item(item_entry("b"))]);
+        let cfg = channel(vec![entries_a, pattern_inc, entries_b]);
+
+        let err = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            Some(Duration::from_secs(90)),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("entries blocks"), "err = {err}");
     }
 
     #[test]
