@@ -141,6 +141,13 @@ pub struct PlexItem {
     pub library: Option<String>,
     /// Show name for an episode (`grandparentTitle`); `None` for a movie.
     pub show: Option<String>,
+    /// The show's own Plex `ratingKey` (`grandparentRatingKey`) for an
+    /// episode; `None` for a movie. Plex never puts a genre on the episode
+    /// record itself — only the show carries one — so [`PlexClient::fetch_all`]
+    /// uses this to fetch each show's genres once and copy them onto every
+    /// one of its episodes (#196). Not written to the catalog directly; it
+    /// exists only to drive that fan-out.
+    pub show_rating_key: Option<String>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
     /// Plex `absoluteIndex` (franchise-wide episode number), when Plex provides
@@ -662,6 +669,9 @@ fn to_plex_item(
         title: m.title.clone().unwrap_or_default(),
         library: library.and_then(non_empty).map(str::to_string),
         show: m.grandparent_title.clone(),
+        show_rating_key: is_episode
+            .then_some(m.grandparent_rating_key.clone())
+            .flatten(),
         season: is_episode.then_some(m.parent_index).flatten(),
         episode: is_episode.then_some(m.index).flatten(),
         absolute_episode: is_episode.then_some(m.absolute_index).flatten(),
@@ -826,6 +836,15 @@ impl PlexClient {
     /// the only thing that catches an item whose `updatedAt` never moves
     /// (null, not zero) and whose metadata later changes: `addedAt` doesn't
     /// move either, so a delta can't see the change, only the initial add.
+    ///
+    /// Plex attaches genre to a show, never to its episodes (#196), so once
+    /// every section's items are collected, every distinct show a fetched
+    /// episode belongs to (`show_rating_key`) gets one [`Self::show_genres`]
+    /// call — cached so a show with many episodes in this pass is only
+    /// fetched once — and [`apply_show_genres`] copies the result onto each
+    /// of that show's episode items. A delta pass (`since` set) only pays for
+    /// the shows among the episodes it actually fetched, the same shape
+    /// [`Self::fetch_collections`] uses for its own per-show fan-out.
     fn fetch_all(&self, since: Option<i64>) -> Result<Vec<PlexItem>, PlexIngestError> {
         let sections: SectionListResp = self.get("/library/sections", &[])?;
         let mut items = Vec::new();
@@ -879,6 +898,21 @@ impl PlexClient {
                 }
             }
         }
+
+        let mut show_genre_cache: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for item in &items {
+            let Some(show_key) = &item.show_rating_key else {
+                continue;
+            };
+            if show_genre_cache.contains_key(show_key) {
+                continue;
+            }
+            let genres = self.show_genres(show_key)?;
+            show_genre_cache.insert(show_key.clone(), genres);
+        }
+        apply_show_genres(&mut items, &show_genre_cache);
+
         Ok(items)
     }
 
@@ -990,6 +1024,23 @@ impl PlexClient {
             .collect())
     }
 
+    /// A show's own genres, via a direct fetch of its metadata record
+    /// (`/library/metadata/{ratingKey}`, no children/leaves suffix). Plex
+    /// attaches genre to the show, never to the episode (#196) — a section's
+    /// bulk episode listing (`type=4`) carries `grandparentTitle` but no
+    /// genre of its own. Empty if the show has none or the fetch returns no
+    /// record.
+    fn show_genres(&self, show_rating_key: &str) -> Result<Vec<String>, PlexIngestError> {
+        let endpoint = format!("/library/metadata/{show_rating_key}");
+        let resp: MediaContainerResp = self.get(&endpoint, &[])?;
+        Ok(resp
+            .media_container
+            .metadata
+            .first()
+            .map(|m| tagged(&m.genre))
+            .unwrap_or_default())
+    }
+
     /// Every Plex label across all library sections, with its section-scoped
     /// members' ratingKeys (#136). Two requests per label — its own listing at
     /// `/library/sections/{id}/label`, then its members at
@@ -1072,6 +1123,33 @@ fn expand_show_members(
         .collect()
 }
 
+/// Copy each show's genres onto its episode items (#196): Plex attaches genre
+/// to the show record, never to the episode, so a bulk episode listing's own
+/// `genres` is always empty and [`PlexClient::fetch_all`] has to fetch it
+/// separately, once per show, via [`PlexClient::show_genres`]. Extends rather
+/// than replaces an item's existing `genres` so nothing is lost if Plex ever
+/// does put a genre directly on an episode record; an episode whose
+/// `show_rating_key` has no entry in `genres` (the show's own fetch found
+/// none, or was never looked up) is left untouched, and a movie (no
+/// `show_rating_key` at all) is never touched.
+///
+/// Pure so the fan-out is unit-tested without a live Plex server;
+/// [`PlexClient::fetch_all`] is the only caller and is the one that populates
+/// `genres` over HTTP.
+fn apply_show_genres(
+    items: &mut [PlexItem],
+    genres: &std::collections::HashMap<String, Vec<String>>,
+) {
+    for item in items {
+        let Some(show_key) = &item.show_rating_key else {
+            continue;
+        };
+        if let Some(show_genres) = genres.get(show_key) {
+            item.genres.extend(show_genres.iter().cloned());
+        }
+    }
+}
+
 // ---- Plex API JSON shapes -------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -1097,6 +1175,11 @@ struct PlexMetadata {
     title: Option<String>,
     #[serde(default)]
     grandparent_title: Option<String>,
+    /// The show's own `ratingKey`, present on an episode record. Read to fetch
+    /// each show's genres and copy them onto its episodes (#196) — see
+    /// [`PlexItem::show_rating_key`].
+    #[serde(default)]
+    grandparent_rating_key: Option<String>,
     #[serde(default)]
     parent_index: Option<i64>,
     #[serde(default)]
@@ -1221,6 +1304,7 @@ mod tests {
             title: "A Movie".into(),
             library: None,
             show: None,
+            show_rating_key: None,
             season: None,
             episode: None,
             absolute_episode: None,
@@ -1812,6 +1896,45 @@ mod tests {
         assert_eq!(item.absolute_episode, None);
     }
 
+    /// #196: `to_plex_item` has to capture `grandparentRatingKey` on an
+    /// episode record so `PlexClient::fetch_all` knows which show to fetch
+    /// genres from — verified live against the Plex server that a bulk
+    /// episode listing (`type=4`) carries this field but no `Genre` of its
+    /// own.
+    #[test]
+    fn to_plex_item_captures_the_show_rating_key_for_episodes() {
+        let json = r#"{
+            "ratingKey": "157474",
+            "type": "episode",
+            "title": "Pilot",
+            "grandparentTitle": "The 'Burbs",
+            "grandparentRatingKey": "157472",
+            "parentIndex": 1,
+            "index": 1,
+            "Media": [{"Part": [{"file": "/media/burbs/e.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        assert_eq!(item.show_rating_key.as_deref(), Some("157472"));
+    }
+
+    /// A movie never has a `grandparentRatingKey` to begin with, but the
+    /// `is_episode` guard has to hold even if one were somehow present —
+    /// same shape as `movie_never_carries_absolute_episode`.
+    #[test]
+    fn movie_never_carries_a_show_rating_key() {
+        let json = r#"{
+            "ratingKey": "2",
+            "type": "movie",
+            "title": "A Film",
+            "grandparentRatingKey": "999",
+            "Media": [{"Part": [{"file": "/media/x.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, None, |p| p.to_string()).unwrap();
+        assert_eq!(item.show_rating_key, None);
+    }
+
     #[test]
     fn ingest_writes_absolute_episode_queryable() {
         let cat = Catalog::open_in_memory().unwrap();
@@ -2027,6 +2150,63 @@ mod tests {
             expand_show_members(&show_keys, &episodes),
             vec!["a-e1".to_string()]
         );
+    }
+
+    /// #196: an episode item with no genre of its own picks up its show's
+    /// genres once `show_genres` has fetched them.
+    #[test]
+    fn apply_show_genres_extends_an_episode_item_from_its_show() {
+        let mut ep = movie("157474", "/media/burbs/e.mkv", &[]);
+        ep.kind = "episode".into();
+        ep.show = Some("The 'Burbs".into());
+        ep.show_rating_key = Some("157472".into());
+        ep.genres = vec![];
+        let mut items = vec![ep];
+        let genres: std::collections::HashMap<String, Vec<String>> = [(
+            "157472".to_string(),
+            vec!["Comedy".to_string(), "Mystery".to_string()],
+        )]
+        .into_iter()
+        .collect();
+
+        apply_show_genres(&mut items, &genres);
+
+        assert_eq!(
+            items[0].genres,
+            vec!["Comedy".to_string(), "Mystery".to_string()]
+        );
+    }
+
+    /// A movie carries no `show_rating_key` at all, so it must never be
+    /// touched by the show-genre fan-out even if (by coincidence) its own
+    /// ratingKey collided with an entry in the genre map.
+    #[test]
+    fn apply_show_genres_leaves_a_movie_untouched() {
+        let mut items = vec![movie("1", "/media/x.mkv", &[])];
+        let genres: std::collections::HashMap<String, Vec<String>> =
+            [("1".to_string(), vec!["Comedy".to_string()])]
+                .into_iter()
+                .collect();
+
+        apply_show_genres(&mut items, &genres);
+
+        assert_eq!(items[0].genres, vec!["Action".to_string()]);
+    }
+
+    /// An episode whose show was never looked up (absent from the map — the
+    /// show's own fetch found nothing to cache, or was skipped) keeps
+    /// whatever genres it already had rather than being cleared.
+    #[test]
+    fn apply_show_genres_leaves_an_episode_untouched_when_its_show_was_never_fetched() {
+        let mut ep = movie("2", "/media/y.mkv", &[]);
+        ep.kind = "episode".into();
+        ep.show_rating_key = Some("no-such-show".into());
+        ep.genres = vec![];
+        let mut items = vec![ep];
+
+        apply_show_genres(&mut items, &std::collections::HashMap::new());
+
+        assert!(items[0].genres.is_empty());
     }
 
     /// A show-subtype container's members are expanded to episode ratingKeys
