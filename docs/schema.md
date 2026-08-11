@@ -281,6 +281,14 @@ ETV-next's XMLTV). Defined in `vendor/etv-next/`
 | `content_rating` | string |
 | `artwork_url` | string |
 | `year` | int |
+| `credits` | object — `{director: [string], actor: [{name, role?}], writer: [string]}` |
+| `country` | list of strings |
+| `star_rating` | string, e.g. `"4 / 5"` |
+
+`credits` is emitted as XMLTV `<credits>` with its children in the order that
+format requires (director, actor, writer) whatever order they are written in
+here. `country` becomes one `<country>` element per entry. `star_rating` is
+passed through verbatim into `<star-rating><value>`.
 
 Set on a block's `program:` for defaults; set on an entry's `program:` to
 override per item. Item values win over block defaults.
