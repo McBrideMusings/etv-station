@@ -1080,4 +1080,157 @@ mod tests {
     fn live_input_is_never_throttled() {
         assert!(ReadRate::Unthrottled.as_args().is_empty());
     }
+
+    /// Convert mode turns text subtitles into WebVTT, which cannot hold a
+    /// picture. A Blu-ray/DVD rip whose only subtitle track is PGS or VobSub
+    /// must still show up on screen, the same way Burn mode already paints
+    /// picture subtitles onto the video. Regression test for the bug where
+    /// `subtitle_source` stayed `None` and the item played with no subtitles
+    /// at all — this proves the pipeline still builds the overlay filter (and
+    /// still feeds ffmpeg the subtitle stream as an input) for a picture
+    /// subtitle even when `subtitle_mode` is `Convert`, not just `Burn`.
+    #[test]
+    fn convert_mode_paints_picture_subtitles_onto_the_video() {
+        use time::OffsetDateTime;
+
+        use crate::frame_rate::FrameRate;
+        use crate::frame_size::FrameSize;
+        use crate::input::{InputSource, LocalInputSource, ProbedInput};
+        use crate::output_format::OutputFormat;
+        use crate::output_settings::{AudioOutputSettings, ScalingMode};
+        use crate::probe::{
+            CodecType, ProbeResult, ProbeResultAudioStream, ProbeResultColorParams,
+            ProbeResultStream, ProbeResultVideoStream,
+        };
+
+        let path = String::from("/media/bluray-rip.mkv");
+        let source = InputSource::Local(LocalInputSource { path: path.clone() });
+
+        let video_stream = ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
+            stream_index: 0,
+            codec: String::from("h264"),
+            codec_type: CodecType::Video,
+            profile: String::new(),
+            height: Some(1080),
+            width: Some(1920),
+            frame_rate: FrameRate::default(),
+            sample_aspect_ratio: Some(String::from("1:1")),
+            display_aspect_ratio: None,
+            pix_fmt: String::from("yuv420p"),
+            color_params: ProbeResultColorParams {
+                color_range: None,
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+            },
+            field_order: None,
+        }));
+        let audio_stream = ProbeResultStream::Audio(ProbeResultAudioStream {
+            stream_index: 1,
+            codec: String::from("aac"),
+            channels: 2,
+        });
+        // A PGS track: the picture-based subtitle format Blu-ray rips carry.
+        let subtitle_stream = ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
+            stream_index: 2,
+            codec: String::from("hdmv_pgs_subtitle"),
+            codec_type: CodecType::Subtitle,
+            profile: String::new(),
+            height: None,
+            width: None,
+            frame_rate: FrameRate::default(),
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            pix_fmt: String::new(),
+            color_params: ProbeResultColorParams {
+                color_range: None,
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+            },
+            field_order: None,
+        }));
+
+        let probe_result = ProbeResult {
+            path: path.clone(),
+            streams: vec![video_stream, audio_stream, subtitle_stream],
+            duration: None,
+            format_name: None,
+        };
+
+        let probed = |stream_index: Option<u32>| ProbedInput {
+            input_source: source.clone(),
+            probe_result: probe_result.clone(),
+            in_point: Duration::ZERO,
+            out_point: Duration::from_secs(3600),
+            stream_index,
+        };
+
+        let input_settings = InputSettings {
+            start: OffsetDateTime::UNIX_EPOCH,
+            audio_input: probed(None),
+            video_input: probed(None),
+            subtitle_input: Some(probed(None)),
+            watermark_input: None,
+            overlay_input: None,
+        };
+
+        let output_settings = OutputSettings {
+            audio: AudioOutputSettings {
+                format: Some(AudioFormat::Aac),
+                bitrate: Some(Kbps(192)),
+                buffer: Some(Kbps(384)),
+                channels: Some(2),
+                sample_rate: Some(Hz(48000)),
+                loudness: None,
+            },
+            video_format: Some(VideoFormat::H264),
+            bit_depth: Some(8),
+            video_bitrate: Some(Kbps(5000)),
+            video_buffer: Some(Kbps(10000)),
+            video_size: Some(FrameSize {
+                width: 1920,
+                height: 1080,
+            }),
+            scaling_mode: ScalingMode::ScaleAndPad,
+            filter_options: VideoFilterOptions::default(),
+            deinterlace: false,
+            accel: None,
+            format: OutputFormat::Hls {
+                playlist: String::from("/tmp/live.m3u8"),
+                segment_template: String::from("/tmp/segment_%03d.ts"),
+                troubleshoot: false,
+            },
+            pts_offset: None,
+            read_rate: ReadRate::Unthrottled,
+            frame_rate: None,
+            // The channel is set to Convert — not Burn — and what this test
+            // pins is that a picture subtitle still gets drawn onto the
+            // video anyway, because WebVTT (Convert's normal output) cannot
+            // represent a picture.
+            subtitle_mode: SubtitleMode::Convert,
+            fonts_folder: None,
+            subtitle_force_style: None,
+            reports_folder: None,
+            report_id: None,
+        };
+
+        let ffmpeg_info = FfmpegInfo::default();
+        let mut pipeline = Pipeline::full(&ffmpeg_info, input_settings, output_settings)
+            .expect("pipeline should build for a picture subtitle in convert mode");
+        pipeline.optimize();
+        let args = pipeline.args().join(" ");
+
+        // The subtitle stream must be fed to ffmpeg as an input...
+        assert!(
+            args.contains(&path),
+            "expected the subtitle-bearing file to be an ffmpeg input; args: {args}"
+        );
+        // ...and painted onto the video via the overlay filter, exactly like
+        // Burn mode does — proving Convert mode no longer drops it silently.
+        assert!(
+            args.contains("overlay"),
+            "expected an overlay filter drawing the picture subtitle onto the video; args: {args}"
+        );
+    }
 }
