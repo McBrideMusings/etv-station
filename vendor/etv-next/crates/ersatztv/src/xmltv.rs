@@ -352,8 +352,16 @@ fn parse_unix_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
+    use axum::routing::get;
     use ersatztv_playout::playout::{Actor, Credits, Playout, PlayoutItem, ProgramMetadata};
     use time::macros::datetime;
+    use tokio::sync::Mutex;
+    use tower::ServiceExt;
 
     use super::*;
 
@@ -420,6 +428,80 @@ mod tests {
             overlay: None,
             metadata: None,
         }
+    }
+
+    // Registers `/xmltv.xml` the same way `run()` does in main.rs and drives it
+    // with a real request, so a route-registration or Content-Type regression
+    // fails here — the other tests only call `build_xmltv()` directly.
+    #[tokio::test]
+    async fn xmltv_epg_route_serves_the_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("playout")).unwrap();
+        let cfg_path = dir.path().join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ersatztv::config::ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: None,
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).unwrap();
+
+        let playout = Playout::new(vec![bare_item()]);
+        std::fs::write(
+            dir.path()
+                .join("playout")
+                .join("20260430T123000.000000000+0000_20260430T130000.000000000+0000.json"),
+            serde_json::to_string(&playout).unwrap(),
+        )
+        .unwrap();
+
+        let state = Arc::new(LineupState {
+            channels: vec![channel],
+            active: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
+            device_id: "test-device".into(),
+        });
+
+        let app = Router::new()
+            .route("/xmltv.xml", get(xmltv_epg))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/xmltv.xml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/xml; charset=utf-8"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            body.contains(r#"<tv generator-info-name="ersatztv-next">"#),
+            "{body}"
+        );
+        assert!(body.contains(r#"<channel id="ersatztv.1">"#), "{body}");
+        assert!(
+            body.contains(
+                r#"<programme start="20260430123000 +0000" stop="20260430130000 +0000" channel="ersatztv.1">"#
+            ),
+            "{body}"
+        );
     }
 
     #[tokio::test]
