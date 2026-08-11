@@ -448,7 +448,7 @@ mod tests {
             logo: None,
             group: None,
         };
-        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).unwrap();
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
 
         let playout = Playout::new(vec![bare_item()]);
         std::fs::write(
