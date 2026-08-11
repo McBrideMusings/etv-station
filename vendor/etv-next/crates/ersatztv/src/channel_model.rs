@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use ersatztv::config::ChannelConfig;
 use ersatztv::error::LineupError;
 use serde::Deserialize;
-use simple_expand_tilde::expand_tilde;
 
 #[derive(Deserialize, Default)]
 struct ConfigHint {
@@ -211,6 +210,12 @@ impl ChannelModel {
     }
 }
 
+/// Resolves `playout.folder` the same way `ersatztv-channel` does: through
+/// `ersatztv_core::resolve_relative_paths`, which owns tilde-expansion and
+/// relative-path joining for both crates. This function does not reimplement
+/// any of that — it only turns the shared resolver's outcome into the two
+/// errors below, since `resolve_relative_paths` never fails outright (it
+/// falls back to a best-effort path instead of erroring).
 fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, LineupError> {
     let body = std::fs::read_to_string(channel_config_path).map_err(|e| {
         LineupError::ChannelConfigRead {
@@ -225,25 +230,45 @@ fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, LineupErro
             source: e,
         })?;
 
-    let folder = PathBuf::from(&parsed.playout.folder);
-    let folder = expand_tilde(&folder)
-        .ok_or_else(|| LineupError::PlayoutFolderExpand(parsed.playout.folder.clone()))?;
+    let parent = channel_config_path
+        .parent()
+        .ok_or(LineupError::LineupConfigFailure(String::from(
+            "failed to find parent of channel config",
+        )))?;
 
-    let resolved = if folder.is_absolute() {
-        folder
-    } else {
-        let parent = channel_config_path
-            .parent()
-            .ok_or(LineupError::LineupConfigFailure(String::from(
-                "failed to find parent of channel config",
-            )))?;
-        parent.join(folder)
-    };
+    let mut value = serde_json::json!({ "playout": { "folder": parsed.playout.folder } });
+    ersatztv_core::resolve_relative_paths(&mut value, parent, &["/playout/folder"]);
 
-    resolved
+    let resolved = value
+        .pointer("/playout/folder")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let resolved_path = PathBuf::from(resolved);
+
+    // A resolved folder that still starts with the raw folder's own leading
+    // `~...` component means the shared resolver's tilde-expansion silently
+    // gave up (its only failure mode: the home directory can't be determined,
+    // including the `~otheruser` form it never even attempts) and fell back
+    // to treating that segment as a plain path piece rather than erroring.
+    // Anchoring on the raw value's own first component — not any `~` found
+    // anywhere in the resolved path — avoids misfiring on an unrelated folder
+    // that happens to be named `~`.
+    let raw_first_component = Path::new(&parsed.playout.folder).components().next();
+    let tilde_expand_failed = raw_first_component.is_some_and(|first| {
+        first
+            .as_os_str()
+            .to_str()
+            .is_some_and(|s| s.starts_with('~'))
+            && resolved_path.components().any(|c| c == first)
+    });
+    if tilde_expand_failed {
+        return Err(LineupError::PlayoutFolderExpand(parsed.playout.folder));
+    }
+
+    resolved_path
         .canonicalize()
         .map_err(|e| LineupError::PlayoutFolderResolve {
-            path: resolved.display().to_string(),
+            path: resolved_path.display().to_string(),
             source: e,
         })
 }
