@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  station:
+    name: station workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # fmt uses unstable formatting options (see rustfmt.toml), so it needs a
+      # separate nightly toolchain. Installing it doesn't change the default
+      # (stable, from the step above) — the fmt step below invokes it
+      # explicitly via `cargo +nightly`.
+      - name: Install nightly toolchain (for fmt)
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      # etv-overlay depends on vello + wgpu + parley, which need these native
+      # libs to build — see the `builder` stage of the Dockerfile.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake pkg-config libfontconfig1-dev
+
+      - name: cargo build
+        run: cargo build --workspace --all-features --locked
+
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D clippy::all
+
+      - name: cargo fmt --check
+        run: cargo +nightly fmt --all -- --check
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  vendor:
+    name: vendor/etv-next workspace
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vendor/etv-next
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install nightly toolchain (for fmt)
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/etv-next
+
+      - name: cargo build
+        run: cargo build --workspace --all-features --locked
+
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D clippy::all
+
+      - name: cargo fmt --check
+        run: cargo +nightly fmt --all -- --check
+
+      - name: cargo test
+        run: cargo test --workspace
