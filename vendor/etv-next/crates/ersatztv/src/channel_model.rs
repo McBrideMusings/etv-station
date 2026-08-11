@@ -244,21 +244,19 @@ async fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, Line
         .unwrap_or_default();
     let resolved_path = PathBuf::from(resolved);
 
-    // A resolved folder that still starts with the raw folder's own leading
-    // `~...` component means the shared resolver's tilde-expansion silently
-    // gave up (its only failure mode: the home directory can't be determined,
-    // including the `~otheruser` form it never even attempts) and fell back
-    // to treating that segment as a plain path piece rather than erroring.
-    // Anchoring on the raw value's own first component — not any `~` found
-    // anywhere in the resolved path — avoids misfiring on an unrelated folder
-    // that happens to be named `~`.
+    // A resolved folder whose first component is still a bare `~` means the
+    // shared resolver's tilde-expansion silently gave up — its only failure
+    // mode is that the home directory can't be determined — and fell back to
+    // treating that segment as a plain path piece rather than erroring.
+    //
+    // The component must be *exactly* `~`, matching what expansion actually
+    // attempts: `simple_expand_tilde::expand_tilde` tests `Path::starts_with("~")`,
+    // which compares whole components. A directory legitimately named
+    // `~backup` is therefore never expanded, never fails, and must not be
+    // read as a failure just because its name opens with a tilde.
     let raw_first_component = Path::new(&parsed.playout.folder).components().next();
     let tilde_expand_failed = raw_first_component.is_some_and(|first| {
-        first
-            .as_os_str()
-            .to_str()
-            .is_some_and(|s| s.starts_with('~'))
-            && resolved_path.components().any(|c| c == first)
+        first.as_os_str() == "~" && resolved_path.components().any(|c| c == first)
     });
     if tilde_expand_failed {
         return Err(LineupError::PlayoutFolderExpand(parsed.playout.folder));
