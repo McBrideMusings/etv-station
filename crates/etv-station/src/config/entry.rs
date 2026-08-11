@@ -22,7 +22,11 @@ use super::source::SourceConfig;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Entry {
-    Item(ItemEntry),
+    /// Boxed: `ItemEntry` is far larger than the other variants, and an
+    /// unboxed variant would size every `Entry` — including the
+    /// `query`/`collection`/`include` kinds, which carry no item data at
+    /// all — to the biggest one. Same reasoning as `Fallback::Item` below.
+    Item(Box<ItemEntry>),
     Query(QueryEntry),
     Collection(CollectionEntry),
     Include(IncludeEntry),

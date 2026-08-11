@@ -305,7 +305,7 @@ mod tests {
             constraints: None,
             entries: ids
                 .iter()
-                .map(|id| ConfigEntry::Item(item_entry(id)))
+                .map(|id| ConfigEntry::Item(Box::new(item_entry(id))))
                 .collect(),
             fallback: None,
             sequencer: None,
@@ -339,7 +339,7 @@ mod tests {
             constraints: None,
             entries: ids
                 .iter()
-                .map(|(id, secs)| ConfigEntry::Item(item_entry_secs(id, *secs)))
+                .map(|(id, secs)| ConfigEntry::Item(Box::new(item_entry_secs(id, *secs))))
                 .collect(),
             fallback: None,
             sequencer: None,
@@ -399,7 +399,7 @@ mod tests {
             constraints: None,
             entries: ids
                 .iter()
-                .map(|id| ConfigEntry::Item(item_entry(id)))
+                .map(|id| ConfigEntry::Item(Box::new(item_entry(id))))
                 .collect(),
             fallback: None,
             sequencer: None,

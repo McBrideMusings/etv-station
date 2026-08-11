@@ -859,14 +859,14 @@ mod tests {
     }
 
     fn item_entry(id: &str) -> Entry {
-        Entry::Item(ItemEntry {
+        Entry::Item(Box::new(ItemEntry {
             source: SourceConfig::Lavfi {
                 params: format!("src={id}"),
             },
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
             program: None,
-        })
+        }))
     }
 
     fn inline_block(entries: Vec<Entry>) -> BlockInclude {
