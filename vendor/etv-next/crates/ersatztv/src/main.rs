@@ -118,7 +118,7 @@ async fn run() -> Result<(), LineupError> {
 
             let mut channels: Vec<ChannelModel> = Vec::with_capacity(lineup_config.channels.len());
             for channel in lineup_config.channels {
-                match ChannelModel::new(&lineup_path, &output_folder, channel) {
+                match ChannelModel::new(&lineup_path, &output_folder, channel).await {
                     Ok(channel_config) => {
                         channels.push(channel_config);
                     }

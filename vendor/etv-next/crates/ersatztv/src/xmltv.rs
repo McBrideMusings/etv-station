@@ -450,8 +450,8 @@ mod tests {
         assert_eq!(paths.len(), 2, "only the two well-named files match");
     }
 
-    #[test]
-    fn build_xmltv_emits_expected_structure() {
+    #[tokio::test]
+    async fn build_xmltv_emits_expected_structure() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("playout")).unwrap();
         let cfg_path = dir.path().join("channel.json");
@@ -465,7 +465,7 @@ mod tests {
             logo: Some("https://example.test/logo.png".into()),
             group: Some("Movies".into()),
         };
-        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).unwrap();
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
 
         let sections = vec![(
             channel.tvg_id().to_owned(),
@@ -630,7 +630,9 @@ mod tests {
             logo: None,
             group: None,
         };
-        let channel = ChannelModel::new(&cfg_path, &hls_output_folder, cfg).unwrap();
+        let channel = ChannelModel::new(&cfg_path, &hls_output_folder, cfg)
+            .await
+            .unwrap();
 
         let items = collect_items(&channel).await;
         assert_eq!(items.len(), 1, "should read only from playout folder");
@@ -697,7 +699,7 @@ mod tests {
             logo: None,
             group: None,
         };
-        let channel = ChannelModel::new(&cfg_path, root, cfg).unwrap();
+        let channel = ChannelModel::new(&cfg_path, root, cfg).await.unwrap();
 
         let items = collect_items(&channel).await;
 
