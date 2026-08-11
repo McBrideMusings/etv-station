@@ -364,7 +364,6 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::LineupState;
 
     #[test]
     fn datetime_format_matches_xmltv_spec() {
@@ -431,13 +430,9 @@ mod tests {
         }
     }
 
-    // Drives the real axum route, not just `build_xmltv()` in isolation — the
-    // gap the existing unit tests below leave open. Registers `/xmltv.xml`
-    // on a router exactly like `run()` does in main.rs, sends a request
-    // through it with `tower::ServiceExt::oneshot`, and checks the three
-    // things a route-registration or Content-Type regression would break:
-    // the response status, the header, and that the body is the same XML
-    // `build_xmltv()` would have produced from the on-disk playout file.
+    // Registers `/xmltv.xml` the same way `run()` does in main.rs and drives it
+    // with a real request, so a route-registration or Content-Type regression
+    // fails here — the other tests only call `build_xmltv()` directly.
     #[tokio::test]
     async fn xmltv_epg_route_serves_the_guide() {
         let dir = tempfile::tempdir().unwrap();
@@ -456,19 +451,18 @@ mod tests {
         let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).unwrap();
 
         let playout = Playout::new(vec![bare_item()]);
-        tokio::fs::write(
+        std::fs::write(
             dir.path()
                 .join("playout")
                 .join("20260430T123000.000000000+0000_20260430T130000.000000000+0000.json"),
             serde_json::to_string(&playout).unwrap(),
         )
-        .await
         .unwrap();
 
-        let state = std::sync::Arc::new(LineupState {
+        let state = Arc::new(LineupState {
             channels: vec![channel],
-            active: std::sync::Arc::new(Mutex::new(HashMap::new())),
-            health: std::sync::Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
             device_id: "test-device".into(),
         });
 
