@@ -299,25 +299,52 @@ mod tests {
         }
     }
 
-    // `~otheruser/...` is a leading component the shared resolver's
-    // tilde-expansion never attempts (it only expands a component that is
-    // exactly `~`), so it survives untouched into the resolved path. That
-    // survival is exactly what read_playout_folder infers as a failed
-    // expand (see the comment above it) — this test is what would catch
-    // that inference breaking (etv-station#247).
+    // A leading component that merely *begins* with `~` — `~otheruser`,
+    // `~backup` — is never a candidate for expansion: the shared resolver's
+    // crate tests `Path::starts_with("~")`, which compares whole components,
+    // so only a bare `~` is ever replaced. Such a component surviving into
+    // the resolved path is therefore not evidence that expansion failed; it
+    // is just the directory's name.
+    //
+    // Reading it as a failure is a real bug that shipped and stopped the
+    // server from starting on a lineup whose only channel pointed at a real
+    // directory named `~backup` (etv-station#239, fixed in 0f837a8). What
+    // must happen instead is an ordinary resolve failure naming the path
+    // that was actually looked for. #247 tracks deleting the inference that
+    // makes this delicate.
     #[tokio::test]
-    async fn unexpandable_tilde_raises_expand_error() {
+    async fn a_name_that_merely_starts_with_a_tilde_is_not_a_failed_expansion() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = write_channel_config(dir.path(), "~otheruser/movies").await;
 
         let err = read_playout_folder(&cfg_path).await.unwrap_err();
 
         match err {
-            LineupError::PlayoutFolderExpand(raw) => {
-                assert_eq!(raw, "~otheruser/movies");
+            LineupError::PlayoutFolderResolve { path, .. } => {
+                assert!(
+                    path.ends_with("~otheruser/movies"),
+                    "resolve error should name the path actually looked for, got {path}"
+                );
             }
-            other => panic!("expected PlayoutFolderExpand, got: {other}"),
+            other => panic!("expected PlayoutFolderResolve, got: {other}"),
         }
+    }
+
+    // The same shape, but for a directory that exists: it must load, not be
+    // rejected. This is the case that broke in production.
+    #[tokio::test]
+    async fn a_real_directory_named_with_a_leading_tilde_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("~backup/media"))
+            .await
+            .unwrap();
+        let cfg_path = write_channel_config(dir.path(), "~backup/media").await;
+
+        let resolved = read_playout_folder(&cfg_path)
+            .await
+            .expect("a real directory whose name starts with ~ must resolve");
+
+        assert!(resolved.ends_with("~backup/media"), "got {resolved:?}");
     }
 
     // A bare `~` is the one leading component the shared resolver's
