@@ -160,9 +160,12 @@ impl PlaylistManager {
         // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
         if Path::new(&self.generated_playlist_file).exists() {
             let generated_playlist = self.generate_playlist(|s| s.to_owned(), None)?;
-            let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
-            tokio::fs::write(temp.path(), generated_playlist).await?;
-            tokio::fs::rename(temp.path(), &self.ffmpeg_playlist_file).await?;
+            write_atomically(
+                &self.output_folder,
+                &self.ffmpeg_playlist_file,
+                generated_playlist,
+            )
+            .await?;
         }
 
         Ok(())
@@ -226,26 +229,23 @@ impl PlaylistManager {
                 + (program_date_time - self.current_session_start).as_seconds_f64())
                 * 90_000.0) as u64)
                 % 8589934592;
-            if let Some(src) = &mut self.subtitle_source {
-                let body = render_subtitle_segment(
-                    src,
-                    src.next_segment_source_offset,
-                    duration,
-                    mpegts_90khz,
-                );
-                let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
-                tokio::fs::write(temp.path(), body).await?;
-                tokio::fs::rename(temp.path(), &vtt_full).await?;
-                src.next_segment_source_offset += Duration::from_secs_f64(duration);
-            } else {
-                let body = format!(
+            let body = match &mut self.subtitle_source {
+                Some(src) => {
+                    let body = render_subtitle_segment(
+                        src,
+                        src.next_segment_source_offset,
+                        duration,
+                        mpegts_90khz,
+                    );
+                    src.next_segment_source_offset += Duration::from_secs_f64(duration);
+                    body
+                }
+                None => format!(
                     "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:{}\n\n",
                     mpegts_90khz
-                );
-                let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
-                tokio::fs::write(temp.path(), body).await?;
-                tokio::fs::rename(temp.path(), &vtt_full).await?;
-            }
+                ),
+            };
+            write_atomically(&self.output_folder, &vtt_full, body).await?;
         }
 
         // trim old segments
@@ -273,9 +273,12 @@ impl PlaylistManager {
 
         // generate and atomically save playlist
         let generated_playlist = self.generate_playlist(|s| s.to_owned(), Some(10))?;
-        let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
-        tokio::fs::write(temp.path(), generated_playlist).await?;
-        tokio::fs::rename(temp.path(), &self.generated_playlist_file).await?;
+        write_atomically(
+            &self.output_folder,
+            &self.generated_playlist_file,
+            generated_playlist,
+        )
+        .await?;
 
         // generate and atomically save subtitle playlist
         if let Some(subtitle_playlist_file) = self.generated_subtitle_playlist_file.clone() {
@@ -283,9 +286,12 @@ impl PlaylistManager {
                 |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
                 Some(10),
             )?;
-            let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
-            tokio::fs::write(temp.path(), generated_subtitle_playlist).await?;
-            tokio::fs::rename(temp.path(), &subtitle_playlist_file).await?;
+            write_atomically(
+                &self.output_folder,
+                &subtitle_playlist_file,
+                generated_subtitle_playlist,
+            )
+            .await?;
         }
 
         if !self.ready && self.segments.len() >= MIN_SEGMENTS {
@@ -433,6 +439,43 @@ impl PlaylistManager {
     }
 }
 
+/// Write `contents` to `destination` in a single step no reader can catch
+/// half-finished: fill a temp file in `folder` — the same folder the
+/// destination lives in, so the rename cannot cross filesystems — then rename
+/// it into place.
+///
+/// Widening the mode is part of that same step. `NamedTempFile` creates its
+/// backing file `0600` on purpose, a scratch file being private to the process
+/// that made it, and that mode survives the rename. Everything written here is
+/// served over HTTP alongside ffmpeg's own files, which land `0644` from the
+/// normal process umask, so the temp file is widened to match before it moves.
+async fn write_atomically(
+    folder: &Path,
+    destination: impl AsRef<Path>,
+    contents: String,
+) -> std::io::Result<()> {
+    let temp = tempfile::NamedTempFile::new_in(folder)?;
+    tokio::fs::write(temp.path(), contents).await?;
+    make_world_readable(&temp)?;
+    tokio::fs::rename(temp.path(), destination).await?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_world_readable(temp: &tempfile::NamedTempFile) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    temp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o644))
+}
+
+/// Non-unix targets have no owner-only-vs-world-readable distinction to fix.
+#[cfg(not(unix))]
+fn make_world_readable(_temp: &tempfile::NamedTempFile) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn render_subtitle_segment(
     src: &mut SubtitleSource,
     seg_start_src: Duration,
@@ -570,5 +613,31 @@ mod tests {
         pm.update().await.unwrap();
 
         assert_eq!(pm.abort(), None);
+    }
+
+    /// The bug this guards: `NamedTempFile` creates its backing file `0600`,
+    /// and a bare rename into the output folder carried that mode onto files
+    /// we serve over HTTP — while ffmpeg's own files in the same folder land
+    /// `0644` from the normal process umask. Both playlists `update()` writes
+    /// go out through [`write_atomically`], so both must come out `0644`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_playlists_are_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc());
+        pm.update().await.unwrap();
+
+        for name in ["live.m3u8", "live_sub.m3u8"] {
+            let mode = std::fs::metadata(dir.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o644, "{name} should be 0644, was {mode:o}");
+        }
     }
 }
