@@ -148,6 +148,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 
 | Path | What |
 |---|---|
+| `.githooks/` | Pre-commit hook rejecting a commit that stages a config with a hostname/path-shaped `${VAR:-default}` (#227) — install with `git config core.hooksPath .githooks`. `check-env-defaults.sh` holds the scan/grep logic (also usable stand-alone, e.g. from CI); `pre-commit` is the thin wrapper git actually invokes. |
 | `tools/dev-run.sh` | Builds etv-overlay, both etv-next binaries (`ersatztv` and `ersatztv-channel`), starts station + etv-next together, prefixes each line with `[station]`/`[etv]`, traps SIGINT/SIGTERM for clean shutdown. The canonical local integration test. |
 | `tools/dev-station.sh` | Runs ONLY the station daemon with `.env` sourced — no overlay build, no etv-next binaries, no HTTP server. For reading the daemon's own log or reproducing a config error, where the rest of the stack is dead weight. Takes an optional config path plus any daemon flags (`--list-folders`). |
 | `tools/kill-dev.sh` | Sends SIGTERM (or `--force` SIGKILL) to all dev processes: etv-station, ersatztv, ersatztv-channel, and any orphaned ffmpeg/ffprobe children. |
