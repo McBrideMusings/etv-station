@@ -63,10 +63,12 @@ defaults, leaving sibling keys alone:
 
 Two things are worth knowing before flipping it:
 
-- `convert` only works on text subtitle formats. Blu-ray and DVD rips carry
-  their subtitles as pictures, which cannot become WebVTT, and those items
-  currently play with no subtitles at all rather than falling back to burning
-  them in ([#236](https://github.com/McBrideMusings/etv-station/issues/236)).
+- `convert` produces a selectable WebVTT track only for text subtitle formats.
+  A Blu-ray or DVD rip carries its subtitles as pictures (PGS, VobSub), which
+  cannot become WebVTT — so for those items the pipeline paints them onto the
+  video instead, per item, the same as `burn` does. The viewer gets subtitles
+  either way; what changes is whether they can be switched off
+  ([#236](https://github.com/McBrideMusings/etv-station/issues/236)).
 - The subtitle track is announced as English on every channel, and nothing in
   the station config changes that: `NAME="English"` and `LANGUAGE="en"` are
   written literally into the playlist by ETV-next, not read from anywhere
