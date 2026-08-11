@@ -51,6 +51,7 @@ export default defineConfig({
           { text: '0002 — A scorer plugin replaces a pool\'s expr', link: '/adr/0002-scorer-plugin-replaces-a-pool-expr' },
           { text: '0003 — One file per chunk, honest names', link: '/adr/0003-one-file-per-chunk-honest-names' },
           { text: '0004 — Calendar and clock sit at different seams', link: '/adr/0004-calendar-and-clock-sit-at-different-seams' },
+          { text: '0005 — A plugin gets the channel seed', link: '/adr/0005-a-plugin-gets-the-channel-seed' },
         ],
       },
     ],
