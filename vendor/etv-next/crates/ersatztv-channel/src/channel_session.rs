@@ -746,6 +746,13 @@ impl ChannelSession {
             subtitle_input,
             watermark_input,
             overlay_input,
+            subtitle_language_tag: self
+                .channel_config
+                .normalization
+                .subtitle
+                .language
+                .tag
+                .clone(),
         };
 
         let mut subtitle_source: Option<SubtitleSource> = None;
@@ -1577,6 +1584,10 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
                 .unwrap_or_default(),
             sample_aspect_ratio: v.sample_aspect_ratio.clone(),
             display_aspect_ratio: v.display_aspect_ratio.clone(),
+            // The probe-hint schema (VideoHint) carries no language field;
+            // this path is unused by etv-station, which always ffprobes
+            // local files directly rather than supplying a hint.
+            language: None,
         }))
     });
 
@@ -1602,6 +1613,9 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
             frame_rate: FrameRate::default(),
             sample_aspect_ratio: None,
             display_aspect_ratio: None,
+            // SubtitleHint carries no language field either; see the video
+            // hint above for why this path never needs one today.
+            language: None,
         }))
     });
 

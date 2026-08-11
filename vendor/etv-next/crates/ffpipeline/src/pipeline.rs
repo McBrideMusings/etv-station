@@ -1124,6 +1124,7 @@ mod tests {
                 color_primaries: None,
             },
             field_order: None,
+            language: None,
         }));
         let audio_stream = ProbeResultStream::Audio(ProbeResultAudioStream {
             stream_index: 1,
@@ -1149,6 +1150,7 @@ mod tests {
                 color_primaries: None,
             },
             field_order: None,
+            language: None,
         }));
 
         let probe_result = ProbeResult {
@@ -1173,6 +1175,7 @@ mod tests {
             subtitle_input: Some(probed(None)),
             watermark_input: None,
             overlay_input: None,
+            subtitle_language_tag: String::from("en"),
         };
 
         let output_settings = OutputSettings {

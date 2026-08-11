@@ -67,6 +67,10 @@ pub struct ProbeResultVideoStream {
     pub pix_fmt: String,
     pub color_params: ProbeResultColorParams,
     pub field_order: Option<String>,
+    /// The stream's `tags.language` value as ffprobe reports it — an ISO
+    /// 639-2 (three-letter) code such as `eng` or `spa`, or `None` when the
+    /// container carries no language tag at all.
+    pub language: Option<String>,
 }
 
 impl ProbeResultVideoStream {
@@ -119,6 +123,107 @@ impl ProbeResultVideoStream {
     pub fn is_still_image(&self) -> bool {
         self.codec_type == CodecType::Video && STILL_IMAGE_CODECS.contains(&self.codec.as_str())
     }
+
+    /// True when this stream's probed language (ISO 639-2, as ffprobe
+    /// reports it) resolves to the same language as `tag`, a BCP 47 tag from
+    /// channel config such as `en` or `en-US`. A stream with no probed
+    /// language never matches.
+    pub fn matches_language(&self, tag: &str) -> bool {
+        let Some(probed) = self.language.as_deref() else {
+            return false;
+        };
+
+        let declared_primary = tag.split('-').next().unwrap_or(tag).to_ascii_lowercase();
+        let probed_lower = probed.to_ascii_lowercase();
+        let probed_primary = iso639_2_to_iso639_1(&probed_lower).unwrap_or(probed_lower.as_str());
+
+        probed_primary == declared_primary
+    }
+}
+
+/// Minimal ISO 639-2 (three-letter) -> ISO 639-1 (two-letter) table, covering
+/// the languages subtitle tracks commonly carry. ffprobe reports
+/// `tags.language` as ISO 639-2 (bibliographic or terminology variant, hence
+/// two entries for several languages); channel config declares a BCP 47 tag,
+/// which for these languages is the ISO 639-1 code. A code with no entry
+/// here — or no ISO 639-1 equivalent at all — simply never matches, so an
+/// unrecognised language tag falls through to the existing first-non-image
+/// selection instead of erroring.
+fn iso639_2_to_iso639_1(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "eng" => "en",
+        "spa" => "es",
+        "fre" | "fra" => "fr",
+        "ger" | "deu" => "de",
+        "ita" => "it",
+        "por" => "pt",
+        "dut" | "nld" => "nl",
+        "swe" => "sv",
+        "nor" => "no",
+        "dan" => "da",
+        "fin" => "fi",
+        "pol" => "pl",
+        "rus" => "ru",
+        "ukr" => "uk",
+        "ces" | "cze" => "cs",
+        "slk" | "slo" => "sk",
+        "ron" | "rum" => "ro",
+        "hun" => "hu",
+        "ell" | "gre" => "el",
+        "tur" => "tr",
+        "heb" => "he",
+        "ara" => "ar",
+        "hin" => "hi",
+        "jpn" => "ja",
+        "kor" => "ko",
+        "zho" | "chi" => "zh",
+        "vie" => "vi",
+        "tha" => "th",
+        "ind" => "id",
+        "may" | "msa" => "ms",
+        "bul" => "bg",
+        "hrv" => "hr",
+        "srp" => "sr",
+        "est" => "et",
+        "lav" => "lv",
+        "lit" => "lt",
+        "isl" | "ice" => "is",
+        "cat" => "ca",
+        "eus" | "baq" => "eu",
+        "glg" => "gl",
+        "afr" => "af",
+        "sqi" | "alb" => "sq",
+        "aze" => "az",
+        "bel" => "be",
+        "bos" => "bs",
+        "kat" | "geo" => "ka",
+        "hye" | "arm" => "hy",
+        "swa" => "sw",
+        "urd" => "ur",
+        "fas" | "per" => "fa",
+        "ben" => "bn",
+        "tam" => "ta",
+        "tel" => "te",
+        "mar" => "mr",
+        "guj" => "gu",
+        "kan" => "kn",
+        "mal" => "ml",
+        "pan" => "pa",
+        "amh" => "am",
+        "khm" => "km",
+        "lao" => "lo",
+        "mon" => "mn",
+        "nep" => "ne",
+        "sin" => "si",
+        "tgl" | "fil" => "tl",
+        "cym" | "wel" => "cy",
+        "gle" => "ga",
+        "gla" => "gd",
+        "mlt" => "mt",
+        "epo" => "eo",
+        "lat" => "la",
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +321,12 @@ struct ProbeOutputStream {
     color_transfer: Option<String>,
     color_primaries: Option<String>,
     field_order: Option<String>,
+    tags: Option<ProbeOutputStreamTags>,
+}
+
+#[derive(Deserialize)]
+struct ProbeOutputStreamTags {
+    language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -419,7 +530,139 @@ fn output_to_result(output_stream: &ProbeOutputStream) -> Option<ProbeResultStre
             frame_rate: FrameRate::parse(&output_stream.r_frame_rate.clone()?),
             sample_aspect_ratio: output_stream.sample_aspect_ratio.to_owned(),
             display_aspect_ratio: output_stream.display_aspect_ratio.to_owned(),
+            language: output_stream.tags.as_ref().and_then(|t| t.language.clone()),
         }))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subtitle_stream_stub() -> ProbeResultVideoStream {
+        ProbeResultVideoStream {
+            stream_index: 0,
+            codec: String::from("subrip"),
+            codec_type: CodecType::Subtitle,
+            profile: String::new(),
+            height: None,
+            width: None,
+            frame_rate: FrameRate::default(),
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            pix_fmt: String::new(),
+            color_params: ProbeResultColorParams::default(),
+            field_order: None,
+            language: None,
+        }
+    }
+
+    /// ffprobe reports each stream's language as an ISO 639-2 tag under
+    /// `tags.language`. Parsing must carry it through onto the probe result
+    /// so the subtitle-stream picker has something to match against.
+    #[test]
+    fn parses_the_language_tag_off_subtitle_streams() {
+        let json = r#"{
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "r_frame_rate": "24/1"
+                },
+                {
+                    "index": 1,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "r_frame_rate": "0/0",
+                    "tags": { "language": "spa" }
+                },
+                {
+                    "index": 2,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "r_frame_rate": "0/0",
+                    "tags": { "language": "eng" }
+                }
+            ],
+            "format": { "format_name": "matroska,webm" }
+        }"#;
+
+        let result =
+            parse_ffprobe_stdout(String::from("/tmp/example.mkv"), json.as_bytes().to_vec())
+                .expect("valid ffprobe output");
+
+        let subtitle_languages: Vec<Option<String>> = result
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                ProbeResultStream::Video(v) if v.codec_type == CodecType::Subtitle => {
+                    Some(v.language.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            subtitle_languages,
+            vec![Some(String::from("spa")), Some(String::from("eng"))]
+        );
+    }
+
+    /// A stream with no `tags` object at all — common for disc-rip PGS
+    /// tracks — must parse cleanly with no language rather than failing.
+    #[test]
+    fn a_stream_with_no_language_tag_parses_as_none() {
+        let json = r#"{
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "subtitle",
+                    "codec_name": "hdmv_pgs_subtitle",
+                    "r_frame_rate": "0/0"
+                }
+            ],
+            "format": {}
+        }"#;
+
+        let result =
+            parse_ffprobe_stdout(String::from("/tmp/example.mkv"), json.as_bytes().to_vec())
+                .expect("valid ffprobe output");
+
+        match result.streams.first() {
+            Some(ProbeResultStream::Video(v)) => assert_eq!(v.language, None),
+            other => panic!("expected a subtitle stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_language_normalizes_iso_639_2_to_the_declared_bcp_47_tag() {
+        let mut stream = subtitle_stream_stub();
+
+        stream.language = Some(String::from("eng"));
+        assert!(stream.matches_language("en"));
+        assert!(!stream.matches_language("es"));
+
+        stream.language = Some(String::from("spa"));
+        assert!(stream.matches_language("es"));
+        assert!(!stream.matches_language("en"));
+    }
+
+    /// The declared tag may carry a region subtag (`en-US`); only the
+    /// primary language subtag should be compared.
+    #[test]
+    fn matches_language_ignores_a_region_subtag_on_the_declared_side() {
+        let mut stream = subtitle_stream_stub();
+        stream.language = Some(String::from("eng"));
+        assert!(stream.matches_language("en-US"));
+    }
+
+    #[test]
+    fn matches_language_is_false_with_no_probed_language() {
+        let stream = subtitle_stream_stub();
+        assert!(!stream.matches_language("en"));
     }
 }

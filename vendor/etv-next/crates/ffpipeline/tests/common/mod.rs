@@ -220,6 +220,7 @@ pub fn build_input(
         subtitle_input: None,
         watermark_input: watermark,
         overlay_input: None,
+        subtitle_language_tag: String::from("en"),
     }
 }
 
