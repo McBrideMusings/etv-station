@@ -73,9 +73,19 @@ impl ChannelSession {
             // the uptime measured below decides whether a run was healthy.
             let started_at = Instant::now();
 
-            let _ = child.wait().await;
+            let status = child.wait().await;
             watcher.abort();
-            log::debug!("channel {} exited", channel_number);
+            match &status {
+                Ok(s) if s.success() => {
+                    log::debug!("channel {channel_number} exited cleanly");
+                }
+                Ok(s) => {
+                    log::warn!("channel {channel_number} exited with status {s}");
+                }
+                Err(e) => {
+                    log::error!("channel {channel_number} wait failed: {e}");
+                }
+            }
 
             // Sample the heartbeat BEFORE the cleanup below removes it. It is
             // the only thing distinguishing "died while someone was watching"
