@@ -156,6 +156,9 @@ fn clone_program(p: &ProgramMetadata) -> ProgramMetadata {
         content_rating: p.content_rating.clone(),
         artwork_url: p.artwork_url.clone(),
         year: p.year,
+        credits: p.credits.clone(),
+        country: p.country.clone(),
+        star_rating: p.star_rating.clone(),
     }
 }
 

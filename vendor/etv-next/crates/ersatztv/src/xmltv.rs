@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use ersatztv::error::LineupError;
-use ersatztv_playout::playout::{DATE_FORMAT, PlayoutItem, ProgramMetadata};
+use ersatztv_playout::playout::{Credits, DATE_FORMAT, PlayoutItem, ProgramMetadata};
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use time::OffsetDateTime;
@@ -146,6 +146,9 @@ fn write_metadata<W: std::io::Write>(
     if let Some(desc) = &meta.description {
         write_text_element(w, "desc", desc)?;
     }
+    if let Some(credits) = &meta.credits {
+        write_credits(w, credits)?;
+    }
     if let Some(categories) = &meta.categories {
         for category in categories {
             write_text_element(w, "category", category)?;
@@ -158,6 +161,11 @@ fn write_metadata<W: std::io::Write>(
         let mut icon = BytesStart::new("icon");
         icon.push_attribute(("src", url.as_str()));
         w.write_event(Event::Empty(icon)).map_err(xml_err)?;
+    }
+    if let Some(countries) = &meta.country {
+        for country in countries {
+            write_text_element(w, "country", country)?;
+        }
     }
     if let (Some(season), Some(episode)) = (meta.season, meta.episode) {
         write_text_element(w, "episode-num", &format!("S{season:02}E{episode:02}"))?;
@@ -181,6 +189,50 @@ fn write_metadata<W: std::io::Write>(
         w.write_event(Event::End(BytesEnd::new("rating")))
             .map_err(xml_err)?;
     }
+    if let Some(star_rating) = &meta.star_rating {
+        let elem = BytesStart::new("star-rating");
+        w.write_event(Event::Start(elem)).map_err(xml_err)?;
+        write_text_element(w, "value", star_rating)?;
+        w.write_event(Event::End(BytesEnd::new("star-rating")))
+            .map_err(xml_err)?;
+    }
+    Ok(())
+}
+
+/// Writes `<credits>` with children in XMLTV's required order — director,
+/// actor, writer — regardless of the order the caller populated `Credits`
+/// in. Omits the whole element (not just an empty one) when every role list
+/// is empty, matching how the rest of `ProgramMetadata` treats "nothing to
+/// say" as "say nothing" rather than an empty tag.
+fn write_credits<W: std::io::Write>(
+    w: &mut Writer<W>,
+    credits: &Credits,
+) -> Result<(), LineupError> {
+    if credits.director.is_empty() && credits.actor.is_empty() && credits.writer.is_empty() {
+        return Ok(());
+    }
+
+    w.write_event(Event::Start(BytesStart::new("credits")))
+        .map_err(xml_err)?;
+    for director in &credits.director {
+        write_text_element(w, "director", director)?;
+    }
+    for actor in &credits.actor {
+        let mut elem = BytesStart::new("actor");
+        if let Some(role) = &actor.role {
+            elem.push_attribute(("role", role.as_str()));
+        }
+        w.write_event(Event::Start(elem)).map_err(xml_err)?;
+        w.write_event(Event::Text(BytesText::new(&actor.name)))
+            .map_err(xml_err)?;
+        w.write_event(Event::End(BytesEnd::new("actor")))
+            .map_err(xml_err)?;
+    }
+    for writer in &credits.writer {
+        write_text_element(w, "writer", writer)?;
+    }
+    w.write_event(Event::End(BytesEnd::new("credits")))
+        .map_err(xml_err)?;
     Ok(())
 }
 
@@ -300,7 +352,7 @@ fn parse_unix_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
 
 #[cfg(test)]
 mod tests {
-    use ersatztv_playout::playout::{Playout, PlayoutItem, ProgramMetadata};
+    use ersatztv_playout::playout::{Actor, Credits, Playout, PlayoutItem, ProgramMetadata};
     use time::macros::datetime;
 
     use super::*;
@@ -332,6 +384,22 @@ mod tests {
                 content_rating: Some("TV-14".into()),
                 artwork_url: Some("https://example.test/poster.jpg".into()),
                 year: Some(2026),
+                credits: Some(Box::new(Credits {
+                    director: vec!["Ridley Scott".into()],
+                    actor: vec![
+                        Actor {
+                            name: "Sigourney Weaver".into(),
+                            role: Some("Ripley".into()),
+                        },
+                        Actor {
+                            name: "Tom Skerritt".into(),
+                            role: None,
+                        },
+                    ],
+                    writer: vec!["Ronald Shusett".into()],
+                })),
+                country: Some(vec!["United States".into(), "United Kingdom".into()]),
+                star_rating: Some("4 / 5".into()),
             }),
             overlay: None,
             // Present on purpose: nothing in this repo reads `metadata`, so if it
@@ -440,6 +508,58 @@ mod tests {
         );
         assert!(xml.contains("<rating>"), "{xml}");
         assert!(xml.contains("<value>TV-14</value>"), "{xml}");
+        assert!(xml.contains("<director>Ridley Scott</director>"), "{xml}");
+        assert!(
+            xml.contains(r#"<actor role="Ripley">Sigourney Weaver</actor>"#),
+            "{xml}"
+        );
+        assert!(xml.contains("<actor>Tom Skerritt</actor>"), "{xml}");
+        assert!(xml.contains("<writer>Ronald Shusett</writer>"), "{xml}");
+        assert!(xml.contains("<country>United States</country>"), "{xml}");
+        assert!(xml.contains("<country>United Kingdom</country>"), "{xml}");
+        assert!(xml.contains("<star-rating>"), "{xml}");
+        assert!(xml.contains("<value>4 / 5</value>"), "{xml}");
+
+        // XMLTV is order-sensitive: verify both the top-level placement of
+        // the new elements against the DTD (`credits?` before `category*`;
+        // `country*` after `icon*`, before `episode-num*`; `star-rating*`
+        // after `rating*`) and the required child order inside `<credits>`
+        // (director, actor, writer).
+        let full_open = r#"<programme start="20260430120000 +0000" stop="20260430123000 +0000" channel="ersatztv.1">"#;
+        let full_idx = xml.find(full_open).expect("populated programme present");
+        let full_close_idx = xml[full_idx..].find("</programme>").unwrap() + full_idx;
+        let full_body = &xml[full_idx..full_close_idx];
+
+        let desc_pos = full_body.find("<desc>").unwrap();
+        let credits_pos = full_body.find("<credits>").unwrap();
+        let category_pos = full_body.find("<category>").unwrap();
+        let icon_pos = full_body.find("<icon ").unwrap();
+        let country_pos = full_body.find("<country>").unwrap();
+        let episode_pos = full_body.find("<episode-num>").unwrap();
+        let rating_pos = full_body.find("<rating>").unwrap();
+        let star_rating_pos = full_body.find("<star-rating>").unwrap();
+        assert!(desc_pos < credits_pos, "credits should follow desc");
+        assert!(
+            credits_pos < category_pos,
+            "credits should precede category per the XMLTV DTD"
+        );
+        assert!(icon_pos < country_pos, "country should follow icon");
+        assert!(
+            country_pos < episode_pos,
+            "country should precede episode-num per the XMLTV DTD"
+        );
+        assert!(
+            rating_pos < star_rating_pos,
+            "star-rating should follow rating"
+        );
+
+        let director_pos = full_body.find("<director>").unwrap();
+        let actor_pos = full_body.find("<actor").unwrap();
+        let writer_pos = full_body.find("<writer>").unwrap();
+        assert!(
+            director_pos < actor_pos && actor_pos < writer_pos,
+            "credits children must appear director, actor, writer per the XMLTV DTD"
+        );
 
         let bare_open = r#"<programme start="20260430123000 +0000" stop="20260430130000 +0000" channel="ersatztv.1">"#;
         let bare_idx = xml.find(bare_open).expect("bare programme present");
@@ -449,6 +569,22 @@ mod tests {
             bare_body.trim().is_empty(),
             "bare programme should have no children, got: {bare_body:?}"
         );
+    }
+
+    // `Some(Credits::default())` — every role list present but empty — is
+    // reachable from a producer that always sets the field (e.g. serializing
+    // a struct that starts empty rather than omitting it). It must still
+    // read as "nothing to say" and emit no `<credits>` tag at all, not an
+    // empty one; a bare `<credits></credits>` is invalid in some XMLTV
+    // readers even though the DTD's `*` cardinalities technically allow it.
+    #[test]
+    fn empty_credits_emits_no_element() {
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut w = Writer::new(&mut buf);
+            write_credits(&mut w, &Credits::default()).unwrap();
+        }
+        assert_eq!(buf.into_inner(), Vec::<u8>::new());
     }
 
     #[tokio::test]

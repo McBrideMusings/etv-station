@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://ersatztv.org/playout/version/0.0.2",
+  "$id": "https://ersatztv.org/playout/version/0.0.3",
   "title": "Playout",
   "description": "A playout schedule for a single time window.\n\nFiles should be named `{start}_{finish}.json` using compact ISO 8601 (no separators), e.g. `20260413T000000.000000000-0500_20260414T002131.620000000-0500.json`, so that the channel can locate the correct file for the current time.",
   "type": "object",
@@ -220,6 +220,81 @@
           ],
           "minimum": 0,
           "description": "Release / air year."
+        },
+        "credits": {
+          "description": "Cast and crew credits, grouped by role. Omit for none.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/Credits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "country": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Country (or countries) of origin, e.g. [\"United States\"]. One `<country>` element is emitted per entry."
+        },
+        "star_rating": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Pre-formatted star rating, e.g. \"4 / 5\", per the XMLTV `star-rating` convention. Emitted verbatim as `<star-rating><value>`."
+        }
+      }
+    },
+    "Credits": {
+      "type": "object",
+      "description": "Cast and crew credits for a programme, grouped by XMLTV role. Each role list is independently optional; an absent role emits no elements for it.",
+      "properties": {
+        "director": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Director names. Defaults to empty."
+        },
+        "actor": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Actor"
+          },
+          "description": "Cast members, in credited order. Defaults to empty."
+        },
+        "writer": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Writer names. Defaults to empty."
+        }
+      }
+    },
+    "Actor": {
+      "type": "object",
+      "description": "A single actor credit, with an optional character/role name — XMLTV's `<actor role=\"...\">`.",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The actor's name."
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The character/role played, if known. Omit if unknown."
         }
       }
     },

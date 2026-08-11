@@ -1238,6 +1238,12 @@ fn catalog_item(
         content_rating: entry.content_rating.clone(),
         artwork_url: None,
         year: as_u32(entry.year),
+        // Not sourced from the catalog yet — populating these from the
+        // `cast`/`writer`/`director`/`country` tag namespaces is separate
+        // producer-side work, tracked as a follow-up.
+        credits: None,
+        country: None,
+        star_rating: None,
     };
     Ok(Some(ResolvedItem {
         id: entry.entry_id.clone(),
@@ -1344,6 +1350,9 @@ fn merge_program(
         content_rating: pick!(content_rating),
         artwork_url: pick!(artwork_url),
         year: pick!(year),
+        credits: pick!(credits),
+        country: pick!(country),
+        star_rating: pick!(star_rating),
     })
 }
 
@@ -1439,8 +1448,8 @@ mod tests {
     #[test]
     fn flattens_items_in_order() {
         let inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
         ]);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -1449,8 +1458,8 @@ mod tests {
 
     #[test]
     fn concatenates_blocks() {
-        let a = include_with(vec![Entry::Item(item_entry("a"))]);
-        let b = include_with(vec![Entry::Item(item_entry("b"))]);
+        let a = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
+        let b = include_with(vec![Entry::Item(Box::new(item_entry("b")))]);
         let items = resolve_channel(&channel(vec![a, b]), path(), &[], None, None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["lavfi:a", "lavfi:b"]);
@@ -1489,10 +1498,10 @@ mod tests {
     #[test]
     fn no_repeat_within_separates_back_to_back_repeats() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
-            Entry::Item(item_entry("c")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
+            Entry::Item(Box::new(item_entry("c"))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let ids = resolved_ids(vec![constrained(inc, 1)]);
@@ -1508,12 +1517,12 @@ mod tests {
         // into the concatenated list — and the channel-level pass is what keeps
         // the join from playing it twice in a row.
         let a = include_with(vec![
-            Entry::Item(item_entry("x")),
-            Entry::Item(item_entry("a")),
+            Entry::Item(Box::new(item_entry("x"))),
+            Entry::Item(Box::new(item_entry("a"))),
         ]);
         let b = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("y")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("y"))),
         ]);
         let ids = resolved_ids(vec![constrained(a, 1), constrained(b, 1)]);
         assert_eq!(ids.len(), 4);
@@ -1528,9 +1537,9 @@ mod tests {
     #[test]
     fn no_repeat_within_holds_across_the_generation_seam() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
-            Entry::Item(item_entry("c")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
+            Entry::Item(Box::new(item_entry("c"))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let state = crate::resume::GenerationState {
@@ -1564,10 +1573,10 @@ mod tests {
     #[test]
     fn no_repeat_within_temporal_separates_short_items() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry_secs("a", 30)),
-            Entry::Item(item_entry_secs("a", 30)),
-            Entry::Item(item_entry_secs("b", 30)),
-            Entry::Item(item_entry_secs("c", 30)),
+            Entry::Item(Box::new(item_entry_secs("a", 30))),
+            Entry::Item(Box::new(item_entry_secs("a", 30))),
+            Entry::Item(Box::new(item_entry_secs("b", 30))),
+            Entry::Item(Box::new(item_entry_secs("c", 30))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let ids = resolved_ids(vec![constrained_within(inc, Duration::from_secs(40))]);
@@ -1584,9 +1593,9 @@ mod tests {
     #[test]
     fn no_repeat_within_temporal_allows_adjacency_when_items_are_long_enough() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry_secs("a", 600)),
-            Entry::Item(item_entry_secs("a", 600)),
-            Entry::Item(item_entry_secs("b", 600)),
+            Entry::Item(Box::new(item_entry_secs("a", 600))),
+            Entry::Item(Box::new(item_entry_secs("a", 600))),
+            Entry::Item(Box::new(item_entry_secs("b", 600))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let ids = resolved_ids(vec![constrained_within(inc, Duration::from_secs(300))]);
@@ -1604,8 +1613,8 @@ mod tests {
     #[test]
     fn no_repeat_within_temporal_holds_across_the_generation_seam() {
         let inc = include_with(vec![
-            Entry::Item(item_entry_secs("a", 600)),
-            Entry::Item(item_entry_secs("b", 600)),
+            Entry::Item(Box::new(item_entry_secs("a", 600))),
+            Entry::Item(Box::new(item_entry_secs("b", 600))),
         ]);
         let state = crate::resume::GenerationState {
             tail: vec!["lavfi:a".to_string()],
@@ -1635,10 +1644,10 @@ mod tests {
     #[test]
     fn the_lists_own_ends_are_left_alone() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
-            Entry::Item(item_entry("c")),
-            Entry::Item(item_entry("a")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
+            Entry::Item(Box::new(item_entry("c"))),
+            Entry::Item(Box::new(item_entry("a"))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let ids = resolved_ids(vec![constrained(inc, 1)]);
@@ -1654,9 +1663,9 @@ mod tests {
         // One title, "no two in a row": impossible. Generation must finish with
         // every item intact and accept the violation.
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let ids = resolved_ids(vec![constrained(inc, 1)]);
@@ -1666,9 +1675,9 @@ mod tests {
     #[test]
     fn unconstrained_channel_keeps_its_resolved_order() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         assert_eq!(
@@ -1680,9 +1689,9 @@ mod tests {
     #[test]
     fn collapse_dedups_by_id() {
         let inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
         ]);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -1695,9 +1704,9 @@ mod tests {
         // `fs:` identity and collapse under the default `collapse` policy; a
         // different file keeps its own identity.
         let inc = include_with(vec![
-            Entry::Item(local_entry("/media/friends/s01e01.mkv")),
-            Entry::Item(local_entry("/media/friends/s01e01.mkv")),
-            Entry::Item(local_entry("/media/friends/s01e02.mkv")),
+            Entry::Item(Box::new(local_entry("/media/friends/s01e01.mkv"))),
+            Entry::Item(Box::new(local_entry("/media/friends/s01e01.mkv"))),
+            Entry::Item(Box::new(local_entry("/media/friends/s01e02.mkv"))),
         ]);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
         assert_eq!(items.len(), 2);
@@ -1711,8 +1720,8 @@ mod tests {
         // identity, so the cross-mount duplicate collapses.
         let roots = vec!["/mnt/media".to_string(), "/Volumes/media".to_string()];
         let inc = include_with(vec![
-            Entry::Item(local_entry("/mnt/media/friends/s01e01.mkv")),
-            Entry::Item(local_entry("/Volumes/media/friends/s01e01.mkv")),
+            Entry::Item(Box::new(local_entry("/mnt/media/friends/s01e01.mkv"))),
+            Entry::Item(Box::new(local_entry("/Volumes/media/friends/s01e01.mkv"))),
         ]);
         let items = resolve_channel(&channel(vec![inc]), path(), &roots, None, None).unwrap();
         assert_eq!(items.len(), 1);
@@ -1738,7 +1747,10 @@ mod tests {
             out_point: Some(Duration::from_secs(5)),
             program: None,
         };
-        let inc = include_with(vec![Entry::Item(lavfi), Entry::Item(http)]);
+        let inc = include_with(vec![
+            Entry::Item(Box::new(lavfi)),
+            Entry::Item(Box::new(http)),
+        ]);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["lavfi:testsrc", "http:https://ex/y.mkv"]);
@@ -1747,8 +1759,8 @@ mod tests {
     #[test]
     fn keep_preserves_duplicates() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
@@ -1758,9 +1770,9 @@ mod tests {
     #[test]
     fn count_mode_truncates_after_dedup() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
-            Entry::Item(item_entry("c")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
+            Entry::Item(Box::new(item_entry("c"))),
         ]);
         inc.mode = Mode::Count(2);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
@@ -1770,7 +1782,7 @@ mod tests {
 
     #[test]
     fn block_program_defaults_cascade() {
-        let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        let mut inc = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
         inc.program = Some(ProgramMetadata {
             title: Some("Default Title".into()),
             sub_title: None,
@@ -1781,6 +1793,9 @@ mod tests {
             content_rating: None,
             artwork_url: None,
             year: None,
+            credits: None,
+            country: None,
+            star_rating: None,
         });
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
         let p = items[0].program.as_ref().unwrap();
@@ -1801,8 +1816,11 @@ mod tests {
             content_rating: None,
             artwork_url: None,
             year: None,
+            credits: None,
+            country: None,
+            star_rating: None,
         });
-        let mut inc = include_with(vec![Entry::Item(item)]);
+        let mut inc = include_with(vec![Entry::Item(Box::new(item))]);
         inc.program = Some(ProgramMetadata {
             title: Some("Default".into()),
             sub_title: None,
@@ -1813,6 +1831,9 @@ mod tests {
             content_rating: None,
             artwork_url: None,
             year: None,
+            credits: None,
+            country: None,
+            star_rating: None,
         });
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
         let p = items[0].program.as_ref().unwrap();
@@ -1834,7 +1855,7 @@ mod tests {
 
     #[test]
     fn non_manual_order_without_catalog_errors() {
-        let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        let mut inc = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
         inc.order = Some(Order::Random);
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap_err();
         assert!(format!("{err}").contains("catalog"), "err = {err}");
@@ -2076,7 +2097,7 @@ mod tests {
         // sorted by release_date. The inline item can't be ranked — it must
         // survive, appended after the ranked query results, never dropped.
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("bumper")),
+            Entry::Item(Box::new(item_entry("bumper"))),
             Entry::Query(QueryEntry {
                 query: "item.year >= 2001".into(),
                 order: None,
@@ -2125,9 +2146,9 @@ mod tests {
         // episode_ids matches the same derived id every other step keys on, so
         // it needs no catalog at all — exercised entirely with inline items.
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
-            Entry::Item(item_entry("c")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
+            Entry::Item(Box::new(item_entry("c"))),
         ]);
         inc.filter = Some(Filter {
             seasons: None,
@@ -2140,7 +2161,7 @@ mod tests {
 
     #[test]
     fn filter_seasons_without_a_catalog_errors() {
-        let mut inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        let mut inc = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
         inc.filter = Some(Filter {
             seasons: Some(vec![1]),
             episode_ids: None,
@@ -2239,7 +2260,7 @@ mod tests {
         // leads and the collection's internal order survives intact.
         let cat = catalog_with_marathon();
         let inc = include_with(vec![
-            Entry::Item(item_entry("bumper")),
+            Entry::Item(Box::new(item_entry("bumper"))),
             Entry::Collection(CollectionEntry {
                 name: "Halloween Marathon".into(),
             }),
@@ -2312,9 +2333,9 @@ mod tests {
     fn collapse_runs_before_order_deterministic_under_random() {
         // Two blocks would collapse cross-block; here one block with a dup id.
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("b")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("b"))),
         ]);
         inc.order = Some(Order::Random);
         let cat = seeded_catalog();
@@ -2332,8 +2353,8 @@ mod tests {
     #[test]
     fn keep_with_manual_preserves_duplicate_items() {
         let mut inc = include_with(vec![
-            Entry::Item(item_entry("a")),
-            Entry::Item(item_entry("a")),
+            Entry::Item(Box::new(item_entry("a"))),
+            Entry::Item(Box::new(item_entry("a"))),
         ]);
         inc.duplicates = Some(Duplicates::Keep);
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
@@ -2348,7 +2369,7 @@ mod tests {
         // collapse to one under the default policy — three films, not four.
         let cat = seeded_catalog();
         let inc = include_with(vec![
-            Entry::Item(local_entry("/media/lotr/imdb:tt0120737.mkv")),
+            Entry::Item(Box::new(local_entry("/media/lotr/imdb:tt0120737.mkv"))),
             Entry::Query(QueryEntry {
                 query: "item.year >= 2001".into(),
                 order: None,
@@ -2793,7 +2814,7 @@ mod tests {
     /// only ever appears for channels that need it.
     #[test]
     fn an_entries_channel_records_its_list_position_and_no_pools() {
-        let inc = include_with(vec![Entry::Item(item_entry("a"))]);
+        let inc = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
         let (_, next) = resolve_channel_with_resume(
             &channel(vec![inc]),
             path(),
@@ -2822,7 +2843,7 @@ mod tests {
     ) -> (Vec<String>, usize) {
         let inc = include_with(
             (0..entries)
-                .map(|i| Entry::Item(item_entry(&i.to_string())))
+                .map(|i| Entry::Item(Box::new(item_entry(&i.to_string()))))
                 .collect(),
         );
         let mut state = GenerationState::empty();
@@ -3000,7 +3021,7 @@ mod tests {
         let pattern_inc = interleave_block(crate::config::Advance::Restart);
         let entries_inc = include_with(
             (0..10)
-                .map(|i| Entry::Item(item_entry(&i.to_string())))
+                .map(|i| Entry::Item(Box::new(item_entry(&i.to_string()))))
                 .collect(),
         );
         channel(vec![pattern_inc, entries_inc])
@@ -3095,8 +3116,8 @@ mod tests {
     fn two_entries_blocks_alongside_a_pattern_block_errors_rather_than_guessing() {
         let cat = interleave_catalog();
         let pattern_inc = interleave_block(crate::config::Advance::Restart);
-        let entries_a = include_with(vec![Entry::Item(item_entry("a"))]);
-        let entries_b = include_with(vec![Entry::Item(item_entry("b"))]);
+        let entries_a = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
+        let entries_b = include_with(vec![Entry::Item(Box::new(item_entry("b")))]);
         let cfg = channel(vec![entries_a, pattern_inc, entries_b]);
 
         let err = resolve_channel_with_resume(

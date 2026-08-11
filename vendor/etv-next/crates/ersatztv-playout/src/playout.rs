@@ -13,7 +13,7 @@ pub const DATE_FORMAT: Iso8601<DATE_CONFIG> = Iso8601::<DATE_CONFIG>;
 
 pub const SUPPORTED_SCHEMA: SchemaVersion = SchemaVersion {
     breaking: 0,
-    compatible: 2,
+    compatible: 3,
 };
 const VERSION_URI_PREFIX: &str = "https://ersatztv.org/playout/version/0.";
 
@@ -155,6 +155,46 @@ pub struct ProgramMetadata {
     pub artwork_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub year: Option<u32>,
+    /// Cast and crew credits, grouped by role. Emitted as `<credits>` with
+    /// children in XMLTV's required order (director, actor, writer)
+    /// regardless of the order populated here.
+    ///
+    /// Boxed because `Credits` (two name lists plus a cast list) is by far
+    /// the largest field here, and `ProgramMetadata` is embedded by value in
+    /// every type that carries it. Most programmes have no credits, so the
+    /// pointer keeps those types small in the common case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<Box<Credits>>,
+    /// Country (or countries) of origin, e.g. `["United States"]`. Emitted
+    /// as one `<country>` element per entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<Vec<String>>,
+    /// Pre-formatted star rating, e.g. `"4 / 5"` per the XMLTV `star-rating`
+    /// convention (`N / M`, whitespace around the slash is ignored).
+    /// Emitted verbatim as `<star-rating><value>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub star_rating: Option<String>,
+}
+
+/// Cast and crew credits for a programme, grouped by XMLTV role. Each role
+/// list is independently optional; an absent role emits no elements for it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Credits {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub director: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actor: Vec<Actor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writer: Vec<String>,
+}
+
+/// A single actor credit, with an optional character/role name — XMLTV's
+/// `<actor role="...">`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Actor {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl PlayoutItem {
