@@ -53,8 +53,8 @@ impl FrameSize {
         );
 
         FrameSize {
-            width: ((source_width * min_percent).round_ties_even() as u32).min(self.width),
-            height: ((source_height * min_percent).round_ties_even() as u32).min(self.height),
+            width: Self::round_to_even(source_width * min_percent).min(self.width),
+            height: Self::round_to_even(source_height * min_percent).min(self.height),
         }
     }
 
@@ -74,9 +74,17 @@ impl FrameSize {
         );
 
         FrameSize {
-            width: (source_width * max_percent).round_ties_even() as u32,
-            height: (source_height * max_percent).round_ties_even() as u32,
+            width: Self::round_to_even(source_width * max_percent),
+            height: Self::round_to_even(source_height * max_percent),
         }
+    }
+
+    /// Rounds to the nearest integer, then up to the next even number if that
+    /// is odd. Every downstream filter here (scale, zscale, pad, the encoder)
+    /// works in yuv420p, which subsamples chroma by 2 in both directions and
+    /// rejects an odd frame dimension outright.
+    fn round_to_even(value: f64) -> u32 {
+        (value.round_ties_even() as u32).next_multiple_of(2)
     }
 
     fn sar_as_float(frame_state: &FrameState) -> Option<f64> {
@@ -174,5 +182,75 @@ mod tests {
         };
 
         assert_eq!(target.square_pixel_size_contain(&state), target);
+    }
+
+    #[test]
+    fn contain_rounds_an_odd_height_up_to_even() {
+        // 3840x1604 HDR source scaled to fit inside a 1280x720 channel target
+        // computes a raw height of 1604 * (1280/3840) = 534.667, which rounds
+        // to the odd 535. zscale (used by the HDR tonemap filter) rejects any
+        // frame dimension not divisible by yuv420p's 2x chroma subsampling,
+        // so an odd height here plays as black. See issue #232.
+        let state = FrameState {
+            size: FrameSize {
+                width: 3840,
+                height: 1604,
+            },
+            is_anamorphic: false,
+            is_interlaced: false,
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            surface: FrameSurface::System,
+            pixel_format: PixelFormat::Yuv420p,
+            is_hdr: true,
+        };
+
+        let target = FrameSize {
+            width: 1280,
+            height: 720,
+        };
+
+        assert_eq!(
+            target.square_pixel_size_contain(&state),
+            FrameSize {
+                width: 1280,
+                height: 536,
+            }
+        );
+    }
+
+    #[test]
+    fn cover_rounds_an_odd_width_up_to_even() {
+        // 500x333 source covering a 640x480 target: the limiting ratio is
+        // 480/333 (height), so width = 500 * 480/333 = 720.72..., which rounds
+        // to the odd 721. square_pixel_size_cover has no target clamp (cover
+        // intentionally overflows the box), so this exercises the same
+        // round_to_even helper as `contain` but through its unclamped path.
+        let state = FrameState {
+            size: FrameSize {
+                width: 500,
+                height: 333,
+            },
+            is_anamorphic: false,
+            is_interlaced: false,
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            surface: FrameSurface::System,
+            pixel_format: PixelFormat::Yuv420p,
+            is_hdr: false,
+        };
+
+        let target = FrameSize {
+            width: 640,
+            height: 480,
+        };
+
+        assert_eq!(
+            target.square_pixel_size_cover(&state),
+            FrameSize {
+                width: 722,
+                height: 480,
+            }
+        );
     }
 }
