@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use ersatztv::config::ChannelConfig;
@@ -95,7 +94,7 @@ struct PlayoutFolder {
 }
 
 impl ChannelModel {
-    pub fn new(
+    pub async fn new(
         config_path: &Path,
         output_folder: &Path,
         channel: ChannelConfig,
@@ -113,14 +112,14 @@ impl ChannelModel {
         }
 
         let mut merged: serde_json::Value = serde_json::Value::Null;
-        if let Ok(config_base) = fs::read_to_string(&channel_config)
+        if let Ok(config_base) = tokio::fs::read_to_string(&channel_config).await
             && let Ok(value) = serde_json::from_str(&config_base)
         {
             merged = value;
         }
 
         for overlay_path in &overlay_paths {
-            if let Ok(overlay_str) = fs::read_to_string(overlay_path)
+            if let Ok(overlay_str) = tokio::fs::read_to_string(overlay_path).await
                 && let Ok(overlay_value) = serde_json::from_str(&overlay_str)
             {
                 ersatztv_core::deep_merge(&mut merged, overlay_value);
@@ -135,7 +134,7 @@ impl ChannelModel {
 
         let subtitle = hint.normalization.subtitle;
 
-        let playout_folder = read_playout_folder(&channel_config)?;
+        let playout_folder = read_playout_folder(&channel_config).await?;
 
         Ok(ChannelModel {
             number: channel.number.clone(),
@@ -216,13 +215,13 @@ impl ChannelModel {
 /// any of that — it only turns the shared resolver's outcome into the two
 /// errors below, since `resolve_relative_paths` never fails outright (it
 /// falls back to a best-effort path instead of erroring).
-fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, LineupError> {
-    let body = std::fs::read_to_string(channel_config_path).map_err(|e| {
-        LineupError::ChannelConfigRead {
+async fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, LineupError> {
+    let body = tokio::fs::read_to_string(channel_config_path)
+        .await
+        .map_err(|e| LineupError::ChannelConfigRead {
             path: channel_config_path.display().to_string(),
             source: e,
-        }
-    })?;
+        })?;
 
     let parsed: ChannelConfigPlayoutOnly =
         serde_json::from_str(&body).map_err(|e| LineupError::ChannelConfigParse {
@@ -265,8 +264,8 @@ fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, LineupErro
         return Err(LineupError::PlayoutFolderExpand(parsed.playout.folder));
     }
 
-    resolved_path
-        .canonicalize()
+    tokio::fs::canonicalize(&resolved_path)
+        .await
         .map_err(|e| LineupError::PlayoutFolderResolve {
             path: resolved_path.display().to_string(),
             source: e,
