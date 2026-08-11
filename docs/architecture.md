@@ -69,14 +69,20 @@ Two things are worth knowing before flipping it:
   video instead, per item, the same as `burn` does. The viewer gets subtitles
   either way; what changes is whether they can be switched off
   ([#236](https://github.com/McBrideMusings/etv-station/issues/236)).
-- The subtitle track is announced as English on every channel, and nothing in
-  the station config changes that: `NAME="English"` and `LANGUAGE="en"` are
-  written literally into the playlist by ETV-next, not read from anywhere
-  ([#238](https://github.com/McBrideMusings/etv-station/issues/238)).
-  The tag describes the subtitle text, not the audio, so Japanese audio with
-  English subtitles is labelled correctly; a channel whose subtitles are not
-  English is not. HLS announces this once per playlist and has no way to vary it
-  per programme, so one label covers the whole channel either way.
+- The announced subtitle language is a channel setting, not a fixed string:
+  `normalization.subtitle.language.{name,tag}` (defaulting to English / `en`)
+  is what goes into `NAME=` and `LANGUAGE=` in the playlist
+  ([#238](https://github.com/McBrideMusings/etv-station/issues/238)). HLS
+  allows one language per subtitle rendition for a whole session, so a channel
+  whose schedule mixes languages still declares the single value it advertises
+  — this cannot vary per programme. The tag describes the subtitle text, not
+  the audio, so Japanese audio with English subtitles is labelled correctly.
+- The stream picker honours that same declaration. When a file carries subtitle
+  streams in more than one language, `select_subtitle_stream()` prefers the
+  probed stream whose ISO 639-2 tag matches the channel's declared tag, and
+  falls back to the first non-image stream when nothing matches or the file
+  carries no language tags at all
+  ([#237](https://github.com/McBrideMusings/etv-station/issues/237)).
 
 ## Why ETV-next is vendored, not pinned
 
