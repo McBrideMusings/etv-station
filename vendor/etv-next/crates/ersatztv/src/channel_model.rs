@@ -269,3 +269,75 @@ async fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, Line
             source: e,
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn write_channel_config(dir: &Path, folder: &str) -> PathBuf {
+        let cfg_path = dir.join("channel.json");
+        let body = serde_json::json!({ "playout": { "folder": folder } }).to_string();
+        tokio::fs::write(&cfg_path, body).await.unwrap();
+        cfg_path
+    }
+
+    #[tokio::test]
+    async fn missing_playout_folder_raises_resolve_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = write_channel_config(dir.path(), "does-not-exist").await;
+
+        let err = read_playout_folder(&cfg_path).await.unwrap_err();
+
+        match err {
+            LineupError::PlayoutFolderResolve { path, .. } => {
+                assert!(
+                    path.ends_with("does-not-exist"),
+                    "resolve error should carry the folder that could not be canonicalized, got {path}"
+                );
+            }
+            other => panic!("expected PlayoutFolderResolve, got: {other}"),
+        }
+    }
+
+    // `~otheruser/...` is a leading component the shared resolver's
+    // tilde-expansion never attempts (it only expands a component that is
+    // exactly `~`), so it survives untouched into the resolved path. That
+    // survival is exactly what read_playout_folder infers as a failed
+    // expand (see the comment above it) — this test is what would catch
+    // that inference breaking (etv-station#247).
+    #[tokio::test]
+    async fn unexpandable_tilde_raises_expand_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = write_channel_config(dir.path(), "~otheruser/movies").await;
+
+        let err = read_playout_folder(&cfg_path).await.unwrap_err();
+
+        match err {
+            LineupError::PlayoutFolderExpand(raw) => {
+                assert_eq!(raw, "~otheruser/movies");
+            }
+            other => panic!("expected PlayoutFolderExpand, got: {other}"),
+        }
+    }
+
+    // A bare `~` is the one leading component the shared resolver's
+    // tilde-expansion crate does replace, with the real home directory —
+    // which every machine running this test has, so canonicalizing it
+    // always succeeds. This must never be misdiagnosed as a failed expand;
+    // it is the other half of the regression guard #247 is about.
+    #[tokio::test]
+    async fn expandable_tilde_does_not_raise_expand_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = write_channel_config(dir.path(), "~").await;
+
+        let resolved = read_playout_folder(&cfg_path)
+            .await
+            .expect("a bare ~ should expand to the real home directory and canonicalize");
+
+        assert_ne!(
+            resolved.as_os_str(),
+            "~",
+            "tilde should have been expanded, not passed through"
+        );
+    }
+}
