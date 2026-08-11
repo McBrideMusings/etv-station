@@ -37,7 +37,11 @@ cargo +nightly fmt --all                 # format
 bun run docs:dev                         # serve VitePress docs on http://localhost:5193
 ./tools/overlay-test.sh                  # render a Vello overlay onto a bumper fixture and open the mp4
 ./tools/overlay-still.sh                 # render a single overlay frame to PNG and open it
+
+git subtree pull --prefix=vendor/etv-next etv-upstream main --squash   # absorb upstream ErsatzTV/next
 ```
+
+The subtree pull is the whole mechanical half of an upstream sync; the judgement half — surveying what changed, checking `schema/playout.json` and the ffmpeg pin, and the keep-ours-then-port conflict doctrine — is in `.claude/skills/upstream-sync/SKILL.md`.
 
 `./tools/dev-run.sh` is the canonical local integration test: it builds both etv-next binaries, starts the station daemon (which writes playout JSON to `examples/output/test/`), starts the ErsatzTV-next HTTP server on `127.0.0.1:8409`, and tees both processes' output with `[station]`/`[etv]` prefixes. Hit `http://127.0.0.1:8409/channel/1.m3u8` for HLS or `/channels.m3u` for the lineup.
 
