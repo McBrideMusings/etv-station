@@ -39,13 +39,15 @@ pub const FAILURE_THRESHOLD: u32 = 3;
 /// Reaching `.ready` is NOT the test, which is the trap this replaced: a worker
 /// that starts, serves, and dies a minute later reaches ready every cycle, so
 /// resetting there meant a channel dying repeatedly sat at one failure forever
-/// and was never declared failed. Staying up is the only thing that
-/// distinguishes working from broken.
+/// and was never declared failed.
 ///
-/// Comfortably above both timers that end a short run — the stall watchdog fires
-/// at 60s, and an idle exit lands at the 90s heartbeat timeout — so a channel
-/// caught in either loop keeps accumulating, while one that genuinely served for
-/// three minutes starts from zero next time.
+/// This is the fallback, not the primary test. It only applies to exits the
+/// worker could not classify; a stall it did classify arrives as `stalled` and
+/// counts no matter how long the run lasted. That split matters because the
+/// stall watchdog fires 60s after the LAST segment, not 60s after startup — a
+/// session that hands out ten segments and then wedges is torn down four-odd
+/// minutes in, so measuring it against any threshold short enough to be useful
+/// for genuine crash loops would still have called it healthy.
 const HEALTHY_UPTIME: Duration = Duration::from_secs(180);
 
 /// Backoff schedule, indexed by how many failures have accumulated past the
@@ -120,19 +122,30 @@ impl HealthMap {
     ///
     /// `viewer_attached` is whether the heartbeat was still fresh at exit — it
     /// MUST be sampled before the worker's cleanup removes the file, or every
-    /// exit reads as unwatched and nothing is ever counted. `uptime` is how long
-    /// the worker ran; a long run counts as healthy even though it ended under a
-    /// viewer, because something that served for minutes is not a channel that
-    /// cannot start.
+    /// exit reads as unwatched and nothing is ever counted.
+    ///
+    /// `stalled` is the worker's own verdict, carried over as
+    /// [`ersatztv_core::STALL_EXIT_CODE`]: the stream stopped reaching the
+    /// viewer. It settles the question outright, because uptime cannot. A
+    /// channel that starts, hands out ten segments, wedges, and is torn down by
+    /// the 60s stall watchdog has been alive for over four minutes — past
+    /// `HEALTHY_UPTIME` — while delivering a frozen picture the whole time. Read
+    /// on uptime alone that exit cleared the failure count, so the backoff never
+    /// engaged and the channel respawned immediately and forever.
+    ///
+    /// `uptime` still decides every other kind of failure, where the server has
+    /// nothing better to go on: something that genuinely served for minutes
+    /// before dying is not a channel that cannot start.
     pub fn record_exit(
         &mut self,
         channel_number: &str,
         viewer_attached: bool,
+        stalled: bool,
         uptime: Duration,
         now: Instant,
     ) {
         let entry = self.channels.entry(channel_number.to_owned()).or_default();
-        if viewer_attached && uptime < HEALTHY_UPTIME {
+        if viewer_attached && (stalled || uptime < HEALTHY_UPTIME) {
             entry.record_failure(now);
         } else {
             entry.record_healthy();
@@ -164,7 +177,7 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..10 {
-            map.record_exit("1", false, Duration::from_secs(10), now);
+            map.record_exit("1", false, false, Duration::from_secs(10), now);
         }
         assert!(!map.get("1").is_failed());
         assert_eq!(map.get("1").consecutive_failures, 0);
@@ -174,11 +187,11 @@ mod tests {
     fn three_exits_under_a_viewer_mark_the_channel_failed() {
         let mut map = HealthMap::default();
         let now = t0();
-        map.record_exit("1", true, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now);
         assert!(!map.get("1").is_failed(), "one failure is not a verdict");
-        map.record_exit("1", true, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now);
         assert!(!map.get("1").is_failed(), "two failures is not a verdict");
-        map.record_exit("1", true, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now);
         assert!(map.get("1").is_failed());
     }
 
@@ -189,7 +202,7 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now);
         }
         let h = map.get("1");
         assert!(!h.may_spawn_at(now), "must not respawn immediately");
@@ -202,17 +215,17 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now);
         }
         assert!(map.get("1").may_spawn_at(now + Duration::from_secs(30)));
-        map.record_exit("1", true, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now);
         assert!(!map.get("1").may_spawn_at(now + Duration::from_secs(59)));
-        map.record_exit("1", true, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now);
         assert!(!map.get("1").may_spawn_at(now + Duration::from_secs(119)));
         // Far past the end of the schedule the wait must stay at the cap, not
         // run off the end of the array or grow without bound.
         for _ in 0..20 {
-            map.record_exit("1", true, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now);
         }
         assert!(!map.get("1").may_spawn_at(now + Duration::from_secs(299)));
         assert!(map.get("1").may_spawn_at(now + Duration::from_secs(300)));
@@ -227,11 +240,11 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now);
         }
         assert!(map.get("1").is_failed());
 
-        map.record_exit("1", true, HEALTHY_UPTIME, now);
+        map.record_exit("1", true, false, HEALTHY_UPTIME, now);
         let h = map.get("1");
         assert!(!h.is_failed());
         assert!(h.may_spawn_at(now));
@@ -250,7 +263,7 @@ mod tests {
         // Each iteration models a full cycle: the worker came up, served, and
         // died well inside HEALTHY_UPTIME with a viewer still attached.
         for expected in 1..=FAILURE_THRESHOLD {
-            map.record_exit("1", true, Duration::from_secs(70), now);
+            map.record_exit("1", true, false, Duration::from_secs(70), now);
             assert_eq!(
                 map.get("1").consecutive_failures,
                 expected,
@@ -260,12 +273,53 @@ mod tests {
         assert!(map.get("1").is_failed());
     }
 
+    // Regression test for the live run on 2026-08-11. Channel 4 was torn down by
+    // the stall watchdog four times in a row while someone watched, and every
+    // one of those exits logged "consecutive failures now 0" — because the
+    // watchdog only fires 60s after the LAST segment, so each run had been alive
+    // 256-284s, past HEALTHY_UPTIME. Nothing ever backed off, the channel
+    // respawned on a loop, and each respawn wiped the HLS folder and restarted
+    // segment numbering under a viewer still asking for the old numbers.
+    #[test]
+    fn a_stall_counts_even_when_the_run_outlived_the_healthy_threshold() {
+        let mut map = HealthMap::default();
+        let now = t0();
+        let long_enough_to_look_healthy = HEALTHY_UPTIME + Duration::from_secs(80);
+
+        for expected in 1..=FAILURE_THRESHOLD {
+            map.record_exit("1", true, true, long_enough_to_look_healthy, now);
+            assert_eq!(
+                map.get("1").consecutive_failures,
+                expected,
+                "a stall must count no matter how long the worker stayed alive"
+            );
+        }
+        assert!(map.get("1").is_failed());
+        assert!(
+            !map.get("1").may_spawn_at(now),
+            "must back off, not respawn"
+        );
+    }
+
+    // The counterpart: a stall nobody was watching is not a viewer-visible
+    // failure, so it must still clear rather than accumulate against a channel
+    // that is simply idle.
+    #[test]
+    fn a_stall_with_no_viewer_still_does_not_count() {
+        let mut map = HealthMap::default();
+        let now = t0();
+        for _ in 0..10 {
+            map.record_exit("1", false, true, Duration::from_secs(10), now);
+        }
+        assert_eq!(map.get("1").consecutive_failures, 0);
+    }
+
     #[test]
     fn channels_are_tracked_independently() {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now);
         }
         assert!(map.get("1").is_failed());
         assert!(!map.get("2").is_failed());

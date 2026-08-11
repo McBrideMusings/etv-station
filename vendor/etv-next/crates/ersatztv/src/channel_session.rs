@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ersatztv::error::LineupError;
-use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, empty_folder};
+use ersatztv_core::{
+    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, STALL_EXIT_CODE, empty_folder,
+};
 use tokio::sync::{Mutex, watch};
 
 use crate::channel_health::HealthMap;
@@ -88,6 +90,12 @@ impl ChannelSession {
                 }
             }
 
+            // The worker's own verdict that the stream stopped reaching the
+            // viewer. Uptime cannot stand in for it — the stall watchdog only
+            // fires 60s after the last segment, so a session that wedges a few
+            // minutes in outlives HEALTHY_UPTIME while showing a frozen picture.
+            let stalled = matches!(&status, Ok(s) if s.code() == Some(STALL_EXIT_CODE));
+
             // Sample the heartbeat BEFORE the cleanup below removes it. It is
             // the only thing distinguishing "died while someone was watching"
             // from an ordinary idle exit, and once the file is gone every exit
@@ -98,7 +106,13 @@ impl ChannelSession {
             let uptime = started_at.elapsed();
             let failures = {
                 let mut guard = health.lock().await;
-                guard.record_exit(&channel_number, viewer_attached, uptime, Instant::now());
+                guard.record_exit(
+                    &channel_number,
+                    viewer_attached,
+                    stalled,
+                    uptime,
+                    Instant::now(),
+                );
                 guard.get(&channel_number).consecutive_failures
             };
             if viewer_attached {

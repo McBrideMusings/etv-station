@@ -47,6 +47,24 @@ pub const OVERLAY_WRITER_TIMEOUT: Duration = Duration::from_secs(20);
 /// poll has to be paced or it spins.
 pub const OVERLAY_WRITER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Exit code the channel worker uses when it gives up because the stream stopped
+/// reaching the viewer — [`ChannelError::SegmentStall`] or
+/// [`ChannelError::Stalled`]. Every other failure still exits 1.
+///
+/// It exists because the server cannot otherwise tell those apart from an
+/// ordinary idle exit, and it was guessing: it treated any run longer than three
+/// minutes as healthy. A session that sat alive for four minutes handing out
+/// nothing then cleared its own failure count, so the backoff never engaged and
+/// the channel respawned on a loop — each respawn wiping the HLS folder and
+/// resetting segment numbering under a client that was still asking for the old
+/// numbers. The worker knows which of the two happened; this carries that
+/// verdict across the process boundary instead of having the server re-derive it
+/// from a clock.
+///
+/// [`ChannelError::SegmentStall`]: ../ersatztv_channel/error/enum.ChannelError.html
+/// [`ChannelError::Stalled`]: ../ersatztv_channel/error/enum.ChannelError.html
+pub const STALL_EXIT_CODE: i32 = 75;
+
 pub const VERSION: &str = env!("ETV_VERSION_STRING");
 
 pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io::Error> {

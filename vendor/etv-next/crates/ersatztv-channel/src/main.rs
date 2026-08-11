@@ -51,7 +51,18 @@ pub async fn main() {
             _ => log::error!("{err}"),
         };
 
-        std::process::exit(1);
+        // Report the two "stopped reaching the viewer" verdicts with their own
+        // exit code. The server counts those as failures no matter how long the
+        // run lasted; anything else keeps the ordinary code and is judged on
+        // uptime as before. See `ersatztv_core::STALL_EXIT_CODE`.
+        let code = match err {
+            ChannelError::SegmentStall(_) | ChannelError::Stalled(_) => {
+                ersatztv_core::STALL_EXIT_CODE
+            }
+            _ => 1,
+        };
+
+        std::process::exit(code);
     }
 }
 
