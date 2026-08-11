@@ -69,6 +69,16 @@ git remote add etv-upstream https://github.com/ErsatzTV/next   # once per clone
 git subtree pull --prefix=vendor/etv-next etv-upstream main --squash
 ```
 
+Install the pre-commit hook (once per clone — git doesn't read hooks from a
+tracked directory on its own). It rejects a commit that stages a config
+containing a real hostname or filesystem path baked in as an env-var default
+(`${VAR:-mac.example.com}` instead of `${VAR}`), so an accidental leak never
+lands. See `.githooks/check-env-defaults.sh` for exactly what's scanned.
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## Build & run
 
 A Cargo workspace with three crates. Common operations:

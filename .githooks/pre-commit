@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Rejects a commit that stages a config file containing a ${VAR:-default}
+# whose default looks like a private hostname or filesystem path. See
+# check-env-defaults.sh for exactly what's scanned and why.
+#
+# Install once per clone (not automatic — git doesn't read hooks from a
+# tracked directory on its own):
+#   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+hook_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+git diff --cached --name-only --diff-filter=ACM | "$hook_dir/check-env-defaults.sh"
