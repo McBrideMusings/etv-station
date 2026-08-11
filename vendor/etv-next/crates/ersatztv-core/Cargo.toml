@@ -7,3 +7,6 @@ edition = "2024"
 serde_json = { workspace = true }
 simple-expand-tilde = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

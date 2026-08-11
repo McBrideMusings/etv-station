@@ -81,3 +81,53 @@ pub async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(200)).await
     }
 }
+
+#[cfg(test)]
+mod empty_folder_tests {
+    use super::empty_folder;
+
+    /// The case this exists for: a channel's HLS output folder — `.ts`
+    /// segments, `.vtt` sidecars, and nested report directories — must come
+    /// back empty, with the folder itself still present so the next writer
+    /// can use it immediately.
+    #[tokio::test]
+    async fn removes_files_and_nested_directories_but_keeps_the_folder_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        tokio::fs::write(root.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("live000000.vtt"), b"cues")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(root.join("nested")).await.unwrap();
+        tokio::fs::write(root.join("nested").join("inner.txt"), b"x")
+            .await
+            .unwrap();
+
+        empty_folder(root).await.unwrap();
+
+        assert!(root.exists(), "the folder itself must survive the wipe");
+        let mut entries = tokio::fs::read_dir(root).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "no files or directories should remain"
+        );
+    }
+
+    /// A channel that has never run yet (or whose output folder was removed
+    /// out of band) has no folder to empty. This is the same case
+    /// `prep_output_folder` relies on at session start, and the exit-time
+    /// cleanup added in #235 hits it too whenever a worker exits before ever
+    /// producing a segment.
+    #[tokio::test]
+    async fn creates_the_folder_when_it_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("does-not-exist-yet");
+
+        empty_folder(&root).await.unwrap();
+
+        assert!(root.is_dir());
+    }
+}

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ersatztv::error::LineupError;
-use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME};
+use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, empty_folder};
 use tokio::sync::{Mutex, watch};
 
 use crate::channel_health::HealthMap;
@@ -51,6 +51,7 @@ impl ChannelSession {
             .map_err(LineupError::Io)?;
 
         let (ready_sender, ready_receiver) = watch::channel(false);
+        let output_folder = channel.output_folder().to_owned();
         let ready_file = channel.output_folder().join(READY_FILE_NAME);
         let heartbeat_file = channel.output_folder().join(HEARTBEAT_FILE_NAME);
         let channel_number = channel.number().to_owned();
@@ -107,6 +108,26 @@ impl ChannelSession {
                 );
             }
 
+            // Clean up this channel's HLS output — the segments and .vtt
+            // sidecars PlaylistManager's trim never reached, because it only
+            // drops a segment once a *later* one pushes it outside the
+            // two-minute playlist window, and no later segment ever arrives
+            // once the worker has exited. Left alone, that tail (about two
+            // minutes of segments) sits on disk until this channel happens to
+            // be watched again — which, for an idle channel, may be never.
+            // Done for every exit route: this point is reached whether the
+            // worker returned cleanly, hit an error, or was killed out from
+            // under it, since `child.wait()` above resolves either way.
+            if let Err(err) = empty_folder(&output_folder).await {
+                log::warn!("failed to clean up output folder for channel {channel_number}: {err}");
+            }
+
+            // Only now release the slot in `active`: `session_middleware`
+            // respawns a worker as soon as this channel's key is gone from
+            // the map, and a fresh worker would start writing new segments
+            // into `output_folder` immediately. Removing the entry before the
+            // wipe above finished would let that race and delete a live
+            // session's segments out from under it.
             active.lock().await.remove(&channel_number);
 
             if ready_file.exists() {
