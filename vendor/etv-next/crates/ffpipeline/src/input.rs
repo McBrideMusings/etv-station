@@ -19,6 +19,12 @@ pub struct InputSettings {
     pub subtitle_input: Option<ProbedInput>,
     pub watermark_input: Option<WatermarkInput>,
     pub overlay_input: Option<OverlayInput>,
+    /// The channel's declared subtitle language (BCP 47, e.g. `en`). HLS
+    /// allows one language per subtitle rendition for the whole session, so
+    /// this is the channel's fixed declaration, not read off the currently
+    /// playing item. `select_subtitle_stream` prefers whichever probed
+    /// stream's language tag matches this.
+    pub subtitle_language_tag: String,
 }
 
 /// Live overlay source feeding the secondary input of an ffmpeg `overlay`
@@ -161,12 +167,25 @@ impl InputSettings {
             }
         }
 
-        // No track was named, so fall back to what the file actually carries.
-        // Text beats image: text can either be burned in or converted to WebVTT,
-        // while an image subtitle can only be burned, so preferring text keeps
-        // both output modes open. Ordinary media files reach this path — a
-        // playout item that names no subtitle track is the common case, not an
-        // unusual one.
+        // No track was named. Prefer a text stream whose probed language
+        // matches what the channel declares — a viewer picking "English"
+        // should get English, whatever order the file lists its tracks in.
+        let language_match = all_subtitle_streams
+            .iter()
+            .copied()
+            .find(|s| !s.is_subtitle_image() && s.matches_language(&self.subtitle_language_tag));
+
+        if let Some(matched) = language_match {
+            return Some(matched);
+        }
+
+        // Nothing matched the declared language (or the file carries no
+        // language tags at all), so fall back to what the file actually
+        // carries. Text beats image: text can either be burned in or
+        // converted to WebVTT, while an image subtitle can only be burned,
+        // so preferring text keeps both output modes open. Ordinary media
+        // files reach this path — a playout item that names no subtitle
+        // track is the common case, not an unusual one.
         all_subtitle_streams
             .iter()
             .copied()
@@ -576,6 +595,15 @@ mod tests {
     use crate::probe::ProbeResultColorParams;
 
     fn stream(stream_index: u32, codec_type: CodecType, codec: &str) -> ProbeResultStream {
+        stream_with_language(stream_index, codec_type, codec, None)
+    }
+
+    fn stream_with_language(
+        stream_index: u32,
+        codec_type: CodecType,
+        codec: &str,
+        language: Option<&str>,
+    ) -> ProbeResultStream {
         ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
             stream_index,
             codec: String::from(codec),
@@ -594,6 +622,7 @@ mod tests {
                 color_primaries: None,
             },
             field_order: None,
+            language: language.map(String::from),
         }))
     }
 
@@ -615,6 +644,13 @@ mod tests {
     }
 
     fn settings(subtitle_input: Option<ProbedInput>) -> InputSettings {
+        settings_with_language(subtitle_input, "en")
+    }
+
+    fn settings_with_language(
+        subtitle_input: Option<ProbedInput>,
+        subtitle_language_tag: &str,
+    ) -> InputSettings {
         InputSettings {
             start: OffsetDateTime::UNIX_EPOCH,
             audio_input: probed(vec![stream(0, CodecType::Video, "h264")], None),
@@ -622,6 +658,7 @@ mod tests {
             subtitle_input,
             watermark_input: None,
             overlay_input: None,
+            subtitle_language_tag: String::from(subtitle_language_tag),
         }
     }
 
@@ -703,5 +740,68 @@ mod tests {
         )));
 
         assert!(input.select_subtitle_stream().is_none());
+    }
+
+    /// A file carries both a Spanish and an English subtitle stream, in that
+    /// order. A channel declaring English must get the English stream even
+    /// though it comes second.
+    #[test]
+    fn prefers_the_stream_matching_the_channels_declared_language_english() {
+        let input = settings_with_language(
+            Some(probed(
+                vec![
+                    stream(0, CodecType::Video, "h264"),
+                    stream_with_language(1, CodecType::Subtitle, "subrip", Some("spa")),
+                    stream_with_language(2, CodecType::Subtitle, "subrip", Some("eng")),
+                ],
+                None,
+            )),
+            "en",
+        );
+
+        let selected = input.select_subtitle_stream().expect("a subtitle stream");
+        assert_eq!(selected.stream_index, 2);
+    }
+
+    /// Same file, channel declares Spanish instead: the Spanish stream wins,
+    /// even though it comes first — the point is the language match, not
+    /// file order.
+    #[test]
+    fn prefers_the_stream_matching_the_channels_declared_language_spanish() {
+        let input = settings_with_language(
+            Some(probed(
+                vec![
+                    stream(0, CodecType::Video, "h264"),
+                    stream_with_language(1, CodecType::Subtitle, "subrip", Some("spa")),
+                    stream_with_language(2, CodecType::Subtitle, "subrip", Some("eng")),
+                ],
+                None,
+            )),
+            "es",
+        );
+
+        let selected = input.select_subtitle_stream().expect("a subtitle stream");
+        assert_eq!(selected.stream_index, 1);
+    }
+
+    /// Neither stream's language matches what the channel declares, so
+    /// selection falls back to today's behavior: first non-image stream in
+    /// file order.
+    #[test]
+    fn falls_back_to_file_order_when_nothing_matches_the_declared_language() {
+        let input = settings_with_language(
+            Some(probed(
+                vec![
+                    stream(0, CodecType::Video, "h264"),
+                    stream_with_language(1, CodecType::Subtitle, "subrip", Some("spa")),
+                    stream_with_language(2, CodecType::Subtitle, "subrip", Some("eng")),
+                ],
+                None,
+            )),
+            "de",
+        );
+
+        let selected = input.select_subtitle_stream().expect("a subtitle stream");
+        assert_eq!(selected.stream_index, 1);
     }
 }
