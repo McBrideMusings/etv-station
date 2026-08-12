@@ -18,6 +18,7 @@ use etv_station::errors::ConfigError;
 use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreInputs, WatchEvent};
+use time::macros::datetime;
 
 /// Four movies and one two-episode show, all locally sourced so resolution
 /// reaches a playable item.
@@ -57,6 +58,58 @@ fn write_plugin(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, body).unwrap();
     path
+}
+
+/// A chunk boundary in UTC, arbitrary but fixed (#270): chunks are cut on
+/// aligned boundaries (00:00, 06:00, 12:00, 18:00 for a 6-hour chunk), so how
+/// many files a short emit window produces depends on distance to the next
+/// boundary, not on the window's own width. The two tests below build their
+/// `start` from this fixed instant rather than `now_utc()`, so the file count
+/// they assert is a property of the instant they chose, not of when the
+/// suite happens to run.
+const CHUNK_BOUNDARY: time::OffsetDateTime = datetime!(2026-04-13 00:00:00 UTC);
+
+/// The chunk width the two tests below emit against. The loop bound in
+/// `assert_one_file_across_the_chunk` and the `chunk_hours` it hands
+/// `emit_window` are both this number, so the two can't drift apart.
+const CHUNK_HOURS: u32 = 6;
+
+/// Runs `emit_window` at fixed starts spread one hour apart across one chunk
+/// (#270), asserting exactly one chunk file at each — proof that the file
+/// count is a property of the fixed start, not a lucky roll of whatever the
+/// wall clock read when the suite ran. Each start gets its own output
+/// directory: every one falls in the same chunk (starting 00:00), and
+/// `emit_window` folds new items onto whatever a chunk file already holds, so
+/// one shared directory would pile each run's items onto the last rather than
+/// prove anything. Returns the last run's written files, for the caller's
+/// content assertions.
+async fn assert_one_file_across_the_chunk(
+    dir: &tempfile::TempDir,
+    rule: &etv_station::rule::Sequential<'_>,
+    tz: &'static time_tz::Tz,
+) -> Vec<PathBuf> {
+    let mut written = Vec::new();
+    for hours in 0..i64::from(CHUNK_HOURS) {
+        let start = CHUNK_BOUNDARY + time::Duration::hours(hours);
+        let out_dir = dir.path().join(format!("output-{hours}"));
+        written = etv_station::emit::emit_window(
+            &out_dir,
+            rule,
+            start,
+            tz,
+            CHUNK_HOURS,
+            start,
+            start + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            written.len(),
+            1,
+            "one chunk file: the window opening at {start} ends inside the same chunk"
+        );
+    }
+    written
 }
 
 /// A one-pool, one-step pattern channel whose pool draws from `plugin`.
@@ -454,22 +507,10 @@ async fn a_records_metadata_is_readable_in_the_emitted_playout_json() {
     // paths, which is a different concern this test does not own.
     let durations = vec![std::time::Duration::from_secs(60); items.len()];
     let rule = etv_station::rule::Sequential::new(&items, &durations);
-    let start = time::OffsetDateTime::now_utc();
-    let out_dir = dir.path().join("output");
     let tz = etv_station::tz::parse("UTC").unwrap();
-    let written = etv_station::emit::emit_window(
-        &out_dir,
-        &rule,
-        start,
-        tz,
-        6,
-        start,
-        start + rule.total_duration(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(written.len(), 1, "one chunk file for this short a window");
 
+    // The content assertions below read back the last of the fixed-start runs (#270).
+    let written = assert_one_file_across_the_chunk(&dir, &rule, tz).await;
     let bytes = tokio::fs::read(&written[0]).await.unwrap();
     let playout: ersatztv_playout::playout::Playout = serde_json::from_slice(&bytes).unwrap();
     let a = playout
@@ -546,22 +587,10 @@ async fn a_take_override_caps_what_the_emitted_playout_json_holds() {
 
     let durations = vec![std::time::Duration::from_secs(60); items.len()];
     let rule = etv_station::rule::Sequential::new(&items, &durations);
-    let start = time::OffsetDateTime::now_utc();
-    let out_dir = dir.path().join("output");
     let tz = etv_station::tz::parse("UTC").unwrap();
-    let written = etv_station::emit::emit_window(
-        &out_dir,
-        &rule,
-        start,
-        tz,
-        6,
-        start,
-        start + rule.total_duration(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(written.len(), 1, "one chunk file for this short a window");
 
+    // The content assertions below read back the last of the fixed-start runs (#270).
+    let written = assert_one_file_across_the_chunk(&dir, &rule, tz).await;
     let bytes = tokio::fs::read(&written[0]).await.unwrap();
     let playout: ersatztv_playout::playout::Playout = serde_json::from_slice(&bytes).unwrap();
     let ids: Vec<&str> = playout.items.iter().map(|i| i.id.as_str()).collect();
