@@ -213,6 +213,12 @@ struct StationContext<'a> {
 /// how hard a many-channel station can hit Tautulli at once — scopes serialize
 /// against each other, which is the behaviour worth having when the alternative
 /// is three simultaneous thousand-row requests.
+///
+/// A `single_user` scope's fetch also resolves that account's numeric id
+/// (#278), cached alongside its events and read back through
+/// [`Self::account_id`] — a scorer plugin needs the id, not the events, to
+/// rank against one person's [`plexdb_reader::Reader::taste_vector_for`]
+/// rather than the pooled vector.
 struct SharedHistory {
     /// What to join fetched rows against, and — because it is `None` whenever
     /// this generation has no reader for the result — the switch that decides
@@ -242,11 +248,28 @@ struct SharedHistory {
     state: tokio::sync::Mutex<HashMap<HistoryScope, HistoryCache>>,
 }
 
-#[derive(Default)]
 struct HistoryCache {
     /// `None` until the first fetch. Tokio's clock, so tests can advance it.
     fetched_at: Option<tokio::time::Instant>,
     events: Arc<[crate::score::WatchEvent]>,
+    /// The account id this scope's fetch resolved (#278), cached alongside
+    /// `events` since both come from the same fetch and age together. `Err`
+    /// names the user a `single_user` name-scope's fetch could not resolve —
+    /// see [`crate::tautulli::resolve_account_id`]. `Ok(None)` before the
+    /// first fetch, the same as an unset field would default to, since a
+    /// scope with no catalog to fetch against never resolves to anything
+    /// more interesting than "nothing to report" anyway.
+    account_id: Result<Option<i64>, String>,
+}
+
+impl Default for HistoryCache {
+    fn default() -> Self {
+        Self {
+            fetched_at: None,
+            events: Arc::from(Vec::new()),
+            account_id: Ok(None),
+        }
+    }
 }
 
 impl SharedHistory {
@@ -272,15 +295,47 @@ impl SharedHistory {
     /// Empty when Tautulli is unset or unreachable, which degrades a scorer's
     /// ranking rather than failing the tick (#74).
     async fn current(&self, scope: &HistoryScope) -> Arc<[crate::score::WatchEvent]> {
+        self.refresh(scope).await.0
+    }
+
+    /// The account id `scope` resolves to right now (#278), from the same
+    /// fetch [`Self::current`] uses — read back rather than fetched a second
+    /// time.
+    ///
+    /// `Ok(None)` for [`HistoryScope::AllUsers`]. `Err` names the user when a
+    /// `single_user` name-scope's fetch found no account to resolve to —
+    /// whether the name is wrong or Tautulli was unreachable this fetch,
+    /// either way there is no id to hand a scorer plugin, and the caller must
+    /// fail the generation loudly rather than let `ctx.account_id` arrive as
+    /// unit and read like a pooled channel. Only worth calling for a channel
+    /// that names a scorer plugin — nothing else reads the result.
+    async fn account_id(&self, scope: &HistoryScope) -> Result<Option<i64>, String> {
+        self.refresh(scope).await.1
+    }
+
+    /// The shared fetch-or-cache-hit both [`Self::current`] and
+    /// [`Self::account_id`] read from, so the two can never observe two
+    /// different fetches for what is supposed to be one scope's one refresh
+    /// window.
+    async fn refresh(
+        &self,
+        scope: &HistoryScope,
+    ) -> (Arc<[crate::score::WatchEvent]>, Result<Option<i64>, String>) {
         let Some(sc) = self.catalog.as_ref() else {
-            return Arc::from(Vec::new());
+            // Nothing to join rows against, and — for a digit-authored
+            // `single_user` scope — nothing needed to resolve one either;
+            // `resolve_account_id` parses that case with no rows consulted.
+            return (
+                Arc::from(Vec::new()),
+                crate::tautulli::resolve_account_id(scope, &[]),
+            );
         };
         let mut state = self.state.lock().await;
         let cache = state.entry(scope.clone()).or_default();
         if let Some(at) = cache.fetched_at
             && at.elapsed() < self.refresh_after
         {
-            return Arc::clone(&cache.events);
+            return (Arc::clone(&cache.events), cache.account_id.clone());
         }
         // The HTTP half runs on a blocking thread — `ureq` is synchronous and
         // would otherwise stall this runtime worker for the request timeout,
@@ -299,6 +354,10 @@ impl SharedHistory {
             }
             None => Vec::new(),
         };
+        // Resolved from `rows` before they are moved into the join below
+        // (#278) — the only place on this side a username maps to an id, and
+        // a digit-authored scope never even looks at `rows` to answer it.
+        let account_id = crate::tautulli::resolve_account_id(scope, &rows);
         let events = if rows.is_empty() {
             // No rows is the ordinary state, not a corner: a station with no
             // `TAUTULLI_URL`/`TAUTULLI_API_KEY` never asks for any, and a
@@ -336,8 +395,9 @@ impl SharedHistory {
             }
         };
         cache.events = Arc::from(events);
+        cache.account_id = account_id;
         cache.fetched_at = Some(tokio::time::Instant::now());
-        Arc::clone(&cache.events)
+        (Arc::clone(&cache.events), cache.account_id.clone())
     }
 }
 
@@ -1667,6 +1727,31 @@ async fn pattern_catch_up(
         Arc::from(Vec::new())
     };
 
+    // The account id a scorer plugin ranks against when this channel is
+    // `single_user`-scoped (#278), resolved from the same Tautulli fetch
+    // `history` above just ran. `None` on a pooled channel and on any channel
+    // with no scorer plugin at all — attribution alone has no use for an id,
+    // only a display name, so it must not gate on this.
+    //
+    // A `single_user` channel whose named user resolved to nobody fails this
+    // generation loudly, naming the user, rather than letting `ctx.account_id`
+    // arrive as unit and a scorer plugin quietly rank against the pooled
+    // vector instead — the exact silent failure #278 exists to rule out. The
+    // failure is caught here and not at config load because resolving a
+    // username needs the same live Tautulli fetch `history` does; a config
+    // pass has no network (see `config::validate::validate_taste_scope`).
+    let account_id = if channel.config.uses_scorer_plugin() {
+        ctx.history
+            .account_id(&channel.config.history_scope())
+            .await
+            .map_err(|reason| ConfigError::Validation {
+                path: channel.config_path.clone(),
+                message: format!("scoring: {reason}"),
+            })?
+    } else {
+        None
+    };
+
     // Whether this generation names watchers, read once — it cannot change
     // inside a tick, and the check sits in the per-item loop below.
     let attribution_wanted = channel.config.attributes_watchers();
@@ -1722,6 +1807,7 @@ async fn pattern_catch_up(
             // The station's configured tz — a sequencer block (#169) reads
             // this to place its pools against the local clock (ADR 0004).
             tz: Some(ctx.tz),
+            account_id,
         };
 
         // This channel's own reader, borrowed for the synchronous resolve and
@@ -2340,6 +2426,74 @@ mod shared_history_tests {
             stamp(&history, &pierce).await.unwrap(),
             pierce_at,
             "the personal scope was still inside its own window and must not have",
+        );
+    }
+
+    // ---- SharedHistory::account_id (#278) ------------------------------------
+
+    /// A pooled channel has no one account to resolve, on a station with a
+    /// perfectly ordinary catalog and cache behind it.
+    #[tokio::test(start_paused = true)]
+    async fn account_id_for_all_users_is_always_none() {
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        assert_eq!(history.account_id(&HistoryScope::AllUsers).await, Ok(None));
+    }
+
+    /// A digit-authored `single_user` scope resolves with no catalog and no
+    /// Tautulli connection at all — it needs no row, only its own config
+    /// value, exactly as `resolve_account_id` documents.
+    #[tokio::test(start_paused = true)]
+    async fn account_id_for_a_digit_scope_needs_no_catalog() {
+        let history = SharedHistory::new(None, None, Duration::ZERO);
+        let scope = HistoryScope::User("501".to_string());
+        assert_eq!(history.account_id(&scope).await, Ok(Some(501)));
+    }
+
+    /// A name-authored `single_user` scope with nothing to resolve it from —
+    /// no catalog at all, so no fetch ever ran — fails naming the user rather
+    /// than defaulting to "no account", which a scorer plugin would read as
+    /// "use the pooled vector".
+    #[tokio::test(start_paused = true)]
+    async fn account_id_for_a_name_scope_with_no_catalog_fails_naming_the_user() {
+        let history = SharedHistory::new(None, None, Duration::ZERO);
+        let scope = HistoryScope::User("Pierce".to_string());
+        let err = history.account_id(&scope).await.unwrap_err();
+        assert!(err.contains("Pierce"), "must name the user: {err}");
+    }
+
+    /// The same failure, this time from a real fetch that came back empty —
+    /// what an unreachable Tautulli or a genuine typo in `user:` both look
+    /// like from here. #278's acceptance criterion is explicit that neither
+    /// may quietly resolve to "no account".
+    #[tokio::test(start_paused = true)]
+    async fn account_id_for_a_name_scope_with_an_empty_fetch_fails_naming_the_user() {
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let scope = HistoryScope::User("Madi".to_string());
+        let err = history.account_id(&scope).await.unwrap_err();
+        assert!(err.contains("Madi"), "must name the user: {err}");
+    }
+
+    /// `account_id` reads back the same fetch `current` already ran, rather
+    /// than paying for a second one — the cache stamp must not move between
+    /// the two calls inside one refresh window.
+    #[tokio::test(start_paused = true)]
+    async fn account_id_reads_the_same_fetch_current_already_ran() {
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let scope = HistoryScope::User("Pierce".to_string());
+
+        history.current(&scope).await;
+        let stamped_at = stamp(&history, &scope).await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let _ = history.account_id(&scope).await;
+
+        assert_eq!(
+            stamp(&history, &scope).await.unwrap(),
+            stamped_at,
+            "reading the account id inside the same window must not trigger a refetch",
         );
     }
 

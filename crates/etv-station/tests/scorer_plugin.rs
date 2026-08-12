@@ -315,6 +315,7 @@ fn pick(ctx) {
         recent: vec!["mov-c".into()],
         now: 3000,
         tz: None,
+        account_id: None,
     };
     let got = resolve_with(&plugin_channel(&p, 1, 1), &catalog(), inputs);
     assert_eq!(

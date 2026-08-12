@@ -132,6 +132,11 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         // wall-clock read this check exists to catch, so both passes need the
         // real zone rather than the UTC fallback.
         tz: Some(crate::tz::parse(&station.station.tz)?),
+        // No live Tautulli fetch happens in this stateless check, the same
+        // simplification `history` above already makes — a `single_user`
+        // channel's `ctx.account_id` is untested here, not incorrectly
+        // resolved (#278).
+        account_id: None,
     };
     // Read once and handed to both passes, for the same reason `now` is: a
     // sequencer block (#169) reads this as `ctx.window.from`, so a daypart

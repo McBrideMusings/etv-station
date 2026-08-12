@@ -725,9 +725,9 @@ config load rather than mid-generation:
 #### `capabilities()` — which host inputs a script needs (#167)
 
 Nothing is available to a script ambiently beyond `ctx.pool`, `ctx.config`,
-`ctx.target_count`, `ctx.now`, `ctx.recent`, and `ctx.seed` — the inputs every
-plugin pool receives with no declaration at all. Two more are gated behind a
-declaration, and a third is opened only by name:
+`ctx.target_count`, `ctx.now`, `ctx.recent`, `ctx.seed`, and `ctx.account_id`
+— the inputs every plugin pool receives with no declaration at all. Two more
+are gated behind a declaration, and a third is opened only by name:
 
 | Capability | Gates | Declared as |
 |---|---|---|
@@ -773,9 +773,10 @@ of a channel with different judgment per pool), `ctx.target_count` (how many
 items the generation needs), `ctx.history` (recent server-wide watch events,
 `#{entry_id, watched_at}`; requires `watch_history`), `ctx.recent` (what this
 channel aired most recently, oldest first), `ctx.now` (unix seconds at
-generation time), `ctx.config` (this pool's `config:` block — see below), and
+generation time), `ctx.config` (this pool's `config:` block — see below),
 `ctx.seed` (the channel's resolved seed mixed with this pool's name — see
-below).
+below), and `ctx.account_id` (the numeric account id a `single_user`-scoped
+channel resolved, or unit `()` on a pooled channel — see below).
 
 #### `ctx.seed` — reproducible randomness (ADR 0005)
 
@@ -797,6 +798,28 @@ script pick randomly from it and still pass `--check-determinism`.
 pick from it with ordinary arithmetic (mix it further, take it modulo a
 candidate count, and so on), the same way `examples/plugins/taste-cosine.rhai`
 (#254) derives a seeded coin flip per output slot for its exploration draw.
+
+#### `ctx.account_id` — the account a personal channel ranks against (#278, ADR 0005)
+
+`ctx.account_id` is the numeric account id `single_user`-scoped watch history
+resolved to that generation, or unit `()` on a pooled (`all_users`) channel. A
+script tests presence with `ctx.account_id != ()`, the same idiom `ctx.config`
+lookups already use for an absent key.
+
+The plugin never resolves a username to an id itself — it has no Tautulli
+access and no accessor for the store's account table. The station already
+does: it narrows the same Tautulli fetch `ctx.history` comes from by exactly
+this account (`taste_scope: single_user`, `user:`), so handing the resolved id
+across is a value the station already holds, not work done on the script's
+behalf (ADR 0005's own test).
+
+`examples/plugins/taste-cosine.rhai` is what this exists for: it ranks against
+`ds.taste_vector_for(ctx.account_id)` when the id is present and
+`ds.pooled_taste_vector()` otherwise — one script, not two, since the cosine,
+the exploration slot, and the eligibility rule are identical either way.
+
+Not gated behind a capability, the same as `ctx.seed`: every `pool_provider`
+script receives it, whether or not the channel is `single_user`-scoped.
 
 ### The determinism contract
 
@@ -1047,6 +1070,15 @@ What is *not* checked at load is whether the named account exists — that needs
 the network, and this is a config pass. Tautulli answers an unknown user with an
 empty history, which shows up at runtime as `rows=0` on that scope's
 `tautulli.history` log line.
+
+A channel with no scorer plugin stops there — `ctx.history` just arrives empty
+and the generation proceeds, same as an unreachable Tautulli (#74). A channel
+that names a scorer plugin goes further (#278): resolving `user` to the
+numeric id `ctx.account_id` carries needs that same live fetch, and a name
+that resolves to nobody fails that channel's generation loudly, naming the
+user, every tick until it is fixed — never a silent fall back to the pooled
+vector, which would make a channel called "For Pierce" rank against everyone's
+viewing while looking perfectly healthy. See `ctx.account_id` above.
 
 #### `attribution` — naming who has been watching
 

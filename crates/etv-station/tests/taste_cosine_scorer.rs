@@ -86,6 +86,37 @@ fn write_taste_fixture(path: &Path) {
         .unwrap();
 }
 
+/// Two accounts' plays in one store (#278): account 42 watches `acct-a`
+/// once, account 99 watches `acct-b` twice (a rewatch, so its own weights
+/// scale to `sqrt(2)/2` rather than coincidentally landing on the same
+/// `0.5` account 42's single play produces — the whole point being that
+/// account 42's vector, account 99's vector, and the vector pooling both
+/// must be three genuinely different numbers, not just three different
+/// orderings of the same ones).
+///
+/// `acct-a` and `acct-b` share the `contact` keyword and each carry one
+/// keyword the other does not (`time`, `space`), so `acct-c` — `contact`
+/// only, never watched by anyone — scores differently under all three
+/// vectors: 42 alone, 99 alone, and the two pooled together.
+fn write_two_account_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('acct-a', 'movie'), ('acct-b', 'movie'), ('acct-c', 'movie');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('acct-a', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('acct-a', 'tmdb_keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
+                 ('acct-b', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('acct-b', 'tmdb_keywords', 'keyword', 'space', '2026-01-01T00:00:00+00:00'),
+                 ('acct-c', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00');
+             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+                 ('h1', 'acct-a', 42, 1700000000),
+                 ('h2', 'acct-b', 99, 1700000001),
+                 ('h3', 'acct-b', 99, 1700000002);",
+        )
+        .unwrap();
+}
+
 /// One locally-sourced entry, so resolution reaches a playable item.
 fn add(cat: &Catalog, id: &str, kind: &str) {
     let e = Entry::new(id, kind, id, Source::Plex);
@@ -168,6 +199,37 @@ impl Scorer {
         )
         .unwrap()
     }
+
+    /// One generation for a `single_user`-scoped channel (#278):
+    /// `account_id` reaches the script as `ctx.account_id`, exactly as the
+    /// station resolves it from a channel's `scoring: { taste_scope:
+    /// single_user, user: … }`. No exploration, same as the ranking test
+    /// above — this is checking which taste vector the script ranked
+    /// against, not the surprise slot.
+    fn pick_scoped(
+        &self,
+        pool: &str,
+        target_count: usize,
+        account_id: Option<i64>,
+    ) -> Vec<PickedItem> {
+        let config = serde_json::json!({ "exploration_fraction": 0.0 });
+        let inputs = ScoreInputs {
+            target_count,
+            account_id,
+            ..Default::default()
+        };
+        pick(
+            &self.cache,
+            &self.script,
+            None,
+            &inputs,
+            0,
+            pool,
+            Some(&config),
+            grant(&self.db),
+        )
+        .unwrap()
+    }
 }
 
 /// A scorer over a larger library: `n_eligible` movies each carrying one
@@ -203,6 +265,82 @@ fn large_scorer(n_eligible: usize, n_ineligible: usize) -> Scorer {
 
 fn source_of(p: &PickedItem) -> Option<&str> {
     p.metadata.as_ref()?.get("source")?.as_str()
+}
+
+fn score_of(picked: &[PickedItem], id: &str) -> f64 {
+    picked
+        .iter()
+        .find(|p| p.id == id)
+        .unwrap_or_else(|| {
+            panic!(
+                "{id} missing from the pick: {:?}",
+                picked.iter().map(|p| &p.id).collect::<Vec<_>>()
+            )
+        })
+        .metadata
+        .as_ref()
+        .unwrap()["score"]
+        .as_f64()
+        .unwrap()
+}
+
+/// #278's acceptance criterion: a `single_user` channel ranks on that
+/// account's own vector, not the house's pooled one, and two different
+/// accounts produce two genuinely different rankings — the failure this
+/// ticket exists to prevent is exactly the case where all three land on the
+/// same numbers because the branch silently never took.
+///
+/// `acct-c` (the `contact`-only candidate neither account watched) is the
+/// clean single number to check: account 42 alone, account 99 alone, and the
+/// two pooled together each define a different `contact` weight
+/// (`write_two_account_fixture`'s own doc comment works the arithmetic), so
+/// its score is the one place this test needs to hand-verify a value rather
+/// than merely diff two runs.
+#[test]
+fn a_single_user_channel_ranks_on_that_accounts_vector_not_the_pooled_one() {
+    let cat = catalog_of(["acct-a", "acct-b", "acct-c"]);
+    let scorer = Scorer::new(&cat, write_two_account_fixture);
+
+    let acct_42 = scorer.pick_scoped("movies", 3, Some(42));
+    let acct_99 = scorer.pick_scoped("movies", 3, Some(99));
+    let pooled = scorer.pick_scoped("movies", 3, None);
+
+    // Account 42's own vector: `contact` and `time` at 0.5 each, from its one
+    // play of `acct-a` (sqrt(1 play) / 2 keywords).
+    let c42 = score_of(&acct_42, "acct-c");
+    let expected_42 = 0.5;
+    assert!(
+        (c42 - expected_42).abs() < 1e-9,
+        "account 42's acct-c score = {c42}, expected {expected_42}"
+    );
+
+    // Account 99's own vector: `contact` and `space` at sqrt(2)/2 each, from
+    // its two plays (a rewatch) of `acct-b`.
+    let c99 = score_of(&acct_99, "acct-c");
+    let expected_99 = 2.0_f64.sqrt() / 2.0;
+    assert!(
+        (c99 - expected_99).abs() < 1e-9,
+        "account 99's acct-c score = {c99}, expected {expected_99}"
+    );
+
+    // The pooled vector sums both accounts' contributions to `contact`
+    // rather than averaging or picking one — plex-db-ex#39's rollup, summed
+    // not normalised per account.
+    let cpooled = score_of(&pooled, "acct-c");
+    let expected_pooled = expected_42 + expected_99;
+    assert!(
+        (cpooled - expected_pooled).abs() < 1e-9,
+        "the pooled acct-c score = {cpooled}, expected {expected_pooled}"
+    );
+
+    // Three different numbers, not three labels on the same one — the
+    // silent failure #278 exists to rule out.
+    assert_ne!(c42, c99, "the two accounts must not rank identically");
+    assert_ne!(c42, cpooled, "an account must not rank like the house pool");
+    assert_ne!(
+        c99, cpooled,
+        "the other account must not rank like it either"
+    );
 }
 
 /// The committed worked example runs. Without this, `taste-cosine.rhai` is
