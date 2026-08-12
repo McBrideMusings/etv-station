@@ -28,6 +28,12 @@
 //   ctx.seed             the channel's resolved seed, already mixed with
 //                        this pool's name (#255, ADR 0005) — the one source
 //                        of reproducible entropy inside the sandbox
+//   ctx.account_id       the numeric account id this channel is scoped to
+//                        under `taste_scope: single_user` (#278, ADR 0005),
+//                        or unit `()` on a pooled (`all_users`) channel —
+//                        this script never resolves a username itself; the
+//                        station already did, from watch history it holds
+//                        and this sandbox cannot reach
 //   ctx.datastore(name)  a handle onto the plex-db-ex reader (#181),
 //                        exposing enrichment_for_many / pooled_taste_vector
 //                        among others
@@ -114,10 +120,19 @@ fn pick(ctx) {
     // 84,722-item library.
     let enrichment = ds.enrichment_for_many(items.map(|item| item.entry_id), ns);
 
-    // The house's pooled taste vector (#254, plex-db-ex#39): one call, not
-    // one per candidate, and no account argument — this is the server-wide
-    // vector, not any one person's.
-    let taste = ds.pooled_taste_vector();
+    // One account's taste vector when the channel is `single_user`-scoped
+    // (#278) and the station resolved that account's id; the house's pooled
+    // vector otherwise (#254, plex-db-ex#39) — one call either way, not one
+    // per candidate. This branch is the only difference a personal channel
+    // makes to this script: the cosine, the exploration slot and the
+    // eligibility rule below are identical for "For You" and "For Pierce".
+    // The station resolves the id, never this script — see ctx.account_id
+    // above.
+    let taste = if ctx.account_id != () {
+        ds.taste_vector_for(ctx.account_id)
+    } else {
+        ds.pooled_taste_vector()
+    };
     let weights = #{};
     for attr in taste.attributes {
         if attr.namespace == ns {

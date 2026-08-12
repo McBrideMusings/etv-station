@@ -166,6 +166,15 @@ pub struct ScoreInputs {
     /// [`crate::sequence`] — the same "least surprising" tolerance
     /// `resolve_channel` already gives an unpinned `window_start`.
     pub tz: Option<&'static time_tz::Tz>,
+    /// The numeric account id a `single_user`-scoped channel's watch history
+    /// resolved to, or `None` for a pooled (`all_users`) channel — handed to
+    /// a scorer plugin as `ctx.account_id` (#278, ADR 0005). The station
+    /// already holds this (it narrowed the same Tautulli fetch `history`
+    /// above came from by exactly this account), and the sandbox has no
+    /// Tautulli access and no accessor for the store's account table to
+    /// resolve one itself, so this follows ADR 0005's `ctx.seed` precedent
+    /// rather than growing a second mechanism.
+    pub account_id: Option<i64>,
 }
 
 /// The tag namespaces exposed to a plugin, each as an array under its own key.
@@ -562,6 +571,11 @@ struct ScoreCtx {
     /// sandbox. Not gated: a `pool_provider` script always receives it, the
     /// same as `now` or `target_count`.
     seed: i64,
+    /// The account id a `single_user`-scoped channel resolved (#278), or
+    /// `None` on a pooled channel. Not gated, the same as `seed`: it is a
+    /// value the station already holds and the sandbox provably cannot
+    /// obtain, not a capability a pool grants or withholds.
+    account_id: Option<i64>,
 }
 
 /// What a script gets back for reading a `ctx` field its pool was not granted
@@ -609,6 +623,17 @@ impl ScoreCtx {
 
     fn get_seed(&mut self) -> i64 {
         self.seed
+    }
+
+    /// `ctx.account_id` (#278): the resolved account id as a Rhai integer, or
+    /// unit `()` on a pooled channel — a script tests presence with
+    /// `ctx.account_id != ()`, the same idiom `ctx.config`'s per-key lookups
+    /// already use for an absent value.
+    fn get_account_id(&mut self) -> Dynamic {
+        match self.account_id {
+            Some(id) => Dynamic::from(id),
+            None => Dynamic::UNIT,
+        }
     }
 }
 
@@ -798,6 +823,7 @@ pub(crate) fn engine() -> Engine {
         .register_get("history", ScoreCtx::get_history)
         .register_get("recent", ScoreCtx::get_recent)
         .register_get("seed", ScoreCtx::get_seed)
+        .register_get("account_id", ScoreCtx::get_account_id)
         .register_fn("datastore", ScoreCtx::get_datastore);
     engine
         .register_type_with_name::<Datastore>("Datastore")
@@ -1000,6 +1026,7 @@ pub fn pick(
         // whether the pool never declared it or `validate` never granted it.
         datastores: granted.datastores,
         seed: mixed_seed(seed, pool_name),
+        account_id: inputs.account_id,
     };
 
     let picked: Array = engine
@@ -2053,6 +2080,54 @@ fn pick(ctx) {
         let mixed = crate::pattern::mix_seed(42, crate::catalog::identity::fnv1a_64("movies"));
         let expected = (mixed & (i64::MAX as u64)) as i64;
         assert_eq!(seed_pick(42, "movies"), expected.to_string());
+    }
+
+    // ---- ctx.account_id (#278) ----------------------------------------------
+
+    /// A script reads back `ctx.account_id`, unit-tested with the same trick
+    /// [`seed_pick`] above uses: return it as the picked id and read it off
+    /// the result.
+    fn account_id_pick(account_id: Option<i64>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            "fn sources() { #{} }\n\
+             fn pick(ctx) { [if ctx.account_id == () { \"none\" } else { ctx.account_id.to_string() }] }\n",
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let inputs = ScoreInputs {
+            account_id,
+            ..Default::default()
+        };
+        let got = pick(
+            &cache,
+            &p,
+            None,
+            &inputs,
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        got.into_iter().next().unwrap().id
+    }
+
+    /// A pooled channel (`ScoreInputs::account_id` unset) hands the script
+    /// unit, not a fabricated id — `taste-cosine.rhai`'s presence check
+    /// depends on this reading as "absent", not as some sentinel number.
+    #[test]
+    fn ctx_account_id_is_unit_when_the_channel_has_none() {
+        assert_eq!(account_id_pick(None), "none");
+    }
+
+    /// A `single_user` channel hands the script exactly the id the station
+    /// resolved (#278) — a plain integer, not gated behind a capability,
+    /// mirroring `ctx.seed`.
+    #[test]
+    fn ctx_account_id_is_the_resolved_id_when_the_channel_has_one() {
+        assert_eq!(account_id_pick(Some(501)), "501");
     }
 
     // ---- record return shape (#166) ----------------------------------------

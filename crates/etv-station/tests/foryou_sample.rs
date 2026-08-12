@@ -407,6 +407,7 @@ fn the_datastore_taste_vector_decides_ranking_not_etv_stations_own_history() {
         recent: Vec::new(),
         now: 900_000 + 3600,
         tz: None,
+        account_id: None,
     };
     let resolve_with = |inputs: &ScoreInputs| {
         let cfg = config_with_movies_config(exploration(0.0));

@@ -103,9 +103,7 @@ impl HistoryScope {
     fn query_param(&self) -> Option<(&'static str, &str)> {
         match self {
             HistoryScope::AllUsers => None,
-            HistoryScope::User(u) if !u.is_empty() && u.chars().all(|c| c.is_ascii_digit()) => {
-                Some(("user_id", u))
-            }
+            HistoryScope::User(u) if is_numeric_id(u) => Some(("user_id", u)),
             HistoryScope::User(u) => Some(("user", u)),
         }
     }
@@ -116,6 +114,61 @@ impl HistoryScope {
             HistoryScope::AllUsers => "all_users",
             HistoryScope::User(u) => u,
         }
+    }
+}
+
+/// Every character an ASCII digit, and at least one of them — the one test
+/// [`HistoryScope::query_param`] and [`resolve_account_id`] both use to tell a
+/// config-authored numeric id from a username, kept in one place so the two
+/// cannot drift apart on what counts as "digits" (see `query_param`'s doc for
+/// why a signed-integer parse is deliberately not used instead).
+fn is_numeric_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The numeric account id `scope` resolves to, going by `rows` — the same
+/// rows [`fetch_rows`] just returned for this exact scope (#278).
+///
+/// `Ok(None)` for [`HistoryScope::AllUsers`]: there is no one account to
+/// resolve, and every pooled channel must stay untouched by this. A `User`
+/// scope written as plain digits already *is* the id
+/// ([`HistoryScope::query_param`]'s own inference) and is parsed straight
+/// back with no row consulted — an account with zero recent plays must not
+/// read as "no such account" just because this fetch came back empty. A
+/// `User` scope written as a name resolves from the first row's `user_id`,
+/// since Tautulli's own `user=` filter already narrowed every returned row to
+/// that one account; `Err`, naming the user, when nothing came back to
+/// resolve from — whether the name is wrong or Tautulli was unreachable this
+/// fetch, either way there is no account to rank against, and a scorer
+/// plugin must never quietly fall back to the pooled vector instead (#278's
+/// whole point).
+///
+/// Either branch hands back a Tautulli-space id, not a plex-db-ex-space one —
+/// see [`HistoryRow::user_id`]'s doc for the one account those two id spaces
+/// disagree on. A digit-authored `user:` is just as exposed to that gap as a
+/// name is: it is never checked against the store, so a channel scoped to the
+/// Plex server owner's own numeric id resolves successfully here and then
+/// finds nothing in `plays.plex_account_id` downstream.
+pub fn resolve_account_id(
+    scope: &HistoryScope,
+    rows: &[HistoryRow],
+) -> Result<Option<i64>, String> {
+    match scope {
+        HistoryScope::AllUsers => Ok(None),
+        HistoryScope::User(u) if is_numeric_id(u) => u
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|e| format!("user {u:?} does not fit a 64-bit account id: {e}")),
+        HistoryScope::User(u) => rows
+            .iter()
+            .find_map(|r| r.user_id)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "no account found for user {u:?} (wrong name, or Tautulli was \
+                     unreachable this fetch)"
+                )
+            }),
     }
 }
 
@@ -176,6 +229,21 @@ pub struct HistoryRow {
     /// The account name, used when `friendly_name` is missing or blank.
     #[serde(default)]
     user: Option<String>,
+    /// The account's numeric id, in Tautulli's own id space. Present on every
+    /// row Tautulli sends — `#[serde(default)]` only guards a row shape this
+    /// crate has not seen — and it is what [`resolve_account_id`] hands a
+    /// `single_user` channel's scorer plugin as `ctx.account_id` (#278).
+    ///
+    /// Not guaranteed to equal `plays.plex_account_id` in the plex-db-ex
+    /// store: the two id spaces agree for every account except the Plex
+    /// server's owner, whom Plex and Tautulli report under two different ids
+    /// (plex-db-ex ADR-0010; `enrich-tautulli-plays` resolves that one case
+    /// via a runtime name join before writing `plays`). Nothing on this side
+    /// performs that translation — a `single_user` channel scoped to the
+    /// owner's own Tautulli username resolves to Tautulli's id here, not the
+    /// store's, and `taste_vector_for` would then match no plays at all.
+    #[serde(default)]
+    user_id: Option<i64>,
 }
 
 impl HistoryRow {
@@ -412,6 +480,7 @@ mod tests {
             stopped,
             friendly_name: None,
             user: None,
+            user_id: None,
         }
     }
 
@@ -427,6 +496,19 @@ mod tests {
             stopped,
             friendly_name: friendly_name.map(str::to_string),
             user: user.map(str::to_string),
+            user_id: None,
+        }
+    }
+
+    /// A row carrying only `user_id` (#278) — what [`resolve_account_id`]
+    /// reads, independent of the display-name fields [`row_by`] exercises.
+    fn row_with_account(user_id: i64) -> HistoryRow {
+        HistoryRow {
+            rating_key: Some("plex-1".into()),
+            stopped: Some(100),
+            friendly_name: None,
+            user: None,
+            user_id: Some(user_id),
         }
     }
 
@@ -564,6 +646,68 @@ mod tests {
             url.contains("user=Sam+%2B+Alex"),
             "the literal + must be percent-encoded, not left to mean a space: {url}"
         );
+    }
+
+    // ---- resolve_account_id (#278) ------------------------------------------
+
+    /// A pooled channel has no one account to resolve, regardless of what
+    /// rows happen to be lying around — `resolve_account_id` never even looks
+    /// at them for `AllUsers`.
+    #[test]
+    fn the_pooled_scope_resolves_to_no_account() {
+        assert_eq!(
+            resolve_account_id(&HistoryScope::AllUsers, &[row_with_account(501)]),
+            Ok(None),
+        );
+    }
+
+    /// A config written as digits already is the id (`HistoryScope::param`'s
+    /// own inference) — no row is consulted, so an account with zero recent
+    /// plays still resolves rather than reading as "no such account".
+    #[test]
+    fn a_digit_scope_resolves_from_the_config_alone() {
+        assert_eq!(
+            resolve_account_id(&HistoryScope::User("7654321".into()), &[]),
+            Ok(Some(7654321)),
+        );
+    }
+
+    /// A name scope resolves from the first row's `user_id` — Tautulli's own
+    /// `user=` filter already narrowed every returned row to that one
+    /// account, so the first row's id is every row's id.
+    #[test]
+    fn a_name_scope_resolves_from_the_first_rows_account_id() {
+        assert_eq!(
+            resolve_account_id(
+                &HistoryScope::User("carol".into()),
+                &[row_with_account(501), row_with_account(501)],
+            ),
+            Ok(Some(501)),
+        );
+    }
+
+    /// The acceptance criterion this ticket exists to satisfy: a name that
+    /// resolved to no rows at all fails naming the user, rather than handing
+    /// back `None` for a scorer plugin to quietly treat as "use the pooled
+    /// vector instead".
+    #[test]
+    fn a_name_scope_with_no_matching_rows_fails_naming_the_user() {
+        let err = resolve_account_id(&HistoryScope::User("nobody".into()), &[]).unwrap_err();
+        assert!(
+            err.contains("nobody"),
+            "the failure must name the user: {err}"
+        );
+    }
+
+    /// A row that matched the filter but carries no `user_id` (an anonymised
+    /// row, or a Tautulli version that omits it) must not silently resolve to
+    /// nothing being wrong — it is exactly as unresolved as no rows at all.
+    #[test]
+    fn a_name_scope_with_rows_naming_nobody_still_fails() {
+        let unattributed = row("plex-1".into(), Some(100));
+        let err =
+            resolve_account_id(&HistoryScope::User("carol".into()), &[unattributed]).unwrap_err();
+        assert!(err.contains("carol"));
     }
 
     #[test]
