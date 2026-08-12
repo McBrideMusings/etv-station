@@ -205,8 +205,8 @@ pub struct PlexIngestStats {
 /// This is Plex's **own** id space, not Tautulli's — the two agree for every
 /// account except the server's owner, whom Plex's history stores under a
 /// small server-local id while Tautulli reports the same person under their
-/// much larger plex.tv id (plex-db-ex ADR-0010,
-/// `docs/adr/0010-the-owner-account-id-is-resolved-by-a-runtime-name-join-not-a-hardcoded-id.md`).
+/// much larger plex.tv id (plex-db-ex's own ADR-0010, in *that* project's
+/// `docs/adr/`, not this one's).
 /// `crate::daemon::SharedHistory` uses this list to translate a `single_user`
 /// channel's account into the id `plexdb_reader::Reader::taste_vector_for`
 /// actually keys its store on.
@@ -1238,23 +1238,16 @@ impl PlexClient {
         }
         Ok(out)
     }
-
-    /// Every real account this Plex server knows (#281) — one `/accounts`
-    /// call, filtered by [`valid_accounts`]. Not part of the catalog ingest
-    /// pass ([`ingest`] never calls this): it exists solely for
-    /// `crate::daemon::SharedHistory` to translate a `single_user` channel's
-    /// account into Plex's own id space.
-    fn fetch_accounts(&self) -> Result<Vec<PlexAccount>, PlexIngestError> {
-        let resp: AccountsResp = self.get("/accounts", &[])?;
-        Ok(valid_accounts(resp.media_container.account))
-    }
 }
 
-/// Every real account `plex`'s server knows (#281) — see [`PlexAccount`]'s
-/// doc for why this is a separate id space from Tautulli's and why a
-/// `single_user` channel needs it.
+/// Every real account `plex`'s server knows (#281) — one `/accounts` call,
+/// filtered by `valid_accounts`. Not part of the catalog ingest pass
+/// ([`ingest`] never calls this): it exists solely for
+/// `crate::daemon::SharedHistory` to translate a `single_user` channel's
+/// account into Plex's own id space, which [`PlexAccount`]'s doc explains.
 pub fn fetch_accounts(plex: &PlexEnv) -> Result<Vec<PlexAccount>, PlexIngestError> {
-    PlexClient::new(plex).fetch_accounts()
+    let resp: AccountsResp = PlexClient::new(plex).get("/accounts", &[])?;
+    Ok(valid_accounts(resp.media_container.account))
 }
 
 /// The `type` query param a label's member fetch needs, from the same

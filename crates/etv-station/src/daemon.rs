@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tracing::Instrument;
 
 use crate::catalog::Catalog;
+use crate::catalog::ingest::plex::{PlexAccount, PlexEnv};
 use crate::config::{ChannelConfig, LoadedChannel, ScoringConfig, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
@@ -19,7 +20,7 @@ use crate::errors::{ConfigError, StationError};
 use crate::history::HistoryDb;
 use crate::overlay_supervisor;
 use crate::scan;
-use crate::tautulli::HistoryScope;
+use crate::tautulli::{HistoryRow, HistoryScope};
 use crate::tz as tzmod;
 
 /// The station-wide history database's filename, under `output_base` — a
@@ -44,7 +45,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // The one read of `PLEX_URL`/`PLEX_TOKEN` in the daemon; everything below
     // takes the connection as an argument, so a test supplies `None` rather than
     // deleting the variables out of the process (#132).
-    let plex = crate::catalog::ingest::plex::PlexEnv::from_env();
+    let plex = PlexEnv::from_env();
     let catalog = open_and_ingest_catalog(&station, plex.as_ref()).await?;
     // What the catalog was opened against — the catalog is opened once and NOT
     // reopened on reload (#96), so a later reload that changes these diverges.
@@ -244,13 +245,13 @@ struct SharedHistory {
     /// (#132).
     tautulli: Option<(String, String)>,
     /// The Plex connection to resolve a `single_user` scope's account id
-    /// against (#281), resolved from the environment once by the caller —
-    /// the same [`crate::catalog::ingest::plex::PlexEnv`] the catalog ingest
-    /// uses. `None` — an unconfigured Plex — makes a `single_user` channel's
-    /// scorer plugin fail its generation loudly naming the user, the same as
-    /// an account Plex's own `/accounts` does not recognise: there is no
-    /// pooled-vector fallback to degrade to.
-    plex: Option<crate::catalog::ingest::plex::PlexEnv>,
+    /// against (#281), resolved from the environment once by the caller — the
+    /// same [`PlexEnv`] the catalog ingest uses. `None` — an unconfigured
+    /// Plex — makes a `single_user` channel's scorer plugin fail its
+    /// generation loudly naming the user, the same as an account Plex's own
+    /// `/accounts` does not recognise: there is no pooled-vector fallback to
+    /// degrade to.
+    plex: Option<PlexEnv>,
     /// How long a fetched history is reused before the next channel to ask
     /// refetches. Set to the shortest `roll_interval` on the station, so no
     /// channel ever sees a history older than one of its own ticks.
@@ -291,7 +292,7 @@ impl SharedHistory {
     fn new(
         catalog: Option<Arc<CatalogInfo>>,
         tautulli: Option<(String, String)>,
-        plex: Option<crate::catalog::ingest::plex::PlexEnv>,
+        plex: Option<PlexEnv>,
         refresh_after: Duration,
     ) -> Self {
         Self {
@@ -459,7 +460,7 @@ impl SharedHistory {
     async fn resolve_account_id(
         &self,
         scope: &HistoryScope,
-        rows: &[crate::tautulli::HistoryRow],
+        rows: &[HistoryRow],
     ) -> Result<Option<i64>, String> {
         let Some(tautulli_id) = crate::tautulli::resolve_account_id(scope, rows)? else {
             return Ok(None);
@@ -498,13 +499,13 @@ impl SharedHistory {
 fn translate_tautulli_id_to_plex(
     tautulli_id: i64,
     scope: &HistoryScope,
-    rows: &[crate::tautulli::HistoryRow],
-    accounts: &[crate::catalog::ingest::plex::PlexAccount],
+    rows: &[HistoryRow],
+    accounts: &[PlexAccount],
 ) -> Result<i64, String> {
     // Direct: the Tautulli id already IS the Plex id for every account except
     // the owner (#281's own diagnosis).
-    if let Some(account) = accounts.iter().find(|a| a.id == tautulli_id) {
-        return Ok(account.id);
+    if accounts.iter().any(|a| a.id == tautulli_id) {
+        return Ok(tautulli_id);
     }
 
     // Fallback: translate through the Tautulli username this scope's rows
@@ -625,7 +626,7 @@ fn plex_ingest_plan(
 /// Plex configured — which skips the Plex pass entirely and contacts nothing.
 async fn open_and_ingest_catalog(
     station: &Station,
-    plex: Option<&crate::catalog::ingest::plex::PlexEnv>,
+    plex: Option<&PlexEnv>,
 ) -> Result<Option<Arc<CatalogInfo>>, StationError> {
     let Some(path) = station
         .station
@@ -743,7 +744,7 @@ async fn run_generation(
     tz: &'static Tz,
     catalog: Option<&Arc<CatalogInfo>>,
     history_db: &Arc<HistoryDb>,
-    plex: Option<&crate::catalog::ingest::plex::PlexEnv>,
+    plex: Option<&PlexEnv>,
     shutdown: &Notify,
     reload: &Notify,
 ) -> (bool, Option<StationError>) {
@@ -2703,8 +2704,8 @@ mod shared_history_tests {
 
     // ---- translate_tautulli_id_to_plex (#281) --------------------------------
 
-    fn plex_account(id: i64, name: &str) -> crate::catalog::ingest::plex::PlexAccount {
-        crate::catalog::ingest::plex::PlexAccount {
+    fn plex_account(id: i64, name: &str) -> PlexAccount {
+        PlexAccount {
             id,
             name: name.to_string(),
         }
@@ -2713,7 +2714,7 @@ mod shared_history_tests {
     /// A row carrying `user_id` and `user` — built through `HistoryRow`'s own
     /// `Deserialize` impl since its fields are private to `tautulli.rs`; every
     /// field is `#[serde(default)]`, so a row naming just these two is valid.
-    fn history_row(user_id: i64, user: &str) -> crate::tautulli::HistoryRow {
+    fn history_row(user_id: i64, user: &str) -> HistoryRow {
         serde_json::from_str(&format!(r#"{{"user_id": {user_id}, "user": {user:?}}}"#)).unwrap()
     }
 

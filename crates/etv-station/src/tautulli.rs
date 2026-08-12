@@ -145,10 +145,11 @@ fn is_numeric_id(s: &str) -> bool {
 ///
 /// Either branch hands back a Tautulli-space id, not a plex-db-ex-space one —
 /// see [`HistoryRow::user_id`]'s doc for the one account those two id spaces
-/// disagree on. A digit-authored `user:` is just as exposed to that gap as a
-/// name is: it is never checked against the store, so a channel scoped to the
-/// Plex server owner's own numeric id resolves successfully here and then
-/// finds nothing in `plays.plex_account_id` downstream.
+/// disagree on. Nothing here translates between them, and a digit-authored
+/// `user:` is exposed to that gap exactly as a name is; the caller
+/// (`daemon::SharedHistory::resolve_account_id`) does that translation
+/// against Plex's own `/accounts` before any scorer plugin sees an id
+/// (#281).
 pub fn resolve_account_id(
     scope: &HistoryScope,
     rows: &[HistoryRow],
@@ -231,17 +232,19 @@ pub struct HistoryRow {
     user: Option<String>,
     /// The account's numeric id, in Tautulli's own id space. Present on every
     /// row Tautulli sends — `#[serde(default)]` only guards a row shape this
-    /// crate has not seen — and it is what [`resolve_account_id`] hands a
-    /// `single_user` channel's scorer plugin as `ctx.account_id` (#278).
+    /// crate has not seen — and it is what [`resolve_account_id`] resolves a
+    /// `single_user` channel's scope to (#278).
     ///
     /// Not guaranteed to equal `plays.plex_account_id` in the plex-db-ex
     /// store: the two id spaces agree for every account except the Plex
     /// server's owner, whom Plex and Tautulli report under two different ids
     /// (plex-db-ex ADR-0010; `enrich-tautulli-plays` resolves that one case
-    /// via a runtime name join before writing `plays`). Nothing on this side
-    /// performs that translation — a `single_user` channel scoped to the
-    /// owner's own Tautulli username resolves to Tautulli's id here, not the
-    /// store's, and `taste_vector_for` would then match no plays at all.
+    /// via a runtime name join before writing `plays`). Nothing in this module
+    /// performs that translation — `daemon::SharedHistory::resolve_account_id`
+    /// does, running the same kind of name join against Plex's own `/accounts`
+    /// so `ctx.account_id` reaches a scorer plugin in the id space
+    /// `taste_vector_for` keys on (#281), matching on the raw account name
+    /// [`Self::username_for`] reads rather than on this id.
     #[serde(default)]
     user_id: Option<i64>,
 }
