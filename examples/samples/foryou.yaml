@@ -1,63 +1,86 @@
-# Sample S8 — For You: a taste-scored channel driven by a plugin (#82).
+# Sample S8 — For You: a keyword-taste-scored channel driven by a plugin
+# (#254).
 #
-# Two movies, then a three-episode run of one show, repeated — but *what* plays
-# is not a query anyone wrote. A scorer plugin picks it, ranking the library by
-# what the server has actually been watching lately and suppressing whatever
-# this channel just aired.
+# Two movies, then a three-episode run of one show, repeated — but *which
+# movies* play is not a query anyone wrote and not a replay of what the
+# house already watched. `../plugins/taste-cosine.rhai` reads TMDB keywords
+# and a pooled taste vector from the plex-db-ex store and ranks the movie
+# pool by how close each candidate's subject sits to what the house has
+# actually been watching — a film nobody here has ever played can still lead
+# the ranking, if its keywords are the house's keywords.
 #
 # What this exercises that no other sample does:
-#   - `plugin` on a pool instead of `expr` (#74) — the plugin runs its own
-#     catalog queries, ranks what it finds, and returns the ordered set
-#   - the station computing no taste score of its own: it supplies the catalog,
-#     the pooled watch history, the recently-aired tail, and a target count,
-#     and takes back nothing but entry_ids in order
+#   - `plugin` on a pool granting a named `datastore` (#181) — the script
+#     reaches plex-db-ex through `ctx.datastore("taste")`, not through this
+#     repo's own catalog or Tautulli history
+#   - `ctx.seed` (#255, ADR 0005) driving a script's own seeded randomness —
+#     the only source of reproducible entropy inside the sandbox, and the
+#     one this scorer uses for its exploration slots
+#   - the station computing no taste score of its own: it supplies the
+#     catalog, the target count, and the seed; the script supplies the
+#     ranking and takes back nothing but entry_ids in order
 #   - a plugin pool composing with `pattern` / `take` / `advance: resume`
 #     exactly as a CEL pool does
-#   - a channel that could set a config-level replay floor and deliberately does
-#     not: `constraints: no_repeat_within` on a pool (#115) is available to any
-#     plugin pool and holds whatever the script does, but this scorer already
-#     suppresses what it recently returned, and the two do not layer — see the
-#     note on the `movies` pool (#116)
 #
-# Two pools, one plugin. `movies` and `shows` name the same `taste-engine.rhai`;
-# the script's own `sources()` splits the library by type, and each pool draws
-# the half it wants. `advance: resume` on `shows` means a show the plugin keeps
-# surfacing continues through its episodes across days rather than restarting.
+# Movies only (#254). TMDB keywords sit on movies and shows but never on an
+# episode directly, and a plugin cannot yet resolve an episode to its show's
+# keywords (#274, not a prerequisite here) — so `shows` below is a plain
+# `expr`, exactly like the deployed `deploy/appdata/channels/001-for-you.yaml`
+# already is. `order` plus `group_by: season` is what makes a plain-expr pool
+# play a season in sequence, which a scorer's own ranking used to do; a
+# season the plugin cannot see is still just as playable this way.
 #
 # Server-wide, deliberately. This channel says no `taste_scope`, which means
-# `all_users`: the watch history handed to the plugin is pooled across every
-# Tautulli account with no user dimension. That is the right default for a house
-# channel on a server with 20 accounts, several shared by more than one real
-# person — "alice's taste" is not a thing those accounts can support.
+# `all_users`: the pooled taste vector plex-db-ex hands back is summed across
+# every account with no per-person split. That is the right default for a
+# house channel on a server with several shared accounts — "alice's taste" is
+# not a thing those accounts can support. A channel that follows one named
+# person writes `taste_scope: single_user` plus `user:` under `scoring:`
+# (#112) — a separate channel file with its own output_folder, not a fan-out
+# of this one. See docs/schema.md § taste_scope.
 #
-# A channel that follows one named person writes `taste_scope: single_user` plus
-# `user:` under `scoring:` (#112) — a separate channel file with its own
-# output_folder, not a fan-out of this one. See docs/schema.md § taste_scope.
+# No replay suppression on the movies pool, and that is a legitimate choice
+# under ADR 0002, not an oversight: this scorer's ranking barely moves
+# generation to generation (the pooled taste vector changes slowly), so the
+# same handful of top-ranked films would lead most windows. The seeded
+# exploration slot below is what keeps every generation from looking
+# identical, not a replay TTL — a scorer that wants suppression too can add
+# it; this one doesn't, and that tradeoff is this script's, not the
+# station's.
+#
+# No `constraints: no_repeat_within` on the movies pool, for the same reason
+# `kungfu.yaml`'s note explains for any plugin pool: `cycles` already drains
+# the largest pool once per window, so a no-repeat rule here would just force
+# the whole movie library into a single window rather than doing anything a
+# taste ranking with no suppression of its own actually wants.
 #
 # Short window on purpose. `window_days: 1` with `chunk_hours: 6` means the
 # plugin re-runs before much of the schedule is written, so the ranking is at
 # most hours stale when it airs. A 30-day window would rank once and air the
-# result a month later, against watch history a month out of date.
+# result a month later, against a taste vector a month out of date.
 #
 # Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
 # dev-run serves it live. It resolves to nothing unless the station's
-# `catalog_path` points at a populated catalog, and its ranking degrades to
-# arbitrary without a reachable Tautulli. Its resolution is also proven by the
-# `foryou_sample` acceptance test.
+# `catalog_path` points at a populated catalog and `PLEXDB_SNAPSHOT_PATH`
+# points at a reachable plex-db-ex snapshot at the schema version
+# `vendor/plexdb-reader` understands — without either, the channel fails to
+# load rather than airing an arbitrary ranking, because the datastore grant
+# is proven openable before any plugin ever runs. Its resolution is also
+# proven by the `foryou_sample` acceptance test, against a hand-built
+# fixture store.
 window_days: 1
 roll_interval: "60s"
 retention_days: 1
 
-# How far back the plugin's replay suppression can see, and the item length used
-# to size how much it is asked for. Both are this channel's taste rather than
-# the daemon's, which is why they are per-channel.
+# How much of the item length a generation asks the plugin to fill, in
+# seconds. This channel mixes films and episodes, so it sits between the two.
 scoring:
-  recent_depth: 200
   nominal_item_secs: 5400
   # Name who has been watching, in the guide and on screen (#113). This is the
-  # channel where it means something: its history is the whole house, so a line
-  # reads "Watched recently by <three names> and N others". A channel scoped to
-  # one person leaves it off — there, every line would name the same person.
+  # channel where it means something: its history is the whole house, so a
+  # line reads "Watched recently by <three names> and N others". A channel
+  # scoped to one person leaves it off — there, every line would name the
+  # same person.
   attribution: true
 
 rule:
@@ -67,69 +90,57 @@ rule:
         title: "For You"
 
       pools:
-        # Movies the plugin thinks are worth surfacing right now. No `order` —
-        # the plugin returns its set already ranked, and re-sorting it would
-        # discard the ranking it exists to produce.
-        #
-        # No `constraints` here, still deliberately — but the reason has changed.
-        # It is now safe to write (#115 moved the table to the pool, so it counts
-        # positions in this pool's own draw order and can no longer disturb the
-        # 2+3 shape). It is simply the wrong tool for this channel: `cycles` is
-        # derived to drain the largest pool once, so a no-repeat rule here would
-        # force every movie in the library into a single window and leave the
-        # plugin's `ctx.recent` suppression nothing to hold back. Replay policy
-        # on this channel therefore stays entirely in the plugin, which is the
-        # only half that knows what "recently" means across generations.
-        # `kungfu.yaml` is the sample that exercises the field.
-        #
-        # That reasoning is a bet on *this* script. `taste-engine.rhai`
-        # suppresses what it recently returned; ETV does not check that any
-        # plugin does, and with `advance: restart` nothing else here stops a
-        # scorer that doesn't from handing back the same top-ranked film every
-        # generation. Point this pool at a different script and the floor
-        # becomes the thing to add — `constraints: { no_repeat_within: N }`,
-        # applied to the list the plugin returned before the pattern draws from
-        # it. Accept the whole-library sweep as the price, or keep the
-        # suppression in the script. See #116 and ADR 0002.
+        # Movies the house's own taste vector ranks. No `order` — the plugin
+        # returns its set already ranked, and re-sorting it would discard the
+        # ranking it exists to produce.
         - name: movies
-          plugin: "../plugins/taste-engine.rhai"
-          # The candidates this pool offers the scorer, authored here instead of
-          # by the script's `sources()` (#210). Written out in full it says
-          # exactly what taste-engine.rhai's own table says, so this pool behaves
-          # identically — what it demonstrates is *where the line lives*: which
-          # items are candidates is the channel's half, the ranking is the
-          # script's (ADR 0002).
-          #
-          # It replaces the script's table wholesale rather than adding to it,
-          # and the set name has to stay `movies` because that is what
-          # taste-engine.rhai reads back as `ctx.sets.movies`. Narrowing this
-          # line is how a real station keeps a taste channel out of a library it
-          # has a dedicated channel for — `&& item.library != "Concerts"` — and
-          # doing it here rather than in the script leaves every other channel
-          # pointed at that script untouched. The `shows` pool below declines
-          # the field, so it still gets whatever the script declares.
-          sources:
-            movies: 'item.type == "movie"'
-          # taste-engine.rhai declares both (#167) — the pool must grant
-          # exactly what it declares, or the channel fails to load.
+          plugin: "../plugins/taste-cosine.rhai"
+          # taste-cosine.rhai declares all three (#167) — the pool must
+          # grant exactly what it declares, or the channel fails to load.
           capabilities: [catalog_read, watch_history]
+          datastores:
+            - name: taste
+              # Never a literal path in a committed config — expanded from
+              # the container's environment at load. See .env.example
+              # § Taste snapshot (plex-db-ex).
+              path: "${PLEXDB_SNAPSHOT_PATH}"
+          config:
+            # The share of output slots filled by a seeded random pick
+            # instead of by rank (#254, ADR 0005) — roughly 1 slot in 5 at
+            # this default, decided by a per-slot coin flip seeded from
+            # `ctx.seed` rather than a fixed stride, so which slots explore
+            # varies by seed and reproduces for a pinned one. Never draws a
+            # title the store has no `tmdb_keywords` fact for.
+            exploration_fraction: 0.2
           select: round_robin
           advance: restart
 
-        # Episodes, ranked the same way. `advance: resume` is what makes a show
-        # the plugin keeps surfacing progress over days instead of replaying its
-        # first three episodes every generation — the resume point is keyed on
-        # `show_id`, so a show that drops out of the ranking and returns later
-        # picks up where it left off.
+        # Episodes, one season at a time — the mechanism
+        # `deploy/appdata/channels/001-for-you.yaml` already uses, since
+        # this half was never a plugin pool even before #254: a season has
+        # to play in episode order, and a scorer returns a ranked set the
+        # station will not re-sort.
+        #
+        # `group_by: season` cuts this pool into one series per season of
+        # per show rather than one per show, so `select: random` draws a
+        # season rather than a title. `order` is what makes it play in order
+        # once drawn — the season number first so a series is a season, then
+        # the episode number inside it.
+        #
+        # `advance: resume` is what makes a show picked up here continue
+        # through its episodes across generations instead of restarting —
+        # the resume point is keyed on `show_id`, so a season that drops out
+        # of rotation and returns later picks up where it left off.
         - name: shows
-          plugin: "../plugins/taste-engine.rhai"
-          capabilities: [catalog_read, watch_history]
-          select: round_robin
+          expr: 'item.type == "episode"'
+          order: "season:asc,episode:asc"
+          group_by: season
+          select: random
           rotate: visit
           advance: resume
           on_short: next
 
-      # Two movies, then three episodes of whichever show is up.
+      # Two movies, then three episodes of whichever season is up.
       pattern:
         - pool: movies
           take: 2

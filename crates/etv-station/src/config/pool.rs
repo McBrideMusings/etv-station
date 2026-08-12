@@ -259,15 +259,16 @@ pub struct Pool {
     /// A returned entry may be a bare `entry_id` string, or a record naming
     /// one plus an optional `metadata` blob and/or a `take` override for that
     /// entry's series (#166) — see [`crate::score::pick`]. The widening is
-    /// additive: a script that returns only bare ids, like
-    /// `taste-engine.rhai`, needs no edit.
+    /// additive: a script that returns only bare ids needs no edit.
     ///
     /// **Replay is the plugin's, unless this pool claims it.** ETV computes no
     /// replay policy for a plugin pool: it hands the script `ctx.recent` and
     /// takes back whatever order comes out. A scorer that suppresses what it
     /// recently returned holds a title back for as long as its own policy says;
     /// one written without suppression hands back the same top-ranked item
-    /// every generation, and with
+    /// every generation — `examples/plugins/taste-cosine.rhai` (#254) is
+    /// exactly that: no replay rule of its own at all, a legitimate choice
+    /// under this ADR — and with
     /// `advance: restart` nothing else in the config stops it — a valid
     /// schedule that plays one film forever. Swapping the script swaps that
     /// behavior, and neither the pool nor the pattern can tell which kind it
@@ -299,7 +300,7 @@ pub struct Pool {
     /// against a script they may not have open.
     ///
     /// This is what lets a channel say *which library* a taste pool draws from
-    /// without touching the script. `taste-engine.rhai` declares
+    /// without touching the script. `taste-cosine.rhai` declares
     /// `movies: item.type == "movie"`, which is every movie-type Plex library
     /// on the server — a "Concerts" section and a "Power Hours" section
     /// included, 1,079 entries that each have their own channel already. The
@@ -313,9 +314,8 @@ pub struct Pool {
     /// The set *names* are the script's vocabulary, not the schema's: nothing
     /// here checks that a name means anything to the script, and one it does not
     /// recognise simply arrives as another entry in `ctx.sets`.
-    /// `taste-engine.rhai` looks for `movies` and `episodes` and falls back to
-    /// every set it was handed, so an override written for it keeps those two
-    /// names.
+    /// `taste-cosine.rhai` looks for one set only, `movies` (#254 — movies
+    /// only), so an override written for it keeps that one name.
     ///
     /// Two pools naming the same script with different `sources` each resolve
     /// their own set — [`crate::score::ScoreCache`] keys on the pair, not the

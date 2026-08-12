@@ -549,7 +549,7 @@ sets both, or neither, fails at load.
 ```yaml
 pools:
   - name: foryou
-    plugin: "../plugins/taste-engine.rhai"
+    plugin: "../plugins/taste-cosine.rhai"
     select: round_robin
     advance: resume
 ```
@@ -582,9 +582,12 @@ marches the pool forward through its returned set rather than letting it revisit
 recent items, which leaves the script's own `ctx.recent` suppression less to hold
 back over the window a generation covers. Set it on a plugin pool when
 the config is the only thing guarding replay; leave it unset when the script is.
-`examples/samples/foryou.yaml` ships a scorer that suppresses and therefore
-declines the field; `examples/samples/kungfu.yaml` is the sample that exercises
-it, on CEL pools.
+`examples/samples/foryou.yaml`'s scorer (#254) holds no replay policy of its own
+at all — a legitimate choice under this ADR, not a gap — and declines the field
+for the reason the sample's own comments give: `cycles` already drains the
+largest pool once per window, so a no-repeat rule here would just force the
+whole movie library into one window. `examples/samples/kungfu.yaml` is the
+sample that exercises the field, on CEL pools.
 
 The script defines four functions:
 
@@ -616,7 +619,7 @@ script's `sources()` declares:
 ```yaml
 pools:
   - name: movies
-    plugin: "../plugins/taste-engine.rhai"
+    plugin: "../plugins/taste-cosine.rhai"
     sources:
       movies: 'item.type == "movie" && item.library == "4K Movies"'
     capabilities: [catalog_read, watch_history]
@@ -629,7 +632,7 @@ called at all — on the same terms as a pool's `constraints` replacing the
 block's: what the pool wrote is the whole list of what it offers its scorer.
 
 This is what lets a channel say which slice of the library a taste pool draws
-from without editing the script. `taste-engine.rhai` declares
+from without editing the script. `taste-cosine.rhai` declares
 `item.type == "movie"`, which spans every movie library on the server; a channel
 that should only surface one of them cannot say so any other way. The script
 cannot narrow it for one channel without narrowing it for every channel pointed
@@ -646,9 +649,9 @@ every query.
 
 The set **names** belong to the script, not to the schema: nothing checks that a
 name means anything to it, and one it does not recognise simply arrives as
-another entry in `ctx.sets`. `taste-engine.rhai` looks for `movies` and
-`episodes` and falls back to every set it was handed, so an override written for
-it keeps those two names.
+another entry in `ctx.sets`. `taste-cosine.rhai` looks for one set only,
+`movies` (#254 — movies only, since an episode cannot yet be resolved to its
+show's keywords), so an override written for it keeps that one name.
 
 Two pools naming the same script with different `sources` each resolve their own
 set, so narrowing one pool never narrows its sibling. Two that wrote the same
@@ -690,7 +693,7 @@ a `rotate: "slot"` draw never asks for the step's own `take` in the first
 place (each slot is always one item), so there is nothing for an override
 to replace there. Zero or negative fails the generation, naming the entry.
 
-The widening is additive: a script returning only bare ids, like `taste-engine.rhai`, needs no edit. A `sequencer:` block's plugin pool record shape parses the same way as a `pattern:` block's, and its `metadata` reaches the emitted JSON identically (#201). The per-entry `take` override remains out of scope for a sequencer block: `arrange()` already decides its own order, so what a `take` override would even mean there is a separate design question, not a plumbing gap (#201).
+The widening is additive: a script returning only bare ids needs no edit. A `sequencer:` block's plugin pool record shape parses the same way as a `pattern:` block's, and its `metadata` reaches the emitted JSON identically (#201). The per-entry `take` override remains out of scope for a sequencer block: `arrange()` already decides its own order, so what a `take` override would even mean there is a separate design question, not a plumbing gap (#201).
 
 #### `hooks()` — what a script says it can do
 
@@ -711,7 +714,7 @@ config load rather than mid-generation:
 
 - A `plugin:` pool naming a script that does not declare `pool_provider` is
   refused, naming the script and the hook it lacked:
-  `pool "movies" names plugin …/taste-engine.rhai via `plugin:`, which requires
+  `pool "movies" names plugin …/taste-cosine.rhai via `plugin:`, which requires
   the plugin to declare the `pool_provider` hook, but it only declares: sequencer`
 - A script declaring a name outside the table is refused, and the message lists
   the names that exist: `declares unknown hook "warp_drive" — known hooks are:
@@ -730,7 +733,7 @@ declaration, and a third is opened only by name:
 |---|---|---|
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
-| a named external datastore | nothing in this slice exposes it to the script — the grant only proves at load time that its location opens (#167; what is reachable through it is #181, out of scope here) | `#{ datastore: "name" }` |
+| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, and `pooled_taste_vector` accessors (#181, #271); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
 
 Unlike `hooks()`, `capabilities()` is optional — a script with no such function
 declares nothing, which is the right answer for a plugin that only reads the
@@ -756,20 +759,23 @@ below. The two sides must agree exactly:
 - A datastore grant naming a location that cannot be opened is refused at
   load, naming the datastore and the underlying error.
 
-`examples/plugins/taste-engine.rhai` reads `ctx.sets` and `ctx.history`, so it
-declares `["catalog_read", "watch_history"]`; `examples/samples/foryou.yaml`
-grants both on each pool that points at it.
+`examples/plugins/taste-cosine.rhai` reads `ctx.sets` and reaches for a named
+datastore, so it declares
+`["catalog_read", "watch_history", #{ datastore: "taste" }]` (#254's interface
+list — `watch_history` is declared without `pick()` reading `ctx.history`
+today, reserved rather than removed); `examples/samples/foryou.yaml` grants
+all three on the one pool that points at it.
 
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
 `entries` plus genres / cast / labels / … as arrays; requires `catalog_read`),
 `ctx.pool` (the name of the pool asking, so one script can serve several pools
-of a channel — a `movies` pool and a `shows` pool ranked by the same taste),
-`ctx.target_count` (how many items the generation needs), `ctx.history` (recent
-server-wide watch events, `#{entry_id, watched_at}`; requires `watch_history`),
-`ctx.recent` (what this channel aired most recently, oldest first), `ctx.now`
-(unix seconds at generation time), `ctx.config` (this pool's `config:`
-block — see below), and `ctx.seed` (the channel's resolved seed mixed with this
-pool's name — see below).
+of a channel with different judgment per pool), `ctx.target_count` (how many
+items the generation needs), `ctx.history` (recent server-wide watch events,
+`#{entry_id, watched_at}`; requires `watch_history`), `ctx.recent` (what this
+channel aired most recently, oldest first), `ctx.now` (unix seconds at
+generation time), `ctx.config` (this pool's `config:` block — see below), and
+`ctx.seed` (the channel's resolved seed mixed with this pool's name — see
+below).
 
 #### `ctx.seed` — reproducible randomness (ADR 0005)
 
@@ -781,17 +787,16 @@ one, and reading either fails the check by design (see "The determinism
 contract").
 
 Two pools of one channel naming the same script get different `ctx.seed`
-values — `examples/samples/foryou.yaml` points a `movies` pool and a `shows`
-pool at one script, and both drawing the same sequence would put their
-exploration slots in lockstep on air, forever. The same channel and the same
-authored seed produce the identical `ctx.seed` across two generations, which
-is what lets a script pick randomly from it and still pass
-`--check-determinism`.
+values — mixing the pool's own name into the channel's seed is what keeps two
+such pools from drawing the same sequence, which would put their exploration
+slots in lockstep on air, forever. The same channel and the same authored seed
+produce the identical `ctx.seed` across two generations, which is what lets a
+script pick randomly from it and still pass `--check-determinism`.
 
 `ctx.seed` is a plain integer, not a PRNG object — a script derives its own
 pick from it with ordinary arithmetic (mix it further, take it modulo a
-candidate count, and so on), the same way `examples/plugins/taste-engine.rhai`
-already does its own ranking math over `ctx`'s other fields.
+candidate count, and so on), the same way `examples/plugins/taste-cosine.rhai`
+(#254) derives a seeded coin flip per output slot for its exploration draw.
 
 ### The determinism contract
 
@@ -827,7 +832,7 @@ the same scoring arithmetic measured 124 s split across helpers and 13 s written
 inline in the loop. Keep per-item work in the loop body; keep named functions for
 the things called once, like reading a tunable out of `ctx.config`.
 
-`examples/plugins/taste-engine.rhai` is written to both rules and says so in its
+`examples/plugins/taste-cosine.rhai` is written to both rules and says so in its
 comments.
 
 ### Named show groups — `groups:` on the channel and on a pool
@@ -900,9 +905,9 @@ verbatim and never reads it.**
 ```yaml
 pools:
   - name: movies
-    plugin: "../plugins/taste-engine.rhai"
+    plugin: "../plugins/taste-cosine.rhai"
     config:
-      affinity_window_days: 30
+      exploration_fraction: 0.2
       weights:
         affinity: 3.0
         nested: [1, 2.5, true, "mixed"]
@@ -915,16 +920,16 @@ intact. No key is reserved.
 This is what lets two channels share one algorithm with different numbers, and
 it is deliberately opaque: nothing here is validated, no key is known to ETV, no
 default is injected, and an unrecognised key is not an error. **A key means
-whatever the script decides it means.** `affinity_window_days` is not a concept
-etv-station has — it exists because `examples/plugins/taste-engine.rhai` looks it
-up, and a different scorer would read entirely different keys. That is the same
-argument that put taste in the plugin at all ([ADR 0002](./adr/0002-scorer-plugin-replaces-a-pool-expr.md)):
+whatever the script decides it means.** `exploration_fraction` is not a concept
+etv-station has — it exists because `examples/plugins/taste-cosine.rhai` looks it
+up (#254), and a different scorer would read entirely different keys. That is the
+same argument that put taste in the plugin at all ([ADR 0002](./adr/0002-scorer-plugin-replaces-a-pool-expr.md)):
 a station that validated these keys would be a party to the taste it exists not
 to hold, and its list would need updating for every script anyone writes.
 
 An absent `config:` arrives as an empty map rather than a missing key, so a
 script can read `ctx.config.anything` unconditionally and get unit back. Which
-is also the catch: **a mistyped key is silent.** `afinity_window_days` reads as
+is also the catch: **a mistyped key is silent.** `exploraton_fraction` reads as
 unset and the script falls back to its own default, exactly as if it had been
 omitted — there is no warning, because there is nothing that knows the correct
 spelling. A script that wants strictness has to declare and check its own
@@ -1102,7 +1107,7 @@ Nothing is ambient — a pool that grants nothing gets a script with no
 ```yaml
 pools:
   - name: movies
-    plugin: "../plugins/taste-engine.rhai"
+    plugin: "../plugins/taste-cosine.rhai"
     capabilities: [catalog_read, watch_history]
 ```
 
@@ -1124,7 +1129,7 @@ committed config:
 ```yaml
     datastores:
       - name: taste
-        path: "${ETV_TASTE_STORE}"
+        path: "${PLEXDB_SNAPSHOT_PATH}"
 ```
 
 The file is opened at load to prove it is reachable; a path that cannot be
@@ -1331,7 +1336,7 @@ The committed samples under `examples/` are authored in YAML:
 | The Lord of the Rings (query channel) | `examples/samples/lotr.yaml` |
 | Trending Mix (pools + pattern interleave) | `examples/samples/trending-mix.yaml` |
 | For You (taste-scored via a plugin) | `examples/samples/foryou.yaml` |
-| Worked example scorer plugin | `examples/plugins/taste-engine.rhai` |
+| Worked example scorer plugin | `examples/plugins/taste-cosine.rhai` |
 | Star Wars timeline block (8 items, manual order) | `examples/blocks/starwars-timeline.yaml` |
 | Die Hard block (1 item) | `examples/blocks/diehard.yaml` |
 
