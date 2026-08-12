@@ -50,3 +50,4 @@ deploy/appdata/*
 !deploy/appdata/etv-next/
 deploy/appdata/etv-next/*
 !deploy/appdata/etv-next/normalization.default.json
+tmp-*.log
