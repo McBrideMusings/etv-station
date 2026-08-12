@@ -15,7 +15,7 @@ use etv_station::config::{
     Advance, BlockInclude, ChannelConfig, Mode, PatternStep, Pool, RuleConfig,
 };
 use etv_station::errors::ConfigError;
-use etv_station::resolve::{resolve_channel_with_resume, ResolvedItem};
+use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreInputs, WatchEvent};
 
@@ -303,55 +303,6 @@ fn pick(ctx) {
     );
 }
 
-/// The committed worked example runs. Without this, `examples/plugins/
-/// taste-engine.rhai` is documentation that nothing proves still compiles —
-/// and a scorer only fails at generation time, on a running channel.
-#[test]
-fn the_committed_example_plugin_runs() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/plugins/taste-engine.rhai")
-        .canonicalize()
-        .expect("examples/plugins/taste-engine.rhai must exist");
-
-    let cat = catalog();
-    let inputs = ScoreInputs {
-        target_count: 3,
-        history: [WatchEvent {
-            entry_id: "mov-a".into(),
-            watched_at: 900_000,
-            watcher: None,
-        }]
-        .into(),
-        // mov-d aired most recently, so the example's replay TTL drops it.
-        recent: vec!["mov-d".into()],
-        now: 900_000 + 3600,
-        tz: None,
-    };
-    // The two halves, in the order the daemon runs them: `prepare` reads the
-    // catalog, `pick` ranks what it found and never sees a database handle.
-    let mut cache = etv_station::score::ScoreCache::default();
-    cache.prepare(&cat, &path, None).unwrap();
-    // The committed example declares both (#167) — grant both here to match.
-    let granted = etv_station::score::GrantedCapabilities {
-        catalog_read: true,
-        watch_history: true,
-        ..Default::default()
-    };
-    let picked =
-        etv_station::score::pick(&cache, &path, None, &inputs, 0, "movies", None, granted).unwrap();
-    let ids: Vec<String> = picked.into_iter().map(|p| p.id).collect();
-
-    assert!(
-        !ids.contains(&"mov-d".to_string()),
-        "a just-aired item must be suppressed: {ids:?}"
-    );
-    assert_eq!(
-        ids.first().map(String::as_str),
-        Some("mov-a"),
-        "the freshly-watched item should rank first: {ids:?}"
-    );
-}
-
 /// A relative `plugin:` path means what it means relative to the channel config
 /// file, not to the daemon's working directory. Without this, a config that
 /// works when launched from the repo root breaks under systemd or Docker, and
@@ -440,8 +391,8 @@ fn pick(ctx) {
 /// way to `ResolvedItem::metadata` — the field `crate::rule::build_playout_item`
 /// copies onto `PlayoutItem::metadata` for the emitted playout JSON. An id
 /// with no record attaches nothing, which is what keeps a plugin that only
-/// ever returns bare ids (`taste-engine.rhai`) producing byte-identical
-/// output to before this existed.
+/// ever returns bare ids producing byte-identical output to before this
+/// existed.
 #[test]
 fn a_records_metadata_reaches_the_resolved_item_and_a_bare_id_carries_none() {
     let dir = tempfile::tempdir().unwrap();

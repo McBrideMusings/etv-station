@@ -491,6 +491,26 @@ mod tests {
         None
     }
 
+    /// A minimal but real plexdb store at the schema version `plexdb-reader`
+    /// understands — just enough for the sample `foryou.yaml` channel's
+    /// `movies` pool to open its granted `taste` datastore at load. Its
+    /// contents are never read here; this test only proves the whole example
+    /// station still loads end to end, not what the plugin scores.
+    fn write_minimal_taste_store() -> PathBuf {
+        // `keep()` hands back the directory and gives up deleting it: the
+        // fixture has to outlive this call, and a `tempdir()` still owned here
+        // would clean itself up on drop.
+        let path = tempfile::tempdir().unwrap().keep().join("taste.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES ({version});",
+            version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+        ))
+        .unwrap();
+        path
+    }
+
     fn local_paths(loaded: &Station) -> Vec<&str> {
         loaded
             .channels
@@ -509,9 +529,19 @@ mod tests {
 
     #[test]
     fn loads_example_fixture() {
-        // An example channel references ${ETV_TEST_MEDIA_DIR}; hand the loader a
-        // table holding it rather than exporting it into the running process.
-        let env = env_map(&[("ETV_TEST_MEDIA_DIR", "/tmp/etv-test-media")]);
+        // An example channel references ${ETV_TEST_MEDIA_DIR}, and the
+        // `foryou.yaml` sample's movies pool references
+        // ${PLEXDB_SNAPSHOT_PATH} (#254) — hand the loader a table holding
+        // both rather than exporting either into the running process.
+        let taste_store = write_minimal_taste_store();
+        // Bound rather than passed inline: `env_map` returns an `impl Fn` that
+        // captures its argument's lifetime, so a temporary array would be
+        // freed while the returned lookup still borrowed it.
+        let vars = [
+            ("ETV_TEST_MEDIA_DIR", "/tmp/etv-test-media"),
+            ("PLEXDB_SNAPSHOT_PATH", taste_store.to_str().unwrap()),
+        ];
+        let env = env_map(&vars);
         let path = examples_station();
         let loaded = load_with_env(&path, &env).expect("examples/station.yaml should load");
         let ch = loaded
