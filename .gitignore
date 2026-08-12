@@ -51,3 +51,6 @@ deploy/appdata/*
 deploy/appdata/etv-next/*
 !deploy/appdata/etv-next/normalization.default.json
 tmp-*.log
+
+# Local verify rig — machine-specific, never committed
+.claude/skills/verify/
