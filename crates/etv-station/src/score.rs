@@ -33,7 +33,11 @@
 //! // granted) the matching capability fails the pick() call that reaches
 //! // for it, naming the capability. A named external datastore is declared
 //! // as `#{ datastore: "name" }` instead of a bare string; see
-//! // `config::Pool::datastores`.
+//! // `config::Pool::datastores`. A granted datastore is reached as
+//! // `ctx.datastore("name")` (#181), which returns a handle exposing the
+//! // plex-db-ex reader crate's four accessors — `enrichment_for`,
+//! // `edges_from`, `edges_to`, `taste_vector_for` — or fails the pick()
+//! // call naming the datastore if it was never granted.
 //! fn capabilities() { ["catalog_read", "watch_history"] }
 //!
 //! // Every catalog query this plugin will read, named. Run once, up front —
@@ -95,7 +99,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use etv_overlay::config_carrier;
 use rhai::serde::DynamicDeserializer;
@@ -343,8 +347,9 @@ pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
 /// A host capability a plugin script can declare via `capabilities()` (#167).
 /// `CatalogRead` gates `ctx.sets`; `WatchHistory` gates `ctx.history`.
 /// `Datastore` names an external handle the channel config must separately
-/// grant — what is behind that handle is out of scope for this station (see
-/// [`crate::config::Pool::datastores`]).
+/// grant (see [`crate::config::Pool::datastores`]) — reached at runtime as
+/// `ctx.datastore("name")` (#181), which returns the plex-db-ex reader
+/// crate's accessors for that store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capability {
     CatalogRead,
@@ -458,26 +463,62 @@ pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, Stri
 
 /// Which capabilities a channel config granted a plugin pool (#167),
 /// resolved from [`crate::config::Pool::capabilities`] before [`pick`] runs.
-/// Datastore grants carry no runtime handle in this slice — a grant only
-/// proves at load time that its location is openable
-/// ([`crate::config::validate`]); nothing here exposes it to the script.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GrantedCapabilities {
     pub catalog_read: bool,
     pub watch_history: bool,
+    /// Opened handles for every datastore this pool was granted (#181), keyed
+    /// by the grant's name — the same name a script's `capabilities()`
+    /// declares via `#{ datastore: "name" }`. Empty for a pool that grants
+    /// none, which is every pool before this field existed.
+    ///
+    /// `plexdb_reader::Reader` wraps a `rusqlite` connection, which is
+    /// [`Send`] but not [`Sync`]; the [`Mutex`] is what lets one [`Arc`] live
+    /// inside a Rhai [`Dynamic`] under this engine's `sync` feature, which
+    /// requires every registered type to be `Send + Sync`. Contention is not
+    /// a concern — [`pick`] runs one script call at a time on one thread, so
+    /// the lock is never held by more than one caller.
+    pub datastores: HashMap<String, Arc<Mutex<plexdb_reader::Reader>>>,
 }
 
 impl GrantedCapabilities {
     /// Read a pool's granted capability names back into the two flags [`pick`]
     /// acts on, so a caller never has to know how a capability is spelled.
     /// Names that are not simple capabilities — a datastore grant — are
-    /// ignored: nothing in this slice hands a script a datastore handle.
+    /// ignored here; [`Self::with_datastores`] handles those separately,
+    /// since opening one can fail and this constructor cannot.
     pub fn from_names(names: &[String]) -> Self {
         let has = |want: &str| names.iter().any(|n| n == want);
         Self {
             catalog_read: has("catalog_read"),
             watch_history: has("watch_history"),
+            datastores: HashMap::new(),
         }
+    }
+
+    /// Open every grant in `grants` and fold the handles into this capability
+    /// set, keyed by grant name. Called once per plugin pool per generation
+    /// (`pattern::resolve_pool_sources`), right before [`pick`] runs —
+    /// load-time validation ([`crate::config::validate`]) already proved each
+    /// path opens and is at the schema version this build understands; this
+    /// reopens it fresh each generation rather than caching a handle across
+    /// them, since a `Reader::open` is one file open plus one `SELECT`, not a
+    /// network round trip.
+    ///
+    /// Fails naming the datastore, its path, and the underlying error if a
+    /// store that validated at load can no longer be opened — e.g. deleted or
+    /// moved mid-run.
+    pub fn with_datastores(
+        mut self,
+        grants: &[crate::config::DatastoreGrant],
+    ) -> Result<Self, String> {
+        for grant in grants {
+            let reader = plexdb_reader::Reader::open(&grant.path)
+                .map_err(|e| format!("datastore {:?} at {:?}: {e}", grant.name, grant.path))?;
+            self.datastores
+                .insert(grant.name.clone(), Arc::new(Mutex::new(reader)));
+        }
+        Ok(self)
     }
 }
 
@@ -489,7 +530,9 @@ impl GrantedCapabilities {
 /// it, at the moment of the read, with a message that names the capability.
 /// Every other field is an ordinary infallible getter; nothing about their
 /// values or names changes from before this existed, so a script that never
-/// touches a gated field is unaffected.
+/// touches a gated field is unaffected. `ctx.datastore("name")` (#181) is
+/// gated the same way, except by name rather than by a single flag — see
+/// [`ScoreCtx::get_datastore`].
 #[derive(Debug, Clone)]
 struct ScoreCtx {
     /// Filled only when `catalog_read` was granted; `None` is what turns a
@@ -502,6 +545,13 @@ struct ScoreCtx {
     /// Filled only when `watch_history` was granted — same gate as `sets`.
     history: Option<Dynamic>,
     recent: Dynamic,
+    /// Every datastore this pool was granted (#181), keyed by name — the same
+    /// map [`GrantedCapabilities::datastores`] carries, moved across whole and
+    /// wrapped in the registered [`Datastore`] type only when a script asks
+    /// for one. A name absent here is indistinguishable to the script from one
+    /// that was never declared: both fail [`ScoreCtx::get_datastore`] the same
+    /// way.
+    datastores: HashMap<String, Arc<Mutex<plexdb_reader::Reader>>>,
 }
 
 /// What a script gets back for reading a `ctx` field its pool was not granted
@@ -534,6 +584,125 @@ impl ScoreCtx {
     fn get_recent(&mut self) -> Dynamic {
         self.recent.clone()
     }
+
+    /// `ctx.datastore("name")` (#181). A name this pool was not granted —
+    /// whether never declared, never granted, or misspelled — fails here
+    /// naming the datastore, the same load-bearing error shape
+    /// [`ungranted`] gives the two boolean-gated fields.
+    fn get_datastore(&mut self, name: &str) -> Result<Dynamic, Box<EvalAltResult>> {
+        self.datastores
+            .get(name)
+            .cloned()
+            .map(|reader| Dynamic::from(Datastore(reader)))
+            .ok_or_else(|| format!("datastore {name:?} not declared or granted").into())
+    }
+}
+
+/// A live handle to one granted datastore (#181), registered as its own Rhai
+/// type so a script calls `ctx.datastore("name").enrichment_for(...)` and the
+/// crate's other three accessors directly. Wraps the same
+/// `Arc<Mutex<plexdb_reader::Reader>>` [`GrantedCapabilities::datastores`]
+/// carries — see that field's doc for why the mutex exists.
+#[derive(Debug, Clone)]
+struct Datastore(Arc<Mutex<plexdb_reader::Reader>>);
+
+impl Datastore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, plexdb_reader::Reader> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn enrichment_for(
+        &mut self,
+        item_id: &str,
+        namespace: &str,
+    ) -> Result<Array, Box<EvalAltResult>> {
+        let facts = self
+            .lock()
+            .enrichment_for(item_id, namespace)
+            .map_err(|e| format!("datastore: enrichment_for({item_id:?}, {namespace:?}): {e}"))?;
+        Ok(facts.into_iter().map(enrichment_fact_to_dynamic).collect())
+    }
+
+    fn edges_from(&mut self, item_id: &str, edge_type: &str) -> Result<Array, Box<EvalAltResult>> {
+        let edges = self
+            .lock()
+            .edges_from(item_id, edge_type)
+            .map_err(|e| format!("datastore: edges_from({item_id:?}, {edge_type:?}): {e}"))?;
+        Ok(edges.into_iter().map(edge_to_dynamic).collect())
+    }
+
+    fn edges_to(&mut self, item_id: &str, edge_type: &str) -> Result<Array, Box<EvalAltResult>> {
+        let edges = self
+            .lock()
+            .edges_to(item_id, edge_type)
+            .map_err(|e| format!("datastore: edges_to({item_id:?}, {edge_type:?}): {e}"))?;
+        Ok(edges.into_iter().map(edge_to_dynamic).collect())
+    }
+
+    fn taste_vector_for(&mut self, plex_account_id: i64) -> Result<Dynamic, Box<EvalAltResult>> {
+        let vector = self
+            .lock()
+            .taste_vector_for(plex_account_id)
+            .map_err(|e| format!("datastore: taste_vector_for({plex_account_id}): {e}"))?;
+        Ok(taste_vector_to_dynamic(vector))
+    }
+}
+
+/// One `enrichment` row (#181), as a Rhai map: `namespace`, `key`, `value`,
+/// `fetched_at` — the same four fields [`plexdb_reader::EnrichmentFact`]
+/// carries, untouched.
+fn enrichment_fact_to_dynamic(fact: plexdb_reader::EnrichmentFact) -> Dynamic {
+    let mut m = Map::new();
+    m.insert("namespace".into(), fact.namespace.into());
+    m.insert("key".into(), fact.key.into());
+    m.insert("value".into(), fact.value.into());
+    m.insert("fetched_at".into(), fact.fetched_at.into());
+    Dynamic::from_map(m)
+}
+
+/// One `edges` row (#181), as a Rhai map — mirrors [`plexdb_reader::Edge`]
+/// field for field.
+fn edge_to_dynamic(edge: plexdb_reader::Edge) -> Dynamic {
+    let mut m = Map::new();
+    m.insert("from_id".into(), edge.from_id.into());
+    m.insert("to_id".into(), edge.to_id.into());
+    m.insert("edge_type".into(), edge.edge_type.into());
+    m.insert("rank".into(), edge.rank.into());
+    m.insert("fetched_at".into(), edge.fetched_at.into());
+    Dynamic::from_map(m)
+}
+
+/// One [`plexdb_reader::TasteVector`] (#181), as a Rhai map: `attributes` (an
+/// array of `{namespace, key, value, weight}` maps) and
+/// `shows_without_seasons` (an array of strings) — mirrors the Rust struct
+/// field for field, nothing renamed or dropped.
+fn taste_vector_to_dynamic(vector: plexdb_reader::TasteVector) -> Dynamic {
+    let attributes: Array = vector
+        .attributes
+        .into_iter()
+        .map(|a| {
+            let mut m = Map::new();
+            m.insert("namespace".into(), a.namespace.into());
+            m.insert("key".into(), a.key.into());
+            m.insert("value".into(), a.value.into());
+            m.insert("weight".into(), a.weight.into());
+            Dynamic::from_map(m)
+        })
+        .collect();
+    let shows_without_seasons: Array = vector
+        .shows_without_seasons
+        .into_iter()
+        .map(Dynamic::from)
+        .collect();
+    let mut m = Map::new();
+    m.insert("attributes".into(), Dynamic::from_array(attributes));
+    m.insert(
+        "shows_without_seasons".into(),
+        Dynamic::from_array(shows_without_seasons),
+    );
+    Dynamic::from_map(m)
 }
 
 /// The Rhai engine every plugin call uses.
@@ -555,6 +724,10 @@ impl ScoreCtx {
 ///
 /// `pub(crate)` so [`crate::sequence`] (#169) shares it rather than a second
 /// engine configuration that could drift from this one.
+///
+/// [`Datastore`] (#181) is registered here unconditionally too, for the same
+/// reason `ScoreCtx` is — harmless when nothing constructs one, and it keeps
+/// every plugin call sharing one engine configuration.
 pub(crate) fn engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
@@ -566,7 +739,14 @@ pub(crate) fn engine() -> Engine {
         .register_get("target_count", ScoreCtx::get_target_count)
         .register_get("now", ScoreCtx::get_now)
         .register_get("history", ScoreCtx::get_history)
-        .register_get("recent", ScoreCtx::get_recent);
+        .register_get("recent", ScoreCtx::get_recent)
+        .register_fn("datastore", ScoreCtx::get_datastore);
+    engine
+        .register_type_with_name::<Datastore>("Datastore")
+        .register_fn("enrichment_for", Datastore::enrichment_for)
+        .register_fn("edges_from", Datastore::edges_from)
+        .register_fn("edges_to", Datastore::edges_to)
+        .register_fn("taste_vector_for", Datastore::taste_vector_for);
     engine
 }
 
@@ -658,8 +838,8 @@ pub struct PickedItem {
 ///
 /// `granted` (#167) is trusted as already reconciled against what the script
 /// declares — [`crate::config::validate`] rejects a mismatch at config load —
-/// so this only decides what `ctx.sets` / `ctx.history` resolve to for *this*
-/// call; it never re-reads `capabilities()`.
+/// so this only decides what `ctx.sets` / `ctx.history` / `ctx.datastore(name)`
+/// (#181) resolve to for *this* call; it never re-reads `capabilities()`.
 pub fn pick(
     cache: &ScoreCache,
     script_path: &Path,
@@ -731,6 +911,10 @@ pub fn pick(
                 .map(|id| Dynamic::from(id.clone()))
                 .collect(),
         ),
+        // Datastore grants (#181) are keyed by name, not gated behind one flag
+        // — `ScoreCtx::get_datastore` fails a lookup of any name absent here,
+        // whether the pool never declared it or `validate` never granted it.
+        datastores: granted.datastores,
     };
 
     let picked: Array = engine
@@ -1058,6 +1242,7 @@ mod tests {
             GrantedCapabilities {
                 catalog_read: true,
                 watch_history: true,
+                ..Default::default()
             },
         )
         // Tests written before #166 assert against bare ids; unwrap the
@@ -1993,6 +2178,7 @@ fn pick(ctx) {
             GrantedCapabilities {
                 catalog_read: true,
                 watch_history: false,
+                ..Default::default()
             },
         )
         .unwrap()

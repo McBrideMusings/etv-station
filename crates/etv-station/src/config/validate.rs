@@ -767,9 +767,13 @@ fn validate_plugin_capabilities(
     }
 
     // Both sets agree now, so every grant here is also declared — prove each
-    // named datastore is actually openable before any plugin ever runs.
+    // named datastore is actually openable, and at the schema version the
+    // vendored `plexdb-reader` crate understands, before any plugin ever
+    // runs (#181). `Reader::open` names both the found and the supported
+    // version when they disagree, and names the path when the file is
+    // simply missing.
     for grant in &pool.datastores {
-        std::fs::File::open(&grant.path).map_err(|e| {
+        plexdb_reader::Reader::open(&grant.path).map_err(|e| {
             bad(format!(
                 "pool {:?}: datastore {:?} at {:?} could not be opened: {e}",
                 pool.name, grant.name, grant.path
@@ -1782,14 +1786,28 @@ fn capabilities() { [] }
         assert!(format!("{err}").contains("telepathy"));
     }
 
-    /// A declared-and-granted datastore whose path opens cleanly validates,
-    /// and the acceptance bar for #167: a station with no datastore grant
-    /// anywhere never even reaches the open call.
+    /// A minimal but real plexdb store: `Reader::open` reads `schema_version`
+    /// and nothing else, so that one table is the whole of what this check
+    /// needs. The accessors — and the tables they read — are exercised in
+    /// `tests/datastore_capability.rs`, not here.
+    fn write_plexdb_fixture(path: &std::path::Path, version: i64) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES ({version});"
+        ))
+        .unwrap();
+    }
+
+    /// A declared-and-granted datastore whose path opens cleanly — a real
+    /// plexdb store at the schema version `plexdb-reader` understands —
+    /// validates, and the acceptance bar for #167: a station with no
+    /// datastore grant anywhere never even reaches the open call.
     #[test]
     fn a_datastore_grant_that_opens_validates() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
-        std::fs::write(&db, b"").unwrap();
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
         validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
@@ -1817,6 +1835,35 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         let msg = format!("{err}");
         assert!(msg.contains("taste_db"), "msg = {msg}");
         assert!(msg.contains("could not be opened"), "msg = {msg}");
+    }
+
+    /// Error case (#181's acceptance bar): a grant pointed at a store whose
+    /// `schema_version` does not match what the vendored `plexdb-reader`
+    /// crate was built against fails at load, naming both the version found
+    /// in the store and the version this build understands — never a panic,
+    /// and never an empty pool that looks like a scheduling result.
+    #[test]
+    fn a_datastore_grant_at_the_wrong_schema_version_is_rejected_naming_both_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("taste.db");
+        let wrong_version = plexdb_reader::SUPPORTED_SCHEMA_VERSION + 1;
+        write_plexdb_fixture(&db, wrong_version);
+        let err = validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { [#{ datastore: "taste_db" }] }
+"#,
+            vec![],
+            vec![("taste_db", db.to_str().unwrap())],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("taste_db"), "msg = {msg}");
+        assert!(msg.contains(&wrong_version.to_string()), "msg = {msg}");
+        assert!(
+            msg.contains(&plexdb_reader::SUPPORTED_SCHEMA_VERSION.to_string()),
+            "msg = {msg}"
+        );
     }
 
     #[test]

@@ -1,0 +1,24 @@
+# Vendored from plex-db-ex (McBrideMusings/plex-db-ex), crates/plexdb-reader,
+# at commit b62bb66. Files under src/ are unmodified copies of that crate;
+# only this manifest is adapted to plug into etv-station's own workspace
+# instead of plex-db-ex's. See docs/architecture.md's "Why plexdb-reader is
+# vendored, not a git dependency" for why, and how to refresh this copy.
+[package]
+name = "plexdb-reader"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only typed access to a plexdb.db store (ADR-0003)."
+
+[dependencies]
+# `limits` on top of the workspace default: `enrichment_for_many` reads this
+# connection's own `SQLITE_LIMIT_VARIABLE_NUMBER` to chunk an `IN` clause
+# rather than assuming a candidate set never exceeds it.
+rusqlite = { workspace = true, features = ["limits"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lib]
+name = "plexdb_reader"
+path = "src/lib.rs"

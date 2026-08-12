@@ -335,6 +335,7 @@ fn the_committed_example_plugin_runs() {
     let granted = etv_station::score::GrantedCapabilities {
         catalog_read: true,
         watch_history: true,
+        ..Default::default()
     };
     let picked =
         etv_station::score::pick(&cache, &path, None, &inputs, "movies", None, granted).unwrap();
