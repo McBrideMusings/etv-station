@@ -142,12 +142,24 @@ pub struct PlexItem {
     /// Show name for an episode (`grandparentTitle`); `None` for a movie.
     pub show: Option<String>,
     /// The show's own Plex `ratingKey` (`grandparentRatingKey`) for an
-    /// episode; `None` for a movie. Plex never puts a genre on the episode
-    /// record itself — only the show carries one — so [`PlexClient::fetch_all`]
-    /// uses this to fetch each show's genres once and copy them onto every
-    /// one of its episodes (#196). Not written to the catalog directly; it
-    /// exists only to drive that fan-out.
+    /// episode; `None` for a movie. Plex never puts a genre, or the show's own
+    /// external GUIDs, on the episode record itself — only the show carries
+    /// them — so [`PlexClient::fetch_all`] uses this to fetch each show's
+    /// details once and copy them onto every one of its episodes (#196,
+    /// #274). Not written to the catalog directly; it exists only to drive
+    /// that fan-out and, via [`Self::show_external_ids`], to derive `show_id`.
     pub show_rating_key: Option<String>,
+    /// The show's own external GUIDs (`imdb`/`tmdb`/`tvdb`/`plex`) — empty for
+    /// a movie, and empty for an episode whose show has not been separately
+    /// fetched yet. Plex puts a show's external ids on the show's own
+    /// metadata record, never the episode, so [`PlexClient::fetch_all`]'s
+    /// per-show fan-out ([`PlexClient::show_details`], the same one that
+    /// copies genres onto episodes) fills this in via [`apply_show_details`].
+    /// [`ingest_items`] feeds it to [`derive_entry_id`] to compute `show_id` —
+    /// the same rule every other identity in this catalog uses, so a show's
+    /// id is stable across a rename and distinct between two shows sharing a
+    /// title (#274).
+    pub show_external_ids: Vec<(ExternalNs, String)>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
     /// Plex `absoluteIndex` (franchise-wide episode number), when Plex provides
@@ -238,20 +250,55 @@ pub fn ingest_items(
             item.show.clone(),
             existing.as_ref().and_then(|e| e.show.clone()),
         );
-        // The grouping key every pool's series rotation reads. Derived from the
-        // show's name rather than taken from Plex's `grandparentRatingKey`,
-        // because a rating key belongs to one server and this column has to
-        // mean the same thing for the same show whatever source produced the
-        // row — the same reason the rest of the identity model (#47) prefers
-        // portable values.
+        // The grouping key every pool's series rotation reads. Derived from
+        // the show's own external GUIDs by the same rule every other identity
+        // in this catalog uses ([`derive_entry_id`]), never from its title —
+        // a show's title is not its identity: two shows can share one (the
+        // 2001 UK *Office* and the 2005 US *Office* both title `"The
+        // Office"`), and a Plex re-scrape can change it. A `grandparentTitle`-
+        // derived id collided the former and orphaned every resume cursor on
+        // the latter (#274). `show_rating_key` (`grandparentRatingKey`)
+        // canonicalises to `/library/metadata/{ratingKey}/children` for the
+        // no-GUID fallback — a show carries no playback path of its own, so
+        // its Plex `key` (the resource Plex itself points at for that show,
+        // its episode-listing endpoint, exactly as a collection's `key` is
+        // `/library/collections/{id}/children` above) is the only string
+        // Plex gives it that is both stable and unique. Spot-checked against
+        // a live `plex-db-ex` snapshot (`plexdb/walk.py`'s `_canonical_for`,
+        // which reads the show record's own `key` rather than reconstructing
+        // it): all 10 of that store's GUID-less shows hash to this exact
+        // string, not the bare `/library/metadata/{ratingKey}` this comment
+        // first assumed — so a plugin holding this catalog's `show_id` can
+        // look the show up there directly.
         //
-        // Without it every episode is its own series of one, which is a silent
-        // failure rather than a loud one: the pattern still emits television,
-        // it just draws a different show every slot and nothing that groups
-        // episodes — `rotate = "visit"`, `advance = "resume"`, `group_by`, a
-        // take-all step — can do its job. The prod catalog had 72,255 episodes
-        // and not one `show_id` before this.
-        entry.show_id = entry.show.as_deref().map(show_id_for);
+        // Without a `show_id` at all, every episode is its own series of one,
+        // which is a silent failure rather than a loud one: the pattern still
+        // emits television, it just draws a different show every slot and
+        // nothing that groups episodes — `rotate = "visit"`, `advance =
+        // "resume"`, `group_by`, a take-all step — can do its job. The prod
+        // catalog had 72,255 episodes and not one `show_id` before #274's
+        // first landing.
+        //
+        // #274 changed the derivation from a title string to a GUID-derived
+        // one, so every `show_id` this catalog already held changed too, and
+        // the resume cursors in `resume.rs` (`PoolResume::next`) and
+        // `history.rs` (the per-show ledger projection) keyed on the old
+        // value simply stop matching — no migration, no dual read, by design
+        // (see #274's issue body). `pattern.rs`'s resume-advance already
+        // treats an id the freshly-resolved set doesn't recognise as "that
+        // series restarts", so every show plays from the top exactly once on
+        // the deploy that ships this.
+        entry.show_id = item
+            .show_rating_key
+            .as_deref()
+            .map(|show_rating_key| {
+                let show_canonical = canonical_path(
+                    &format!("/library/metadata/{show_rating_key}/children"),
+                    &roots,
+                );
+                derive_entry_id(&item.show_external_ids, &show_canonical)
+            })
+            .or_else(|| existing.as_ref().and_then(|e| e.show_id.clone()));
         entry.season = item
             .season
             .or_else(|| existing.as_ref().and_then(|e| e.season));
@@ -587,16 +634,6 @@ fn non_empty(s: &str) -> Option<&str> {
     (!s.trim().is_empty()).then_some(s)
 }
 
-/// The grouping key for a show, from its name.
-///
-/// `show:` + the name verbatim, which is the shape the rest of the project
-/// already reads — [`crate::resolve`] recovers the display name by trimming
-/// exactly this prefix, so anything cleverer here (a slug, a hash) would come
-/// back out as the show's on-screen name.
-fn show_id_for(show: &str) -> String {
-    format!("show:{show}")
-}
-
 /// Prefer a non-empty Plex string, else keep what the entry already had.
 fn merged(primary: Option<&str>, existing: Option<String>) -> Option<String> {
     primary.map(str::to_string).or(existing)
@@ -641,6 +678,17 @@ fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
         return None;
     }
     Some((ns, value.to_string()))
+}
+
+/// Every recognised external id on one Plex metadata record, in the order Plex
+/// reported them; unrecognised schemes and blank values drop out
+/// ([`parse_guid`]). Used for both an item's own ids and, on a show's record,
+/// the ids [`PlexClient::show_details`] hands its episodes.
+fn external_ids_of(m: &PlexMetadata) -> Vec<(ExternalNs, String)> {
+    m.guid
+        .iter()
+        .filter_map(|g| g.id.as_deref().and_then(parse_guid))
+        .collect()
 }
 
 /// The agent Plex reports for a section it matches against nothing — its
@@ -695,11 +743,7 @@ fn to_plex_item(
     translate: impl Fn(&str) -> String,
 ) -> Option<PlexItem> {
     let raw_path = m.media.first()?.part.first()?.file.as_deref()?;
-    let external_ids = m
-        .guid
-        .iter()
-        .filter_map(|g| g.id.as_deref().and_then(parse_guid))
-        .collect();
+    let external_ids = external_ids_of(m);
     let reported = m.kind.clone().unwrap_or_else(|| "video".into());
     let kind = match kind_override {
         Some(over) if reported == "movie" => over.to_string(),
@@ -718,6 +762,10 @@ fn to_plex_item(
         show_rating_key: is_episode
             .then_some(m.grandparent_rating_key.clone())
             .flatten(),
+        // Filled in later, once per distinct show, by
+        // [`PlexClient::fetch_all`]'s [`apply_show_details`] fan-out — this
+        // per-record conversion never talks to the network.
+        show_external_ids: Vec::new(),
         season: is_episode.then_some(m.parent_index).flatten(),
         episode: is_episode.then_some(m.index).flatten(),
         absolute_episode: is_episode.then_some(m.absolute_index).flatten(),
@@ -883,13 +931,15 @@ impl PlexClient {
     /// (null, not zero) and whose metadata later changes: `addedAt` doesn't
     /// move either, so a delta can't see the change, only the initial add.
     ///
-    /// Plex attaches genre to a show, never to its episodes (#196), so once
-    /// every section's items are collected, every distinct show a fetched
-    /// episode belongs to (`show_rating_key`) gets one [`Self::show_genres`]
-    /// call — cached so a show with many episodes in this pass is only
-    /// fetched once — and [`apply_show_genres`] copies the result onto each
-    /// of that show's episode items. A delta pass (`since` set) only pays for
-    /// the shows among the episodes it actually fetched, the same shape
+    /// Plex attaches genre and external GUIDs to a show, never to its
+    /// episodes (#196, #274), so once every section's items are collected,
+    /// every distinct show a fetched episode belongs to (`show_rating_key`)
+    /// gets one [`Self::show_details`] call — cached so a show with many
+    /// episodes in this pass is only fetched once — and
+    /// [`apply_show_details`] copies the result onto each of that show's
+    /// episode items, `show_external_ids` included so [`ingest_items`] can
+    /// derive `show_id` from it. A delta pass (`since` set) only pays for the
+    /// shows among the episodes it actually fetched, the same shape
     /// [`Self::fetch_collections`] uses for its own per-show fan-out.
     fn fetch_all(&self, since: Option<i64>) -> Result<Vec<PlexItem>, PlexIngestError> {
         let sections: SectionListResp = self.get("/library/sections", &[])?;
@@ -949,19 +999,19 @@ impl PlexClient {
             }
         }
 
-        let mut show_genre_cache: std::collections::HashMap<String, Vec<String>> =
+        let mut show_details_cache: std::collections::HashMap<String, ShowDetails> =
             std::collections::HashMap::new();
         for item in &items {
             let Some(show_key) = &item.show_rating_key else {
                 continue;
             };
-            if show_genre_cache.contains_key(show_key) {
+            if show_details_cache.contains_key(show_key) {
                 continue;
             }
-            let genres = self.show_genres(show_key)?;
-            show_genre_cache.insert(show_key.clone(), genres);
+            let details = self.show_details(show_key)?;
+            show_details_cache.insert(show_key.clone(), details);
         }
-        apply_show_genres(&mut items, &show_genre_cache);
+        apply_show_details(&mut items, &show_details_cache);
 
         Ok(items)
     }
@@ -1074,20 +1124,25 @@ impl PlexClient {
             .collect())
     }
 
-    /// A show's own genres, via a direct fetch of its metadata record
-    /// (`/library/metadata/{ratingKey}`, no children/leaves suffix). Plex
-    /// attaches genre to the show, never to the episode (#196) — a section's
-    /// bulk episode listing (`type=4`) carries `grandparentTitle` but no
-    /// genre of its own. Empty if the show has none or the fetch returns no
-    /// record.
-    fn show_genres(&self, show_rating_key: &str) -> Result<Vec<String>, PlexIngestError> {
+    /// A show's own genres and external GUIDs, via a direct fetch of its
+    /// metadata record (`/library/metadata/{ratingKey}`, no children/leaves
+    /// suffix). Plex attaches both to the show, never to the episode (#196,
+    /// #274) — a section's bulk episode listing (`type=4`) carries
+    /// `grandparentTitle` and `grandparentRatingKey` but neither the show's
+    /// genre nor its `Guid` array. One request covers both, since they live
+    /// on the same record. Empty if the show has neither or the fetch
+    /// returns no record.
+    fn show_details(&self, show_rating_key: &str) -> Result<ShowDetails, PlexIngestError> {
         let endpoint = format!("/library/metadata/{show_rating_key}");
         let resp: MediaContainerResp = self.get(&endpoint, &[])?;
         Ok(resp
             .media_container
             .metadata
             .first()
-            .map(|m| tagged(&m.genre))
+            .map(|m| ShowDetails {
+                genres: tagged(&m.genre),
+                external_ids: external_ids_of(m),
+            })
             .unwrap_or_default())
     }
 
@@ -1173,29 +1228,43 @@ fn expand_show_members(
         .collect()
 }
 
-/// Copy each show's genres onto its episode items (#196): Plex attaches genre
-/// to the show record, never to the episode, so a bulk episode listing's own
-/// `genres` is always empty and [`PlexClient::fetch_all`] has to fetch it
-/// separately, once per show, via [`PlexClient::show_genres`]. Extends rather
-/// than replaces an item's existing `genres` so nothing is lost if Plex ever
-/// does put a genre directly on an episode record; an episode whose
-/// `show_rating_key` has no entry in `genres` (the show's own fetch found
-/// none, or was never looked up) is left untouched, and a movie (no
-/// `show_rating_key` at all) is never touched.
+/// A show's own genres and external GUIDs, fetched together from one direct
+/// metadata request ([`PlexClient::show_details`]) because Plex attaches both
+/// to the show record, never the episode (#196, #274).
+#[derive(Debug, Clone, Default)]
+struct ShowDetails {
+    genres: Vec<String>,
+    external_ids: Vec<(ExternalNs, String)>,
+}
+
+/// Copy each show's genres and external GUIDs onto its episode items (#196,
+/// #274): Plex attaches both to the show record, never to the episode, so a
+/// bulk episode listing's own `genres`/`Guid` are always empty and
+/// [`PlexClient::fetch_all`] has to fetch them separately, once per show, via
+/// [`PlexClient::show_details`]. Genres extend rather than replace an item's
+/// existing list so nothing is lost if Plex ever does put a genre directly on
+/// an episode record; `show_external_ids` is set outright, since an episode
+/// record never carries its show's GUIDs at all. An episode whose
+/// `show_rating_key` has no entry in `details` (the show's own fetch found
+/// nothing, or was never looked up) is left untouched — its `show_id` then
+/// falls through to whatever the entry already had, same as any other column
+/// Plex reports nothing for this pass — and a movie (no `show_rating_key` at
+/// all) is never touched.
 ///
 /// Pure so the fan-out is unit-tested without a live Plex server;
 /// [`PlexClient::fetch_all`] is the only caller and is the one that populates
-/// `genres` over HTTP.
-fn apply_show_genres(
+/// `details` over HTTP.
+fn apply_show_details(
     items: &mut [PlexItem],
-    genres: &std::collections::HashMap<String, Vec<String>>,
+    details: &std::collections::HashMap<String, ShowDetails>,
 ) {
     for item in items {
         let Some(show_key) = &item.show_rating_key else {
             continue;
         };
-        if let Some(show_genres) = genres.get(show_key) {
-            item.genres.extend(show_genres.iter().cloned());
+        if let Some(show) = details.get(show_key) {
+            item.genres.extend(show.genres.iter().cloned());
+            item.show_external_ids = show.external_ids.clone();
         }
     }
 }
@@ -1360,6 +1429,7 @@ mod tests {
             library: None,
             show: None,
             show_rating_key: None,
+            show_external_ids: vec![],
             season: None,
             episode: None,
             absolute_episode: None,
@@ -1499,22 +1569,29 @@ mod tests {
     /// episode is its own series of one and every grouping knob — `rotate =
     /// "visit"`, `advance = "resume"`, `group_by`, a take-all step — quietly
     /// does nothing while the channel still emits television. The prod catalog
-    /// held 72,255 episodes and not one `show_id` before this.
+    /// held 72,255 episodes and not one `show_id` before this (#91), and #274
+    /// then moved the derivation off the show's title onto its own GUIDs — the
+    /// real *The Office (US)* `imdb:tt0386676`, spot-checked against a live
+    /// `plex-db-ex` snapshot.
     #[test]
-    fn episodes_of_one_show_share_a_show_id_and_movies_have_none() {
+    fn episodes_of_one_show_share_a_show_id_derived_from_the_shows_guid_and_movies_have_none() {
         let cat = Catalog::open_in_memory().unwrap();
-        let mut e1 = movie("plex-e1", "/data/media/tv/got/s01e01.mkv", &[]);
+        let mut e1 = movie("plex-e1", "/data/media/tv/office/s01e01.mkv", &[]);
         e1.kind = "episode".into();
-        e1.title = "Winter Is Coming".into();
-        e1.show = Some("Game of Thrones".into());
+        e1.title = "Pilot".into();
+        e1.show = Some("The Office".into());
+        e1.show_rating_key = Some("81044".into());
+        e1.show_external_ids = vec![(ExternalNs::Imdb, "tt0386676".to_string())];
         e1.season = Some(1);
         e1.episode = Some(1);
-        let mut e2 = movie("plex-e2", "/data/media/tv/got/s02e03.mkv", &[]);
+        let mut e2 = movie("plex-e2", "/data/media/tv/office/s02e01.mkv", &[]);
         e2.kind = "episode".into();
-        e2.title = "What Is Dead May Never Die".into();
-        e2.show = Some("Game of Thrones".into());
+        e2.title = "The Dundies".into();
+        e2.show = Some("The Office".into());
+        e2.show_rating_key = Some("81044".into());
+        e2.show_external_ids = e1.show_external_ids.clone();
         e2.season = Some(2);
-        e2.episode = Some(3);
+        e2.episode = Some(1);
         let film = movie("plex-m1", "/data/media/movies/Die Hard.mkv", &[]);
 
         ingest_items(&cat, &[e1, e2, film], &["/data/media".into()]).unwrap();
@@ -1525,14 +1602,109 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            vec!["show:Game of Thrones", "show:Game of Thrones"],
-            "both episodes group under one show, the film under none"
+            vec!["imdb:tt0386676", "imdb:tt0386676"],
+            "both episodes group under one show, derived from its GUID; the film under none"
         );
+    }
 
-        // The name reads back out of the key, which is what `resolve` relies on.
-        for value in shows.values() {
-            assert_eq!(value.trim_start_matches("show:"), "Game of Thrones");
+    /// The bug #274 exists to fix: two shows that happen to share a title must
+    /// not collapse into one series. Both here are literally titled "The
+    /// Office" — the UK original and the US remake — with different Plex
+    /// rating keys and different GUIDs, exactly as they'd arrive from a real
+    /// server. A title-keyed `show_id` (the pre-#274 behaviour) would have
+    /// produced `"show:The Office"` for both and merged their rotations.
+    #[test]
+    fn two_shows_sharing_a_title_get_different_show_ids() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut uk = movie("plex-uk-e1", "/data/media/tv/office-uk/s01e01.mkv", &[]);
+        uk.kind = "episode".into();
+        uk.show = Some("The Office".into());
+        uk.show_rating_key = Some("50001".into());
+        uk.show_external_ids = vec![(ExternalNs::Imdb, "tt0290978".to_string())];
+        let mut us = movie("plex-us-e1", "/data/media/tv/office-us/s01e01.mkv", &[]);
+        us.kind = "episode".into();
+        us.show = Some("The Office".into());
+        us.show_rating_key = Some("81044".into());
+        us.show_external_ids = vec![(ExternalNs::Imdb, "tt0386676".to_string())];
+
+        ingest_items(&cat, &[uk, us], &["/data/media".into()]).unwrap();
+
+        let ids = cat.all_entry_ids().unwrap();
+        let shows = cat.show_ids_for(&ids).unwrap();
+        let mut got: Vec<&String> = shows.values().collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["imdb:tt0290978", "imdb:tt0386676"],
+            "same title, different GUIDs, two distinct show_ids"
+        );
+    }
+
+    /// A show with no usable GUID still gets a `show_id` — the same posture as
+    /// the `fs:` path-hash fallback for a GUID-less file — but the fallback is
+    /// the show's Plex metadata key, never its title (#274's settled answer).
+    /// Two same-titled, GUID-less shows must still separate, which a
+    /// title-derived fallback could never do.
+    #[test]
+    fn a_guidless_show_falls_back_to_its_plex_metadata_key_not_its_title() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut a = movie("plex-a-e1", "/data/media/tv/home-a/s01e01.mkv", &[]);
+        a.kind = "episode".into();
+        a.show = Some("Home Videos".into());
+        a.show_rating_key = Some("70001".into());
+        let mut b = movie("plex-b-e1", "/data/media/tv/home-b/s01e01.mkv", &[]);
+        b.kind = "episode".into();
+        b.show = Some("Home Videos".into());
+        b.show_rating_key = Some("70002".into());
+
+        ingest_items(&cat, &[a, b], &["/data/media".into()]).unwrap();
+
+        let ids = cat.all_entry_ids().unwrap();
+        let shows = cat.show_ids_for(&ids).unwrap();
+        let mut got: Vec<String> = shows.values().cloned().collect();
+        got.sort();
+        assert_eq!(got.len(), 2, "two distinct shows, not merged by title");
+        for id in &got {
+            assert!(id.starts_with("fs:"), "expected a path-hash id, got {id}");
         }
+        assert_ne!(got[0], got[1]);
+    }
+
+    /// Renaming a show in Plex must not orphan its `show_id` — the id is
+    /// derived from the show's rating key + GUIDs, neither of which a title
+    /// change touches, so a re-scrape that only rewrites `grandparentTitle`
+    /// leaves every resume cursor keyed on the show intact.
+    #[test]
+    fn renaming_a_show_does_not_change_its_show_id() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut before = movie("plex-r-e1", "/data/media/tv/r/s01e01.mkv", &[]);
+        before.kind = "episode".into();
+        before.show = Some("Working Title".into());
+        before.show_rating_key = Some("90001".into());
+        before.show_external_ids = vec![(ExternalNs::Imdb, "tt9999999".to_string())];
+        ingest_items(&cat, &[before], &["/data/media".into()]).unwrap();
+        let ids_before = cat.all_entry_ids().unwrap();
+        let show_id_before = cat.show_ids_for(&ids_before).unwrap();
+
+        let mut after = movie("plex-r-e1", "/data/media/tv/r/s01e01.mkv", &[]);
+        after.kind = "episode".into();
+        after.show = Some("Renamed Show".into());
+        after.show_rating_key = Some("90001".into());
+        after.show_external_ids = vec![(ExternalNs::Imdb, "tt9999999".to_string())];
+        ingest_items(&cat, &[after], &["/data/media".into()]).unwrap();
+        let ids_after = cat.all_entry_ids().unwrap();
+        let show_id_after = cat.show_ids_for(&ids_after).unwrap();
+
+        assert_eq!(
+            ids_before, ids_after,
+            "the episode's own entry_id is unchanged"
+        );
+        assert_eq!(
+            show_id_before.values().next(),
+            show_id_after.values().next(),
+            "a title rename must not change the show_id"
+        );
+        assert_eq!(show_id_after.values().next().unwrap(), "imdb:tt9999999");
     }
 
     #[test]
@@ -2371,60 +2543,76 @@ mod tests {
     }
 
     /// #196: an episode item with no genre of its own picks up its show's
-    /// genres once `show_genres` has fetched them.
+    /// genres once `show_details` has fetched them. #274: the show's external
+    /// GUIDs ride along on the same fetch and land on the item too.
     #[test]
-    fn apply_show_genres_extends_an_episode_item_from_its_show() {
+    fn apply_show_details_extends_an_episode_item_from_its_show() {
         let mut ep = movie("157474", "/media/burbs/e.mkv", &[]);
         ep.kind = "episode".into();
         ep.show = Some("The 'Burbs".into());
         ep.show_rating_key = Some("157472".into());
         ep.genres = vec![];
         let mut items = vec![ep];
-        let genres: std::collections::HashMap<String, Vec<String>> = [(
+        let details: std::collections::HashMap<String, ShowDetails> = [(
             "157472".to_string(),
-            vec!["Comedy".to_string(), "Mystery".to_string()],
+            ShowDetails {
+                genres: vec!["Comedy".to_string(), "Mystery".to_string()],
+                external_ids: vec![(ExternalNs::Imdb, "tt0095016".to_string())],
+            },
         )]
         .into_iter()
         .collect();
 
-        apply_show_genres(&mut items, &genres);
+        apply_show_details(&mut items, &details);
 
         assert_eq!(
             items[0].genres,
             vec!["Comedy".to_string(), "Mystery".to_string()]
         );
+        assert_eq!(
+            items[0].show_external_ids,
+            vec![(ExternalNs::Imdb, "tt0095016".to_string())]
+        );
     }
 
     /// A movie carries no `show_rating_key` at all, so it must never be
-    /// touched by the show-genre fan-out even if (by coincidence) its own
-    /// ratingKey collided with an entry in the genre map.
+    /// touched by the show-details fan-out even if (by coincidence) its own
+    /// ratingKey collided with an entry in the details map.
     #[test]
-    fn apply_show_genres_leaves_a_movie_untouched() {
+    fn apply_show_details_leaves_a_movie_untouched() {
         let mut items = vec![movie("1", "/media/x.mkv", &[])];
-        let genres: std::collections::HashMap<String, Vec<String>> =
-            [("1".to_string(), vec!["Comedy".to_string()])]
-                .into_iter()
-                .collect();
+        let details: std::collections::HashMap<String, ShowDetails> = [(
+            "1".to_string(),
+            ShowDetails {
+                genres: vec!["Comedy".to_string()],
+                external_ids: vec![(ExternalNs::Imdb, "tt0000001".to_string())],
+            },
+        )]
+        .into_iter()
+        .collect();
 
-        apply_show_genres(&mut items, &genres);
+        apply_show_details(&mut items, &details);
 
         assert_eq!(items[0].genres, vec!["Action".to_string()]);
+        assert!(items[0].show_external_ids.is_empty());
     }
 
     /// An episode whose show was never looked up (absent from the map — the
     /// show's own fetch found nothing to cache, or was skipped) keeps
-    /// whatever genres it already had rather than being cleared.
+    /// whatever genres and show_external_ids it already had rather than being
+    /// cleared.
     #[test]
-    fn apply_show_genres_leaves_an_episode_untouched_when_its_show_was_never_fetched() {
+    fn apply_show_details_leaves_an_episode_untouched_when_its_show_was_never_fetched() {
         let mut ep = movie("2", "/media/y.mkv", &[]);
         ep.kind = "episode".into();
         ep.show_rating_key = Some("no-such-show".into());
         ep.genres = vec![];
         let mut items = vec![ep];
 
-        apply_show_genres(&mut items, &std::collections::HashMap::new());
+        apply_show_details(&mut items, &std::collections::HashMap::new());
 
         assert!(items[0].genres.is_empty());
+        assert!(items[0].show_external_ids.is_empty());
     }
 
     /// A show-subtype container's members are expanded to episode ratingKeys

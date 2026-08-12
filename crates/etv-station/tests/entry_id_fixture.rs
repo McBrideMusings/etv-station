@@ -231,3 +231,33 @@ fn an_unusable_guid_value_is_absent_rather_than_an_identity() {
         "imdb: tt1375666 "
     );
 }
+
+/// #274's fallback for a show with no usable GUID hashes
+/// `/library/metadata/{ratingKey}/children` — the show's own Plex `key`
+/// (its episode-listing endpoint, the resource Plex itself names for a
+/// container record), not `/library/metadata/{ratingKey}` bare. Pinned
+/// against every one of the 10 GUID-less shows in a real `plex-db-ex`
+/// schema-7 snapshot (1,617 shows total), spot-checked 2026-08-12 — this
+/// exact set of rating keys and `fs:` hashes is what that store's own walk
+/// (`plexdb/walk.py`) derived for the same shows, confirming both sides
+/// still agree.
+#[test]
+fn a_guidless_shows_id_matches_plex_db_exs_derivation_for_the_same_shows() {
+    let cases: &[(&str, &str)] = &[
+        ("25546", "fs:7ea66ae69c76e410"),
+        ("26383", "fs:c1a498b24adac30a"),
+        ("168843", "fs:c84d9617554479dc"),
+        ("30370", "fs:74a1e326ba39aa17"),
+        ("31196", "fs:9b848940c9e03baa"),
+        ("105549", "fs:6a36d7a75c2c3cfe"),
+        ("63873", "fs:dc5307b309689fd3"),
+        ("133232", "fs:63340dfa4e5eb586"),
+        ("157592", "fs:7345dc875e803a59"),
+        ("43876", "fs:6edc996d401664c8"),
+    ];
+    for (rk, expect) in cases {
+        let canonical = canonical_path(&format!("/library/metadata/{rk}/children"), &[]);
+        let got = derive_entry_id(&[], &canonical);
+        assert_eq!(&got, expect, "rating key {rk}");
+    }
+}
