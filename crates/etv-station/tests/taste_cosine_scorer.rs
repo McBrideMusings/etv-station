@@ -173,8 +173,9 @@ impl Scorer {
         }
     }
 
-    /// One generation. `exploration_fraction` reaches the script as the pool's
-    /// `config:`; `None` leaves the script's own default in place.
+    /// One generation on a pooled channel — the ordinary case, with no one
+    /// account behind it. `exploration_fraction` reaches the script as the
+    /// pool's `config:`; `None` leaves the script's own default in place.
     fn pick(
         &self,
         pool: &str,
@@ -182,22 +183,7 @@ impl Scorer {
         target_count: usize,
         exploration_fraction: Option<f64>,
     ) -> Vec<PickedItem> {
-        let config = exploration_fraction.map(|f| serde_json::json!({ "exploration_fraction": f }));
-        let inputs = ScoreInputs {
-            target_count,
-            ..Default::default()
-        };
-        pick(
-            &self.cache,
-            &self.script,
-            None,
-            &inputs,
-            seed,
-            pool,
-            config.as_ref(),
-            grant(&self.db),
-        )
-        .unwrap()
+        self.pick_for(pool, seed, target_count, exploration_fraction, None)
     }
 
     /// One generation for a `single_user`-scoped channel (#278):
@@ -212,7 +198,20 @@ impl Scorer {
         target_count: usize,
         account_id: Option<i64>,
     ) -> Vec<PickedItem> {
-        let config = serde_json::json!({ "exploration_fraction": 0.0 });
+        self.pick_for(pool, 0, target_count, Some(0.0), account_id)
+    }
+
+    /// The one call into `score::pick` both of the above make, so the two
+    /// cannot drift apart on how a generation is set up.
+    fn pick_for(
+        &self,
+        pool: &str,
+        seed: u64,
+        target_count: usize,
+        exploration_fraction: Option<f64>,
+        account_id: Option<i64>,
+    ) -> Vec<PickedItem> {
+        let config = exploration_fraction.map(|f| serde_json::json!({ "exploration_fraction": f }));
         let inputs = ScoreInputs {
             target_count,
             account_id,
@@ -223,9 +222,9 @@ impl Scorer {
             &self.script,
             None,
             &inputs,
-            0,
+            seed,
             pool,
-            Some(&config),
+            config.as_ref(),
             grant(&self.db),
         )
         .unwrap()
@@ -284,6 +283,16 @@ fn score_of(picked: &[PickedItem], id: &str) -> f64 {
         .unwrap()
 }
 
+/// A hand-computed cosine score, checked to within float noise. `what` names
+/// whose score it is, so a failure reads as a sentence rather than as two
+/// bare numbers.
+fn assert_close(got: f64, expected: f64, what: &str) {
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "{what} = {got}, expected {expected}"
+    );
+}
+
 /// #278's acceptance criterion: a `single_user` channel ranks on that
 /// account's own vector, not the house's pooled one, and two different
 /// accounts produce two genuinely different rankings — the failure this
@@ -307,30 +316,24 @@ fn a_single_user_channel_ranks_on_that_accounts_vector_not_the_pooled_one() {
 
     // Account 42's own vector: `contact` and `time` at 0.5 each, from its one
     // play of `acct-a` (sqrt(1 play) / 2 keywords).
-    let c42 = score_of(&acct_42, "acct-c");
     let expected_42 = 0.5;
-    assert!(
-        (c42 - expected_42).abs() < 1e-9,
-        "account 42's acct-c score = {c42}, expected {expected_42}"
-    );
+    let c42 = score_of(&acct_42, "acct-c");
+    assert_close(c42, expected_42, "account 42's acct-c score");
 
     // Account 99's own vector: `contact` and `space` at sqrt(2)/2 each, from
     // its two plays (a rewatch) of `acct-b`.
-    let c99 = score_of(&acct_99, "acct-c");
     let expected_99 = 2.0_f64.sqrt() / 2.0;
-    assert!(
-        (c99 - expected_99).abs() < 1e-9,
-        "account 99's acct-c score = {c99}, expected {expected_99}"
-    );
+    let c99 = score_of(&acct_99, "acct-c");
+    assert_close(c99, expected_99, "account 99's acct-c score");
 
     // The pooled vector sums both accounts' contributions to `contact`
     // rather than averaging or picking one — plex-db-ex#39's rollup, summed
     // not normalised per account.
     let cpooled = score_of(&pooled, "acct-c");
-    let expected_pooled = expected_42 + expected_99;
-    assert!(
-        (cpooled - expected_pooled).abs() < 1e-9,
-        "the pooled acct-c score = {cpooled}, expected {expected_pooled}"
+    assert_close(
+        cpooled,
+        expected_42 + expected_99,
+        "the pooled acct-c score",
     );
 
     // Three different numbers, not three labels on the same one — the

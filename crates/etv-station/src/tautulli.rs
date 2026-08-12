@@ -142,6 +142,13 @@ fn is_numeric_id(s: &str) -> bool {
 /// fetch, either way there is no account to rank against, and a scorer
 /// plugin must never quietly fall back to the pooled vector instead (#278's
 /// whole point).
+///
+/// Either branch hands back a Tautulli-space id, not a plex-db-ex-space one —
+/// see [`HistoryRow::user_id`]'s doc for the one account those two id spaces
+/// disagree on. A digit-authored `user:` is just as exposed to that gap as a
+/// name is: it is never checked against the store, so a channel scoped to the
+/// Plex server owner's own numeric id resolves successfully here and then
+/// finds nothing in `plays.plex_account_id` downstream.
 pub fn resolve_account_id(
     scope: &HistoryScope,
     rows: &[HistoryRow],
@@ -156,7 +163,12 @@ pub fn resolve_account_id(
             .iter()
             .find_map(|r| r.user_id)
             .map(Some)
-            .ok_or_else(|| format!("no account found for user {u:?}")),
+            .ok_or_else(|| {
+                format!(
+                    "no account found for user {u:?} (wrong name, or Tautulli was \
+                     unreachable this fetch)"
+                )
+            }),
     }
 }
 
