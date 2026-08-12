@@ -58,6 +58,15 @@ use crate::catalog::{Catalog, CatalogError};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Items per page when paging a section's bulk listing (#195). A live TV
+/// section's `type=4&includeGuids=1` listing is 72,780+ episodes in one
+/// unpaged response — 160MB+ and still arriving when [`HTTP_TIMEOUT`] runs
+/// out. Paging with `X-Plex-Container-Start`/`X-Plex-Container-Size` keeps
+/// every single response to this many items regardless of section size, so
+/// no response ever races the timeout; raising `HTTP_TIMEOUT` instead would
+/// only make the same unbounded response take longer to eventually fail.
+const SECTION_PAGE_SIZE: i64 = 500;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlexIngestError {
     #[error("http: {0}")]
@@ -895,6 +904,26 @@ fn section_list_params<'a>(
     params
 }
 
+/// Whether [`PlexClient::fetch_paged_metadata`] needs another page after the
+/// one it just read.
+///
+/// `next_start` is the container offset already covered (`start + page_len`
+/// for the page just read); `total_size` is that page's own `MediaContainer`
+/// answer, which — per Plex's paging contract, verified live (#195) — stays
+/// the section's true total on every page, not just the first. Continues
+/// only while both hold: `total_size` says more is left, **and** the page
+/// just read was non-empty. The emptiness check matters on its own: a
+/// container reporting a `total_size` this loop can never catch up to (a
+/// miscount, or the library shrinking mid-fetch) would otherwise spin
+/// forever requesting pages that keep coming back with nothing — an empty
+/// page is Plex's own "nothing more here," and that is what actually stops
+/// the loop, `total_size` or no. `total_size` missing entirely (`None`)
+/// falls back to "this page was the whole answer," matching the pre-#195
+/// unpaged behaviour for any endpoint that never sends the field.
+fn has_more_pages(next_start: i64, page_len: i64, total_size: Option<i64>) -> bool {
+    page_len > 0 && next_start < total_size.unwrap_or(next_start)
+}
+
 // ---- HTTP client (thin outer layer) --------------------------------------
 
 struct PlexClient {
@@ -928,11 +957,10 @@ impl PlexClient {
         p.to_string()
     }
 
-    fn get<T: for<'de> Deserialize<'de>>(
-        &self,
-        endpoint: &str,
-        params: &[(&str, &str)],
-    ) -> Result<T, PlexIngestError> {
+    /// The shared request builder behind [`Self::get`] and [`Self::get_paged`]
+    /// — token, `Accept` header, and query params, before either adds its own
+    /// container-paging headers (or doesn't).
+    fn request(&self, endpoint: &str, params: &[(&str, &str)]) -> ureq::Request {
         let url = format!("{}{}", self.base_url, endpoint);
         let mut req = self
             .agent
@@ -942,10 +970,73 @@ impl PlexClient {
         for (k, v) in params {
             req = req.query(k, v);
         }
-        req.call()
+        req
+    }
+
+    fn get<T: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+    ) -> Result<T, PlexIngestError> {
+        self.request(endpoint, params)
+            .call()
             .map_err(|e| PlexIngestError::Http(e.to_string()))?
             .into_json()
             .map_err(|e| PlexIngestError::Parse(e.to_string()))
+    }
+
+    /// Same as [`Self::get`], scoped to one page of a bulk listing via Plex's
+    /// `X-Plex-Container-Start`/`X-Plex-Container-Size` headers (#195) — see
+    /// [`Self::fetch_paged_metadata`] for the loop that drives it.
+    fn get_paged<T: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        start: i64,
+        size: i64,
+    ) -> Result<T, PlexIngestError> {
+        self.request(endpoint, params)
+            .set("X-Plex-Container-Start", &start.to_string())
+            .set("X-Plex-Container-Size", &size.to_string())
+            .call()
+            .map_err(|e| PlexIngestError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| PlexIngestError::Parse(e.to_string()))
+    }
+
+    /// One endpoint's complete `Metadata` list, paged [`SECTION_PAGE_SIZE`] at
+    /// a time so no single response has to arrive within [`HTTP_TIMEOUT`]
+    /// (#195) — a section this large (72,780+ episodes, 160MB+ unpaged) was
+    /// still receiving its one giant response when the whole-request timeout
+    /// ran out. Plex's own `totalSize` on each page — not a short final page
+    /// — is what [`has_more_pages`] uses to end the loop; a page landing
+    /// exactly on `SECTION_PAGE_SIZE` items is not itself proof there is
+    /// nothing left.
+    ///
+    /// The delta filter in `params` (`updatedAt>`/`addedAt>`, when the caller
+    /// passes one) narrows what Plex counts into `totalSize` in the first
+    /// place, so this loop pages exactly as much on a delta pass as on a full
+    /// one — a small delta simply reports a small `totalSize` and finishes in
+    /// one page.
+    fn fetch_paged_metadata(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Vec<PlexMetadata>, PlexIngestError> {
+        let mut all = Vec::new();
+        let mut start: i64 = 0;
+        loop {
+            let resp: MediaContainerResp =
+                self.get_paged(endpoint, params, start, SECTION_PAGE_SIZE)?;
+            let page_len = resp.media_container.metadata.len() as i64;
+            let total_size = resp.media_container.total_size;
+            all.extend(resp.media_container.metadata);
+            start += page_len;
+            if !has_more_pages(start, page_len, total_size) {
+                break;
+            }
+        }
+        Ok(all)
     }
 
     /// Every movie and episode across all library sections, as [`PlexItem`]s.
@@ -1003,32 +1094,27 @@ impl PlexClient {
             };
             let params = section_list_params(section.kind.as_deref(), since_param.as_deref());
             let endpoint = format!("/library/sections/{id}/all");
-            let resp: MediaContainerResp = self.get(&endpoint, &params)?;
+            let metadata = self.fetch_paged_metadata(&endpoint, &params)?;
             // Size of the #134 class: items this section reports with no
             // `updatedAt` at all, and so would be invisible to an
             // `updatedAt>`-only delta. Logged unconditionally (not just on a
             // delta pass) so the class is visible rather than discovered by
             // accident.
-            let missing_updated_at = resp
-                .media_container
-                .metadata
-                .iter()
-                .filter(|m| m.updated_at.is_none())
-                .count();
+            let missing_updated_at = metadata.iter().filter(|m| m.updated_at.is_none()).count();
             if missing_updated_at > 0 {
                 tracing::info!(
                     event = "catalog.ingest.plex_missing_updated_at",
                     section = section.title.as_deref().unwrap_or(""),
                     section_id = %id,
                     missing_updated_at,
-                    total = resp.media_container.metadata.len(),
+                    total = metadata.len(),
                     "items in this section have no updatedAt; reached via addedAt on delta, full sweep otherwise",
                 );
             }
             // Worked out once per section rather than per item — it is a fact
             // about the library, not about anything inside it (#214).
             let kind_override = section_kind_override(section);
-            for m in &resp.media_container.metadata {
+            for m in &metadata {
                 if let Some(item) = to_plex_item(m, section.title.as_deref(), kind_override, |p| {
                     self.translate(p)
                 }) {
@@ -1072,6 +1158,17 @@ impl PlexClient {
     /// every collection in this one `fetch_collections` call, because a show
     /// commonly belongs to more than one collection and its ~45-episode leaf
     /// list is not worth re-fetching for each.
+    ///
+    /// **Deliberately not paged (#195), unlike [`Self::fetch_paged_metadata`]'s
+    /// section listing.** The two requests in here are bounded by a different,
+    /// far smaller count: `/library/sections/{id}/collections` is one row per
+    /// *collection* (137 on the largest live section, verified against the
+    /// production server), not one per item, and the biggest single
+    /// `/children` fetch on that same server is 3,008 members — about 4% of
+    /// the 72,780-episode section listing that actually raced the timeout.
+    /// Neither has anywhere near the item count that made the section listing
+    /// unbounded; if a library's collections ever grow to challenge that, this
+    /// call is the one to revisit.
     fn fetch_collections(
         &self,
         since: Option<i64>,
@@ -1329,6 +1426,16 @@ struct MediaContainerResp {
 struct MediaContainer {
     #[serde(default, rename = "Metadata")]
     metadata: Vec<PlexMetadata>,
+    /// The container's total item count, independent of how many `Metadata`
+    /// entries this particular page carries — Plex's own answer to "is there
+    /// more" for a paged request (#195). Verified live against a paged
+    /// section listing (`X-Plex-Container-Size=3` on a 73,674-item TV
+    /// section): the JSON container carries `totalSize` as a top-level
+    /// sibling of `size`/`offset`/`Metadata`, unaffected by the page size
+    /// requested. `None` on an endpoint that never sends it (or a page
+    /// requested with no container headers at all).
+    #[serde(default, rename = "totalSize")]
+    total_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1588,6 +1695,46 @@ mod tests {
     fn section_list_params_full_pass_has_no_delta_filter() {
         let params = section_list_params(Some("show"), None);
         assert_eq!(params, vec![("type", "4"), ("includeGuids", "1")]);
+    }
+
+    /// #195: a full page (this page's length equals what was requested) with
+    /// more left according to `totalSize` must keep going — this is the exact
+    /// shape of every page but the last on a 72,780-item section paged
+    /// `SECTION_PAGE_SIZE` at a time.
+    #[test]
+    fn has_more_pages_continues_mid_section() {
+        assert!(has_more_pages(500, 500, Some(72_780)));
+    }
+
+    /// The page that lands exactly on the container's `totalSize` is the last
+    /// one — landing exactly on a page-sized boundary must still stop, or the
+    /// loop would issue one guaranteed-empty request per section forever.
+    #[test]
+    fn has_more_pages_stops_at_the_total() {
+        assert!(!has_more_pages(72_780, 500, Some(72_780)));
+    }
+
+    /// A short final page (fewer items than requested) is Plex's other way of
+    /// saying "that's everything" — must stop even if `total_size` disagreed.
+    #[test]
+    fn has_more_pages_stops_on_a_short_page() {
+        assert!(!has_more_pages(72_780, 280, Some(72_780)));
+    }
+
+    /// An empty page always stops the loop, regardless of what `total_size`
+    /// claims — this is what keeps a miscounted or shrinking-mid-fetch
+    /// container from spinning on guaranteed-empty requests forever.
+    #[test]
+    fn has_more_pages_stops_on_an_empty_page_even_if_total_size_disagrees() {
+        assert!(!has_more_pages(500, 0, Some(72_780)));
+    }
+
+    /// An endpoint that never sends `totalSize` at all (unpaged responses,
+    /// pre-#195) must behave exactly like the old unpaged fetch: one request,
+    /// then stop — never loop forever waiting for a total that never arrives.
+    #[test]
+    fn has_more_pages_stops_when_total_size_is_absent() {
+        assert!(!has_more_pages(500, 500, None));
     }
 
     #[test]
