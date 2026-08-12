@@ -798,6 +798,7 @@ fn resolve_block(
             include.constraints.as_ref(),
             &script_path,
             state,
+            seed,
             score_env,
             crate::sequence::Window {
                 from: window_start.unix_timestamp(),

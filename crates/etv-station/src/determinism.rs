@@ -587,6 +587,39 @@ fn pick(ctx) {
 }
 "#;
 
+    /// A scorer that shuffles purely from `ctx.seed` (#255, ADR 0005) —
+    /// no clock read at all — using the same key/sort mixing shape as
+    /// [`WALL_CLOCK_PLUGIN`] above, so the only variable between the two
+    /// fixtures is where the entropy comes from.
+    const CTX_SEED_PLUGIN: &str = r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read"] }
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let ids = [];
+    for item in ctx.sets.movies { ids.push(item.entry_id); }
+
+    // Reduced into the modulus immediately, exactly as the wall-clock
+    // fixture reduces its own reading — `ctx.seed` is a full 63-bit value
+    // and multiplying it by `idx + 1` and 7919 unreduced overflows Rhai's
+    // checked i64 multiplication.
+    let seed = ctx.seed % 999999937;
+
+    let scored = [];
+    let idx = 0;
+    for id in ids {
+        let key = ((seed + 1) * (idx + 1) * 7919) % 999999937;
+        scored.push(#{ id: id, key: key });
+        idx += 1;
+    }
+    scored.sort(|a, b| if a.key < b.key { -1 } else if a.key > b.key { 1 } else { 0 });
+
+    let out = [];
+    for s in scored { out.push(s.id); }
+    out
+}
+"#;
+
     fn plugin_pool(script: &Path) -> Pool {
         Pool {
             name: "movies".into(),
@@ -666,5 +699,39 @@ fn pick(ctx) {
         assert!(diff.entry_a.is_some());
         assert!(diff.entry_b.is_some());
         assert_ne!(diff.entry_a, diff.entry_b);
+    }
+
+    /// The reason `ctx.seed` exists: a scorer that shuffles from it instead
+    /// of Rhai's own wall clock passes the check (#255, ADR 0005) — the
+    /// opposite assertion from the wall-clock fixture above, over an
+    /// otherwise identical mixing shape. The channel starts unseeded, so
+    /// this also covers "an unseeded channel still works": `check` pins one
+    /// fresh seed before either pass, and that pinned value is what reaches
+    /// the script both times.
+    #[test]
+    fn a_plugin_picking_from_ctx_seed_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_plugin(&dir, CTX_SEED_PLUGIN);
+        let ids = ["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"];
+        let catalog_path = dir.path().join("catalog.db");
+        catalog_with_movies(&catalog_path, &ids);
+
+        let cfg = base_channel(
+            RuleConfig {
+                blocks: vec![pattern_block(&script, ids.len())],
+            },
+            None,
+        );
+        assert!(cfg.seed.is_none(), "fixture must start unseeded");
+        let mut station = station_with(
+            "reshuffled",
+            cfg,
+            Some(catalog_path.to_string_lossy().into_owned()),
+        );
+        let report = check(&mut station, "reshuffled").unwrap();
+        assert!(
+            report.is_identical(),
+            "a plugin picking from ctx.seed must reproduce across two passes: {report:?}"
+        );
     }
 }

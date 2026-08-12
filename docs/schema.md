@@ -716,9 +716,9 @@ config load rather than mid-generation:
 #### `capabilities()` — which host inputs a script needs (#167)
 
 Nothing is available to a script ambiently beyond `ctx.pool`, `ctx.config`,
-`ctx.target_count`, `ctx.now`, and `ctx.recent` — the inputs every plugin pool
-has always received. Two more are gated behind a declaration, and a third is
-opened only by name:
+`ctx.target_count`, `ctx.now`, `ctx.recent`, and `ctx.seed` — the inputs every
+plugin pool receives with no declaration at all. Two more are gated behind a
+declaration, and a third is opened only by name:
 
 | Capability | Gates | Declared as |
 |---|---|---|
@@ -761,8 +761,31 @@ of a channel — a `movies` pool and a `shows` pool ranked by the same taste),
 `ctx.target_count` (how many items the generation needs), `ctx.history` (recent
 server-wide watch events, `#{entry_id, watched_at}`; requires `watch_history`),
 `ctx.recent` (what this channel aired most recently, oldest first), `ctx.now`
-(unix seconds at generation time), and `ctx.config` (this pool's `config:`
-block — see below).
+(unix seconds at generation time), `ctx.config` (this pool's `config:`
+block — see below), and `ctx.seed` (the channel's resolved seed mixed with this
+pool's name — see below).
+
+#### `ctx.seed` — reproducible randomness (ADR 0005)
+
+`ctx.seed` is an integer: the channel's resolved `seed` (authored, or a fresh
+value drawn once per generation when unset — #46) mixed with the asking pool's
+name. It is the only source of entropy a script has that survives the
+determinism check below — Rhai's own `timestamp()`/`elapsed()` is the other
+one, and reading either fails the check by design (see "The determinism
+contract").
+
+Two pools of one channel naming the same script get different `ctx.seed`
+values — `examples/samples/foryou.yaml` points a `movies` pool and a `shows`
+pool at one script, and both drawing the same sequence would put their
+exploration slots in lockstep on air, forever. The same channel and the same
+authored seed produce the identical `ctx.seed` across two generations, which
+is what lets a script pick randomly from it and still pass
+`--check-determinism`.
+
+`ctx.seed` is a plain integer, not a PRNG object — a script derives its own
+pick from it with ordinary arithmetic (mix it further, take it modulo a
+candidate count, and so on), the same way `examples/plugins/taste-engine.rhai`
+already does its own ranking math over `ctx`'s other fields.
 
 ### The determinism contract
 

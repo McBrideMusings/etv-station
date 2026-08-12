@@ -58,6 +58,10 @@
 //!     // ctx.history       — recent server-wide watch events
 //!     // ctx.recent        — entry_ids this channel aired most recently
 //!     // ctx.now           — unix seconds at generation time
+//!     // ctx.seed          — this pool's reproducible seed (#255, ADR 0005):
+//!     //                     the channel's resolved seed mixed with the pool's
+//!     //                     name, so a random choice made from it reproduces
+//!     //                     exactly on a second generation
 //!
 //!     // A bare id — everything before #166 already means this:
 //!     // "ghost"
@@ -502,6 +506,11 @@ struct ScoreCtx {
     /// Filled only when `watch_history` was granted — same gate as `sets`.
     history: Option<Dynamic>,
     recent: Dynamic,
+    /// The channel's resolved generation seed, mixed with this pool's name
+    /// (#255, ADR 0005) — the one source of reproducible entropy inside the
+    /// sandbox. Not gated: a `pool_provider` script always receives it, the
+    /// same as `now` or `target_count`.
+    seed: i64,
 }
 
 /// What a script gets back for reading a `ctx` field its pool was not granted
@@ -533,6 +542,9 @@ impl ScoreCtx {
     }
     fn get_recent(&mut self) -> Dynamic {
         self.recent.clone()
+    }
+    fn get_seed(&mut self) -> i64 {
+        self.seed
     }
 }
 
@@ -566,7 +578,8 @@ pub(crate) fn engine() -> Engine {
         .register_get("target_count", ScoreCtx::get_target_count)
         .register_get("now", ScoreCtx::get_now)
         .register_get("history", ScoreCtx::get_history)
-        .register_get("recent", ScoreCtx::get_recent);
+        .register_get("recent", ScoreCtx::get_recent)
+        .register_get("seed", ScoreCtx::get_seed);
     engine
 }
 
@@ -643,6 +656,21 @@ pub struct PickedItem {
     pub take_override: Option<usize>,
 }
 
+/// `ctx.seed` for one pool: the channel's resolved generation seed folded
+/// with a stable hash of the pool's own name, so two pools naming the same
+/// script draw independent sequences while one pool's value is stable across
+/// two generations of the same seed (#255, ADR 0005).
+///
+/// The top bit is cleared so the result is always a non-negative `i64` — a
+/// script picking with `ctx.seed % n` gets an ordinary non-negative modulus
+/// without first needing to know Rhai's `%` follows Rust's sign-of-dividend
+/// rule for negative operands. That costs one bit of the mix's 64, which is
+/// not a meaningful loss of entropy.
+fn mixed_seed(seed: u64, pool_name: &str) -> i64 {
+    let mixed = crate::pattern::mix_seed(seed, crate::catalog::identity::fnv1a_64(pool_name));
+    (mixed & (i64::MAX as u64)) as i64
+}
+
 /// Run a prepared script's `pick()` and return what it chose, in the order it
 /// chose them.
 ///
@@ -660,11 +688,20 @@ pub struct PickedItem {
 /// declares — [`crate::config::validate`] rejects a mismatch at config load —
 /// so this only decides what `ctx.sets` / `ctx.history` resolve to for *this*
 /// call; it never re-reads `capabilities()`.
+///
+/// `seed` is the channel's resolved generation seed — the same value
+/// [`crate::pattern::RollKey`] mixes into the pattern walk's own draws.
+/// [`ctx.seed`](ScoreCtx) mixes it with `pool_name` via
+/// [`crate::pattern::mix_seed`] (#255, ADR 0005), so two pools naming the same
+/// script never draw the same sequence, while one pool's value stays fixed
+/// across two generations of the same seed.
+#[allow(clippy::too_many_arguments)]
 pub fn pick(
     cache: &ScoreCache,
     script_path: &Path,
     sources: Option<&PoolSources>,
     inputs: &ScoreInputs,
+    seed: u64,
     pool_name: &str,
     pool_config: Option<&serde_json::Value>,
     granted: GrantedCapabilities,
@@ -731,6 +768,7 @@ pub fn pick(
                 .map(|id| Dynamic::from(id.clone()))
                 .collect(),
         ),
+        seed: mixed_seed(seed, pool_name),
     };
 
     let picked: Array = engine
@@ -1053,6 +1091,7 @@ mod tests {
             script_path,
             None,
             inputs,
+            0,
             pool_name,
             pool_config,
             GrantedCapabilities {
@@ -1631,6 +1670,7 @@ fn pick(ctx) {
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1661,6 +1701,7 @@ fn pick(ctx) {
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1703,6 +1744,7 @@ fn pick(ctx) {
             &p,
             None,
             &inputs,
+            0,
             "test",
             Some(&cfg),
             GrantedCapabilities::default(),
@@ -1712,6 +1754,73 @@ fn pick(ctx) {
             got.into_iter().map(|p| p.id).collect::<Vec<_>>(),
             vec!["m1"]
         );
+    }
+
+    // ---- ctx.seed (#255, ADR 0005) ------------------------------------------
+
+    /// A script reads back whatever `ctx.seed` resolved to by returning it as
+    /// the (fabricated, catalog-unchecked) picked id — `pick` never validates
+    /// a returned id against the catalog, so this is a normal way to assert
+    /// on a `ctx` field's value, the same trick `ungated_fields_stay_available…`
+    /// above uses for `ctx.config`.
+    fn seed_pick(seed: u64, pool_name: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            "fn sources() { #{} }\nfn pick(ctx) { [ctx.seed.to_string()] }\n",
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let got = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            seed,
+            pool_name,
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        got.into_iter().next().unwrap().id
+    }
+
+    /// Two pools of one channel naming the same script must not draw the
+    /// same sequence (ADR 0005) — `examples/samples/foryou.yaml` points a
+    /// `movies` and a `shows` pool at one script, and both receiving the
+    /// same seed would put their exploration slots in lockstep on air.
+    #[test]
+    fn ctx_seed_differs_by_pool_name() {
+        assert_ne!(seed_pick(42, "movies"), seed_pick(42, "shows"));
+    }
+
+    /// The same channel, the same authored seed, two generations: `ctx.seed`
+    /// is identical — the property #168's generate-twice-and-diff check
+    /// depends on.
+    #[test]
+    fn ctx_seed_is_stable_across_two_calls() {
+        assert_eq!(seed_pick(42, "movies"), seed_pick(42, "movies"));
+    }
+
+    /// Changing the channel's seed changes `ctx.seed` for the same pool —
+    /// the acceptance criterion "changing the seed changes which titles
+    /// landed in those slots" has no chance of holding otherwise.
+    #[test]
+    fn ctx_seed_differs_when_the_channel_seed_differs() {
+        assert_ne!(seed_pick(42, "movies"), seed_pick(43, "movies"));
+    }
+
+    /// Pins the exact mix `ctx.seed` computes — the channel seed and a
+    /// stable hash of the pool name folded through the same SplitMix64 step
+    /// the pattern engine's own `RollKey` uses, with the top bit cleared so
+    /// script arithmetic never has to reckon with a negative `ctx.seed`.
+    /// A regression here is a silent reshuffle of every exploration slot in
+    /// production, not just a test failure.
+    #[test]
+    fn ctx_seed_is_the_channel_seed_mixed_with_the_pool_name() {
+        let mixed = crate::pattern::mix_seed(42, crate::catalog::identity::fnv1a_64("movies"));
+        let expected = (mixed & (i64::MAX as u64)) as i64;
+        assert_eq!(seed_pick(42, "movies"), expected.to_string());
     }
 
     // ---- record return shape (#166) ----------------------------------------
@@ -1729,6 +1838,7 @@ fn pick(ctx) {
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1762,6 +1872,7 @@ fn pick(ctx) {
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1792,6 +1903,7 @@ fn pick(ctx) { [#{ entry_id: "m1", take: 3 }, "m2"] }
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1824,6 +1936,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1853,6 +1966,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
                 &p,
                 None,
                 &ScoreInputs::default(),
+                0,
                 "test",
                 None,
                 GrantedCapabilities::default(),
@@ -1883,6 +1997,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1907,6 +2022,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1935,6 +2051,7 @@ fn pick(ctx) { ["m1", #{ entry_id: "m1" }] }
             &p,
             None,
             &ScoreInputs::default(),
+            0,
             "test",
             None,
             GrantedCapabilities::default(),
@@ -1988,6 +2105,7 @@ fn pick(ctx) {
             path,
             src,
             &ScoreInputs::default(),
+            0,
             "movies",
             None,
             GrantedCapabilities {
