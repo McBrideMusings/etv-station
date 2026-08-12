@@ -128,12 +128,13 @@ pub enum ReconcileOpenError {
 /// failure deep inside [`reconcile`].
 pub fn open_plexdb_readonly(path: impl AsRef<Path>) -> Result<Connection, ReconcileOpenError> {
     let path = path.as_ref();
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
-        |source| ReconcileOpenError::Open {
-            path: path.to_path_buf(),
-            source,
-        },
-    )?;
+    let conn =
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|source| {
+            ReconcileOpenError::Open {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
     let version: Option<i64> = conn
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
             row.get(0)
@@ -232,7 +233,10 @@ pub fn reconcile(
         .keys()
         .filter(|rk| !plexdb_by_rk.contains_key(rk.as_str()))
         .map(|rk| {
-            let title = etv_titles.get(etv_by_rk[rk].as_str()).cloned().unwrap_or_default();
+            let title = etv_titles
+                .get(etv_by_rk[rk].as_str())
+                .cloned()
+                .unwrap_or_default();
             (rk.clone(), title)
         })
         .collect();
@@ -283,16 +287,13 @@ fn fetch_guids(
 ) -> Result<HashMap<String, Vec<(ExternalNs, String)>>, CatalogError> {
     let mut stmt = conn.prepare(sql)?;
     let ns_params: Vec<&str> = RECOGNISED_NAMESPACES.iter().map(|ns| ns.as_str()).collect();
-    let rows = stmt.query_map(
-        rusqlite::params_from_iter(ns_params.iter()),
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ns_params.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
     let mut out: HashMap<String, Vec<(ExternalNs, String)>> = HashMap::new();
     for row in rows {
         let (id, ns, value) = row?;
@@ -414,7 +415,13 @@ mod tests {
         conn
     }
 
-    fn add_item(conn: &Connection, item_id: &str, title: &str, rating_key: &str, guids: &[(ExternalNs, &str)]) {
+    fn add_item(
+        conn: &Connection,
+        item_id: &str,
+        title: &str,
+        rating_key: &str,
+        guids: &[(ExternalNs, &str)],
+    ) {
         conn.execute(
             "INSERT INTO items (item_id, type, title) VALUES (?1, 'movie', ?2)",
             rusqlite::params![item_id, title],
@@ -435,7 +442,13 @@ mod tests {
         }
     }
 
-    fn add_entry(catalog: &Catalog, entry_id: &str, title: &str, rating_key: &str, guids: &[(ExternalNs, &str)]) {
+    fn add_entry(
+        catalog: &Catalog,
+        entry_id: &str,
+        title: &str,
+        rating_key: &str,
+        guids: &[(ExternalNs, &str)],
+    ) {
         catalog
             .upsert_entry(&Entry::new(entry_id, "movie", title, Source::Plex))
             .unwrap();
@@ -457,8 +470,20 @@ mod tests {
     fn matching_titles_agree() {
         let catalog = Catalog::open_in_memory().unwrap();
         let plexdb = plexdb_store();
-        add_entry(&catalog, "imdb:tt1", "Die Hard", "100", &[(ExternalNs::Imdb, "tt1")]);
-        add_item(&plexdb, "imdb:tt1", "Die Hard", "100", &[(ExternalNs::Imdb, "tt1")]);
+        add_entry(
+            &catalog,
+            "imdb:tt1",
+            "Die Hard",
+            "100",
+            &[(ExternalNs::Imdb, "tt1")],
+        );
+        add_item(
+            &plexdb,
+            "imdb:tt1",
+            "Die Hard",
+            "100",
+            &[(ExternalNs::Imdb, "tt1")],
+        );
 
         let report = reconcile(&catalog, &plexdb).unwrap();
 
@@ -474,7 +499,13 @@ mod tests {
         let catalog = Catalog::open_in_memory().unwrap();
         let plexdb = plexdb_store();
         // etv-station only ever recorded the tmdb guid for this rating key.
-        add_entry(&catalog, "tmdb:562", "Die Hard", "100", &[(ExternalNs::Tmdb, "562")]);
+        add_entry(
+            &catalog,
+            "tmdb:562",
+            "Die Hard",
+            "100",
+            &[(ExternalNs::Tmdb, "562")],
+        );
         add_item(
             &plexdb,
             "imdb:tt1",
@@ -492,7 +523,11 @@ mod tests {
         assert_eq!(mismatch.rating_key, "100");
         assert_eq!(mismatch.item_id, "imdb:tt1");
         assert_eq!(mismatch.entry_id, "tmdb:562");
-        assert!(mismatch.reason.contains("imdb GUID is present in plex-db-ex but absent from etv-station"));
+        assert!(
+            mismatch
+                .reason
+                .contains("imdb GUID is present in plex-db-ex but absent from etv-station")
+        );
     }
 
     /// Issue #269 names this the most alarming message the check can emit,
@@ -504,7 +539,13 @@ mod tests {
     fn an_identity_covering_two_rating_keys_is_reported_as_inherited_not_drifted() {
         let catalog = Catalog::open_in_memory().unwrap();
         let plexdb = plexdb_store();
-        add_item(&plexdb, "imdb:tt0047034", "Godzilla", "5550", &[(ExternalNs::Imdb, "tt0047034")]);
+        add_item(
+            &plexdb,
+            "imdb:tt0047034",
+            "Godzilla",
+            "5550",
+            &[(ExternalNs::Imdb, "tt0047034")],
+        );
         // A second rating key that inherited Godzilla's identity — the show
         // Plex reports as The Golden Girls.
         plexdb
@@ -514,7 +555,13 @@ mod tests {
                 [],
             )
             .unwrap();
-        add_entry(&catalog, "imdb:tt0047034", "Godzilla", "5550", &[(ExternalNs::Imdb, "tt0047034")]);
+        add_entry(
+            &catalog,
+            "imdb:tt0047034",
+            "Godzilla",
+            "5550",
+            &[(ExternalNs::Imdb, "tt0047034")],
+        );
         add_entry(
             &catalog,
             "imdb:tt0088526",
@@ -530,7 +577,11 @@ mod tests {
         assert_eq!(mismatch.rating_key, "141718");
         assert!(mismatch.reason.contains("covers 2 Plex rating keys"));
         assert!(mismatch.reason.contains("inherited an identity"));
-        assert!(!mismatch.reason.contains("the derivation rule itself disagrees"));
+        assert!(
+            !mismatch
+                .reason
+                .contains("the derivation rule itself disagrees")
+        );
     }
 
     #[test]
@@ -543,15 +594,31 @@ mod tests {
         let report = reconcile(&catalog, &plexdb).unwrap();
 
         assert_eq!(report.mismatches.len(), 1);
-        assert!(report.mismatches[0].reason.contains("canonical path disagreed"));
+        assert!(
+            report.mismatches[0]
+                .reason
+                .contains("canonical path disagreed")
+        );
     }
 
     #[test]
     fn a_guid_win_against_a_path_hash_is_reported_as_a_missing_guid() {
         let catalog = Catalog::open_in_memory().unwrap();
         let plexdb = plexdb_store();
-        add_item(&plexdb, "imdb:tt9", "Unmatched Elsewhere", "300", &[(ExternalNs::Imdb, "tt9")]);
-        add_entry(&catalog, "fs:cccccccccccccccc", "Unmatched Elsewhere", "300", &[]);
+        add_item(
+            &plexdb,
+            "imdb:tt9",
+            "Unmatched Elsewhere",
+            "300",
+            &[(ExternalNs::Imdb, "tt9")],
+        );
+        add_entry(
+            &catalog,
+            "fs:cccccccccccccccc",
+            "Unmatched Elsewhere",
+            "300",
+            &[],
+        );
 
         let report = reconcile(&catalog, &plexdb).unwrap();
 
@@ -565,14 +632,29 @@ mod tests {
     fn titles_present_in_only_one_store_are_counted_and_listed() {
         let catalog = Catalog::open_in_memory().unwrap();
         let plexdb = plexdb_store();
-        add_item(&plexdb, "imdb:tt1", "Only In Plexdb", "100", &[(ExternalNs::Imdb, "tt1")]);
-        add_entry(&catalog, "imdb:tt2", "Only In Etv", "200", &[(ExternalNs::Imdb, "tt2")]);
+        add_item(
+            &plexdb,
+            "imdb:tt1",
+            "Only In Plexdb",
+            "100",
+            &[(ExternalNs::Imdb, "tt1")],
+        );
+        add_entry(
+            &catalog,
+            "imdb:tt2",
+            "Only In Etv",
+            "200",
+            &[(ExternalNs::Imdb, "tt2")],
+        );
 
         let report = reconcile(&catalog, &plexdb).unwrap();
 
         assert_eq!(report.compared, 0);
         assert!(report.mismatches.is_empty());
-        assert_eq!(report.only_in_etv, vec![("200".to_string(), "Only In Etv".to_string())]);
+        assert_eq!(
+            report.only_in_etv,
+            vec![("200".to_string(), "Only In Etv".to_string())]
+        );
         assert_eq!(
             report.only_in_plexdb,
             vec![("100".to_string(), "Only In Plexdb".to_string())]
@@ -583,7 +665,13 @@ mod tests {
     fn running_it_twice_produces_the_same_report() {
         let catalog = Catalog::open_in_memory().unwrap();
         let plexdb = plexdb_store();
-        add_item(&plexdb, "imdb:tt1", "A", "100", &[(ExternalNs::Imdb, "tt1")]);
+        add_item(
+            &plexdb,
+            "imdb:tt1",
+            "A",
+            "100",
+            &[(ExternalNs::Imdb, "tt1")],
+        );
         add_item(&plexdb, "tmdb:2", "B", "101", &[(ExternalNs::Tmdb, "2")]);
         add_entry(&catalog, "tvdb:9", "A", "100", &[(ExternalNs::Tvdb, "9")]);
         add_entry(&catalog, "tmdb:2", "B", "101", &[(ExternalNs::Tmdb, "2")]);
@@ -618,7 +706,10 @@ mod tests {
         let conn = open_plexdb_readonly(file.path()).expect("open read-only");
         let result = conn.execute("INSERT INTO t (id) VALUES (1)", []);
 
-        assert!(result.is_err(), "a read-only plexdb connection must not accept a write");
+        assert!(
+            result.is_err(),
+            "a read-only plexdb connection must not accept a write"
+        );
     }
 
     #[test]
@@ -635,7 +726,11 @@ mod tests {
                 .expect("build a store at the wrong version");
         }
 
-        let err = open_plexdb_readonly(file.path()).expect_err("wrong schema version must refuse to open");
-        assert!(matches!(err, ReconcileOpenError::UnsupportedSchemaVersion { .. }));
+        let err = open_plexdb_readonly(file.path())
+            .expect_err("wrong schema version must refuse to open");
+        assert!(matches!(
+            err,
+            ReconcileOpenError::UnsupportedSchemaVersion { .. }
+        ));
     }
 }

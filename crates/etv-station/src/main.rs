@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use etv_station::catalog::reconcile_plexdb::{self, ReconcileReport};
 use etv_station::catalog::Catalog;
+use etv_station::catalog::reconcile_plexdb::{self, ReconcileReport};
 use etv_station::{config, daemon, etv_next};
 use tracing_subscriber::EnvFilter;
 
