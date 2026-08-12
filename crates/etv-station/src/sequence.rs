@@ -109,6 +109,12 @@ pub struct Window {
 /// `block_constraints` is the block's own `[constraints]` table, which every
 /// pool that declares none inherits — the same rule a pattern block's pools
 /// follow.
+///
+/// `seed` is the channel's resolved generation seed — the same value a
+/// `pattern` block's `RollKey` mixes into its own draws. A pool inside a
+/// sequencer block is resolved through the same [`crate::pattern::resolve_pool_sources`]
+/// a pattern block uses, so a `plugin:` pool here gets `ctx.seed` exactly as
+/// one under `pattern:` does (#255).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn build(
@@ -118,6 +124,7 @@ pub fn build(
     block_constraints: Option<&Constraints>,
     sequencer: &Path,
     state: &GenerationState,
+    seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
     window: Window,
 ) -> Result<
@@ -129,8 +136,14 @@ pub fn build(
     String,
 > {
     let mut score_cache = crate::score::ScoreCache::default();
-    let pool_id_lists =
-        crate::pattern::resolve_pool_sources(catalog, pools, groups, &mut score_cache, score_env)?;
+    let pool_id_lists = crate::pattern::resolve_pool_sources(
+        catalog,
+        pools,
+        groups,
+        &mut score_cache,
+        seed,
+        score_env,
+    )?;
 
     // Per pool: its bucket_order-sequenced series (kept for the resume
     // derivation below) and its item maps (handed to the script as
@@ -527,6 +540,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -565,6 +579,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 12345,
@@ -619,6 +634,7 @@ fn arrange(ctx) {
             None,
             &script,
             &state,
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -651,6 +667,7 @@ fn arrange(ctx) { ["nonexistent-id"] }
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -683,6 +700,7 @@ fn arrange(ctx) { ["mov-1"] }
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -724,6 +742,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -764,6 +783,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -803,6 +823,7 @@ fn arrange(ctx) { ["mov-1"] }
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -849,6 +870,7 @@ fn arrange(ctx) {
             None,
             &script,
             &state,
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -886,6 +908,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -922,6 +945,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
+            0,
             test_env(),
             Window {
                 from: 0,
@@ -973,6 +997,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
+            0,
             env,
             Window { from, fill: None },
         )

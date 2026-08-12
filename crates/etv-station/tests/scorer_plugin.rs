@@ -15,7 +15,7 @@ use etv_station::config::{
     Advance, BlockInclude, ChannelConfig, Mode, PatternStep, Pool, RuleConfig,
 };
 use etv_station::errors::ConfigError;
-use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
+use etv_station::resolve::{resolve_channel_with_resume, ResolvedItem};
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreInputs, WatchEvent};
 
@@ -337,7 +337,7 @@ fn the_committed_example_plugin_runs() {
         watch_history: true,
     };
     let picked =
-        etv_station::score::pick(&cache, &path, None, &inputs, "movies", None, granted).unwrap();
+        etv_station::score::pick(&cache, &path, None, &inputs, 0, "movies", None, granted).unwrap();
     let ids: Vec<String> = picked.into_iter().map(|p| p.id).collect();
 
     assert!(

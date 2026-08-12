@@ -581,6 +581,18 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Mix two `u64`s into one via the same fixed SplitMix64 step [`splitmix64`]
+/// uses elsewhere, rather than `DefaultHasher`'s unstable-across-builds
+/// output. [`crate::score::pick`] uses this to fold the channel's resolved
+/// `seed` with a hash of the asking pool's name into `ctx.seed` (#255, ADR
+/// 0005) — two pools naming the same script must not draw the same sequence.
+pub(crate) fn mix_seed(a: u64, b: u64) -> u64 {
+    let mut state = a
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(b.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    splitmix64(&mut state)
+}
+
 /// Resolve the pools and walk the pattern, returning the interleaved `entry_id`
 /// list, the resume state to persist for the next window, and every id's
 /// metadata blob (#166) — a plugin pool's `entry_id -> metadata` map, empty
@@ -638,7 +650,8 @@ pub fn build(
     // Two passes, split by whether they read the database — see
     // [`resolve_pool_sources`], which does both.
     let mut score_cache = crate::score::ScoreCache::default();
-    let pool_id_lists = resolve_pool_sources(catalog, pools, groups, &mut score_cache, score_env)?;
+    let pool_id_lists =
+        resolve_pool_sources(catalog, pools, groups, &mut score_cache, seed, score_env)?;
 
     // Pass 3, reads the catalog again: turn each pool's ids into its runtime.
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
@@ -772,6 +785,7 @@ pub(crate) fn resolve_pool_sources(
     pools: &[Pool],
     groups: &[ShowGroup],
     score_cache: &mut crate::score::ScoreCache,
+    seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
 ) -> Result<Vec<Vec<String>>, String> {
     // Pass 1, reads the catalog: resolve every expression pool's ids, and
@@ -843,6 +857,7 @@ pub(crate) fn resolve_pool_sources(
                 &path,
                 cfg.sources.as_ref(),
                 score_env.inputs,
+                seed,
                 &cfg.name,
                 cfg.config.as_ref(),
                 granted,
@@ -3059,6 +3074,7 @@ fn pick(ctx) { [#{ entry_id: "mov-1", take: 3 }, "mov-2"] }
             std::slice::from_ref(&pool),
             &[],
             &mut score_cache,
+            0,
             test_env(),
         )
         .unwrap();
@@ -3116,7 +3132,7 @@ fn pick(ctx) { [#{ entry_id: "mov-1", take: 7 }] }
 
         let mut score_cache = crate::score::ScoreCache::default();
         let pool_id_lists =
-            resolve_pool_sources(&cat, &pools, &[], &mut score_cache, test_env()).unwrap();
+            resolve_pool_sources(&cat, &pools, &[], &mut score_cache, 0, test_env()).unwrap();
 
         let mut runtimes = Vec::new();
         for (cfg, ids) in pools.iter().zip(pool_id_lists) {

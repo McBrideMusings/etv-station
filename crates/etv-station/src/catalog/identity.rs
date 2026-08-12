@@ -116,7 +116,11 @@ pub fn canonical_path(raw: &str, source_roots: &[&str]) -> String {
 /// documented algorithm — an `entry_id` is persisted in `catalog.db` and must
 /// stay stable across Rust toolchain upgrades, which `DefaultHasher` does not
 /// guarantee.
-fn fnv1a_64(s: &str) -> u64 {
+///
+/// `pub(crate)` rather than private to this module: [`crate::score`] reuses it
+/// to fold a pool's name into `ctx.seed` (#255) — the same "stable, not
+/// `DefaultHasher`" requirement a mixed-in string hash needs there too.
+pub(crate) fn fnv1a_64(s: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
