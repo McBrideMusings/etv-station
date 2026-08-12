@@ -1968,9 +1968,8 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         struct FieldVisitor(DatastoreAgeEvent);
         impl Visit for FieldVisitor {
             fn record_u64(&mut self, field: &Field, value: u64) {
-                match field.name() {
-                    "age_secs" => self.0.age_secs = Some(value),
-                    _ => {}
+                if field.name() == "age_secs" {
+                    self.0.age_secs = Some(value);
                 }
             }
             fn record_str(&mut self, field: &Field, value: &str) {

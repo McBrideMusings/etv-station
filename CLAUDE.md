@@ -38,7 +38,7 @@ The common operations:
 ./tools/dev-run.sh                       # run station daemon + ETV-next together (integration test)
 ./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
 cargo test --workspace                   # run workspace tests
-cargo clippy --workspace -- -D clippy::all   # lint (deny all warnings)
+cargo clippy --workspace --all-features --all-targets -- -D clippy::all   # lint, exactly as CI runs it
 cargo +nightly fmt --all                 # format
 bun run docs:dev                         # serve VitePress docs on http://localhost:5193
 ./tools/overlay-test.sh                  # render a Vello overlay onto a bumper fixture and open the mp4
