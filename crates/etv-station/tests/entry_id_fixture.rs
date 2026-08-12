@@ -6,34 +6,41 @@
 //! runtime that they agree, and if they drift every join between that store and
 //! this catalog silently returns nothing — no error on either side.
 //!
-//! So it is enforced by test. Both repositories keep a byte-identical copy of
-//! `tests/fixtures/entry_id.json`, both run every case in it, and both pin its
-//! SHA-256.
+//! So each side runs the same table of cases against its own implementation.
+//! This repository keeps `tests/fixtures/entry_id.json`; plex-db-ex keeps
+//! `tests/fixtures/item_id.json`, which is the same table under its own name for
+//! the id (its top-level key is `item_id_cases` where ours is `entry_id_cases`).
 //!
-//! **What that actually guarantees, stated precisely:** each repository hashes
-//! its *own* copy against its *own* recorded constant, and nothing compares the
-//! two constants to each other. So this catches "the fixture changed here and
-//! somebody did not notice" — the suite goes red until the constant is updated
-//! deliberately. It does **not** make divergence impossible: edit the fixture
-//! *and* its constant here, forget the other repository, and both suites stay
-//! green while the copies disagree. The remaining guard at that point is the
-//! failure message, which names the other repository, and the discipline to
-//! follow it.
+//! **The two files are no longer byte-identical, and only this side pins a
+//! hash.** plex-db-ex removed its pin deliberately and rewrote its ADR-0006 to
+//! say why: the guard made every legitimate case addition a red suite plus a
+//! constant to update, and the version it had pinned this repository's copy,
+//! which made a consumer's state a condition of that store's suite going green.
+//! Its fixture is now "the published spec of the derivation rule" — added to,
+//! never quietly reinterpreted — and nothing hashes it.
+//!
+//! **What the pin below still buys, stated precisely:** it catches an
+//! accidental edit to *our* copy. The suite goes red until the constant is
+//! updated deliberately, so a fixture change is always a thing someone chose.
+//! It says nothing whatsoever about the other repository, and it never did —
+//! each side only ever hashed its own file. Keeping the two tables in agreement
+//! is discipline, not machinery: change a case here and the same case has to be
+//! carried across by hand.
 //!
 //! **The duplication is deliberate.** Do not de-duplicate it. A single copy read
 //! across repositories by relative path holds only while both checkouts sit side
 //! by side, and a clone of this repository alone would *skip* the check rather
-//! than fail it — which is precisely the silence being defended against. The
-//! reasoning is recorded in plex-db-ex ADR-0006.
+//! than fail it — which is precisely the silence being defended against.
 
 use std::path::PathBuf;
 
 use etv_station::catalog::{ExternalNs, canonical_path, derive_entry_id};
 use sha2::{Digest, Sha256};
 
-/// SHA-256 of `tests/fixtures/entry_id.json`. `plex-db-ex` pins the same value
-/// in `tests/test_identity.py`. Changing the fixture means changing both repos
-/// in the same breath and updating this constant in both.
+/// SHA-256 of this repository's own `tests/fixtures/entry_id.json`. Nothing
+/// else records it — plex-db-ex removed its pin (its ADR-0006). Update this
+/// deliberately when you change a case, and carry the same case across to
+/// plex-db-ex's `tests/fixtures/item_id.json` by hand.
 const FIXTURE_SHA256: &str = "845182affd5d0f96430b61332681a6a75eab338ff6342775afdb60ec91f54e91";
 
 /// Resolved from `CARGO_MANIFEST_DIR`, so the test reads nothing outside this
@@ -101,16 +108,19 @@ fn cases<'a>(fixture: &'a serde_json::Value, key: &str) -> &'a Vec<serde_json::V
 }
 
 #[test]
-fn fixture_matches_the_hash_recorded_in_both_repositories() {
+fn the_fixture_matches_its_recorded_hash() {
     let actual = format!("{:x}", Sha256::digest(fixture_bytes()));
     assert_eq!(
         actual, FIXTURE_SHA256,
         "\n\ntests/fixtures/entry_id.json does not match the recorded SHA-256.\n\
-         This file is shared with McBrideMusings/plex-db-ex (tests/fixtures/entry_id.json)\n\
-         and both repositories pin its hash. If you changed it here, the two copies have\n\
-         diverged and every join between that store and this catalog will silently return\n\
-         nothing.\n\n\
-         Copy the new file to the other repository and update the recorded SHA-256 in BOTH.\n"
+         If you changed it on purpose, update FIXTURE_SHA256 in this file to the value\n\
+         above — that is all this check asks for.\n\n\
+         Then carry the same case across by hand. The other implementation of this rule\n\
+         lives in McBrideMusings/plex-db-ex, which keeps its own table at\n\
+         tests/fixtures/item_id.json (same cases, `item_id_cases` where ours is\n\
+         `entry_id_cases`). It does not pin a hash and nothing compares the two files, so\n\
+         if the tables disagree, every join between that store and this catalog silently\n\
+         returns nothing and no suite goes red.\n"
     );
 }
 
