@@ -142,7 +142,7 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
 
     let a = generate_once(
         channel,
-        &station.station.source_roots,
+        &station.station.identity_roots,
         catalog.as_ref(),
         &state,
         &scoring,
@@ -151,7 +151,7 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
     )?;
     let b = generate_once(
         channel,
-        &station.station.source_roots,
+        &station.station.identity_roots,
         catalog.as_ref(),
         &state,
         &scoring,
@@ -168,7 +168,7 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
 /// with no clone and no risk of one pass's call mutating what the other sees.
 fn generate_once(
     channel: &LoadedChannel,
-    source_roots: &[String],
+    identity_roots: &[String],
     catalog: Option<&Catalog>,
     state: &GenerationState,
     scoring: &ScoreInputs,
@@ -178,7 +178,7 @@ fn generate_once(
     let (items, _resume_out) = resolve_channel_with_resume(
         &channel.config,
         &channel.config_path,
-        source_roots,
+        identity_roots,
         None,
         catalog,
         state,
@@ -273,6 +273,7 @@ mod tests {
                 output_base: PathBuf::from("/tmp/out"),
                 channels: Vec::new(),
                 source_roots: Vec::new(),
+                identity_roots: Vec::new(),
                 catalog_path,
                 catalog_refresh_secs: 0,
                 full_sweep_after_secs: 0,

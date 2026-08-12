@@ -34,12 +34,12 @@ async fn a_moved_file_stops_answering_to_the_folder_it_left() {
     let media = tmp.path().join("media");
     let db = tmp.path().join("catalog.db");
     let roots = vec![media.clone()];
-    let source_roots = vec![media.to_string_lossy().into_owned()];
+    let identity_roots = vec![media.to_string_lossy().into_owned()];
 
     touch(&media.join("bumpers/station-bumper-01.mp4"));
 
     let cat = Catalog::open(&db).unwrap();
-    ingest_roots(&cat, &roots, &source_roots).await.unwrap();
+    ingest_roots(&cat, &roots, &identity_roots).await.unwrap();
     assert_eq!(
         cat.resolve_query(r#"item.fs_dir == "bumpers""#)
             .unwrap()
@@ -55,7 +55,7 @@ async fn a_moved_file_stops_answering_to_the_folder_it_left() {
         media.join("commercials/station-bumper-01.mp4"),
     )
     .unwrap();
-    ingest_roots(&cat, &roots, &source_roots).await.unwrap();
+    ingest_roots(&cat, &roots, &identity_roots).await.unwrap();
     drop(cat);
 
     // Read it back the way a channel does: a separate, read-only handle.

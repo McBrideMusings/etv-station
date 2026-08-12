@@ -29,7 +29,11 @@ channels:
 # re-ingests. `ETV_STATION_CATALOG` overrides it at runtime.
 catalog_path: tmp/catalog.db
 
-# `source_roots` is deliberately absent: the mount paths differ per host (a
-# laptop's SMB mount, the container's bind mount, CI's fixture dir) and they are
-# nobody else's business, so they come from ETV_STATION_SOURCE_ROOTS in the
-# gitignored `.env` (colon-separated) rather than being hardcoded here.
+# `source_roots` and `identity_roots` are deliberately absent: the mount paths
+# differ per host (a laptop's SMB mount, the container's bind mount, CI's
+# fixture dir) and they are nobody else's business, so they come from
+# ETV_STATION_SOURCE_ROOTS and ETV_STATION_IDENTITY_ROOTS in the gitignored
+# `.env` (each colon-separated) rather than being hardcoded here. The two are
+# separate decisions (#243): `source_roots` says which directories the daemon
+# scans into the catalog, `identity_roots` says which root to strip when
+# deriving a local item's identity — setting one does not imply the other.

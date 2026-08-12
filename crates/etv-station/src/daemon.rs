@@ -50,6 +50,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // reopened on reload (#96), so a later reload that changes these diverges.
     let opened_catalog_path = station.station.catalog_path.clone();
     let opened_source_roots = station.station.source_roots.clone();
+    let opened_identity_roots = station.station.identity_roots.clone();
     // The station-wide play-history database (#111): one file under
     // `output_base`, shared by every channel and distinguished by a `channel`
     // column, opened once for the same reason the catalog is — every channel
@@ -119,11 +120,12 @@ pub async fn run(station: Station) -> Result<(), StationError> {
             Ok(s) => {
                 if catalog.is_some()
                     && (s.station.catalog_path != opened_catalog_path
-                        || s.station.source_roots != opened_source_roots)
+                        || s.station.source_roots != opened_source_roots
+                        || s.station.identity_roots != opened_identity_roots)
                 {
                     tracing::warn!(
                         event = "config.reload_catalog_divergent",
-                        "reload changes catalog_path/source_roots, but the catalog is opened once at startup and is not reopened; the running catalog and its path index still reflect the config it was opened with — restart to apply",
+                        "reload changes catalog_path/source_roots/identity_roots, but the catalog is opened once at startup and is not reopened; the running catalog and its path index still reflect the config it was opened with — restart to apply",
                     );
                 }
                 tracing::info!(event = "config.reload", config = %config_path.display(), "configuration reloaded");
@@ -172,7 +174,7 @@ struct CatalogInfo {
 #[derive(Clone, Copy)]
 struct StationContext<'a> {
     tz: &'static Tz,
-    source_roots: &'a [String],
+    identity_roots: &'a [String],
     catalog: Option<&'a CatalogInfo>,
     history: &'a SharedHistory,
     /// The station-wide play-history database (#111). Named distinctly from
@@ -448,11 +450,14 @@ async fn open_and_ingest_catalog(
 
     let mut catalog = Catalog::open(path)?;
     let source_roots = &station.station.source_roots;
+    let identity_roots = &station.station.identity_roots;
 
-    // Local filesystem: scan the media roots (identity is canonicalised against
-    // the same roots).
+    // Local filesystem: scan `source_roots` (an operational choice about which
+    // directories this deployment may walk); identity is canonicalised against
+    // `identity_roots` instead — a property of the media layout, not the same
+    // decision (#243).
     let fs_roots: Vec<PathBuf> = source_roots.iter().map(PathBuf::from).collect();
-    match crate::catalog::ingest::fs::ingest_roots(&catalog, &fs_roots, source_roots).await {
+    match crate::catalog::ingest::fs::ingest_roots(&catalog, &fs_roots, identity_roots).await {
         Ok(stats) => tracing::info!(
             event = "catalog.ingest.fs",
             entries = stats.entries_written,
@@ -497,7 +502,7 @@ async fn open_and_ingest_catalog(
                     mode = if since.is_some() { "delta" } else { "full" },
                     "contacting plex to ingest the catalog; a full pass reads the whole library and can take a few minutes",
                 );
-                let roots = source_roots.clone();
+                let roots = identity_roots.clone();
                 let conn = plex.clone();
                 let (returned, ingested) = tokio::task::spawn_blocking(move || {
                     let result =
@@ -524,7 +529,7 @@ async fn open_and_ingest_catalog(
     }
 
     // Build the path-match index once, now that the catalog is fully ingested.
-    let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
+    let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
     let path_index = crate::catalog::ingest::canonical_index(&catalog, &roots)?;
 
     // The writable handle dies here, with the last write this process will make.
@@ -609,7 +614,7 @@ async fn run_generation(
                 let ch = &s.channels[idx];
                 let ctx = StationContext {
                     tz,
-                    source_roots: &s.station.source_roots,
+                    identity_roots: &s.station.identity_roots,
                     catalog: cat.as_deref(),
                     history: &hist,
                     history_db: &hdb,
@@ -1732,7 +1737,7 @@ async fn pattern_catch_up(
             let (items, resume_out) = crate::resolve::resolve_channel_with_resume(
                 &channel.config,
                 &channel.config_path,
-                ctx.source_roots,
+                ctx.identity_roots,
                 ctx.catalog.map(|info| &info.path_index),
                 reader,
                 &state,
@@ -2549,8 +2554,9 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         std::fs::write(dir.path().join("channel.toml"), CHANNEL_BODY).unwrap();
         let station = crate::config::load(&dir.path().join("station.toml")).unwrap();
 
-        // No source_roots + no Plex connection → a clean, empty ingest that still
-        // opens the db and returns a shareable handle. Passing `None` is what
+        // No source_roots, no identity_roots, no Plex connection → a clean,
+        // empty ingest that still opens the db and returns a shareable
+        // handle. Passing `None` is what
         // keeps this hermetic: the dev shell exports `PLEX_URL`/`PLEX_TOKEN`, and
         // an ingest that read them itself would hit a live server. Nothing here
         // touches the process environment, so nothing races another test thread

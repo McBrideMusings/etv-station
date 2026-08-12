@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 /// SHA-256 of `tests/fixtures/entry_id.json`. `plex-db-ex` pins the same value
 /// in `tests/test_identity.py`. Changing the fixture means changing both repos
 /// in the same breath and updating this constant in both.
-const FIXTURE_SHA256: &str = "e2bb9bb35e9d33924bf2bf0c48fffd84c8704da6bc3bdd7f6cf971b3a1adcb88";
+const FIXTURE_SHA256: &str = "845182affd5d0f96430b61332681a6a75eab338ff6342775afdb60ec91f54e91";
 
 /// Resolved from `CARGO_MANIFEST_DIR`, so the test reads nothing outside this
 /// repository and passes in a checkout with no sibling `plex-db-ex`.
