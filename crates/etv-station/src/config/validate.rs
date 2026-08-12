@@ -1,15 +1,24 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use super::block::Duplicates;
 use super::channel::{ChannelConfig, TasteScope};
 use super::constraints::{Constraints, NoRepeatWithin};
 use super::order::Order;
-use super::pool::{Pool, Rotate, ShowGroup, Take, TakeFrom};
+use super::pool::{DatastoreGrant, Pool, Rotate, ShowGroup, Take, TakeFrom};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
 use crate::pattern::{MAX_CYCLES, MAX_TAKE};
+
+/// A datastore that stops being republished stays openable — the file is
+/// still there, still at a schema version this build understands — so
+/// `Reader::open` succeeding proves nothing about whether the sweep that
+/// writes it is still running. Two missed daily publishes is the line
+/// between "ran a little late" and "the pipeline is down and nobody's
+/// looking" (#256).
+const DATASTORE_STALE_AFTER: Duration = Duration::from_secs(48 * 60 * 60);
 
 pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(), ConfigError> {
     if station.channels.is_empty() {
@@ -779,9 +788,72 @@ fn validate_plugin_capabilities(
                 pool.name, grant.name, grant.path
             ))
         })?;
+        log_datastore_age(&pool.name, grant);
     }
 
     Ok(())
+}
+
+/// Logs a granted datastore's age at load — how long since its file was last
+/// written, read from the file's mtime rather than anything inside it. Never
+/// fails the load: an absent file already fails loudly a few lines up in
+/// [`validate_plugin_capabilities`], via `Reader::open`, and a stale-but-open
+/// file is the case this exists for — a stale ranking beats a dark channel
+/// (#256).
+///
+/// `plexdb publish` renames the file into place atomically (plex-db-ex#15),
+/// so mtime marks the publish moment rather than a partial write landing
+/// mid-copy.
+fn log_datastore_age(pool_name: &str, grant: &DatastoreGrant) {
+    let modified = match std::fs::metadata(&grant.path).and_then(|m| m.modified()) {
+        Ok(modified) => modified,
+        Err(e) => {
+            tracing::warn!(
+                event = "datastore.age_unknown",
+                pool = %pool_name,
+                datastore = %grant.name,
+                path = %grant.path,
+                error = %e,
+                "datastore opened, but its modification time could not be read; its age is unknown"
+            );
+            return;
+        }
+    };
+    // A clock behind the file's mtime (skew, or a filesystem that reports a
+    // time in the future) is treated as zero age rather than failing —
+    // logging "unknown age" here would be a worse answer than logging "just
+    // published" for a case this check is not trying to detect.
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO);
+
+    tracing::info!(
+        event = "datastore.age",
+        pool = %pool_name,
+        datastore = %grant.name,
+        path = %grant.path,
+        age_secs = age.as_secs(),
+        "datastore {:?} age at load: {}",
+        grant.name,
+        humantime::format_duration(age),
+    );
+
+    if age > DATASTORE_STALE_AFTER {
+        tracing::warn!(
+            event = "datastore.stale",
+            pool = %pool_name,
+            datastore = %grant.name,
+            path = %grant.path,
+            age_secs = age.as_secs(),
+            threshold_secs = DATASTORE_STALE_AFTER.as_secs(),
+            "datastore {:?} at {:?} has not been updated in {} — past the {} staleness \
+             threshold; still loading it, since a stale ranking beats a dark channel",
+            grant.name,
+            grant.path,
+            humantime::format_duration(age),
+            humantime::format_duration(DATASTORE_STALE_AFTER),
+        );
+    }
 }
 
 /// A block naming a script for `sequencer:` must be able to say the script
@@ -1867,6 +1939,193 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
             msg.contains(&plexdb_reader::SUPPORTED_SCHEMA_VERSION.to_string()),
             "msg = {msg}"
         );
+    }
+
+    // ---- datastore age at load (#256) --------------------------------------
+
+    /// One captured `datastore.*` tracing event, with the structured fields
+    /// the tests below check against — shared by all the age tests since
+    /// each is asking a different question of the same event stream ("did
+    /// this fire", "did it not fire", "what age did it carry").
+    #[derive(Default, Clone, Debug)]
+    struct DatastoreAgeEvent {
+        event: String,
+        age_secs: Option<u64>,
+        path: Option<String>,
+        datastore: Option<String>,
+    }
+
+    /// Runs `f` under a subscriber that records every `datastore.*` event
+    /// emitted, in order, so a test can assert either that one fired with
+    /// specific fields or that none fired at all.
+    fn capture_datastore_age_events<T>(f: impl FnOnce() -> T) -> (T, Vec<DatastoreAgeEvent>) {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct FieldVisitor(DatastoreAgeEvent);
+        impl Visit for FieldVisitor {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                match field.name() {
+                    "age_secs" => self.0.age_secs = Some(value),
+                    _ => {}
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.0.event = value.to_string();
+                }
+            }
+            // `%grant.path` and `%grant.name` (both `String`, via `Display`)
+            // record via `record_debug`, not `record_str` — same reasoning
+            // as the `collection` field captured in
+            // `catalog/ingest/plex.rs`'s tracing tests.
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "path" => self.0.path = Some(format!("{value:?}")),
+                    "datastore" => self.0.datastore = Some(format!("{value:?}")),
+                    _ => {}
+                }
+            }
+        }
+
+        struct CaptureDatastoreEvents(Arc<Mutex<Vec<DatastoreAgeEvent>>>);
+        impl<S: tracing::Subscriber> Layer<S> for CaptureDatastoreEvents {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                if visitor.0.event.starts_with("datastore.") {
+                    self.0.lock().unwrap().push(visitor.0);
+                }
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureDatastoreEvents(Arc::clone(&seen)));
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let events = seen.lock().unwrap().clone();
+        (result, events)
+    }
+
+    /// Sets a file's mtime directly, bypassing the write that would normally
+    /// bump it — the only way to make a fixture read as N hours old without
+    /// actually waiting N hours.
+    fn set_mtime(path: &std::path::Path, when: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// A granted datastore logs its age at load, whatever that age is —
+    /// first acceptance bar for #256. A freshly written fixture's age is
+    /// seconds, not hours.
+    #[test]
+    fn a_datastore_grant_logs_its_age_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("taste.db");
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
+
+        let (result, events) = capture_datastore_age_events(|| {
+            validate_plugin_script_with_capabilities(
+                r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { [#{ datastore: "taste_db" }] }
+"#,
+                vec![],
+                vec![("taste_db", db.to_str().unwrap())],
+            )
+        });
+        result.unwrap();
+
+        let age_event = events
+            .iter()
+            .find(|e| e.event == "datastore.age")
+            .unwrap_or_else(|| panic!("no datastore.age event among {events:?}"));
+        assert_eq!(age_event.datastore.as_deref(), Some("taste_db"));
+        // A generous bound, not a precise one: this is proving the age came
+        // from a fresh mtime rather than a cached/stale value, not timing the
+        // test itself, so it should never flake on a loaded machine.
+        assert!(age_event.age_secs.unwrap() < 60, "events = {events:?}");
+        assert!(!events.iter().any(|e| e.event == "datastore.stale"));
+    }
+
+    /// A snapshot older than 48 hours logs a warning naming both the age and
+    /// the path — second acceptance bar for #256.
+    #[test]
+    fn a_datastore_older_than_48_hours_logs_a_warning_naming_the_age_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("taste.db");
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
+        let fifty_hours_ago = SystemTime::now() - Duration::from_secs(50 * 60 * 60);
+        set_mtime(&db, fifty_hours_ago);
+
+        let (result, events) = capture_datastore_age_events(|| {
+            validate_plugin_script_with_capabilities(
+                r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { [#{ datastore: "taste_db" }] }
+"#,
+                vec![],
+                vec![("taste_db", db.to_str().unwrap())],
+            )
+        });
+        result.unwrap();
+
+        let stale_event = events
+            .iter()
+            .find(|e| e.event == "datastore.stale")
+            .unwrap_or_else(|| panic!("no datastore.stale event among {events:?}"));
+        assert_eq!(stale_event.datastore.as_deref(), Some("taste_db"));
+        assert_eq!(stale_event.path.as_deref(), Some(db.to_str().unwrap()));
+        assert!(
+            stale_event.age_secs.unwrap() >= 50 * 60 * 60,
+            "events = {events:?}"
+        );
+    }
+
+    /// No snapshot age ever refuses the load — verified at an age well past
+    /// the 48-hour threshold. A stale ranking is better than a dark channel;
+    /// the absent-file case already fails loudly via `Reader::open` (#181),
+    /// unchanged by this ticket.
+    #[test]
+    fn no_snapshot_age_prevents_a_load_even_well_past_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("taste.db");
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
+        let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        set_mtime(&db, thirty_days_ago);
+
+        validate_plugin_script_with_capabilities(
+            r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { [#{ datastore: "taste_db" }] }
+"#,
+            vec![],
+            vec![("taste_db", db.to_str().unwrap())],
+        )
+        .unwrap();
+    }
+
+    /// A station granting no datastore anywhere reads no mtime and logs
+    /// nothing about a snapshot — the same "never even reaches the check"
+    /// bar #167 set for the open call itself.
+    #[test]
+    fn a_station_granting_no_datastore_reads_no_mtime_and_logs_nothing_about_a_snapshot() {
+        let (result, events) = capture_datastore_age_events(|| {
+            validate_plugin_script_with_capabilities(
+                r#"fn hooks() { ["pool_provider"] }"#,
+                vec![],
+                vec![],
+            )
+        });
+        result.unwrap();
+        assert!(events.is_empty(), "events = {events:?}");
     }
 
     #[test]

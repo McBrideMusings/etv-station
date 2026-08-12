@@ -34,6 +34,7 @@ What the container supplies, so these files stay host-agnostic:
 | `ETV_STATION_CATALOG` | `/data/catalog.db` | overrides `catalog_path` — a rebuildable cache, not config |
 | `ETV_HLS_OUTPUT` | `/data/hls` | ETV-next's HLS working set |
 | `ETV_PORT` | `8409` | the port the lineup, `channels.m3u`, and `xmltv.xml` are served on |
+| `PLEXDB_SNAPSHOT_PATH` | `/data/plexdb.snapshot.db` | the taste-ranking snapshot a pool's `datastores` grant expands `${PLEXDB_SNAPSHOT_PATH}` to (#256) — the same `/data` mount `ETV_STATION_CATALOG` uses, written by the separate plex-db-ex container (plex-db-ex#43) with no copy step in between |
 
 Under `ETV_STATION_OUTPUT_BASE` the daemon also keeps `history.db` — the
 play-history ledger, one sqlite database shared by every channel (#111).
