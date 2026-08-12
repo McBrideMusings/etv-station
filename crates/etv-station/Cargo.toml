@@ -13,6 +13,7 @@ glob = { workspace = true }
 humantime = { workspace = true }
 humantime-serde = { workspace = true }
 nix = { workspace = true }
+plexdb-reader = { workspace = true }
 regex = { workspace = true }
 rhai = { workspace = true }
 rusqlite = { workspace = true }

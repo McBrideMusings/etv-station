@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/etv-station", "crates/etv-query-test", "crates/etv-overlay"]
+members = ["crates/etv-station", "crates/etv-query-test", "crates/etv-overlay", "vendor/plexdb-reader"]
 exclude = ["vendor/etv-next"]
 resolver = "3"
 
@@ -9,6 +9,7 @@ ersatztv-core = { path = "vendor/etv-next/crates/ersatztv-core" }
 ersatztv-playout = { path = "vendor/etv-next/crates/ersatztv-playout" }
 etv-station = { path = "crates/etv-station" }
 etv-overlay = { path = "crates/etv-overlay" }
+plexdb-reader = { path = "vendor/plexdb-reader" }
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 cel = { version = "0.13", features = ["json"] }
@@ -21,7 +22,7 @@ png = "0.17"
 pollster = "0.4"
 regex = "1"
 rhai = { version = "1.20", features = ["sync", "serde"] }
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions", "limits"] }
 serde = { version = "1", features = ["derive"] }
 # Reports the keys a config file carried that the types do not know, so an
 # unrecognised key can be a warning instead of a refusal to start.

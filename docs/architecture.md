@@ -96,6 +96,16 @@ This replaced a git submodule pointing at a fork (`McBrideMusings/etv-next-stati
 
 The cost: nothing enforces the separation any more. A single commit can now mix a station change and an ETV-next change, which makes the next upstream merge harder to read. Keep them in separate commits.
 
+## Why plexdb-reader is vendored, not a git dependency
+
+`etv-station` links [plex-db-ex](https://github.com/McBrideMusings/plex-db-ex)'s read-only `plexdb-reader` crate to expose enrichment tags, affinity edges, and taste vectors to a Rhai plugin whose channel config granted the datastore capability (#181, `crates/etv-station/src/score.rs`). The crate's `crates/plexdb-reader/{Cargo.toml,src}` sit in this repo, unmodified, under `vendor/plexdb-reader/`, as an ordinary workspace member — not a git dependency:
+
+- `plex-db-ex` is a **private** repository, and neither this repo's CI (`actions/checkout@v4` checks out only `etv-station` itself) nor the Docker build (`cargo build` runs inside the image with no SSH agent forwarded in) carry any credential that could fetch it. A git dependency would build on this machine, where `pierce`'s own SSH key is already trusted, and fail everywhere else.
+- The crate is small (four files, ~760 lines) and self-contained (`rusqlite` + `thiserror`, both already workspace dependencies here), so vendoring the whole `plex-db-ex` repo the way `vendor/etv-next` vendors ErsatzTV/next — with `git subtree pull` — would be pulling in a Python package and its migrations for one Rust crate. It is copied in by hand instead: `cp` the four files from a checkout of `plex-db-ex`'s `crates/plexdb-reader/{Cargo.toml,src}`, verbatim except the manifest's dependency lines, which point at etv-station's own `[workspace.dependencies]` instead of plex-db-ex's.
+- `plexdb_reader::schema::SUPPORTED_SCHEMA_VERSION` still makes schema drift a compile-time-and-load-time question exactly as the etv-next vendoring does: a column the crate reads getting dropped upstream fails this build, and a store at the wrong version fails a granted channel's load naming both versions, never a panic and never a silently empty pool.
+
+The crate's own tests are not vendored — its integration suite shells out to `uv run plexdb init` against a full `plex-db-ex` checkout to build its fixture store, which this repo does not have. `crates/etv-station/tests/datastore_capability.rs` and `config::validate::tests` cover the same ground with their own hand-built fixture stores instead.
+
 ## Why a separate program (not a fork of etv-next)
 
 ETV-next's README is explicit: "Library and metadata management, scheduling and playout creation are not in scope for this project." Forking to add scheduling would mean eating merge conflicts on every pipeline-side PR forever. The companion-program approach keeps ETV-next's pipeline work and `etv-station`'s rule work on independent release cadences.
