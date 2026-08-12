@@ -21,6 +21,7 @@ pub mod ingest;
 pub mod model;
 pub mod order;
 pub mod query;
+pub mod reconcile_plexdb;
 pub mod schema;
 
 use std::collections::HashSet;

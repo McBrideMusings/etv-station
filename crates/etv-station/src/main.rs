@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
+use etv_station::catalog::reconcile_plexdb::{self, ReconcileReport};
+use etv_station::catalog::Catalog;
 use etv_station::{config, daemon, etv_next};
 use tracing_subscriber::EnvFilter;
 
@@ -42,6 +44,15 @@ struct Cli {
     /// or a load/resolve failure.
     #[arg(long, value_name = "CHANNEL")]
     check_determinism: Option<String>,
+
+    /// Compare this station's catalog (`--config`'s `catalog_path`)
+    /// `entry_id` against a `plex-db-ex` snapshot's `item_id`, joined on
+    /// Plex rating key, then exit — a report, never a fix (#269). Both
+    /// databases are opened read-only; every mismatch prints in full, and
+    /// "present in only one store" titles are counted and sampled. Exit
+    /// code is non-zero when anything mismatches.
+    #[arg(long, value_name = "PLEXDB_PATH")]
+    reconcile_plexdb: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -73,6 +84,10 @@ fn main() -> ExitCode {
 
     if let Some(channel) = cli.check_determinism.as_deref() {
         return check_determinism(&cli.config, channel);
+    }
+
+    if let Some(plexdb_path) = cli.reconcile_plexdb.as_deref() {
+        return reconcile_plexdb_cmd(&cli.config, plexdb_path);
     }
 
     init_tracing(cli.log_format);
@@ -220,6 +235,95 @@ fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
             eprintln!("check-determinism: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Load the station config, open its catalog and the named `plex-db-ex`
+/// snapshot both read-only, compare `entry_id` against `item_id`, and print
+/// the report. See `catalog::reconcile_plexdb` (#269) for what the
+/// comparison does and why it lives here rather than in `plex-db-ex`. Exit
+/// code is non-zero when anything mismatches, so this can run as a check
+/// rather than be read by eye.
+fn reconcile_plexdb_cmd(config_path: &Path, plexdb_path: &Path) -> ExitCode {
+    let station = match config::load(config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("reconcile-plexdb: failed to load configuration: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some(catalog_path) = station.station.catalog_path.clone() else {
+        eprintln!(
+            "reconcile-plexdb: station config at {} has no catalog_path set — nothing to compare",
+            config_path.display()
+        );
+        return ExitCode::from(1);
+    };
+    let catalog = match Catalog::open_readonly(&catalog_path) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("reconcile-plexdb: failed to open catalog at {catalog_path}: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let plexdb_conn = match reconcile_plexdb::open_plexdb_readonly(plexdb_path) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("reconcile-plexdb: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let report = match reconcile_plexdb::reconcile(&catalog, &plexdb_conn) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("reconcile-plexdb: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    print_reconcile_report(&report);
+
+    if report.mismatched() > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_reconcile_report(report: &ReconcileReport) {
+    println!(
+        "compared {} title(s) present in both stores: {} agree, {} differ",
+        report.compared,
+        report.agree,
+        report.mismatched(),
+    );
+    for mismatch in &report.mismatches {
+        println!(
+            "  rating_key={} title={:?} entry_id={} item_id={}",
+            mismatch.rating_key, mismatch.title, mismatch.entry_id, mismatch.item_id,
+        );
+        println!("    reason: {}", mismatch.reason);
+    }
+    print_one_sided(
+        "in etv-station only (plex-db-ex never ingested this rating key from Plex)",
+        &report.only_in_etv,
+    );
+    print_one_sided(
+        "in plex-db-ex only (this repository's walk never saw this rating key)",
+        &report.only_in_plexdb,
+    );
+}
+
+fn print_one_sided(label: &str, rows: &[(String, String)]) {
+    println!("{} title(s) {}", rows.len(), label);
+    for (rating_key, title) in rows.iter().take(reconcile_plexdb::ONE_SIDED_SAMPLE_LIMIT) {
+        println!("  rating_key={rating_key} title={title:?}");
+    }
+    if rows.len() > reconcile_plexdb::ONE_SIDED_SAMPLE_LIMIT {
+        println!(
+            "  … and {} more",
+            rows.len() - reconcile_plexdb::ONE_SIDED_SAMPLE_LIMIT
+        );
     }
 }
 
