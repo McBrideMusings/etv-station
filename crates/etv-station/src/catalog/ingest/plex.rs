@@ -680,6 +680,17 @@ fn parse_guid(id: &str) -> Option<(ExternalNs, String)> {
     Some((ns, value.to_string()))
 }
 
+/// Every recognised external id on one Plex metadata record, in the order Plex
+/// reported them; unrecognised schemes and blank values drop out
+/// ([`parse_guid`]). Used for both an item's own ids and, on a show's record,
+/// the ids [`PlexClient::show_details`] hands its episodes.
+fn external_ids_of(m: &PlexMetadata) -> Vec<(ExternalNs, String)> {
+    m.guid
+        .iter()
+        .filter_map(|g| g.id.as_deref().and_then(parse_guid))
+        .collect()
+}
+
 /// The agent Plex reports for a section it matches against nothing — its
 /// **Other Videos** library type, and a Movies library switched to the
 /// personal-media agent, both land here. See [`section_kind_override`].
@@ -732,11 +743,7 @@ fn to_plex_item(
     translate: impl Fn(&str) -> String,
 ) -> Option<PlexItem> {
     let raw_path = m.media.first()?.part.first()?.file.as_deref()?;
-    let external_ids = m
-        .guid
-        .iter()
-        .filter_map(|g| g.id.as_deref().and_then(parse_guid))
-        .collect();
+    let external_ids = external_ids_of(m);
     let reported = m.kind.clone().unwrap_or_else(|| "video".into());
     let kind = match kind_override {
         Some(over) if reported == "movie" => over.to_string(),
@@ -1134,11 +1141,7 @@ impl PlexClient {
             .first()
             .map(|m| ShowDetails {
                 genres: tagged(&m.genre),
-                external_ids: m
-                    .guid
-                    .iter()
-                    .filter_map(|g| g.id.as_deref().and_then(parse_guid))
-                    .collect(),
+                external_ids: external_ids_of(m),
             })
             .unwrap_or_default())
     }
@@ -1259,9 +1262,9 @@ fn apply_show_details(
         let Some(show_key) = &item.show_rating_key else {
             continue;
         };
-        if let Some(d) = details.get(show_key) {
-            item.genres.extend(d.genres.iter().cloned());
-            item.show_external_ids = d.external_ids.clone();
+        if let Some(show) = details.get(show_key) {
+            item.genres.extend(show.genres.iter().cloned());
+            item.show_external_ids = show.external_ids.clone();
         }
     }
 }
@@ -1573,16 +1576,12 @@ mod tests {
     #[test]
     fn episodes_of_one_show_share_a_show_id_derived_from_the_shows_guid_and_movies_have_none() {
         let cat = Catalog::open_in_memory().unwrap();
-        let office_guid = [(ExternalNs::Imdb, "tt0386676")];
         let mut e1 = movie("plex-e1", "/data/media/tv/office/s01e01.mkv", &[]);
         e1.kind = "episode".into();
         e1.title = "Pilot".into();
         e1.show = Some("The Office".into());
         e1.show_rating_key = Some("81044".into());
-        e1.show_external_ids = office_guid
-            .iter()
-            .map(|(ns, v)| (*ns, (*v).to_string()))
-            .collect();
+        e1.show_external_ids = vec![(ExternalNs::Imdb, "tt0386676".to_string())];
         e1.season = Some(1);
         e1.episode = Some(1);
         let mut e2 = movie("plex-e2", "/data/media/tv/office/s02e01.mkv", &[]);
