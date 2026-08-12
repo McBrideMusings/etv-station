@@ -260,6 +260,36 @@ impl HistoryRow {
             .find(|s| !s.is_empty())
             .map(str::to_string)
     }
+
+    /// This row's raw Tautulli username, when the row belongs to `scope`'s
+    /// account — deliberately `user`, never [`Self::watcher`]'s
+    /// friendly-name-first pick, because a Tautulli-configured display name is
+    /// not what plex-db-ex's ADR-0010 confirms agrees with Plex's own
+    /// `/accounts` `name` for the same person; the raw account name is (#281).
+    ///
+    /// A name-authored scope already narrowed every returned row to this one
+    /// account via Tautulli's own `user=` filter ([`HistoryScope::query_param`]),
+    /// so any row answers it. A digit-authored scope's `user_id=` filter does
+    /// the same, but is checked again against the row's own `user_id` here
+    /// rather than trusted blindly — the digit-authored case is the one #281
+    /// exists to get right, so it gets the extra care.
+    ///
+    /// Consumed by [`crate::daemon`]'s Plex-side account id translation, not by
+    /// anything in this module — [`resolve_account_id`] stays Tautulli-only.
+    pub(crate) fn username_for(&self, scope: &HistoryScope) -> Option<&str> {
+        match scope {
+            HistoryScope::AllUsers => None,
+            HistoryScope::User(u) if is_numeric_id(u) => {
+                let id: i64 = u.parse().ok()?;
+                if self.user_id == Some(id) {
+                    self.user.as_deref()
+                } else {
+                    None
+                }
+            }
+            HistoryScope::User(_) => self.user.as_deref(),
+        }
+    }
 }
 
 /// Strip the API key out of anything on its way to a log.
@@ -512,6 +542,20 @@ mod tests {
         }
     }
 
+    /// A row carrying both `user_id` and `user` (#281) — what
+    /// [`HistoryRow::username_for`] reads to translate a Tautulli account into
+    /// the name a Plex `/accounts` lookup needs, distinct from [`row_by`]'s
+    /// `friendly_name`-first fields.
+    fn row_with_account_and_username(user_id: i64, username: &str) -> HistoryRow {
+        HistoryRow {
+            rating_key: Some("plex-1".into()),
+            stopped: Some(100),
+            friendly_name: None,
+            user: Some(username.to_string()),
+            user_id: Some(user_id),
+        }
+    }
+
     /// `friendly_name` wins because it is the name a person recognises — on
     /// this server the account spelled `bob` displays as `Bob Example`.
     #[test]
@@ -708,6 +752,58 @@ mod tests {
         let err =
             resolve_account_id(&HistoryScope::User("carol".into()), &[unattributed]).unwrap_err();
         assert!(err.contains("carol"));
+    }
+
+    // ---- HistoryRow::username_for (#281) --------------------------------
+
+    /// The pooled scope names nobody, so there is no username to translate.
+    #[test]
+    fn username_for_all_users_is_always_none() {
+        let rows = [row_with_account_and_username(501, "carol")];
+        assert_eq!(HistoryScope::AllUsers.query_param(), None);
+        assert_eq!(rows[0].username_for(&HistoryScope::AllUsers), None);
+    }
+
+    /// A name-authored scope trusts any row — Tautulli's own `user=` filter
+    /// already narrowed every returned row to this one account.
+    #[test]
+    fn username_for_a_name_scope_reads_any_rows_username() {
+        let rows = [row_with_account_and_username(501, "carol")];
+        assert_eq!(
+            rows[0].username_for(&HistoryScope::User("carol".into())),
+            Some("carol"),
+        );
+    }
+
+    /// A digit-authored scope only reads a row whose own `user_id` matches the
+    /// configured id — the extra check #281 needs, since a digit-authored
+    /// scope's `user_id=` filter is the one case this whole ticket is about
+    /// getting right rather than trusting blindly.
+    #[test]
+    fn username_for_a_digit_scope_checks_the_rows_own_user_id() {
+        let matching = row_with_account_and_username(501, "carol");
+        assert_eq!(
+            matching.username_for(&HistoryScope::User("501".into())),
+            Some("carol"),
+        );
+
+        let mismatched = row_with_account_and_username(999, "someone_else");
+        assert_eq!(
+            mismatched.username_for(&HistoryScope::User("501".into())),
+            None,
+            "a row for a different account must not answer this scope",
+        );
+    }
+
+    /// A row with no `user` field (anonymised, or a Tautulli version that
+    /// omits it) has no username to hand back, matched-id or not.
+    #[test]
+    fn username_for_a_row_naming_nobody_is_none() {
+        let unattributed = row_with_account(501);
+        assert_eq!(
+            unattributed.username_for(&HistoryScope::User("501".into())),
+            None,
+        );
     }
 
     #[test]

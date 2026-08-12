@@ -95,6 +95,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
             tz,
             catalog.as_ref(),
             &history_db,
+            plex.as_ref(),
             &shutdown,
             &reload,
         )
@@ -214,11 +215,15 @@ struct StationContext<'a> {
 /// against each other, which is the behaviour worth having when the alternative
 /// is three simultaneous thousand-row requests.
 ///
-/// A `single_user` scope's fetch also resolves that account's numeric id
-/// (#278), cached alongside its events and read back through
+/// A `single_user` scope's fetch also resolves that account's **Plex** id
+/// (#278, #281), cached alongside its events and read back through
 /// [`Self::account_id`] — a scorer plugin needs the id, not the events, to
 /// rank against one person's [`plexdb_reader::Reader::taste_vector_for`]
-/// rather than the pooled vector.
+/// rather than the pooled vector. It is Plex's own id, not Tautulli's: the two
+/// disagree for exactly one account, the server's owner (plex-db-ex
+/// ADR-0010), so [`Self::resolve_account_id`] translates through Plex's own
+/// `/accounts` rather than handing a scorer plugin the raw Tautulli id
+/// [`crate::tautulli::resolve_account_id`] finds.
 struct SharedHistory {
     /// What to join fetched rows against, and — because it is `None` whenever
     /// this generation has no reader for the result — the switch that decides
@@ -238,6 +243,14 @@ struct SharedHistory {
     /// what lets a test exercise that path without mutating the process
     /// (#132).
     tautulli: Option<(String, String)>,
+    /// The Plex connection to resolve a `single_user` scope's account id
+    /// against (#281), resolved from the environment once by the caller —
+    /// the same [`crate::catalog::ingest::plex::PlexEnv`] the catalog ingest
+    /// uses. `None` — an unconfigured Plex — makes a `single_user` channel's
+    /// scorer plugin fail its generation loudly naming the user, the same as
+    /// an account Plex's own `/accounts` does not recognise: there is no
+    /// pooled-vector fallback to degrade to.
+    plex: Option<crate::catalog::ingest::plex::PlexEnv>,
     /// How long a fetched history is reused before the next channel to ask
     /// refetches. Set to the shortest `roll_interval` on the station, so no
     /// channel ever sees a history older than one of its own ticks.
@@ -252,13 +265,15 @@ struct HistoryCache {
     /// `None` until the first fetch. Tokio's clock, so tests can advance it.
     fetched_at: Option<tokio::time::Instant>,
     events: Arc<[crate::score::WatchEvent]>,
-    /// The account id this scope's fetch resolved (#278), cached alongside
-    /// `events` since both come from the same fetch and age together. `Err`
-    /// names the user a `single_user` name-scope's fetch could not resolve —
-    /// see [`crate::tautulli::resolve_account_id`]. `Ok(None)` before the
-    /// first fetch, the same as an unset field would default to, since a
-    /// scope with no catalog to fetch against never resolves to anything
-    /// more interesting than "nothing to report" anyway.
+    /// The **Plex** account id this scope's fetch resolved (#278, #281),
+    /// cached alongside `events` since both come from the same fetch and age
+    /// together. `Err` names the user when nothing resolved — a Tautulli
+    /// account [`crate::tautulli::resolve_account_id`] could not find, no
+    /// Plex configured to translate it, or a Tautulli account Plex's own
+    /// `/accounts` does not recognise; see [`SharedHistory::resolve_account_id`].
+    /// `Ok(None)` before the first fetch, the same as an unset field would
+    /// default to, since a scope with no catalog to fetch against never
+    /// resolves to anything more interesting than "nothing to report" anyway.
     account_id: Result<Option<i64>, String>,
 }
 
@@ -276,11 +291,13 @@ impl SharedHistory {
     fn new(
         catalog: Option<Arc<CatalogInfo>>,
         tautulli: Option<(String, String)>,
+        plex: Option<crate::catalog::ingest::plex::PlexEnv>,
         refresh_after: Duration,
     ) -> Self {
         Self {
             catalog,
             tautulli,
+            plex,
             refresh_after,
             state: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -298,17 +315,19 @@ impl SharedHistory {
         self.refresh(scope).await.0
     }
 
-    /// The account id `scope` resolves to right now (#278), from the same
-    /// fetch [`Self::current`] uses — read back rather than fetched a second
-    /// time.
+    /// The **Plex** account id `scope` resolves to right now (#278, #281),
+    /// from the same fetch [`Self::current`] uses — read back rather than
+    /// fetched a second time.
     ///
     /// `Ok(None)` for [`HistoryScope::AllUsers`]. `Err` names the user when a
-    /// `single_user` name-scope's fetch found no account to resolve to —
-    /// whether the name is wrong or Tautulli was unreachable this fetch,
-    /// either way there is no id to hand a scorer plugin, and the caller must
-    /// fail the generation loudly rather than let `ctx.account_id` arrive as
-    /// unit and read like a pooled channel. Only worth calling for a channel
-    /// that names a scorer plugin — nothing else reads the result.
+    /// `single_user` scope could not be resolved all the way to a Plex
+    /// account id — a Tautulli account Tautulli itself does not recognise, no
+    /// `PLEX_URL`/`PLEX_TOKEN` configured to translate it, or a Tautulli
+    /// account Plex's own `/accounts` does not recognise. Either way there is
+    /// no id to hand a scorer plugin, and the caller must fail the generation
+    /// loudly rather than let `ctx.account_id` arrive as unit and read like a
+    /// pooled channel. Only worth calling for a channel that names a scorer
+    /// plugin — nothing else reads the result.
     async fn account_id(&self, scope: &HistoryScope) -> Result<Option<i64>, String> {
         self.refresh(scope).await.1
     }
@@ -322,13 +341,15 @@ impl SharedHistory {
         scope: &HistoryScope,
     ) -> (Arc<[crate::score::WatchEvent]>, Result<Option<i64>, String>) {
         let Some(sc) = self.catalog.as_ref() else {
-            // Nothing to join rows against, and — for a digit-authored
-            // `single_user` scope — nothing needed to resolve one either;
-            // `resolve_account_id` parses that case with no rows consulted.
-            return (
-                Arc::from(Vec::new()),
-                crate::tautulli::resolve_account_id(scope, &[]),
-            );
+            // Nothing to join rows against, so no Tautulli fetch runs here —
+            // unchanged from before #281. A `single_user` scope's account id
+            // still has to be resolved (#278), and #281 needs a live Plex
+            // `/accounts` fetch to do it, run with no rows to fall back on: a
+            // scope whose config value doesn't directly match a Plex account
+            // id/name fails loudly here, exactly as a name-scope already did
+            // in this configuration before #281.
+            let account_id = self.resolve_account_id(scope, &[]).await;
+            return (Arc::from(Vec::new()), account_id);
         };
         let mut state = self.state.lock().await;
         let cache = state.entry(scope.clone()).or_default();
@@ -355,9 +376,10 @@ impl SharedHistory {
             None => Vec::new(),
         };
         // Resolved from `rows` before they are moved into the join below
-        // (#278) — the only place on this side a username maps to an id, and
-        // a digit-authored scope never even looks at `rows` to answer it.
-        let account_id = crate::tautulli::resolve_account_id(scope, &rows);
+        // (#278, #281) — the only place on this side a username maps to an
+        // id, and a digit-authored scope that matches a Plex account id
+        // directly never even looks at `rows` to answer it.
+        let account_id = self.resolve_account_id(scope, &rows).await;
         let events = if rows.is_empty() {
             // No rows is the ordinary state, not a corner: a station with no
             // `TAUTULLI_URL`/`TAUTULLI_API_KEY` never asks for any, and a
@@ -399,6 +421,112 @@ impl SharedHistory {
         cache.fetched_at = Some(tokio::time::Instant::now());
         (Arc::clone(&cache.events), cache.account_id.clone())
     }
+
+    /// The **Plex** account id `scope` resolves to (#281) — `Ok(None)` for
+    /// [`HistoryScope::AllUsers`].
+    ///
+    /// Starts from [`crate::tautulli::resolve_account_id`]'s Tautulli-space id
+    /// (#278, unchanged — that function's job is narrowing the Tautulli
+    /// fetch and validating the account exists there, not taste) and
+    /// translates it into Plex's own id space, since the two only disagree
+    /// for one account: the server's owner, whom Plex's own history stores
+    /// under a small server-local id while Tautulli reports the same person
+    /// under their much larger plex.tv id (plex-db-ex ADR-0010). A `single_user`
+    /// channel's scorer plugin ranks against
+    /// `plexdb_reader::Reader::taste_vector_for`, which is keyed on *Plex's*
+    /// id, so handing it the raw Tautulli id is exactly #281's silent bug.
+    ///
+    /// Two steps, direct then fallback, so every account except the owner
+    /// resolves with no Tautulli row needed at all — unchanged from before
+    /// #281:
+    /// 1. **Direct.** The Tautulli-resolved id, checked against Plex's own
+    ///    `/accounts` by id. Every account agrees on id except the owner, so
+    ///    this is the only step most accounts ever need.
+    /// 2. **Fallback**, only when the direct check misses. `rows`' Tautulli
+    ///    username for this scope ([`crate::tautulli::HistoryRow::username_for`])
+    ///    matched against a Plex account's *name* — the one field
+    ///    plex-db-ex's own name join (ADR-0010) confirms agrees between the
+    ///    two systems. `rows` is what this refresh already fetched; no
+    ///    second Tautulli call.
+    ///
+    /// `Err`, naming the user, when: `resolve_account_id` itself failed; this
+    /// station has no `PLEX_URL`/`PLEX_TOKEN` to translate with; Plex was
+    /// unreachable; or neither step above found a match. Never a silent
+    /// `Ok(None)` for a `single_user` scope — that is what let a `single_user`
+    /// channel rank against an empty vector without anything in the logs
+    /// saying why (#281's whole point, same rule #278 set for the Tautulli
+    /// side).
+    async fn resolve_account_id(
+        &self,
+        scope: &HistoryScope,
+        rows: &[crate::tautulli::HistoryRow],
+    ) -> Result<Option<i64>, String> {
+        let Some(tautulli_id) = crate::tautulli::resolve_account_id(scope, rows)? else {
+            return Ok(None);
+        };
+        let Some(env) = self.plex.clone() else {
+            return Err(format!(
+                "taste_scope: single_user resolved a Tautulli account ({tautulli_id}) but this \
+                 station has no PLEX_URL/PLEX_TOKEN configured to translate it into a Plex \
+                 account id (#281)",
+            ));
+        };
+        let accounts =
+            tokio::task::spawn_blocking(move || crate::catalog::ingest::plex::fetch_accounts(&env))
+                .await
+                .map_err(|e| format!("plex accounts fetch panicked: {e}"))?
+                .map_err(|e| {
+                    format!("fetching plex accounts to resolve a taste_scope account id: {e}")
+                })?;
+
+        translate_tautulli_id_to_plex(tautulli_id, scope, rows, &accounts).map(Some)
+    }
+}
+
+/// The pure core of [`SharedHistory::resolve_account_id`]'s Plex-side
+/// translation (#281) — split out from the HTTP-fetching wrapper above so the
+/// direct/fallback decision is unit-tested without a live Plex server, the
+/// same "pure core, thin HTTP wrapper" split [`crate::catalog::ingest::plex`]
+/// already uses.
+///
+/// `tautulli_id` is what [`crate::tautulli::resolve_account_id`] already
+/// resolved for `scope`; `accounts` is a live `/accounts` listing. Direct
+/// match by id first (every account except the owner), then a fallback
+/// through `rows`' Tautulli username for `scope` matched by Plex account
+/// name — see [`SharedHistory::resolve_account_id`]'s doc for why each step
+/// exists.
+fn translate_tautulli_id_to_plex(
+    tautulli_id: i64,
+    scope: &HistoryScope,
+    rows: &[crate::tautulli::HistoryRow],
+    accounts: &[crate::catalog::ingest::plex::PlexAccount],
+) -> Result<i64, String> {
+    // Direct: the Tautulli id already IS the Plex id for every account except
+    // the owner (#281's own diagnosis).
+    if let Some(account) = accounts.iter().find(|a| a.id == tautulli_id) {
+        return Ok(account.id);
+    }
+
+    // Fallback: translate through the Tautulli username this scope's rows
+    // report, matched against a Plex account's name.
+    let Some(username) = rows.iter().find_map(|r| r.username_for(scope)) else {
+        return Err(format!(
+            "no Plex account has id {tautulli_id} (Tautulli's account id for this scope), and \
+             no recent Tautulli row named the account to translate its username instead — \
+             regenerate once the account has recent watch history, or reconfigure `user:` with \
+             the account's Plex name directly",
+        ));
+    };
+    accounts
+        .iter()
+        .find(|a| a.name == username)
+        .map(|a| a.id)
+        .ok_or_else(|| {
+            format!(
+                "no Plex account is named {username:?} (this station's Tautulli username for \
+                 the account this scope resolved to Tautulli id {tautulli_id})",
+            )
+        })
 }
 
 /// The catalog this generation's [`SharedHistory`] should join watch rows
@@ -615,6 +743,7 @@ async fn run_generation(
     tz: &'static Tz,
     catalog: Option<&Arc<CatalogInfo>>,
     history_db: &Arc<HistoryDb>,
+    plex: Option<&crate::catalog::ingest::plex::PlexEnv>,
     shutdown: &Notify,
     reload: &Notify,
 ) -> (bool, Option<StationError>) {
@@ -630,6 +759,9 @@ async fn run_generation(
         history_catalog(&station.channels, catalog),
         // The one read of `TAUTULLI_URL`/`TAUTULLI_API_KEY` in the daemon (#132).
         crate::tautulli::credentials_from_env(),
+        // The same `PLEX_URL`/`PLEX_TOKEN` connection the catalog ingest used
+        // at startup (#281) — not a second read of the environment.
+        plex.cloned(),
         station
             .channels
             .iter()
@@ -2259,7 +2391,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn every_channel_in_one_tick_shares_a_single_fetch() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
 
         // Four channels, each asking at the top of its own tick. The clock moves
         // a second between them — well inside the hour-long window, but enough
@@ -2292,7 +2424,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn the_next_tick_refetches_once_the_window_has_passed() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(60));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(60));
 
         let first = history.current(&HistoryScope::AllUsers).await;
         let first_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
@@ -2329,7 +2461,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn two_scopes_do_not_serve_each_other_the_wrong_history() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
 
         let pierce = HistoryScope::User("Pierce".to_string());
         let madi = HistoryScope::User("Madi".to_string());
@@ -2369,7 +2501,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn channels_sharing_one_audience_share_one_fetch() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
         let pierce = HistoryScope::User("Pierce".to_string());
 
         let first = history.current(&pierce).await;
@@ -2401,7 +2533,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn one_scope_expiring_does_not_refetch_the_others() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(60));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(60));
         let pierce = HistoryScope::User("Pierce".to_string());
 
         history.current(&HistoryScope::AllUsers).await;
@@ -2436,18 +2568,26 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn account_id_for_all_users_is_always_none() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
         assert_eq!(history.account_id(&HistoryScope::AllUsers).await, Ok(None));
     }
 
-    /// A digit-authored `single_user` scope resolves with no catalog and no
-    /// Tautulli connection at all — it needs no row, only its own config
-    /// value, exactly as `resolve_account_id` documents.
+    /// A digit-authored `single_user` scope's Tautulli id resolves with no
+    /// catalog and no Tautulli connection at all — `resolve_account_id`
+    /// needs no row for that half. But #281 requires translating it into
+    /// Plex's own id space before it can become `ctx.account_id`, and with no
+    /// `PLEX_URL`/`PLEX_TOKEN` configured there is nothing to translate
+    /// against — the digit must not be trusted as already being the Plex id,
+    /// which is exactly the silent bug #281 exists to close.
     #[tokio::test(start_paused = true)]
-    async fn account_id_for_a_digit_scope_needs_no_catalog() {
-        let history = SharedHistory::new(None, None, Duration::ZERO);
+    async fn account_id_for_a_digit_scope_fails_with_no_plex_configured() {
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
         let scope = HistoryScope::User("501".to_string());
-        assert_eq!(history.account_id(&scope).await, Ok(Some(501)));
+        let err = history.account_id(&scope).await.unwrap_err();
+        assert!(
+            err.contains("PLEX_URL") || err.contains("PLEX_TOKEN"),
+            "must say why nothing could be translated: {err}",
+        );
     }
 
     /// A name-authored `single_user` scope with nothing to resolve it from —
@@ -2456,7 +2596,7 @@ mod shared_history_tests {
     /// "use the pooled vector".
     #[tokio::test(start_paused = true)]
     async fn account_id_for_a_name_scope_with_no_catalog_fails_naming_the_user() {
-        let history = SharedHistory::new(None, None, Duration::ZERO);
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
         let scope = HistoryScope::User("Pierce".to_string());
         let err = history.account_id(&scope).await.unwrap_err();
         assert!(err.contains("Pierce"), "must name the user: {err}");
@@ -2469,7 +2609,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn account_id_for_a_name_scope_with_an_empty_fetch_fails_naming_the_user() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
         let scope = HistoryScope::User("Madi".to_string());
         let err = history.account_id(&scope).await.unwrap_err();
         assert!(err.contains("Madi"), "must name the user: {err}");
@@ -2481,7 +2621,7 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn account_id_reads_the_same_fetch_current_already_ran() {
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
         let scope = HistoryScope::User("Pierce".to_string());
 
         history.current(&scope).await;
@@ -2503,7 +2643,7 @@ mod shared_history_tests {
     /// `fetched_at`.
     #[tokio::test(start_paused = true)]
     async fn a_station_with_no_catalog_never_fetches() {
-        let history = SharedHistory::new(None, None, Duration::ZERO);
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
 
         assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
         assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
@@ -2522,7 +2662,7 @@ mod shared_history_tests {
     async fn no_rows_logs_no_join_event() {
         let (joins, _guard) = count_events("tautulli.join");
         let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
 
         assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
         assert_eq!(
@@ -2551,7 +2691,7 @@ mod shared_history_tests {
             Catalog::open_readonly(&info.path).is_err(),
             "the observation only works if opening this catalog really does fail",
         );
-        let history = SharedHistory::new(Some(info), None, Duration::from_secs(3600));
+        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
 
         assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
         assert_eq!(
@@ -2559,6 +2699,106 @@ mod shared_history_tests {
             0,
             "a fetch that produced no rows must not open a catalog reader",
         );
+    }
+
+    // ---- translate_tautulli_id_to_plex (#281) --------------------------------
+
+    fn plex_account(id: i64, name: &str) -> crate::catalog::ingest::plex::PlexAccount {
+        crate::catalog::ingest::plex::PlexAccount {
+            id,
+            name: name.to_string(),
+        }
+    }
+
+    /// A row carrying `user_id` and `user` — built through `HistoryRow`'s own
+    /// `Deserialize` impl since its fields are private to `tautulli.rs`; every
+    /// field is `#[serde(default)]`, so a row naming just these two is valid.
+    fn history_row(user_id: i64, user: &str) -> crate::tautulli::HistoryRow {
+        serde_json::from_str(&format!(r#"{{"user_id": {user_id}, "user": {user:?}}}"#)).unwrap()
+    }
+
+    /// The common case, and the one #281 must not regress: for every account
+    /// except the owner, the Tautulli id already IS the Plex id, so a direct
+    /// match resolves with no row consulted at all.
+    #[test]
+    fn direct_match_needs_no_rows() {
+        let accounts = [plex_account(1, "pierce"), plex_account(12345, "carol")];
+        assert_eq!(
+            translate_tautulli_id_to_plex(
+                12345,
+                &HistoryScope::User("12345".into()),
+                &[],
+                &accounts,
+            ),
+            Ok(12345),
+        );
+    }
+
+    /// The owner's exact mismatch #281 exists to fix: Tautulli's much larger
+    /// plex.tv id matches no Plex account directly, so the fallback reads the
+    /// row's Tautulli username and matches it against Plex's account name
+    /// instead — landing on Plex's own small server-local id.
+    #[test]
+    fn fallback_translates_through_the_tautulli_username() {
+        let accounts = [plex_account(1, "pierce"), plex_account(12345, "carol")];
+        let scope = HistoryScope::User("22831969".into());
+        let rows = [history_row(22831969, "pierce")];
+        assert_eq!(
+            translate_tautulli_id_to_plex(22831969, &scope, &rows, &accounts),
+            Ok(1)
+        );
+    }
+
+    /// The same fallback for a name-authored scope: any row answers it, since
+    /// Tautulli's own `user=` filter already narrowed every row to this one
+    /// account.
+    #[test]
+    fn fallback_works_for_a_name_authored_scope_too() {
+        let accounts = [plex_account(1, "pierce")];
+        let scope = HistoryScope::User("pierce".into());
+        let rows = [history_row(22831969, "pierce")];
+        assert_eq!(
+            translate_tautulli_id_to_plex(22831969, &scope, &rows, &accounts),
+            Ok(1)
+        );
+    }
+
+    /// Neither a direct id match nor a row to translate from — the exact
+    /// combination #281's own "digit scope with no recent plays" limitation
+    /// produces. Must fail naming the Tautulli id, not silently degrade.
+    #[test]
+    fn no_direct_match_and_no_row_fails_naming_the_tautulli_id() {
+        let accounts = [plex_account(1, "pierce")];
+        let scope = HistoryScope::User("22831969".into());
+        let err = translate_tautulli_id_to_plex(22831969, &scope, &[], &accounts).unwrap_err();
+        assert!(
+            err.contains("22831969"),
+            "must name the unresolved Tautulli id: {err}"
+        );
+    }
+
+    /// A row names a username, but nothing in Plex's own `/accounts` carries
+    /// that name — a real config error (a typo, a renamed account) must fail
+    /// naming what was actually looked up, not the id that already failed.
+    #[test]
+    fn fallback_with_no_matching_plex_account_fails_naming_the_username() {
+        let accounts = [plex_account(1, "someone_else")];
+        let scope = HistoryScope::User("22831969".into());
+        let rows = [history_row(22831969, "pierce")];
+        let err = translate_tautulli_id_to_plex(22831969, &scope, &rows, &accounts).unwrap_err();
+        assert!(err.contains("pierce"), "must name the username: {err}");
+    }
+
+    /// Id 0 must never be reachable as a direct match, even if some future
+    /// data shape resolved a Tautulli id of 0 — [`valid_accounts`] excludes it
+    /// upstream, but this pins the behaviour here too: an accounts list with
+    /// no id-0 entry (the normal, filtered shape) simply cannot match it.
+    #[test]
+    fn id_zero_is_never_a_direct_match() {
+        let accounts = [plex_account(1, "pierce")];
+        let scope = HistoryScope::User("0".into());
+        let err = translate_tautulli_id_to_plex(0, &scope, &[], &accounts).unwrap_err();
+        assert!(err.contains('0'));
     }
 }
 
