@@ -35,9 +35,10 @@
 //! // as `#{ datastore: "name" }` instead of a bare string; see
 //! // `config::Pool::datastores`. A granted datastore is reached as
 //! // `ctx.datastore("name")` (#181), which returns a handle exposing the
-//! // plex-db-ex reader crate's four accessors — `enrichment_for`,
-//! // `edges_from`, `edges_to`, `taste_vector_for` — or fails the pick()
-//! // call naming the datastore if it was never granted.
+//! // plex-db-ex reader crate's six accessors — `enrichment_for`,
+//! // `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`,
+//! // `pooled_taste_vector` — or fails the pick() call naming the
+//! // datastore if it was never granted.
 //! fn capabilities() { ["catalog_read", "watch_history"] }
 //!
 //! // Every catalog query this plugin will read, named. Run once, up front —
@@ -613,7 +614,7 @@ impl ScoreCtx {
 
 /// A live handle to one granted datastore (#181), registered as its own Rhai
 /// type so a script calls `ctx.datastore("name").enrichment_for(...)` and the
-/// crate's other three accessors directly. Wraps the same
+/// crate's other five accessors directly. Wraps the same
 /// `Arc<Mutex<plexdb_reader::Reader>>` [`GrantedCapabilities::datastores`]
 /// carries — see that field's doc for why the mutex exists.
 #[derive(Debug, Clone)]
@@ -638,6 +639,38 @@ impl Datastore {
         Ok(facts.into_iter().map(enrichment_fact_to_dynamic).collect())
     }
 
+    /// One host call for a whole candidate set, rather than
+    /// [`Self::enrichment_for`] once per id — see
+    /// [`plexdb_reader::Reader::enrichment_for_many`] for why that call shape
+    /// exists at all (plex-db-ex#40).
+    fn enrichment_for_many(
+        &mut self,
+        item_ids: Array,
+        namespace: &str,
+    ) -> Result<Map, Box<EvalAltResult>> {
+        let ids: Vec<String> = item_ids
+            .into_iter()
+            .map(|id| {
+                id.into_string().map_err(|actual| {
+                    format!(
+                        "datastore: enrichment_for_many: item id must be a string, got {actual}"
+                    )
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let by_item = self
+            .lock()
+            .enrichment_for_many(ids.iter().map(String::as_str), namespace)
+            .map_err(|e| format!("datastore: enrichment_for_many({namespace:?}): {e}"))?;
+        Ok(by_item
+            .into_iter()
+            .map(|(item_id, facts)| {
+                let facts: Array = facts.into_iter().map(enrichment_fact_to_dynamic).collect();
+                (item_id.into(), Dynamic::from_array(facts))
+            })
+            .collect())
+    }
+
     fn edges_from(&mut self, item_id: &str, edge_type: &str) -> Result<Array, Box<EvalAltResult>> {
         let edges = self
             .lock()
@@ -659,6 +692,17 @@ impl Datastore {
             .lock()
             .taste_vector_for(plex_account_id)
             .map_err(|e| format!("datastore: taste_vector_for({plex_account_id}): {e}"))?;
+        Ok(taste_vector_to_dynamic(vector))
+    }
+
+    /// The server-wide taste vector — see
+    /// [`plexdb_reader::Reader::pooled_taste_vector`] for what "pooled" means
+    /// (plex-db-ex#39).
+    fn pooled_taste_vector(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
+        let vector = self
+            .lock()
+            .pooled_taste_vector()
+            .map_err(|e| format!("datastore: pooled_taste_vector(): {e}"))?;
         Ok(taste_vector_to_dynamic(vector))
     }
 }
@@ -758,9 +802,11 @@ pub(crate) fn engine() -> Engine {
     engine
         .register_type_with_name::<Datastore>("Datastore")
         .register_fn("enrichment_for", Datastore::enrichment_for)
+        .register_fn("enrichment_for_many", Datastore::enrichment_for_many)
         .register_fn("edges_from", Datastore::edges_from)
         .register_fn("edges_to", Datastore::edges_to)
-        .register_fn("taste_vector_for", Datastore::taste_vector_for);
+        .register_fn("taste_vector_for", Datastore::taste_vector_for)
+        .register_fn("pooled_taste_vector", Datastore::pooled_taste_vector);
     engine
 }
 

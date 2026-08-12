@@ -515,11 +515,12 @@ pub struct Pool {
     /// The location is proven openable — and at the schema version the
     /// vendored `plexdb-reader` crate understands — before any plugin ever
     /// runs ([`crate::config::validate`]), so a station whose channels grant
-    /// none opens no connection at all. A granted plugin reaches the four
-    /// accessors the crate publishes (`enrichment_for`, `edges_from`,
-    /// `edges_to`, `taste_vector_for`) as `ctx.datastore("name")` (#181,
-    /// [`crate::score::pick`]); what those accessors actually read from is
-    /// `plex-db-ex`'s concern, not this station's.
+    /// none opens no connection at all. A granted plugin reaches the six
+    /// accessors the crate publishes (`enrichment_for`, `enrichment_for_many`,
+    /// `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`) as
+    /// `ctx.datastore("name")` (#181, [`crate::score::pick`]); what those
+    /// accessors actually read from is `plex-db-ex`'s concern, not this
+    /// station's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub datastores: Vec<DatastoreGrant>,
 }
