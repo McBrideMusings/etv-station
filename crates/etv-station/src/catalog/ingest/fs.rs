@@ -66,14 +66,16 @@ pub struct FsIngestStats {
     pub entries_pruned: usize,
 }
 
-/// Walk `roots`, probe durations, and ingest into `catalog`. `source_roots` are
-/// the media mount roots used to canonicalise paths for identity (see
-/// [`canonical_path`]). Files that fail to probe are still ingested with a `None`
-/// duration — a missing runtime is a metadata gap, not a reason to drop the file.
+/// Walk `roots`, probe durations, and ingest into `catalog`. `identity_roots`
+/// are the media mount roots used to canonicalise paths for identity (see
+/// [`canonical_path`]) — a separate setting from `roots` (#243): this function
+/// scans exactly the directories it is given, whatever `identity_roots` says.
+/// Files that fail to probe are still ingested with a `None` duration — a
+/// missing runtime is a metadata gap, not a reason to drop the file.
 pub async fn ingest_roots(
     catalog: &Catalog,
     roots: &[PathBuf],
-    source_roots: &[String],
+    identity_roots: &[String],
 ) -> Result<FsIngestStats, FsIngestError> {
     // Case-insensitive so `.MKV` matches, and the root prefix is escaped so a
     // real directory name containing glob metacharacters (`Show [1080p]`,
@@ -108,7 +110,7 @@ pub async fn ingest_roots(
     // `prune_absent: true` — this walked every configured root exhaustively, so a
     // stored row the walk did not reach is a file that is gone, not one that was
     // skipped. Anything that ever scans a subset of the roots must pass `false`.
-    catalog.in_transaction(|c| ingest_files(c, &probed, source_roots, true))
+    catalog.in_transaction(|c| ingest_files(c, &probed, identity_roots, true))
 }
 
 /// Write catalog rows for already-probed files. Pure over the catalog (no
@@ -121,15 +123,15 @@ pub async fn ingest_roots(
 /// [`super::plex::ingest_collections`]: when true, any `local_fs` provenance row
 /// this pass did not stamp is deleted, and any entry left with no provenance row
 /// at all goes with it. It must be true only when `files` is the **complete**
-/// content of every root in `source_roots` — on a partial pass, absence means
+/// content of every root the caller scanned — on a partial pass, absence means
 /// "not looked at", and pruning would drop files that are still on disk.
 pub fn ingest_files(
     catalog: &Catalog,
     files: &[(PathBuf, Option<f64>)],
-    source_roots: &[String],
+    identity_roots: &[String],
     prune_absent: bool,
 ) -> Result<FsIngestStats, FsIngestError> {
-    let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
+    let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
     // Canonical-path → entry_id over everything already in the catalog (Plex rows
     // from a prior ingest, or FS rows from a prior scan). Built once; within this
     // pass, deterministic `fs:` derivation keeps same-file duplicates coherent
@@ -676,8 +678,8 @@ mod tests {
 
         let cat = Catalog::open_in_memory().unwrap();
         let roots = vec![root.clone()];
-        let source_roots = vec![root.to_string_lossy().into_owned()];
-        let stats = ingest_roots(&cat, &roots, &source_roots).await.unwrap();
+        let identity_roots = vec![root.to_string_lossy().into_owned()];
+        let stats = ingest_roots(&cat, &roots, &identity_roots).await.unwrap();
         assert_eq!(stats.sources_written, 1);
         assert_eq!(stats.sources_pruned, 0);
         age_fs_rows(&cat);
@@ -688,7 +690,7 @@ mod tests {
         )
         .unwrap();
 
-        let stats = ingest_roots(&cat, &roots, &source_roots).await.unwrap();
+        let stats = ingest_roots(&cat, &roots, &identity_roots).await.unwrap();
         assert_eq!(stats.sources_written, 1);
         assert_eq!(stats.sources_pruned, 1);
         assert_eq!(stats.entries_pruned, 1);

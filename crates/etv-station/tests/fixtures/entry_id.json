@@ -205,6 +205,20 @@
       "source_roots": ["/Volumes/media", "/mnt/media"],
       "external_ids": [["imdb", "tt1375666"]],
       "expect": "imdb:tt1375666"
+    },
+    {
+      "name": "two independent stores, each stripping only its own single configured root, still agree — side A's own view of the file",
+      "raw": "/media/concerts/coachella-2019.mkv",
+      "source_roots": ["/media"],
+      "external_ids": [],
+      "expect": "fs:a08133ff0c858d24"
+    },
+    {
+      "name": "two independent stores, each stripping only its own single configured root, still agree — side B's own, differently-mounted view of the same file",
+      "raw": "/Volumes/library/concerts/coachella-2019.mkv",
+      "source_roots": ["/Volumes/library"],
+      "external_ids": [],
+      "expect": "fs:a08133ff0c858d24"
     }
   ]
 }

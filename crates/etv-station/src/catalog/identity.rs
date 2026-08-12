@@ -76,19 +76,24 @@ pub fn is_blank_guid_value(value: &str) -> bool {
 }
 
 /// Canonicalise a raw filesystem path for identity/dedup: strip the configured
-/// source-root prefix (so the same file is one identity regardless of which
+/// identity-root prefix (so the same file is one identity regardless of which
 /// mount root a given process sees it under) and normalise separators to `/`.
 ///
 /// The realpath/symlink-resolution half of the locked canonical-path rule is a
 /// filesystem operation and belongs to the ingester; this function is the pure,
 /// deterministic string half that identity derivation and tests depend on. The
-/// first matching root in `source_roots` wins.
-pub fn canonical_path(raw: &str, source_roots: &[&str]) -> String {
+/// first matching root in `roots` wins.
+///
+/// `roots` is a station's `identity_roots` (see
+/// [`crate::config::StationConfig::identity_roots`]) — deliberately not
+/// `source_roots`, which names the directories the daemon *scans*, a separate
+/// decision (#243).
+pub fn canonical_path(raw: &str, roots: &[&str]) -> String {
     let normalized = raw.replace('\\', "/");
     // Longest root first, so an overlapping shorter root (`/Volumes` vs
     // `/Volumes/media`) can't shadow the more specific match and leave a stray
     // segment in the "canonical" path.
-    let mut roots: Vec<String> = source_roots
+    let mut roots: Vec<String> = roots
         .iter()
         .map(|r| {
             let r = r.replace('\\', "/");
@@ -116,7 +121,11 @@ pub fn canonical_path(raw: &str, source_roots: &[&str]) -> String {
 /// documented algorithm — an `entry_id` is persisted in `catalog.db` and must
 /// stay stable across Rust toolchain upgrades, which `DefaultHasher` does not
 /// guarantee.
-fn fnv1a_64(s: &str) -> u64 {
+///
+/// `pub(crate)` rather than private to this module: [`crate::score`] reuses it
+/// to fold a pool's name into `ctx.seed` (#255) — the same "stable, not
+/// `DefaultHasher`" requirement a mixed-in string hash needs there too.
+pub(crate) fn fnv1a_64(s: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;

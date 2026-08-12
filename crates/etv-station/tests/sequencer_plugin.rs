@@ -17,7 +17,7 @@ use etv_station::config::{
 use etv_station::resolve::resolve_channel_with_resume;
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreEnv, ScoreInputs};
-use etv_station::sequence::{Window, build};
+use etv_station::sequence::{build, Window};
 
 /// One two-episode show (`spotlight`'s pool) and four movies (`discovery`'s
 /// pool), all locally sourced so resolution reaches a playable item.
@@ -143,6 +143,7 @@ fn the_committed_example_interleaves_a_resuming_and_a_restarting_pool() {
         None,
         &script_path(),
         &state,
+        0,
         test_env(&inputs),
         Window {
             from: 0,
@@ -180,6 +181,7 @@ fn the_committed_example_starts_spotlight_at_the_top_with_no_cursor() {
         None,
         &script_path(),
         &GenerationState::empty(),
+        0,
         test_env(&inputs),
         Window {
             from: 0,

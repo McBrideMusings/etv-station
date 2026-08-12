@@ -42,11 +42,14 @@ of what each channel has aired, migrated once from each channel's old
 `.history` file and appended to ever since. Back it up with the rest of the
 data volume; deleting it loses every channel's resume position.
 
-Media roots (`ETV_STATION_SOURCE_ROOTS`), Plex credentials (`PLEX_URL`,
-`PLEX_TOKEN`), and Tautulli credentials (`TAUTULLI_URL`, `TAUTULLI_API_KEY`)
-are per-host, so they come from the container's environment rather than from
-any file here. Tautulli is what a scorer plugin ranks by: without it the watch
-history the daemon hands the script is empty, and the ranking is arbitrary.
+Media roots — `ETV_STATION_SOURCE_ROOTS` (directories the daemon scans into
+the catalog) and `ETV_STATION_IDENTITY_ROOTS` (the root stripped when deriving
+a local item's identity, a separate decision — #243) — Plex credentials
+(`PLEX_URL`, `PLEX_TOKEN`), and Tautulli credentials (`TAUTULLI_URL`,
+`TAUTULLI_API_KEY`) are per-host, so they come from the container's
+environment rather than from any file here. Tautulli is what a scorer plugin
+ranks by: without it the watch history the daemon hands the script is empty,
+and the ranking is arbitrary.
 
 Only `README.md` and `etv-next/normalization.default.json` are committed — the
 channels, blocks, overlays, and the station config itself are personal, the same

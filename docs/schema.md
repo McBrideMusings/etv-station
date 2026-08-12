@@ -67,7 +67,7 @@ Every entry is tagged by a `kind` field. Four kinds. Source: `config/entry.rs`.
 | `program` | no | [`ProgramMetadata`](#programmetadata) — overrides block defaults for this item |
 
 Identity is **derived from the `source`, never authored** — a local file from a
-canonical hash of its path (root-stripped via the station `source_roots`), a
+canonical hash of its path (root-stripped via the station `identity_roots`), a
 `lavfi`/`http` source from its defining field. That derived id drives within-block
 duplicate collapse and the regeneration anchor, so two inline items pointing at
 the same file collapse to one. (Collapsing a manual item against a catalog
@@ -433,7 +433,12 @@ channels:                      # literal paths or globs, relative to this file
   - channels/diehard.yaml
   - channels/*.yaml            # a glob works too — expands to every match
 
-source_roots:                  # optional — media mount roots, daemon's view
+# source_roots left empty on purpose here: a full-library scan is unaffordable
+# at startup on this deployment, so the catalog is Plex-only. identity_roots is
+# still set — it's pure string manipulation and costs nothing at startup — so a
+# local item's derived identity still agrees with a different store reading the
+# same library. The two are independent; setting one does not imply the other.
+identity_roots:
   - /data/media
 
 catalog_path: /var/lib/etv-station/catalog.db   # optional — enables query channels
@@ -446,7 +451,8 @@ full_sweep_after_secs: 86400   # optional — force a full (deletion-catching) r
 | `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
-| `source_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts is one identity. Empty just skips root-stripping. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime — the intended way to supply them, since mount paths are host-specific and do not belong in a committed config. |
+| `source_roots` | no — default empty | list of directories the daemon walks to populate the catalog when `catalog_path` is set — an operational choice about what this deployment scans, not used for identity. Empty skips the filesystem scan entirely. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime. |
+| `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
 
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
@@ -716,9 +722,9 @@ config load rather than mid-generation:
 #### `capabilities()` — which host inputs a script needs (#167)
 
 Nothing is available to a script ambiently beyond `ctx.pool`, `ctx.config`,
-`ctx.target_count`, `ctx.now`, and `ctx.recent` — the inputs every plugin pool
-has always received. Two more are gated behind a declaration, and a third is
-opened only by name:
+`ctx.target_count`, `ctx.now`, `ctx.recent`, and `ctx.seed` — the inputs every
+plugin pool receives with no declaration at all. Two more are gated behind a
+declaration, and a third is opened only by name:
 
 | Capability | Gates | Declared as |
 |---|---|---|
@@ -761,8 +767,31 @@ of a channel — a `movies` pool and a `shows` pool ranked by the same taste),
 `ctx.target_count` (how many items the generation needs), `ctx.history` (recent
 server-wide watch events, `#{entry_id, watched_at}`; requires `watch_history`),
 `ctx.recent` (what this channel aired most recently, oldest first), `ctx.now`
-(unix seconds at generation time), and `ctx.config` (this pool's `config:`
-block — see below).
+(unix seconds at generation time), `ctx.config` (this pool's `config:`
+block — see below), and `ctx.seed` (the channel's resolved seed mixed with this
+pool's name — see below).
+
+#### `ctx.seed` — reproducible randomness (ADR 0005)
+
+`ctx.seed` is an integer: the channel's resolved `seed` (authored, or a fresh
+value drawn once per generation when unset — #46) mixed with the asking pool's
+name. It is the only source of entropy a script has that survives the
+determinism check below — Rhai's own `timestamp()`/`elapsed()` is the other
+one, and reading either fails the check by design (see "The determinism
+contract").
+
+Two pools of one channel naming the same script get different `ctx.seed`
+values — `examples/samples/foryou.yaml` points a `movies` pool and a `shows`
+pool at one script, and both drawing the same sequence would put their
+exploration slots in lockstep on air, forever. The same channel and the same
+authored seed produce the identical `ctx.seed` across two generations, which
+is what lets a script pick randomly from it and still pass
+`--check-determinism`.
+
+`ctx.seed` is a plain integer, not a PRNG object — a script derives its own
+pick from it with ordinary arithmetic (mix it further, take it modulo a
+candidate count, and so on), the same way `examples/plugins/taste-engine.rhai`
+already does its own ranking math over `ctx`'s other fields.
 
 ### The determinism contract
 

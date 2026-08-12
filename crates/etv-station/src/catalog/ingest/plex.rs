@@ -196,9 +196,9 @@ pub struct PlexIngestStats {
 pub fn ingest_items(
     catalog: &Catalog,
     items: &[PlexItem],
-    source_roots: &[String],
+    identity_roots: &[String],
 ) -> Result<PlexIngestStats, PlexIngestError> {
-    let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
+    let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
     let index = super::canonical_index(catalog, &roots)?;
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -508,13 +508,14 @@ pub fn ingest_labels(
 }
 
 /// Fetch every library's movies + episodes from Plex and ingest them.
-/// `source_roots` canonicalise paths for identity/path-match.
+/// `identity_roots` canonicalise paths for identity/path-match — Plex is never
+/// scanned, so there is no `source_roots` equivalent here (#243).
 ///
 /// `plex` carries the connection; see [`PlexEnv::from_env`] for where it comes
 /// from in production.
 pub fn ingest(
     catalog: &Catalog,
-    source_roots: &[String],
+    identity_roots: &[String],
     since: Option<i64>,
     plex: &PlexEnv,
 ) -> Result<PlexIngestStats, PlexIngestError> {
@@ -557,7 +558,7 @@ pub fn ingest(
     // fetch omits unchanged collections, which must not be read as deletions.
     let prune_absent = since.is_none();
     catalog.in_transaction(|c| {
-        let stats = ingest_items(c, &items, source_roots)?;
+        let stats = ingest_items(c, &items, identity_roots)?;
         ingest_labels(c, &labels)?;
         ingest_collections(c, &collections, prune_absent)?;
         c.set_last_plex_ingest(started)?;
