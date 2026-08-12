@@ -17,9 +17,9 @@ use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
 use etv_station::config::{GroupBy, Order, Pool, Select};
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreEnv, ScoreInputs};
-use etv_station::sequence::{build, Window};
-use time::macros::datetime;
+use etv_station::sequence::{Window, build};
 use time::OffsetDateTime;
+use time::macros::datetime;
 
 /// Add a movie to the catalog. `duration_ms` of `None` leaves it with no
 /// measured duration at all — the item the script sees as
