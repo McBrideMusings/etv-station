@@ -26,6 +26,8 @@ Keep a change that touches `vendor/etv-next/` in its own commit, separate from s
 
 `vendor/plexdb-reader/` holds a hand-copied, unmodified snapshot of [plex-db-ex](https://github.com/McBrideMusings/plex-db-ex)'s `crates/plexdb-reader` — the read-only reader crate the core links to expose enrichment tags, affinity edges, and taste vectors to a granted Rhai plugin (#181). Unlike `vendor/etv-next/`, this is **not** a subtree merge and not editable here: refresh it by copying `crates/plexdb-reader/{Cargo.toml,src}` from a `plex-db-ex` checkout over the existing files, re-adapting only the manifest's dependency lines to this workspace's own `[workspace.dependencies]`. See `docs/architecture.md`'s "Why plexdb-reader is vendored, not a git dependency" for why it isn't a git dependency instead.
 
+The copy and its drift guard are one step, not two: `crates/etv-station/tests/vendor_plexdb_reader_pin.rs` pins the SHA-256 of `vendor/plexdb-reader/src/`, so a refresh that copies the files without updating `VENDOR_SRC_SHA256` in that test fails `cargo test`. After copying, run the test — it fails naming the hash it actually computed — and paste that hash in as the new constant, in the same commit as the copy.
+
 ## Build & run
 
 This is a Cargo workspace with three application crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer) — plus the vendored `vendor/plexdb-reader` (see above). `vendor/etv-next` is its own workspace, excluded from this one and consumed as a path dependency.
