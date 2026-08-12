@@ -199,6 +199,44 @@ pub struct PlexIngestStats {
     pub inherited: usize,
 }
 
+/// One real account Plex's own `/accounts` reports — the server owner and
+/// every home/shared user alike (#281).
+///
+/// This is Plex's **own** id space, not Tautulli's — the two agree for every
+/// account except the server's owner, whom Plex's history stores under a
+/// small server-local id while Tautulli reports the same person under their
+/// much larger plex.tv id (plex-db-ex's own ADR-0010, in *that* project's
+/// `docs/adr/`, not this one's).
+/// `crate::daemon::SharedHistory` uses this list to translate a `single_user`
+/// channel's account into the id `plexdb_reader::Reader::taste_vector_for`
+/// actually keys its store on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlexAccount {
+    pub id: i64,
+    pub name: String,
+}
+
+/// `raw`, filtered to the accounts a Plex account lookup should ever match
+/// against: id `0` and a blank name both excluded.
+///
+/// Id `0` is Plex's own placeholder account, empty `name` on every server
+/// this has been checked against — plex-db-ex's identical filter over the
+/// identical endpoint documents the same thing
+/// (`plexdb/plex_client.py::valid_accounts`). Excluding it by id rather than
+/// by name matters if a server ever *does* give it a non-blank name: id `0`
+/// still is not a person, and nothing configured as `user:` should ever be
+/// able to match it.
+fn valid_accounts(raw: Vec<PlexAccountRow>) -> Vec<PlexAccount> {
+    raw.into_iter()
+        .filter_map(|row| match (row.id, row.name) {
+            (Some(id), Some(name)) if id != 0 && !name.trim().is_empty() => {
+                Some(PlexAccount { id, name })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Write catalog rows for already-parsed Plex items. Pure over the catalog, so
 /// tests exercise identity, external ids, and FS↔Plex path-match directly.
 ///
@@ -1202,6 +1240,16 @@ impl PlexClient {
     }
 }
 
+/// Every real account `plex`'s server knows (#281) — one `/accounts` call,
+/// filtered by `valid_accounts`. Not part of the catalog ingest pass
+/// ([`ingest`] never calls this): it exists solely for
+/// `crate::daemon::SharedHistory` to translate a `single_user` channel's
+/// account into Plex's own id space, which [`PlexAccount`]'s doc explains.
+pub fn fetch_accounts(plex: &PlexEnv) -> Result<Vec<PlexAccount>, PlexIngestError> {
+    let resp: AccountsResp = PlexClient::new(plex).get("/accounts", &[])?;
+    Ok(valid_accounts(resp.media_container.account))
+}
+
 /// The `type` query param a label's member fetch needs, from the same
 /// [`plex_type_code`] mapping [`section_list_params`] uses for a section's own
 /// bulk listing.
@@ -1410,6 +1458,28 @@ struct SectionEntry {
     /// since both report `type = "movie"` — see [`section_kind_override`].
     #[serde(default)]
     agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountsResp {
+    #[serde(rename = "MediaContainer")]
+    media_container: AccountsContainer,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AccountsContainer {
+    #[serde(default, rename = "Account")]
+    account: Vec<PlexAccountRow>,
+}
+
+/// One raw `/accounts` entry, before [`valid_accounts`] drops the id-0
+/// placeholder and anything with a blank name.
+#[derive(Debug, Deserialize)]
+struct PlexAccountRow {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[cfg(test)]
@@ -3006,5 +3076,100 @@ mod tests {
         // Sibling prefix must NOT be remapped.
         assert_eq!(client.translate("/mediabackup/x.mkv"), "/mediabackup/x.mkv");
         assert_eq!(client.translate("/other/path"), "/other/path");
+    }
+
+    // ---- /accounts (#281) -----------------------------------------------
+
+    /// The real shape of `/accounts`, per plex-db-ex's own confirmed-live
+    /// documentation (`plexdb/plex_client.py::accounts`): an owner, a shared
+    /// user, and id 0's placeholder with a blank name.
+    #[test]
+    fn accounts_response_parses_id_and_name() {
+        let json = r#"{"MediaContainer": {"Account": [
+            {"id": 0, "name": ""},
+            {"id": 1, "name": "pierce"},
+            {"id": 22831969, "name": "madi"}
+        ]}}"#;
+        let resp: AccountsResp = serde_json::from_str(json).unwrap();
+        let rows: Vec<(Option<i64>, Option<String>)> = resp
+            .media_container
+            .account
+            .into_iter()
+            .map(|a| (a.id, a.name))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some(0), Some(String::new())),
+                (Some(1), Some("pierce".to_string())),
+                (Some(22831969), Some("madi".to_string())),
+            ],
+        );
+    }
+
+    /// `valid_accounts` drops id 0's placeholder — the one plex-db-ex's own
+    /// `valid_accounts` over the same endpoint excludes — and keeps everyone
+    /// else, owner and shared user alike.
+    #[test]
+    fn valid_accounts_excludes_the_id_zero_placeholder() {
+        let raw = vec![
+            PlexAccountRow {
+                id: Some(0),
+                name: Some(String::new()),
+            },
+            PlexAccountRow {
+                id: Some(1),
+                name: Some("pierce".to_string()),
+            },
+            PlexAccountRow {
+                id: Some(22831969),
+                name: Some("madi".to_string()),
+            },
+        ];
+        assert_eq!(
+            valid_accounts(raw),
+            vec![
+                PlexAccount {
+                    id: 1,
+                    name: "pierce".to_string(),
+                },
+                PlexAccount {
+                    id: 22831969,
+                    name: "madi".to_string(),
+                },
+            ],
+        );
+    }
+
+    /// Id 0 is excluded by id, not by name — a server that somehow gives its
+    /// placeholder a non-blank name must still not let it match a `user:`.
+    #[test]
+    fn valid_accounts_excludes_id_zero_even_with_a_name() {
+        let raw = vec![PlexAccountRow {
+            id: Some(0),
+            name: Some("not actually a person".to_string()),
+        }];
+        assert_eq!(valid_accounts(raw), Vec::new());
+    }
+
+    /// A row missing `id` or `name` entirely (a response shape this crate
+    /// hasn't seen) is dropped rather than panicking or matching everything.
+    #[test]
+    fn valid_accounts_excludes_a_row_missing_id_or_name() {
+        let raw = vec![
+            PlexAccountRow {
+                id: None,
+                name: Some("carol".to_string()),
+            },
+            PlexAccountRow {
+                id: Some(2),
+                name: None,
+            },
+            PlexAccountRow {
+                id: Some(3),
+                name: Some("   ".to_string()),
+            },
+        ];
+        assert_eq!(valid_accounts(raw), Vec::new());
     }
 }

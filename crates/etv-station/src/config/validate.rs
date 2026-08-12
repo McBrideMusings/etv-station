@@ -189,12 +189,17 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
 ///
 /// A channel with no scorer plugin stops there: `ctx.history` just arrives
 /// empty and the generation proceeds, same as an unreachable Tautulli. A
-/// channel that *does* name a scorer plugin goes further (#278): resolving
-/// `user` to the numeric account id `ctx.account_id` carries needs that same
-/// live fetch, and a name that resolves to nobody fails that generation
-/// loudly, naming the user, rather than letting the plugin quietly rank
-/// against the pooled vector instead. See `daemon::pattern_catch_up` and
-/// [`crate::tautulli::resolve_account_id`].
+/// channel that *does* name a scorer plugin goes further (#278, #281):
+/// resolving `user` to the **Plex** account id `ctx.account_id` carries needs
+/// that same live Tautulli fetch, and then a live Plex `/accounts` fetch to
+/// translate into Plex's own id space — Plex's and Tautulli's only disagree
+/// for the server's owner (plex-db-ex ADR-0010), which is exactly the case
+/// that must not resolve to an empty taste vector. A `user` that cannot be
+/// carried all the way through both fails that generation loudly, naming the
+/// user, rather than letting the plugin quietly rank against the pooled
+/// vector instead. See `daemon::pattern_catch_up`,
+/// [`crate::tautulli::resolve_account_id`], and
+/// `daemon::SharedHistory::resolve_account_id`.
 fn validate_taste_scope(path: &Path, channel: &ChannelConfig) -> Result<(), ConfigError> {
     let Some(scoring) = channel.scoring.as_ref() else {
         return Ok(());

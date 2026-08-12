@@ -145,10 +145,11 @@ fn is_numeric_id(s: &str) -> bool {
 ///
 /// Either branch hands back a Tautulli-space id, not a plex-db-ex-space one —
 /// see [`HistoryRow::user_id`]'s doc for the one account those two id spaces
-/// disagree on. A digit-authored `user:` is just as exposed to that gap as a
-/// name is: it is never checked against the store, so a channel scoped to the
-/// Plex server owner's own numeric id resolves successfully here and then
-/// finds nothing in `plays.plex_account_id` downstream.
+/// disagree on. Nothing here translates between them, and a digit-authored
+/// `user:` is exposed to that gap exactly as a name is; the caller
+/// (`daemon::SharedHistory::resolve_account_id`) does that translation
+/// against Plex's own `/accounts` before any scorer plugin sees an id
+/// (#281).
 pub fn resolve_account_id(
     scope: &HistoryScope,
     rows: &[HistoryRow],
@@ -231,17 +232,19 @@ pub struct HistoryRow {
     user: Option<String>,
     /// The account's numeric id, in Tautulli's own id space. Present on every
     /// row Tautulli sends — `#[serde(default)]` only guards a row shape this
-    /// crate has not seen — and it is what [`resolve_account_id`] hands a
-    /// `single_user` channel's scorer plugin as `ctx.account_id` (#278).
+    /// crate has not seen — and it is what [`resolve_account_id`] resolves a
+    /// `single_user` channel's scope to (#278).
     ///
     /// Not guaranteed to equal `plays.plex_account_id` in the plex-db-ex
     /// store: the two id spaces agree for every account except the Plex
     /// server's owner, whom Plex and Tautulli report under two different ids
     /// (plex-db-ex ADR-0010; `enrich-tautulli-plays` resolves that one case
-    /// via a runtime name join before writing `plays`). Nothing on this side
-    /// performs that translation — a `single_user` channel scoped to the
-    /// owner's own Tautulli username resolves to Tautulli's id here, not the
-    /// store's, and `taste_vector_for` would then match no plays at all.
+    /// via a runtime name join before writing `plays`). Nothing in this module
+    /// performs that translation — `daemon::SharedHistory::resolve_account_id`
+    /// does, running the same kind of name join against Plex's own `/accounts`
+    /// so `ctx.account_id` reaches a scorer plugin in the id space
+    /// `taste_vector_for` keys on (#281), matching on the raw account name
+    /// [`Self::username_for`] reads rather than on this id.
     #[serde(default)]
     user_id: Option<i64>,
 }
@@ -259,6 +262,36 @@ impl HistoryRow {
             .map(str::trim)
             .find(|s| !s.is_empty())
             .map(str::to_string)
+    }
+
+    /// This row's raw Tautulli username, when the row belongs to `scope`'s
+    /// account — deliberately `user`, never [`Self::watcher`]'s
+    /// friendly-name-first pick, because a Tautulli-configured display name is
+    /// not what plex-db-ex's ADR-0010 confirms agrees with Plex's own
+    /// `/accounts` `name` for the same person; the raw account name is (#281).
+    ///
+    /// A name-authored scope already narrowed every returned row to this one
+    /// account via Tautulli's own `user=` filter ([`HistoryScope::query_param`]),
+    /// so any row answers it. A digit-authored scope's `user_id=` filter does
+    /// the same, but is checked again against the row's own `user_id` here
+    /// rather than trusted blindly — the digit-authored case is the one #281
+    /// exists to get right, so it gets the extra care.
+    ///
+    /// Consumed by [`crate::daemon`]'s Plex-side account id translation, not by
+    /// anything in this module — [`resolve_account_id`] stays Tautulli-only.
+    pub(crate) fn username_for(&self, scope: &HistoryScope) -> Option<&str> {
+        match scope {
+            HistoryScope::AllUsers => None,
+            HistoryScope::User(u) if is_numeric_id(u) => {
+                let id: i64 = u.parse().ok()?;
+                if self.user_id == Some(id) {
+                    self.user.as_deref()
+                } else {
+                    None
+                }
+            }
+            HistoryScope::User(_) => self.user.as_deref(),
+        }
     }
 }
 
@@ -512,6 +545,20 @@ mod tests {
         }
     }
 
+    /// A row carrying both `user_id` and `user` (#281) — what
+    /// [`HistoryRow::username_for`] reads to translate a Tautulli account into
+    /// the name a Plex `/accounts` lookup needs, distinct from [`row_by`]'s
+    /// `friendly_name`-first fields.
+    fn row_with_account_and_username(user_id: i64, username: &str) -> HistoryRow {
+        HistoryRow {
+            rating_key: Some("plex-1".into()),
+            stopped: Some(100),
+            friendly_name: None,
+            user: Some(username.to_string()),
+            user_id: Some(user_id),
+        }
+    }
+
     /// `friendly_name` wins because it is the name a person recognises — on
     /// this server the account spelled `bob` displays as `Bob Example`.
     #[test]
@@ -708,6 +755,58 @@ mod tests {
         let err =
             resolve_account_id(&HistoryScope::User("carol".into()), &[unattributed]).unwrap_err();
         assert!(err.contains("carol"));
+    }
+
+    // ---- HistoryRow::username_for (#281) --------------------------------
+
+    /// The pooled scope names nobody, so there is no username to translate.
+    #[test]
+    fn username_for_all_users_is_always_none() {
+        let rows = [row_with_account_and_username(501, "carol")];
+        assert_eq!(HistoryScope::AllUsers.query_param(), None);
+        assert_eq!(rows[0].username_for(&HistoryScope::AllUsers), None);
+    }
+
+    /// A name-authored scope trusts any row — Tautulli's own `user=` filter
+    /// already narrowed every returned row to this one account.
+    #[test]
+    fn username_for_a_name_scope_reads_any_rows_username() {
+        let rows = [row_with_account_and_username(501, "carol")];
+        assert_eq!(
+            rows[0].username_for(&HistoryScope::User("carol".into())),
+            Some("carol"),
+        );
+    }
+
+    /// A digit-authored scope only reads a row whose own `user_id` matches the
+    /// configured id — the extra check #281 needs, since a digit-authored
+    /// scope's `user_id=` filter is the one case this whole ticket is about
+    /// getting right rather than trusting blindly.
+    #[test]
+    fn username_for_a_digit_scope_checks_the_rows_own_user_id() {
+        let matching = row_with_account_and_username(501, "carol");
+        assert_eq!(
+            matching.username_for(&HistoryScope::User("501".into())),
+            Some("carol"),
+        );
+
+        let mismatched = row_with_account_and_username(999, "someone_else");
+        assert_eq!(
+            mismatched.username_for(&HistoryScope::User("501".into())),
+            None,
+            "a row for a different account must not answer this scope",
+        );
+    }
+
+    /// A row with no `user` field (anonymised, or a Tautulli version that
+    /// omits it) has no username to hand back, matched-id or not.
+    #[test]
+    fn username_for_a_row_naming_nobody_is_none() {
+        let unattributed = row_with_account(501);
+        assert_eq!(
+            unattributed.username_for(&HistoryScope::User("501".into())),
+            None,
+        );
     }
 
     #[test]
