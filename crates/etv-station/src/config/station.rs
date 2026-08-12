@@ -36,15 +36,35 @@ pub struct StationConfig {
     /// that doesn't exist is an error, and a glob matching nothing is an error.
     pub channels: Vec<String>,
 
-    /// Media mount roots, in the daemon's filesystem view. Used to canonicalise
-    /// a local item's path when deriving its identity (see
+    /// Filesystem directories the daemon walks to populate the catalog when
+    /// `catalog_path` is set — an operational choice about which parts of this
+    /// deployment's disk the daemon is allowed to read. Empty (the default)
+    /// skips the filesystem scan entirely; a Plex-only station, or one that
+    /// hasn't set `catalog_path` at all, leaves it empty and the scan costs
+    /// nothing at startup.
+    ///
+    /// **Not used for identity.** See [`Self::identity_roots`] for the setting
+    /// that canonicalises a local item's path — the two used to be one field,
+    /// and setting it to fix identity started an unwanted filesystem walk
+    /// (#243).
+    #[serde(default)]
+    pub source_roots: Vec<String>,
+
+    /// Media mount roots, in the daemon's own filesystem view. Used to
+    /// canonicalise a local item's path when deriving its identity (see
     /// [`crate::catalog::identity::canonical_path`]) so the same file collapses
     /// to one identity regardless of which mount root it is reached under. May
     /// be empty — an empty list only skips root-stripping, leaving identity as a
-    /// hash of the separator-normalised full path. The daemon also scans these
-    /// roots to populate the catalog when `catalog_path` is set.
+    /// hash of the separator-normalised full path, which is portable only while
+    /// every consumer of that identity mounts the disk at the same path.
+    ///
+    /// **Pure string manipulation — touches no disk.** Unlike
+    /// [`Self::source_roots`], setting this triggers no filesystem access, so it
+    /// is safe to fill in with the real media root even when a full-library scan
+    /// is unaffordable at startup. `ETV_STATION_IDENTITY_ROOTS` (colon-separated)
+    /// overrides at runtime, matching `source_roots`' own override convention.
     #[serde(default)]
-    pub source_roots: Vec<String>,
+    pub identity_roots: Vec<String>,
 
     /// Path to the sqlite catalog the daemon opens and ingests at startup, so
     /// `query` entries and non-`manual` order resolve and manual items path-match

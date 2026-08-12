@@ -113,14 +113,14 @@ impl ResolvedItem {
 pub fn resolve_channel(
     config: &ChannelConfig,
     path: &Path,
-    source_roots: &[String],
+    identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let (items, _) = resolve_channel_with_resume(
         config,
         path,
-        source_roots,
+        identity_roots,
         path_index,
         catalog,
         &GenerationState::empty(),
@@ -166,7 +166,7 @@ pub fn resolve_channel(
 pub fn resolve_channel_with_resume(
     config: &ChannelConfig,
     path: &Path,
-    source_roots: &[String],
+    identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
     state: &GenerationState,
@@ -214,7 +214,7 @@ pub fn resolve_channel_with_resume(
             include,
             idx,
             path,
-            source_roots,
+            identity_roots,
             path_index,
             catalog,
             &config.groups,
@@ -718,7 +718,7 @@ fn resolve_block(
     include: &BlockInclude,
     idx: usize,
     path: &Path,
-    source_roots: &[String],
+    identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
     groups: &[ShowGroup],
@@ -814,7 +814,9 @@ fn resolve_block(
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
-            Entry::Item(item) => items.push(resolve_item(item, defaults, source_roots, path_index)),
+            Entry::Item(item) => {
+                items.push(resolve_item(item, defaults, identity_roots, path_index))
+            }
             Entry::Query(query) => {
                 let cat = catalog.ok_or_else(|| {
                     unsupported(format!(
@@ -855,8 +857,15 @@ fn resolve_block(
     if items.is_empty()
         && let Some(fallback) = &include.fallback
     {
-        items = resolve_fallback(catalog, fallback, defaults, seed, source_roots, path_index)
-            .map_err(|m| unsupported(format!("block #{idx}: fallback: {m}")))?;
+        items = resolve_fallback(
+            catalog,
+            fallback,
+            defaults,
+            seed,
+            identity_roots,
+            path_index,
+        )
+        .map_err(|m| unsupported(format!("block #{idx}: fallback: {m}")))?;
     }
 
     // 1.6. Filter (#197) — narrow the resolved list before duplicates/order
@@ -1003,7 +1012,7 @@ fn resolve_fallback(
     fallback: &Fallback,
     defaults: Option<&ProgramMetadata>,
     seed: u64,
-    source_roots: &[String],
+    identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
 ) -> Result<Vec<ResolvedItem>, String> {
     match fallback {
@@ -1013,7 +1022,12 @@ fn resolve_fallback(
             })?;
             resolve_query(cat, query, defaults, seed)
         }
-        Fallback::Item(item) => Ok(vec![resolve_item(item, defaults, source_roots, path_index)]),
+        Fallback::Item(item) => Ok(vec![resolve_item(
+            item,
+            defaults,
+            identity_roots,
+            path_index,
+        )]),
     }
 }
 
@@ -1277,11 +1291,11 @@ fn catalog_item(
 fn resolve_item(
     item: &ItemEntry,
     defaults: Option<&ProgramMetadata>,
-    source_roots: &[String],
+    identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
 ) -> ResolvedItem {
     ResolvedItem {
-        id: derive_item_id(&item.source, source_roots, path_index),
+        id: derive_item_id(&item.source, identity_roots, path_index),
         source: item.source.clone(),
         in_point: item.in_point,
         out_point: item.out_point,
@@ -1306,12 +1320,12 @@ fn resolve_item(
 /// collapse and the regeneration anchor, so it must be deterministic.
 fn derive_item_id(
     source: &SourceConfig,
-    source_roots: &[String],
+    identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
 ) -> String {
     match source {
         SourceConfig::Local { path } => {
-            let roots: Vec<&str> = source_roots.iter().map(String::as_str).collect();
+            let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
             let canonical = canonical_path(path, &roots);
             path_index
                 .and_then(|idx| idx.get(&canonical))
@@ -1715,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn source_roots_canonicalise_local_identity_across_mounts() {
+    fn identity_roots_canonicalise_local_identity_across_mounts() {
         // The same file reached under two configured mount roots derives one
         // identity, so the cross-mount duplicate collapses.
         let roots = vec!["/mnt/media".to_string(), "/Volumes/media".to_string()];
