@@ -223,6 +223,11 @@ pub struct Entry {
     pub release_date: Option<String>,
     pub duration_ms: Option<i64>,
     pub content_rating: Option<String>,
+    /// Plex's `summary` attribute, verbatim. Feeds `ProgramMetadata.description`
+    /// so the XMLTV guide carries a synopsis (#186). `None` for a source that
+    /// authors no summary — the `fs` ingester, or a Plex item Plex itself left
+    /// blank.
+    pub summary: Option<String>,
     /// The library this entry came from, by **title** — the Plex section title
     /// ("4K Movies"), so a config author writes `item.library == "4K Movies"`.
     /// `None` for a source that has no library concept (the `fs` ingester).

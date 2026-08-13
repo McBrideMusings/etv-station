@@ -707,6 +707,7 @@ async fn open_and_ingest_catalog(
                         mode = if since.is_some() { "delta" } else { "full" },
                         entries = stats.entries_written,
                         sources = stats.sources_written,
+                        summary_missing = stats.summary_missing,
                         "plex catalog ingest complete",
                     ),
                     Err(e) => {

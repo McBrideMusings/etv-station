@@ -108,6 +108,14 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     DELETE FROM tags WHERE namespace = 'fs_dir';
     "#,
+    // v5 — the entry's synopsis (#186). Plex's `summary` attribute, stored
+    // verbatim and fed to `ProgramMetadata.description` so the XMLTV guide
+    // carries a `<desc>`. NULL for entries no source authored a summary for —
+    // everything the `fs` ingester writes, and any Plex item Plex itself left
+    // blank.
+    r#"
+    ALTER TABLE entries ADD COLUMN summary TEXT;
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

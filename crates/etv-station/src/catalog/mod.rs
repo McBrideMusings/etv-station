@@ -226,9 +226,9 @@ impl Catalog {
             "INSERT INTO entries (
                 entry_id, type, title, title_sort, show, show_id, season, episode,
                 absolute_episode, edition, studio, year, release_date, duration_ms,
-                content_rating, library, primary_source, raw_metadata
+                content_rating, library, primary_source, raw_metadata, summary
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
             )
             ON CONFLICT(entry_id) DO UPDATE SET
                 type=excluded.type, title=excluded.title, title_sort=excluded.title_sort,
@@ -238,7 +238,7 @@ impl Catalog {
                 release_date=excluded.release_date, duration_ms=excluded.duration_ms,
                 content_rating=excluded.content_rating, library=excluded.library,
                 primary_source=excluded.primary_source,
-                raw_metadata=excluded.raw_metadata",
+                raw_metadata=excluded.raw_metadata, summary=excluded.summary",
             params![
                 e.entry_id,
                 e.kind,
@@ -258,6 +258,7 @@ impl Catalog {
                 e.library,
                 e.primary_source.as_str(),
                 e.raw_metadata,
+                e.summary,
             ],
         )?;
         Ok(())
@@ -839,7 +840,7 @@ fn collect_sources(
 /// Column list for `entries`, in the order [`row_to_entry`] reads.
 const ENTRY_COLS: &str = "entry_id, type, title, title_sort, show, show_id, season, episode, \
      absolute_episode, edition, studio, year, release_date, duration_ms, content_rating, \
-     library, primary_source, raw_metadata";
+     library, primary_source, raw_metadata, summary";
 
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     Ok(Entry {
@@ -870,6 +871,7 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
             })?
         },
         raw_metadata: r.get(17)?,
+        summary: r.get(18)?,
     })
 }
 
@@ -1032,6 +1034,7 @@ mod tests {
             content_rating: Some("PG".into()),
             library: Some("4K Movies".into()),
             raw_metadata: Some(r#"{"tagline":"…"}"#.into()),
+            summary: Some("A princess held captive by the Empire.".into()),
             ..Entry::new("imdb:tt0076759", "movie", "Star Wars", Source::Plex)
         };
         c.upsert_entry(&e).unwrap();
