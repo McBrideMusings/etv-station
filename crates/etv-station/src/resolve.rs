@@ -1246,7 +1246,7 @@ fn catalog_item(
     let program = ProgramMetadata {
         title: Some(entry.title.clone()),
         sub_title: None,
-        description: None,
+        description: entry.summary.clone(),
         season: as_u32(entry.season),
         episode: as_u32(entry.episode),
         categories: None,
@@ -1941,6 +1941,38 @@ mod tests {
             SourceConfig::Local { path } => assert!(path.ends_with("tt0120737.mkv")),
             other => panic!("expected local source, got {other:?}"),
         }
+    }
+
+    /// #186: `entries.summary` reaches `ProgramMetadata.description`, so the
+    /// XMLTV guide carries a synopsis with no channel config. An entry with
+    /// no summary must emit `description: None` rather than an empty string,
+    /// so the vendored xmltv writer's `if let Some` skip stays correct.
+    #[test]
+    fn catalog_summary_populates_program_description() {
+        let cat = seeded_catalog();
+        cat.upsert_entry(&{
+            let mut e = cat.entry("imdb:tt0120737").unwrap().unwrap();
+            e.summary = Some("A hobbit sets out to destroy a ring.".into());
+            e
+        })
+        .unwrap();
+        let inc = query_block(
+            "item.title.contains(\"Ring\") || item.title.contains(\"Tower\") || item.title.contains(\"King\")",
+            Order::parse("release_date:asc").unwrap(),
+        );
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let with_summary = items.iter().find(|i| i.id == "imdb:tt0120737").unwrap();
+        assert_eq!(
+            with_summary
+                .program
+                .as_ref()
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("A hobbit sets out to destroy a ring.")
+        );
+        let without_summary = items.iter().find(|i| i.id == "imdb:tt0167261").unwrap();
+        assert_eq!(without_summary.program.as_ref().unwrap().description, None);
     }
 
     // ---- block fallback (#97) ----------------------------------------------
