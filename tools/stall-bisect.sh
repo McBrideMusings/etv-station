@@ -33,7 +33,13 @@ OUT="$DIAG/stall-bisect.log"
 
 [ -r "$ARGV_LOG" ] || { echo "no argv log at $ARGV_LOG — is ffmpeg_path pointed at ffmpeg-probe.sh?" >&2; exit 1; }
 
-rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
+# Run every variant as the same user the real container runs as, so the
+# comparison is like-for-like and the scratch directories are writable.
+RUN_AS=$(docker inspect etv-station --format '{{.Config.User}}' 2>/dev/null)
+[ -n "$RUN_AS" ] || RUN_AS="99:100"
+
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/local"
+chown -R "${RUN_AS%%:*}:${RUN_AS##*:}" "$SCRATCH" 2>/dev/null
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT"; }
 
@@ -66,7 +72,12 @@ run_variant() {
     log "--- $name ---"
     local t0 t1
     t0=$(date +%s)
+    # Same uid as the real container. Without it the variant runs as the image's
+    # default user, cannot write its segments, and every run "finishes" in a
+    # second or two with a permission error — which reads as an implausibly fast
+    # result rather than as a failure.
     docker run --rm --device /dev/dri \
+        --user "$RUN_AS" \
         -e LIBVA_DRIVER_NAME=iHD \
         -v /mnt/user/media/library:/media:ro \
         -v "$SCRATCH":/scratch \
@@ -112,12 +123,12 @@ log "bisect channel=$CHANNEL slice=${DUR}s"
 log "source: $(printf '%s\n' "${ARGV[@]}" | grep -A1 '^-i$' | tail -1)"
 log "================================================================"
 
-mkdir -p "$SCRATCH/local"
 mapfile -t A_BASE < <(build 1 /scratch/local 0)
 run_variant "baseline (no throttle, segments to local disk)" "${A_BASE[@]}"
 
 mapfile -t A_ARRAY < <(build 1 "/data/hls/bisect$CHANNEL" 0)
 mkdir -p "$APPDATA/data/hls/bisect$CHANNEL"
+chown "${RUN_AS%%:*}:${RUN_AS##*:}" "$APPDATA/data/hls/bisect$CHANNEL" 2>/dev/null
 run_variant "to-array (no throttle, segments to the user share)" "${A_ARRAY[@]}"
 rm -rf "${APPDATA:?}/data/hls/bisect$CHANNEL"
 

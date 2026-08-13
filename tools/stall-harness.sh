@@ -68,15 +68,25 @@ viewer_loop() {
 # the newest file on disk cannot be fooled that way: nothing written means
 # nothing written, restart or not. An empty directory reports a large age, which
 # is correct — a channel with no segments at all is not producing.
-seconds_since_last_segment() {
+# Sets $SINCE rather than echoing it. `since=$(fn)` would run this in a
+# subshell, and the `dir_empty_since` bookkeeping below would be discarded every
+# call — leaving the empty-directory clock permanently unset and every wipe
+# reported as a gap the length of the harness's own uptime.
+SINCE=0
+compute_since() {
     local newest now
     newest=$(stat -c %Y "$HLS"/*.ts 2>/dev/null | sort -n | tail -1)
     now=$(date +%s)
-    if [ -z "$newest" ]; then
-        echo $(( now - ${dir_empty_since:-now} ))
+    if [ -n "$newest" ]; then
+        dir_empty_since=""          # directory has content again
+        SINCE=$(( now - newest ))
         return
     fi
-    echo $(( now - newest ))
+    # Empty directory. Time it from when it FIRST went empty — a teardown wipes
+    # the directory, and clocking that from harness start reports a gap of
+    # however long the harness has been up, which is both wrong and alarming.
+    [ -n "${dir_empty_since:-}" ] || dir_empty_since=$now
+    SINCE=$(( now - dir_empty_since ))
 }
 
 newest_index() {
@@ -181,12 +191,12 @@ trap "kill $VIEWER_PID 2>/dev/null; log 'harness stopped'; exit 0" INT TERM
 round=0
 in_gap=0
 gap_started=0
-dir_empty_since=$(date +%s)
+dir_empty_since=""
 
 while true; do
     now=$(date +%s)
-    [ -n "$(ls "$HLS"/*.ts 2>/dev/null | head -1)" ] || dir_empty_since=${dir_empty_since:-$now}
-    since=$(seconds_since_last_segment)
+    compute_since
+    since=$SINCE
     idx=$(newest_index)
 
     if [ "$since" -lt "$GAP_TRIGGER" ] && [ "$in_gap" = 1 ]; then
