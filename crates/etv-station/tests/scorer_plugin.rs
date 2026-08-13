@@ -159,6 +159,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     // so this helper grants both for every test that uses it.
                     capabilities: vec!["catalog_read".into(), "watch_history".into()],
                     datastores: Vec::new(),
+                    guide: None,
                 }],
                 pattern: vec![PatternStep {
                     pool: "foryou".into(),

@@ -11,7 +11,7 @@ use std::time::Duration;
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source, TagNs};
 use etv_station::config::{
     BlockInclude, ChannelConfig, Entry as ConfigEntry, GuideConfig, ItemEntry, Mode, Order,
-    QueryEntry, RuleConfig, SourceConfig,
+    PatternStep, Pool, QueryEntry, RuleConfig, SourceConfig, Take, TakeFrom,
 };
 use etv_station::resolve::resolve_channel;
 
@@ -85,6 +85,75 @@ fn query_all() -> ConfigEntry {
         query: "item.title != ''".into(),
         order: None,
     })
+}
+
+/// A pattern block naming `pools`, walked once by `pattern` (#289's own
+/// fixtures need no pattern beyond drawing every declared pool once).
+fn pattern_block(
+    pools: Vec<Pool>,
+    pattern: Vec<PatternStep>,
+    guide: Option<GuideConfig>,
+) -> BlockInclude {
+    let mut block = inline_block(vec![], guide);
+    block.pools = pools;
+    block.pattern = pattern;
+    block
+}
+
+/// A minimal `expr`-sourced pool, with an optional pool-level `guide:`
+/// (#289) — the rung between the block and the item.
+fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
+    Pool {
+        name: name.into(),
+        expr: Some(expr.into()),
+        plugin: None,
+        sources: None,
+        groups: Vec::new(),
+        order: Some(Order::parse("title:asc").unwrap()),
+        bucket_order: None,
+        group_by: Default::default(),
+        select: Default::default(),
+        rotate: Default::default(),
+        advance: Default::default(),
+        on_short: Default::default(),
+        constraints: None,
+        config: None,
+        capabilities: Vec::new(),
+        datastores: Vec::new(),
+        guide,
+    }
+}
+
+fn step(pool: &str, take: usize) -> PatternStep {
+    PatternStep {
+        pool: pool.into(),
+        take: Take::Count(take),
+        from: TakeFrom::Start,
+        chance: 1.0,
+    }
+}
+
+/// A films pool and a bumpers pool, catalog-resolved by `library`, exactly
+/// the shape #289's issue was filed against — one movie, one station id.
+fn films_and_bumpers_catalog() -> Catalog {
+    fn add_movie(cat: &Catalog, id: &str, title: &str, library: &str) {
+        let mut entry = Entry::new(id, "movie", title, Source::Plex);
+        entry.library = Some(library.into());
+        cat.upsert_entry(&entry).unwrap();
+        cat.add_source(&EntrySource {
+            source: Source::LocalFs,
+            source_id: format!("fs-{id}"),
+            entry_id: id.into(),
+            playback_path: format!("/media/{id}.mkv"),
+            last_seen: None,
+        })
+        .unwrap();
+    }
+
+    let cat = Catalog::open_in_memory().unwrap();
+    add_movie(&cat, "film-1", "Die Hard", "Films");
+    add_movie(&cat, "bumper-1", "ID Card", "Station IDs");
+    cat
 }
 
 /// #158 decision #1 + decision #3: with no `guide:` block anywhere, an
@@ -263,4 +332,96 @@ fn a_catalog_resolved_item_only_sees_block_and_channel_guide() {
         .as_ref()
         .expect("block guide reaches a catalog item");
     assert_eq!(guide.description.as_deref(), Some("block description"));
+}
+
+/// #289: a pattern block interleaving a films pool and a bumpers pool — the
+/// bumpers pool names its own `guide.title`, which reaches only the items it
+/// draws. The films pool declares no `guide:` of its own, so its items fall
+/// through to the block's, exactly as they would with no pool rung at all.
+#[test]
+fn a_pools_own_guide_title_reaches_only_that_pools_items() {
+    let cat = films_and_bumpers_catalog();
+
+    let bumper_guide = GuideConfig {
+        title: Some("Station Break".into()),
+        sub_title: None,
+        description: None,
+        categories: None,
+    };
+    let block_guide = GuideConfig {
+        title: Some("{title} (block)".into()),
+        sub_title: None,
+        description: None,
+        categories: None,
+    };
+
+    let films = pool("films", "item.library == 'Films'", None);
+    let bumpers = pool(
+        "bumpers",
+        "item.library == 'Station IDs'",
+        Some(bumper_guide),
+    );
+    let block = pattern_block(
+        vec![films, bumpers],
+        vec![step("films", 1), step("bumpers", 1)],
+        Some(block_guide),
+    );
+    let channel = base_channel(vec![block], None);
+
+    let items = resolve_channel(&channel, path(), &[], None, Some(&cat)).unwrap();
+
+    let film_item = items.iter().find(|i| i.id == "film-1").unwrap();
+    let bumper_item = items.iter().find(|i| i.id == "bumper-1").unwrap();
+
+    assert_eq!(
+        bumper_item.guide.as_ref().unwrap().title.as_deref(),
+        Some("Station Break"),
+        "the bumpers pool's own guide.title wins over the block's"
+    );
+    assert_eq!(
+        film_item.guide.as_ref().unwrap().title.as_deref(),
+        Some("{title} (block)"),
+        "the films pool declares no guide of its own, so its items still see the block's"
+    );
+}
+
+/// A pool's own `guide:` only overrides the fields it sets — a field it
+/// says nothing about still falls through to the block, same as every other
+/// rung in the cascade (#289 mirrors #158's field-by-field rule, not a
+/// whole-level override).
+#[test]
+fn a_pools_own_guide_only_overrides_the_fields_it_sets() {
+    let cat = films_and_bumpers_catalog();
+
+    let bumper_guide = GuideConfig {
+        title: Some("Station Break".into()),
+        sub_title: None,
+        description: None,
+        categories: None,
+    };
+    let block_guide = GuideConfig {
+        title: Some("block title".into()),
+        description: Some("block description".into()),
+        sub_title: None,
+        categories: None,
+    };
+
+    let bumpers = pool(
+        "bumpers",
+        "item.library == 'Station IDs'",
+        Some(bumper_guide),
+    );
+    let block = pattern_block(vec![bumpers], vec![step("bumpers", 1)], Some(block_guide));
+    let channel = base_channel(vec![block], None);
+
+    let items = resolve_channel(&channel, path(), &[], None, Some(&cat)).unwrap();
+    let bumper_item = items.iter().find(|i| i.id == "bumper-1").unwrap();
+    let guide = bumper_item.guide.as_ref().unwrap();
+
+    assert_eq!(guide.title.as_deref(), Some("Station Break"));
+    assert_eq!(
+        guide.description.as_deref(),
+        Some("block description"),
+        "the pool said nothing about description, so the block's still reaches it"
+    );
 }

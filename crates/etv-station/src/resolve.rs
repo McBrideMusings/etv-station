@@ -776,7 +776,7 @@ fn resolve_block(
             inputs: scoring,
             base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
         };
-        let (ids, pools, metadata) = crate::pattern::build(
+        let (ids, pools, metadata, pool_guides) = crate::pattern::build(
             cat,
             &include.pools,
             groups,
@@ -796,6 +796,7 @@ fn resolve_block(
             &ids,
             defaults,
             guide_defaults,
+            &pool_guides,
             &metadata,
             include.mode,
             idx,
@@ -822,7 +823,7 @@ fn resolve_block(
             .as_ref()
             .expect("resolve_block reaches this branch only when `sequencer` is set");
         let script_path = crate::score::resolve_plugin_path(base_dir, sequencer);
-        let (ids, pools, metadata) = crate::sequence::build(
+        let (ids, pools, metadata, pool_guides) = crate::sequence::build(
             cat,
             &include.pools,
             groups,
@@ -844,6 +845,7 @@ fn resolve_block(
             &ids,
             defaults,
             guide_defaults,
+            &pool_guides,
             &metadata,
             include.mode,
             idx,
@@ -979,6 +981,7 @@ fn resolve_pool_block_items(
     ids: &[String],
     defaults: Option<&ProgramMetadata>,
     guide_defaults: Option<&GuideConfig>,
+    pool_guides: &HashMap<String, GuideConfig>,
     metadata: &HashMap<String, serde_json::Value>,
     mode: Mode,
     idx: usize,
@@ -990,7 +993,15 @@ fn resolve_pool_block_items(
     };
     let mut items: Vec<ResolvedItem> = ids
         .iter()
-        .map(|id| catalog_item(cat, id, defaults, guide_defaults))
+        .map(|id| {
+            // The pool rung (#289) sits between the block and the item: a
+            // drawn id whose pool authored its own `guide:` sees that ahead
+            // of the pre-merged block ∘ channel default, exactly like an
+            // inline item's own `guide:` would if a pool draw had one to
+            // author.
+            let effective_guide = GuideConfig::cascade(None, pool_guides.get(id), guide_defaults);
+            catalog_item(cat, id, defaults, effective_guide.as_ref())
+        })
         .collect::<Result<Vec<_>, String>>()
         .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
         .into_iter()
@@ -2623,6 +2634,7 @@ mod tests {
                 config: None,
                 capabilities: Vec::new(),
                 datastores: Vec::new(),
+                guide: None,
             },
             Pool {
                 name: "shows".into(),
@@ -2641,6 +2653,7 @@ mod tests {
                 config: None,
                 capabilities: Vec::new(),
                 datastores: Vec::new(),
+                guide: None,
             },
         ];
         inc.pattern = vec![
@@ -3365,6 +3378,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }];
         inc.pattern = vec![PatternStep {
             pool: "shows".into(),

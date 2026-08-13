@@ -88,6 +88,7 @@ use crate::config::{
     ShowGroup, Take, TakeFrom,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
+use crate::guide::GuideConfig;
 use crate::resume::{GenerationState, PoolResume};
 
 /// Upper bound on an explicitly-authored `cycles`. A derived count needs no cap
@@ -640,6 +641,7 @@ pub fn build(
         Vec<String>,
         BTreeMap<String, PoolResume>,
         HashMap<String, serde_json::Value>,
+        HashMap<String, GuideConfig>,
     ),
     String,
 > {
@@ -683,6 +685,15 @@ pub fn build(
     };
 
     let mut out = Vec::new();
+    // This pool's own `guide:` (#289), the rung between the block and the
+    // item — recorded per drawn id as the pattern walks, so a caller left
+    // with only a flat id list (`resolve::resolve_pool_block_items`) can
+    // still tell a bumper's draw from a film's. Only pools that declare
+    // `guide:` add anything here, same as `metadata_out` below. Two pools
+    // drawing the same `entry_id` collide here on the same terms
+    // `Pool::constraints` already documents as "blind across pools" — pools
+    // that must stay apart have to be disjoint by construction.
+    let mut guide_out: HashMap<String, GuideConfig> = HashMap::new();
     let mut laid = Duration::ZERO;
     for cycle in 0..cycles {
         // Checked between cycles, never inside one: a cycle is the unit the
@@ -711,6 +722,11 @@ pub fn build(
             let drawn = runtimes[idx].visit(step.take, step.from, &roll);
             if budget.is_some() {
                 laid += runtimes[idx].runtime_of(&drawn);
+            }
+            if let Some(guide) = &runtimes[idx].cfg.guide {
+                for id in &drawn {
+                    guide_out.insert(id.clone(), guide.clone());
+                }
             }
             out.extend(drawn);
         }
@@ -741,7 +757,7 @@ pub fn build(
     // #173 to read. See [`flatten_picked_extras`] (#203) for why the pool
     // half of the key is dropped here.
     let metadata_out = flatten_picked_extras(score_cache.picked_extras);
-    Ok((out, resume_out, metadata_out))
+    Ok((out, resume_out, metadata_out, guide_out))
 }
 
 /// Flatten `ScoreCache::picked_extras`'s metadata half down to a plain
@@ -1404,6 +1420,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -1425,6 +1442,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -1450,6 +1468,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -1537,6 +1556,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -1835,6 +1855,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -1850,7 +1871,7 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = franchise_catalog();
-        let (ids, pool_state, _metadata) = build(
+        let (ids, pool_state, _metadata, _guide) = build(
             &cat,
             &pools,
             &groups,
@@ -2024,7 +2045,7 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = catalog();
-        let (ids, pool_state, _metadata) = build(
+        let (ids, pool_state, _metadata, _guide) = build(
             &cat,
             &pools,
             &[],
@@ -2509,7 +2530,7 @@ mod tests {
         let mut p = movies_pool();
         p.expr = Some("item.type == \"nonesuch\"".into());
         let cat = catalog();
-        let (ids, _, _metadata) = build(
+        let (ids, _, _metadata, _guide) = build(
             &cat,
             &[p],
             &[],
@@ -2562,7 +2583,7 @@ mod tests {
     ) -> (Vec<String>, BTreeMap<String, PoolResume>) {
         let mut movies = movies_pool();
         movies.advance = Advance::Resume;
-        let (ids, resume, _metadata) = build(
+        let (ids, resume, _metadata, _guide) = build(
             cat,
             &[movies],
             &[],
@@ -2811,7 +2832,7 @@ mod tests {
         let cat = movies_with_a_long_one();
         let mut movies = movies_pool();
         movies.constraints = Some(no_repeat_within(Duration::from_secs(90 * 60)));
-        let (ids, _, _metadata) = build(
+        let (ids, _, _metadata, _guide) = build(
             &cat,
             &[movies],
             &[],

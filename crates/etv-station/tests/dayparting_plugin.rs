@@ -58,6 +58,7 @@ fn pool(name: &str, expr: &str, config: Option<serde_json::Value>) -> Pool {
         // capability grant is needed (#167).
         capabilities: Vec::new(),
         datastores: Vec::new(),
+        guide: None,
     }
 }
 
@@ -103,7 +104,7 @@ fn run(
             fill: Some(Duration::from_secs(fill_secs)),
         },
     )
-    .map(|(ids, _, _)| ids)
+    .map(|(ids, _, _, _)| ids)
 }
 
 /// A block naming the sequencer places each pool in its declared hour range,
