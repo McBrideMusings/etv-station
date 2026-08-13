@@ -28,6 +28,40 @@ use serde_json::{Map, Value};
 
 use crate::config;
 
+/// Which encoder every channel is built to use, unless `presentation.json`
+/// overrides it for one.
+///
+/// This is deliberately environment-driven rather than a value in the committed
+/// `normalization.default.json`: `vaapi_device` names a device node that exists
+/// on one machine and not the next, and a checkout without that hardware must
+/// not inherit a default that fails. It sits beside `ETV_PORT` and
+/// `ETV_HLS_OUTPUT`, which are host facts for the same reason.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccelSettings {
+    /// ETV-next's `normalization.video.accel` — `vaapi`, `cuda`, `qsv`, and so
+    /// on. Never empty; an unset `ETV_ACCEL` produces `None` for the whole
+    /// struct rather than an empty string here.
+    pub accel: String,
+    /// `normalization.video.vaapi_device`. Required by VAAPI, unused otherwise.
+    pub vaapi_device: Option<String>,
+    /// `normalization.video.vaapi_driver`. Required by VAAPI, unused otherwise.
+    pub vaapi_driver: Option<String>,
+}
+
+/// The `accel` values ETV-next's channel config will deserialize
+/// (`vendor/etv-next/crates/ersatztv-channel/src/config.rs`). Checked here so a
+/// typo fails the render with a readable message instead of becoming a channel
+/// that quietly encodes in software.
+const KNOWN_ACCELS: [&str; 7] = [
+    "amf",
+    "cuda",
+    "qsv",
+    "rkmpp",
+    "vaapi",
+    "videotoolbox",
+    "vulkan",
+];
+
 /// Where the generated files go and what the lineup server is told to do.
 #[derive(Debug, Clone)]
 pub struct RenderOptions {
@@ -40,6 +74,9 @@ pub struct RenderOptions {
     /// Directory holding `normalization.default.json` (and the optional
     /// `presentation.json`), and receiving the generated files.
     pub out_dir: PathBuf,
+    /// Station-wide encoder. `None` leaves whatever the defaults file carries,
+    /// which ships as `""` — software.
+    pub accel: Option<AccelSettings>,
 }
 
 impl RenderOptions {
@@ -58,11 +95,34 @@ impl RenderOptions {
             .parse::<u16>()
             .map_err(|_| RenderError::Port(port_raw))?;
 
+        let accel = match var("ETV_ACCEL") {
+            None => None,
+            Some(accel) => {
+                if !KNOWN_ACCELS.contains(&accel.as_str()) {
+                    return Err(RenderError::UnknownAccel(accel));
+                }
+                let vaapi_device = var("ETV_VAAPI_DEVICE");
+                let vaapi_driver = var("ETV_VAAPI_DRIVER");
+                // ETV-next reverts to software when either is missing, and says
+                // so only at DEBUG. Refusing here turns a channel that quietly
+                // encodes on the CPU into a container that will not start.
+                if accel == "vaapi" && (vaapi_device.is_none() || vaapi_driver.is_none()) {
+                    return Err(RenderError::VaapiIncomplete);
+                }
+                Some(AccelSettings {
+                    accel,
+                    vaapi_device,
+                    vaapi_driver,
+                })
+            }
+        };
+
         Ok(Self {
             bind_address: var("ETV_BIND_ADDRESS").unwrap_or_else(|| "0.0.0.0".to_string()),
             port,
             hls_output: var("ETV_HLS_OUTPUT").unwrap_or_else(|| "tmp/hls".to_string()),
             out_dir,
+            accel,
         })
     }
 }
@@ -85,6 +145,12 @@ pub enum RenderError {
     Config(String),
     #[error("ETV_PORT must be an integer, got {0:?}")]
     Port(String),
+    #[error("ETV_ACCEL must be one of {}, got {:?}", KNOWN_ACCELS.join(", "), .0)]
+    UnknownAccel(String),
+    #[error(
+        "ETV_ACCEL=vaapi also needs ETV_VAAPI_DEVICE (e.g. /dev/dri/renderD128) and ETV_VAAPI_DRIVER (e.g. iHD); without both, every channel silently encodes in software"
+    )]
+    VaapiIncomplete,
     #[error("no channels resolved from {0}")]
     NoChannels(PathBuf),
     #[error("missing {0}")]
@@ -210,7 +276,16 @@ pub fn render_folders(
     if !default_path.exists() {
         return Err(RenderError::MissingDefaults(default_path));
     }
-    let default_body = read_json_object(&default_path)?;
+    let mut default_body = read_json_object(&default_path)?;
+
+    // Onto the defaults, BEFORE the per-channel merge, so a `presentation.json`
+    // override still wins for one channel. This is the station-wide answer, not
+    // the last word — the opposite of `playout.folder` below, which the station
+    // owns outright and injects afterwards.
+    if let Some(accel) = opts.accel.as_ref() {
+        apply_accel(&mut default_body, accel);
+    }
+    let default_body = default_body;
 
     let presentation_path = opts.out_dir.join("presentation.json");
     let presentation = if presentation_path.exists() {
@@ -300,6 +375,47 @@ pub fn render_folders(
     })
 }
 
+/// Write the station-wide encoder into a channel body's
+/// `normalization.video` block.
+///
+/// The VAAPI keys are removed rather than left behind when the encoder is not
+/// VAAPI: a stale `vaapi_device` naming a node that no longer exists is exactly
+/// the shape that makes a channel revert to software with nothing above DEBUG
+/// to say so.
+fn apply_accel(body: &mut Map<String, Value>, accel: &AccelSettings) {
+    let video = body
+        .entry("normalization".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !video.is_object() {
+        *video = Value::Object(Map::new());
+    }
+    let video = video
+        .as_object_mut()
+        .expect("normalization is an object")
+        .entry("video".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !video.is_object() {
+        *video = Value::Object(Map::new());
+    }
+    let video = video.as_object_mut().expect("video is an object");
+
+    video.insert("accel".to_string(), Value::String(accel.accel.clone()));
+
+    for (key, value) in [
+        ("vaapi_device", accel.vaapi_device.as_ref()),
+        ("vaapi_driver", accel.vaapi_driver.as_ref()),
+    ] {
+        match value {
+            Some(v) if accel.accel == "vaapi" => {
+                video.insert(key.to_string(), Value::String(v.clone()));
+            }
+            _ => {
+                video.remove(key);
+            }
+        }
+    }
+}
+
 /// Recursively merge `override_` onto a copy of `base` (objects only).
 fn deep_merge(base: &Map<String, Value>, override_: &Map<String, Value>) -> Map<String, Value> {
     let mut result = base.clone();
@@ -380,6 +496,22 @@ mod tests {
             port: 8409,
             hls_output: "tmp/hls".to_string(),
             out_dir: dir.to_path_buf(),
+            accel: None,
+        }
+    }
+
+    fn opts_with_accel(dir: &Path, accel: AccelSettings) -> RenderOptions {
+        RenderOptions {
+            accel: Some(accel),
+            ..opts(dir)
+        }
+    }
+
+    fn vaapi() -> AccelSettings {
+        AccelSettings {
+            accel: "vaapi".to_string(),
+            vaapi_device: Some("/dev/dri/renderD128".to_string()),
+            vaapi_driver: Some("iHD".to_string()),
         }
     }
 
@@ -479,6 +611,98 @@ mod tests {
             "playout folder must be absolute, got {folder}"
         );
         assert!(folder.ends_with("out/star-trek"));
+    }
+
+    /// The whole point of the setting: one value reaches every channel, and
+    /// every channel it reaches has all three keys VAAPI needs. Missing any one
+    /// of them is what makes ETV-next revert to software with nothing above
+    /// DEBUG to say so.
+    #[test]
+    fn the_station_wide_encoder_reaches_every_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
+
+        let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
+        render_folders(&folders, &opts_with_accel(dir.path(), vaapi()), "id").unwrap();
+
+        for name in ["channel1.json", "channel2.json"] {
+            let video = read(&dir.path().join(name))["normalization"]["video"].clone();
+            assert_eq!(video["accel"], "vaapi", "{name}");
+            assert_eq!(video["vaapi_device"], "/dev/dri/renderD128", "{name}");
+            assert_eq!(video["vaapi_driver"], "iHD", "{name}");
+        }
+    }
+
+    /// A non-VAAPI encoder must not leave VAAPI keys behind. A `vaapi_device`
+    /// naming a node that is not there is the same silent-software failure.
+    #[test]
+    fn switching_to_cuda_drops_the_vaapi_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("normalization.default.json"),
+            r#"{"normalization": {"video": {"accel": "vaapi",
+                 "vaapi_device": "/dev/dri/renderD128", "vaapi_driver": "iHD"}}}"#,
+        )
+        .unwrap();
+
+        let cuda = AccelSettings {
+            accel: "cuda".to_string(),
+            vaapi_device: None,
+            vaapi_driver: None,
+        };
+        let folders = vec![PathBuf::from("out/star-trek")];
+        render_folders(&folders, &opts_with_accel(dir.path(), cuda), "id").unwrap();
+
+        let video = read(&dir.path().join("channel1.json"))["normalization"]["video"].clone();
+        assert_eq!(video["accel"], "cuda");
+        assert!(video.get("vaapi_device").is_none(), "{video}");
+        assert!(video.get("vaapi_driver").is_none(), "{video}");
+    }
+
+    /// The station-wide value is a default, not the last word: it goes on
+    /// before the per-channel merge so `presentation.json` can still put one
+    /// channel on a different card. This is the hook #260's profiles hang off.
+    #[test]
+    fn a_presentation_override_still_beats_the_station_wide_encoder() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
+        fs::write(
+            dir.path().join("presentation.json"),
+            r#"{"diehard": {"config": {"normalization": {"video": {"accel": "cuda"}}}}}"#,
+        )
+        .unwrap();
+
+        let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
+        render_folders(&folders, &opts_with_accel(dir.path(), vaapi()), "id").unwrap();
+
+        assert_eq!(
+            read(&dir.path().join("channel1.json"))["normalization"]["video"]["accel"],
+            "vaapi",
+            "a channel that says nothing takes the station-wide encoder"
+        );
+        assert_eq!(
+            read(&dir.path().join("channel2.json"))["normalization"]["video"]["accel"],
+            "cuda",
+            "a channel that names its own encoder keeps it"
+        );
+    }
+
+    /// Leaving `ETV_ACCEL` unset must not touch the defaults file's own value.
+    #[test]
+    fn no_configured_encoder_leaves_the_defaults_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("normalization.default.json"),
+            r#"{"normalization": {"video": {"accel": "", "width": 1280}}}"#,
+        )
+        .unwrap();
+
+        let folders = vec![PathBuf::from("out/star-trek")];
+        render_folders(&folders, &opts(dir.path()), "id").unwrap();
+
+        let video = read(&dir.path().join("channel1.json"))["normalization"]["video"].clone();
+        assert_eq!(video["accel"], "");
+        assert_eq!(video["width"], 1280);
     }
 
     #[test]

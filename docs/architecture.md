@@ -48,6 +48,23 @@ playback block `--render-etv-next` copies into every generated `channelN.json`:
   viewer sees them and no player setting can turn them off, because by the time
   the video arrives the words are part of the image.
 
+Two things this switch does *not* control, both worth knowing before reaching
+for it:
+
+**It only governs text subtitles.** A Blu-ray or DVD rip usually carries its
+subtitles as pictures — `hdmv_pgs_subtitle` or `dvd_subtitle` — and a picture
+cannot be turned into WebVTT text. ETV-next composites those onto the video in
+either mode. So `convert` is not a promise that nothing gets painted in; it is a
+promise about the tracks that *can* be converted.
+
+**Nothing is painted in unless a playout item asks for it.** The station writes
+items that name no subtitle track, and an item that names none plays without
+subtitles. That is the station's default and the reason the picture-subtitle path
+above stays cold: a channel of Blu-ray rips does not silently acquire a permanent,
+unselectable subtitle nobody chose. An item opts in by carrying
+`tracks.subtitle` — a `stream_index` to pick a track out of its own file, or a
+`source` to name a sidecar.
+
 One channel wanting the other behaviour overrides it in `presentation.json`,
 beside the defaults file, under that channel's identity — the same place a
 per-channel resolution override goes. The render deep-merges it over the
