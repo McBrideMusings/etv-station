@@ -228,6 +228,19 @@ impl PlayoutItem {
         self.finish
     }
 
+    /// Whether this item names a subtitle track selection at all. `false`
+    /// covers both "no `tracks` block" and "`tracks` present but no
+    /// `subtitle` selection" — either way, nothing asked for subtitles, so
+    /// nothing should be produced or advertised for it. This says nothing
+    /// about whether the selected stream can actually yield cues (a
+    /// picture-based Blu-ray/DVD subtitle track still resolves `true` here);
+    /// that can only be known once the stream is probed.
+    pub fn requests_subtitle(&self) -> bool {
+        self.tracks
+            .as_ref()
+            .is_some_and(|tracks| tracks.subtitle.is_some())
+    }
+
     /// Construct a scheduled item from an already-resolved source, defaulting
     /// every optional field (`tracks`/`watermark`/`program`/`overlay`/`metadata`). Callers
     /// set whichever optionals they drive afterward. New optional schema fields
@@ -589,6 +602,47 @@ pub async fn from_file(path: &str) -> Result<PlayoutLoadResult, PlayoutError> {
     Ok(PlayoutLoadResult { playout })
 }
 
+/// Whether any playout chunk file (`{start}_{finish}.json`) currently sitting
+/// in `folder` contains an item that names a subtitle track selection.
+///
+/// This is the shared fact both the master-playlist decision (`ersatztv`,
+/// which channel/HTTP-request the client's player at) and the channel's own
+/// subtitle production (`ersatztv-channel`, the worker that actually plays
+/// the schedule) can independently derive from the exact same source of
+/// truth — the playout JSON directory — without either process having to
+/// signal the other. A folder that can't be read, or contains no files that
+/// parse, reports `false` rather than erroring, matching how a channel with
+/// nothing scheduled yet behaves: nothing has asked for subtitles.
+pub async fn schedule_requests_subtitle(folder: &Path) -> bool {
+    let mut entries = match tokio::fs::read_dir(folder).await {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+
+        if let Ok(loaded) = from_file(path_str).await
+            && loaded
+                .playout
+                .items
+                .iter()
+                .any(PlayoutItem::requests_subtitle)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn parse_playout_filename(file_stem: &str) -> Option<(OffsetDateTime, OffsetDateTime)> {
     let split: Vec<&str> = file_stem.split("_").collect();
     if split.len() == 2 {
@@ -618,5 +672,65 @@ fn parse_unix_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
         OffsetDateTime::from_unix_timestamp(epoch).ok()
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod schedule_requests_subtitle_tests {
+    use super::*;
+
+    fn item(id: &str, wants_subtitle: bool) -> PlayoutItem {
+        let start = OffsetDateTime::now_utc();
+        let finish = start + time::Duration::minutes(5);
+        let mut playout_item = PlayoutItem::scheduled(
+            id.to_string(),
+            start,
+            finish,
+            PlayoutItemSource::local("/media/file.mkv".to_string(), None, None),
+        );
+        if wants_subtitle {
+            playout_item.tracks = Some(PlayoutItemTracks {
+                audio: None,
+                video: None,
+                subtitle: Some(TrackSelection {
+                    source: None,
+                    stream_index: Some(2),
+                }),
+            });
+        }
+        playout_item
+    }
+
+    fn write_chunk(dir: &Path, name: &str, items: Vec<PlayoutItem>) {
+        let playout = Playout::new(items);
+        std::fs::write(dir.join(name), serde_json::to_string(&playout).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn true_when_any_chunk_file_has_an_item_requesting_subtitles() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(
+            dir.path(),
+            "chunk.json",
+            vec![item("no-subs", false), item("wants-subs", true)],
+        );
+
+        assert!(schedule_requests_subtitle(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn false_when_no_item_in_any_chunk_file_requests_subtitles() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), "chunk.json", vec![item("no-subs", false)]);
+
+        assert!(!schedule_requests_subtitle(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn false_when_folder_is_empty_or_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!schedule_requests_subtitle(dir.path()).await);
+        assert!(!schedule_requests_subtitle(&dir.path().join("does-not-exist")).await);
     }
 }
