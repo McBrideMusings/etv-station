@@ -83,6 +83,7 @@ fn discovery_pool() -> Pool {
         // grant is needed (#167).
         capabilities: Vec::new(),
         datastores: Vec::new(),
+        guide: None,
     }
 }
 
@@ -106,6 +107,7 @@ fn spotlight_pool() -> Pool {
         // grant is needed (#167).
         capabilities: Vec::new(),
         datastores: Vec::new(),
+        guide: None,
     }
 }
 
@@ -136,7 +138,7 @@ fn the_committed_example_interleaves_a_resuming_and_a_restarting_pool() {
     let mut state = GenerationState::empty();
     state.cursor.insert("show:pilot".into(), "ep-1".to_string());
 
-    let (ids, resume, _) = build(
+    let (ids, resume, _, _) = build(
         &cat,
         &pools,
         &[],
@@ -174,7 +176,7 @@ fn the_committed_example_starts_spotlight_at_the_top_with_no_cursor() {
     let pools = vec![spotlight_pool(), discovery_pool()];
     let inputs = ScoreInputs::default();
 
-    let (ids, _, _) = build(
+    let (ids, _, _, _) = build(
         &cat,
         &pools,
         &[],
@@ -224,6 +226,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
         // capability grant is needed (#167).
         capabilities: Vec::new(),
         datastores: Vec::new(),
+        guide: None,
     }
 }
 

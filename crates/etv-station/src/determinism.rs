@@ -656,6 +656,7 @@ fn pick(ctx) {
             // pair matches what a real config would have to write.
             capabilities: vec!["catalog_read".into()],
             datastores: Vec::new(),
+            guide: None,
         }
     }
 

@@ -202,10 +202,20 @@ fn validate_guide(
     let Some(guide) = guide else {
         return Ok(());
     };
-    let bad = |field: &str, message: String| ConfigError::Validation {
+    validate_guide_templates(guide, &|field, message| ConfigError::Validation {
         path: path.to_path_buf(),
         message: format!("{label}: guide.{field}: {message}"),
-    };
+    })
+}
+
+/// The field-by-field template check every cascade level shares. `bad` turns
+/// a field name (`"title"`, `"categories[2]"`) plus the template's own
+/// complaint into the error that names where to go and fix it — the level's
+/// label is already folded into that closure by the caller.
+fn validate_guide_templates(
+    guide: &GuideConfig,
+    bad: &dyn Fn(&str, String) -> ConfigError,
+) -> Result<(), ConfigError> {
     if let Some(t) = &guide.title {
         crate::guide::validate_template(t).map_err(|m| bad("title", m))?;
     }
@@ -734,6 +744,14 @@ fn validate_block_pools<'a>(
             let pool_bad = |m: String| bad(format!("pool {:?}: {m}", pool.name));
             validate_constraints(c, &pool_bad)?;
         }
+        // This pool's own `guide:` (#289) — validated on the same terms as
+        // every other cascade level, with the pool's name in the message
+        // since that is the line the author has to go and fix.
+        if let Some(guide) = &pool.guide {
+            validate_guide_templates(guide, &|field, message| {
+                bad(format!("pool {:?}: guide.{field}: {message}", pool.name))
+            })?;
+        }
         if !pool_names.insert(pool.name.as_str()) {
             return Err(bad(format!(
                 "pool name {:?} is already used by another block in this channel; \
@@ -1046,6 +1064,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -2355,6 +2374,41 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("none of"), "msg = {msg}");
+    }
+
+    /// #289: a pool's own `guide:` is checked on the same terms as every
+    /// other cascade level — an unknown `{field}` fails the load naming both
+    /// the field and the pool that authored it.
+    #[test]
+    fn a_pools_guide_with_an_unknown_field_is_rejected_naming_the_pool() {
+        let mut p = pool("bumpers");
+        p.guide = Some(GuideConfig {
+            title: Some("{tagline}".into()),
+            sub_title: None,
+            description: None,
+            categories: None,
+        });
+        let block = pattern_block(vec![p], vec![step("bumpers", 1)]);
+        let cfg = channel_with(vec![block]);
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bumpers"), "msg = {msg}");
+        assert!(msg.contains("tagline"), "msg = {msg}");
+    }
+
+    /// A pool whose `guide:` uses only known fields validates cleanly.
+    #[test]
+    fn a_pools_guide_with_known_fields_validates() {
+        let mut p = pool("bumpers");
+        p.guide = Some(GuideConfig {
+            title: Some("Station Break".into()),
+            sub_title: None,
+            description: None,
+            categories: None,
+        });
+        let block = pattern_block(vec![p], vec![step("bumpers", 1)]);
+        let cfg = channel_with(vec![block]);
+        validate_channel(&dummy_path(), &cfg).expect("known guide fields validate");
     }
 
     #[test]
