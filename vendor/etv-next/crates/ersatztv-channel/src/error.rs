@@ -66,6 +66,16 @@ pub enum ChannelError {
     #[error("channel {0} terminated after ffmpeg stall")]
     Stalled(String),
 
+    /// The item was still playing correctly, but the transcode had fallen far
+    /// enough behind wall clock that the remaining buffer would have run out.
+    ///
+    /// Not a failure of the item, and deliberately never surfaced to a viewer:
+    /// the session resumes the same item from where it got to, with a fresh
+    /// initial burst to rebuild the lead. Treating it as a failure would replace
+    /// a perfectly good film with black and silence for the rest of its slot.
+    #[error("lead exhausted while the item was still playing; restarting it")]
+    LeadExhausted,
+
     #[error("failed to capture ffmpeg stderr")]
     CaptureFFmpegStderrFailure,
 

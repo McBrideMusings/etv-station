@@ -56,6 +56,31 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(60);
 /// so ffmpeg reads this much at full speed before slowing to wall-clock speed.
 const TARGET_BUFFER: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 11);
 
+/// Lead at which a still-playing item is restarted to rebuild its buffer.
+///
+/// `-readrate 1.0` asks ffmpeg for exactly wall-clock speed, and ffmpeg delivers
+/// a few percent under whatever it is asked for — measured at 0.958x on an idle
+/// machine and 0.69x on a busy one. Because readrate only ever slows the read
+/// down, a shortfall is never repaid, so the lead from [`TARGET_BUFFER`] drains
+/// at the deficit rate and the session eventually cannot produce a segment
+/// before the viewer needs it.
+///
+/// The lead used to be topped up only between items, which is fine for a
+/// half-hour episode and useless for a feature film: one item can run for hours
+/// with no opportunity to recover. Restarting the item mid-way costs a seek and
+/// a few seconds of respawn, and buys back the whole buffer.
+///
+/// Set above the 4-10s a respawn takes, so the new process is producing again
+/// before the remaining lead runs out.
+const REBURST_AT_LEAD: time::Duration = time::Duration::seconds(20);
+
+/// Lead the item must reach before [`REBURST_AT_LEAD`] is allowed to fire.
+///
+/// Without this the check would trip immediately: at the start of an item the
+/// lead is still being built, so it is legitimately below the threshold and
+/// would restart the item forever without ever playing any of it.
+const REBURST_ARM_AT_LEAD: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 6);
+
 /// Read end of the overlay rawvideo fifo, held open by this process and handed
 /// to ffmpeg as an inherited fd. There are no fifos off unix, so the type is
 /// uninhabited there and the overlay path fails instead of being constructed.
@@ -466,6 +491,19 @@ impl ChannelSession {
                 | ChannelError::Stalled(_)),
             ) => {
                 return Err(e);
+            }
+            // The item is fine; the transcode had merely fallen behind. Pick it
+            // up where its segments actually reached and leave the state at
+            // `Seek` so it resumes mid-item rather than restarting the film.
+            // This must be handled ahead of the catch-all below — routing it
+            // there would blank the rest of the item, which is a far worse
+            // outcome than the few seconds of respawn it costs here.
+            Err(ChannelError::LeadExhausted) => {
+                let resumed_at = *self.playlist_manager.lock().await.last_segment_end();
+                self.transcoded_until = resumed_at;
+                self.state = ChannelSessionState::Seek;
+                log::debug!("resuming the same item from {}", resumed_at);
+                return Ok(());
             }
             Err(e) if troubleshoot => return Err(e),
             Err(e) => {
@@ -919,6 +957,33 @@ impl ChannelSession {
                 self.write_dossier(current_item, &video_probe_result, &audio_probe_result,
                     subtitle_probe_result.as_ref(), &ring, "ffmpeg stalled".to_string()).await;
                 return Err(ChannelError::Stalled(self.channel_config.number().to_owned()));
+            }
+            // Losing ground, but still producing. Distinct from the stall arm
+            // above: ffmpeg is healthy and emitting segments, just slower than
+            // they are being consumed, so waiting for it to stop producing
+            // entirely means waiting until after the viewer has already run out.
+            lead = async {
+                    let mut armed = false;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let playlist_manager = self.playlist_manager.lock().await;
+                        let lead = *playlist_manager.last_segment_end() - OffsetDateTime::now_utc();
+                        drop(playlist_manager);
+                        let fire;
+                        (armed, fire) = reburst_decision(armed, lead);
+                        if fire {
+                            break lead;
+                        }
+                    }
+                } => {
+                log::info!(
+                    "lead down to {}s while still playing; restarting the item to rebuild the buffer",
+                    lead.whole_seconds()
+                );
+                ffmpeg_child.kill().await.ok();
+                let _ = reader_handle.await;
+                self.cleanup_old_report().await;
+                return Err(ChannelError::LeadExhausted);
             }
         }
 
@@ -1524,6 +1589,21 @@ fn clear_nonblocking(file: &std::fs::File) -> Result<(), ChannelError> {
     Ok(())
 }
 
+/// Whether a still-playing item should be restarted to rebuild its lead.
+///
+/// Returns the next `armed` state and whether to fire now. Split out from the
+/// select arm that drives it because the arming half is the part that is easy to
+/// get wrong and impossible to observe once it is inside a `tokio::select!`.
+fn reburst_decision(armed: bool, lead: time::Duration) -> (bool, bool) {
+    if armed {
+        (true, lead <= REBURST_AT_LEAD)
+    } else {
+        // Arming needs a lead that has actually been built. Firing on the way UP
+        // would restart the item forever without ever playing any of it.
+        (lead >= REBURST_ARM_AT_LEAD, false)
+    }
+}
+
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
     match value {
         WatermarkLocation::TopLeft => ffpipeline::input::WatermarkLocation::TopLeft,
@@ -1646,6 +1726,77 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod reburst_tests {
+    use super::*;
+
+    /// A fresh item starts with no lead at all. Firing here would kill the
+    /// transcode before it had produced anything, restart it, and do the same
+    /// again — the film would never play.
+    #[test]
+    fn a_lead_still_being_built_does_not_fire() {
+        let (armed, fire) = reburst_decision(false, time::Duration::seconds(0));
+        assert!(!armed, "must not arm before the lead is built");
+        assert!(!fire);
+
+        let (armed, fire) = reburst_decision(false, REBURST_AT_LEAD - time::Duration::seconds(1));
+        assert!(!armed, "a lead below the arming level is still the way up");
+        assert!(!fire, "firing on the way up would restart the item forever");
+    }
+
+    #[test]
+    fn arming_needs_the_lead_to_reach_the_arming_level() {
+        let (armed, fire) = reburst_decision(false, REBURST_ARM_AT_LEAD);
+        assert!(armed);
+        assert!(
+            !fire,
+            "arming is not firing — the lead is healthy at this point"
+        );
+    }
+
+    /// The case this exists for: the lead was built, then drained by a
+    /// transcode running under wall-clock speed.
+    #[test]
+    fn an_armed_item_fires_once_the_lead_drains() {
+        let (armed, fire) = reburst_decision(true, REBURST_AT_LEAD);
+        assert!(
+            armed,
+            "arming survives so a recovering lead cannot disarm it"
+        );
+        assert!(fire);
+
+        let (_, fire) = reburst_decision(true, REBURST_AT_LEAD + time::Duration::seconds(1));
+        assert!(!fire, "still has lead to spare");
+    }
+
+    /// A lead that has gone negative means the viewer has already caught up with
+    /// the encoder. It must fire, not be treated as an unreachable state.
+    #[test]
+    fn a_negative_lead_fires() {
+        let (_, fire) = reburst_decision(true, time::Duration::seconds(-30));
+        assert!(fire);
+    }
+
+    /// The threshold has to leave room for the respawn itself. A channel takes
+    /// 4-10s to produce its first segment, so firing at a lead shorter than that
+    /// would hand the viewer a gap rather than avoid one.
+    #[test]
+    fn the_threshold_leaves_room_for_a_respawn() {
+        assert!(
+            REBURST_AT_LEAD >= time::Duration::seconds(12),
+            "too tight to respawn before the viewer runs dry"
+        );
+        assert!(
+            REBURST_ARM_AT_LEAD > REBURST_AT_LEAD,
+            "arming level must sit above the firing level or the two race"
+        );
+        assert!(
+            TARGET_BUFFER > REBURST_ARM_AT_LEAD,
+            "a full buffer must comfortably arm the check"
+        );
     }
 }
 

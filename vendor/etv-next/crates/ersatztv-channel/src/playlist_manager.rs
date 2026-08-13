@@ -144,6 +144,18 @@ impl PlaylistManager {
         &self.last_progress
     }
 
+    /// Wall-clock end of the newest segment produced so far.
+    ///
+    /// `last_segment_end - now` is the session's remaining lead: how much
+    /// already-transcoded video a viewer has left before they catch up with the
+    /// encoder. The session watches this to notice it is losing ground while an
+    /// item is still playing, which is the only place that lead can be measured
+    /// — `transcoded_until` is not updated until an item finishes, and a feature
+    /// film is one item lasting hours.
+    pub fn last_segment_end(&self) -> &OffsetDateTime {
+        &self.last_segment_end
+    }
+
     pub async fn before_new_pipeline(
         &mut self,
         new_pts_offset: Option<PtsOffset>,
