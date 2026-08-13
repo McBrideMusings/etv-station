@@ -116,6 +116,8 @@ async fn assert_one_file_across_the_chunk(
 fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
     ChannelConfig {
         name: None,
+        display_name: None,
+        guide: None,
         scoring: None,
         anchor: None,
         window_days: 1,
@@ -129,6 +131,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
             blocks: vec![BlockInclude {
                 block: None,
                 program: None,
+                guide: None,
                 duplicates: None,
                 constraints: None,
                 entries: Vec::new(),

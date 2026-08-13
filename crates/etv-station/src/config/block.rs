@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::constraints::Constraints;
 use super::entry::{Entry, Fallback};
 use super::pool::{PatternStep, Pool};
+use crate::guide::GuideConfig;
 
 /// Within-block duplicate policy (#46 locked decision). Block-scoped:
 /// cross-block repeats are always allowed.
@@ -27,6 +28,11 @@ pub struct BlockFile {
     /// Program-metadata defaults applied to items that omit their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<ProgramMetadata>,
+
+    /// Block-level `guide:` defaults (#158), the middle of the three cascade
+    /// levels (channel → block → item).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideConfig>,
 
     /// `None` means unset — an entries block then resolves to the [`Duplicates`]
     /// default (`collapse`) while a pattern block forces `keep`. Splicing the

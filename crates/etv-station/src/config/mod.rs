@@ -12,6 +12,7 @@ mod source;
 mod station;
 mod validate;
 
+pub use crate::guide::GuideConfig;
 pub use block::{BlockFile, Duplicates};
 pub use channel::{ChannelConfig, ChannelOverlayConfig, ScoringConfig};
 pub use constraints::{Constraints, NoRepeatWithin};

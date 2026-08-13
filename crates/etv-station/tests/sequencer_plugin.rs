@@ -234,6 +234,8 @@ fn foryou_pool(plugin: &Path) -> Pool {
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
         name: None,
+        display_name: None,
+        guide: None,
         scoring: None,
         anchor: None,
         window_days: 1,
@@ -247,6 +249,7 @@ fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
             blocks: vec![BlockInclude {
                 block: None,
                 program: None,
+                guide: None,
                 duplicates: None,
                 constraints: None,
                 entries: Vec::new(),

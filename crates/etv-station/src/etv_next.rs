@@ -9,12 +9,20 @@
 //! What the station owns (derived here): the channel roster, channel numbers
 //! (station order), and each `playout.folder`.
 //!
-//! What ETV-next owns (supplied here, NOT from the station config): display
-//! names and the `normalization` / `ffmpeg` playback block. Defaults come from
-//! `normalization.default.json` in the output directory; per-channel display
-//! names and playback overrides come from an optional `presentation.json` keyed
-//! by channel identity, each value `{name?, config?}` where `config` is a
-//! partial deep-merged onto the default channel body.
+//! What ETV-next owns (supplied here, NOT from the station config): the
+//! `normalization` / `ffmpeg` playback block, from `normalization.default.json`
+//! in the output directory. The lineup display name, by contrast, IS station
+//! config — each channel's own `display_name` (#158), falling back to its
+//! identity — never a second file.
+//!
+//! Until #158, the display name and a per-channel playback override both came
+//! from an optional `presentation.json` keyed by channel identity. That file is
+//! no longer read at all — no precedence rule, no dual support — because it
+//! lived outside the channel config and outside git, so a channel's guide-facing
+//! name could only be changed by hand-editing a file nobody would think to look
+//! in. The per-channel playback override `presentation.json` also carried has no
+//! replacement here; a channel that needs one waits on whatever issue picks that
+//! back up.
 //!
 //! It lives in the daemon binary rather than a helper script because the
 //! runtime image runs both processes and has no interpreter: the container
@@ -28,8 +36,9 @@ use serde_json::{Map, Value};
 
 use crate::config;
 
-/// Which encoder every channel is built to use, unless `presentation.json`
-/// overrides it for one.
+/// Which encoder every channel is built to use — station-wide; there is no
+/// remaining per-channel override since `presentation.json` was removed
+/// (#158 decision #5).
 ///
 /// This is deliberately environment-driven rather than a value in the committed
 /// `normalization.default.json`: `vaapi_device` names a device node that exists
@@ -71,8 +80,8 @@ pub struct RenderOptions {
     pub port: u16,
     /// `output.folder` in the emitted lineup — ETV-next's HLS working dir.
     pub hls_output: String,
-    /// Directory holding `normalization.default.json` (and the optional
-    /// `presentation.json`), and receiving the generated files.
+    /// Directory holding `normalization.default.json`, and receiving the
+    /// generated files.
     pub out_dir: PathBuf,
     /// Station-wide encoder. `None` leaves whatever the defaults file carries,
     /// which ships as `""` — software.
@@ -182,6 +191,14 @@ pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, Rend
     if folders.is_empty() {
         return Err(RenderError::NoChannels(config_path.to_path_buf()));
     }
+    // The channel's own `display_name` (#158) — never a second file. `None`
+    // falls back to the identity, resolved from the folder name in
+    // `render_folders` exactly as it always has.
+    let display_names: Vec<Option<String>> = station
+        .channels
+        .iter()
+        .map(|ch| ch.config.display_name.clone())
+        .collect();
     // The station config is the only place the tuner identity can come from,
     // and this is the only entry point that has it. The minted id is kept beside
     // that config file — see `resolve_device_id` for why not on the data volume.
@@ -189,7 +206,7 @@ pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, Rend
         station.station.device_id.as_deref(),
         config_dir(config_path),
     )?;
-    render_folders(&folders, opts, &device_id)
+    render_folders(&folders, &display_names, opts, &device_id)
 }
 
 /// The directory holding the station config, which is where state that must
@@ -269,30 +286,25 @@ pub fn resolve_device_id(
 /// which nothing here would notice and only Plex would.
 pub fn render_folders(
     folders: &[PathBuf],
+    display_names: &[Option<String>],
     opts: &RenderOptions,
     device_id: &str,
 ) -> Result<Rendered, RenderError> {
+    assert_eq!(
+        folders.len(),
+        display_names.len(),
+        "folders/display_names length mismatch"
+    );
     let default_path = opts.out_dir.join("normalization.default.json");
     if !default_path.exists() {
         return Err(RenderError::MissingDefaults(default_path));
     }
     let mut default_body = read_json_object(&default_path)?;
 
-    // Onto the defaults, BEFORE the per-channel merge, so a `presentation.json`
-    // override still wins for one channel. This is the station-wide answer, not
-    // the last word — the opposite of `playout.folder` below, which the station
-    // owns outright and injects afterwards.
     if let Some(accel) = opts.accel.as_ref() {
         apply_accel(&mut default_body, accel);
     }
     let default_body = default_body;
-
-    let presentation_path = opts.out_dir.join("presentation.json");
-    let presentation = if presentation_path.exists() {
-        read_json_object(&presentation_path)?
-    } else {
-        Map::new()
-    };
 
     // Drop any previously generated channel files so a shrunk roster (or the
     // legacy un-numbered channel.json) can't leave orphans behind.
@@ -306,12 +318,10 @@ pub fn render_folders(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let overrides = presentation.get(&identity).and_then(Value::as_object);
-        let display = overrides
-            .and_then(|o| o.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or(&identity)
-            .to_string();
+        // #158: the display name is the channel's own `display_name`, read
+        // from its YAML by `render` above — never a second file. Falls back
+        // to the identity, same as before this field existed.
+        let display = display_names[index].clone().unwrap_or(identity);
 
         // Absolute so ETV-next reads exactly where the station writes,
         // regardless of ETV-next's own working directory. A relative folder is
@@ -322,16 +332,11 @@ pub fn render_folders(
             source,
         })?;
 
-        let channel_overrides = overrides
-            .and_then(|o| o.get("config"))
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let mut channel = deep_merge(&default_body, &channel_overrides);
+        let mut channel = default_body.clone();
 
         // The station owns playout.folder — inject it AFTER the merge so a
-        // `playout` key in the default body or a presentation override can never
-        // clobber the derived folder (it may still carry other playout.* keys).
+        // `playout` key in the default body can never clobber the derived
+        // folder (it may still carry other playout.* keys).
         let playout = channel
             .entry("playout".to_string())
             .or_insert_with(|| Value::Object(Map::new()));
@@ -414,22 +419,6 @@ fn apply_accel(body: &mut Map<String, Value>, accel: &AccelSettings) {
             }
         }
     }
-}
-
-/// Recursively merge `override_` onto a copy of `base` (objects only).
-fn deep_merge(base: &Map<String, Value>, override_: &Map<String, Value>) -> Map<String, Value> {
-    let mut result = base.clone();
-    for (key, val) in override_ {
-        match (result.get(key), val) {
-            (Some(Value::Object(existing)), Value::Object(incoming)) => {
-                result.insert(key.clone(), Value::Object(deep_merge(existing, incoming)));
-            }
-            _ => {
-                result.insert(key.clone(), val.clone());
-            }
-        }
-    }
-    result
 }
 
 fn read_json_object(path: &Path) -> Result<Map<String, Value>, RenderError> {
@@ -515,6 +504,12 @@ mod tests {
         }
     }
 
+    /// No `display_name:` authored on any channel — every one falls back to
+    /// its identity, same as before that field existed.
+    fn no_names(n: usize) -> Vec<Option<String>> {
+        vec![None; n]
+    }
+
     // Plex keys a DVR's whole channel mapping on the device id, so an id that
     // changes between runs costs the user 60 channels of remapping by hand.
     // These three tests are what "stable" means in practice.
@@ -570,7 +565,8 @@ mod tests {
         fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek")];
-        let rendered = render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
+        let rendered =
+            render_folders(&folders, &no_names(1), &opts(dir.path()), "test-device-id").unwrap();
 
         // Read back through ETV-next's own config type, not as loose JSON. The
         // two sides have to agree on this key's name, and a mismatch is exactly
@@ -592,7 +588,8 @@ mod tests {
         fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
-        let rendered = render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
+        let rendered =
+            render_folders(&folders, &no_names(2), &opts(dir.path()), "test-device-id").unwrap();
         assert_eq!(rendered.channels, 2);
 
         let lineup = read(&rendered.lineup_path);
@@ -623,7 +620,13 @@ mod tests {
         fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
-        render_folders(&folders, &opts_with_accel(dir.path(), vaapi()), "id").unwrap();
+        render_folders(
+            &folders,
+            &no_names(2),
+            &opts_with_accel(dir.path(), vaapi()),
+            "id",
+        )
+        .unwrap();
 
         for name in ["channel1.json", "channel2.json"] {
             let video = read(&dir.path().join(name))["normalization"]["video"].clone();
@@ -651,40 +654,18 @@ mod tests {
             vaapi_driver: None,
         };
         let folders = vec![PathBuf::from("out/star-trek")];
-        render_folders(&folders, &opts_with_accel(dir.path(), cuda), "id").unwrap();
+        render_folders(
+            &folders,
+            &no_names(1),
+            &opts_with_accel(dir.path(), cuda),
+            "id",
+        )
+        .unwrap();
 
         let video = read(&dir.path().join("channel1.json"))["normalization"]["video"].clone();
         assert_eq!(video["accel"], "cuda");
         assert!(video.get("vaapi_device").is_none(), "{video}");
         assert!(video.get("vaapi_driver").is_none(), "{video}");
-    }
-
-    /// The station-wide value is a default, not the last word: it goes on
-    /// before the per-channel merge so `presentation.json` can still put one
-    /// channel on a different card. This is the hook #260's profiles hang off.
-    #[test]
-    fn a_presentation_override_still_beats_the_station_wide_encoder() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
-        fs::write(
-            dir.path().join("presentation.json"),
-            r#"{"diehard": {"config": {"normalization": {"video": {"accel": "cuda"}}}}}"#,
-        )
-        .unwrap();
-
-        let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
-        render_folders(&folders, &opts_with_accel(dir.path(), vaapi()), "id").unwrap();
-
-        assert_eq!(
-            read(&dir.path().join("channel1.json"))["normalization"]["video"]["accel"],
-            "vaapi",
-            "a channel that says nothing takes the station-wide encoder"
-        );
-        assert_eq!(
-            read(&dir.path().join("channel2.json"))["normalization"]["video"]["accel"],
-            "cuda",
-            "a channel that names its own encoder keeps it"
-        );
     }
 
     /// Leaving `ETV_ACCEL` unset must not touch the defaults file's own value.
@@ -698,59 +679,60 @@ mod tests {
         .unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek")];
-        render_folders(&folders, &opts(dir.path()), "id").unwrap();
+        render_folders(&folders, &no_names(1), &opts(dir.path()), "id").unwrap();
 
         let video = read(&dir.path().join("channel1.json"))["normalization"]["video"].clone();
         assert_eq!(video["accel"], "");
         assert_eq!(video["width"], 1280);
     }
 
+    /// #158: the lineup display name comes from the channel's own
+    /// `display_name` (already resolved by `render` before this function
+    /// sees it), never a second file.
     #[test]
-    fn presentation_supplies_display_name_and_merges_config() {
+    fn a_channels_display_name_reaches_the_lineup() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
+
+        let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
+        let names = vec![Some("Star Trek 24/7".to_string()), None];
+        let rendered =
+            render_folders(&folders, &names, &opts(dir.path()), "test-device-id").unwrap();
+
+        let lineup = read(&rendered.lineup_path);
+        assert_eq!(lineup["channels"][0]["name"], "Star Trek 24/7");
+        // A channel with no `display_name:` falls back to its identity.
+        assert_eq!(lineup["channels"][1]["name"], "diehard");
+    }
+
+    /// #158 decision #5: no dual support. A `presentation.json` left behind
+    /// from before this change must not be read at all — not for the name,
+    /// not for a config override — even though it still exists on disk.
+    #[test]
+    fn a_leftover_presentation_json_is_never_read() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
         fs::write(
             dir.path().join("presentation.json"),
-            r#"{"star-trek": {"name": "Star Trek 24/7",
+            r#"{"star-trek": {"name": "Old Name From A File",
                  "config": {"normalization": {"video": {"width": 1920}}}}}"#,
         )
         .unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek")];
-        let rendered = render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
+        let rendered =
+            render_folders(&folders, &no_names(1), &opts(dir.path()), "test-device-id").unwrap();
 
         let lineup = read(&rendered.lineup_path);
-        assert_eq!(lineup["channels"][0]["name"], "Star Trek 24/7");
-
-        let channel1 = read(&dir.path().join("channel1.json"));
-        assert_eq!(channel1["normalization"]["video"]["width"], 1920);
-        // Untouched sibling keys survive the merge.
-        assert_eq!(channel1["normalization"]["video"]["height"], 720);
-        assert_eq!(channel1["ffmpeg"]["ffmpeg_path"], "");
-    }
-
-    #[test]
-    fn presentation_cannot_clobber_the_derived_playout_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
-        fs::write(
-            dir.path().join("presentation.json"),
-            r#"{"star-trek": {"config": {"playout": {"folder": "/wrong", "mode": "shuffle"}}}}"#,
-        )
-        .unwrap();
-
-        let folders = vec![PathBuf::from("out/star-trek")];
-        render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
-
-        let channel1 = read(&dir.path().join("channel1.json"));
-        assert!(
-            channel1["playout"]["folder"]
-                .as_str()
-                .unwrap()
-                .ends_with("out/star-trek")
+        assert_eq!(
+            lineup["channels"][0]["name"], "star-trek",
+            "the identity, not presentation.json's name"
         );
-        // Other playout keys from the override still come through.
-        assert_eq!(channel1["playout"]["mode"], "shuffle");
+        let channel1 = read(&dir.path().join("channel1.json"));
+        assert_eq!(
+            channel1["normalization"]["video"]["width"], 1280,
+            "the default body, not presentation.json's config override"
+        );
     }
 
     #[test]
@@ -761,7 +743,7 @@ mod tests {
         fs::write(dir.path().join("channel.json"), "{}").unwrap();
 
         let folders = vec![PathBuf::from("out/only")];
-        render_folders(&folders, &opts(dir.path()), "test-device-id").unwrap();
+        render_folders(&folders, &no_names(1), &opts(dir.path()), "test-device-id").unwrap();
 
         assert!(dir.path().join("channel1.json").exists());
         assert!(!dir.path().join("channel7.json").exists());
@@ -773,6 +755,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = render_folders(
             &[PathBuf::from("out/x")],
+            &no_names(1),
             &opts(dir.path()),
             "test-device-id",
         )

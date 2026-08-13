@@ -11,6 +11,7 @@ pub mod emit;
 pub mod error_card;
 pub mod errors;
 pub mod etv_next;
+pub mod guide;
 pub mod history;
 pub mod overlay_supervisor;
 pub mod pattern;
