@@ -500,8 +500,7 @@ impl ChannelSession {
         let video_source = Self::resolve_source(current_item, |t| t.video.as_ref())
             .ok_or(ChannelError::PlayoutJsonVideoSourceRequired)?;
 
-        // prioritize source from subtitle tracks, then default source
-        let subtitle_source = Self::resolve_source(current_item, |t| t.subtitle.as_ref());
+        let subtitle_source = Self::resolve_subtitle_source(current_item);
 
         let audio_source_is_video_source = audio_source == video_source;
         let subtitle_source_is_video_source =
@@ -1303,6 +1302,29 @@ impl ChannelSession {
             .or_else(|| item.source.clone())
     }
 
+    /// Subtitles are opt-in, which is why this does not go through
+    /// [`Self::resolve_source`].
+    ///
+    /// Audio and video fall back to the item's own source because every item
+    /// must have both — an item that names neither still has to play.
+    /// Subtitles are different: most items carry no `tracks.subtitle` at all,
+    /// and the same fallback there would make "this item names no subtitle
+    /// track" mean exactly the same thing as "burn in whatever subtitle the
+    /// file happens to contain". A Blu-ray rip whose only subtitle tracks are
+    /// PGS then gets a picture subtitle composited onto every frame that
+    /// nobody asked for and no viewer can switch off — while the channel's own
+    /// selectable WebVTT rendition goes out carrying nothing.
+    ///
+    /// So an absent selection means absent. A selection that names a
+    /// `stream_index` but no `source` still means "that track of this item's
+    /// own file", which is how an item asks for subtitles it does carry.
+    fn resolve_subtitle_source(item: &PlayoutItem) -> Option<PlayoutItemSource> {
+        item.tracks
+            .as_ref()
+            .and_then(|t| t.subtitle.as_ref())
+            .and_then(|sel| sel.source.clone().or_else(|| item.source.clone()))
+    }
+
     async fn extract_and_convert_subs(
         &mut self,
         input: &ProbedInput,
@@ -1624,6 +1646,93 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    const MOVIE: &str = "/media/movies/bluray-rip.mkv";
+    const SIDECAR: &str = "/media/movies/bluray-rip.en.srt";
+
+    /// Build an item from JSON rather than by hand: a real playout file is
+    /// JSON, and "the item names no subtitle track" is a shape that only
+    /// exists once serde has turned an absent key into `None`.
+    fn item(tracks: &str) -> PlayoutItem {
+        let json = format!(
+            r#"{{
+                "id": "test",
+                "start": "2026-08-12T21:00:00Z",
+                "finish": "2026-08-12T23:00:00Z",
+                "source": {{"source_type": "local", "path": "{MOVIE}"}}
+                {tracks}
+            }}"#
+        );
+        serde_json::from_str(&json).expect("valid playout item")
+    }
+
+    fn path_of(source: Option<PlayoutItemSource>) -> Option<String> {
+        match source {
+            Some(PlayoutItemSource::Local { path, .. }) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The regression this exists for: an item that says nothing about
+    /// subtitles used to resolve to its own media file, so a Blu-ray rip got
+    /// its first PGS track composited onto every frame. Nothing requested
+    /// that, and burning it in costs more than the video itself.
+    #[test]
+    fn an_item_naming_no_subtitle_track_gets_no_subtitles() {
+        assert_eq!(
+            ChannelSession::resolve_subtitle_source(&item("")),
+            None,
+            "an absent subtitle selection must mean absent"
+        );
+    }
+
+    /// An empty `tracks` object is still no selection.
+    #[test]
+    fn an_item_with_tracks_but_no_subtitle_selection_gets_no_subtitles() {
+        assert_eq!(
+            ChannelSession::resolve_subtitle_source(&item(r#", "tracks": {}"#)),
+            None
+        );
+    }
+
+    /// How an item asks for a subtitle it carries itself: name the track, not
+    /// the file. This must keep working, or nothing can opt in.
+    #[test]
+    fn a_subtitle_selection_with_only_a_stream_index_uses_the_items_own_file() {
+        let resolved = ChannelSession::resolve_subtitle_source(&item(
+            r#", "tracks": {"subtitle": {"stream_index": 3}}"#,
+        ));
+        assert_eq!(path_of(resolved).as_deref(), Some(MOVIE));
+    }
+
+    /// A subtitle track living in a separate file still resolves to that file.
+    #[test]
+    fn a_subtitle_selection_naming_its_own_source_uses_that_source() {
+        let resolved = ChannelSession::resolve_subtitle_source(&item(&format!(
+            r#", "tracks": {{"subtitle": {{"source": {{"source_type": "local", "path": "{SIDECAR}"}}}}}}"#
+        )));
+        assert_eq!(path_of(resolved).as_deref(), Some(SIDECAR));
+    }
+
+    /// Audio and video keep the fallback subtitles just lost: every item must
+    /// have both, so an item that names neither still has to play.
+    #[test]
+    fn audio_and_video_still_fall_back_to_the_items_own_source() {
+        let bare = item("");
+        assert_eq!(
+            path_of(ChannelSession::resolve_source(&bare, |t| t.audio.as_ref())).as_deref(),
+            Some(MOVIE)
+        );
+        assert_eq!(
+            path_of(ChannelSession::resolve_source(&bare, |t| t.video.as_ref())).as_deref(),
+            Some(MOVIE)
+        );
     }
 }
 
