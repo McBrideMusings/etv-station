@@ -27,14 +27,24 @@ pub fn format_xmltv_datetime(dt: OffsetDateTime) -> String {
 
 pub async fn xmltv_epg(
     State(state): State<Arc<LineupState>>,
+    request: axum::extract::Request,
 ) -> Result<impl IntoResponse, LineupError> {
+    // The station never knows its own externally-reachable address (it may
+    // sit behind a reverse proxy, a different port mapping, or a bare
+    // hostname depending on the deploy), so it publishes artwork URLs as
+    // paths relative to this server's own root (`/artwork/...`, #187) and
+    // this request supplies what to resolve them against — the same
+    // `X-Forwarded-*`/`Host` derivation `hdhr_discover` already uses for the
+    // HDHomeRun endpoints.
+    let base_url = crate::get_scheme_host(request.headers());
+
     let mut sections: Vec<(String, Vec<PlayoutItem>)> = Vec::with_capacity(state.channels.len());
     for channel in &state.channels {
         let items = collect_items(channel).await;
         sections.push((channel.tvg_id().to_owned(), items));
     }
 
-    let xml = build_xmltv(&state.channels, &sections)?;
+    let xml = build_xmltv(&state.channels, &sections, &base_url)?;
 
     Ok((
         [(
@@ -48,6 +58,7 @@ pub async fn xmltv_epg(
 fn build_xmltv(
     channels: &[ChannelModel],
     sections: &[(String, Vec<PlayoutItem>)],
+    base_url: &str,
 ) -> Result<String, LineupError> {
     let mut buf = Cursor::new(Vec::<u8>::new());
     {
@@ -65,7 +76,7 @@ fn build_xmltv(
 
         for (tvg_id, items) in sections {
             for item in items {
-                write_programme(&mut w, tvg_id, item)?;
+                write_programme(&mut w, tvg_id, item, base_url)?;
             }
         }
 
@@ -74,6 +85,18 @@ fn build_xmltv(
     }
 
     String::from_utf8(buf.into_inner()).map_err(|e| LineupError::XmltvFailure(e.to_string()))
+}
+
+/// Resolve an icon `src` against `base_url` when it's relative (`/artwork/...`,
+/// #187), otherwise pass it through unchanged. A relative URL only ever comes
+/// from the station's own artwork cache; anything already absolute (e.g. a
+/// future source that publishes a full URL) is left exactly as given.
+fn resolve_icon_url(url: &str, base_url: &str) -> String {
+    if let Some(path) = url.strip_prefix('/') {
+        format!("{base_url}/{path}")
+    } else {
+        url.to_string()
+    }
 }
 
 fn write_channel<W: std::io::Write>(
@@ -114,6 +137,7 @@ fn write_programme<W: std::io::Write>(
     w: &mut Writer<W>,
     tvg_id: &str,
     item: &PlayoutItem,
+    base_url: &str,
 ) -> Result<(), LineupError> {
     let start = format_xmltv_datetime(item.start);
     let stop = format_xmltv_datetime(item.finish);
@@ -125,7 +149,7 @@ fn write_programme<W: std::io::Write>(
     w.write_event(Event::Start(elem)).map_err(xml_err)?;
 
     if let Some(meta) = &item.program {
-        write_metadata(w, meta)?;
+        write_metadata(w, meta, base_url)?;
     }
 
     w.write_event(Event::End(BytesEnd::new("programme")))
@@ -136,6 +160,7 @@ fn write_programme<W: std::io::Write>(
 fn write_metadata<W: std::io::Write>(
     w: &mut Writer<W>,
     meta: &ProgramMetadata,
+    base_url: &str,
 ) -> Result<(), LineupError> {
     if let Some(title) = &meta.title {
         write_text_element(w, "title", title)?;
@@ -158,8 +183,9 @@ fn write_metadata<W: std::io::Write>(
         write_text_element(w, "date", &year.to_string())?;
     }
     if let Some(url) = &meta.artwork_url {
+        let resolved = resolve_icon_url(url, base_url);
         let mut icon = BytesStart::new("icon");
-        icon.push_attribute(("src", url.as_str()));
+        icon.push_attribute(("src", resolved.as_str()));
         w.write_event(Event::Empty(icon)).map_err(xml_err)?;
     }
     if let Some(countries) = &meta.country {
@@ -554,7 +580,12 @@ mod tests {
             vec![fully_populated_item(), bare_item()],
         )];
 
-        let xml = build_xmltv(std::slice::from_ref(&channel), &sections).unwrap();
+        let xml = build_xmltv(
+            std::slice::from_ref(&channel),
+            &sections,
+            "http://example.test",
+        )
+        .unwrap();
 
         assert!(
             xml.contains(r#"<tv generator-info-name="ersatztv-next">"#),
@@ -651,6 +682,50 @@ mod tests {
             bare_body.trim().is_empty(),
             "bare programme should have no children, got: {bare_body:?}"
         );
+    }
+
+    // #187: the station only ever writes a path relative to this server's own
+    // root (never a Plex URL — a Plex URL is `X-Plex-Token` in disguise), and
+    // this is the resolution that turns it into something a guide reader
+    // fetching from a different host can actually load. The absent-artwork
+    // case (no `<icon>` at all) is already covered by `bare_item()` in the
+    // structure test above.
+    #[tokio::test]
+    async fn a_relative_artwork_url_resolves_against_the_request_host() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("playout")).unwrap();
+        let cfg_path = dir.path().join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ersatztv::config::ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: None,
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
+
+        let mut item = fully_populated_item();
+        item.program.as_mut().unwrap().artwork_url = Some("/artwork/abc123.jpg".into());
+        let sections = vec![(channel.tvg_id().to_owned(), vec![item])];
+
+        let xml = build_xmltv(
+            std::slice::from_ref(&channel),
+            &sections,
+            "http://viewer.example:8409",
+        )
+        .unwrap();
+
+        assert!(
+            xml.contains(r#"<icon src="http://viewer.example:8409/artwork/abc123.jpg"/>"#),
+            "{xml}"
+        );
+        // The whole point of #187: never a Plex URL, and never the credential
+        // that makes one work.
+        assert!(!xml.contains("X-Plex-Token"), "{xml}");
+        assert!(!xml.contains("plex.tv"), "{xml}");
     }
 
     // `Some(Credits::default())` — every role list present but empty — is
