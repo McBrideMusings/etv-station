@@ -46,6 +46,14 @@ A block with no calendar declaration. It always airs, which is what makes it the
 
 A stretch of the day with a declared character — late-night animation, prime-time films. Not a schema concept: a channel wanting dayparts is one block whose pools are its dayparts, arranged by a sequencer plugin that reads the clock. Distinct from a [[dated block]], which is calendar-conditional and resolved before any clock exists. See ADR 0004 and #169.
 
+## Program metadata
+
+What a viewer reads about an item rather than what plays: its title, sub-title, description, season and episode number, rating, year. Carried per scheduled item and turned into guide XML by ErsatzTV-next. Distinct from the item's source, which is the file and the in/out points.
+
+## Metadata cascade
+
+The order in which [[program metadata]] is settled for one item, least specific to most: the catalog row, then the channel, then the block, then the item's own entry. A more specific layer overrides a less specific one field by field, so a block can restate the title without discarding the season number underneath it. The catalog row is the base of the cascade, not a layer in it — it is observed data, and every layer above it is an author stating an intent.
+
 ## Drift
 
 The gap between when a [[daypart]] was meant to start and when it actually does, because the item before it ran past the boundary. Accepted rather than corrected: closing it would mean cutting an item short or leaving dead air, and padding it out is impossible while the library has no interstitials (#85). Bounded by the longest item in the pool.
