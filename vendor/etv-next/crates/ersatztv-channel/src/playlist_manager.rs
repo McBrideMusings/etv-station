@@ -362,8 +362,7 @@ impl PlaylistManager {
 
         let (skip, limit) = match max_segments {
             Some(max) => {
-                let anchor = OffsetDateTime::now_utc()
-                    - Duration::from_secs(ffpipeline::pipeline::SEGMENT_SECONDS as u64 * 5u64);
+                let anchor = OffsetDateTime::now_utc() - Duration::from_secs(1200u64);
 
                 let candidate_skip = self
                     .segments
