@@ -24,7 +24,7 @@
       "tonemap_algorithm": "linear"
     },
     "subtitle": {
-      "mode": "convert"
+      "mode": "burn"
     }
   }
 }
