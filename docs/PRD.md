@@ -16,7 +16,7 @@ Therefore anyone running ETV-next must produce playout JSON externally. The bund
 
 1. **Continuously feed ETV-next.** At any moment, every configured channel has playout JSON files on disk whose `[start, finish)` window contains "now" and extends N days into the future.
 2. **Composable sequencing.** A channel is defined by blocks — flat entry lists or pool/pattern interleaves — resolved into one ordered list per generation. Architecture supports adding composition primitives without rewriting the core.
-3. **Embed program metadata.** Items carry title / description / season / episode / categories / rating / artwork — written into the `program` block of each playout item so ETV-next's XMLTV is populated.
+3. **Embed program metadata.** Items carry title / description / season / episode / categories / rating / artwork — written into the `program` block of each playout item so ETV-next's XMLTV is populated. An episode's title is the series name and its own name goes in `sub_title`, and genre tags become categories, with no config; a `guide:` block cascading channel → block → item (most specific field wins) authors any of these explicitly, with plain `{field}` templates and an `{a|b}` fallback (#158).
 4. **Stay decoupled from ETV-next.** Filesystem-only contract. No IPC, no shared process, no schema fork. ETV-next's `schema/playout.json` is the boundary.
 5. **Track ETV-next's schema without drifting.** Achieved by depending on ETV-next's `ersatztv-playout` Rust crate at the source level, vendored into this repo (see Architecture below).
 
