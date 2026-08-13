@@ -313,6 +313,8 @@ mod tests {
             catalog_duration: None,
             error_card: false,
             metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
         }
     }
 
@@ -340,6 +342,8 @@ mod tests {
             catalog_duration: None,
             error_card: false,
             metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -360,6 +364,8 @@ mod tests {
             catalog_duration: None,
             error_card: false,
             metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -376,6 +382,8 @@ mod tests {
             catalog_duration: None,
             error_card: false,
             metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
         }
     }
 
@@ -450,6 +458,8 @@ mod tests {
             catalog_duration: None,
             error_card: false,
             metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
         };
         let err = cache.resolve_all(vec![bad]).await.unwrap_err();
         assert!(matches!(err, StationError::MissingField { .. }));

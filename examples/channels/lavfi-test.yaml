@@ -1,4 +1,11 @@
 name: test
+# Exercises #158 on every dev-run: a display name distinct from the identity
+# above, and a channel-level `guide:` template that overrides the description
+# each item's own `program:` block already set, proving the cascade and the
+# {field} substitution both reach the emitted playout JSON.
+display_name: "Test Pattern Channel"
+guide:
+  description: "{title}, generated at {now}."
 window_days: 1
 # Deliberately overrides the 6h default to 1h — the one committed channel that
 # exercises a non-default chunk size, so chunking is checked at !=6 on every

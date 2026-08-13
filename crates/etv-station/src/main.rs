@@ -30,8 +30,9 @@ struct Cli {
 
     /// Render ETV-next's lineup.json + channelN.json into this directory from
     /// the station config, then exit. The directory must already hold
-    /// `normalization.default.json`; `presentation.json` is used if present.
-    /// The container entrypoint runs this before starting ETV-next, so the
+    /// `normalization.default.json`. Display names come from each channel's
+    /// own `display_name` (#158) — there is no `presentation.json`. The
+    /// container entrypoint runs this before starting ETV-next, so the
     /// playout folders it reads are always the ones the daemon writes.
     #[arg(long, value_name = "DIR")]
     render_etv_next: Option<PathBuf>,

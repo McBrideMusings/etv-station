@@ -116,6 +116,8 @@ pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration
         catalog_duration: None,
         error_card: true,
         metadata: None,
+        guide: None,
+        guide_fields: crate::guide::GuideFields::default(),
     }
 }
 

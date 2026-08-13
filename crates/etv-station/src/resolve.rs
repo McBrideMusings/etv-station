@@ -62,6 +62,7 @@ use crate::config::{
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap};
 use crate::errors::ConfigError;
+use crate::guide::{GuideConfig, GuideFields};
 use crate::resume::{GenerationState, ResumeMap};
 
 /// A concrete, ordered item ready for duration probing and sequencing. Produced
@@ -93,6 +94,19 @@ pub struct ResolvedItem {
     /// `crate::rule::build_playout_item`. `None` for every item with no pool
     /// or plugin behind it, and for a plugin pick that attached nothing.
     pub metadata: Option<serde_json::Value>,
+    /// The effective `guide:` config for this item (#158) — already cascaded
+    /// item → block → channel, most specific field wins. `None` means no
+    /// level said anything, which is not "no guide text": the daemon still
+    /// applies the series-title convention and genre-tag categories with no
+    /// template involved. `Some` means at least one field has a template to
+    /// render once the schedule (start/finish, neighbours) and watch history
+    /// are known — which `ResolvedItem` does not have yet, so rendering
+    /// happens later, in `crate::daemon`.
+    pub guide: Option<crate::guide::GuideConfig>,
+    /// Raw catalog attributes the `guide:` template surface can address
+    /// beyond `program` (studio, edition, genres, cast, …). Empty for an
+    /// inline item, which has no catalog row behind it.
+    pub guide_fields: crate::guide::GuideFields,
 }
 
 impl ResolvedItem {
@@ -224,6 +238,7 @@ pub fn resolve_channel_with_resume(
             fill,
             window_start,
             &mut resume_out,
+            config.guide.as_ref(),
         )?;
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished
@@ -728,6 +743,7 @@ fn resolve_block(
     fill: Option<Duration>,
     window_start: OffsetDateTime,
     resume_out: &mut ResumeMap,
+    channel_guide: Option<&GuideConfig>,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
@@ -735,6 +751,12 @@ fn resolve_block(
     };
 
     let defaults = include.program();
+    // Block ∘ channel, pre-merged once here — same shape as `defaults`
+    // above: every catalog-resolved item on this block sees the identical
+    // 2-level cascade, and an inline item's own `guide:` merges on top of
+    // this result as the third (most specific) level in `resolve_item`.
+    let guide_defaults = GuideConfig::cascade(None, include.guide(), channel_guide);
+    let guide_defaults = guide_defaults.as_ref();
 
     // A pattern block builds its list by interleaving pools instead of playing
     // a flat entries list, so it takes its own path: the pattern IS the
@@ -769,7 +791,16 @@ fn resolve_block(
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(pools);
 
-        return resolve_pool_block_items(cat, &ids, defaults, &metadata, include.mode, idx, path);
+        return resolve_pool_block_items(
+            cat,
+            &ids,
+            defaults,
+            guide_defaults,
+            &metadata,
+            include.mode,
+            idx,
+            path,
+        );
     }
 
     // A sequencer block resolves its pools exactly as a pattern block does —
@@ -808,23 +839,36 @@ fn resolve_block(
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(pools);
 
-        return resolve_pool_block_items(cat, &ids, defaults, &metadata, include.mode, idx, path);
+        return resolve_pool_block_items(
+            cat,
+            &ids,
+            defaults,
+            guide_defaults,
+            &metadata,
+            include.mode,
+            idx,
+            path,
+        );
     }
 
     // 1. Resolve entries to a flat item list (authored order).
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
-            Entry::Item(item) => {
-                items.push(resolve_item(item, defaults, identity_roots, path_index))
-            }
+            Entry::Item(item) => items.push(resolve_item(
+                item,
+                defaults,
+                guide_defaults,
+                identity_roots,
+                path_index,
+            )),
             Entry::Query(query) => {
                 let cat = catalog.ok_or_else(|| {
                     unsupported(format!(
                         "block #{idx}: a query entry needs the catalog, which is not available"
                     ))
                 })?;
-                let resolved = resolve_query(cat, query, defaults, seed)
+                let resolved = resolve_query(cat, query, defaults, guide_defaults, seed)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                 items.extend(resolved);
             }
@@ -834,7 +878,7 @@ fn resolve_block(
                         "block #{idx}: a collection entry needs the catalog, which is not available"
                     ))
                 })?;
-                let resolved = resolve_collection(cat, collection, defaults)
+                let resolved = resolve_collection(cat, collection, defaults, guide_defaults)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                 items.extend(resolved);
             }
@@ -862,6 +906,7 @@ fn resolve_block(
             catalog,
             fallback,
             defaults,
+            guide_defaults,
             seed,
             identity_roots,
             path_index,
@@ -928,10 +973,12 @@ fn resolve_block(
 /// `mode: count` shortfall truncate/warn. A `pattern:` block and a
 /// `sequencer:` block do all three identically once each has its own ids in
 /// hand, so any future per-drawn-item field added here reaches both at once.
+#[allow(clippy::too_many_arguments)]
 fn resolve_pool_block_items(
     cat: &Catalog,
     ids: &[String],
     defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
     metadata: &HashMap<String, serde_json::Value>,
     mode: Mode,
     idx: usize,
@@ -943,7 +990,7 @@ fn resolve_pool_block_items(
     };
     let mut items: Vec<ResolvedItem> = ids
         .iter()
-        .map(|id| catalog_item(cat, id, defaults))
+        .map(|id| catalog_item(cat, id, defaults, guide_defaults))
         .collect::<Result<Vec<_>, String>>()
         .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
         .into_iter()
@@ -984,6 +1031,7 @@ fn resolve_query(
     catalog: &Catalog,
     query: &QueryEntry,
     defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
     seed: u64,
 ) -> Result<Vec<ResolvedItem>, String> {
     let mut ids = catalog
@@ -996,7 +1044,7 @@ fn resolve_query(
     }
     Ok(ids
         .iter()
-        .map(|id| catalog_item(catalog, id, defaults))
+        .map(|id| catalog_item(catalog, id, defaults, guide_defaults))
         .collect::<Result<Vec<_>, String>>()?
         .into_iter()
         .flatten()
@@ -1012,6 +1060,7 @@ fn resolve_fallback(
     catalog: Option<&Catalog>,
     fallback: &Fallback,
     defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
     seed: u64,
     identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
@@ -1021,11 +1070,12 @@ fn resolve_fallback(
             let cat = catalog.ok_or_else(|| {
                 "a query fallback needs the catalog, which is not available".to_string()
             })?;
-            resolve_query(cat, query, defaults, seed)
+            resolve_query(cat, query, defaults, guide_defaults, seed)
         }
         Fallback::Item(item) => Ok(vec![resolve_item(
             item,
             defaults,
+            guide_defaults,
             identity_roots,
             path_index,
         )]),
@@ -1043,6 +1093,7 @@ fn resolve_collection(
     catalog: &Catalog,
     entry: &CollectionEntry,
     defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
 ) -> Result<Vec<ResolvedItem>, String> {
     let mut ids = catalog
         .collection_ids_by_name(&entry.name)
@@ -1082,7 +1133,7 @@ fn resolve_collection(
     }
     Ok(members
         .iter()
-        .map(|id| catalog_item(catalog, id, defaults))
+        .map(|id| catalog_item(catalog, id, defaults, guide_defaults))
         .collect::<Result<Vec<_>, String>>()?
         .into_iter()
         .flatten()
@@ -1218,6 +1269,7 @@ fn catalog_item(
     catalog: &Catalog,
     entry_id: &str,
     defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
 ) -> Result<Option<ResolvedItem>, String> {
     let entry = catalog
         .entry(entry_id)
@@ -1243,23 +1295,88 @@ fn catalog_item(
     // Catalog columns are i64; ProgramMetadata uses u32. Out-of-range values
     // (negative / overflow) drop to None rather than wrap.
     let as_u32 = |v: Option<i64>| v.and_then(|n| u32::try_from(n).ok());
+
+    // #158 decision #1: an episode's `<title>` carries the series name and
+    // `<sub-title>` its own episode name, per XMLTV convention. Not
+    // configurable — there is no toggle for which name goes in which
+    // element, unconditional on `entry.kind`. A `guide.title`/`guide.sub_title`
+    // template, if authored, still overrides this default like any other
+    // field — see `render_program` in `crate::daemon`.
+    let is_episode = entry.kind == "episode";
+    let (title, sub_title) = if is_episode {
+        (
+            entry.show.clone().unwrap_or_else(|| entry.title.clone()),
+            Some(entry.title.clone()),
+        )
+    } else {
+        (entry.title.clone(), None)
+    };
+
+    // #158 decision #3: genre tags become `<category>` automatically, no
+    // config required. A channel can still override via `guide.categories`.
+    let genres = catalog
+        .tags_for(entry_id, TagNs::Genre)
+        .map_err(|e| e.to_string())?;
+    let categories = if genres.is_empty() {
+        None
+    } else {
+        Some(genres.clone())
+    };
+
     let program = ProgramMetadata {
-        title: Some(entry.title.clone()),
-        sub_title: None,
+        title: Some(title),
+        sub_title,
+        // #186 default: the catalog's summary column, when the source
+        // filled one, with no `guide:` config needed. A `guide.description`
+        // template, if authored at any cascade level, overrides this in the
+        // render pass (`crate::daemon::render_guide_and_attribution`) —
+        // same as every other field here.
         description: entry.summary.clone(),
         season: as_u32(entry.season),
         episode: as_u32(entry.episode),
-        categories: None,
+        categories,
         content_rating: entry.content_rating.clone(),
         artwork_url: None,
         year: as_u32(entry.year),
         // Not sourced from the catalog yet — populating these from the
         // `cast`/`writer`/`director`/`country` tag namespaces is separate
-        // producer-side work, tracked as a follow-up.
+        // producer-side work, tracked as a follow-up. (The same tags ARE
+        // exposed to the `guide:` template surface below, as `{cast}` etc —
+        // this is specifically about the structured `<credits>`/`<country>`
+        // XMLTV elements, split to etv-next-station#35 per #158's "the guide
+        // stops at what ETV-next already emits".)
         credits: None,
         country: None,
         star_rating: None,
     };
+
+    let guide_fields = GuideFields {
+        show: entry.show.clone(),
+        absolute_episode: entry.absolute_episode,
+        release_date: entry.release_date.clone(),
+        studio: entry.studio.clone(),
+        edition: entry.edition.clone(),
+        library: entry.library.clone(),
+        duration: entry
+            .duration_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| Duration::from_millis(ms as u64)),
+        cast: catalog
+            .tags_for(entry_id, TagNs::Cast)
+            .map_err(|e| e.to_string())?,
+        directors: catalog
+            .tags_for(entry_id, TagNs::Director)
+            .map_err(|e| e.to_string())?,
+        writers: catalog
+            .tags_for(entry_id, TagNs::Writer)
+            .map_err(|e| e.to_string())?,
+        countries: catalog
+            .tags_for(entry_id, TagNs::Country)
+            .map_err(|e| e.to_string())?,
+        genres,
+        summary: entry.summary.clone(),
+    };
+
     Ok(Some(ResolvedItem {
         id: entry.entry_id.clone(),
         source: SourceConfig::Local {
@@ -1286,12 +1403,18 @@ fn catalog_item(
         // this function has no pool/plugin context at all, so `None` here is
         // the whole answer for them.
         metadata: None,
+        // No item-level `guide:` for a catalog-resolved entry — there is no
+        // per-entry config surface for a query/collection result, only the
+        // block ∘ channel cascade `guide_defaults` already carries.
+        guide: guide_defaults.cloned(),
+        guide_fields,
     }))
 }
 
 fn resolve_item(
     item: &ItemEntry,
     defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
     identity_roots: &[String],
     path_index: Option<&HashMap<String, String>>,
 ) -> ResolvedItem {
@@ -1307,6 +1430,12 @@ fn resolve_item(
         error_card: false,
         // No pool, no plugin — nothing could have attached a blob.
         metadata: None,
+        // Item's own `guide:` wins, then the pre-merged block ∘ channel
+        // cascade — the third and most specific cascade level.
+        guide: GuideConfig::cascade(item.guide.as_ref(), guide_defaults, None),
+        // An inline item has no catalog row, so nothing to fill these from —
+        // its `program` above is the whole answer.
+        guide_fields: GuideFields::default(),
     }
 }
 
@@ -1390,6 +1519,7 @@ mod tests {
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
             program: None,
+            guide: None,
         }
     }
 
@@ -1402,6 +1532,7 @@ mod tests {
             in_point: None,
             out_point: Some(Duration::from_secs(secs)),
             program: None,
+            guide: None,
         }
     }
 
@@ -1412,6 +1543,7 @@ mod tests {
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
             program: None,
+            guide: None,
         }
     }
 
@@ -1419,6 +1551,7 @@ mod tests {
         BlockInclude {
             block: None,
             program: None,
+            guide: None,
             duplicates: None,
             constraints: None,
             entries,
@@ -1437,6 +1570,8 @@ mod tests {
         ChannelConfig {
             scoring: None,
             name: None,
+            display_name: None,
+            guide: None,
             window_days: 1,
             chunk_hours: 24,
             roll_interval: Duration::from_secs(3600),
@@ -1751,6 +1886,7 @@ mod tests {
             in_point: None,
             out_point: Some(Duration::from_secs(5)),
             program: None,
+            guide: None,
         };
         let http = ItemEntry {
             source: SourceConfig::Http {
@@ -1761,6 +1897,7 @@ mod tests {
             in_point: None,
             out_point: Some(Duration::from_secs(5)),
             program: None,
+            guide: None,
         };
         let inc = include_with(vec![
             Entry::Item(Box::new(lavfi)),

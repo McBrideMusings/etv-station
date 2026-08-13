@@ -257,6 +257,8 @@ mod tests {
         ChannelConfig {
             scoring,
             name: None,
+            display_name: None,
+            guide: None,
             window_days: 1,
             chunk_hours: 24,
             roll_interval: StdDuration::from_secs(3600),
@@ -300,6 +302,7 @@ mod tests {
             in_point: None,
             out_point: Some(StdDuration::from_secs(30)),
             program: None,
+            guide: None,
         }
     }
 
@@ -307,6 +310,7 @@ mod tests {
         BlockInclude {
             block: None,
             program: None,
+            guide: None,
             duplicates: None,
             constraints: None,
             entries: ids
@@ -334,6 +338,7 @@ mod tests {
             in_point: None,
             out_point: Some(StdDuration::from_secs(secs)),
             program: None,
+            guide: None,
         }
     }
 
@@ -341,6 +346,7 @@ mod tests {
         BlockInclude {
             block: None,
             program: None,
+            guide: None,
             duplicates: None,
             constraints: None,
             entries: ids
@@ -401,6 +407,7 @@ mod tests {
         BlockInclude {
             block: None,
             program: None,
+            guide: None,
             duplicates: None,
             constraints: None,
             entries: ids
@@ -656,6 +663,7 @@ fn pick(ctx) {
         BlockInclude {
             block: None,
             program: None,
+            guide: None,
             duplicates: None,
             constraints: None,
             entries: Vec::new(),
