@@ -280,6 +280,7 @@ mod tests {
                 source_roots: Vec::new(),
                 identity_roots: Vec::new(),
                 catalog_path,
+                artwork_cache_dir: None,
                 catalog_refresh_secs: 0,
                 full_sweep_after_secs: 0,
             },

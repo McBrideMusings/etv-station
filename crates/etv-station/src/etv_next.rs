@@ -77,6 +77,15 @@ pub struct RenderOptions {
     /// Station-wide encoder. `None` leaves whatever the defaults file carries,
     /// which ships as `""` — software.
     pub accel: Option<AccelSettings>,
+    /// `artwork.folder` in the emitted lineup — the directory the station
+    /// caches Plex posters to and ETV-next serves at `/artwork` (#187).
+    /// `None` (the default) omits the `artwork` block entirely, which mounts
+    /// nothing at `/artwork` and matches the station never publishing an
+    /// `<icon>` for anything it hasn't cached. Same env var etv-station's own
+    /// ingest reads (`ETV_STATION_ARTWORK_CACHE`) — one directory, one source
+    /// of truth, read independently by each process the way `ETV_HLS_OUTPUT`
+    /// already is.
+    pub artwork_dir: Option<String>,
 }
 
 impl RenderOptions {
@@ -123,6 +132,7 @@ impl RenderOptions {
             hls_output: var("ETV_HLS_OUTPUT").unwrap_or_else(|| "tmp/hls".to_string()),
             out_dir,
             accel,
+            artwork_dir: var("ETV_STATION_ARTWORK_CACHE"),
         })
     }
 }
@@ -356,7 +366,7 @@ pub fn render_folders(
         }));
     }
 
-    let lineup = serde_json::json!({
+    let mut lineup = serde_json::json!({
         "server": {
             "bind_address": opts.bind_address,
             "port": opts.port,
@@ -365,6 +375,12 @@ pub fn render_folders(
         "output": {"folder": opts.hls_output},
         "channels": lineup_channels,
     });
+    // Mounted at ETV-next's `/artwork` (#187) only when the station has
+    // artwork caching turned on — unset leaves the lineup exactly as it was
+    // before this existed, and ETV-next mounts nothing there.
+    if let Some(dir) = &opts.artwork_dir {
+        lineup["artwork"] = serde_json::json!({"folder": dir});
+    }
     let lineup_path = opts.out_dir.join("lineup.json");
     write_json(&lineup_path, &lineup)?;
 
@@ -497,6 +513,7 @@ mod tests {
             hls_output: "tmp/hls".to_string(),
             out_dir: dir.to_path_buf(),
             accel: None,
+            artwork_dir: None,
         }
     }
 
@@ -611,6 +628,28 @@ mod tests {
             "playout folder must be absolute, got {folder}"
         );
         assert!(folder.ends_with("out/star-trek"));
+    }
+
+    // #187: unset by default (artwork caching is off), so the lineup carries
+    // no `artwork` key at all and ETV-next mounts nothing at `/artwork`.
+    #[test]
+    fn a_configured_artwork_dir_is_emitted_and_an_unset_one_is_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
+        let folders = vec![PathBuf::from("out/star-trek")];
+
+        let without = opts(dir.path());
+        let rendered = render_folders(&folders, &without, "test-device-id").unwrap();
+        let lineup = read(&rendered.lineup_path);
+        assert!(lineup.get("artwork").is_none(), "{lineup}");
+
+        let with = RenderOptions {
+            artwork_dir: Some("/data/artwork".to_string()),
+            ..opts(dir.path())
+        };
+        let rendered = render_folders(&folders, &with, "test-device-id").unwrap();
+        let lineup = read(&rendered.lineup_path);
+        assert_eq!(lineup["artwork"]["folder"], "/data/artwork");
     }
 
     /// The whole point of the setting: one value reaches every channel, and

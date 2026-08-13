@@ -1251,7 +1251,18 @@ fn catalog_item(
         episode: as_u32(entry.episode),
         categories: None,
         content_rating: entry.content_rating.clone(),
-        artwork_url: None,
+        // A path relative to ETV-next's own HTTP root, never a Plex URL
+        // (#187) — a Plex artwork URL carries `X-Plex-Token` as a working
+        // credential, and `xmltv.xml` is served over plain HTTP to every
+        // guide reader. ETV-next's xmltv writer resolves this against the
+        // request's own host (see `xmltv::write_metadata` in vendor/etv-next),
+        // so the station never has to know its own externally-reachable
+        // address. `None` when no artwork was cached — no `<icon>`, not a
+        // broken link.
+        artwork_url: entry
+            .artwork_cache_path
+            .as_deref()
+            .map(|filename| format!("/artwork/{filename}")),
         year: as_u32(entry.year),
         // Not sourced from the catalog yet — populating these from the
         // `cast`/`writer`/`director`/`country` tag namespaces is separate

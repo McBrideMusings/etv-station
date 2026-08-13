@@ -108,6 +108,18 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     DELETE FROM tags WHERE namespace = 'fs_dir';
     "#,
+    // v5 — artwork cache bookkeeping (#187). `artwork_cache_path` is the
+    // filename (relative to the station's `artwork_cache_dir`) the entry's
+    // fetched image is written under; `artwork_source_key` is the Plex
+    // `thumb` path last used to fetch it, kept so a re-ingest can tell "art
+    // changed" from "art unchanged" without re-downloading every item on
+    // every pass. Both are written by the artwork-cache step alone —
+    // `upsert_entry` never touches them — so a Plex metadata refresh can
+    // never clobber a cached image out from under a pending write.
+    r#"
+    ALTER TABLE entries ADD COLUMN artwork_cache_path TEXT;
+    ALTER TABLE entries ADD COLUMN artwork_source_key TEXT;
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

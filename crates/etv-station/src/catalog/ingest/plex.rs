@@ -47,6 +47,8 @@
 //!
 //! Out of scope (tracked separately): playlists.
 
+use std::io::Read as _;
+use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -195,6 +197,10 @@ pub struct PlexItem {
     pub writers: Vec<String>,
     pub producers: Vec<String>,
     pub countries: Vec<String>,
+    /// Server-relative artwork path (`m.thumb`), if Plex reports one. Consulted
+    /// only by [`PlexClient::fetch_and_cache_artwork`] (#187) — never merged
+    /// into the catalog's own columns by [`ingest_items`].
+    pub thumb: Option<String>,
 }
 
 /// What one ingest pass touched.
@@ -606,12 +612,15 @@ pub fn ingest_labels(
 /// scanned, so there is no `source_roots` equivalent here (#243).
 ///
 /// `plex` carries the connection; see [`PlexEnv::from_env`] for where it comes
-/// from in production.
+/// from in production. `artwork_dir` is the station's `artwork_cache_dir`
+/// (#187); `None` skips artwork entirely — no fetch, no `<icon>` in the
+/// guide, the safe default this issue shipped without regressing.
 pub fn ingest(
     catalog: &Catalog,
     identity_roots: &[String],
     since: Option<i64>,
     plex: &PlexEnv,
+    artwork_dir: Option<&Path>,
 ) -> Result<PlexIngestStats, PlexIngestError> {
     let client = PlexClient::new(plex);
     let items = client.fetch_all(since)?;
@@ -651,13 +660,24 @@ pub fn ingest(
     // Prune deleted collections only on a full pass (`since` is None); a delta
     // fetch omits unchanged collections, which must not be read as deletions.
     let prune_absent = since.is_none();
-    catalog.in_transaction(|c| {
+    let stats: PlexIngestStats = catalog.in_transaction(|c| {
         let stats = ingest_items(c, &items, identity_roots)?;
         ingest_labels(c, &labels)?;
         ingest_collections(c, &collections, prune_absent)?;
         c.set_last_plex_ingest(started)?;
-        Ok(stats)
-    })
+        Ok::<PlexIngestStats, PlexIngestError>(stats)
+    })?;
+
+    // Deliberately outside the transaction above: this makes network requests
+    // per item (potentially thousands), and a sqlite write transaction has no
+    // business holding a lock across that. Each cache write is its own
+    // `set_artwork` call instead, which is fine — this step is idempotent and
+    // simply retries anything it didn't get to on the next ingest pass.
+    if let Some(dir) = artwork_dir {
+        client.fetch_and_cache_artwork(catalog, &items, dir);
+    }
+
+    Ok(stats)
 }
 
 /// Resolve the entry an item should attach to, if any: a GUID the catalog
@@ -689,6 +709,38 @@ fn merged(primary: Option<&str>, existing: Option<String>) -> Option<String> {
 /// Prefer the Plex value, else keep the existing one.
 fn or_existing(primary: Option<String>, existing: Option<String>) -> Option<String> {
     primary.or(existing)
+}
+
+/// Whether an item's artwork needs (re-)fetching (#187). `current_source_key`
+/// is the entry's stored `artwork_source_key`, if any; `thumb` is what Plex
+/// reports right now; `file_exists` is whether the cached file this entry
+/// would write to is actually present on disk.
+///
+/// Fetches when the thumb path changed since the last fetch (Plex re-scraped
+/// or the user changed the poster — verified live: a changed poster changes
+/// the trailing revision number in `thumb`, e.g.
+/// `/library/metadata/12345/thumb/167899999`), OR when nothing has ever been
+/// cached, OR when the catalog says something is cached but the file itself
+/// is gone (a wiped cache dir, a manual `rm`, a dir moved out from under a
+/// stale config) — trusting the database's word over an absent file would
+/// leave the item silently art-less until its `thumb` next happens to change.
+fn artwork_needs_fetch(current_source_key: Option<&str>, thumb: &str, file_exists: bool) -> bool {
+    !file_exists || current_source_key != Some(thumb)
+}
+
+/// The filename an entry's cached artwork is written under, inside the
+/// station's `artwork_cache_dir` — fixed per entry (never content-hashed) so
+/// a refresh overwrites the existing file in place instead of accumulating a
+/// new one per revision (#187, "bounded growth"). `entry_id` may contain `:`
+/// and `/` (an `imdb:`/`fs:`-prefixed id can hash a path), neither of which
+/// is safe in a filename, so both — and anything else outside
+/// `[A-Za-z0-9_-]` — are replaced with `_`.
+fn artwork_filename(entry_id: &str) -> String {
+    let safe: String = entry_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!("{safe}.jpg")
 }
 
 /// Parse a Plex `Guid.id` (`imdb://tt0095016`, `tmdb://562`) into a recognised
@@ -836,6 +888,7 @@ fn to_plex_item(
         writers: tagged(&m.writer),
         producers: tagged(&m.producer),
         countries: tagged(&m.country),
+        thumb: m.thumb.as_deref().and_then(non_empty).map(str::to_string),
     })
 }
 
@@ -1281,6 +1334,116 @@ impl PlexClient {
             .unwrap_or_default())
     }
 
+    /// Fetch and cache each item's artwork, when it needs fetching (#187).
+    ///
+    /// Never publishes a Plex URL: this downloads the bytes behind `item.thumb`
+    /// with the same `X-Plex-Token` every other request carries, and writes
+    /// them to `dir` under a filename derived only from the catalog
+    /// `entry_id` — `X-Plex-Token` never leaves this function. Skips an item
+    /// entirely when its `entry_id` isn't resolvable (shouldn't happen right
+    /// after `ingest_items` wrote it, but a lookup failure is not a reason to
+    /// crash the ingest) or it reports no `thumb` at all.
+    ///
+    /// Only fetches when [`artwork_needs_fetch`] says the cached copy is
+    /// missing or stale — the "fetched once per item, not on every
+    /// generation" requirement. A failed fetch is logged with the item's
+    /// title and entry id and leaves whatever cache state already existed
+    /// untouched, so a transient Plex hiccup neither crashes the ingest nor
+    /// erases a previously-good image, and the item is retried on the next
+    /// pass (its `artwork_source_key` was never updated to match).
+    fn fetch_and_cache_artwork(&self, catalog: &Catalog, items: &[PlexItem], dir: &Path) {
+        for item in items {
+            let Some(thumb) = item.thumb.as_deref() else {
+                continue;
+            };
+            let entry_id = match catalog.entry_id_for_source(Source::Plex, &item.rating_key) {
+                Ok(Some(id)) => id,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "catalog.artwork.entry_lookup_failed",
+                        rating_key = %item.rating_key,
+                        error = %e,
+                        "could not resolve entry_id for artwork fetch; skipping",
+                    );
+                    continue;
+                }
+            };
+            let filename = artwork_filename(&entry_id);
+            let path = dir.join(&filename);
+            let current = match catalog.entry(&entry_id) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "catalog.artwork.entry_read_failed",
+                        entry_id = %entry_id,
+                        error = %e,
+                        "could not read entry for artwork fetch; skipping",
+                    );
+                    continue;
+                }
+            };
+            let current_key = current.as_ref().and_then(|e| e.artwork_source_key.as_deref());
+            if !artwork_needs_fetch(current_key, thumb, path.exists()) {
+                continue;
+            }
+
+            match self.get_image(thumb) {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(&path, &bytes) {
+                        tracing::warn!(
+                            event = "catalog.artwork.write_failed",
+                            entry_id = %entry_id,
+                            title = %item.title,
+                            path = %path.display(),
+                            error = %e,
+                            "fetched artwork but could not write it to the cache dir",
+                        );
+                        continue;
+                    }
+                    if let Err(e) = catalog.set_artwork(&entry_id, &filename, thumb) {
+                        tracing::warn!(
+                            event = "catalog.artwork.record_failed",
+                            entry_id = %entry_id,
+                            title = %item.title,
+                            error = %e,
+                            "wrote artwork to disk but could not record it in the catalog",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "catalog.artwork.fetch_failed",
+                        entry_id = %entry_id,
+                        title = %item.title,
+                        thumb = %thumb,
+                        error = %e,
+                        "artwork fetch failed; item will have no <icon> in the guide until a later pass succeeds",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Download the bytes at a Plex-relative path (e.g. `item.thumb`), with
+    /// the same token-bearing request every other endpoint uses. Never
+    /// returns the URL or the token to the caller — only the image bytes.
+    fn get_image(&self, path: &str) -> Result<Vec<u8>, PlexIngestError> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .agent
+            .get(&url)
+            .set("X-Plex-Token", &self.token)
+            .call()
+            .map_err(|e| PlexIngestError::Http(e.to_string()))?;
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .take(50 * 1024 * 1024) // a runaway response must not exhaust memory
+            .read_to_end(&mut bytes)
+            .map_err(|e| PlexIngestError::Http(e.to_string()))?;
+        Ok(bytes)
+    }
+
     /// Every Plex label across all library sections, with its section-scoped
     /// members' ratingKeys (#136). Two requests per label — its own listing at
     /// `/library/sections/{id}/label`, then its members at
@@ -1511,6 +1674,12 @@ struct PlexMetadata {
     country: Vec<TaggedField>,
     #[serde(default, rename = "Media")]
     media: Vec<PlexMedia>,
+    /// Server-relative path to this item's poster (`/library/metadata/{id}/thumb/{rev}`),
+    /// authenticated the same way every other Plex request is (#187). Never
+    /// written into the catalog directly — [`PlexClient::fetch_and_cache_artwork`]
+    /// downloads it once, and only the resulting local file is ever published.
+    #[serde(default)]
+    thumb: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1622,6 +1791,7 @@ mod tests {
             writers: vec![],
             producers: vec![],
             countries: vec![],
+            thumb: None,
         }
     }
 

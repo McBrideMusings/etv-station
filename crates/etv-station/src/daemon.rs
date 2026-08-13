@@ -641,6 +641,26 @@ async fn open_and_ingest_catalog(
     let source_roots = &station.station.source_roots;
     let identity_roots = &station.station.identity_roots;
 
+    // Artwork cache (#187): unset means the feature is off — no directory, no
+    // fetch, no `<icon>` in the guide, same as before this existed. Created
+    // up front, the same way `prepare_generation` creates each channel's
+    // output_folder, so a fresh deploy on an empty volume has somewhere to
+    // write before the first Plex pass tries to.
+    let artwork_dir = station
+        .station
+        .artwork_cache_dir
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from);
+    if let Some(dir) = &artwork_dir {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|source| StationError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+    }
+
     // Local filesystem: scan `source_roots` (an operational choice about which
     // directories this deployment may walk); identity is canonicalised against
     // `identity_roots` instead — a property of the media layout, not the same
@@ -693,9 +713,15 @@ async fn open_and_ingest_catalog(
                 );
                 let roots = identity_roots.clone();
                 let conn = plex.clone();
+                let artwork_dir_for_ingest = artwork_dir.clone();
                 let (returned, ingested) = tokio::task::spawn_blocking(move || {
-                    let result =
-                        crate::catalog::ingest::plex::ingest(&catalog, &roots, since, &conn);
+                    let result = crate::catalog::ingest::plex::ingest(
+                        &catalog,
+                        &roots,
+                        since,
+                        &conn,
+                        artwork_dir_for_ingest.as_deref(),
+                    );
                     (catalog, result)
                 })
                 .await
@@ -714,6 +740,28 @@ async fn open_and_ingest_catalog(
                     }
                 }
             }
+        }
+    }
+
+    // Reconcile the artwork cache against the now-fully-ingested catalog
+    // (#187): removes any cached file no current entry references, which is
+    // what keeps the cache bounded by the catalog rather than growing
+    // forever as entries come and go. Runs every pass (not just a full
+    // sweep) — the reconcile itself is a directory listing plus a set diff,
+    // cheap relative to the ingest it follows.
+    if let Some(dir) = &artwork_dir {
+        match crate::catalog::ingest::reconcile_artwork_cache(&catalog, dir) {
+            Ok(removed) if removed > 0 => tracing::info!(
+                event = "catalog.artwork.reconciled",
+                removed,
+                "removed cached artwork files no catalog entry references",
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                event = "catalog.artwork.reconcile_io_failed",
+                error = %e,
+                "could not reconcile the artwork cache directory; continuing",
+            ),
         }
     }
 
