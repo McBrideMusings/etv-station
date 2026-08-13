@@ -300,7 +300,7 @@
     },
     "PlayoutItemTracks": {
       "type": "object",
-      "description": "Per-track overrides for a playout item. Omit a field to use the server default for that track kind (first stream of that kind in the item's `source`, if any).",
+      "description": "Per-track overrides for a playout item. Omit `video` or `audio` to use the server default for that track kind (first stream of that kind in the item's `source`). `subtitle` is different: omit it and the item plays with no subtitles at all. Subtitles are opt-in, because a picture subtitle is composited onto every frame and cannot be switched off by a viewer, so it must be asked for rather than inherited.",
       "properties": {
         "video": {
           "description": "Video track selection.",
@@ -339,7 +339,7 @@
     },
     "TrackSelection": {
       "type": "object",
-      "description": "Selects a single track (video or audio).\n\n- `source` absent: inherit the parent `PlayoutItem.source`.\n- `source` present: use this source for this track, overriding the parent.\n- `stream_index` absent: server picks the first stream of the track's kind in the effective source.\n- `stream_index` present: use this specific stream within the effective source.",
+      "description": "Selects a single track (video, audio, or subtitle).\n\n- `source` absent: inherit the parent `PlayoutItem.source`.\n- `source` present: use this source for this track, overriding the parent.\n- `stream_index` absent: server picks the first stream of the track's kind in the effective source.\n- `stream_index` present: use this specific stream within the effective source.\n\nNote that this describes a selection that is present. Leaving `tracks.subtitle` out entirely is not the same as an empty selection: it means no subtitles, not \"pick one for me\".",
       "properties": {
         "source": {
           "description": "Source to pull this track from. If omitted, inherits from the parent `PlayoutItem.source`.",
