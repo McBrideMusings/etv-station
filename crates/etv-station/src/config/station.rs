@@ -74,6 +74,17 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_path: Option<String>,
 
+    /// Directory Plex artwork is cached to at ingest time and ETV-next serves
+    /// from over its own HTTP surface (#187) — the only acceptable source for
+    /// `<icon src>` in the generated guide, since a Plex artwork URL carries
+    /// `X-Plex-Token` as a working credential. Unset (the default) disables
+    /// artwork caching entirely: no fetch happens and `<icon>` is omitted from
+    /// every programme, the same safe-by-default behavior as before this
+    /// existed. `ETV_STATION_ARTWORK_CACHE` overrides at runtime, matching
+    /// `catalog_path`'s own override convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork_cache_dir: Option<String>,
+
     /// How long a freshly ingested catalog is trusted without contacting Plex at
     /// all, in seconds. A restart inside this window reuses the sqlite file as
     /// it stands — the common case when iterating on channel configs, where the

@@ -152,6 +152,7 @@ ENV ETV_STATION_CONFIG=/config/station.yaml \
     ETV_NEXT_DIR=/config/etv-next \
     ETV_STATION_OUTPUT_BASE=/data/playout \
     ETV_STATION_CATALOG=/data/catalog.db \
+    ETV_STATION_ARTWORK_CACHE=/data/artwork \
     ETV_HLS_OUTPUT=/data/hls \
     ETV_BIND_ADDRESS=0.0.0.0 \
     ETV_PORT=8409

@@ -150,7 +150,7 @@ async fn run() -> Result<(), LineupError> {
 
             let listener = tokio::net::TcpListener::bind(addr).await?;
 
-            let app = Router::new()
+            let mut app = Router::new()
                 .route("/channel/{filename}", get(stream))
                 .route("/channels.m3u", get(channel_playlist))
                 .route("/xmltv.xml", get(crate::xmltv::xmltv_epg))
@@ -170,7 +170,21 @@ async fn run() -> Result<(), LineupError> {
                             session_middleware,
                         ))
                         .service(tower_http::services::ServeDir::new(&output_folder)),
-                )
+                );
+
+            // Station-cached Plex artwork (#187) — only mounted when the
+            // lineup names a folder for it. `<icon src>` in xmltv.xml always
+            // points here, never at Plex directly, which is what keeps
+            // `X-Plex-Token` out of a file served over plain HTTP to every
+            // guide reader.
+            if let Some(artwork) = &lineup_config.artwork {
+                app = app.nest_service(
+                    "/artwork",
+                    tower_http::services::ServeDir::new(&artwork.folder),
+                );
+            }
+
+            let app = app
                 .layer(axum::middleware::from_fn(fix_content_types))
                 .layer(CorsLayer::permissive())
                 // Outermost, so it sees the status every other layer settled
@@ -548,7 +562,7 @@ async fn hdhr_lineup_status() -> impl IntoResponse {
     }))
 }
 
-fn get_scheme_host(headers: &HeaderMap) -> String {
+pub(crate) fn get_scheme_host(headers: &HeaderMap) -> String {
     let scheme = get_first_header_value(headers, "x-forwarded-proto")
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "http".to_string());

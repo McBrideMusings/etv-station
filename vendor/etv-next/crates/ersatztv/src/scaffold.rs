@@ -81,6 +81,7 @@ pub async fn add_lineup(lineup_path: &Path, channels: u32, force: bool) -> Resul
         xmltv: Some(XmltvConfig {
             folder: String::from("./xmltv"),
         }),
+        artwork: None,
         channels: channels_config,
     };
 

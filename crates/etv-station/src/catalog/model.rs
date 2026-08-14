@@ -242,6 +242,18 @@ pub struct Entry {
     pub primary_source: Source,
     /// Everything not promoted to a column, as a JSON string.
     pub raw_metadata: Option<String>,
+    /// Filename the entry's cached artwork is written under, relative to the
+    /// station's `artwork_cache_dir` (#187). `None` when no artwork has been
+    /// fetched (no Plex `thumb`, a fetch that hasn't run yet, or a fetch that
+    /// failed). Written only by [`super::Catalog::set_artwork`] — never by
+    /// [`super::Catalog::upsert_entry`] — so a routine metadata re-ingest
+    /// can't erase a cached image.
+    pub artwork_cache_path: Option<String>,
+    /// The Plex `thumb` path the cached image at `artwork_cache_path` was
+    /// fetched from, so a later ingest can tell a changed thumb from an
+    /// unchanged one without re-downloading. Same write rule as
+    /// `artwork_cache_path`.
+    pub artwork_source_key: Option<String>,
 }
 
 impl Entry {

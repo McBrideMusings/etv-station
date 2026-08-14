@@ -8,6 +8,7 @@ pub mod fs;
 pub mod plex;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use super::identity::canonical_path;
 use super::{Catalog, CatalogError};
@@ -35,4 +36,92 @@ pub(crate) fn canonical_index(
         }
     }
     Ok(index)
+}
+
+/// Delete every file directly under `dir` that no current entry's
+/// `artwork_cache_path` names (#187) — what keeps the cache bounded by the
+/// catalog rather than growing forever. An entry pruned by
+/// [`Catalog::delete_entries_without_sources`] takes its cached image with it
+/// on the next call here; nothing else ever removes a cached file.
+///
+/// Run once per ingest pass (see `daemon::open_and_ingest_catalog`), after
+/// both ingesters have written. A missing `dir` (artwork caching never ran)
+/// is not an error — nothing to reconcile. Returns the number of files
+/// removed.
+pub fn reconcile_artwork_cache(catalog: &Catalog, dir: &Path) -> std::io::Result<usize> {
+    let keep = match catalog.all_artwork_cache_paths() {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::error!(
+                event = "catalog.artwork.reconcile_failed",
+                error = %e,
+                "could not read artwork_cache_path from the catalog; skipping reconcile",
+            );
+            return Ok(0);
+        }
+    };
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if keep.contains(&name) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(
+                event = "catalog.artwork.reconcile_remove_failed",
+                file = %name,
+                error = %e,
+                "failed to remove orphaned cached artwork file",
+            );
+            continue;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod artwork_reconcile_tests {
+    use super::*;
+    use crate::catalog::model::{Entry, Source};
+
+    #[test]
+    fn removes_files_no_entry_references_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.jpg"), b"keep").unwrap();
+        std::fs::write(dir.path().join("orphan.jpg"), b"orphan").unwrap();
+
+        let catalog = Catalog::open_in_memory().unwrap();
+        let mut entry = Entry::new("imdb:tt1", "movie", "Kept", Source::Plex);
+        entry.artwork_cache_path = Some("keep.jpg".into());
+        catalog.upsert_entry(&entry).unwrap();
+        catalog
+            .set_artwork("imdb:tt1", "keep.jpg", "/library/metadata/1/thumb/1")
+            .unwrap();
+
+        let removed = reconcile_artwork_cache(&catalog, dir.path()).unwrap();
+        assert_eq!(removed, 1);
+        assert!(dir.path().join("keep.jpg").exists());
+        assert!(!dir.path().join("orphan.jpg").exists());
+    }
+
+    #[test]
+    fn a_missing_cache_dir_is_not_an_error() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let missing = std::path::Path::new("/nonexistent/etv-station-artwork-test-dir");
+        assert_eq!(reconcile_artwork_cache(&catalog, missing).unwrap(), 0);
+    }
 }

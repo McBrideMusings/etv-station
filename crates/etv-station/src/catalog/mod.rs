@@ -331,6 +331,46 @@ impl Catalog {
         Ok(n)
     }
 
+    /// Record a successful artwork cache write for `entry_id`: `cache_path`
+    /// is the filename written under the station's `artwork_cache_dir`,
+    /// `source_key` the Plex `thumb` path it was fetched from (#187).
+    ///
+    /// A dedicated setter, not folded into [`Self::upsert_entry`], on
+    /// purpose: `upsert_entry` runs on every Plex metadata (re)ingest, and an
+    /// artwork fetch is a separate, much rarer pass (only when the `thumb`
+    /// changed). Routing both through one write would force a choice between
+    /// re-fetching art on every metadata touch or having metadata ingest
+    /// silently null out a cached path it knows nothing about; a second
+    /// setter needs neither.
+    pub fn set_artwork(
+        &self,
+        entry_id: &str,
+        cache_path: &str,
+        source_key: &str,
+    ) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "UPDATE entries SET artwork_cache_path = ?2, artwork_source_key = ?3 \
+             WHERE entry_id = ?1",
+            params![entry_id, cache_path, source_key],
+        )?;
+        Ok(())
+    }
+
+    /// Every non-null `artwork_cache_path` currently on the books — what the
+    /// cache directory is allowed to hold. The artwork-reconcile pass deletes
+    /// any file on disk not in this set (#187): an entry pruned by
+    /// [`Self::delete_entries_without_sources`] takes its cached image with
+    /// it on the next reconcile rather than leaving an orphan behind forever.
+    pub fn all_artwork_cache_paths(&self) -> Result<HashSet<String>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT artwork_cache_path FROM entries WHERE artwork_cache_path IS NOT NULL")?;
+        let paths = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(paths)
+    }
+
     /// Record an external GUID for an entry (also the dedup match index).
     pub fn add_external_id(
         &self,
@@ -840,7 +880,7 @@ fn collect_sources(
 /// Column list for `entries`, in the order [`row_to_entry`] reads.
 const ENTRY_COLS: &str = "entry_id, type, title, title_sort, show, show_id, season, episode, \
      absolute_episode, edition, studio, year, release_date, duration_ms, content_rating, \
-     library, primary_source, raw_metadata, summary";
+     library, primary_source, raw_metadata, summary, artwork_cache_path, artwork_source_key";
 
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     Ok(Entry {
@@ -872,6 +912,8 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         },
         raw_metadata: r.get(17)?,
         summary: r.get(18)?,
+        artwork_cache_path: r.get(19)?,
+        artwork_source_key: r.get(20)?,
     })
 }
 

@@ -6,7 +6,7 @@ use simple_expand_tilde::expand_tilde;
 
 use crate::error::LineupError;
 
-const PATH_FIELDS: &[&str] = &["/output/folder", "/xmltv/folder"];
+const PATH_FIELDS: &[&str] = &["/output/folder", "/xmltv/folder", "/artwork/folder"];
 
 #[derive(Deserialize, Serialize, Clone, JsonSchema)]
 pub struct LineupConfig {
@@ -14,6 +14,13 @@ pub struct LineupConfig {
     pub server: ServerConfig,
     pub output: OutputConfig,
     pub xmltv: Option<XmltvConfig>,
+    /// Directory served at `/artwork` (station-cached Plex posters, #187).
+    /// `None` mounts nothing there — a request to `/artwork/...` 404s, which
+    /// only matters if something links there, and nothing does unless this is
+    /// set: the station only ever writes a `/artwork/...` `<icon src>` when it
+    /// has itself cached the file this config point at.
+    #[serde(default)]
+    pub artwork: Option<ArtworkConfig>,
     pub channels: Vec<ChannelConfig>,
 }
 
@@ -48,6 +55,11 @@ pub struct OutputConfig {
 
 #[derive(Deserialize, Serialize, Clone, JsonSchema)]
 pub struct XmltvConfig {
+    pub folder: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, JsonSchema)]
+pub struct ArtworkConfig {
     pub folder: String,
 }
 

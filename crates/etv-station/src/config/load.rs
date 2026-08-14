@@ -57,6 +57,7 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
         env("ETV_STATION_CATALOG"),
         env("ETV_STATION_SOURCE_ROOTS"),
         env("ETV_STATION_IDENTITY_ROOTS"),
+        env("ETV_STATION_ARTWORK_CACHE"),
     );
     validate::validate_station(station_path, &station)?;
 
@@ -104,8 +105,9 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
 /// that override the file value without editing it. `tz` comes from
 /// `ETV_STATION_TZ`, `output_base` from `ETV_STATION_OUTPUT_BASE`,
 /// `catalog_path` from `ETV_STATION_CATALOG`, `source_roots` from
-/// `ETV_STATION_SOURCE_ROOTS`, and `identity_roots` from
-/// `ETV_STATION_IDENTITY_ROOTS` (all read at the single call site in [`load`]).
+/// `ETV_STATION_SOURCE_ROOTS`, `identity_roots` from
+/// `ETV_STATION_IDENTITY_ROOTS`, and `artwork_cache_dir` from
+/// `ETV_STATION_ARTWORK_CACHE` (all read at the single call site in [`load`]).
 /// An absent or blank value leaves the file value untouched. Taking the values
 /// as parameters keeps this pure and testable without mutating process-global
 /// env in parallel tests.
@@ -125,6 +127,7 @@ fn apply_env_overrides(
     catalog_path: Option<String>,
     source_roots: Option<String>,
     identity_roots: Option<String>,
+    artwork_cache_dir: Option<String>,
 ) {
     if let Some(tz) = tz
         && !tz.trim().is_empty()
@@ -150,6 +153,11 @@ fn apply_env_overrides(
         && !roots.trim().is_empty()
     {
         station.identity_roots = split_colon_roots(&roots);
+    }
+    if let Some(dir) = artwork_cache_dir
+        && !dir.trim().is_empty()
+    {
+        station.artwork_cache_dir = Some(dir);
     }
 }
 
@@ -815,6 +823,7 @@ mod tests {
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,
+            artwork_cache_dir: None,
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
             device_id: None,
@@ -831,12 +840,14 @@ mod tests {
             Some("/var/lib/etv/catalog.db".into()),
             Some("/mnt/movies:/mnt/tv".into()),
             Some("/mnt/identity".into()),
+            Some("/data/artwork".into()),
         );
         assert_eq!(s.tz, "America/Chicago");
         assert_eq!(s.output_base, PathBuf::from("/shared/playout"));
         assert_eq!(s.catalog_path.as_deref(), Some("/var/lib/etv/catalog.db"));
         assert_eq!(s.source_roots, vec!["/mnt/movies", "/mnt/tv"]);
         assert_eq!(s.identity_roots, vec!["/mnt/identity"]);
+        assert_eq!(s.artwork_cache_dir.as_deref(), Some("/data/artwork"));
     }
 
     #[test]
@@ -849,12 +860,14 @@ mod tests {
             Some("  ".into()),
             None,
             None,
+            Some("   ".into()),
         );
         assert_eq!(s.tz, "UTC");
         assert_eq!(s.output_base, PathBuf::from("out"));
         assert_eq!(s.catalog_path, None);
         assert!(s.source_roots.is_empty());
         assert!(s.identity_roots.is_empty());
+        assert_eq!(s.artwork_cache_dir, None);
     }
 
     #[test]
@@ -867,6 +880,7 @@ mod tests {
             None,
             Some(":/mnt/a: :/mnt/b:".into()),
             None,
+            None,
         );
         assert_eq!(s.source_roots, vec!["/mnt/a", "/mnt/b"]);
     }
@@ -875,7 +889,7 @@ mod tests {
     fn source_roots_override_keeps_file_value_when_blank() {
         let mut s = station_config();
         s.source_roots = vec!["/from/file".into()];
-        apply_env_overrides(&mut s, None, None, None, Some("   ".into()), None);
+        apply_env_overrides(&mut s, None, None, None, Some("   ".into()), None, None);
         assert_eq!(s.source_roots, vec!["/from/file"]);
     }
 
@@ -889,6 +903,7 @@ mod tests {
             None,
             None,
             Some(":/mnt/a: :/mnt/b:".into()),
+            None,
         );
         assert_eq!(s.identity_roots, vec!["/mnt/a", "/mnt/b"]);
     }
@@ -897,8 +912,16 @@ mod tests {
     fn identity_roots_override_keeps_file_value_when_blank() {
         let mut s = station_config();
         s.identity_roots = vec!["/from/file".into()];
-        apply_env_overrides(&mut s, None, None, None, None, Some("   ".into()));
+        apply_env_overrides(&mut s, None, None, None, None, Some("   ".into()), None);
         assert_eq!(s.identity_roots, vec!["/from/file"]);
+    }
+
+    #[test]
+    fn artwork_cache_dir_override_keeps_file_value_when_blank() {
+        let mut s = station_config();
+        s.artwork_cache_dir = Some("/from/file".into());
+        apply_env_overrides(&mut s, None, None, None, None, None, Some("  ".into()));
+        assert_eq!(s.artwork_cache_dir.as_deref(), Some("/from/file"));
     }
 
     #[test]
@@ -907,12 +930,28 @@ mod tests {
         // (#243) is that the scan roots and the identity roots are two separate
         // decisions, not one defaulted from the other.
         let mut s = station_config();
-        apply_env_overrides(&mut s, None, None, None, Some("/mnt/scan".into()), None);
+        apply_env_overrides(
+            &mut s,
+            None,
+            None,
+            None,
+            Some("/mnt/scan".into()),
+            None,
+            None,
+        );
         assert_eq!(s.source_roots, vec!["/mnt/scan"]);
         assert!(s.identity_roots.is_empty());
 
         let mut s = station_config();
-        apply_env_overrides(&mut s, None, None, None, None, Some("/mnt/identity".into()));
+        apply_env_overrides(
+            &mut s,
+            None,
+            None,
+            None,
+            None,
+            Some("/mnt/identity".into()),
+            None,
+        );
         assert!(s.source_roots.is_empty());
         assert_eq!(s.identity_roots, vec!["/mnt/identity"]);
     }
