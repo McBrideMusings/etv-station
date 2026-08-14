@@ -51,7 +51,7 @@ deploy/appdata/etv-next/*
 tmp-*.log
 
 # Local verify rig — machine-specific, never committed
-.claude/skills/verify/
+.claude/skills/verify-project/
 
 # Unraid GUI container template — carries this host's appdata/media paths and
 # port, so it is machine config, not project config. Synced to the host on every
