@@ -24,6 +24,7 @@ Quick reference. The full rationale lives in [PRD §Architecture](/PRD#architect
 - **etv-next** has read-only on the same volume. Loads the JSON file whose `[start, finish)` covers "now," produces HLS + XMLTV.
 - Coupling is exactly two things: the playout JSON schema (a Rust path-dep on the vendored ETV-next source) and the directory layout convention.
 - The directory layout is single-sourced from the station config: each channel's output folder is derived as `{output_base}/{identity}` (see [schema](/schema#station-file)), and `etv-station --render-etv-next <dir>` generates ETV-next's `lineup.json` + `channelN.json` from that same config — so ETV-next reads exactly where the station writes, with no folder path authored twice. The container entrypoint runs that render at every start, so the two can only ever agree.
+- A third contact point beyond playout JSON and the HLS working set (#187): the station writes cached Plex artwork under `artwork_cache_dir` (`ETV_STATION_ARTWORK_CACHE`, `/data/artwork` in the container), and ETV-next serves it back at `/artwork` — mounted from the `artwork.folder` key `etv-station --render-etv-next` writes into `lineup.json` when artwork caching is on. `<icon src>` in the generated `xmltv.xml` is always either this local path (resolved to an absolute URL against the request's own host) or absent — never a Plex URL, since a Plex artwork URL carries `X-Plex-Token` as a working credential and the guide is served over plain HTTP.
 
 ## Subtitles
 
