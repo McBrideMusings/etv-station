@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -207,6 +207,73 @@ def _fmt_span(seconds: float) -> str:
     if h:
         return f"{h}h"
     return f"{m}m"
+
+
+TIMELINE_ROW_MINUTES = 15  # each output row spans this much wall-clock time
+TIMELINE_LOOKBACK_HOURS = 2  # how far before `now` the default view starts
+TIMELINE_LOOKAHEAD_HOURS = 12  # how far past `now` the default view extends
+
+
+def _timeline_intervals(
+    progs: list[Programme], now: datetime, view_start: datetime, view_end: datetime
+) -> list[tuple[datetime, datetime, str | None]]:
+    """(start, end, title|None) for every minute of [view_start, view_end) —
+    title is None for an off-air stretch. Consecutive programmes are
+    connected with zero gap between them; a programme running past `now`
+    with no successor yet known does not appear as a gap until it actually
+    ends. `progs` must already be sorted by start (programmes_for does this).
+    """
+    intervals: list[tuple[datetime, datetime, str | None]] = []
+    cursor = view_start
+    for p in progs:
+        if p.stop <= view_start:
+            continue
+        if p.start >= view_end:
+            break
+        if p.start > cursor:
+            intervals.append((cursor, min(p.start, view_end), None))
+        intervals.append((max(p.start, view_start), min(p.stop, view_end), p.title or "(untitled)"))
+        cursor = min(p.stop, view_end)
+        if cursor >= view_end:
+            break
+    if cursor < view_end:
+        intervals.append((cursor, view_end, None))
+    return intervals
+
+
+def render_timeline(
+    progs: list[Programme],
+    now: datetime,
+    view_start: datetime | None = None,
+    view_end: datetime | None = None,
+    row_minutes: int = TIMELINE_ROW_MINUTES,
+) -> list[str]:
+    """Plain-text rows, one per `row_minutes`, running start-of-window to
+    end-of-window. Every row a programme's runtime covers gets that
+    programme's block; every row an off-air stretch covers gets shaded
+    filler — the amount of blank space on screen IS the size of the gap,
+    not a duration printed once and easy to skim past.
+    """
+    if view_start is None:
+        view_start = now - timedelta(hours=TIMELINE_LOOKBACK_HOURS)
+    if view_end is None:
+        view_end = now + timedelta(hours=TIMELINE_LOOKAHEAD_HOURS)
+    step = timedelta(minutes=row_minutes)
+    lines: list[str] = []
+    for start, end, title in _timeline_intervals(progs, now, view_start, view_end):
+        n_rows = max(1, round((end - start) / step))
+        for i in range(n_rows):
+            row_start = start + i * step
+            row_end = row_start + step if i < n_rows - 1 else end
+            marker = " ◀ NOW" if row_start <= now < row_end else ""
+            label = _fmt_dt(row_start) if i == 0 else "      "
+            if title is not None:
+                bar = "█" * min(3, max(1, n_rows))
+                text = f"{title}  ({_fmt_span((end - start).total_seconds())})" if i == 0 else ""
+                lines.append(f"{label}  {bar} {text}{marker}")
+            else:
+                lines.append(f"{label}  ░░░ off-air{marker}")
+    return lines
 
 
 def current_gap(programmes: list[Programme], channel_id: str, now: datetime) -> tuple[datetime, datetime | None] | None:
@@ -400,33 +467,16 @@ def run_tui(host: str) -> None:
             progs = programmes_for(self.programmes, self.selected_channel)
             if not progs:
                 lines.append("[red]⚠ no programmes scheduled at all[/red]")
-            prev_stop: datetime | None = None
-            now_marked = False
-            for p in progs:
-                gap_start = prev_stop
-                gap_end = p.start
-                if gap_start is not None and gap_end > gap_start:
-                    marker = ""
-                    if gap_start <= now < gap_end and not now_marked:
-                        marker = "  ← now"
-                        now_marked = True
-                    lines.append(
-                        f'[red]⚠ GAP  {_fmt_dt(gap_start)}–{_fmt_dt(gap_end)}  '
-                        f"({_fmt_span((gap_end - gap_start).total_seconds())} off-air){marker}[/red]"
-                    )
-                title = escape(p.title or "(untitled)")
-                span = f"{_fmt_dt(p.start)}–{_fmt_dt(p.stop)}"
-                row = f'{span}  [link="{p.icon}"]{title}[/link]' if p.icon else f"{span}  {title}"
-                if p.start <= now < p.stop and not now_marked:
-                    row += "  ← now"
-                    now_marked = True
-                lines.append(row)
-                prev_stop = p.stop
-            if prev_stop is not None and now >= prev_stop:
+            else:
+                view_start = now - timedelta(hours=TIMELINE_LOOKBACK_HOURS)
+                view_end = now + timedelta(hours=TIMELINE_LOOKAHEAD_HOURS)
                 lines.append(
-                    f"[red]⚠ GAP  {_fmt_dt(prev_stop)}–present  "
-                    f"({_fmt_span((now - prev_stop).total_seconds())} off-air, nothing scheduled)  ← now[/red]"
+                    f"{_fmt_dt(view_start)} … {_fmt_dt(view_end)}  "
+                    f"(one row = {TIMELINE_ROW_MINUTES}m — blank rows are dead air, sized to how long)"
                 )
+                lines.append("")
+                for row in render_timeline(progs, now, view_start, view_end):
+                    lines.append(f"[red]{escape(row)}[/red]" if "off-air" in row else escape(row))
             body.update("\n".join(lines))
 
         def action_open_vlc(self) -> None:
