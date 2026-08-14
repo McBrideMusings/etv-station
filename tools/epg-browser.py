@@ -328,6 +328,7 @@ def run_tui(host: str) -> None:
     from textual.widgets import Footer, Header, ListItem, ListView, Label, Static
 
     class EpgBrowserApp(App):
+        ENABLE_COMMAND_PALETTE = False
         CSS = """
         Horizontal { height: 1fr; }
         #channels { width: 34; border-right: solid $accent; }
