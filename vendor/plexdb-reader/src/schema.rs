@@ -18,7 +18,7 @@ use crate::error::ReaderError;
 
 /// The schema version this crate's accessors are written against.
 ///
-/// Currently version 7 — `items`, `external_ids`, `plex_items`, `enrichment`,
+/// Currently version 8 — `items`, `external_ids`, `plex_items`, `enrichment`,
 /// `enrichment_cursor`, `plays`, `plays_ingest_cursor`, `edges`, `collection`,
 /// `collection_membership` — see `plexdb/schema.py`.
 ///
@@ -33,7 +33,13 @@ use crate::error::ReaderError;
 /// them (issue #41, ADR-0013). Against a v6 store that query would now return
 /// the sentinels as real attributes, which is exactly why the gate demands an
 /// exact match rather than a minimum.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 7;
+///
+/// **Version 8 does not change what this crate reads.** It adds `last_seen`
+/// to `external_ids` (issue #57), recording which of a title's ids Plex
+/// still reports; no accessor here reads it. The gate still demands an exact
+/// match rather than a minimum, so a v7 store — missing the column — is
+/// still refused rather than silently read as if it had it.
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 8;
 
 /// Confirm `conn` is a plexdb store at exactly [`SUPPORTED_SCHEMA_VERSION`].
 pub(crate) fn check(conn: &Connection, path: &Path) -> Result<(), ReaderError> {

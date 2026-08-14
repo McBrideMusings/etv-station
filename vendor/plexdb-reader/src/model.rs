@@ -50,6 +50,30 @@ pub struct TasteAttribute {
     pub weight: f64,
 }
 
+/// One crowd list a title appears on, and where in it — a join of one
+/// `collection_membership` row with the `collection` row it belongs to.
+///
+/// `collection_id`, `source`, and `observed_at` (the membership's own, not
+/// the list's) are always present; every other field is nullable at the
+/// source and stays `Option<_>` here rather than collapsing to `0` or `""`,
+/// because a missing `rank` must stay distinguishable from rank 1 and a
+/// missing `name`/`url`/`size`/`likes` from a source that genuinely recorded
+/// none. There is deliberately no `weight` field — `rank`, `size`, `likes`
+/// and `mentions` are the facts a source gave; a consumer wanting one number
+/// computes it from those (plex-db-ex#33, ADR-0012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionMembership {
+    pub collection_id: String,
+    pub source: String,
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub size: Option<i64>,
+    pub likes: Option<i64>,
+    pub rank: Option<i64>,
+    pub mentions: Option<i64>,
+    pub observed_at: String,
+}
+
 /// A user's Layer 2 taste vector, plus what the rollup could not weigh
 /// properly.
 ///

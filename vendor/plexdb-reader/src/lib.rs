@@ -24,13 +24,13 @@
 //! rather than what a person likes, so it stays with the consumer. See
 //! ADR-0011.
 //!
-//! **Collection membership is not implemented yet.** The issue that
-//! commissioned this crate (plex-db-ex#11) asks for it, and the tables it
-//! would read now exist — schema v6 added `collection` and
-//! `collection_membership`, filled by `plexdb harvest-mdblist`
-//! (plex-db-ex#34). The accessor itself is plex-db-ex#29, no longer blocked.
+//! [`Reader::collections_for`] answers the crowd-list question the issue that
+//! commissioned this crate (plex-db-ex#11) asked for: which lists a title
+//! appears on, and where in them. The tables it reads — `collection` and
+//! `collection_membership` — landed in schema v6, filled by
+//! `plexdb harvest-mdblist` (plex-db-ex#34); the accessor is plex-db-ex#29.
 //!
-//! It will carry no weight, and that is deliberate rather than an omission:
+//! It carries no weight, and that is deliberate rather than an omission:
 //! the store records `rank`, `mentions`, and the collection's own `size` and
 //! `likes` as the source gave them, and a consumer wanting one number
 //! computes it from those (plex-db-ex#33, ADR-0012). All four are nullable at
@@ -49,7 +49,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags, Row};
 
 pub use error::ReaderError;
-pub use model::{Edge, EnrichmentFact, TasteAttribute, TasteVector};
+pub use model::{CollectionMembership, Edge, EnrichmentFact, TasteAttribute, TasteVector};
 pub use schema::SUPPORTED_SCHEMA_VERSION;
 
 /// A title watched less than half a season contributes nothing. Hu, Koren &
@@ -226,6 +226,29 @@ impl Reader {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
             .query_map((item_id, edge_type), Self::edge_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every crowd list `item_id` appears on, ordered by `collection_id` for
+    /// a stable, deterministic result — `rank` orders a title's position
+    /// *within* one list, not one list against another, so it cannot supply
+    /// this ordering. Empty, not an error, for a title on no lists.
+    ///
+    /// Each row joins one `collection_membership` fact with the `collection`
+    /// it belongs to, so a caller gets a list's own name/url/size/likes
+    /// alongside this title's rank/mentions in it without a second query.
+    pub fn collections_for(&self, item_id: &str) -> Result<Vec<CollectionMembership>, ReaderError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cm.collection_id, c.source, c.name, c.url, c.size, c.likes, \
+                    cm.rank, cm.mentions, cm.observed_at \
+             FROM collection_membership cm \
+             JOIN collection c ON c.collection_id = cm.collection_id \
+             WHERE cm.item_id = ?1 \
+             ORDER BY cm.collection_id",
+        )?;
+        let rows = stmt
+            .query_map((item_id,), Self::collection_membership_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -471,6 +494,20 @@ impl Reader {
             fetched_at: row.get(4)?,
         })
     }
+
+    fn collection_membership_row(row: &Row) -> rusqlite::Result<CollectionMembership> {
+        Ok(CollectionMembership {
+            collection_id: row.get(0)?,
+            source: row.get(1)?,
+            name: row.get(2)?,
+            url: row.get(3)?,
+            size: row.get(4)?,
+            likes: row.get(5)?,
+            rank: row.get(6)?,
+            mentions: row.get(7)?,
+            observed_at: row.get(8)?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -519,7 +556,7 @@ mod tests {
             setup
                 .execute_batch(
                     "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                     INSERT INTO schema_version (version) VALUES (7);
+                     INSERT INTO schema_version (version) VALUES (8);
                      CREATE TABLE items (item_id TEXT PRIMARY KEY);
                      CREATE TABLE enrichment (
                          item_id    TEXT NOT NULL,
