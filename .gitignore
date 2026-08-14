@@ -13,6 +13,9 @@ docs/.vitepress/dist
 # committed normalization.default.json does NOT match these.
 examples/etv-next/lineup.json
 examples/etv-next/channel*.json
+# Dead per #158 decision 5 — no longer read at all, but a stray copy from an
+# old checkout keeps showing up as untracked cruft if it isn't ignored too.
+examples/etv-next/presentation.json
 examples/output/
 # Minted on first run beside the station config. Per-install, and the one value
 # a fresh clone must not inherit — a shared tuner id makes two people's servers
