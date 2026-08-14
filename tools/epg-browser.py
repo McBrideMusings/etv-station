@@ -197,6 +197,12 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%a %H:%M")
 
 
+def _fmt_dt_sec(dt: datetime) -> str:
+    """Same as _fmt_dt but with seconds — used for real programme-boundary
+    timestamps (changeovers, EPG-data cutoffs), never for block labels."""
+    return dt.strftime("%a %H:%M:%S")
+
+
 def _fmt_span(seconds: float) -> str:
     """4h23m gap or 12m gap — never bare minutes-since-epoch-style noise."""
     total = int(seconds)
@@ -207,73 +213,6 @@ def _fmt_span(seconds: float) -> str:
     if h:
         return f"{h}h"
     return f"{m}m"
-
-
-TIMELINE_ROW_MINUTES = 15  # each output row spans this much wall-clock time
-TIMELINE_LOOKBACK_HOURS = 2  # how far before `now` the default view starts
-TIMELINE_LOOKAHEAD_HOURS = 12  # how far past `now` the default view extends
-
-
-def _timeline_intervals(
-    progs: list[Programme], now: datetime, view_start: datetime, view_end: datetime
-) -> list[tuple[datetime, datetime, str | None]]:
-    """(start, end, title|None) for every minute of [view_start, view_end) —
-    title is None for an off-air stretch. Consecutive programmes are
-    connected with zero gap between them; a programme running past `now`
-    with no successor yet known does not appear as a gap until it actually
-    ends. `progs` must already be sorted by start (programmes_for does this).
-    """
-    intervals: list[tuple[datetime, datetime, str | None]] = []
-    cursor = view_start
-    for p in progs:
-        if p.stop <= view_start:
-            continue
-        if p.start >= view_end:
-            break
-        if p.start > cursor:
-            intervals.append((cursor, min(p.start, view_end), None))
-        intervals.append((max(p.start, view_start), min(p.stop, view_end), p.title or "(untitled)"))
-        cursor = min(p.stop, view_end)
-        if cursor >= view_end:
-            break
-    if cursor < view_end:
-        intervals.append((cursor, view_end, None))
-    return intervals
-
-
-def render_timeline(
-    progs: list[Programme],
-    now: datetime,
-    view_start: datetime | None = None,
-    view_end: datetime | None = None,
-    row_minutes: int = TIMELINE_ROW_MINUTES,
-) -> list[str]:
-    """Plain-text rows, one per `row_minutes`, running start-of-window to
-    end-of-window. Every row a programme's runtime covers gets that
-    programme's block; every row an off-air stretch covers gets shaded
-    filler — the amount of blank space on screen IS the size of the gap,
-    not a duration printed once and easy to skim past.
-    """
-    if view_start is None:
-        view_start = now - timedelta(hours=TIMELINE_LOOKBACK_HOURS)
-    if view_end is None:
-        view_end = now + timedelta(hours=TIMELINE_LOOKAHEAD_HOURS)
-    step = timedelta(minutes=row_minutes)
-    lines: list[str] = []
-    for start, end, title in _timeline_intervals(progs, now, view_start, view_end):
-        n_rows = max(1, round((end - start) / step))
-        for i in range(n_rows):
-            row_start = start + i * step
-            row_end = row_start + step if i < n_rows - 1 else end
-            marker = " ◀ NOW" if row_start <= now < row_end else ""
-            label = _fmt_dt(row_start) if i == 0 else "      "
-            if title is not None:
-                bar = "█" * min(3, max(1, n_rows))
-                text = f"{title}  ({_fmt_span((end - start).total_seconds())})" if i == 0 else ""
-                lines.append(f"{label}  {bar} {text}{marker}")
-            else:
-                lines.append(f"{label}  ░░░ off-air{marker}")
-    return lines
 
 
 def current_gap(programmes: list[Programme], channel_id: str, now: datetime) -> tuple[datetime, datetime | None] | None:
@@ -392,15 +331,25 @@ def run_tui(host: str) -> None:
         CSS = """
         Horizontal { height: 1fr; }
         #channels { width: 34; border-right: solid $accent; }
+        #programmes { width: 40; border-right: solid $accent; }
         #detail { padding: 0 1; }
         """
         BINDINGS = [
             ("r", "refresh", "Refresh"),
-            ("v", "open_vlc", "Artwork in VLC"),
+            ("v", "open_vlc", "Stream in VLC"),
+            ("a", "open_artwork", "Artwork preview"),
             ("s", "open_sublime", "XML in Sublime"),
+            ("left", "focus_channels", "◀ Channels"),
+            ("right", "focus_programmes", "Shows ▶"),
             ("q", "quit", "Quit"),
             ("escape", "quit", "Quit"),
         ]
+
+        REFRESH_SECS = 60  # re-fetch lineup from the station this often
+        TICK_SECS = 15  # rebuild the block list (cheap, no fetch) this often —
+        # this is what makes the top block roll from e.g. 15:45 to 16:00 live
+        BLOCK_MINUTES = 15  # width of one row in the shows sidebar
+        BLOCK_SAFETY_CAP = 2000  # ~20 days of blocks — a runaway-loop backstop, not a UX truncation
 
         def __init__(self, host: str) -> None:
             super().__init__()
@@ -408,11 +357,17 @@ def run_tui(host: str) -> None:
             self.channels: dict[str, Channel] = {}
             self.programmes: list[Programme] = []
             self.selected_channel: str | None = None
+            # Parallel to #programmes items. Each entry is either:
+            #   ("block", block_start, segments)  — segments: list[(Programme|None, start, stop)]
+            #   ("end", end_bound, None)          — the "Last EPG data: ..." closing row
+            #   ("empty", None, last_known_programme_or_None)  — nothing live/future at all
+            self.programme_rows: list[tuple[str, datetime | None, object]] = []
 
         def compose(self) -> ComposeResult:
             yield Header()
             with Horizontal():
                 yield ListView(id="channels")
+                yield ListView(id="programmes")
                 with VerticalScroll(id="detail"):
                     yield Static("Loading…", id="detail-body", markup=True)
             yield Footer()
@@ -420,10 +375,14 @@ def run_tui(host: str) -> None:
         def on_mount(self) -> None:
             self.title = f"epg-browser — {self.host}"
             self.action_refresh()
+            self.query_one("#channels", ListView).focus()
+            self.set_interval(self.REFRESH_SECS, self.action_refresh)
+            self.set_interval(self.TICK_SECS, lambda: self._load_programmes(keep_selection=True))
 
         def action_refresh(self) -> None:
             self.channels, self.programmes = fetch_lineup(self.host)
             lv = self.query_one("#channels", ListView)
+            keep_index = lv.index
             lv.clear()
             now = datetime.now(timezone.utc)
             for tvg_id, chan in self.channels.items():
@@ -437,7 +396,155 @@ def run_tui(host: str) -> None:
                 )
             if self.channels and self.selected_channel is None:
                 self.selected_channel = next(iter(self.channels))
+            if keep_index is not None and keep_index < len(lv):
+                lv.index = keep_index
+                # The highlighted row and the detail pane must name the same
+                # channel — if the lineup reordered since the last fetch,
+                # keep_index now lands on a different tvg_id than the one
+                # that was selected before, so resync selected_channel to
+                # what's actually highlighted rather than leaving it stale.
+                self.selected_channel = list(self.channels.keys())[keep_index]
+            self._load_programmes(keep_selection=True)
+
+        @staticmethod
+        def _floor_block(dt: datetime, minutes: int) -> datetime:
+            floored_minute = (dt.minute // minutes) * minutes
+            return dt.replace(minute=floored_minute, second=0, microsecond=0)
+
+        def _load_programmes(self, keep_selection: bool = False) -> None:
+            """(Re)populate the #programmes sidebar as fixed BLOCK_MINUTES-wide
+            rows, clock-aligned, starting at the block containing `now` and
+            reading forward only — an EPG never scrolls back through history to
+            find the live edge. Every block is rendered, on-air or off-air, all
+            the way to the real end of known EPG data; nothing is summarized or
+            capped, so a scheduling gap is exactly as long on screen as it is
+            in reality. On a fresh channel switch the top (now) block is
+            selected; on a periodic rebuild, whatever block the user had
+            highlighted stays highlighted (by its real start time, not row
+            index, since the list shifts every time the top block rolls over)."""
+            lv = self.query_one("#programmes", ListView)
+            keep_kind = None
+            keep_block_start = None
+            if keep_selection and lv.index is not None and self.programme_rows and lv.index < len(self.programme_rows):
+                keep_kind, keep_block_start, _ = self.programme_rows[lv.index]
+            lv.clear()
+            self.programme_rows = []
+            if self.selected_channel is None:
+                self.refresh_detail()
+                return
+            now = datetime.now(timezone.utc)
+            all_progs = programmes_for(self.programmes, self.selected_channel)
+            progs_fwd = [p for p in all_progs if p.stop > now]
+
+            if not progs_fwd:
+                last = max(all_progs, key=lambda p: p.stop) if all_progs else None
+                if last is None:
+                    label = "[red]⚠ No EPG scheduled right now[/red]\n[dim]   no programme data at all for this channel[/dim]"
+                else:
+                    ago = _fmt_span((now - last.stop).total_seconds())
+                    label = (
+                        "[red]⚠ No EPG scheduled right now[/red]\n"
+                        f"[dim]   Last EPG: {escape(last.title or '(untitled)')} — "
+                        f"ended {_fmt_dt_sec(last.stop)} ({ago} ago)[/dim]"
+                    )
+                lv.append(ListItem(Label(label), name="empty"))
+                self.programme_rows.append(("empty", None, last))
+                lv.index = 0
+                self.refresh_detail()
+                return
+
+            block_start = self._floor_block(now, self.BLOCK_MINUTES)
+            end_bound = progs_fwd[-1].stop  # real timestamp where known EPG data actually ends
+
+            # Sweep progs_fwd into a flat list of (programme_or_None, start, stop)
+            # segments covering [now, end_bound) with zero gaps between them and
+            # real (unrounded) boundary timestamps — this is what lets a single
+            # 15m block contain a mid-block changeover. Anchored at `now`, not
+            # `block_start`: a show that already finished airing before `now`
+            # but whose slot falls inside the still-visible current block must
+            # never render as a phantom "off-air" gap — nothing before `now`
+            # is real content or a real gap, it's just history, and history
+            # doesn't get shown here at all.
+            segments: list[tuple[Programme | None, datetime, datetime]] = []
+            cursor = now
+            for p in progs_fwd:
+                if p.start > cursor:
+                    segments.append((None, cursor, min(p.start, end_bound)))
+                segments.append((p, max(p.start, now), p.stop))
+                cursor = p.stop
+                if cursor >= end_bound:
+                    break
+
+            def _title(seg: tuple[Programme | None, datetime, datetime]) -> str:
+                return (seg[0].title or "(untitled)") if seg[0] else "— off-air —"
+
+            select_idx = 0
+            seg_i = 0
+            cur = block_start
+            step = timedelta(minutes=self.BLOCK_MINUTES)
+            row_count = 0
+            while cur < end_bound and row_count < self.BLOCK_SAFETY_CAP:
+                block_end = cur + step
+                overlapping = []
+                i = seg_i
+                while i < len(segments) and segments[i][1] < block_end and segments[i][2] > cur:
+                    overlapping.append(segments[i])
+                    i += 1
+                while seg_i < len(segments) and segments[seg_i][2] <= block_end:
+                    seg_i += 1
+                is_first = row_count == 0
+                marker = "▶" if is_first else " "
+                # One line per block, always — no separate CHANGEOVER row. A
+                # block a single show fully occupies just shows its title; a
+                # block where a boundary falls shows "A → B" inline. The exact
+                # boundary timestamp(s) and full fields for both shows live in
+                # the detail pane only, not here.
+                if len(overlapping) <= 1:
+                    text = escape(_title(overlapping[0])) if overlapping else "[red]— off-air —[/red]"
+                else:
+                    text = escape(" → ".join(_title(seg) for seg in overlapping))
+                label = f"{marker} {_fmt_dt(cur)}  {text}"
+                lv.append(ListItem(Label(label), name="block"))
+                self.programme_rows.append(("block", cur, overlapping))
+                if keep_kind == "block" and cur == keep_block_start:
+                    select_idx = row_count
+                elif keep_kind != "block" and keep_kind != "end" and is_first:
+                    select_idx = row_count
+                cur = block_end
+                row_count += 1
+
+            lv.append(
+                ListItem(
+                    Label(
+                        f"[red]⚠ Last EPG data: {_fmt_dt_sec(end_bound)}[/red]\n"
+                        "[dim]   nothing scheduled after this[/dim]"
+                    ),
+                    name="end",
+                )
+            )
+            self.programme_rows.append(("end", end_bound, None))
+            if keep_kind == "end":
+                select_idx = len(self.programme_rows) - 1
+
+            lv.index = select_idx
             self.refresh_detail()
+
+        def _programme_fields(self, p: Programme) -> list[str]:
+            def field(label: str, value: object) -> str:
+                if value in (None, "", []):
+                    return f"  {label}: [dim]∅[/dim]"
+                return f"  {label}: {escape(str(value))}"
+
+            return [
+                field("title", p.title),
+                field("sub-title", p.sub_title),
+                field("desc", p.desc),
+                field("season/episode", f"S{p.season}E{p.episode}" if p.season and p.episode else None),
+                field("categories", ", ".join(p.categories) if p.categories else None),
+                field("rating", p.rating),
+                field("star-rating", p.star_rating),
+                field("icon", p.icon),
+            ]
 
         def _gap_subtitle(self, tvg_id: str, now: datetime) -> str:
             gap = current_gap(self.programmes, tvg_id, now)
@@ -448,10 +555,28 @@ def run_tui(host: str) -> None:
                 return f"(off-air {_fmt_span((now - gap_start).total_seconds())} — nothing scheduled)"
             return f"(off-air — next in {_fmt_span((gap_end - now).total_seconds())})"
 
+        def _selected_row(self) -> tuple[str, datetime | None, object] | None:
+            lv = self.query_one("#programmes", ListView)
+            idx = lv.index
+            if idx is None or not self.programme_rows or idx >= len(self.programme_rows):
+                return None
+            return self.programme_rows[idx]
+
         def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-            if event.item is not None and event.item.name:
-                self.selected_channel = event.item.name
+            if event.list_view.id == "channels":
+                if event.item is not None and event.item.name and event.item.name != self.selected_channel:
+                    self.selected_channel = event.item.name
+                    self._load_programmes()
+                else:
+                    self.refresh_detail()
+            elif event.list_view.id == "programmes":
                 self.refresh_detail()
+
+        def action_focus_channels(self) -> None:
+            self.query_one("#channels", ListView).focus()
+
+        def action_focus_programmes(self) -> None:
+            self.query_one("#programmes", ListView).focus()
 
         def refresh_detail(self) -> None:
             body = self.query_one("#detail-body", Static)
@@ -466,34 +591,64 @@ def run_tui(host: str) -> None:
                 "",
             ]
             now = datetime.now(timezone.utc)
-            progs = programmes_for(self.programmes, self.selected_channel)
-            if not progs:
-                lines.append("[red]⚠ no programmes scheduled at all[/red]")
+            lines.append(f"[b][yellow]now: {_fmt_dt_sec(now)} UTC[/yellow][/b]")
+            lines.append("")
+
+            row = self._selected_row()
+            if row is None:
+                lines.append("[dim]No block selected.[/dim]")
             else:
-                view_start = now - timedelta(hours=TIMELINE_LOOKBACK_HOURS)
-                view_end = now + timedelta(hours=TIMELINE_LOOKAHEAD_HOURS)
-                lines.append(
-                    f"{_fmt_dt(view_start)} … {_fmt_dt(view_end)}  "
-                    f"(one row = {TIMELINE_ROW_MINUTES}m — blank rows are dead air, sized to how long)"
-                )
-                lines.append("")
-                for row in render_timeline(progs, now, view_start, view_end):
-                    lines.append(f"[red]{escape(row)}[/red]" if "off-air" in row else escape(row))
+                kind, _, payload = row
+                if kind == "empty":
+                    lines.append("[b]status: no live schedule[/b]")
+                    if payload is not None:
+                        lines.append("last known EPG entry:")
+                        lines.extend(self._programme_fields(payload))
+                    else:
+                        lines.append("[dim]No EPG data for this channel at all.[/dim]")
+                elif kind == "end":
+                    lines.append(f"[b]End of known EPG data[/b]  ({_fmt_dt_sec(payload)})")
+                    lines.append("[dim]Nothing has been generated past this point.[/dim]")
+                else:  # "block"
+                    segments: list[tuple[Programme | None, datetime, datetime]] = payload
+                    if len(segments) == 1 and segments[0][0] is None:
+                        lines.append("[b]status: off-air[/b] — no programme scheduled in this block")
+                    else:
+                        for i, (p, s, e) in enumerate(segments):
+                            if p is None:
+                                lines.append(f"[dim]— off-air {_fmt_dt_sec(s)} … {_fmt_dt_sec(e)} —[/dim]")
+                                lines.append("")
+                                continue
+                            heading = "Selected show" if len(segments) == 1 else ("Ends this block" if i == 0 else "Begins this block")
+                            lines.append(f"[b]{heading}[/b]  ({_fmt_dt_sec(s)} → {_fmt_dt_sec(e)})")
+                            lines.extend(self._programme_fields(p))
+                            lines.append("")
             body.update("\n".join(lines))
 
         def action_open_vlc(self) -> None:
             if self.selected_channel is None:
                 return
-            now = datetime.now(timezone.utc)
-            current, _ = current_and_next(self.programmes, self.selected_channel, now)
-            url = current.icon if current and current.icon else None
+            chan = self.channels[self.selected_channel]
+            subprocess.run(["open", "-a", "VLC", chan.stream_url])
+
+        def action_open_artwork(self) -> None:
+            url = None
+            row = self._selected_row()
+            if row is not None:
+                kind, _, payload = row
+                if kind == "block":
+                    for p, _, _ in payload:
+                        if p is not None and p.icon:
+                            url = p.icon
+                            break
+                elif kind == "empty" and payload is not None and payload.icon:
+                    url = payload.icon
+            if url is None and self.selected_channel is not None:
+                url = self.channels[self.selected_channel].logo
             if url is None:
-                chan = self.channels[self.selected_channel]
-                url = chan.logo
-            if url is None:
-                self.notify("No artwork URL for the current programme.", severity="warning")
+                self.notify("No artwork URL for the selected show.", severity="warning")
                 return
-            subprocess.run(["open", "-a", "VLC", url])
+            subprocess.run(["open", url])
 
         def action_open_sublime(self) -> None:
             if self.selected_channel is None:
