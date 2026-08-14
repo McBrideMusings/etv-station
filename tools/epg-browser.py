@@ -190,6 +190,42 @@ def current_and_next(
     return current, nxt
 
 
+def _fmt_dt(dt: datetime) -> str:
+    """Weekday-qualified so a two-day-old entry can't be misread as "later
+    today" — a bare %H:%M is exactly what made the schedule gap in #292 look
+    like an upcoming show instead of a stale listing days in the past."""
+    return dt.strftime("%a %H:%M")
+
+
+def _fmt_span(seconds: float) -> str:
+    """4h23m gap or 12m gap — never bare minutes-since-epoch-style noise."""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m = rem // 60
+    if h and m:
+        return f"{h}h{m:02d}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
+def current_gap(programmes: list[Programme], channel_id: str, now: datetime) -> tuple[datetime, datetime | None] | None:
+    """(gap_start, gap_end) if `now` falls in a scheduling gap for this channel,
+    else None. gap_end is None when nothing at all is scheduled past `now` —
+    the "playout generation stalled" case, not just a short between-shows gap.
+    """
+    chan = programmes_for(programmes, channel_id)
+    if any(p.start <= now < p.stop for p in chan):
+        return None
+    before = [p for p in chan if p.stop <= now]
+    after = [p for p in chan if p.start > now]
+    gap_start = max((p.stop for p in before), default=None)
+    gap_end = min((p.start for p in after), default=None)
+    if gap_start is None and gap_end is None:
+        return None  # no programmes at all for this channel — nothing to report a span for
+    return gap_start, gap_end
+
+
 # --- JSON subcommands -------------------------------------------------------
 
 
@@ -323,7 +359,7 @@ def run_tui(host: str) -> None:
             now = datetime.now(timezone.utc)
             for tvg_id, chan in self.channels.items():
                 current, _ = current_and_next(self.programmes, tvg_id, now)
-                subtitle = current.title if current and current.title else "(no current programme)"
+                subtitle = current.title if current and current.title else self._gap_subtitle(tvg_id, now)
                 lv.append(
                     ListItem(
                         Label(f"{escape(chan.name)}\n[dim]{escape(subtitle)}[/dim]"),
@@ -333,6 +369,15 @@ def run_tui(host: str) -> None:
             if self.channels and self.selected_channel is None:
                 self.selected_channel = next(iter(self.channels))
             self.refresh_detail()
+
+        def _gap_subtitle(self, tvg_id: str, now: datetime) -> str:
+            gap = current_gap(self.programmes, tvg_id, now)
+            if gap is None:
+                return "(no programmes scheduled)"
+            gap_start, gap_end = gap
+            if gap_end is None:
+                return f"(off-air {_fmt_span((now - gap_start).total_seconds())} — nothing scheduled)"
+            return f"(off-air — next in {_fmt_span((gap_end - now).total_seconds())})"
 
         def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
             if event.item is not None and event.item.name:
@@ -351,13 +396,37 @@ def run_tui(host: str) -> None:
                 f'guide:  [link="{self.host}/xmltv.xml"]{escape(self.host)}/xmltv.xml[/link]',
                 "",
             ]
-            for p in programmes_for(self.programmes, self.selected_channel):
+            now = datetime.now(timezone.utc)
+            progs = programmes_for(self.programmes, self.selected_channel)
+            if not progs:
+                lines.append("[red]⚠ no programmes scheduled at all[/red]")
+            prev_stop: datetime | None = None
+            now_marked = False
+            for p in progs:
+                gap_start = prev_stop
+                gap_end = p.start
+                if gap_start is not None and gap_end > gap_start:
+                    marker = ""
+                    if gap_start <= now < gap_end and not now_marked:
+                        marker = "  ← now"
+                        now_marked = True
+                    lines.append(
+                        f'[red]⚠ GAP  {_fmt_dt(gap_start)}–{_fmt_dt(gap_end)}  '
+                        f"({_fmt_span((gap_end - gap_start).total_seconds())} off-air){marker}[/red]"
+                    )
                 title = escape(p.title or "(untitled)")
-                span = f"{p.start.strftime('%H:%M')}–{p.stop.strftime('%H:%M')}"
-                if p.icon:
-                    lines.append(f'{span}  [link="{p.icon}"]{title}[/link]')
-                else:
-                    lines.append(f"{span}  {title}")
+                span = f"{_fmt_dt(p.start)}–{_fmt_dt(p.stop)}"
+                row = f'{span}  [link="{p.icon}"]{title}[/link]' if p.icon else f"{span}  {title}"
+                if p.start <= now < p.stop and not now_marked:
+                    row += "  ← now"
+                    now_marked = True
+                lines.append(row)
+                prev_stop = p.stop
+            if prev_stop is not None and now >= prev_stop:
+                lines.append(
+                    f"[red]⚠ GAP  {_fmt_dt(prev_stop)}–present  "
+                    f"({_fmt_span((now - prev_stop).total_seconds())} off-air, nothing scheduled)  ← now[/red]"
+                )
             body.update("\n".join(lines))
 
         def action_open_vlc(self) -> None:
