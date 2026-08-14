@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::constraints::Constraints;
 use super::order::Order;
+use crate::guide::GuideConfig;
 
 /// A named set of sibling shows — a franchise — declared once on a channel
 /// and referenced by name from any pool's [`Pool::groups`] (#165).
@@ -523,6 +524,20 @@ pub struct Pool {
     /// station's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub datastores: Vec<DatastoreGrant>,
+
+    /// This pool's own `guide:` defaults (#289) — the rung between the block
+    /// and the item in the cascade [`GuideConfig::cascade`] defines, for the
+    /// one case a plain block-level `guide:` cannot reach: a pattern block
+    /// that interleaves several pools (a films pool and a bumpers pool,
+    /// say). Every item drawn from this pool sees this table ahead of the
+    /// block's, so a bumper can be named "Station Break" without also
+    /// renaming the films it airs between.
+    ///
+    /// Applies only to a pattern or sequencer block's pool draw
+    /// ([`crate::resolve::resolve_pool_block_items`]) — an `entries` block
+    /// has no `pools` to author this on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideConfig>,
 }
 
 /// One named external datastore grant (#167) — see [`Pool::datastores`].

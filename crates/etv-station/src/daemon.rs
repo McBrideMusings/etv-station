@@ -733,6 +733,7 @@ async fn open_and_ingest_catalog(
                         mode = if since.is_some() { "delta" } else { "full" },
                         entries = stats.entries_written,
                         sources = stats.sources_written,
+                        summary_missing = stats.summary_missing,
                         "plex catalog ingest complete",
                     ),
                     Err(e) => {
@@ -1318,6 +1319,8 @@ mod supervisor_tests {
                 catalog_duration: None,
                 error_card: false,
                 metadata: None,
+                guide: None,
+                guide_fields: crate::guide::GuideFields::default(),
             })
             .collect();
         let durations = vec![slot; count];
@@ -1546,6 +1549,8 @@ mod regen_floor_tests {
             catalog_duration: None,
             error_card: false,
             metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
         }
     }
 
@@ -2035,39 +2040,6 @@ async fn pattern_catch_up(
             (items, resume_out, show_ids)
         };
 
-        // Name who has been watching, on the channels that asked to (#113).
-        //
-        // Stamped here rather than inside `resolve` because the watch history is
-        // the daemon's — `resolve` is handed a `ScoreInputs` for a plugin to
-        // rank with and has no business also editing guide text with it. Doing
-        // it after resolve also means it lands on whatever the channel actually
-        // scheduled, however that list was chosen: a plugin pool, a CEL query,
-        // or a hand-written entry list all get the same treatment.
-        let mut items = items;
-        if attribution_wanted {
-            let credits = crate::attribution::Attribution::build(&history);
-            let mut stamped = 0usize;
-            for item in &mut items {
-                let Some(line) = credits.line_for(&item.id) else {
-                    continue;
-                };
-                let program = item.program.get_or_insert_with(Default::default);
-                program.description = Some(crate::attribution::append_to_description(
-                    program.description.take(),
-                    &line,
-                ));
-                stamped += 1;
-            }
-            tracing::info!(
-                event = "attribution.stamped",
-                channel = %channel.name,
-                items = items.len(),
-                stamped,
-                entries_with_watchers = credits.len(),
-                "named recent watchers on this generation's items",
-            );
-        }
-
         // No "the channel ran out" branch: every series loops, so a pattern
         // channel cannot play itself empty. An empty resolve means an empty
         // *set*, which `resolve_channel_with_resume` has already raised as the
@@ -2076,7 +2048,7 @@ async fn pattern_catch_up(
         // Takes the list and hands one back: an unreadable file becomes an
         // on-screen error card of the same length, so the channel keeps its
         // shape instead of failing over one bad file.
-        let (items, durations, probe_stats) = cache.resolve_all(items).await?;
+        let (mut items, durations, probe_stats) = cache.resolve_all(items).await?;
         if probe_stats.error_cards > 0 || probe_stats.dropped > 0 {
             tracing::warn!(
                 event = "generation.unreadable_media",
@@ -2086,6 +2058,26 @@ async fn pattern_catch_up(
                 "some items could not be read; see the per-item warnings above",
             );
         }
+
+        // Render each item's `guide:` overrides (#158) and, on a channel that
+        // opted into it, name who has been watching (#113) — both need the
+        // schedule (this item's own start/finish, a one-item lookahead) and
+        // the watch history `history` already fetched above, neither of
+        // which `resolve_channel_with_resume` had: that call happens before
+        // duration-probing has assigned any item a real length. Stamped here
+        // rather than inside `resolve` for the same reason attribution
+        // always was — it lands on whatever the channel actually scheduled,
+        // however that list was chosen: a plugin pool, a CEL query, or a
+        // hand-written entry list all get the same treatment.
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            from,
+            &channel.name,
+            channel.config.display_name.as_deref(),
+            attribution_wanted,
+            &history,
+        );
 
         // A channel with an `anchor` in the past joins its list where elapsed
         // time says it should be, rather than at item 0 — "this station has been
@@ -2209,6 +2201,413 @@ async fn pattern_catch_up(
     cache.save(output).await?;
 
     Ok(resume)
+}
+
+/// Render each item's cascaded `guide:` template (#158) and, on a channel
+/// that opted in, append the #113 "watched recently by" line — the one pass
+/// that needs the schedule (each item's own start/finish, a one-item
+/// lookahead/lookbehind over this generation) and the watch history
+/// together, which is why it runs here rather than inside `resolve` (no
+/// schedule yet) or inside `Sequential` (no watch history).
+///
+/// `items` and `durations` are already paired 1:1 by
+/// [`crate::duration::DurationCache::resolve_all`] — the same pairing the
+/// play-history `records` loop right after this call relies on.
+fn render_guide_and_attribution(
+    items: &mut [crate::resolve::ResolvedItem],
+    durations: &[Duration],
+    from: OffsetDateTime,
+    channel_identity: &str,
+    channel_display_name: Option<&str>,
+    attribution_wanted: bool,
+    history: &[crate::score::WatchEvent],
+) {
+    let channel_name = channel_display_name.unwrap_or(channel_identity);
+    let credits = attribution_wanted.then(|| crate::attribution::Attribution::build(history));
+
+    // Snapshot every item's default title *before* any item in this pass is
+    // rewritten, so item N's `{next_title}`/`{prev_title}` always reads item
+    // N±1's series-convention/catalog title — never a value this same pass
+    // already replaced.
+    let base_titles: Vec<Option<String>> = items
+        .iter()
+        .map(|item| item.program.as_ref().and_then(|p| p.title.clone()))
+        .collect();
+
+    let generated_at = OffsetDateTime::now_utc();
+    let mut airing = from;
+    let mut stamped = 0usize;
+    for (idx, dur) in durations.iter().enumerate() {
+        let start = airing;
+        let stop = start + time::Duration::seconds_f64(dur.as_secs_f64());
+        airing = stop;
+
+        let watched_by = credits
+            .as_ref()
+            .and_then(|c| c.line_for(&items[idx].id))
+            .map(|line| line.to_string());
+
+        let Some(guide) = items[idx].guide.clone() else {
+            // No `guide:` override anywhere in the cascade for this item —
+            // the built-in defaults from `resolve` (series-title convention,
+            // genre categories) stand as written. `attribution: true` still
+            // applies its line on top, exactly as before #158.
+            if let Some(line) = &watched_by {
+                let program = items[idx].program.get_or_insert_with(Default::default);
+                program.description = Some(crate::attribution::append_to_description(
+                    program.description.take(),
+                    line,
+                ));
+                stamped += 1;
+            }
+            continue;
+        };
+
+        let base = items[idx].program.take().unwrap_or_default();
+        // Owned copies of what the render context borrows from `base`, so
+        // `base` can move into the rebuilt `program` below while `ctx` is
+        // still in scope.
+        let base_title = base.title.clone();
+        let base_content_rating = base.content_rating.clone();
+        let program_title = base_title.clone();
+
+        let ctx = crate::guide::RenderContext {
+            fields: &items[idx].guide_fields,
+            base_title: base_title.as_deref(),
+            base_season: base.season,
+            base_episode: base.episode,
+            base_year: base.year,
+            base_content_rating: base_content_rating.as_deref(),
+            channel_identity,
+            channel_name,
+            program_title: program_title.as_deref(),
+            watched_by: watched_by.as_deref(),
+            next_title: base_titles
+                .get(idx + 1)
+                .and_then(|t: &Option<String>| t.as_deref()),
+            next_start: (idx + 1 < durations.len()).then_some(stop),
+            prev_title: if idx > 0 {
+                base_titles[idx - 1].as_deref()
+            } else {
+                None
+            },
+            start,
+            stop,
+            now: generated_at,
+        };
+
+        let mut program = base;
+        if let Some(t) = &guide.title {
+            program.title = Some(crate::guide::render(t, &ctx));
+        }
+        if let Some(t) = &guide.sub_title {
+            let rendered = crate::guide::render(t, &ctx);
+            program.sub_title = (!rendered.is_empty()).then_some(rendered);
+        }
+        match &guide.description {
+            Some(t) => {
+                let rendered = crate::guide::render(t, &ctx);
+                program.description = (!rendered.is_empty()).then_some(rendered);
+                // An explicit `{watched_by}` already carries the line — the
+                // shorthand appending it again would duplicate it (#158
+                // decision #4).
+                if let Some(line) = &watched_by
+                    && !crate::guide::references_watched_by(t)
+                {
+                    program.description = Some(crate::attribution::append_to_description(
+                        program.description.take(),
+                        line,
+                    ));
+                    stamped += 1;
+                }
+            }
+            None => {
+                if let Some(line) = &watched_by {
+                    program.description = Some(crate::attribution::append_to_description(
+                        program.description.take(),
+                        line,
+                    ));
+                    stamped += 1;
+                }
+            }
+        }
+        if let Some(cats) = &guide.categories {
+            let rendered = crate::guide::render_categories(cats, &ctx);
+            program.categories = (!rendered.is_empty()).then_some(rendered);
+        }
+        items[idx].program = Some(program);
+    }
+
+    if attribution_wanted {
+        tracing::info!(
+            event = "attribution.stamped",
+            channel = %channel_identity,
+            items = items.len(),
+            stamped,
+            entries_with_watchers = credits.as_ref().map(|c| c.len()).unwrap_or(0),
+            "named recent watchers on this generation's items",
+        );
+    }
+}
+
+#[cfg(test)]
+mod render_guide_and_attribution_tests {
+    use super::*;
+    use crate::guide::{GuideConfig, GuideFields};
+    use crate::resolve::ResolvedItem;
+    use crate::score::WatchEvent;
+    use ersatztv_playout::playout::ProgramMetadata;
+    use time::macros::datetime;
+
+    fn item_with_guide(id: &str, title: &str, guide: Option<GuideConfig>) -> ResolvedItem {
+        ResolvedItem {
+            id: id.into(),
+            source: crate::config::SourceConfig::Lavfi {
+                params: "testsrc".into(),
+            },
+            in_point: None,
+            out_point: None,
+            program: Some(ProgramMetadata {
+                title: Some(title.into()),
+                ..Default::default()
+            }),
+            catalog_duration: None,
+            error_card: false,
+            metadata: None,
+            guide,
+            guide_fields: GuideFields::default(),
+        }
+    }
+
+    fn watch(entry: &str, who: &str) -> WatchEvent {
+        WatchEvent {
+            entry_id: entry.into(),
+            watched_at: 0,
+            watcher: Some(who.into()),
+        }
+    }
+
+    /// An item with no `guide:` override anywhere is untouched — the
+    /// defaults resolve already computed (series-title convention, genre
+    /// categories) stand exactly as written.
+    #[test]
+    fn no_override_leaves_the_default_program_untouched() {
+        let mut items = vec![item_with_guide("a", "Die Hard", None)];
+        let durations = vec![Duration::from_secs(60)];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().title.as_deref(),
+            Some("Die Hard")
+        );
+    }
+
+    /// `{field}` substitution and the `{a|b}` fallback.
+    #[test]
+    fn template_substitution_and_fallback() {
+        let guide = GuideConfig {
+            title: Some("{channel_name}".into()),
+            description: Some("{content_missing|program_title}".into()),
+            sub_title: None,
+            categories: None,
+        };
+        let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
+        let durations = vec![Duration::from_secs(60)];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            Some("Die Hard 24/7"),
+            false,
+            &[],
+        );
+        let program = items[0].program.as_ref().unwrap();
+        assert_eq!(program.title.as_deref(), Some("Die Hard 24/7"));
+        // "content_missing" isn't a real field name, but every unresolved
+        // name renders empty rather than panicking (validation is what
+        // catches a real typo at load) — proving the fallback still lands on
+        // the working `program_title` branch.
+        assert_eq!(program.description.as_deref(), Some("Die Hard"));
+    }
+
+    /// `{genres}` in a `categories:` list fans out to one `<category>` per
+    /// tag; a non-fan-out entry renders as one string.
+    #[test]
+    fn categories_fan_out_and_plain_entries() {
+        let guide = GuideConfig {
+            categories: Some(vec!["{genres}".into(), "Movie Night".into()]),
+            title: None,
+            sub_title: None,
+            description: None,
+        };
+        let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
+        items[0].guide_fields.genres = vec!["Action".into(), "Thriller".into()];
+        let durations = vec![Duration::from_secs(60)];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().categories.as_deref(),
+            Some(
+                &[
+                    "Action".to_string(),
+                    "Thriller".to_string(),
+                    "Movie Night".to_string()
+                ][..]
+            )
+        );
+    }
+
+    /// The schedule: `{next_title}`/`{prev_title}` read the neighbouring
+    /// item's *default* title, never a title this same pass already
+    /// rewrote — and the first/last item's missing neighbour renders empty.
+    #[test]
+    fn next_and_prev_title_read_the_original_neighbour_not_a_rewritten_one() {
+        let guide = |t: &str| {
+            Some(GuideConfig {
+                description: Some(t.into()),
+                title: None,
+                sub_title: None,
+                categories: None,
+            })
+        };
+        let mut items = vec![
+            item_with_guide("a", "First", guide("{next_title}")),
+            item_with_guide("b", "Second", guide("{prev_title|next_title}")),
+            item_with_guide("c", "Third", guide("{prev_title}")),
+        ];
+        let durations = vec![
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().description.as_deref(),
+            Some("Second"),
+            "item a's next is b's ORIGINAL title, not b's rewritten description"
+        );
+        assert_eq!(
+            items[1].program.as_ref().unwrap().description.as_deref(),
+            Some("First"),
+            "prev branch wins since it is non-empty"
+        );
+        assert_eq!(
+            items[2].program.as_ref().unwrap().description.as_deref(),
+            Some("Second"),
+            "the last item has no next, so prev is used"
+        );
+    }
+
+    /// `attribution: true` still appends the #113 line when no `guide:`
+    /// override is present at all.
+    #[test]
+    fn attribution_appends_with_no_guide_override() {
+        let mut items = vec![item_with_guide("a", "Die Hard", None)];
+        let durations = vec![Duration::from_secs(60)];
+        let history = vec![watch("a", "bob")];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            true,
+            &history,
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().description.as_deref(),
+            Some("Watched recently by bob")
+        );
+    }
+
+    /// A description template that does NOT reference `{watched_by}` still
+    /// gets the #113 line appended.
+    #[test]
+    fn attribution_appends_after_a_description_template_that_omits_it() {
+        let guide = GuideConfig {
+            description: Some("Now playing".into()),
+            title: None,
+            sub_title: None,
+            categories: None,
+        };
+        let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
+        let durations = vec![Duration::from_secs(60)];
+        let history = vec![watch("a", "bob")];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            true,
+            &history,
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().description.as_deref(),
+            Some("Now playing\n\nWatched recently by bob")
+        );
+    }
+
+    /// A description template that DOES reference `{watched_by}` already
+    /// carries the line — the shorthand must not duplicate it (#158
+    /// decision #4).
+    #[test]
+    fn an_explicit_watched_by_reference_is_not_duplicated() {
+        let guide = GuideConfig {
+            description: Some("Now playing. {watched_by}".into()),
+            title: None,
+            sub_title: None,
+            categories: None,
+        };
+        let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
+        let durations = vec![Duration::from_secs(60)];
+        let history = vec![watch("a", "bob")];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            true,
+            &history,
+        );
+        let desc = items[0]
+            .program
+            .as_ref()
+            .unwrap()
+            .description
+            .clone()
+            .unwrap();
+        assert_eq!(desc, "Now playing. Watched recently by bob");
+        assert_eq!(
+            desc.matches("Watched recently by bob").count(),
+            1,
+            "the line must appear exactly once, got {desc:?}"
+        );
+    }
 }
 
 /// `OverlaySpec` (an ETV-next type) is not `Clone`, and each generation in a

@@ -85,6 +85,7 @@ use time_tz::{OffsetDateTimeExt, Tz};
 
 use crate::catalog::Catalog;
 use crate::config::{Constraints, Pool, ShowGroup};
+use crate::guide::GuideConfig;
 use crate::resume::{GenerationState, PoolResume};
 
 /// The window bounds a sequencer script sees (ADR 0004).
@@ -132,6 +133,7 @@ pub fn build(
         Vec<String>,
         BTreeMap<String, PoolResume>,
         HashMap<String, serde_json::Value>,
+        HashMap<String, GuideConfig>,
     ),
     String,
 > {
@@ -255,7 +257,19 @@ pub fn build(
     // uses (#203) so this path can't drop a field the pattern path keeps.
     let metadata_out = crate::pattern::flatten_picked_extras(score_cache.picked_extras);
 
-    Ok((arranged, resume_out, metadata_out))
+    // This pool's own `guide:` (#289), the same rung the pattern walk
+    // records — read here from `item_location`, which already knows which
+    // pool supplied each id in the script's chosen timeline.
+    let mut guide_out: HashMap<String, GuideConfig> = HashMap::new();
+    for id in &arranged {
+        if let Some(&(pool_idx, _)) = item_location.get(id)
+            && let Some(guide) = &pools[pool_idx].guide
+        {
+            guide_out.insert(id.clone(), guide.clone());
+        }
+    }
+
+    Ok((arranged, resume_out, metadata_out, guide_out))
 }
 
 /// Compile `sequencer` and call its `arrange(ctx)`, returning the raw
@@ -495,6 +509,7 @@ mod tests {
             // An `expr` pool reaches no plugin, so it needs no grant (#167).
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -533,7 +548,7 @@ fn arrange(ctx) {
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -572,7 +587,7 @@ fn arrange(ctx) {
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -627,7 +642,7 @@ fn arrange(ctx) {
         let mut state = GenerationState::empty();
         state.cursor.insert("show:got".into(), "got-e2".to_string());
 
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -693,7 +708,7 @@ fn arrange(ctx) { ["mov-1"] }
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -735,7 +750,7 @@ fn arrange(ctx) {
         }];
         // Every episode is 30s; a 65s window fits two whole episodes and
         // then the one that crosses the boundary — three, not all four.
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -776,7 +791,7 @@ fn arrange(ctx) {
             p.order = Some(Order::parse("show:asc,season:asc,episode:asc").unwrap());
             p
         }];
-        let (_, resume, _) = build(
+        let (_, resume, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -816,7 +831,7 @@ fn arrange(ctx) { ["mov-1"] }
             pool("movies", "item.type == \"movie\""),
             pool("shows", "item.type == \"episode\""),
         ];
-        let (_, resume, _) = build(
+        let (_, resume, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -863,7 +878,7 @@ fn arrange(ctx) {
             cursor: BTreeMap::new(),
             tail: Vec::new(),
         };
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -901,7 +916,7 @@ fn arrange(ctx) {
         let cat = catalog();
         let mut movies = pool("movies", "item.type == \"movie\"");
         movies.config = Some(serde_json::json!({"hour_start": 20}));
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &[movies],
             &[],
@@ -938,7 +953,7 @@ fn arrange(ctx) {
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],
@@ -990,7 +1005,7 @@ fn arrange(ctx) {
             inputs: &inputs,
             base_dir: std::path::Path::new("."),
         };
-        let (ids, _, _) = build(
+        let (ids, _, _, _) = build(
             &cat,
             &pools,
             &[],

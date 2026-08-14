@@ -65,20 +65,15 @@ unselectable subtitle nobody chose. An item opts in by carrying
 `tracks.subtitle` — a `stream_index` to pick a track out of its own file, or a
 `source` to name a sidecar.
 
-One channel wanting the other behaviour overrides it in `presentation.json`,
-beside the defaults file, under that channel's identity — the same place a
-per-channel resolution override goes. The render deep-merges it over the
-defaults, leaving sibling keys alone:
+`subtitle.mode` is a station-wide setting today, read from
+`normalization.default.json` alone. `presentation.json`, which used to carry a
+per-channel deep-merge override for it, was removed outright when the channel
+display name moved into the channel YAML (#158, decision 5) — no dual support,
+no replacement decided for the config-override half of what it did. A channel
+wanting `burn` while the rest of the station runs `convert` has no config path
+to say so right now.
 
-```json
-{
-  "star-trek": {
-    "config": { "normalization": { "subtitle": { "mode": "burn" } } }
-  }
-}
-```
-
-Two things are worth knowing before flipping it:
+Two things are worth knowing about the mode itself:
 
 - `convert` produces a selectable WebVTT track only for text subtitle formats.
   A Blu-ray or DVD rip carries its subtitles as pictures (PGS, VobSub), which

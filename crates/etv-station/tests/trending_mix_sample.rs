@@ -397,7 +397,10 @@ fn trending_mix_sample_items_carry_catalog_metadata() {
     let program = episode.program.as_ref().expect("episode carries metadata");
     assert_eq!(program.season, Some(1));
     assert_eq!(program.episode, Some(1));
-    assert_eq!(program.title.as_deref(), Some("GoT S1E1"));
+    // #158 decision #1: an episode's `<title>` carries the series name and
+    // `<sub-title>` its own episode name, not the reverse.
+    assert_eq!(program.title.as_deref(), Some("got"));
+    assert_eq!(program.sub_title.as_deref(), Some("GoT S1E1"));
 
     match &episode.source {
         etv_station::config::SourceConfig::Local { path } => {

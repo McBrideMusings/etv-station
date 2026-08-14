@@ -10,6 +10,7 @@ use super::filter::Filter;
 use super::mode::Mode;
 use super::order::Order;
 use super::pool::{PatternStep, Pool};
+use crate::guide::GuideConfig;
 
 /// A channel's sequencing rule: an ordered list of block-includes that compose
 /// into the channel's playout. Replaces the v1 `loop_forever` rule (#46).
@@ -36,6 +37,12 @@ pub struct BlockInclude {
     /// Inline form: program-metadata defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<ProgramMetadata>,
+
+    /// Block-level `guide:` defaults (#158). Path form: spliced in from the
+    /// referenced block file's own `guide:` by [`Self::apply_body`], same as
+    /// `program` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideConfig>,
 
     /// Inline form: within-block duplicate policy. `None` resolves to the
     /// [`Duplicates`] default (`collapse`).
@@ -114,6 +121,11 @@ impl BlockInclude {
     /// The effective program-metadata defaults for this block.
     pub fn program(&self) -> Option<&ProgramMetadata> {
         self.program.as_ref()
+    }
+
+    /// The effective `guide:` defaults for this block (#158).
+    pub fn guide(&self) -> Option<&GuideConfig> {
+        self.guide.as_ref()
     }
 
     /// The effective duplicate policy. An entries block defaults to `collapse`;
@@ -227,6 +239,7 @@ impl BlockInclude {
     /// block file.
     pub(super) fn apply_body(&mut self, body: BlockFile) {
         self.program = body.program;
+        self.guide = body.guide;
         self.duplicates = body.duplicates;
         self.constraints = body.constraints;
         self.entries = body.entries;

@@ -108,7 +108,15 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     DELETE FROM tags WHERE namespace = 'fs_dir';
     "#,
-    // v5 — artwork cache bookkeeping (#187). `artwork_cache_path` is the
+    // v5 — the entry's synopsis (#186). Plex's `summary` attribute, stored
+    // verbatim and fed to `ProgramMetadata.description` so the XMLTV guide
+    // carries a `<desc>`. NULL for entries no source authored a summary for —
+    // everything the `fs` ingester writes, and any Plex item Plex itself left
+    // blank.
+    r#"
+    ALTER TABLE entries ADD COLUMN summary TEXT;
+    "#,
+    // v6 — artwork cache bookkeeping (#187). `artwork_cache_path` is the
     // filename (relative to the station's `artwork_cache_dir`) the entry's
     // fetched image is written under; `artwork_source_key` is the Plex
     // `thumb` path last used to fetch it, kept so a re-ingest can tell "art

@@ -182,6 +182,10 @@ pub struct PlexItem {
     /// value for this item.
     pub release_date: Option<String>,
     pub content_rating: Option<String>,
+    /// Plex `summary` — the synopsis text. Feeds `entries.summary` and, from
+    /// there, `ProgramMetadata.description` for the XMLTV guide (#186). `None`
+    /// when Plex has no summary for this item.
+    pub summary: Option<String>,
     /// Plex `editionTitle`; `None`/empty = theatrical.
     pub edition: Option<String>,
     /// Plex `studio` — single production-company string.
@@ -212,6 +216,10 @@ pub struct PlexIngestStats {
     pub sources_written: usize,
     /// Items that inherited an existing entry_id by path-match (FS↔Plex dedup).
     pub inherited: usize,
+    /// Movies and episodes this pass wrote with no summary — Plex reported
+    /// none and none was already on file. Logged rather than assumed (#186):
+    /// a source's blank synopsis is invisible unless something counts it.
+    pub summary_missing: usize,
 }
 
 /// One real account Plex's own `/accounts` reports — the server owner and
@@ -370,6 +378,10 @@ pub fn ingest_items(
             item.content_rating.clone(),
             existing.as_ref().and_then(|e| e.content_rating.clone()),
         );
+        entry.summary = or_existing(
+            item.summary.clone(),
+            existing.as_ref().and_then(|e| e.summary.clone()),
+        );
         entry.edition = or_existing(
             item.edition.clone(),
             existing.as_ref().and_then(|e| e.edition.clone()),
@@ -396,6 +408,9 @@ pub fn ingest_items(
             item.library.clone(),
             existing.as_ref().and_then(|e| e.library.clone()),
         );
+        if entry.summary.is_none() && matches!(entry.kind.as_str(), "movie" | "episode") {
+            stats.summary_missing += 1;
+        }
         catalog.upsert_entry(&entry)?;
         stats.entries_written += 1;
 
@@ -872,6 +887,9 @@ fn to_plex_item(
         release_date: m.originally_available_at.clone(),
         kind,
         content_rating: m.content_rating.clone(),
+        // Blank summary normalises to `None`, same as edition/studio below, so
+        // the merge never overwrites an existing summary with an empty string.
+        summary: m.summary.as_deref().and_then(non_empty).map(str::to_string),
         // Absent/blank `editionTitle` means theatrical — normalise to `None` so
         // the merge never overwrites an existing edition with an empty string.
         edition: m
@@ -1634,6 +1652,10 @@ struct PlexMetadata {
     duration: Option<i64>,
     #[serde(default)]
     content_rating: Option<String>,
+    /// The synopsis text — maps onto `entries.summary` and, from there,
+    /// `ProgramMetadata.description` (#186).
+    #[serde(default)]
+    summary: Option<String>,
     /// Unix seconds Plex last touched this record. Read for collections, to
     /// skip the per-collection children request when nothing has changed, and
     /// for library items in [`PlexClient::fetch_all`] to count how many carry
@@ -1782,6 +1804,7 @@ mod tests {
             year: Some(1988),
             release_date: Some("1988-07-15".into()),
             content_rating: None,
+            summary: None,
             edition: None,
             studio: None,
             duration_ms: Some(7_920_000),
@@ -2254,6 +2277,37 @@ mod tests {
         assert_eq!(item.studio, None);
     }
 
+    /// #186: `PlexMetadata.summary` maps onto `PlexItem.summary`, and a blank
+    /// summary normalises to `None` — same rule as edition/studio above, so
+    /// the merge never overwrites an existing summary with an empty string.
+    #[test]
+    fn to_plex_item_maps_summary_and_normalises_blank() {
+        let json = r#"{
+            "ratingKey": "3",
+            "type": "movie",
+            "title": "A New Hope",
+            "summary": "A princess held captive by the Empire.",
+            "Media": [{"Part": [{"file": "/media/anh.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
+        assert_eq!(
+            item.summary.as_deref(),
+            Some("A princess held captive by the Empire.")
+        );
+
+        let blank_json = r#"{
+            "ratingKey": "4",
+            "type": "movie",
+            "title": "No Summary",
+            "summary": "",
+            "Media": [{"Part": [{"file": "/media/none.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(blank_json).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
+        assert_eq!(item.summary, None);
+    }
+
     #[test]
     fn ingest_writes_edition_and_studio_queryable() {
         let cat = Catalog::open_in_memory().unwrap();
@@ -2280,6 +2334,59 @@ mod tests {
                 .unwrap(),
             vec!["imdb:tt-e".to_string()]
         );
+    }
+
+    /// #186: the summary Plex reports lands on `entries.summary`, and a delta
+    /// pass that re-fetches the item with a changed summary overwrites the
+    /// stored one — the guide must not go stale relative to Plex.
+    #[test]
+    fn ingest_writes_and_updates_summary() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut item = movie(
+            "plex-s",
+            "/data/media/m/s.mkv",
+            &[(ExternalNs::Imdb, "tt-s")],
+        );
+        item.summary = Some("Original synopsis.".into());
+        ingest_items(&cat, &[item.clone()], &["/data/media".into()]).unwrap();
+        let e = cat.entry("imdb:tt-s").unwrap().unwrap();
+        assert_eq!(e.summary.as_deref(), Some("Original synopsis."));
+
+        // A later pass (delta sync) with a changed summary replaces it.
+        item.summary = Some("Revised synopsis.".into());
+        ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
+        let e = cat.entry("imdb:tt-s").unwrap().unwrap();
+        assert_eq!(e.summary.as_deref(), Some("Revised synopsis."));
+    }
+
+    /// #186's acceptance criterion: rows still missing a summary after a full
+    /// ingest must be counted, not assumed. `summary_missing` counts only
+    /// movies and episodes — the categories the issue cares about — and
+    /// leaves other kinds (e.g. a bumper) out of the count entirely.
+    #[test]
+    fn ingest_counts_movies_and_episodes_missing_a_summary() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let with_summary = {
+            let mut it = movie(
+                "plex-w",
+                "/data/media/m/w.mkv",
+                &[(ExternalNs::Imdb, "tt-w")],
+            );
+            it.summary = Some("Has a synopsis.".into());
+            it
+        };
+        let without_summary = movie(
+            "plex-n",
+            "/data/media/m/n.mkv",
+            &[(ExternalNs::Imdb, "tt-n")],
+        );
+        let stats = ingest_items(
+            &cat,
+            &[with_summary, without_summary],
+            &["/data/media".into()],
+        )
+        .unwrap();
+        assert_eq!(stats.summary_missing, 1);
     }
 
     /// The section title is stamped onto every item the section yields — the

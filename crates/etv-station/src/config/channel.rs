@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::pool::ShowGroup;
 use super::rule::RuleConfig;
+use crate::guide::GuideConfig;
 use crate::tautulli::HistoryScope;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -16,6 +17,26 @@ pub struct ChannelConfig {
     /// path separators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// The name shown to viewers — in the XMLTV guide's `<display-name>` and
+    /// the lineup's channel name — as distinct from [`name`](Self::name),
+    /// which drives the identity (log label, output folder, overlay
+    /// handshake). `None` falls back to the identity, same as before this
+    /// field existed. Replaces `presentation.json`'s per-channel `name` key
+    /// (#158 decision #5): that file lived outside the channel config and
+    /// outside git, which is why a channel's guide-facing name could only be
+    /// changed by hand-editing a file nobody would think to look in. There is
+    /// no dual support — `presentation.json` is no longer read at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
+    /// Channel-level `guide:` defaults (#158) — the least specific of the
+    /// three cascade levels (channel → block → item, most specific wins).
+    /// `None` (no `guide:` block at all) is not "no guide text": every item
+    /// still gets the series-title convention and genre-tag categories for
+    /// free, with no config needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideConfig>,
 
     /// How far ahead of live the schedule is materialized. This is also what
     /// bounds a single generation, whichever shape the channel is: a pattern

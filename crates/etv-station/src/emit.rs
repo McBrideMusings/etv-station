@@ -168,6 +168,8 @@ mod tests {
             catalog_duration: None,
             error_card: false,
             metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
         }
     }
 

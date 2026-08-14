@@ -8,6 +8,7 @@ use super::filter::Filter;
 use super::mode::Mode;
 use super::order::Order;
 use super::source::SourceConfig;
+use crate::guide::GuideConfig;
 
 /// One entry in a block's flat `[[entries]]` list. The `kind` tag selects the
 /// variant explicitly (#46 locked decision: explicit tag over field-inference).
@@ -63,6 +64,11 @@ pub struct ItemEntry {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<ProgramMetadata>,
+
+    /// Item-level `guide:` defaults (#158), the most specific of the three
+    /// cascade levels (channel → block → item).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideConfig>,
 }
 
 /// A CEL query resolved against the catalog at generation time. Resolution is

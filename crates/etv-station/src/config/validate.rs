@@ -5,11 +5,13 @@ use std::time::{Duration, SystemTime};
 use super::block::Duplicates;
 use super::channel::{ChannelConfig, TasteScope};
 use super::constraints::{Constraints, NoRepeatWithin};
+use super::entry::Entry;
 use super::order::Order;
 use super::pool::{DatastoreGrant, Pool, Rotate, ShowGroup, Take, TakeFrom};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
+use crate::guide::GuideConfig;
 use crate::pattern::{MAX_CYCLES, MAX_TAKE};
 
 /// A datastore that stops being republished stays openable — the file is
@@ -124,6 +126,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
 
     validate_taste_scope(path, channel)?;
     validate_show_groups(path, &channel.groups)?;
+    validate_guide(path, "channel", channel.guide.as_ref())?;
 
     // A `plugin:` path means what it means relative to the channel config
     // file (see `score::ScoreEnv::resolve_path`, which every generation-time
@@ -148,6 +151,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // rule over the block's own list, but it has to be a legal table either
         // way — an inherited nonsense value is still nonsense.
         validate_constraints(&include.constraints(), &bad)?;
+        validate_guide(path, &format!("block #{idx}"), include.guide())?;
 
         if include.is_pattern() {
             validate_pattern_block(include, &mut pool_names, &channel.groups, base_dir, &bad)?;
@@ -169,8 +173,63 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // authored — so there is no id to validate here. Within-block duplicates
         // (two entries resolving to the same file) collapse in `resolve`, they
         // are not a config error. `duplicates = "keep"` opts out of the collapse.
+        for (entry_idx, entry) in include.entries().iter().enumerate() {
+            if let Entry::Item(item) = entry {
+                validate_guide(
+                    path,
+                    &format!("block #{idx}: item #{entry_idx}"),
+                    item.guide.as_ref(),
+                )?;
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Validate one level's `guide:` block (#158): every `{field}` (or `{a|b}`
+/// branch) named in `title`/`sub_title`/`description`/each `categories` entry
+/// must be a recognised field. `label` identifies which cascade level failed
+/// — `"channel"`, `"block #N"`, or `"block #N: item #M"` — so the error names
+/// exactly where to fix it, per the acceptance criterion that an unknown
+/// field fails at load naming the field *and* the channel (`path` already
+/// carries the channel).
+fn validate_guide(
+    path: &Path,
+    label: &str,
+    guide: Option<&GuideConfig>,
+) -> Result<(), ConfigError> {
+    let Some(guide) = guide else {
+        return Ok(());
+    };
+    validate_guide_templates(guide, &|field, message| ConfigError::Validation {
+        path: path.to_path_buf(),
+        message: format!("{label}: guide.{field}: {message}"),
+    })
+}
+
+/// The field-by-field template check every cascade level shares. `bad` turns
+/// a field name (`"title"`, `"categories[2]"`) plus the template's own
+/// complaint into the error that names where to go and fix it — the level's
+/// label is already folded into that closure by the caller.
+fn validate_guide_templates(
+    guide: &GuideConfig,
+    bad: &dyn Fn(&str, String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    if let Some(t) = &guide.title {
+        crate::guide::validate_template(t).map_err(|m| bad("title", m))?;
+    }
+    if let Some(t) = &guide.sub_title {
+        crate::guide::validate_template(t).map_err(|m| bad("sub_title", m))?;
+    }
+    if let Some(t) = &guide.description {
+        crate::guide::validate_template(t).map_err(|m| bad("description", m))?;
+    }
+    if let Some(cats) = &guide.categories {
+        for (i, t) in cats.iter().enumerate() {
+            crate::guide::validate_template(t).map_err(|m| bad(&format!("categories[{i}]"), m))?;
+        }
+    }
     Ok(())
 }
 
@@ -685,6 +744,14 @@ fn validate_block_pools<'a>(
             let pool_bad = |m: String| bad(format!("pool {:?}: {m}", pool.name));
             validate_constraints(c, &pool_bad)?;
         }
+        // This pool's own `guide:` (#289) — validated on the same terms as
+        // every other cascade level, with the pool's name in the message
+        // since that is the line the author has to go and fix.
+        if let Some(guide) = &pool.guide {
+            validate_guide_templates(guide, &|field, message| {
+                bad(format!("pool {:?}: guide.{field}: {message}", pool.name))
+            })?;
+        }
         if !pool_names.insert(pool.name.as_str()) {
             return Err(bad(format!(
                 "pool name {:?} is already used by another block in this channel; \
@@ -956,6 +1023,7 @@ mod tests {
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
             program: None,
+            guide: None,
         }))
     }
 
@@ -963,6 +1031,7 @@ mod tests {
         BlockInclude {
             block: None,
             program: None,
+            guide: None,
             duplicates: None,
             constraints: None,
             entries,
@@ -995,6 +1064,7 @@ mod tests {
             config: None,
             capabilities: Vec::new(),
             datastores: Vec::new(),
+            guide: None,
         }
     }
 
@@ -1034,6 +1104,8 @@ mod tests {
         ChannelConfig {
             scoring: None,
             name: None,
+            display_name: None,
+            guide: None,
             window_days: 1,
             chunk_hours: 24,
             roll_interval: Duration::from_secs(3600),
@@ -1527,6 +1599,7 @@ mod tests {
                 in_point: None,
                 out_point: Some(std::time::Duration::from_secs(30)),
                 program: None,
+                guide: None,
             },
         )));
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
@@ -2304,6 +2377,41 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("none of"), "msg = {msg}");
+    }
+
+    /// #289: a pool's own `guide:` is checked on the same terms as every
+    /// other cascade level — an unknown `{field}` fails the load naming both
+    /// the field and the pool that authored it.
+    #[test]
+    fn a_pools_guide_with_an_unknown_field_is_rejected_naming_the_pool() {
+        let mut p = pool("bumpers");
+        p.guide = Some(GuideConfig {
+            title: Some("{tagline}".into()),
+            sub_title: None,
+            description: None,
+            categories: None,
+        });
+        let block = pattern_block(vec![p], vec![step("bumpers", 1)]);
+        let cfg = channel_with(vec![block]);
+        let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bumpers"), "msg = {msg}");
+        assert!(msg.contains("tagline"), "msg = {msg}");
+    }
+
+    /// A pool whose `guide:` uses only known fields validates cleanly.
+    #[test]
+    fn a_pools_guide_with_known_fields_validates() {
+        let mut p = pool("bumpers");
+        p.guide = Some(GuideConfig {
+            title: Some("Station Break".into()),
+            sub_title: None,
+            description: None,
+            categories: None,
+        });
+        let block = pattern_block(vec![p], vec![step("bumpers", 1)]);
+        let cfg = channel_with(vec![block]);
+        validate_channel(&dummy_path(), &cfg).expect("known guide fields validate");
     }
 
     #[test]

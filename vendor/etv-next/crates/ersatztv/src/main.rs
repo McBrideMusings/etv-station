@@ -268,7 +268,7 @@ async fn stream(
         log::warn!("failed to refresh heartbeat for channel {number}: {err}");
     }
 
-    let content = get_multi_variant(channel, request.headers());
+    let content = get_multi_variant(channel, request.headers()).await;
 
     Ok((
         [(
@@ -408,16 +408,27 @@ async fn fix_content_types(
     response
 }
 
-fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> String {
+async fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> String {
     let mut result = String::new();
     result.push_str("#EXTM3U\n");
     result.push_str("#EXT-X-VERSION:6\n");
 
     // Only channels converting subtitles to WebVTT have a separate track to
-    // offer. A burned-in channel has the words inside the video picture, so
-    // announcing a rendition here would point players at a subtitle playlist
-    // listing .vtt files that were never written.
-    if channel.has_subtitle_track() {
+    // offer, and only when the schedule currently playing actually asks for
+    // one. `has_subtitle_track()` alone is the channel's static config — true
+    // for any Convert-mode channel regardless of whether any item ever names
+    // a subtitle selection. A channel whose items never opt into subtitles
+    // (or haven't yet) would otherwise advertise a rendition that never gets
+    // cues, and an old VLC (3.0.4, what iPlayTV on tvOS bundles) tears down
+    // video along with it the first time it reads an empty cue file — #286.
+    // Reading the same playout folder the channel worker itself plays from
+    // means both sides agree without any new cross-process signalling: the
+    // worker never stops serving `live_sub.m3u8` when Convert is set, so
+    // whatever this check allows, the worker already provides.
+    let has_subtitle_track = channel.has_subtitle_track()
+        && ersatztv_playout::playout::schedule_requests_subtitle(channel.playout_folder()).await;
+
+    if has_subtitle_track {
         result.push_str(&format!(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"{}\",URI=\"{}/session/{}/live_sub.m3u8\"\n",
             channel.subtitle_language_name(),
@@ -677,4 +688,105 @@ async fn session_middleware(
     }
 
     next.run(request).await
+}
+
+#[cfg(test)]
+mod get_multi_variant_tests {
+    use ersatztv::config::ChannelConfig;
+    use ersatztv_playout::playout::{Playout, PlayoutItem, PlayoutItemSource};
+    use time::OffsetDateTime;
+
+    use super::*;
+
+    async fn convert_mode_channel(dir: &std::path::Path) -> ChannelModel {
+        std::fs::create_dir(dir.join("playout")).unwrap();
+        let cfg_path = dir.join("channel.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"playout":{"folder":"playout"},"normalization":{"subtitle":{"mode":"convert"}}}"#,
+        )
+        .unwrap();
+        let cfg = ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: None,
+            group: None,
+        };
+        ChannelModel::new(&cfg_path, dir, cfg).await.unwrap()
+    }
+
+    fn write_playout_chunk(dir: &std::path::Path, items: Vec<PlayoutItem>) {
+        let playout = Playout::new(items);
+        std::fs::write(
+            dir.join("playout").join("chunk.json"),
+            serde_json::to_string(&playout).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn item_wanting_subtitle(wants_subtitle: bool) -> PlayoutItem {
+        let start = OffsetDateTime::now_utc();
+        let finish = start + time::Duration::minutes(5);
+        let mut item = PlayoutItem::scheduled(
+            "item-1".into(),
+            start,
+            finish,
+            PlayoutItemSource::local("/media/file.mkv".into(), None, None),
+        );
+        if wants_subtitle {
+            item.tracks = Some(ersatztv_playout::playout::PlayoutItemTracks {
+                audio: None,
+                video: None,
+                subtitle: Some(ersatztv_playout::playout::TrackSelection {
+                    source: None,
+                    stream_index: Some(2),
+                }),
+            });
+        }
+        item
+    }
+
+    // #286: a Convert-mode channel whose schedule never requests a subtitle
+    // track must not advertise one — that's exactly the case where the
+    // subtitle rendition is present but every cue file it would serve is
+    // empty, which kills an old bundled-VLC player outright.
+    #[tokio::test]
+    async fn convert_mode_with_no_item_requesting_subtitles_does_not_advertise() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = convert_mode_channel(dir.path()).await;
+        write_playout_chunk(dir.path(), vec![item_wanting_subtitle(false)]);
+
+        let result = get_multi_variant(&channel, &HeaderMap::new()).await;
+
+        assert!(!result.contains("TYPE=SUBTITLES"), "{result}");
+        assert!(!result.contains("SUBTITLES=\"subs\""), "{result}");
+    }
+
+    #[tokio::test]
+    async fn convert_mode_with_an_item_requesting_subtitles_advertises() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = convert_mode_channel(dir.path()).await;
+        write_playout_chunk(
+            dir.path(),
+            vec![item_wanting_subtitle(false), item_wanting_subtitle(true)],
+        );
+
+        let result = get_multi_variant(&channel, &HeaderMap::new()).await;
+
+        assert!(result.contains("TYPE=SUBTITLES"), "{result}");
+        assert!(result.contains("SUBTITLES=\"subs\""), "{result}");
+    }
+
+    #[tokio::test]
+    async fn convert_mode_with_no_playout_folder_contents_does_not_advertise() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = convert_mode_channel(dir.path()).await;
+
+        let result = get_multi_variant(&channel, &HeaderMap::new()).await;
+
+        assert!(!result.contains("TYPE=SUBTITLES"), "{result}");
+    }
 }
