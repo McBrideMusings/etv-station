@@ -398,6 +398,8 @@ def run_tui(host: str) -> None:
             ("r", "refresh", "Refresh"),
             ("v", "open_vlc", "Artwork in VLC"),
             ("s", "open_sublime", "XML in Sublime"),
+            ("q", "quit", "Quit"),
+            ("escape", "quit", "Quit"),
         ]
 
         def __init__(self, host: str) -> None:
