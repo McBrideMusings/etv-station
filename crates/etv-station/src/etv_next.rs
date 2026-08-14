@@ -636,7 +636,8 @@ mod tests {
         let folders = vec![PathBuf::from("out/star-trek")];
 
         let without = opts(dir.path());
-        let rendered = render_folders(&folders, &without, "test-device-id").unwrap();
+        let rendered =
+            render_folders(&folders, &no_names(1), &without, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert!(lineup.get("artwork").is_none(), "{lineup}");
 
@@ -644,7 +645,7 @@ mod tests {
             artwork_dir: Some("/data/artwork".to_string()),
             ..opts(dir.path())
         };
-        let rendered = render_folders(&folders, &with, "test-device-id").unwrap();
+        let rendered = render_folders(&folders, &no_names(1), &with, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert_eq!(lineup["artwork"]["folder"], "/data/artwork");
     }
