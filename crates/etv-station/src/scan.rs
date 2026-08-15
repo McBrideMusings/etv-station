@@ -54,8 +54,32 @@ pub async fn scan_output_folder(folder: &Path) -> Result<Vec<DiscoveredFile>, St
     Ok(out)
 }
 
-pub fn highest_finish(files: &[DiscoveredFile]) -> Option<OffsetDateTime> {
-    files.iter().map(|f| f.finish).max()
+/// The furthest instant any discovered file reaches, read from the items'
+/// real finish times rather than trusted from the filename — the same way
+/// [`first_coverage_gap`] reads item spans instead of filenames. A chunk is
+/// *named* for its boundary even when its last item keeps airing past it (a
+/// movie straddling the seam is written into both neighbouring chunk files on
+/// purpose), so trusting the filename here would under-claim the frontier and
+/// stop forward materialization early (the #154 defect).
+///
+/// A file that can't be read or parsed as a `Playout` (blank, garbage, or a
+/// sidecar this scan shouldn't have matched) falls back to its filename
+/// finish rather than being skipped, so a single unreadable file can't hide
+/// the frontier the daemon resumes from.
+pub async fn highest_finish(files: &[DiscoveredFile]) -> Option<OffsetDateTime> {
+    let mut max: Option<OffsetDateTime> = None;
+    for f in files {
+        let mut finish = f.finish;
+        if let Ok(bytes) = tokio::fs::read(&f.path).await
+            && let Ok(playout) = serde_json::from_slice::<Playout>(&bytes)
+            && let Some(item_finish) = playout.items.iter().map(|item| item.finish).max()
+            && item_finish > finish
+        {
+            finish = item_finish;
+        }
+        max = Some(max.map_or(finish, |m| m.max(finish)));
+    }
+    max
 }
 
 /// What one sweep removed, split by which end of the window it fell off.
@@ -254,9 +278,9 @@ mod tests {
         tokio::fs::write(path, b"{}").await.unwrap();
     }
 
-    #[test]
-    fn highest_finish_returns_none_for_empty() {
-        assert!(highest_finish(&[]).is_none());
+    #[tokio::test]
+    async fn highest_finish_returns_none_for_empty() {
+        assert!(highest_finish(&[]).await.is_none());
     }
 
     #[tokio::test]
@@ -549,7 +573,7 @@ mod tests {
         // window as covered through 2037 and doing nothing.
         let files = scan_output_folder(dir.path()).await.unwrap();
         assert_eq!(
-            highest_finish(&files),
+            highest_finish(&files).await,
             Some(datetime!(2026-08-10 06:00 UTC)),
         );
     }
@@ -568,6 +592,44 @@ mod tests {
         );
     }
 
+    // The #154 defect: a chunk is *named* for its boundary even when its last
+    // item keeps airing past it (a movie straddling the seam is written into
+    // both neighbouring chunk files on purpose, so whichever ETV-next opens
+    // can play across it). `highest_finish` must read that item's real finish
+    // out of the file content, the same way `first_coverage_gap` already does
+    // for coverage holes — not trust the filename, which under-claims here.
+    #[tokio::test]
+    async fn highest_finish_reads_the_straddling_items_real_finish_not_the_filename() {
+        let dir = tempdir().unwrap();
+        // File named for the 23:00-05:00 chunk boundary, but its last item
+        // ("Sinners" in the reported guide) keeps airing until 07:06:22 —
+        // past what the name claims.
+        write_playout(
+            dir.path(),
+            datetime!(2026-08-09 23:00 UTC),
+            datetime!(2026-08-10 05:00 UTC),
+            &[(
+                datetime!(2026-08-09 23:00 UTC),
+                datetime!(2026-08-10 07:06:22 UTC),
+            )],
+        )
+        .await;
+
+        let files = scan_output_folder(dir.path()).await.unwrap();
+        assert_eq!(
+            files[0].finish,
+            datetime!(2026-08-10 05:00 UTC),
+            "sanity check: the filename itself under-claims, as observed in prod",
+        );
+
+        let finish = highest_finish(&files).await;
+        assert_eq!(
+            finish,
+            Some(datetime!(2026-08-10 07:06:22 UTC)),
+            "highest_finish must read the item's real finish, not the filename's",
+        );
+    }
+
     #[tokio::test]
     async fn parses_well_formed_filenames() {
         let dir = tempdir().unwrap();
@@ -581,6 +643,6 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].start, start);
         assert_eq!(files[0].finish, finish);
-        assert_eq!(highest_finish(&files), Some(finish));
+        assert_eq!(highest_finish(&files).await, Some(finish));
     }
 }

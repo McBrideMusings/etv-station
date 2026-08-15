@@ -1303,7 +1303,7 @@ mod supervisor_tests {
             .await
             .unwrap();
         let now = OffsetDateTime::now_utc();
-        let from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+        let from = scan::highest_finish(&existing).await.unwrap_or(now).max(now);
         let slot = Duration::from_secs(1800);
         let target = now + window_duration(channel.config.window_days);
         let count = ((target - from).as_seconds_f64() / 1800.0).ceil().max(0.0) as usize;
@@ -1887,7 +1887,7 @@ async fn pattern_catch_up(
     // materialized channel continues from the last item's finish, so the
     // timeline stays gapless across the seam.
     let existing = scan::scan_output_folder(output).await?;
-    let mut from = scan::highest_finish(&existing).unwrap_or(now).max(now);
+    let mut from = scan::highest_finish(&existing).await.unwrap_or(now).max(now);
     // Only the first generation of a channel with nothing written yet joins its
     // list mid-way from a past `anchor`; see the phase calculation below.
     let mut first_generation = existing.is_empty();
