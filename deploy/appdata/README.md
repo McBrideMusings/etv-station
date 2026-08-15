@@ -12,6 +12,8 @@ deploy/appdata/
   channels/                           one file per channel
   blocks/                             block definitions the channels reference
   overlays/                           overlay specs + their scripts
+  assets/                             images an overlay spec's `path` points at
+                                      (`../assets/x.png` from `overlays/`)
   plugins/                            scorer scripts a channel's pool names via
                                       `plugin:`, resolved relative to the
                                       channel file (so `../plugins/x.rhai`)
