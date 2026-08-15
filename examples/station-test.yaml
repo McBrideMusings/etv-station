@@ -1,0 +1,9 @@
+tz: "America/Chicago"
+
+output_base: examples/output
+
+channels:
+  - channels/lavfi-test.yaml
+
+# No catalog for the test configuration - lavfi channels don't need one
+catalog_path: tmp/catalog.db
