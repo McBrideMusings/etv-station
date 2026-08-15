@@ -23,7 +23,7 @@ fi
 : "${ETV_PORT:=8409}"
 export ETV_BIND_ADDRESS ETV_PORT
 
-STATION_CONFIG="examples/station.yaml"
+: "${STATION_CONFIG:=examples/station.yaml}"
 
 mkdir -p tmp/hls
 
@@ -86,7 +86,7 @@ preflight_stale_procs
 # stdout; the daemon build it triggers is needed a moment later anyway. A
 # non-zero exit means the config won't load — the daemon would choke on it too,
 # so fail fast instead of booting a doomed stack.
-if ! folders_output="$(cargo run -q -p etv-station -- --config "$STATION_CONFIG" --list-folders)"; then
+if ! folders_output="$(cargo run -q -p etv-station --bin etv-station -- --config "$STATION_CONFIG" --list-folders)"; then
   echo "[dev] station --list-folders failed — $STATION_CONFIG won't load; aborting" >&2
   exit 1
 fi
@@ -146,7 +146,7 @@ cargo build -p etv-overlay 2>&1 \
 # playout folders it reads are derived from where the station writes (never
 # hand-authored to match). Same binary, same flag the container entrypoint runs,
 # so dev and prod render through one code path.
-cargo run -q -p etv-station -- \
+cargo run -q -p etv-station --bin etv-station -- \
   --config "$STATION_CONFIG" --render-etv-next "${ETV_NEXT_DIR:-examples/etv-next}" \
   | while IFS= read -r l; do printf '[dev] %s\n' "$l"; done
 
@@ -160,7 +160,7 @@ EOF
 
 (
   ETV_STATION_TZ="${ETV_STATION_TZ:-UTC}" \
-    cargo run -p etv-station -- --config "$STATION_CONFIG" 2>&1 \
+    cargo run -p etv-station --bin etv-station -- --config "$STATION_CONFIG" 2>&1 \
     | while IFS= read -r l; do printf '[station] %s\n' "$l"; done
 ) &
 
