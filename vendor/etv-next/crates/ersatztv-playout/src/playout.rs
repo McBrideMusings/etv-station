@@ -78,23 +78,17 @@ pub struct PlayoutItem {
     /// the XMLTV guide; missing fields are simply omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub program: Option<ProgramMetadata>,
-    /// Optional overlay spec — when present, the channel reads RGBA frames from
-    /// `fifo_path` and composites them on top of the video. The producer of the
-    /// playout JSON is responsible for arranging for something to be writing to
-    /// that fifo while this item is playing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub overlay: Option<OverlaySpec>,
     /// Arbitrary per-airing data attached by whatever produced this playout
     /// JSON, carried through untouched.
     ///
     /// **Nothing in this repo reads it.** It is deserialized, held, and
     /// re-serialized; no key is reserved, no shape is validated, and an
     /// unrecognised key is not an error. It exists because the producer and
-    /// the overlay process on the other side of `overlay.fifo_path` both read
-    /// this file and need a channel between them that is per-item — the
-    /// overlay spec is per-item too, but its fields are all geometry, and
-    /// widening them for one producer's vocabulary would put that producer's
-    /// concepts into this schema.
+    /// the overlay process on the other side of the channel's overlay fifo both
+    /// read this file and need a channel between them that is per-item — the
+    /// overlay spec is not per-item (see [`OverlaySpec`]), and widening it for
+    /// one producer's vocabulary would put that producer's concepts into this
+    /// schema.
     ///
     /// A producer that attaches nothing leaves this absent, which is the
     /// common case and costs nothing on the wire.
@@ -106,6 +100,16 @@ pub struct PlayoutItem {
 /// `overlay` filter. The channel worker opens the fifo itself, on a deadline,
 /// and hands ffmpeg the already-open descriptor — ffmpeg's own `open()` on a
 /// fifo with no writer never returns, which would wedge the channel forever.
+///
+/// This lives on the **channel config**, not on a playout item. Every field is
+/// geometry of the raster the overlay process writes, and that raster is the
+/// video frame — so it is a constant of the channel, and nothing an individual
+/// item can vary. Carrying it per item meant an item generated before the
+/// channel had an overlay stayed un-overlaid forever, since a playout chunk is
+/// rewritten with its existing items intact; "absent" silently meant "no
+/// overlay" rather than "inherit". What an item *can* vary is which artwork the
+/// overlay process draws, and that is the producer's vocabulary — it travels in
+/// [`PlayoutItem::metadata`], which this repo does not interpret.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct OverlaySpec {
     /// Filesystem path the channel will open for reading. Must exist as a fifo
@@ -219,7 +223,6 @@ impl PlayoutItem {
             tracks: None,
             watermark: None,
             program: None,
-            overlay: None,
             metadata: None,
         })
     }
@@ -242,7 +245,7 @@ impl PlayoutItem {
     }
 
     /// Construct a scheduled item from an already-resolved source, defaulting
-    /// every optional field (`tracks`/`watermark`/`program`/`overlay`/`metadata`). Callers
+    /// every optional field (`tracks`/`watermark`/`program`/`metadata`). Callers
     /// set whichever optionals they drive afterward. New optional schema fields
     /// default here, so producers that use this constructor don't need editing
     /// when the schema grows.
@@ -260,7 +263,6 @@ impl PlayoutItem {
             tracks: None,
             watermark: None,
             program: None,
-            overlay: None,
             metadata: None,
         }
     }

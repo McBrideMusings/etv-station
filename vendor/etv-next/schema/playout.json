@@ -88,63 +88,6 @@
               "type": "null"
             }
           ]
-        },
-        "overlay": {
-          "description": "Optional live overlay. When present, the channel reads RGBA frames from `fifo_path` and composites them on top of the video using ffmpeg's overlay filter. The producer of the playout JSON is responsible for making sure something is writing to that fifo while this item plays.",
-          "oneOf": [
-            {
-              "$ref": "#/definitions/OverlaySpec"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      }
-    },
-    "OverlaySpec": {
-      "type": "object",
-      "description": "Spec for a live overlay source feeding the secondary input of an ffmpeg `overlay` filter. The channel worker opens the fifo itself, on a deadline, and hands ffmpeg the already-open descriptor — ffmpeg's own open() on a fifo with no writer never returns, which would wedge the channel forever.",
-      "required": [
-        "fifo_path",
-        "width",
-        "height",
-        "framerate"
-      ],
-      "properties": {
-        "fifo_path": {
-          "type": "string",
-          "description": "Filesystem path the channel opens for reading. Must exist as a fifo (or regular file) by the time the channel starts the item."
-        },
-        "pixel_format": {
-          "type": "string",
-          "default": "rgba",
-          "description": "ffmpeg pixel-format name for the rawvideo stream (default \"rgba\")."
-        },
-        "width": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Width of the overlay raster in pixels."
-        },
-        "height": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Height of the overlay raster in pixels."
-        },
-        "framerate": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Framerate of the rawvideo stream produced by the overlay process."
-        },
-        "x": {
-          "type": "integer",
-          "default": 0,
-          "description": "Overlay top-left x position relative to the main video (default 0)."
-        },
-        "y": {
-          "type": "integer",
-          "default": 0,
-          "description": "Overlay top-left y position relative to the main video (default 0)."
         }
       }
     },

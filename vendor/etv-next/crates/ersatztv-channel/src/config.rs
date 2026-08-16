@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use ersatztv_playout::playout::OverlaySpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -11,6 +12,7 @@ use crate::error::ChannelError;
 
 pub const PATH_FIELDS: &[&str] = &[
     "/playout/folder",
+    "/overlay/fifo_path",
     "/ffmpeg/ffmpeg_path",
     "/ffmpeg/ffprobe_path",
     "/ffmpeg/reports_folder",
@@ -22,6 +24,12 @@ pub struct ChannelConfig {
     pub playout: PlayoutConfig,
     pub ffmpeg: FfmpegConfig,
     pub normalization: NormalizationConfig,
+    /// Live overlay composited over every item on this channel. Absent means
+    /// the channel has no overlay at all — the one place that decision is
+    /// recorded, so it cannot go stale the way a per-item copy did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub overlay: Option<OverlaySpec>,
 
     #[serde(skip)]
     expanded_playout_folder: PathBuf,

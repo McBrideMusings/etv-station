@@ -733,32 +733,33 @@ impl ChannelSession {
             _ => None,
         };
 
-        let (overlay_input, mut overlay_fifo) = if let Some(spec) = current_item.overlay.as_ref() {
-            // Tell the overlay producer (the etv-station daemon) this channel is
-            // now watched so it spawns the overlay process, then open the fifo
-            // ourselves and wait (bounded) for that producer to attach. Failing
-            // here fails the item, which the caller replaces with black/silence.
-            let fifo = self
-                .signal_overlay_wanted_and_wait_ready(&spec.fifo_path)
-                .await?;
-            (
-                Some(OverlayInput {
-                    // ffmpeg reads the descriptor we already opened, never the
-                    // fifo path — an open it performed itself could not be
-                    // bounded, and an unbounded one wedges the channel.
-                    fifo_path: overlay_fifo_input_path(&fifo),
-                    pixel_format: spec.pixel_format.clone(),
-                    width: spec.width,
-                    height: spec.height,
-                    framerate: spec.framerate,
-                    x: spec.x,
-                    y: spec.y,
-                }),
-                Some(fifo),
-            )
-        } else {
-            (None, None)
-        };
+        let (overlay_input, mut overlay_fifo) =
+            if let Some(spec) = self.channel_config.overlay.as_ref() {
+                // Tell the overlay producer (the etv-station daemon) this channel is
+                // now watched so it spawns the overlay process, then open the fifo
+                // ourselves and wait (bounded) for that producer to attach. Failing
+                // here fails the item, which the caller replaces with black/silence.
+                let fifo = self
+                    .signal_overlay_wanted_and_wait_ready(&spec.fifo_path)
+                    .await?;
+                (
+                    Some(OverlayInput {
+                        // ffmpeg reads the descriptor we already opened, never the
+                        // fifo path — an open it performed itself could not be
+                        // bounded, and an unbounded one wedges the channel.
+                        fifo_path: overlay_fifo_input_path(&fifo),
+                        pixel_format: spec.pixel_format.clone(),
+                        width: spec.width,
+                        height: spec.height,
+                        framerate: spec.framerate,
+                        x: spec.x,
+                        y: spec.y,
+                    }),
+                    Some(fifo),
+                )
+            } else {
+                (None, None)
+            };
 
         let mut input_settings = InputSettings {
             start: current_item.start,
@@ -1210,7 +1211,6 @@ impl ChannelSession {
             }),
             watermark: None,
             program: None,
-            overlay: None,
             metadata: None,
         }
     }

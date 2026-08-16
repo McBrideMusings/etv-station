@@ -435,7 +435,6 @@ mod tests {
                 country: Some(vec!["United States".into(), "United Kingdom".into()]),
                 star_rating: Some("4 / 5".into()),
             }),
-            overlay: None,
             // Present on purpose: nothing in this repo reads `metadata`, so if it
             // ever leaked into the guide these assertions would say so.
             metadata: Some(serde_json::json!({ "picked_because": "oscar" })),
@@ -451,7 +450,6 @@ mod tests {
             tracks: None,
             watermark: None,
             program: None,
-            overlay: None,
             metadata: None,
         }
     }
