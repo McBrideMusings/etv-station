@@ -11,6 +11,8 @@ set -m
 
 # shellcheck source=tools/dev-procs.sh
 . "$(dirname "$0")/dev-procs.sh"
+# shellcheck source=tools/probe-checks.sh
+. "$(dirname "$0")/probe-checks.sh"
 
 if [ -f .env ]; then
   set -a
@@ -49,6 +51,21 @@ fail() {
 
 pass() { printf '%s %s\n' "$(green 'PASS')" "$*"; }
 warn() { printf '%s %s\n' "$(yellow 'WARN')" "$*"; }
+
+# Run a probe-checks.sh assertion: PASS with <label>, or FAIL with the check's
+# own message and abort. Every probe_check_* call in this script goes through
+# here so the pass/fail/exit shape is written once.
+check_or_die() {
+  local label="$1"
+  shift
+  local msg
+  if msg="$("$@")"; then
+    pass "$label"
+  else
+    fail "$msg"
+    exit 1
+  fi
+}
 
 require() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -118,22 +135,8 @@ pass "lineup contains channel/1.m3u8"
 # Fetch /channel/1.m3u8 — assert 200, starts with #EXTM3U, contains /session/1/live.m3u8.
 printf 'verifying channel master playlist...\n'
 master_body="$(curl -fsS "$BASE_URL/channel/1.m3u8" || true)"
-if [ -z "$master_body" ]; then
-  fail "master playlist did not return a body"
-  exit 1
-fi
-
-if ! printf '%s\n' "$master_body" | head -1 | grep -q "#EXTM3U"; then
-  fail "master playlist does not start with #EXTM3U"
-  exit 1
-fi
-pass "master playlist starts with #EXTM3U"
-
-if ! printf '%s\n' "$master_body" | grep -q "session/1/live.m3u8"; then
-  fail "master playlist does not contain /session/1/live.m3u8"
-  exit 1
-fi
-pass "master playlist contains /session/1/live.m3u8"
+check_or_die "master playlist starts with #EXTM3U and contains /session/1/live.m3u8" \
+  probe_check_master_playlist "$master_body" 1
 
 # Wait for ffmpeg segment ramp-up, then fetch live.m3u8 and latest segment.
 printf 'waiting for ffmpeg segment production...\n'
@@ -182,18 +185,11 @@ if [ -z "$xmltv_body" ]; then
 fi
 
 # Validate XML structure.
-if ! printf '%s\n' "$xmltv_body" | xmllint --noout - 2>/dev/null; then
-  fail "xmltv.xml is not valid XML"
-  exit 1
-fi
-pass "xmltv.xml is valid XML"
+check_or_die "xmltv.xml is valid XML" probe_check_xmltv_wellformed "$xmltv_body"
 
 # Check for <channel id= element.
-if ! printf '%s\n' "$xmltv_body" | grep -q '<channel id='; then
-  fail "xmltv.xml does not contain <channel id="
-  exit 1
-fi
-pass "xmltv.xml contains <channel id= element"
+check_or_die "xmltv.xml contains <channel id= element" \
+  probe_check_xmltv_channel_present "$xmltv_body"
 
 # Send SIGINT to dev-run process group and wait for clean exit.
 printf 'shutting down dev stack...\n'

@@ -98,11 +98,16 @@ FROM ghcr.io/ersatztv/ersatztv-ffmpeg:8.1.2 AS runtime
 # why the diagnostics now live in here rather than as loose scripts copied onto
 # the Unraid host. Off unless ETV_DIAG_CAPTURE says otherwise, so an ordinary
 # run pays only the image size.
+# curl + libxml2-utils (xmllint) are here for tools/soak-probe.sh (#297): it
+# probes localhost the same way tools/verify-integration.sh does on a dev
+# host, and neither is otherwise part of this runtime image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         iproute2 \
         libcap2-bin \
         libvulkan1 \
+        libxml2-utils \
         mesa-vulkan-drivers \
         python3 \
         tcpdump \
@@ -142,6 +147,7 @@ COPY --from=etv-builder /build/etv-next/target/release/ersatztv /usr/local/bin/e
 COPY --from=etv-builder /build/etv-next/target/release/ersatztv-channel /usr/local/bin/ersatztv-channel
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py /usr/local/bin/
+COPY --chmod=755 tools/probe-checks.sh tools/soak-probe.sh /usr/local/bin/
 
 # Config lives on a bind mount; the playout folders and the HLS working set are
 # written under /data so a restart resumes from what the daemon already emitted.

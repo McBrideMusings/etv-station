@@ -25,6 +25,10 @@ set -uo pipefail
 # takes well over a minute; the folders already exist by then, so a timeout
 # costs a few "unable to find playout JSON" lines, not a missing channel.
 : "${ETV_STARTUP_TIMEOUT:=180}"
+: "${ETV_DIAG_DIR:=/data/diag}"
+# How often the soak-test probe loop (#297) runs, in seconds. Default matches
+# the issue's own example (`while true; do <probe>; sleep 3600; done`).
+: "${SOAK_PROBE_INTERVAL_SECS:=3600}"
 
 log() { printf '[entrypoint] %s\n' "$*"; }
 die() { printf '[entrypoint] %s\n' "$*" >&2; exit 1; }
@@ -100,8 +104,36 @@ shutdown() {
 }
 trap shutdown TERM INT EXIT
 
-# 2b. Diagnostics, when asked for.
+# 2b. Diagnostics dir + station/etv log tee.
 #
+# diag_dir backs three things: the two opt-in packet-level diagnostics below
+# (switched by ETV_DIAG_CAPTURE), the always-on tee of station/ersatztv stdout
+# into a file (soak-probe.sh's log-scan check needs a file to grep — today
+# that output only reaches the Docker log driver, which a process inside the
+# container cannot read), and the soak probe loop's own evidence. Computed
+# once, unconditionally, so an unwritable mount degrades all three the same
+# way rather than each rediscovering the same failure separately.
+diag_dir="$ETV_DIAG_DIR"
+diag_ready=0
+if mkdir -p "$diag_dir" 2>/dev/null && [ -w "$diag_dir" ]; then
+    diag_ready=1
+else
+    log "WARNING: ETV_DIAG_DIR ($diag_dir) is not writable — no station/etv log capture, no soak probe"
+fi
+
+# Runs "$@" in the background, teeing its combined stdout+stderr to
+# $diag_dir/station-etv.log via process substitution — which, unlike piping
+# into `tee` directly, keeps $! pointing at "$@"'s own pid rather than tee's,
+# so station_pid/etv_pid tracking below is unaffected. Falls back to a plain
+# background start when diag_dir isn't writable.
+run_logged() {
+    if [ "$diag_ready" -eq 1 ]; then
+        "$@" > >(tee -a "$diag_dir/station-etv.log") 2>&1 &
+    else
+        "$@" &
+    fi
+}
+
 # These used to be two scripts copied onto the Unraid host by hand and started
 # over ssh, on the belief that a container could not see a client's real
 # address. It can — ETV-next logs the peer from the socket — so the only thing
@@ -111,15 +143,15 @@ trap shutdown TERM INT EXIT
 # What the wire still answers that the access log cannot: a request that never
 # reached the server at all, and a connection that died mid-answer. That is a
 # small enough set to be worth having and too small to run always, so it is a
-# switch.
+# switch — unlike the log tee and the soak probe loop above/below it, which
+# are always on.
 #
 # Neither is supervised. If a capture dies the stream is unaffected, and the
 # wait loop below only ends the container for its two real children — an
 # unrecognised pid falls through and it waits again.
 if [ -n "${ETV_DIAG_CAPTURE:-}" ] \
     && ! [[ "${ETV_DIAG_CAPTURE}" =~ ^(0|off|false|no)$ ]]; then
-    diag_dir="${ETV_DIAG_DIR:-/data/diag}"
-    if mkdir -p "$diag_dir" 2>/dev/null && [ -w "$diag_dir" ]; then
+    if [ "$diag_ready" -eq 1 ]; then
         PORT="${ETV_PORT:-8409}" LOG_FILE="$diag_dir/access.log" \
             stream-access-log.py &
         diag_pids+=($!)
@@ -133,7 +165,7 @@ if [ -n "${ETV_DIAG_CAPTURE:-}" ] \
 fi
 
 # 3. The daemon.
-etv-station --config "$ETV_STATION_CONFIG" --log-format "$ETV_LOG_FORMAT" &
+run_logged etv-station --config "$ETV_STATION_CONFIG" --log-format "$ETV_LOG_FORMAT"
 station_pid=$!
 
 # Poll all folders each tick and drop them as they fill, so the wait is
@@ -157,9 +189,27 @@ if [ "${#pending[@]}" -gt 0 ]; then
 fi
 
 # 4. The server.
-ersatztv "$ETV_NEXT_DIR/lineup.json" &
+run_logged ersatztv "$ETV_NEXT_DIR/lineup.json"
 etv_pid=$!
 log "serving on ${ETV_BIND_ADDRESS:-0.0.0.0}:${ETV_PORT:-8409}"
+
+# 5. Soak-test probe loop (#297): a third background process, same non-fatal
+# shape as the diagnostics above — its pid goes into diag_pids so shutdown()
+# reaps it, but it is never assigned to station_pid/etv_pid, so it is never
+# fed into the `wait -n -p dead_pid` loop's recognized set below. A probe
+# crash must never take the stack down — only a dead daemon or a dead
+# ETV-next does that. No separate install step and no host cron: this loop
+# starts with the container, exactly like the two diagnostics above it.
+if [ "$diag_ready" -eq 1 ]; then
+    (
+        while true; do
+            ETV_DIAG_DIR="$diag_dir" /usr/local/bin/soak-probe.sh || true
+            sleep "$SOAK_PROBE_INTERVAL_SECS"
+        done
+    ) &
+    diag_pids+=($!)
+    log "soak probe loop started (every ${SOAK_PROBE_INTERVAL_SECS}s, evidence in $diag_dir)"
+fi
 
 # The two processes are not equals here. ETV-next streams the window the daemon
 # has already written, so a dead daemon costs nothing until that window runs out
@@ -183,7 +233,7 @@ while true; do
         fi
         log "station daemon exited (status $status) — restarting (attempt $restarts); the stream keeps serving the window already written"
         sleep 2
-        etv-station --config "$ETV_STATION_CONFIG" --log-format "$ETV_LOG_FORMAT" &
+        run_logged etv-station --config "$ETV_STATION_CONFIG" --log-format "$ETV_LOG_FORMAT"
         station_pid=$!
     fi
 done
