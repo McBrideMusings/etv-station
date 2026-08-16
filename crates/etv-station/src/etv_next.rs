@@ -636,8 +636,7 @@ mod tests {
         let folders = vec![PathBuf::from("out/star-trek")];
 
         let without = opts(dir.path());
-        let rendered =
-            render_folders(&folders, &no_names(1), &without, "test-device-id").unwrap();
+        let rendered = render_folders(&folders, &no_names(1), &without, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert!(lineup.get("artwork").is_none(), "{lineup}");
 

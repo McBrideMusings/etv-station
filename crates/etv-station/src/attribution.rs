@@ -57,7 +57,7 @@ impl Attribution {
         // Most recent first, so the first time a name is seen for an entry is
         // that person's latest watch of it.
         let mut ordered: Vec<&WatchEvent> = history.iter().collect();
-        ordered.sort_by(|a, b| b.watched_at.cmp(&a.watched_at));
+        ordered.sort_by_key(|e| std::cmp::Reverse(e.watched_at));
 
         let mut by_entry: HashMap<String, Vec<String>> = HashMap::new();
         for event in ordered {

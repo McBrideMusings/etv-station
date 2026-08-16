@@ -63,7 +63,10 @@ pub async fn cover_after_written(
     now: OffsetDateTime,
 ) -> Result<Option<OffsetDateTime>, StationError> {
     let existing = scan::scan_output_folder(&channel.output_folder).await?;
-    let from = scan::highest_finish(&existing).await.unwrap_or(now).max(now);
+    let from = scan::highest_finish(&existing)
+        .await
+        .unwrap_or(now)
+        .max(now);
     let target = now + crate::daemon::window_duration(channel.config.window_days);
     if from >= target {
         return Ok(None);
