@@ -95,6 +95,57 @@ zero means the station just repaired chunks that would otherwise have aired
 black. `admin logs | grep reconcile` is the check after a big Radarr rename
 batch — not because anything needs doing, but to confirm nothing did.
 
+## Verifying a graphics overlay actually reaches the screen
+
+The overlay spec lives on the **channel**, in `channel{N}.json` — never on a
+playout item. Check the render first, because it is instant and needs no stream:
+
+```sh
+mkdir -p tmp/claude/render && cp deploy/appdata/etv-next/normalization.default.json tmp/claude/render/
+cargo run -q -p etv-station --bin etv-station -- \
+  --config <a station yaml> --render-etv-next tmp/claude/render
+python3 -c "import json;print(json.load(open('tmp/claude/render/channel1.json')).get('overlay'))"
+```
+
+A channel with an overlay prints its own `fifo_path`; a channel without prints
+`None`. Two channels printing the *same* fifo path is a bug — each writes its own.
+
+**Only a real frame proves it.** The spec reaching ffmpeg does not mean anything
+was drawn: the overlay process is spawned on demand and can crash after ffmpeg
+has already committed to reading its fifo. Grab a frame and look:
+
+```sh
+ffmpeg -y -i "http://$HOST:$PORT/channel/<N>.m3u8" -frames:v 1 tmp/claude/frame.png
+ffmpeg -y -i tmp/claude/frame.png -vf "crop=440:200:840:520" tmp/claude/corner.png
+```
+
+Every overlay in the deployed station is `corner = "bottom_right"`, so that crop
+is where the logo is. Stack several crops with `vstack` and label each with
+`drawtext` before reading them — on dark content the boundary between two
+unlabelled crops is impossible to place, and a logo gets attributed to the wrong
+channel.
+
+**A fully black frame is the overlay failing, not the channel being idle.** The
+channel worker opens the fifo and waits for a writer; if `etv-overlay` died there
+is no writer, and ffmpeg blocks. The cause is in the container log:
+
+```sh
+admin logs | grep -iE "overlay\.(spawn|exit)|unsupported PNG"
+```
+
+`etv-overlay` accepts **8-bit RGBA PNGs only**. A GrayscaleAlpha or Palette PNG
+exits 1 in a crash-loop and blacks out every channel using it. Audit before
+adding artwork — `d[25]` is the PNG colour type (6) and `d[24]` the bit depth (8):
+
+```sh
+python3 -c "
+import glob
+for f in sorted(glob.glob('deploy/appdata/assets/*.png')):
+    d=open(f,'rb').read(33)
+    if (d[25],d[24])!=(6,8): print('CONVERT', f, d[25], d[24])"
+ffmpeg -y -i bad.png -pix_fmt rgba fixed.png   # the fix; alpha survives
+```
+
 ## Two blockers you will hit, and how to get past them
 
 **1. `PLEXDB_SNAPSHOT_PATH` is not in `.env`.** `examples/samples/foryou.yaml` references
