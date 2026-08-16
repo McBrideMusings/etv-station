@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::config;
+use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
 
 /// Which encoder every channel is built to use — station-wide; there is no
 /// remaining per-channel override since `presentation.json` was removed
@@ -190,24 +191,38 @@ pub enum RenderError {
     NotAnObject(PathBuf),
 }
 
+/// One channel's inputs to the ETV-next config render.
+///
+/// A struct rather than parallel slices because these three travel together and
+/// are indexed together — the length assert that guarded two of them was the
+/// seam, and a third and fourth array would only widen it.
+pub struct ChannelRender {
+    /// Playout folder the station writes and ETV-next reads.
+    pub folder: PathBuf,
+    /// The channel's own `display_name` (#158) — never a second file. `None`
+    /// falls back to the identity resolved from the folder name.
+    pub display_name: Option<String>,
+    /// The channel's live overlay, or `None` for a channel that has none. This
+    /// is the only record of that decision: it used to be copied onto every
+    /// playout item, where an item written before the channel had an overlay
+    /// kept "no overlay" forever.
+    pub overlay: Option<PlayoutOverlaySpec>,
+}
+
 /// Load the station config and render ETV-next's config from its channels.
 pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, RenderError> {
     let station = config::load(config_path).map_err(|e| RenderError::Config(e.to_string()))?;
-    let folders: Vec<PathBuf> = station
-        .channels
-        .iter()
-        .map(|ch| ch.output_folder.clone())
-        .collect();
-    if folders.is_empty() {
+    if station.channels.is_empty() {
         return Err(RenderError::NoChannels(config_path.to_path_buf()));
     }
-    // The channel's own `display_name` (#158) — never a second file. `None`
-    // falls back to the identity, resolved from the folder name in
-    // `render_folders` exactly as it always has.
-    let display_names: Vec<Option<String>> = station
+    let channels: Vec<ChannelRender> = station
         .channels
         .iter()
-        .map(|ch| ch.config.display_name.clone())
+        .map(|ch| ChannelRender {
+            folder: ch.output_folder.clone(),
+            display_name: ch.config.display_name.clone(),
+            overlay: crate::daemon::load_overlay_playout_spec(ch),
+        })
         .collect();
     // The station config is the only place the tuner identity can come from,
     // and this is the only entry point that has it. The minted id is kept beside
@@ -216,7 +231,7 @@ pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, Rend
         station.station.device_id.as_deref(),
         config_dir(config_path),
     )?;
-    render_folders(&folders, &display_names, opts, &device_id)
+    render_channels(&channels, opts, &device_id)
 }
 
 /// The directory holding the station config, which is where state that must
@@ -285,7 +300,7 @@ pub fn resolve_device_id(
     Ok(minted)
 }
 
-/// Render from an already-resolved list of playout folders, in channel order.
+/// Render from an already-resolved list of channels, in channel order.
 ///
 /// Split out from [`render`] so the emitted shape can be tested without
 /// standing up a whole station config.
@@ -294,17 +309,11 @@ pub fn resolve_device_id(
 /// defaulted to empty in [`RenderOptions::from_env`], and any caller pairing
 /// that with this function would have emitted a tuner with a blank identity —
 /// which nothing here would notice and only Plex would.
-pub fn render_folders(
-    folders: &[PathBuf],
-    display_names: &[Option<String>],
+pub fn render_channels(
+    channels: &[ChannelRender],
     opts: &RenderOptions,
     device_id: &str,
 ) -> Result<Rendered, RenderError> {
-    assert_eq!(
-        folders.len(),
-        display_names.len(),
-        "folders/display_names length mismatch"
-    );
     let default_path = opts.out_dir.join("normalization.default.json");
     if !default_path.exists() {
         return Err(RenderError::MissingDefaults(default_path));
@@ -320,9 +329,10 @@ pub fn render_folders(
     // legacy un-numbered channel.json) can't leave orphans behind.
     remove_stale_channel_files(&opts.out_dir)?;
 
-    let mut lineup_channels = Vec::with_capacity(folders.len());
-    for (index, folder) in folders.iter().enumerate() {
+    let mut lineup_channels = Vec::with_capacity(channels.len());
+    for (index, channel_render) in channels.iter().enumerate() {
         let number = index + 1;
+        let folder = &channel_render.folder;
         let identity = folder
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -331,7 +341,7 @@ pub fn render_folders(
         // #158: the display name is the channel's own `display_name`, read
         // from its YAML by `render` above — never a second file. Falls back
         // to the identity, same as before this field existed.
-        let display = display_names[index].clone().unwrap_or(identity);
+        let display = channel_render.display_name.clone().unwrap_or(identity);
 
         // Absolute so ETV-next reads exactly where the station writes,
         // regardless of ETV-next's own working directory. A relative folder is
@@ -360,6 +370,23 @@ pub fn render_folders(
                 "folder".to_string(),
                 Value::String(playout_folder.to_string_lossy().into_owned()),
             );
+
+        // The station owns `overlay` for the same reason it owns
+        // `playout.folder`: both name paths the station itself creates. Injected
+        // after the merge so a stray `overlay` key in the defaults body cannot
+        // point a channel at another channel's fifo. A channel with no overlay
+        // writes no key, which ETV-next reads as "no overlay on this channel".
+        if let Some(spec) = channel_render.overlay.as_ref() {
+            channel.insert(
+                "overlay".to_string(),
+                serde_json::to_value(spec).map_err(|source| RenderError::Json {
+                    path: opts.out_dir.join(format!("channel{number}.json")),
+                    source,
+                })?,
+            );
+        } else {
+            channel.remove("overlay");
+        }
 
         let channel_path = opts.out_dir.join(format!("channel{number}.json"));
         write_json(&channel_path, &Value::Object(channel))?;
@@ -391,7 +418,7 @@ pub fn render_folders(
 
     Ok(Rendered {
         lineup_path,
-        channels: folders.len(),
+        channels: channels.len(),
         device_id: device_id.to_string(),
     })
 }
@@ -521,10 +548,30 @@ mod tests {
         }
     }
 
-    /// No `display_name:` authored on any channel — every one falls back to
-    /// its identity, same as before that field existed.
-    fn no_names(n: usize) -> Vec<Option<String>> {
-        vec![None; n]
+    /// No `display_name:` authored on any channel and no overlay — every one
+    /// falls back to its identity, same as before those fields existed.
+    fn chans(folders: &[PathBuf]) -> Vec<ChannelRender> {
+        folders
+            .iter()
+            .map(|folder| ChannelRender {
+                folder: folder.clone(),
+                display_name: None,
+                overlay: None,
+            })
+            .collect()
+    }
+
+    /// Channels carrying authored `display_name:` values, in the same order.
+    fn named(folders: &[PathBuf], names: Vec<Option<String>>) -> Vec<ChannelRender> {
+        folders
+            .iter()
+            .zip(names)
+            .map(|(folder, display_name)| ChannelRender {
+                folder: folder.clone(),
+                display_name,
+                overlay: None,
+            })
+            .collect()
     }
 
     // Plex keys a DVR's whole channel mapping on the device id, so an id that
@@ -583,7 +630,7 @@ mod tests {
 
         let folders = vec![PathBuf::from("out/star-trek")];
         let rendered =
-            render_folders(&folders, &no_names(1), &opts(dir.path()), "test-device-id").unwrap();
+            render_channels(&chans(&folders), &opts(dir.path()), "test-device-id").unwrap();
 
         // Read back through ETV-next's own config type, not as loose JSON. The
         // two sides have to agree on this key's name, and a mismatch is exactly
@@ -606,7 +653,7 @@ mod tests {
 
         let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
         let rendered =
-            render_folders(&folders, &no_names(2), &opts(dir.path()), "test-device-id").unwrap();
+            render_channels(&chans(&folders), &opts(dir.path()), "test-device-id").unwrap();
         assert_eq!(rendered.channels, 2);
 
         let lineup = read(&rendered.lineup_path);
@@ -636,7 +683,7 @@ mod tests {
         let folders = vec![PathBuf::from("out/star-trek")];
 
         let without = opts(dir.path());
-        let rendered = render_folders(&folders, &no_names(1), &without, "test-device-id").unwrap();
+        let rendered = render_channels(&chans(&folders), &without, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert!(lineup.get("artwork").is_none(), "{lineup}");
 
@@ -644,7 +691,7 @@ mod tests {
             artwork_dir: Some("/data/artwork".to_string()),
             ..opts(dir.path())
         };
-        let rendered = render_folders(&folders, &no_names(1), &with, "test-device-id").unwrap();
+        let rendered = render_channels(&chans(&folders), &with, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert_eq!(lineup["artwork"]["folder"], "/data/artwork");
     }
@@ -659,9 +706,8 @@ mod tests {
         fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
-        render_folders(
-            &folders,
-            &no_names(2),
+        render_channels(
+            &chans(&folders),
             &opts_with_accel(dir.path(), vaapi()),
             "id",
         )
@@ -693,13 +739,7 @@ mod tests {
             vaapi_driver: None,
         };
         let folders = vec![PathBuf::from("out/star-trek")];
-        render_folders(
-            &folders,
-            &no_names(1),
-            &opts_with_accel(dir.path(), cuda),
-            "id",
-        )
-        .unwrap();
+        render_channels(&chans(&folders), &opts_with_accel(dir.path(), cuda), "id").unwrap();
 
         let video = read(&dir.path().join("channel1.json"))["normalization"]["video"].clone();
         assert_eq!(video["accel"], "cuda");
@@ -718,7 +758,7 @@ mod tests {
         .unwrap();
 
         let folders = vec![PathBuf::from("out/star-trek")];
-        render_folders(&folders, &no_names(1), &opts(dir.path()), "id").unwrap();
+        render_channels(&chans(&folders), &opts(dir.path()), "id").unwrap();
 
         let video = read(&dir.path().join("channel1.json"))["normalization"]["video"].clone();
         assert_eq!(video["accel"], "");
@@ -736,7 +776,7 @@ mod tests {
         let folders = vec![PathBuf::from("out/star-trek"), PathBuf::from("out/diehard")];
         let names = vec![Some("Star Trek 24/7".to_string()), None];
         let rendered =
-            render_folders(&folders, &names, &opts(dir.path()), "test-device-id").unwrap();
+            render_channels(&named(&folders, names), &opts(dir.path()), "test-device-id").unwrap();
 
         let lineup = read(&rendered.lineup_path);
         assert_eq!(lineup["channels"][0]["name"], "Star Trek 24/7");
@@ -760,7 +800,7 @@ mod tests {
 
         let folders = vec![PathBuf::from("out/star-trek")];
         let rendered =
-            render_folders(&folders, &no_names(1), &opts(dir.path()), "test-device-id").unwrap();
+            render_channels(&chans(&folders), &opts(dir.path()), "test-device-id").unwrap();
 
         let lineup = read(&rendered.lineup_path);
         assert_eq!(
@@ -782,19 +822,96 @@ mod tests {
         fs::write(dir.path().join("channel.json"), "{}").unwrap();
 
         let folders = vec![PathBuf::from("out/only")];
-        render_folders(&folders, &no_names(1), &opts(dir.path()), "test-device-id").unwrap();
+        render_channels(&chans(&folders), &opts(dir.path()), "test-device-id").unwrap();
 
         assert!(dir.path().join("channel1.json").exists());
         assert!(!dir.path().join("channel7.json").exists());
         assert!(!dir.path().join("channel.json").exists());
     }
 
+    /// The overlay decision is recorded once, on the channel — so a channel
+    /// that has one always has one, no matter when its playout items were
+    /// generated. This is the whole point of moving it off the item: 1371 items
+    /// across 52 deployed channels had been written before their channel had an
+    /// overlay, and every one of them stayed watermark-free forever.
+    #[test]
+    fn a_channels_overlay_lands_in_its_channel_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("normalization.default.json"), DEFAULTS).unwrap();
+        let channels = vec![
+            ChannelRender {
+                folder: PathBuf::from("out/hbo"),
+                display_name: None,
+                overlay: Some(PlayoutOverlaySpec {
+                    fifo_path: "/data/playout/085-hbo/overlay.fifo".into(),
+                    pixel_format: "rgba".into(),
+                    width: 1280,
+                    height: 720,
+                    framerate: 30,
+                    x: 0,
+                    y: 0,
+                }),
+            },
+            ChannelRender {
+                folder: PathBuf::from("out/plain"),
+                display_name: None,
+                overlay: None,
+            },
+        ];
+        render_channels(&channels, &opts(dir.path()), "test-device-id").unwrap();
+
+        let with = read(&dir.path().join("channel1.json"));
+        assert_eq!(
+            with["overlay"]["fifo_path"], "/data/playout/085-hbo/overlay.fifo",
+            "a channel with an overlay must publish its fifo to ETV-next"
+        );
+        assert_eq!(with["overlay"]["width"], 1280);
+        assert_eq!(with["overlay"]["framerate"], 30);
+
+        let without = read(&dir.path().join("channel2.json"));
+        assert!(
+            without.get("overlay").is_none(),
+            "a channel with no overlay must write no overlay key, got {:?}",
+            without.get("overlay")
+        );
+    }
+
+    /// A stray `overlay` in the shared defaults body would otherwise point every
+    /// channel at the first channel's fifo — each one reading frames drawn for
+    /// somebody else's logo.
+    #[test]
+    fn a_defaults_overlay_never_leaks_into_a_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut defaults: Map<String, Value> = serde_json::from_str(DEFAULTS).unwrap();
+        defaults.insert(
+            "overlay".to_string(),
+            serde_json::json!({"fifo_path": "/wrong.fifo", "width": 1, "height": 1, "framerate": 1}),
+        );
+        fs::write(
+            dir.path().join("normalization.default.json"),
+            serde_json::to_string(&Value::Object(defaults)).unwrap(),
+        )
+        .unwrap();
+
+        render_channels(
+            &chans(&[PathBuf::from("out/plain")]),
+            &opts(dir.path()),
+            "test-device-id",
+        )
+        .unwrap();
+
+        let channel = read(&dir.path().join("channel1.json"));
+        assert!(
+            channel.get("overlay").is_none(),
+            "a channel with no overlay must not inherit one from the defaults body"
+        );
+    }
+
     #[test]
     fn missing_defaults_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = render_folders(
-            &[PathBuf::from("out/x")],
-            &no_names(1),
+        let err = render_channels(
+            &chans(&[PathBuf::from("out/x")]),
             &opts(dir.path()),
             "test-device-id",
         )

@@ -314,7 +314,6 @@ mod tests {
                 title: Some("Die Hard".into()),
                 ..Default::default()
             }),
-            overlay: None,
             metadata: None,
         }
     }

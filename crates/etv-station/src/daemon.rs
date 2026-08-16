@@ -1313,7 +1313,7 @@ fn validate_overlay_configs(station: &Station) -> Result<(), StationError> {
     Ok(())
 }
 
-fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySpec> {
+pub(crate) fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySpec> {
     let (overlay_config_path, fifo_path) = resolve_overlay_paths(channel)?;
     match etv_overlay::overlay_spec::OverlaySpec::from_path(&overlay_config_path) {
         Ok(spec) => Some(PlayoutOverlaySpec {
@@ -2088,7 +2088,6 @@ async fn pattern_catch_up(
     let output = &channel.output_folder;
     let now = OffsetDateTime::now_utc();
     let target = now + window_duration(channel.config.window_days);
-    let overlay_spec = load_overlay_playout_spec(channel);
     let mut cache = DurationCache::load(output).await?;
 
     // Bound the window at both ends BEFORE reading the frontier, so a file
@@ -2387,8 +2386,7 @@ async fn pattern_catch_up(
             };
         first_generation = false;
 
-        let rule = crate::rule::Sequential::new(items_slice, durations_slice)
-            .with_overlay(overlay_spec.as_ref().map(clone_overlay_spec));
+        let rule = crate::rule::Sequential::new(items_slice, durations_slice);
         let span = rule.total_duration() - (from - seq_start);
         if span <= time::Duration::ZERO {
             // Zero wall-clock length would never advance `from`. Stop rather
@@ -2888,20 +2886,6 @@ mod render_guide_and_attribution_tests {
             1,
             "the line must appear exactly once, got {desc:?}"
         );
-    }
-}
-
-/// `OverlaySpec` (an ETV-next type) is not `Clone`, and each generation in a
-/// catch-up builds its own rule.
-fn clone_overlay_spec(spec: &PlayoutOverlaySpec) -> PlayoutOverlaySpec {
-    PlayoutOverlaySpec {
-        fifo_path: spec.fifo_path.clone(),
-        pixel_format: spec.pixel_format.clone(),
-        width: spec.width,
-        height: spec.height,
-        framerate: spec.framerate,
-        x: spec.x,
-        y: spec.y,
     }
 }
 

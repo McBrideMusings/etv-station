@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ersatztv_playout::playout::{OverlaySpec, PlayoutItem, ProgramMetadata};
+use ersatztv_playout::playout::{PlayoutItem, ProgramMetadata};
 use time::OffsetDateTime;
 
 use crate::resolve::ResolvedItem;
@@ -28,7 +28,6 @@ pub trait Rule {
 pub struct Sequential<'a> {
     items: &'a [ResolvedItem],
     durations: &'a [Duration],
-    overlay: Option<OverlaySpec>,
 }
 
 impl<'a> Sequential<'a> {
@@ -38,16 +37,7 @@ impl<'a> Sequential<'a> {
             durations.len(),
             "items/durations length mismatch"
         );
-        Self {
-            items,
-            durations,
-            overlay: None,
-        }
-    }
-
-    pub fn with_overlay(mut self, overlay: Option<OverlaySpec>) -> Self {
-        self.overlay = overlay;
-        self
+        Self { items, durations }
     }
 
     /// Wall-clock length of the whole sequence — how far forward one generation
@@ -85,7 +75,6 @@ impl Rule for Sequential<'_> {
                     &self.items[idx],
                     item_start_utc,
                     item_finish_utc,
-                    self.overlay.as_ref(),
                 ));
             }
             item_start_utc = item_finish_utc;
@@ -132,12 +121,10 @@ fn build_playout_item(
     item: &ResolvedItem,
     start: OffsetDateTime,
     finish: OffsetDateTime,
-    overlay: Option<&OverlaySpec>,
 ) -> PlayoutItem {
     let mut playout_item =
         PlayoutItem::scheduled(item.id.clone(), start, finish, item.to_playout_source());
     playout_item.program = item.program.as_ref().map(clone_program);
-    playout_item.overlay = overlay.cloned();
     // A plugin pool's metadata blob (#166), carried untouched from
     // `ResolvedItem::metadata`. `PlayoutItem::scheduled` already defaults this
     // to `None`, so an item nothing attached to changes no output.
