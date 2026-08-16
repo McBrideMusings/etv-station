@@ -733,16 +733,28 @@ impl ChannelSession {
             _ => None,
         };
 
-        let (overlay_input, mut overlay_fifo) =
-            if let Some(spec) = self.channel_config.overlay.as_ref() {
-                // Tell the overlay producer (the etv-station daemon) this channel is
-                // now watched so it spawns the overlay process, then open the fifo
-                // ourselves and wait (bounded) for that producer to attach. Failing
-                // here fails the item, which the caller replaces with black/silence.
-                let fifo = self
-                    .signal_overlay_wanted_and_wait_ready(&spec.fifo_path)
-                    .await?;
-                (
+        let (overlay_input, mut overlay_fifo) = match self.channel_config.overlay.as_ref() {
+            // Tell the overlay producer (the etv-station daemon) this channel is
+            // now watched so it spawns the overlay process, then open the fifo
+            // ourselves and wait (bounded) for that producer to attach.
+            //
+            // A failure here is NOT an item failure. The overlay is decoration;
+            // the program is the point. Propagating the error replaced the whole
+            // item with black and silence, so a two-hour film became two hours of
+            // black because a watermark writer was late — and it *is* routinely
+            // late: the producer despawns its overlay when a channel goes cold,
+            // and a viewer arriving in that same instant loses the race between
+            // the producer's 5s respawn poll and this side's 20s writer timeout.
+            // Observed in production 2026-08-16 on 011-madison, where the writer
+            // attached 6 seconds after this side had already given up.
+            //
+            // So: log it and play the item bare. A missing watermark is a defect
+            // a viewer can watch through; a black screen is not.
+            Some(spec) => match self
+                .signal_overlay_wanted_and_wait_ready(&spec.fifo_path)
+                .await
+            {
+                Ok(fifo) => (
                     Some(OverlayInput {
                         // ffmpeg reads the descriptor we already opened, never the
                         // fifo path — an open it performed itself could not be
@@ -756,10 +768,14 @@ impl ChannelSession {
                         y: spec.y,
                     }),
                     Some(fifo),
-                )
-            } else {
-                (None, None)
-            };
+                ),
+                Err(e) => {
+                    log::warn!("overlay unavailable for this item, playing without it: {e}");
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
 
         let mut input_settings = InputSettings {
             start: current_item.start,
