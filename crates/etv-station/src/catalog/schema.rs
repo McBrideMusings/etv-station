@@ -128,6 +128,19 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE entries ADD COLUMN artwork_cache_path TEXT;
     ALTER TABLE entries ADD COLUMN artwork_source_key TEXT;
     "#,
+    // v7 — soft delete (ADR 0006). An ingest pass that can no longer find a
+    // source, or an entry all of whose sources are gone, writes an ISO-8601
+    // timestamp here instead of issuing a `DELETE`. `NULL` = live, which is
+    // what every existing row gets on upgrade — correct, since anything the
+    // old binary would have deleted is already gone.
+    //
+    // Nullable with no default beyond `NULL` on purpose: "was this touched by
+    // the last full pass" is the same bookkeeping `entry_sources.last_seen`
+    // already does, and this is its missing half.
+    r#"
+    ALTER TABLE entries ADD COLUMN missing_since TEXT;
+    ALTER TABLE entry_sources ADD COLUMN missing_since TEXT;
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

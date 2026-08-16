@@ -52,6 +52,7 @@ fn library() -> Catalog {
             entry_id: id.to_string(),
             playback_path: format!("/media/{id}.mkv"),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
     };

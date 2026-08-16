@@ -40,9 +40,9 @@ pub(crate) fn canonical_index(
 
 /// Delete every file directly under `dir` that no current entry's
 /// `artwork_cache_path` names (#187) — what keeps the cache bounded by the
-/// catalog rather than growing forever. An entry pruned by
-/// [`Catalog::delete_entries_without_sources`] takes its cached image with it
-/// on the next call here; nothing else ever removes a cached file.
+/// catalog rather than growing forever. Since ADR 0006 no entry is ever
+/// removed, so in practice this only collects images an entry stopped naming
+/// (a changed Plex `thumb`); nothing else ever removes a cached file.
 ///
 /// Run once per ingest pass (see `daemon::open_and_ingest_catalog`), after
 /// both ingesters have written. A missing `dir` (artwork caching never ran)
