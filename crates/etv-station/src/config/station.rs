@@ -86,10 +86,20 @@ pub struct StationConfig {
     pub artwork_cache_dir: Option<String>,
 
     /// How long a freshly ingested catalog is trusted without contacting Plex at
-    /// all, in seconds. A restart inside this window reuses the sqlite file as
-    /// it stands — the common case when iterating on channel configs, where the
-    /// daemon may be restarted many times an hour and the library has not
-    /// changed. `0` disables the skip and re-checks Plex on every start.
+    /// all, in seconds. Two things read it, both meaning the same thing:
+    ///
+    /// - **At startup**, a restart inside this window reuses the sqlite file as
+    ///   it stands — the common case when iterating on channel configs, where
+    ///   the daemon may be restarted many times an hour and the library has not
+    ///   changed.
+    /// - **While running**, it is the interval of the catalog refresh: the
+    ///   daemon re-ingests this often, so a long-lived process cannot fall out
+    ///   of the freshness window and stay there. A rename or a new title shows
+    ///   up within one interval instead of at the next restart. The
+    ///   reconciliation sweep runs on the same tick, patching playout JSON that
+    ///   was written before the change.
+    ///
+    /// `0` disables both: no skip at startup, and no periodic refresh.
     #[serde(default = "default_catalog_refresh_secs")]
     pub catalog_refresh_secs: u64,
 

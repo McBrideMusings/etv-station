@@ -257,6 +257,28 @@ A catalog row that carries no playback source at all is skipped the same way, fo
 the same reason: a single hollow row must not take down every channel whose query
 happens to match it.
 
+**A file that moved after it was scheduled**
+Playout JSON bakes in an absolute path per item, and the daemon writes days
+ahead. A rename on disk after that — a Radarr re-import adding `[EN]`/`2.0` to a
+filename — used to leave every already-written chunk pointing at the old name,
+and the channel aired black for the whole slot. Nothing regenerated it, because
+by the daemon's own reckoning the schedule was fine.
+
+Two things now stop that. The **catalog refresh** re-ingests every
+`catalog_refresh_secs` instead of only at startup, so the catalog learns the new
+path within one interval. The **reconciliation sweep** then walks every playout
+file that has not fully aired and re-asks the catalog where each item's
+`entry_id` resolves to now: a changed path is patched in place, and an entry the
+library no longer holds at all is swapped for the same black card an unreadable
+file gets. Slot times and program metadata are untouched, so the guide still says
+what it always said. ETV-next re-reads playout JSON per item, so nothing
+restarts.
+
+An entry that disappears from the library is **marked, never deleted**
+([ADR 0006](./adr/0006-catalog-entries-are-soft-deleted.md)): the scheduler stops
+picking it, and every ledger row and enrichment edge joined on its `entry_id`
+keeps resolving. If the file comes back, the next ingest clears the mark.
+
 **Crash safety**
 Files are written atomically (write to temp + `rename(2)`). ETV-next is unaffected by `etv-station` being down — it keeps playing materialized files until the window expires.
 

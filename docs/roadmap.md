@@ -25,6 +25,18 @@ The port also surfaced [#135](https://github.com/McBrideMusings/etv-station/issu
 (`release_date` never populated) and [#137](https://github.com/McBrideMusings/etv-station/issues/137)
 (one Plex film can become two catalog entries).
 
+**The catalog stopped being a startup snapshot (2026-08-16).** Ingest ran once
+before the first generation and never again, so the running station's view of
+the library was frozen at boot. A batch of Radarr renames on the host proved what
+that costs: playout written before the rename still named the old files, ffmpeg
+could not open them, and channels 2 and 21 aired black and silence for whole
+slots while Plex had reported the correct path all along. Three changes, together:
+ingest now re-runs every `catalog_refresh_secs` inside the daemon loop; a
+reconciliation sweep on the same tick patches already-written playout JSON in
+place; and an entry the library loses is marked missing rather than deleted
+([ADR 0006](/adr/0006-catalog-entries-are-soft-deleted)), so `entry_id` stays the
+durable join key the ledger and the coming enrichment graph need.
+
 ## Next — three sequential phases of v2+ scope expansion
 
 The v2+ direction extends `etv-station` from a hand-authored Loop Forever generator into a composable, catalog-aware playout system with overlay graphics. See [PRD §Scope evolution beyond v1](/PRD#scope-evolution-beyond-v1) for the framing and rationale.

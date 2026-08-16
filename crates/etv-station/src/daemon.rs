@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,9 +157,22 @@ pub async fn run(station: Station) -> Result<(), StationError> {
 /// queued behind it — three channels dark for 6m34s over nine seconds of work.
 ///
 /// SQLite has no such limitation. The file is in WAL mode, which exists so many
-/// readers can work at once, and nothing writes it after ingest. So each channel
-/// opens its own read-only handle from `path` (see [`Catalog::open_readonly`])
-/// and there is no shared lock left to contend on.
+/// readers can work at once alongside one writer. So each channel opens its own
+/// read-only handle from `path` (see [`Catalog::open_readonly`]) and there is no
+/// shared lock left to contend on.
+///
+/// The writer is [`refresh_catalog`], on the catalog-refresh tick. A channel's
+/// handle is long-lived but its read transactions are per-statement, so the next
+/// query after a refresh commits sees the refreshed rows — which is what makes a
+/// rename visible to a running channel with nothing restarted.
+///
+/// `path_index` is the one thing here that does **not** follow a refresh: it is
+/// built once, at startup, and handed to the channel tasks by reference. It
+/// serves inline (`manual`) items path-matching onto a catalog identity, so a
+/// title first ingested after startup won't be path-matched until the next
+/// restart. Deliberate — the alternative is a lock on the hot resolve path for a
+/// case that only affects inline items — and the same staleness a config reload
+/// already warns about above.
 struct CatalogInfo {
     path: PathBuf,
     path_index: HashMap<String, String>,
@@ -556,7 +569,14 @@ fn history_catalog(
     }
 }
 
-/// What a startup should do about the Plex half of the catalog.
+/// What an ingest pass should do about the Plex half of the catalog.
+///
+/// Still consulted on every pass, including a refresh tick, even though the
+/// tick fires exactly `catalog_refresh_secs` apart and so never lands on
+/// [`PlexIngestPlan::Skip`] itself. The branch earns its place at **startup**:
+/// a restart-heavy editing session (many restarts an hour, unchanged library)
+/// reuses the sqlite file instead of paying a Plex round trip each time, which
+/// is the case the setting was added for.
 #[derive(Debug, PartialEq, Eq)]
 enum PlexIngestPlan {
     /// The catalog was ingested recently enough to trust as-is; don't contact
@@ -637,7 +657,67 @@ async fn open_and_ingest_catalog(
         return Ok(None);
     };
 
-    let mut catalog = Catalog::open(path)?;
+    let catalog = ingest_catalog(station, plex, Catalog::open(path)?).await?;
+    let identity_roots = &station.station.identity_roots;
+
+    // Build the path-match index once, now that the catalog is fully ingested.
+    let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
+    let path_index = crate::catalog::ingest::canonical_index(&catalog, &roots)?;
+
+    // The writable handle dies here. A [`refresh_catalog`] tick reopens its own
+    // for the duration of the pass; between passes nothing holds a writer.
+    drop(catalog);
+
+    Ok(Some(Arc::new(CatalogInfo {
+        path: PathBuf::from(path),
+        path_index,
+    })))
+}
+
+/// Re-run [`ingest_catalog`] against the already-open catalog file — the
+/// **catalog refresh** the daemon loop fires every `catalog_refresh_secs`
+/// (docs/CONTEXT.md).
+///
+/// Opens its own writable handle for the pass and drops it before returning.
+/// Every channel task holds a long-lived read-only handle to the same file;
+/// SQLite is in WAL mode, so one writer and many readers coexist and each
+/// reader's next statement sees whatever this pass committed. That is what
+/// makes a mid-flight refresh visible to a running channel without restarting
+/// anything.
+///
+/// Returns `Ok(())` for a station with no `catalog_path` — nothing to refresh.
+async fn refresh_catalog(station: &Station, plex: Option<&PlexEnv>) -> Result<(), StationError> {
+    let Some(path) = station
+        .station
+        .catalog_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let catalog = ingest_catalog(station, plex, Catalog::open(path)?).await?;
+    drop(catalog);
+    Ok(())
+}
+
+/// Run one ingest pass — local filesystem, then Plex, then the artwork-cache
+/// reconcile — over `catalog`, and hand the handle back.
+///
+/// Takes and returns the handle rather than borrowing it because the Plex
+/// client is blocking and has to move onto a `spawn_blocking` thread. Every
+/// failure inside is logged and swallowed: a Plex outage or a stale media mount
+/// must not take playout down, and on a refresh tick it must not end the
+/// generation either.
+///
+/// Called at startup by [`open_and_ingest_catalog`] and on every refresh tick
+/// by [`refresh_catalog`]. It is the only thing in this process that writes the
+/// catalog.
+async fn ingest_catalog(
+    station: &Station,
+    plex: Option<&PlexEnv>,
+    catalog: Catalog,
+) -> Result<Catalog, StationError> {
+    let mut catalog = catalog;
     let source_roots = &station.station.source_roots;
     let identity_roots = &station.station.identity_roots;
 
@@ -671,8 +751,8 @@ async fn open_and_ingest_catalog(
             event = "catalog.ingest.fs",
             entries = stats.entries_written,
             sources = stats.sources_written,
-            sources_pruned = stats.sources_pruned,
-            entries_pruned = stats.entries_pruned,
+            sources_marked_missing = stats.sources_marked_missing,
+            entries_marked_missing = stats.entries_marked_missing,
             "local-fs catalog ingest complete",
         ),
         Err(e) => {
@@ -734,6 +814,8 @@ async fn open_and_ingest_catalog(
                         entries = stats.entries_written,
                         sources = stats.sources_written,
                         summary_missing = stats.summary_missing,
+                        sources_marked_missing = stats.sources_marked_missing,
+                        entries_marked_missing = stats.entries_marked_missing,
                         "plex catalog ingest complete",
                     ),
                     Err(e) => {
@@ -766,18 +848,7 @@ async fn open_and_ingest_catalog(
         }
     }
 
-    // Build the path-match index once, now that the catalog is fully ingested.
-    let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
-    let path_index = crate::catalog::ingest::canonical_index(&catalog, &roots)?;
-
-    // The writable handle dies here, with the last write this process will make.
-    // Everything downstream reopens the file read-only, one handle per channel.
-    drop(catalog);
-
-    Ok(Some(Arc::new(CatalogInfo {
-        path: PathBuf::from(path),
-        path_index,
-    })))
+    Ok(catalog)
 }
 
 /// Spawn one generation's channel + overlay tasks against `station`, run until a
@@ -868,11 +939,34 @@ async fn run_generation(
         ));
     }
 
-    // `biased` makes shutdown win if both signals are pending.
-    let do_reload = select! {
-        biased;
-        _ = shutdown.notified() => false,
-        _ = reload.notified() => true,
+    // The **catalog refresh** tick. Before this, ingest ran once at startup and
+    // never again, so a library change — a rename, a new episode, a title
+    // pulled — was invisible until the next restart. `catalog_refresh_secs`
+    // already meant "how long a freshly ingested catalog is trusted"; here it
+    // becomes the interval that keeps that true rather than a window a
+    // long-lived process falls out of and never re-enters.
+    //
+    // `Delay` missed-tick behaviour, not `Burst`: a refresh that overruns the
+    // interval (a full Plex sweep of a large library takes minutes) must not
+    // come back to a queue of ticks it then runs back to back.
+    //
+    // Per generation rather than per process, so a SIGHUP that changes the
+    // interval takes effect. The first tick is one interval away, not
+    // immediate — `open_and_ingest_catalog` has just run.
+    let mut refresh = catalog_refresh_interval(station);
+
+    // `biased` makes shutdown win if both signals are pending, and both win
+    // over a refresh tick — a station being told to stop has no business
+    // starting a multi-minute Plex sweep first.
+    let do_reload = loop {
+        select! {
+            biased;
+            _ = shutdown.notified() => break false,
+            _ = reload.notified() => break true,
+            _ = tick(refresh.as_mut()) => {
+                run_catalog_refresh(station, plex).await;
+            }
+        }
     };
 
     // Stop this generation and wait for every task to wind down: channel loops
@@ -918,6 +1012,106 @@ async fn run_generation(
     }
 
     (do_reload, first_err)
+}
+
+/// The catalog-refresh ticker for one generation, or `None` when there is
+/// nothing to refresh: no `catalog_path`, or `catalog_refresh_secs = 0`.
+///
+/// Zero means "never trust the stored catalog, re-check on every start" for the
+/// startup plan ([`plex_ingest_plan`]), and there is no sensible interval to
+/// read out of it here — a zero-length `tokio` interval is an error, and
+/// treating it as "refresh continuously" would hammer Plex forever. So it
+/// disables the periodic refresh and leaves the startup behaviour alone.
+fn catalog_refresh_interval(station: &Station) -> Option<tokio::time::Interval> {
+    let has_catalog = station
+        .station
+        .catalog_path
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    if !has_catalog || station.station.catalog_refresh_secs == 0 {
+        return None;
+    }
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(station.station.catalog_refresh_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `tokio::time::interval` fires its first tick immediately. The catalog was
+    // ingested moments ago in `open_and_ingest_catalog`, so swallow it here
+    // rather than opening a station with a duplicate full sweep.
+    interval.reset();
+    Some(interval)
+}
+
+/// Await one tick of an optional interval. A `None` ticker (the station has no
+/// catalog, or refresh is disabled) never fires, so the corresponding `select!`
+/// arm is inert — the same shape [`recv_signal`] uses for a signal handler that
+/// failed to install.
+async fn tick(interval: Option<&mut tokio::time::Interval>) {
+    match interval {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// One refresh tick: re-ingest the catalog, then sweep the already-written
+/// playout JSON so it agrees with what the catalog now says (docs/CONTEXT.md,
+/// "Catalog refresh" and "Reconciliation sweep").
+///
+/// Everything here is logged and swallowed. A refresh is maintenance running
+/// underneath a station that is on the air; a Plex outage or an unreadable
+/// playout file must leave the channels streaming exactly as they were, not end
+/// the generation.
+///
+/// The sweep runs after the ingest, in the same tick, because the ingest is
+/// what makes it worth running: it is the pass that just learned the new path.
+async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>) {
+    if let Err(e) = refresh_catalog(station, plex).await {
+        tracing::error!(
+            event = "catalog.refresh_failed",
+            error = %e,
+            "periodic catalog refresh failed; keeping the catalog as it stands",
+        );
+        // Deliberately not `return`: the sweep re-reads the catalog file, and
+        // whatever the failed pass did commit is still worth reconciling
+        // against. A partial ingest that renamed half the library should fix
+        // the half it got.
+    }
+
+    let Some(path) = station
+        .station
+        .catalog_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return;
+    };
+    match crate::reconcile::reconcile_playout_paths(
+        &station.channels,
+        Path::new(path),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    {
+        Ok(counts) if counts.changed_anything() => tracing::info!(
+            event = "reconcile.swept",
+            files_examined = counts.files_examined,
+            files_rewritten = counts.files_rewritten,
+            paths_patched = counts.paths_patched,
+            items_carded = counts.items_carded,
+            "reconciled already-written playout against the refreshed catalog",
+        ),
+        Ok(counts) => tracing::debug!(
+            event = "reconcile.clean",
+            files_examined = counts.files_examined,
+            "playout on disk already agrees with the catalog",
+        ),
+        Err(e) => tracing::error!(
+            event = "reconcile.failed",
+            error = %e,
+            "could not reconcile playout against the catalog; leaving it as it is",
+        ),
+    }
 }
 
 /// Install the signal handlers that drive the daemon: SIGTERM/SIGINT request
@@ -1303,7 +1497,10 @@ mod supervisor_tests {
             .await
             .unwrap();
         let now = OffsetDateTime::now_utc();
-        let from = scan::highest_finish(&existing).await.unwrap_or(now).max(now);
+        let from = scan::highest_finish(&existing)
+            .await
+            .unwrap_or(now)
+            .max(now);
         let slot = Duration::from_secs(1800);
         let target = now + window_duration(channel.config.window_days);
         let count = ((target - from).as_seconds_f64() / 1800.0).ceil().max(0.0) as usize;
@@ -1887,7 +2084,10 @@ async fn pattern_catch_up(
     // materialized channel continues from the last item's finish, so the
     // timeline stays gapless across the seam.
     let existing = scan::scan_output_folder(output).await?;
-    let mut from = scan::highest_finish(&existing).await.unwrap_or(now).max(now);
+    let mut from = scan::highest_finish(&existing)
+        .await
+        .unwrap_or(now)
+        .max(now);
     // Only the first generation of a channel with nothing written yet joins its
     // list mid-way from a past `anchor`; see the phase calculation below.
     let mut first_generation = existing.is_empty();
