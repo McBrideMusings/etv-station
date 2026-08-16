@@ -208,11 +208,10 @@ fn main() -> Result<(), String> {
     };
 
     let grant = |plexdb: &Path, name: &str| -> Result<GrantedCapabilities, String> {
-        GrantedCapabilities::from_names(&pool_cfg.capabilities)
-            .with_datastores(&[DatastoreGrant {
-                name: name.to_string(),
-                path: plexdb.display().to_string(),
-            }])
+        GrantedCapabilities::from_names(&pool_cfg.capabilities).with_datastores(&[DatastoreGrant {
+            name: name.to_string(),
+            path: plexdb.display().to_string(),
+        }])
     };
 
     // Run 1: realistic generation — the channel's own pool_config, real

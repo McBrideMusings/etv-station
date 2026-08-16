@@ -32,7 +32,14 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     let config_path = station.config_path.clone();
     let shutdown = Arc::new(Notify::new());
     let reload = Arc::new(Notify::new());
-    spawn_signal_listener(shutdown.clone(), reload.clone());
+    // SIGUSR1 — "re-read the library now". See [`RefreshKind::Forced`].
+    let refresh_now = Arc::new(Notify::new());
+    spawn_signal_listener(shutdown.clone(), reload.clone(), refresh_now.clone());
+    let signals = Signals {
+        shutdown,
+        reload,
+        refresh_now,
+    };
 
     // Each pass of this loop runs one "generation" of channel + overlay tasks
     // against the current config. SIGHUP re-reads the config from disk and
@@ -97,8 +104,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
             catalog.as_ref(),
             &history_db,
             plex.as_ref(),
-            &shutdown,
-            &reload,
+            &signals,
         )
         .await;
 
@@ -176,6 +182,22 @@ pub async fn run(station: Station) -> Result<(), StationError> {
 struct CatalogInfo {
     path: PathBuf,
     path_index: HashMap<String, String>,
+}
+
+/// The three things a running generation waits on, all delivered by
+/// [`spawn_signal_listener`] from a Unix signal.
+///
+/// One value rather than three parameters: they are woken by one `select!`,
+/// live exactly as long as each other, and every future signal belongs here
+/// too — which is the difference between adding a variant and widening three
+/// signatures again.
+struct Signals {
+    /// SIGTERM/SIGINT — stop the generation and exit.
+    shutdown: Arc<Notify>,
+    /// SIGHUP — re-read the config from disk and start a fresh generation.
+    reload: Arc<Notify>,
+    /// SIGUSR1 — refresh the catalog now, full pass. See [`RefreshKind::Forced`].
+    refresh_now: Arc<Notify>,
 }
 
 /// Everything a channel loop needs that belongs to the *station* rather than to
@@ -657,7 +679,8 @@ async fn open_and_ingest_catalog(
         return Ok(None);
     };
 
-    let catalog = ingest_catalog(station, plex, Catalog::open(path)?).await?;
+    let catalog =
+        ingest_catalog(station, plex, Catalog::open(path)?, RefreshKind::Scheduled).await?;
     let identity_roots = &station.station.identity_roots;
 
     // Build the path-match index once, now that the catalog is fully ingested.
@@ -686,7 +709,11 @@ async fn open_and_ingest_catalog(
 /// anything.
 ///
 /// Returns `Ok(())` for a station with no `catalog_path` — nothing to refresh.
-async fn refresh_catalog(station: &Station, plex: Option<&PlexEnv>) -> Result<(), StationError> {
+async fn refresh_catalog(
+    station: &Station,
+    plex: Option<&PlexEnv>,
+    kind: RefreshKind,
+) -> Result<(), StationError> {
     let Some(path) = station
         .station
         .catalog_path
@@ -695,7 +722,7 @@ async fn refresh_catalog(station: &Station, plex: Option<&PlexEnv>) -> Result<()
     else {
         return Ok(());
     };
-    let catalog = ingest_catalog(station, plex, Catalog::open(path)?).await?;
+    let catalog = ingest_catalog(station, plex, Catalog::open(path)?, kind).await?;
     drop(catalog);
     Ok(())
 }
@@ -716,6 +743,7 @@ async fn ingest_catalog(
     station: &Station,
     plex: Option<&PlexEnv>,
     catalog: Catalog,
+    kind: RefreshKind,
 ) -> Result<Catalog, StationError> {
     let mut catalog = catalog;
     let source_roots = &station.station.source_roots;
@@ -768,12 +796,19 @@ async fn ingest_catalog(
     if let Some(plex) = plex {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let last = catalog.last_plex_ingest()?;
-        match plex_ingest_plan(
-            last,
-            now,
-            station.station.catalog_refresh_secs,
-            station.station.full_sweep_after_secs,
-        ) {
+        // A forced refresh never asks the plan. See [`RefreshKind::Forced`]: a
+        // delta cannot see a file that was renamed without Plex bumping its
+        // `updatedAt`, and repairing exactly that is why anyone sends SIGUSR1.
+        let plan = match kind {
+            RefreshKind::Forced => PlexIngestPlan::Full,
+            RefreshKind::Scheduled => plex_ingest_plan(
+                last,
+                now,
+                station.station.catalog_refresh_secs,
+                station.station.full_sweep_after_secs,
+            ),
+        };
+        match plan {
             PlexIngestPlan::Skip { age_secs } => tracing::info!(
                 event = "catalog.ingest.plex_skipped",
                 age_secs = age_secs,
@@ -865,9 +900,13 @@ async fn run_generation(
     catalog: Option<&Arc<CatalogInfo>>,
     history_db: &Arc<HistoryDb>,
     plex: Option<&PlexEnv>,
-    shutdown: &Notify,
-    reload: &Notify,
+    signals: &Signals,
 ) -> (bool, Option<StationError>) {
+    let Signals {
+        shutdown,
+        reload,
+        refresh_now,
+    } = signals;
     let mut handles = Vec::new();
     let mut supervisor_handles = Vec::new();
     // One watch history for the whole station (#126). Built per generation
@@ -956,15 +995,20 @@ async fn run_generation(
     let mut refresh = catalog_refresh_interval(station);
 
     // `biased` makes shutdown win if both signals are pending, and both win
-    // over a refresh tick — a station being told to stop has no business
-    // starting a multi-minute Plex sweep first.
+    // over a refresh — a station being told to stop has no business starting a
+    // multi-minute Plex sweep first. SIGUSR1 sits above the timer so an operator
+    // asking for a refresh now is not made to queue behind one that was about
+    // to fire anyway.
     let do_reload = loop {
         select! {
             biased;
             _ = shutdown.notified() => break false,
             _ = reload.notified() => break true,
+            _ = refresh_now.notified() => {
+                run_catalog_refresh(station, plex, RefreshKind::Forced).await;
+            }
             _ = tick(refresh.as_mut()) => {
-                run_catalog_refresh(station, plex).await;
+                run_catalog_refresh(station, plex, RefreshKind::Scheduled).await;
             }
         }
     };
@@ -1054,6 +1098,24 @@ async fn tick(interval: Option<&mut tokio::time::Interval>) {
     }
 }
 
+/// Whether a refresh may consult [`plex_ingest_plan`] or must re-read the whole
+/// library regardless of what it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshKind {
+    /// The periodic tick. `plex_ingest_plan` decides: skip, delta, or full.
+    Scheduled,
+    /// SIGUSR1, or a startup that asked for it. Always a **full** pass.
+    ///
+    /// Forcing full is the entire reason this exists. Plex's `updatedAt` is not
+    /// bumped when a file is renamed on disk — observed in prod 2026-08-16, on
+    /// items whose path had changed hours earlier and whose `updatedAt` was
+    /// still weeks or months old. A delta asks "what changed since the cursor",
+    /// so those items can never appear in one, and a forced refresh that
+    /// honoured the plan would run a delta and repair nothing — which is
+    /// precisely the situation someone reaches for this in.
+    Forced,
+}
+
 /// One refresh tick: re-ingest the catalog, then sweep the already-written
 /// playout JSON so it agrees with what the catalog now says (docs/CONTEXT.md,
 /// "Catalog refresh" and "Reconciliation sweep").
@@ -1065,8 +1127,13 @@ async fn tick(interval: Option<&mut tokio::time::Interval>) {
 ///
 /// The sweep runs after the ingest, in the same tick, because the ingest is
 /// what makes it worth running: it is the pass that just learned the new path.
-async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>) {
-    if let Err(e) = refresh_catalog(station, plex).await {
+async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>, kind: RefreshKind) {
+    tracing::info!(
+        event = "catalog.refresh_start",
+        forced = kind == RefreshKind::Forced,
+        "refreshing the catalog",
+    );
+    if let Err(e) = refresh_catalog(station, plex, kind).await {
         tracing::error!(
             event = "catalog.refresh_failed",
             error = %e,
@@ -1115,9 +1182,10 @@ async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>) {
 }
 
 /// Install the signal handlers that drive the daemon: SIGTERM/SIGINT request
-/// shutdown, SIGHUP requests a config reload. Both notify the single waiter in
-/// `run` via `notify_one`, so a signal delivered before `run` parks is not lost.
-fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>) {
+/// shutdown, SIGHUP requests a config reload, SIGUSR1 requests an immediate
+/// full catalog refresh. All notify the single waiter in `run` via
+/// `notify_one`, so a signal delivered before `run` parks is not lost.
+fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>, refresh_now: Arc<Notify>) {
     use tokio::signal::unix::{SignalKind, signal};
 
     tokio::spawn(async move {
@@ -1132,6 +1200,15 @@ fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>) {
         let mut sighup = signal(SignalKind::hangup())
             .map_err(|e| {
                 tracing::error!(event = "signal.handler_failed", signal = "SIGHUP", error = %e, "failed to install SIGHUP handler; config reload via signal disabled");
+            })
+            .ok();
+        // SIGUSR1: refresh the catalog now, don't wait for the tick. Chosen
+        // because the daemon binds no port of its own — the HTTP surface
+        // belongs to ETV-next — so a signal is the only control channel that
+        // already exists and needs no new listener, no config, and no auth.
+        let mut sigusr1 = signal(SignalKind::user_defined1())
+            .map_err(|e| {
+                tracing::error!(event = "signal.handler_failed", signal = "SIGUSR1", error = %e, "failed to install SIGUSR1 handler; on-demand catalog refresh disabled");
             })
             .ok();
 
@@ -1150,6 +1227,10 @@ fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>) {
                 _ = recv_signal(sighup.as_mut()) => {
                     tracing::info!(event = "signal.reload", signal = "SIGHUP", "sighup received, reloading config");
                     reload.notify_one();
+                }
+                _ = recv_signal(sigusr1.as_mut()) => {
+                    tracing::info!(event = "signal.refresh_now", signal = "SIGUSR1", "sigusr1 received, refreshing the catalog now");
+                    refresh_now.notify_one();
                 }
             }
         }
@@ -2914,6 +2995,49 @@ mod ingest_plan_tests {
         assert_eq!(
             plex_ingest_plan(Some(last), last, 0, SWEEP),
             PlexIngestPlan::Delta { since: last }
+        );
+    }
+
+    /// The whole point of SIGUSR1: a forced refresh must not consult the plan.
+    ///
+    /// Observed in prod 2026-08-16 — Radarr renamed four films at 21:40, Plex
+    /// served the new paths correctly when asked, but left each item's
+    /// `updatedAt` at its old value (2026-05-26 and 2026-07-15 for two of
+    /// them). A delta asks Plex for records touched since the cursor, so those
+    /// items were invisible to every delta pass and the catalog kept serving
+    /// paths whose files no longer existed. Both channels aired black.
+    ///
+    /// This asserts the shape that makes the manual lever useful: at an age
+    /// where the scheduled path would happily run a delta (or skip entirely),
+    /// forcing still yields a full pass.
+    #[test]
+    fn a_forced_refresh_is_always_full_where_a_scheduled_one_would_not_be() {
+        let last = 1_000_000;
+        // Fresh enough that the scheduled path would not even contact Plex...
+        assert_eq!(
+            plex_ingest_plan(Some(last), last + 1, REFRESH, SWEEP),
+            PlexIngestPlan::Skip { age_secs: 1 }
+        );
+        // ...and old enough that it would run a delta, which cannot see a
+        // rename Plex did not stamp.
+        assert_eq!(
+            plex_ingest_plan(Some(last), last + REFRESH as i64, REFRESH, SWEEP),
+            PlexIngestPlan::Delta { since: last }
+        );
+        // Forcing consults none of that. `ingest_catalog` matches on
+        // `RefreshKind` before it ever calls `plex_ingest_plan`, so the only
+        // thing that can come out of a forced pass is a full one.
+        assert_eq!(
+            match RefreshKind::Forced {
+                RefreshKind::Forced => PlexIngestPlan::Full,
+                RefreshKind::Scheduled => plex_ingest_plan(Some(last), last + 1, REFRESH, SWEEP),
+            },
+            PlexIngestPlan::Full,
+        );
+        assert_eq!(
+            PlexIngestPlan::Full.since(),
+            None,
+            "a full pass has no cursor"
         );
     }
 
