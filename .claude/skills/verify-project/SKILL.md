@@ -140,7 +140,7 @@ adding artwork — `d[25]` is the PNG colour type (6) and `d[24]` the bit depth 
 ```sh
 python3 -c "
 import glob
-for f in sorted(glob.glob('deploy/appdata/assets/*.png')):
+for f in sorted(glob.glob('deploy/appdata/channels/*/logo.png') + glob.glob('deploy/appdata/shared/*.png')):
     d=open(f,'rb').read(33)
     if (d[25],d[24])!=(6,8): print('CONVERT', f, d[25], d[24])"
 ffmpeg -y -i bad.png -pix_fmt rgba fixed.png   # the fix; alpha survives

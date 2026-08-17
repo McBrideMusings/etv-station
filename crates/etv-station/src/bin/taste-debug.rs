@@ -15,12 +15,12 @@
 //!
 //! Usage:
 //!   cargo run --bin taste-debug -- \
-//!     --channel deploy/appdata/channels/002-for-pierce.yaml \
+//!     --channel deploy/appdata/channels/002-for-pierce/channel.yaml \
 //!     --catalog /path/to/catalog.db \
 //!     --account-id 12345
 //!
 //! Omit `--account-id` to score against the pooled (house-wide) taste vector,
-//! matching what 001-for-you.yaml does.
+//! matching what 001-for-you/channel.yaml does.
 
 use std::path::{Path, PathBuf};
 
@@ -35,7 +35,7 @@ use etv_station::tautulli::{self, HistoryScope};
     about = "Explain a scorer plugin pool's ranking against the real catalog + plexdb snapshot"
 )]
 struct Cli {
-    /// Channel config file (e.g. deploy/appdata/channels/002-for-pierce.yaml).
+    /// Channel config file (e.g. deploy/appdata/channels/002-for-pierce/channel.yaml).
     #[arg(long)]
     channel: PathBuf,
 
@@ -52,7 +52,7 @@ struct Cli {
     /// its own `scoring.user`, via Tautulli — same as a live generation —
     /// so this is only needed to override that, or when TAUTULLI_URL/
     /// TAUTULLI_API_KEY aren't set. Omit entirely on an `all_users` channel
-    /// like 001-for-you.yaml for the pooled (house-wide) taste vector.
+    /// like 001-for-you/channel.yaml for the pooled (house-wide) taste vector.
     #[arg(long)]
     account_id: Option<i64>,
 

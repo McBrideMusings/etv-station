@@ -193,7 +193,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 
 | Path | What |
 |---|---|
-| `deploy/appdata/` | Local mirror of the folder the deployed container runs out of (`/config`): `station.yaml` (carrying the `ffmpeg:`/`normalization:` playback block, as `examples/station.yaml` does), `channels/`, `blocks/`, `overlays/`, `plugins/` (scorer scripts a channel names via `plugin:`, resolved relative to the channel file). Pushing it is a config change; rebuilding the image is a code change. Only the README is committed — the rest is personal, like `examples/channels/`. See the README inside. |
+| `deploy/appdata/` | Local mirror of the folder the deployed container runs out of (`/config`): `station.yaml` (carrying the `ffmpeg:`/`normalization:` playback block, as `examples/station.yaml` does), `channels/<name>/` (one dir per channel: `channel.yaml` + its own `overlay.toml` + `logo.png`), `shared/` (overlay+asset pairs more than one channel points at), `plugins/` (scorer scripts a channel names via `plugin:`, resolved relative to the channel file). Pushing it is a config change; rebuilding the image is a code change. Only the README is committed — the rest is personal, like `examples/channels/`. See the README inside. |
 | `tmp/run.log` | Tee'd output of the most recent dev/tooling invocation. Inspect after a failed run. |
 | `target/` | Cargo build output. Gitignored. |
 | `docs/.vitepress/cache/`, `docs/.vitepress/dist/` | VitePress cache and build output. Gitignored. |

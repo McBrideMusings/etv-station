@@ -5,15 +5,15 @@
 # + plexdb snapshot.
 #
 # Subcommand form picks --channel for you, discovered live from whichever
-# deploy/appdata/channels/*.yaml actually declare a `plugin:` pool — nothing
-# hardcoded, so a new plugin-backed channel shows up here with no edit to
-# this file. A single_user channel (For Pierce, For Madi) resolves its own
-# account over Tautulli inside the Rust tool itself, same as a live
+# deploy/appdata/channels/*/channel.yaml actually declare a `plugin:` pool —
+# nothing hardcoded, so a new plugin-backed channel shows up here with no
+# edit to this file. A single_user channel (For Pierce, For Madi) resolves
+# its own account over Tautulli inside the Rust tool itself, same as a live
 # generation — no name-to-id table here, and nothing personally-identifying
 # in this committed file (deploy/appdata/ itself is gitignored).
 #
 #   ./tools/taste-debug.sh                          # list available channels
-#   ./tools/taste-debug.sh for-pierce                # explain 002-for-pierce.yaml
+#   ./tools/taste-debug.sh for-pierce                # explain 002-for-pierce/channel.yaml
 #   ./tools/taste-debug.sh endless --top 10 --extended-target-count 500
 #   ./tools/taste-debug.sh --channel path/to/other.yaml ...   # raw passthrough
 #
@@ -37,16 +37,16 @@ CACHE_DIR="tmp/claude/scratchpad/taste-debug"
 DEFAULT_CATALOG="$CACHE_DIR/catalog.db"
 DEFAULT_PLEXDB="$CACHE_DIR/plexdb.snapshot.db"
 
-# name (file stem, numeric prefix stripped) -> path, one per plugin-backed
-# channel. Discovered by grepping for `plugin:` rather than hand-listed, so
-# 001-for-you.yaml becomes `for-you`, 045-endless.yaml becomes `endless`, and
-# a future plugin channel needs no edit here.
+# name (channel dir name, numeric prefix stripped) -> path, one per
+# plugin-backed channel. Discovered by grepping for `plugin:` rather than
+# hand-listed, so 001-for-you/ becomes `for-you`, 045-endless/ becomes
+# `endless`, and a future plugin channel needs no edit here.
 plugin_channel_path() {
   local name="$1" f stem
-  for f in "$CHANNELS_DIR"/*.yaml; do
+  for f in "$CHANNELS_DIR"/*/channel.yaml; do
     [ -f "$f" ] || continue
     grep -q "plugin:" "$f" || continue
-    stem="$(basename "$f" .yaml | sed -E 's/^[0-9]+-//')"
+    stem="$(basename "$(dirname "$f")" | sed -E 's/^[0-9]+-//')"
     [ "$stem" = "$name" ] && { echo "$f"; return 0; }
   done
   return 1
@@ -54,10 +54,10 @@ plugin_channel_path() {
 
 list_plugin_channels() {
   local f stem
-  for f in "$CHANNELS_DIR"/*.yaml; do
+  for f in "$CHANNELS_DIR"/*/channel.yaml; do
     [ -f "$f" ] || continue
     grep -q "plugin:" "$f" || continue
-    stem="$(basename "$f" .yaml | sed -E 's/^[0-9]+-//')"
+    stem="$(basename "$(dirname "$f")" | sed -E 's/^[0-9]+-//')"
     echo "  $stem  ($f)"
   done
 }
