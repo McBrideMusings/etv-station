@@ -5,6 +5,7 @@ resolver = "3"
 
 [workspace.dependencies]
 ersatztv = { path = "vendor/etv-next/crates/ersatztv" }
+ersatztv-channel = { path = "vendor/etv-next/crates/ersatztv-channel" }
 ersatztv-core = { path = "vendor/etv-next/crates/ersatztv-core" }
 ersatztv-playout = { path = "vendor/etv-next/crates/ersatztv-playout" }
 etv-station = { path = "crates/etv-station" }

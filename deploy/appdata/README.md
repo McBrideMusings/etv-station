@@ -8,7 +8,9 @@ not require a rebuild.
 
 ```
 deploy/appdata/
-  station.yaml                        the station config the daemon loads
+  station.yaml                        the station config the daemon loads —
+                                      carries the ffmpeg + normalization block
+                                      every channel body is built from
   channels/                           one file per channel
   blocks/                             block definitions the channels reference
   overlays/                           overlay specs + their scripts
@@ -17,9 +19,6 @@ deploy/appdata/
   plugins/                            scorer scripts a channel's pool names via
                                       `plugin:`, resolved relative to the
                                       channel file (so `../plugins/x.rhai`)
-  etv-next/
-    normalization.default.json        the ffmpeg + normalization block every
-                                      channel body is built from
 ```
 
 A channel's lineup/guide display name is its own `display_name:` in
@@ -56,6 +55,6 @@ environment rather than from any file here. Tautulli is what a scorer plugin
 ranks by: without it the watch history the daemon hands the script is empty,
 and the ranking is arbitrary.
 
-Only `README.md` and `etv-next/normalization.default.json` are committed — the
-channels, blocks, overlays, and the station config itself are personal, the same
-way `examples/channels/` is.
+Only `README.md` is committed — the channels, blocks, overlays, and the
+station config itself (including its `ffmpeg:`/`normalization:` block) are
+personal, the same way `examples/channels/` is.

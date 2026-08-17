@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 cel = { workspace = true }
 clap = { workspace = true }
+# ETV-next's own playback profile types (`ffmpeg` / `normalization`). Borrowed
+# rather than redeclared so a renamed or retyped upstream field is a compile
+# error here instead of a station.yaml key ETV-next silently ignores.
+ersatztv-channel = { workspace = true }
 ersatztv-core = { workspace = true }
 ersatztv-playout = { workspace = true }
 etv-overlay = { workspace = true }

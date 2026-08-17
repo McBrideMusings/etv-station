@@ -32,8 +32,9 @@ Subtitles are entirely ETV-next's work — the station never opens a media file
 to look for them. What the station decides is *which of the two ways* ETV-next
 should do it, and it decides that for every channel at once.
 
-The switch is one field in `etv-next/normalization.default.json`, the shared
-playback block `--render-etv-next` copies into every generated `channelN.json`:
+The switch is one field in the station config's `normalization:` block, the
+shared playback body `--render-etv-next` copies into every generated
+`channelN.json`:
 
 ```json
 "subtitle": {
@@ -66,8 +67,8 @@ unselectable subtitle nobody chose. An item opts in by carrying
 `tracks.subtitle` — a `stream_index` to pick a track out of its own file, or a
 `source` to name a sidecar.
 
-`subtitle.mode` is a station-wide setting today, read from
-`normalization.default.json` alone. `presentation.json`, which used to carry a
+`subtitle.mode` is a station-wide setting today, read from the station
+config's `normalization:` block alone. `presentation.json`, which used to carry a
 per-channel deep-merge override for it, was removed outright when the channel
 display name moved into the channel YAML (#158, decision 5) — no dual support,
 no replacement decided for the config-override half of what it did. A channel

@@ -9,7 +9,7 @@ mod order;
 mod pool;
 mod rule;
 mod source;
-mod station;
+pub(crate) mod station;
 mod validate;
 
 pub use crate::guide::GuideConfig;

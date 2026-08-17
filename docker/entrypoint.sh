@@ -73,8 +73,6 @@ mkdir -p "$ETV_NEXT_DIR" || die "cannot create $ETV_NEXT_DIR"
 # Checked before the render rather than after it fails, because the render is
 # the first writer and its own error names only the file.
 require_writable "$ETV_NEXT_DIR" "the ETV-next config directory"
-[ -r "$ETV_NEXT_DIR/normalization.default.json" ] \
-    || die "missing $ETV_NEXT_DIR/normalization.default.json — it carries the ffmpeg/normalization block every channel is built from"
 
 # 1. ETV-next config, derived from the station config. Fatal on failure: booting
 #    ETV-next on last run's lineup would serve a roster that no longer exists.

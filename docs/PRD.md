@@ -24,7 +24,7 @@ Therefore anyone running ETV-next must produce playout JSON externally. The bund
 
 - **Library management.** No NFO scraping, no online metadata providers, no media DB. Items are declared explicitly in config; the operator is responsible for accurate paths and metadata. (If they want richer metadata, that's another program upstream of this one.)
 - **Real-time control plane.** v1 is config-file driven, not network-driven. No web UI, no REST API, no live-event injection endpoint. Config edits + reload signal are sufficient for v1.
-- **Encoding decisions.** This program never invokes ffmpeg for encoding, never renders frames. It only reads media metadata it needs to produce playout entries (e.g. duration via `ffprobe`). Track selection / normalization / hwaccel is ETV-next's job.
+- **Encoding decisions.** This program never invokes ffmpeg for encoding, never renders frames. It only reads media metadata it needs to produce playout entries (e.g. duration via `ffprobe`). Track selection / normalization / hwaccel are ETV-next's job to *execute* — the station owns the typed `ffmpeg:`/`normalization:` profile it hands ETV-next (see Architecture below), but never runs an encoder itself.
 - **Modifying ETV-next.** Station work does not change `vendor/etv-next/` as a side-effect. If a schema change is needed, that's a deliberate, separately committed change to the vendored tree.
 
 ## Architecture

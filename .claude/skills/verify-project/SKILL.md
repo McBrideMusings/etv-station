@@ -101,7 +101,7 @@ The overlay spec lives on the **channel**, in `channel{N}.json` — never on a
 playout item. Check the render first, because it is instant and needs no stream:
 
 ```sh
-mkdir -p tmp/claude/render && cp deploy/appdata/etv-next/normalization.default.json tmp/claude/render/
+mkdir -p tmp/claude/render
 cargo run -q -p etv-station --bin etv-station -- \
   --config <a station yaml> --render-etv-next tmp/claude/render
 python3 -c "import json;print(json.load(open('tmp/claude/render/channel1.json')).get('overlay'))"

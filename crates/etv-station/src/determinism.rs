@@ -285,6 +285,8 @@ mod tests {
                 artwork_cache_dir: None,
                 catalog_refresh_secs: 0,
                 full_sweep_after_secs: 0,
+                ffmpeg: crate::config::station::default_ffmpeg(),
+                normalization: crate::config::station::empty_normalization_for_test(),
             },
             channels: vec![LoadedChannel {
                 name: name.to_string(),

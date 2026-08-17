@@ -3810,7 +3810,7 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         let dir = tempfile::tempdir().unwrap();
         let out_base = dir.path().join("out");
         let station = format!(
-            "tz = {:?}\noutput_base = {:?}\nchannels = [\"channel.toml\"]\n",
+            "tz = {:?}\noutput_base = {:?}\nchannels = [\"channel.toml\"]\n\n[normalization.audio]\n[normalization.video]\n",
             tz,
             out_base.to_string_lossy(),
         );
@@ -3850,7 +3850,7 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         let out_base = dir.path().join("out");
         let db = dir.path().join("catalog.db");
         let station_toml = format!(
-            "tz = \"UTC\"\noutput_base = {:?}\ncatalog_path = {:?}\nchannels = [\"channel.toml\"]\n",
+            "tz = \"UTC\"\noutput_base = {:?}\ncatalog_path = {:?}\nchannels = [\"channel.toml\"]\n\n[normalization.audio]\n[normalization.video]\n",
             out_base.to_string_lossy(),
             db.to_string_lossy(),
         );

@@ -37,3 +37,36 @@ catalog_path: tmp/catalog.db
 # separate decisions (#243): `source_roots` says which directories the daemon
 # scans into the catalog, `identity_roots` says which root to strip when
 # deriving a local item's identity — setting one does not imply the other.
+
+# ETV-next's own `ffmpeg`/`normalization` playback profile — the block every
+# generated `channelN.json` is built from. Deserialized through ETV-next's own
+# config types (`ersatztv_channel::config`), so these keys are spelled exactly
+# as that crate's structs, not a station-flavoured synonym. `accel` is left
+# unset here on purpose: it is environment-driven (`ETV_ACCEL` /
+# `ETV_VAAPI_DEVICE` / `ETV_VAAPI_DRIVER`), since a hardware device node that
+# exists on one host does not exist on the next.
+ffmpeg:
+  ffmpeg_path: ""
+  ffprobe_path: ""
+  disabled_filters: []
+
+normalization:
+  audio:
+    format: aac
+    bitrate_kbps: 192
+    buffer_kbps: 384
+    channels: 2
+    sample_rate_hz: 48000
+    normalize_loudness: false
+  video:
+    format: h264
+    bit_depth: 8
+    width: 1280
+    height: 720
+    bitrate_kbps: 2000
+    buffer_kbps: 4000
+    # Baked in for the dev sample (Mac hardware accel), unlike the deployed
+    # station's config where this is left unset and comes from ETV_ACCEL.
+    accel: videotoolbox
+  subtitle:
+    mode: convert

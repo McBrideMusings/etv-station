@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use ersatztv_channel::config::{FfmpegConfig, NormalizationConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -110,6 +111,19 @@ pub struct StationConfig {
     /// this often. `0` disables delta ingest entirely: every pass is full.
     #[serde(default = "default_full_sweep_after_secs")]
     pub full_sweep_after_secs: u64,
+
+    /// ETV-next's `ffmpeg:` block, deserialized through its own type so a
+    /// renamed field fails this build instead of being silently dropped.
+    /// Every field defaults, so `ffmpeg:` can be omitted entirely.
+    #[serde(default = "default_ffmpeg")]
+    pub ffmpeg: FfmpegConfig,
+
+    /// ETV-next's `normalization:` block — the playback profile handed to
+    /// every rendered `channelN.json`. Required, not defaulted: a station with
+    /// no playback profile should fail to load rather than silently emit an
+    /// empty one that ETV-next then rejects (`audio`/`video` are required
+    /// there too).
+    pub normalization: NormalizationConfig,
 }
 
 /// 15 minutes: long enough that a restart-heavy editing session pays the ingest
@@ -126,4 +140,21 @@ fn default_full_sweep_after_secs() -> u64 {
 
 fn default_tz() -> String {
     "UTC".to_string()
+}
+
+/// `FfmpegConfig` (from `ersatztv_channel::config`) does not derive `Default`
+/// — every field on it defaults individually instead, so an empty object
+/// deserializes into the same value a hand-written `Default` impl would
+/// produce, without a second copy of upstream's field list to drift from it.
+pub(crate) fn default_ffmpeg() -> FfmpegConfig {
+    serde_json::from_value(serde_json::json!({})).expect("every FfmpegConfig field defaults")
+}
+
+/// A `NormalizationConfig` with every field left unset, for tests that build a
+/// `StationConfig` literal and don't care about the playback profile.
+/// `audio`/`video` are required, but every field inside them is `Option`.
+#[cfg(test)]
+pub(crate) fn empty_normalization_for_test() -> NormalizationConfig {
+    serde_json::from_value(serde_json::json!({"audio": {}, "video": {}}))
+        .expect("audio/video with no fields set is a valid NormalizationConfig")
 }
