@@ -72,13 +72,19 @@ impl Catalog {
     ///
     /// The station opens one of these per channel so channels never queue on a
     /// shared connection. Reads are the only thing a channel ever does: every
-    /// mutating method on this type is called from `catalog::ingest`, and that
-    /// runs once in `open_and_ingest_catalog` before any channel task is
-    /// spawned, so the database is immutable for the rest of the process.
+    /// mutating method on this type is called from `catalog::ingest`, and the
+    /// daemon runs that in exactly one place — `ingest_catalog`, at startup and
+    /// on each catalog-refresh tick — never from a channel task.
     ///
     /// `SQLITE_OPEN_READ_ONLY` makes that a guarantee rather than a convention —
     /// a write through one of these handles fails at the database rather than
-    /// silently racing the others.
+    /// silently racing the writer.
+    ///
+    /// A handle held across a refresh stays valid and starts returning the
+    /// refreshed rows: WAL mode allows one writer alongside many readers, and a
+    /// reader that holds no open transaction takes a fresh snapshot per
+    /// statement. That is what lets a renamed file reach a running channel
+    /// without restarting it.
     ///
     /// No migrations and no `journal_mode` pragma: both write, and the writable
     /// [`Self::open`] that produced this file has already applied them. The SQL
@@ -190,10 +196,21 @@ impl Catalog {
     /// results come back in `entry_id` order (a stable, deterministic set —
     /// user-facing ordering is #69's job). An expression that matches nothing
     /// yields an empty vec, never an error.
+    ///
+    /// **This is the pool-selection query, so it is where missing entries are
+    /// skipped** (ADR 0006). `missing_since IS NULL` is added unconditionally
+    /// and is not expressible in the CEL — a config author cannot ask for
+    /// missing entries, because there is nothing to play behind one.
+    ///
+    /// Nothing else gains the filter. `no_repeat_within` spacing in
+    /// [`crate::constrain`] still counts a missing entry's past airings (they
+    /// happened), and the history/attribution joins still resolve its title and
+    /// metadata for the ledger. Only *future picks* are affected.
     pub fn resolve_query(&self, cel: &str) -> Result<Vec<String>, CatalogError> {
         let where_clause = query::translate(cel)?;
         let sql = format!(
-            "SELECT entry_id FROM entries WHERE {} ORDER BY entry_id",
+            "SELECT entry_id FROM entries WHERE ({}) AND entries.missing_since IS NULL \
+             ORDER BY entry_id",
             where_clause.sql
         );
         self.ordered_ids(&sql, where_clause.params)
@@ -221,6 +238,11 @@ impl Catalog {
     }
 
     /// Insert or replace a logical entry by `entry_id`.
+    ///
+    /// Always clears `missing_since` (ADR 0006). An ingest writing this row is
+    /// an ingest that just saw the entry, so whatever a previous full pass
+    /// concluded about its absence is stale by definition. `Entry.missing_since`
+    /// is therefore an output field only — its value here is ignored.
     pub fn upsert_entry(&self, e: &Entry) -> Result<(), CatalogError> {
         self.conn.execute(
             "INSERT INTO entries (
@@ -238,7 +260,8 @@ impl Catalog {
                 release_date=excluded.release_date, duration_ms=excluded.duration_ms,
                 content_rating=excluded.content_rating, library=excluded.library,
                 primary_source=excluded.primary_source,
-                raw_metadata=excluded.raw_metadata, summary=excluded.summary",
+                raw_metadata=excluded.raw_metadata, summary=excluded.summary,
+                missing_since=NULL",
             params![
                 e.entry_id,
                 e.kind,
@@ -265,13 +288,17 @@ impl Catalog {
     }
 
     /// Attach a provenance row. Two sources on one `entry_id` = a deduped item.
+    ///
+    /// Clears `missing_since` for the same reason [`Self::upsert_entry`] does:
+    /// this pass just saw the row, so it is live whatever the last full pass
+    /// concluded. `EntrySource.missing_since` is an output field only.
     pub fn add_source(&self, s: &EntrySource) -> Result<(), CatalogError> {
         self.conn.execute(
             "INSERT INTO entry_sources (source, source_id, entry_id, playback_path, last_seen)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(source, source_id) DO UPDATE SET
                 entry_id=excluded.entry_id, playback_path=excluded.playback_path,
-                last_seen=excluded.last_seen",
+                last_seen=excluded.last_seen, missing_since=NULL",
             params![
                 s.source.as_str(),
                 s.source_id,
@@ -283,50 +310,73 @@ impl Catalog {
         Ok(())
     }
 
-    /// Drop every provenance row for `source` that this scan did not touch, and
-    /// report how many went.
+    /// Mark every provenance row for `source` that this scan did not touch, and
+    /// report how many were newly marked.
     ///
     /// A scan stamps `last_seen` with one instant, identical on every row it
     /// writes, so "not stamped with `scan_stamp`" is exactly "not seen by this
     /// scan" — a file that was moved, renamed, or deleted under a scanned root.
-    /// Without this, `add_source` (insert-or-update only) keeps that row forever:
-    /// its `playback_path` is an instruction to play a file that is not there,
-    /// and `EXISTS` membership tests in [`query`] keep counting it.
+    /// Without this, `add_source` (insert-or-update only) leaves that row
+    /// looking live forever: its `playback_path` is an instruction to play a
+    /// file that is not there.
     ///
-    /// The comparison is equality, not "older than", deliberately. `last_seen`
-    /// is an RFC3339 string and its sub-second part is variable-width, so `<`
-    /// would order `…:56.5Z` before `…:56Z`; equality needs no ordering at all.
-    /// It is also fail-safe: two scans landing on the same instant keep rows
-    /// rather than deleting live ones.
+    /// The row is **kept**, with `missing_since` set (ADR 0006). A delete could
+    /// not tell "gone forever" from "gone until the next pass re-matches it",
+    /// and guessing wrong silently orphaned every table joined on `entry_id`.
+    /// Read sites that pick a file to play must prefer a live row — see
+    /// [`crate::resolve::pick_playback_source`].
+    ///
+    /// Already-marked rows are left alone (`missing_since IS NULL` in the
+    /// predicate), so the timestamp records when the row *first* went missing
+    /// rather than when the most recent pass noticed it again.
+    ///
+    /// The `last_seen` comparison is equality, not "older than", deliberately.
+    /// `last_seen` is an RFC3339 string and its sub-second part is
+    /// variable-width, so `<` would order `…:56.5Z` before `…:56Z`; equality
+    /// needs no ordering at all. It is also fail-safe: two scans landing on the
+    /// same instant keep rows live rather than marking live ones missing.
     ///
     /// Safe only on a **full** pass over every configured root — the same rule as
     /// [`Self::delete_collection`]. On a partial pass, "not seen" means "not
-    /// looked at", and this would delete files that are still on disk.
-    pub fn sweep_unseen_sources(
+    /// looked at", and this would mark files that are still on disk.
+    pub fn mark_unseen_sources_missing(
         &self,
         source: Source,
         scan_stamp: &str,
     ) -> Result<usize, CatalogError> {
         let n = self.conn.execute(
-            "DELETE FROM entry_sources WHERE source = ?1 AND last_seen IS NOT ?2",
+            "UPDATE entry_sources SET missing_since = ?2 \
+             WHERE source = ?1 AND last_seen IS NOT ?2 AND missing_since IS NULL",
             params![source.as_str(), scan_stamp],
         )?;
         Ok(n)
     }
 
-    /// Delete every entry that has no provenance row left, and report how many
-    /// went. Their `entry_external_ids`, `tags`, and `collection_items` rows go
-    /// with them via `ON DELETE CASCADE`.
+    /// Mark every entry left with no live provenance row, and report how many
+    /// were newly marked. Their `entry_external_ids`, `tags`, and
+    /// `collection_items` rows stay exactly where they are.
     ///
-    /// An entry's `entry_sources` rows are the only thing that says where to play
-    /// it from; with none left there is nothing to play, and the entry would
-    /// otherwise linger forever satisfying queries that can never air it. Every
-    /// ingester writes a source row for each entry it creates, so an entry only
-    /// reaches zero rows by having them swept.
-    pub fn delete_entries_without_sources(&self) -> Result<usize, CatalogError> {
+    /// An entry's `entry_sources` rows are the only thing that says where to
+    /// play it from; with every one of them marked missing there is nothing to
+    /// play, so the scheduler must stop picking it ([`Self::resolve_query`]
+    /// filters on this column). It is not deleted: `entry_id` is a durable join
+    /// key for the play-history ledger and the enrichment graph, and a drive
+    /// that is briefly offline must not silently take those rows with it (ADR
+    /// 0006).
+    ///
+    /// Unconditional rather than gated on "this pass marked something": an
+    /// entry can also be left source-less by an earlier pass, and one pass that
+    /// skips it skips it forever.
+    pub fn mark_entries_missing_without_live_sources(
+        &self,
+        scan_stamp: &str,
+    ) -> Result<usize, CatalogError> {
         let n = self.conn.execute(
-            "DELETE FROM entries WHERE entry_id NOT IN (SELECT entry_id FROM entry_sources)",
-            [],
+            "UPDATE entries SET missing_since = ?1 \
+             WHERE entry_id NOT IN \
+                 (SELECT entry_id FROM entry_sources WHERE missing_since IS NULL) \
+               AND missing_since IS NULL",
+            params![scan_stamp],
         )?;
         Ok(n)
     }
@@ -358,13 +408,16 @@ impl Catalog {
 
     /// Every non-null `artwork_cache_path` currently on the books — what the
     /// cache directory is allowed to hold. The artwork-reconcile pass deletes
-    /// any file on disk not in this set (#187): an entry pruned by
-    /// [`Self::delete_entries_without_sources`] takes its cached image with
-    /// it on the next reconcile rather than leaving an orphan behind forever.
+    /// any file on disk not in this set (#187).
+    ///
+    /// Since ADR 0006 nothing removes an entry, so a missing entry keeps its
+    /// cached image — deliberately: the image is what the guide shows for its
+    /// past airings, and re-fetching it if the file resurfaces costs a network
+    /// round trip for nothing.
     pub fn all_artwork_cache_paths(&self) -> Result<HashSet<String>, CatalogError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT artwork_cache_path FROM entries WHERE artwork_cache_path IS NOT NULL")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT artwork_cache_path FROM entries WHERE artwork_cache_path IS NOT NULL",
+        )?;
         let paths = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<HashSet<_>, _>>()?;
@@ -746,7 +799,7 @@ impl Catalog {
     /// Provenance rows for an entry, ordered by source then id.
     pub fn sources_for(&self, entry_id: &str) -> Result<Vec<EntrySource>, CatalogError> {
         let mut stmt = self.conn.prepare(
-            "SELECT source, source_id, entry_id, playback_path, last_seen
+            "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since
              FROM entry_sources WHERE entry_id = ?1 ORDER BY source, source_id",
         )?;
         collect_sources(&mut stmt, params![entry_id])
@@ -757,7 +810,7 @@ impl Catalog {
     /// for path-match inherit.
     pub fn all_sources(&self) -> Result<Vec<EntrySource>, CatalogError> {
         let mut stmt = self.conn.prepare(
-            "SELECT source, source_id, entry_id, playback_path, last_seen
+            "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since
              FROM entry_sources ORDER BY source, source_id",
         )?;
         collect_sources(&mut stmt, [])
@@ -843,7 +896,7 @@ impl Catalog {
 }
 
 /// Run a prepared `entry_sources` query (columns in the canonical `source,
-/// source_id, entry_id, playback_path, last_seen` order) and map the result set
+/// source_id, entry_id, playback_path, last_seen, missing_since` order) and map the result set
 /// into typed [`EntrySource`] rows. Rows are collected before parsing so the
 /// `source` discriminator's parse error can surface as a [`CatalogError`].
 fn collect_sources(
@@ -858,29 +911,34 @@ fn collect_sources(
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
-        .map(|(source, source_id, entry_id, playback_path, last_seen)| {
-            Ok(EntrySource {
-                source: source.parse().map_err(|m| CatalogError::BadRow {
-                    field: "source",
-                    message: m,
-                })?,
-                source_id,
-                entry_id,
-                playback_path,
-                last_seen,
-            })
-        })
+        .map(
+            |(source, source_id, entry_id, playback_path, last_seen, missing_since)| {
+                Ok(EntrySource {
+                    source: source.parse().map_err(|m| CatalogError::BadRow {
+                        field: "source",
+                        message: m,
+                    })?,
+                    source_id,
+                    entry_id,
+                    playback_path,
+                    last_seen,
+                    missing_since,
+                })
+            },
+        )
         .collect()
 }
 
 /// Column list for `entries`, in the order [`row_to_entry`] reads.
 const ENTRY_COLS: &str = "entry_id, type, title, title_sort, show, show_id, season, episode, \
      absolute_episode, edition, studio, year, release_date, duration_ms, content_rating, \
-     library, primary_source, raw_metadata, summary, artwork_cache_path, artwork_source_key";
+     library, primary_source, raw_metadata, summary, artwork_cache_path, artwork_source_key, \
+     missing_since";
 
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     Ok(Entry {
@@ -914,6 +972,7 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         summary: r.get(18)?,
         artwork_cache_path: r.get(19)?,
         artwork_source_key: r.get(20)?,
+        missing_since: r.get(21)?,
     })
 }
 
@@ -1059,6 +1118,102 @@ mod tests {
         assert_eq!(got.library, None);
     }
 
+    /// The whole read-side contract of ADR 0006, in one place: a missing entry
+    /// is skipped when picking what to air next, and resolves exactly as before
+    /// through every other door — by id, by external id, by source — so the
+    /// ledger and the enrichment graph keep working.
+    #[test]
+    fn a_missing_entry_is_unschedulable_but_still_fully_resolvable() {
+        let c = cat();
+        for id in ["imdb:tt-live", "imdb:tt-gone"] {
+            c.upsert_entry(&Entry {
+                year: Some(1988),
+                ..Entry::new(id, "movie", "Die Hard", Source::Plex)
+            })
+            .unwrap();
+            c.add_source(&EntrySource {
+                source: Source::Plex,
+                source_id: format!("rk-{id}"),
+                entry_id: id.into(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: Some("2026-08-16T00:00:00Z".into()),
+                missing_since: None,
+            })
+            .unwrap();
+            c.add_external_id(ExternalNs::Imdb, id, id).unwrap();
+        }
+        // Only `tt-gone`'s source went unseen by this pass.
+        c.conn
+            .execute(
+                "UPDATE entry_sources SET last_seen = '2000-01-01T00:00:00Z'
+                 WHERE entry_id = 'imdb:tt-gone'",
+                [],
+            )
+            .unwrap();
+        c.mark_unseen_sources_missing(Source::Plex, "2026-08-16T00:00:00Z")
+            .unwrap();
+        c.mark_entries_missing_without_live_sources("2026-08-16T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(
+            c.resolve_query("item.year == 1988").unwrap(),
+            vec!["imdb:tt-live".to_string()],
+            "the pool-selection query must skip a missing entry",
+        );
+        // Every non-scheduling read still finds it.
+        let gone = c.entry("imdb:tt-gone").unwrap().unwrap();
+        assert_eq!(gone.title, "Die Hard");
+        assert!(gone.missing_since.is_some());
+        assert_eq!(
+            c.entry_id_for_external_id(ExternalNs::Imdb, "imdb:tt-gone")
+                .unwrap(),
+            Some("imdb:tt-gone".to_string()),
+        );
+        assert_eq!(
+            c.entry_id_for_source(Source::Plex, "rk-imdb:tt-gone")
+                .unwrap(),
+            Some("imdb:tt-gone".to_string()),
+        );
+        assert_eq!(c.sources_for("imdb:tt-gone").unwrap().len(), 1);
+        assert_eq!(
+            c.durations_for(&["imdb:tt-gone".to_string()])
+                .unwrap()
+                .len(),
+            0,
+            "no duration was ever written; the point is the read did not error",
+        );
+        assert!(
+            c.all_entry_ids()
+                .unwrap()
+                .contains(&"imdb:tt-gone".to_string())
+        );
+    }
+
+    /// The filter is `AND`ed onto the translated CEL, so a `WHERE` that is an
+    /// `OR` at the top level cannot leak a missing entry through its second
+    /// branch — the parenthesisation is load-bearing.
+    #[test]
+    fn the_missing_filter_binds_tighter_than_a_top_level_or() {
+        let c = cat();
+        c.upsert_entry(&Entry {
+            year: Some(1999),
+            ..Entry::new("imdb:tt-gone", "movie", "The Matrix", Source::Plex)
+        })
+        .unwrap();
+        c.conn
+            .execute(
+                "UPDATE entries SET missing_since = '2026-08-16T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            c.resolve_query(r#"item.year == 1999 || item.title == "The Matrix""#)
+                .unwrap()
+                .is_empty(),
+        );
+    }
+
     #[test]
     fn entry_round_trips_all_columns() {
         let c = cat();
@@ -1107,6 +1262,7 @@ mod tests {
             entry_id: "imdb:tt1".into(),
             playback_path: "/plex/dune.mkv".into(),
             last_seen: Some("2026-07-10T00:00:00Z".into()),
+            missing_since: None,
         })
         .unwrap();
         c.add_source(&EntrySource {
@@ -1115,6 +1271,7 @@ mod tests {
             entry_id: "imdb:tt1".into(),
             playback_path: "/Volumes/media/dune.mkv".into(),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
         let sources = c.sources_for("imdb:tt1").unwrap();
@@ -1196,6 +1353,7 @@ mod tests {
             entry_id: "id1".into(),
             playback_path: "/x".into(),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
         c.add_tag("id1", TagNs::Genre, "Sci-Fi").unwrap();

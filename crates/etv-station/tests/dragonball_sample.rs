@@ -42,6 +42,7 @@ fn dragonball_catalog() -> Catalog {
             entry_id: id.clone(),
             playback_path: format!("/media/db/s{season}e{episode}.mkv"),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
     }

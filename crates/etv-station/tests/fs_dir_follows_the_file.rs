@@ -103,6 +103,7 @@ fn an_entry_with_files_in_two_folders_answers_to_both() {
             entry_id: "imdb:tt0095016".to_string(),
             playback_path: format!("/data/media/{folder}/die-hard.mkv"),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
     }

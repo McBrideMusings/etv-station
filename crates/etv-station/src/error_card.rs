@@ -85,11 +85,23 @@ pub fn make_error_card(item: &mut ResolvedItem, path: &Path, reason: &str, slot:
         .unwrap_or_else(|| item.id.clone());
 
     item.source = SourceConfig::Lavfi {
-        params: card_params("PLAYBACK ERROR", &title, reason),
+        params: playback_error_params(&title, reason),
     };
     item.in_point = Some(Duration::ZERO);
     item.out_point = Some(slot);
     item.error_card = true;
+}
+
+/// The `lavfi` params behind [`make_error_card`]'s screen, for a caller that
+/// has no [`ResolvedItem`] to rewrite.
+///
+/// The reconciliation sweep ([`crate::reconcile`]) patches items in playout
+/// JSON that has already been written, where the item is a
+/// `PlayoutItem` — the emitted shape, past the point where a `ResolvedItem`
+/// exists. It needs the same screen, so it takes the same params rather than
+/// growing a second card that drifts from this one.
+pub(crate) fn playback_error_params(title: &str, reason: &str) -> String {
+    card_params("PLAYBACK ERROR", title, reason)
 }
 
 /// Build one segment of the card a channel airs when its **own loop** has died

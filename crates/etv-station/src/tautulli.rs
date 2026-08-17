@@ -502,6 +502,7 @@ mod tests {
             entry_id: "m1".into(),
             playback_path: "/media/alpha.mkv".into(),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
         c
@@ -611,6 +612,7 @@ mod tests {
             entry_id: "m2".into(),
             playback_path: "/media/beta.mkv".into(),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
         let got = resolved(&c, vec![row(serde_json::json!(4242), Some(7))]);

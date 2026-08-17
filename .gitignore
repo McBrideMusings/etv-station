@@ -53,9 +53,6 @@ deploy/appdata/etv-next/*
 !deploy/appdata/etv-next/normalization.default.json
 tmp-*.log
 
-# Local verify rig — machine-specific, never committed
-.claude/skills/verify-project/
-
 # Unraid GUI container template — carries this host's appdata/media paths and
 # port, so it is machine config, not project config. Synced to the host on every
 # `deploy image`; recreate it from admin.toml and the host env file.

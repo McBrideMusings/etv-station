@@ -54,6 +54,18 @@ What a viewer reads about an item rather than what plays: its title, sub-title, 
 
 The order in which [[program metadata]] is settled for one item, least specific to most: the catalog row, then the channel, then the block, then the item's own entry. A more specific layer overrides a less specific one field by field, so a block can restate the title without discarding the season number underneath it. The catalog row is the base of the cascade, not a layer in it — it is observed data, and every layer above it is an author stating an intent.
 
+## Missing entry
+
+A catalog `entries` row whose `missing_since` is non-null: every one of its `entry_sources` provenance rows lost its underlying file on a full ingest pass. Never deleted — retained for its `entry_id` (so history, watch-graph, and enrichment data joined on it stay intact) and for reuse if the file resurfaces under a source the next pass re-matches, which clears `missing_since` back to null. Skipped, not excluded, when the scheduler picks new candidates: it still counts toward `no_repeat_within` spacing for airings that already happened, it just isn't eligible to be picked again until it's no longer missing. Contrast a rename, where a source's `playback_path` changes but `missing_since` never gets set.
+
+## Reconciliation sweep
+
+The periodic pass, run on the same interval as [[catalog refresh]], that walks every not-yet-fully-aired playout JSON file (`finish > now`) and patches any item whose embedded `id` (the catalog `entry_id`, already stable across a rename) now resolves to a different `playback_path` than the one baked into the file. Rewrites the file on disk in place; ErsatzTV-next re-reads it per item with no restart needed. An item whose entry has gone missing entirely gets swapped for an error card instead of a path patch.
+
+## Catalog refresh
+
+The periodic re-run of catalog ingest (Plex + local-fs) inside the daemon's own loop, on `catalog_refresh_secs`. Replaces the old startup-only ingest, whose freshness window the same config value already governed.
+
 ## Drift
 
 The gap between when a [[daypart]] was meant to start and when it actually does, because the item before it ran past the boundary. Accepted rather than corrected: closing it would mean cutting an item short or leaving dead air, and padding it out is impossible while the library has no interstitials (#85). Bounded by the longest item in the pool.

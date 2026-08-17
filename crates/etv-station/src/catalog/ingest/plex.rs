@@ -220,6 +220,26 @@ pub struct PlexIngestStats {
     /// none and none was already on file. Logged rather than assumed (#186):
     /// a source's blank synopsis is invisible unless something counts it.
     pub summary_missing: usize,
+    /// The `last_seen` stamp every row this pass wrote carries — the one
+    /// instant [`ingest`] needs to hand
+    /// [`Catalog::mark_unseen_sources_missing`] after a **full** pass, so
+    /// "not stamped with this" means "Plex no longer reports it".
+    ///
+    /// `None` only when formatting the clock failed, in which case nothing
+    /// written carries a stamp either and marking on it would take the whole
+    /// Plex source out at once. Not a count, unlike everything above it: the
+    /// marking runs in [`ingest`] (where `since.is_none()` says whether the
+    /// pass was full) but the stamp is minted here, and passing it back beats
+    /// giving [`ingest_items`] a fourth parameter every one of its 30-odd
+    /// test call sites would have to thread through.
+    pub scan_stamp: Option<String>,
+    /// `plex` provenance rows newly marked missing by a full pass — Plex no
+    /// longer reports the item at all. Always 0 on a delta pass, where absence
+    /// means "unchanged", not "gone".
+    pub sources_marked_missing: usize,
+    /// Entries newly marked missing because every one of their provenance rows
+    /// is now missing. Always 0 on a delta pass.
+    pub entries_marked_missing: usize,
 }
 
 /// One real account Plex's own `/accounts` reports — the server owner and
@@ -277,7 +297,10 @@ pub fn ingest_items(
         .format(&time::format_description::well_known::Rfc3339)
         .ok();
 
-    let mut stats = PlexIngestStats::default();
+    let mut stats = PlexIngestStats {
+        scan_stamp: now.clone(),
+        ..PlexIngestStats::default()
+    };
     for item in items {
         let canonical = canonical_path(&item.playback_path, &roots);
         // Identity precedence (locked #47 model): (1) a GUID already known to the
@@ -426,6 +449,12 @@ pub fn ingest_items(
             entry_id: entry_id.clone(),
             playback_path: item.playback_path.clone(),
             last_seen: now.clone(),
+            // Ignored by `add_source`, which always writes NULL here: a row
+            // this pass wrote is a row this pass saw (ADR 0006). This is also
+            // the whole rename fix — Plex keys the row on `ratingKey`, which
+            // survives a rename, so the row's `playback_path` is simply
+            // updated to the new filename and `missing_since` stays clear.
+            missing_since: None,
         })?;
 
         for (ns, values) in [
@@ -676,9 +705,23 @@ pub fn ingest(
     // fetch omits unchanged collections, which must not be read as deletions.
     let prune_absent = since.is_none();
     let stats: PlexIngestStats = catalog.in_transaction(|c| {
-        let stats = ingest_items(c, &items, identity_roots)?;
+        let mut stats = ingest_items(c, &items, identity_roots)?;
         ingest_labels(c, &labels)?;
         ingest_collections(c, &collections, prune_absent)?;
+        // Reconcile *item* deletions, the same contract `ingest_collections`
+        // has had all along and the fs ingester has had since #144. Before ADR
+        // 0006 the Plex path reconciled collections and nothing else: a title
+        // pulled out of the library simply stopped being mentioned by every
+        // later fetch and sat in the catalog forever, still schedulable, still
+        // pointing at a file Plex no longer serves.
+        //
+        // Full pass only. A delta fetch returns just the changed items, so
+        // "not stamped by this pass" there means "unchanged" — marking on it
+        // would take the entire library out of the pool in one go.
+        if let (true, Some(stamp)) = (prune_absent, stats.scan_stamp.as_deref()) {
+            stats.sources_marked_missing = c.mark_unseen_sources_missing(Source::Plex, stamp)?;
+            stats.entries_marked_missing = c.mark_entries_missing_without_live_sources(stamp)?;
+        }
         c.set_last_plex_ingest(started)?;
         Ok::<PlexIngestStats, PlexIngestError>(stats)
     })?;
@@ -753,7 +796,13 @@ fn artwork_needs_fetch(current_source_key: Option<&str>, thumb: &str, file_exist
 fn artwork_filename(entry_id: &str) -> String {
     let safe: String = entry_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("{safe}.jpg")
 }
@@ -1401,7 +1450,9 @@ impl PlexClient {
                     continue;
                 }
             };
-            let current_key = current.as_ref().and_then(|e| e.artwork_source_key.as_deref());
+            let current_key = current
+                .as_ref()
+                .and_then(|e| e.artwork_source_key.as_deref());
             if !artwork_needs_fetch(current_key, thumb, path.exists()) {
                 continue;
             }
@@ -1971,6 +2022,179 @@ mod tests {
         assert_eq!(
             parse_guid("imdb:// tt0095016 "),
             Some((ExternalNs::Imdb, " tt0095016 ".into()))
+        );
+    }
+
+    /// Age every `plex` provenance row so the next pass's stamp is
+    /// unambiguously newer, the same trick `fs.rs`'s tests use. Without it two
+    /// passes in the same test can land close enough together that "not stamped
+    /// by this pass" is doing less work than the test thinks.
+    fn age_plex_rows(cat: &Catalog) {
+        cat.conn
+            .execute(
+                "UPDATE entry_sources SET last_seen = '2000-01-01T00:00:00Z'
+                 WHERE source = 'plex'",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// Before ADR 0006 the Plex ingest reconciled *collections* and nothing
+    /// else: a title deleted from the library stopped appearing in every later
+    /// fetch and simply sat in the catalog forever — still matched by queries,
+    /// still scheduled, still pointing at a file Plex no longer serves. This is
+    /// the missing half, and it is new behaviour rather than a rename of
+    /// something that already worked.
+    ///
+    /// Drives the two calls `ingest` makes after a full pass directly, with the
+    /// `scan_stamp` `ingest_items` reports — `ingest` itself needs a live Plex
+    /// server, and the marking is exactly these two statements.
+    #[test]
+    fn a_full_pass_marks_a_title_plex_no_longer_reports() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let kept = movie(
+            "rk-keep",
+            "/data/media/m/keep.mkv",
+            &[(ExternalNs::Imdb, "tt-k")],
+        );
+        let pulled = movie(
+            "rk-gone",
+            "/data/media/m/gone.mkv",
+            &[(ExternalNs::Imdb, "tt-g")],
+        );
+        ingest_items(&cat, &[kept.clone(), pulled], &roots).unwrap();
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
+        age_plex_rows(&cat);
+
+        // The next full fetch reports only the title that is still there.
+        let stats = ingest_items(&cat, &[kept], &roots).unwrap();
+        let stamp = stats.scan_stamp.clone().expect("a pass must mint a stamp");
+        assert_eq!(
+            cat.mark_unseen_sources_missing(Source::Plex, &stamp)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            cat.mark_entries_missing_without_live_sources(&stamp)
+                .unwrap(),
+            1
+        );
+
+        // Kept: live, and still schedulable.
+        assert!(
+            cat.entry("imdb:tt-k")
+                .unwrap()
+                .unwrap()
+                .missing_since
+                .is_none()
+        );
+        assert_eq!(
+            cat.resolve_query(r#"item.title != """#).unwrap(),
+            vec!["imdb:tt-k".to_string()],
+            "only the live title may be picked for a new airing",
+        );
+
+        // Pulled: marked, kept, and still readable by id for the ledger.
+        let gone = cat.entry("imdb:tt-g").unwrap().expect("the row is kept");
+        assert!(gone.missing_since.is_some());
+        assert_eq!(gone.title, "A Movie");
+        assert_eq!(cat.sources_for("imdb:tt-g").unwrap().len(), 1);
+        assert!(
+            cat.sources_for("imdb:tt-g").unwrap()[0]
+                .missing_since
+                .is_some()
+        );
+    }
+
+    /// A second full pass over an unchanged library must not keep re-stamping
+    /// what it already marked, or `missing_since` records when the last sweep
+    /// ran rather than when the title went away.
+    #[test]
+    fn marking_is_idempotent_across_full_passes() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        ingest_items(
+            &cat,
+            &[movie(
+                "rk-gone",
+                "/data/media/m/gone.mkv",
+                &[(ExternalNs::Imdb, "tt-g")],
+            )],
+            &roots,
+        )
+        .unwrap();
+        age_plex_rows(&cat);
+
+        let first = ingest_items(&cat, &[], &roots).unwrap();
+        let stamp = first.scan_stamp.clone().unwrap();
+        cat.mark_unseen_sources_missing(Source::Plex, &stamp)
+            .unwrap();
+        cat.mark_entries_missing_without_live_sources(&stamp)
+            .unwrap();
+        let marked_at = cat.entry("imdb:tt-g").unwrap().unwrap().missing_since;
+        assert!(marked_at.is_some());
+
+        let second = ingest_items(&cat, &[], &roots).unwrap();
+        let stamp = second.scan_stamp.clone().unwrap();
+        assert_eq!(
+            cat.mark_unseen_sources_missing(Source::Plex, &stamp)
+                .unwrap(),
+            0,
+            "an already-marked source must not be marked again",
+        );
+        assert_eq!(
+            cat.mark_entries_missing_without_live_sources(&stamp)
+                .unwrap(),
+            0,
+        );
+        assert_eq!(
+            cat.entry("imdb:tt-g").unwrap().unwrap().missing_since,
+            marked_at,
+            "missing_since records when it first went missing, not when we last looked",
+        );
+    }
+
+    /// The resurrection case ADR 0006 keeps the row for: the title comes back,
+    /// the next pass writes the row, and the mark clears with no migration and
+    /// no special path — every join built on the `entry_id` never noticed.
+    #[test]
+    fn a_title_that_comes_back_is_live_again() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let film = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        ingest_items(&cat, std::slice::from_ref(&film), &roots).unwrap();
+        age_plex_rows(&cat);
+
+        let stats = ingest_items(&cat, &[], &roots).unwrap();
+        let stamp = stats.scan_stamp.clone().unwrap();
+        cat.mark_unseen_sources_missing(Source::Plex, &stamp)
+            .unwrap();
+        cat.mark_entries_missing_without_live_sources(&stamp)
+            .unwrap();
+        assert!(
+            cat.entry("imdb:tt-a")
+                .unwrap()
+                .unwrap()
+                .missing_since
+                .is_some()
+        );
+
+        ingest_items(&cat, &[film], &roots).unwrap();
+
+        let back = cat.entry("imdb:tt-a").unwrap().unwrap();
+        assert!(
+            back.missing_since.is_none(),
+            "an ingest that sees the entry clears the mark"
+        );
+        assert!(
+            cat.sources_for("imdb:tt-a").unwrap()[0]
+                .missing_since
+                .is_none()
+        );
+        assert_eq!(
+            cat.resolve_query(r#"item.title != """#).unwrap(),
+            vec!["imdb:tt-a".to_string()]
         );
     }
 

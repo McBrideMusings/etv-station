@@ -155,6 +155,17 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
     // exit. `None` means "not cold" — any request is live. Set instead of
     // deleting the marker, so a request newer than this wakes us again.
     let mut cold_at: Option<std::time::SystemTime> = None;
+    // The `.overlay-wanted` mtime as it stood when the running overlay was
+    // spawned — the request that overlay is actually serving. Going cold must
+    // record THIS, not the mtime at the moment of reaping: etv-next rewrites the
+    // marker before every item, so a viewer arriving during the overlay's idle
+    // wind-down leaves a fresher mtime that the reap would otherwise capture as
+    // "already served", and the supervisor would sleep through a live request.
+    // That is the 2026-08-16 011-madison failure: marker touched at 06:08:39,
+    // despawn recorded it at 06:08:40, and no overlay came back until the worker
+    // rewrote the marker 25s later — 6s after it had given up and blacked out
+    // the item.
+    let mut served_mtime: Option<std::time::SystemTime> = None;
 
     loop {
         tokio::select! {
@@ -211,7 +222,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                                     // See the module docs: whoever writes the
                                     // marker owns it, and a returning viewer is
                                     // signalled by a fresher mtime.
-                                    cold_at = wanted_mtime(&ctx);
+                                    cold_at = served_mtime;
                                 }
                             }
                         } else if !ready_observed && ctx.ready_path().exists() {
@@ -250,6 +261,7 @@ pub async fn run(ctx: OverlayContext, shutdown: Arc<Notify>) {
                                     child = Some(new_child);
                                     ready_observed = false;
                                     cold_at = None;
+                                    served_mtime = wanted_mtime(&ctx);
                                 }
                                 Err(err) => {
                                     tracing::warn!(
@@ -476,6 +488,45 @@ mod tests {
             .set_modified(later)
             .unwrap();
         assert!(wants_overlay(&ctx, cold));
+    }
+
+    /// The 2026-08-16 011-madison failure. A viewer arrives while the overlay is
+    /// winding down: the worker rewrites `.overlay-wanted` at 06:08:39, the
+    /// overlay is reaped at 06:08:40, and the reap records *that* fresh mtime as
+    /// the request it served. The live request then looks already-served, no
+    /// overlay comes back, and the worker blacks the item out after its 20s wait.
+    ///
+    /// Recording the mtime captured at SPAWN keeps the viewer's newer request
+    /// distinguishable, so the next poll respawns.
+    #[test]
+    fn a_request_arriving_during_wind_down_is_not_recorded_as_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+
+        // The marker as it stood when the overlay was spawned.
+        std::fs::write(ctx.wanted_path(), b"").unwrap();
+        let served_mtime = wanted_mtime(&ctx);
+
+        // A viewer arrives just before the reap; the worker rewrites the marker.
+        let arrival = served_mtime.unwrap() + Duration::from_secs(60);
+        std::fs::File::open(ctx.wanted_path())
+            .unwrap()
+            .set_modified(arrival)
+            .unwrap();
+
+        // Reaping records what the overlay served, NOT what the marker says now.
+        let cold = served_mtime;
+        assert!(
+            wants_overlay(&ctx, cold),
+            "a request that landed after the overlay spawned must still be live"
+        );
+
+        // The bug: recording the marker's mtime at reap time swallows it.
+        let cold_at_reap = wanted_mtime(&ctx);
+        assert!(
+            !wants_overlay(&ctx, cold_at_reap),
+            "guards the regression — this is what the old code recorded"
+        );
     }
 
     #[test]

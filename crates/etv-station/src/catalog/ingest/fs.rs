@@ -14,9 +14,16 @@
 //!
 //! A full pass also reconciles **deletions** (#144): every row it writes carries
 //! the same `last_seen` stamp, and rows left holding an older one are files that
-//! moved, were renamed, or were deleted — they are swept, along with any entry
-//! whose last provenance row went with them. Without that, a row for a file that
-//! is gone keeps telling a channel to play a path that no longer resolves.
+//! moved, were renamed, or were deleted — they get `missing_since` set, along
+//! with any entry whose last live provenance row went with them. Without that, a
+//! row for a file that is gone keeps telling a channel to play a path that no
+//! longer resolves.
+//!
+//! Marked, not deleted (ADR 0006): `entry_id` is a durable join key for the
+//! play-history ledger and the enrichment graph, and "gone forever" is
+//! indistinguishable at this point from "gone until the next pass re-matches
+//! it". The scheduler stops picking a missing entry ([`crate::catalog::Catalog::resolve_query`]);
+//! everything joined on its id keeps resolving.
 //!
 //! It writes **no tags at all**. The directory a file sits in used to be stored
 //! as an `fs_dir` tag, which only ever accumulated: move a bumper from
@@ -57,13 +64,15 @@ pub struct FsIngestStats {
     /// Files that inherited an existing entry_id via path-match (cross-source
     /// dedup or a prior scan).
     pub inherited: usize,
-    /// `local_fs` provenance rows deleted because the file behind them is no
-    /// longer under a scanned root (moved, renamed, or deleted). Always 0 unless
-    /// the pass was a full one.
-    pub sources_pruned: usize,
-    /// Entries deleted because pruning took their last provenance row, leaving
-    /// nothing to play.
-    pub entries_pruned: usize,
+    /// `local_fs` provenance rows newly marked missing because the file behind
+    /// them is no longer under a scanned root (moved, renamed, or deleted).
+    /// Always 0 unless the pass was a full one. The rows are kept, not deleted
+    /// (ADR 0006), so this counts rows that went from live to missing — a row
+    /// already missing before this pass is not counted again.
+    pub sources_marked_missing: usize,
+    /// Entries newly marked missing because every one of their provenance rows
+    /// is now missing, leaving nothing to play.
+    pub entries_marked_missing: usize,
 }
 
 /// Walk `roots`, probe durations, and ingest into `catalog`. `identity_roots`
@@ -121,10 +130,11 @@ pub async fn ingest_roots(
 ///
 /// `prune_absent` reconciles *deletions*, the same contract as
 /// [`super::plex::ingest_collections`]: when true, any `local_fs` provenance row
-/// this pass did not stamp is deleted, and any entry left with no provenance row
-/// at all goes with it. It must be true only when `files` is the **complete**
-/// content of every root the caller scanned — on a partial pass, absence means
-/// "not looked at", and pruning would drop files that are still on disk.
+/// this pass did not stamp is marked missing, and any entry left with no live
+/// provenance row at all is marked too. It must be true only when `files` is the
+/// **complete** content of every root the caller scanned — on a partial pass,
+/// absence means "not looked at", and marking would take files that are still on
+/// disk out of the scheduling pool.
 pub fn ingest_files(
     catalog: &Catalog,
     files: &[(PathBuf, Option<f64>)],
@@ -175,6 +185,9 @@ pub fn ingest_files(
             entry_id: entry_id.clone(),
             playback_path: raw,
             last_seen: now.clone(),
+            // Ignored by `add_source`, which always writes NULL here: a row
+            // this pass wrote is a row this pass saw (ADR 0006).
+            missing_since: None,
         })?;
 
         stats.sources_written += 1;
@@ -183,14 +196,15 @@ pub fn ingest_files(
     // Reconcile deletions last, so every row this pass touched already carries
     // `now` and only genuinely-absent files are left holding an older stamp.
     // `now` is `None` only if formatting the clock failed, in which case nothing
-    // written above carries a stamp either — sweeping on it would delete the
-    // whole source. Keeping the rows is the safe failure.
+    // written above carries a stamp either — sweeping on it would mark the
+    // whole source missing. Leaving the rows live is the safe failure.
     if let (true, Some(stamp)) = (prune_absent, now.as_deref()) {
-        stats.sources_pruned = catalog.sweep_unseen_sources(Source::LocalFs, stamp)?;
-        // Unconditional, not gated on `sources_pruned > 0`: an entry can also be
-        // left sourceless by an earlier pass that swept nothing, and one pass
-        // that leaves it behind leaves it behind forever.
-        stats.entries_pruned = catalog.delete_entries_without_sources()?;
+        stats.sources_marked_missing =
+            catalog.mark_unseen_sources_missing(Source::LocalFs, stamp)?;
+        // Unconditional, not gated on `sources_marked_missing > 0`: an entry can
+        // also be left with only missing sources by an earlier pass that marked
+        // nothing, and one pass that leaves it behind leaves it behind forever.
+        stats.entries_marked_missing = catalog.mark_entries_missing_without_live_sources(stamp)?;
     }
     Ok(stats)
 }
@@ -277,16 +291,30 @@ mod tests {
             .unwrap();
     }
 
+    /// Every `local_fs` path the catalog would still play — missing rows are
+    /// kept on disk (ADR 0006) but are not a file anything should open, so they
+    /// are excluded here the same way [`crate::resolve::pick_playback_source`]
+    /// excludes them.
     fn fs_paths(cat: &Catalog) -> Vec<String> {
         let mut paths: Vec<String> = cat
             .all_sources()
             .unwrap()
             .into_iter()
-            .filter(|s| s.source == Source::LocalFs)
+            .filter(|s| s.source == Source::LocalFs && s.missing_since.is_none())
             .map(|s| s.playback_path)
             .collect();
         paths.sort();
         paths
+    }
+
+    /// `missing_since` for one `local_fs` row, by playback path. `None` = live;
+    /// the outer `None` means no such row at all.
+    fn fs_missing_since(cat: &Catalog, playback_path: &str) -> Option<Option<String>> {
+        cat.all_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.source == Source::LocalFs && s.playback_path == playback_path)
+            .map(|s| s.missing_since)
     }
 
     #[test]
@@ -339,6 +367,7 @@ mod tests {
             entry_id: "imdb:tt0095016".into(),
             playback_path: "/data/media/movies/Die Hard (1988)/Die.Hard.mkv".into(),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
 
@@ -387,6 +416,7 @@ mod tests {
             entry_id: "fs:deadbeef".into(),
             playback_path: path.into(),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
         cat.upsert_entry(&Entry::new("imdb:tt1", "movie", "X", Source::Plex))
@@ -397,6 +427,7 @@ mod tests {
             entry_id: "imdb:tt1".into(),
             playback_path: path.into(),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
 
@@ -431,8 +462,8 @@ mod tests {
         // Second pass: same files → same rows, now all inherited, no duplication.
         let stats = ingest_files(&cat, &files, &roots, true).unwrap();
         assert_eq!(stats.inherited, 2);
-        assert_eq!(stats.sources_pruned, 0);
-        assert_eq!(stats.entries_pruned, 0);
+        assert_eq!(stats.sources_marked_missing, 0);
+        assert_eq!(stats.entries_marked_missing, 0);
         assert_eq!(cat.all_entry_ids().unwrap(), first_ids);
         let second_sources: usize = first_ids
             .iter()
@@ -462,8 +493,12 @@ mod tests {
         assert_eq!(cat.all_sources().unwrap().len(), 1);
     }
 
+    /// A file deleted off disk stops being playable, but its row and its entry
+    /// stay (ADR 0006) — with `missing_since` set, which is what takes it out of
+    /// the scheduling pool. The old behaviour deleted both, which silently
+    /// orphaned every ledger row joined on the `entry_id`.
     #[test]
-    fn full_scan_forgets_a_deleted_file() {
+    fn full_scan_marks_a_deleted_file_missing_and_keeps_its_row() {
         let cat = Catalog::open_in_memory().unwrap();
         let roots = ["/data/media".to_string()];
         ingest_files(
@@ -488,10 +523,58 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stats.sources_pruned, 1);
-        assert_eq!(stats.entries_pruned, 1);
+        assert_eq!(stats.sources_marked_missing, 1);
+        assert_eq!(stats.entries_marked_missing, 1);
         assert_eq!(fs_paths(&cat), vec!["/data/media/bumpers/keep.mkv"]);
-        assert_eq!(cat.all_entry_ids().unwrap().len(), 1);
+        // Both rows are still there; only one of them is still live.
+        assert_eq!(cat.all_sources().unwrap().len(), 2);
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
+        assert!(
+            fs_missing_since(&cat, "/data/media/bumpers/gone.mkv")
+                .expect("the deleted file's row must be kept, not deleted")
+                .is_some(),
+            "the deleted file's provenance row must carry missing_since",
+        );
+        assert!(
+            fs_missing_since(&cat, "/data/media/bumpers/keep.mkv")
+                .unwrap()
+                .is_none(),
+            "the surviving file's row must stay live",
+        );
+        let gone_id = cat
+            .all_entry_ids()
+            .unwrap()
+            .into_iter()
+            .find(|id| fs_paths_for(&cat, id) == vec!["/data/media/bumpers/gone.mkv"])
+            .expect("the deleted file's entry must be kept");
+        assert!(
+            cat.entry(&gone_id)
+                .unwrap()
+                .unwrap()
+                .missing_since
+                .is_some(),
+            "an entry with no live source left must be marked missing",
+        );
+        // And the scheduler stops picking it, which is the whole point.
+        assert_eq!(
+            cat.resolve_query(r#"item.fs_dir == "bumpers""#)
+                .unwrap()
+                .len(),
+            1,
+        );
+    }
+
+    /// Every `local_fs` playback path attached to one entry, live or missing.
+    fn fs_paths_for(cat: &Catalog, entry_id: &str) -> Vec<String> {
+        let mut paths: Vec<String> = cat
+            .sources_for(entry_id)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.source == Source::LocalFs)
+            .map(|s| s.playback_path)
+            .collect();
+        paths.sort();
+        paths
     }
 
     #[test]
@@ -517,8 +600,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs_paths(&cat), vec!["/data/media/commercials/x.mkv"]);
-        let ids = cat.all_entry_ids().unwrap();
-        assert_eq!(ids.len(), 1);
+        // Two entries now, because the `fs:` id is derived from the path and the
+        // path changed — but only the new one is live. The old one is kept and
+        // marked missing (ADR 0006) rather than deleted, so anything joined on
+        // its id still resolves.
+        let ids: Vec<String> = cat
+            .all_entry_ids()
+            .unwrap()
+            .into_iter()
+            .filter(|id| cat.entry(id).unwrap().unwrap().missing_since.is_none())
+            .collect();
+        assert_eq!(ids.len(), 1, "only the moved-to entry is still live");
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
         // The move re-typed it, and `item.fs_dir` follows the file: it answers to
         // the folder the file is in now and stops answering to the one it left
         // (#123). Here the `fs:` id is derived from the path, so the move also
@@ -557,8 +650,13 @@ mod tests {
         assert_eq!(tag_rows, 0);
     }
 
+    /// Marking the last source missing takes the entry out of the scheduling
+    /// pool, but leaves the row and everything hanging off it — external ids,
+    /// tags, collection membership — exactly where they were. That retention is
+    /// the point of ADR 0006: `entry_id` is a join key the play-history ledger
+    /// and the enrichment graph depend on.
     #[test]
-    fn sweeping_the_last_source_takes_the_entry_and_its_children() {
+    fn marking_the_last_source_keeps_the_entry_and_its_children() {
         let cat = Catalog::open_in_memory().unwrap();
         let roots = ["/data/media".to_string()];
         ingest_files(
@@ -580,23 +678,28 @@ mod tests {
         // The root is now empty: nothing left to attach provenance to.
         let stats = ingest_files(&cat, &[], &roots, true).unwrap();
 
-        assert_eq!(stats.sources_pruned, 1);
-        assert_eq!(stats.entries_pruned, 1);
-        assert!(cat.entry(&id).unwrap().is_none());
+        assert_eq!(stats.sources_marked_missing, 1);
+        assert_eq!(stats.entries_marked_missing, 1);
+        assert!(
+            cat.entry(&id).unwrap().unwrap().missing_since.is_some(),
+            "the entry is kept, marked missing",
+        );
         assert!(
             cat.resolve_query(r#"item.fs_dir == "bumpers""#)
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "a missing entry must not be schedulable",
         );
         assert_eq!(
             cat.entry_id_for_external_id(ExternalNs::Imdb, "tt-swept")
                 .unwrap(),
-            None
+            Some(id),
+            "the external id must keep resolving — that is what makes the file resurfacing a re-match rather than a fresh entry",
         );
     }
 
     #[test]
-    fn a_partial_scan_deletes_nothing() {
+    fn a_partial_scan_marks_nothing() {
         let cat = Catalog::open_in_memory().unwrap();
         let roots = ["/data/media".to_string()];
         ingest_files(
@@ -621,8 +724,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stats.sources_pruned, 0);
-        assert_eq!(stats.entries_pruned, 0);
+        assert_eq!(stats.sources_marked_missing, 0);
+        assert_eq!(stats.entries_marked_missing, 0);
         assert_eq!(
             fs_paths(&cat),
             vec![
@@ -646,6 +749,7 @@ mod tests {
             entry_id: "imdb:tt1".into(),
             playback_path: path.into(),
             last_seen: Some("2000-01-01T00:00:00Z".into()),
+            missing_since: None,
         })
         .unwrap();
         ingest_files(&cat, &[file(path, 120.0)], &roots, true).unwrap();
@@ -654,13 +758,24 @@ mod tests {
         // The local copy vanished; Plex still serves the same title.
         let stats = ingest_files(&cat, &[], &roots, true).unwrap();
 
-        assert_eq!(stats.sources_pruned, 1);
-        assert_eq!(stats.entries_pruned, 0);
+        assert_eq!(stats.sources_marked_missing, 1);
+        assert_eq!(
+            stats.entries_marked_missing, 0,
+            "the Plex row is still live, so the entry is not missing",
+        );
         assert!(fs_paths(&cat).is_empty());
         // The Plex row's own `last_seen` is stale too, and the fs sweep must not
-        // have touched it.
-        assert_eq!(cat.sources_for("imdb:tt1").unwrap().len(), 1);
-        assert_eq!(cat.entry("imdb:tt1").unwrap().unwrap().title, "Die Hard");
+        // have touched it — nor may the entry have been marked.
+        let plex_row = cat
+            .sources_for("imdb:tt1")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.source == Source::Plex)
+            .unwrap();
+        assert!(plex_row.missing_since.is_none());
+        let entry = cat.entry("imdb:tt1").unwrap().unwrap();
+        assert_eq!(entry.title, "Die Hard");
+        assert!(entry.missing_since.is_none());
     }
 
     /// The daemon's actual front door, driven over a real directory: scan, move
@@ -669,7 +784,7 @@ mod tests {
     /// what "still there" means. Files are empty, so `ffprobe` fails and every
     /// duration is `None` — the sweep does not depend on probing.
     #[tokio::test]
-    async fn ingest_roots_over_a_real_directory_forgets_a_moved_file() {
+    async fn ingest_roots_over_a_real_directory_marks_a_moved_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("bumpers")).unwrap();
@@ -681,7 +796,7 @@ mod tests {
         let identity_roots = vec![root.to_string_lossy().into_owned()];
         let stats = ingest_roots(&cat, &roots, &identity_roots).await.unwrap();
         assert_eq!(stats.sources_written, 1);
-        assert_eq!(stats.sources_pruned, 0);
+        assert_eq!(stats.sources_marked_missing, 0);
         age_fs_rows(&cat);
 
         std::fs::rename(
@@ -692,8 +807,8 @@ mod tests {
 
         let stats = ingest_roots(&cat, &roots, &identity_roots).await.unwrap();
         assert_eq!(stats.sources_written, 1);
-        assert_eq!(stats.sources_pruned, 1);
-        assert_eq!(stats.entries_pruned, 1);
+        assert_eq!(stats.sources_marked_missing, 1);
+        assert_eq!(stats.entries_marked_missing, 1);
         assert_eq!(
             fs_paths(&cat),
             vec![
@@ -702,7 +817,9 @@ mod tests {
                     .into_owned()
             ]
         );
-        assert_eq!(cat.all_entry_ids().unwrap().len(), 1);
+        // Two rows on the books, one of them missing — the moved-from path is
+        // kept so the file moving back is a re-match, not a fresh entry.
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
     }
 
     #[test]

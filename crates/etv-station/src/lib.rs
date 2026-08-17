@@ -15,6 +15,7 @@ pub mod guide;
 pub mod history;
 pub mod overlay_supervisor;
 pub mod pattern;
+pub mod reconcile;
 pub mod resolve;
 pub mod resume;
 pub mod rule;

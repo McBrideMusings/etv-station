@@ -254,6 +254,16 @@ pub struct Entry {
     /// unchanged one without re-downloading. Same write rule as
     /// `artwork_cache_path`.
     pub artwork_source_key: Option<String>,
+    /// ISO-8601 timestamp set when a full ingest pass finds zero live sources
+    /// for this entry. `None` = active. Cleared the next time any ingest sees
+    /// the entry again — a row being written means it is not missing, full
+    /// stop. See ADR 0006: this replaces the hard delete, so `entry_id` stays a
+    /// durable join key for history, attribution, and the enrichment graph.
+    ///
+    /// Never set by a caller: [`super::Catalog::upsert_entry`] ignores whatever
+    /// is in this field and writes `NULL`. Only the mark/clear pair
+    /// ([`super::Catalog::mark_entries_missing_without_live_sources`]) moves it.
+    pub missing_since: Option<String>,
 }
 
 impl Entry {
@@ -285,6 +295,15 @@ pub struct EntrySource {
     pub playback_path: String,
     /// ISO-8601 timestamp of the last ingest that saw this row.
     pub last_seen: Option<String>,
+    /// Set when a full ingest pass didn't touch this row — the file behind it
+    /// moved, was renamed, or was deleted. `None` = live. Mirrors `last_seen`'s
+    /// bookkeeping; see ADR 0006. Cleared by the next pass that writes the row.
+    ///
+    /// Kept rather than deleted so a resurrected file path-matches back onto
+    /// the entry it always belonged to, and so a rename leaves a trail instead
+    /// of a hole. Read sites that pick a file to play must prefer a live row —
+    /// see [`crate::resolve::pick_playback_source`].
+    pub missing_since: Option<String>,
 }
 
 /// A Plex collection. Membership + order live in `collection_items`.

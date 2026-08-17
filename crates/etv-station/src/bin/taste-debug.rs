@@ -31,7 +31,9 @@ use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInput
 use etv_station::tautulli::{self, HistoryScope};
 
 #[derive(Parser, Debug)]
-#[command(about = "Explain a scorer plugin pool's ranking against the real catalog + plexdb snapshot")]
+#[command(
+    about = "Explain a scorer plugin pool's ranking against the real catalog + plexdb snapshot"
+)]
 struct Cli {
     /// Channel config file (e.g. deploy/appdata/channels/002-for-pierce.yaml).
     #[arg(long)]
@@ -206,12 +208,10 @@ fn main() -> Result<(), String> {
     };
 
     let grant = |plexdb: &Path, name: &str| -> Result<GrantedCapabilities, String> {
-        GrantedCapabilities::from_names(&pool_cfg.capabilities)
-            .with_datastores(&[DatastoreGrant {
-                name: name.to_string(),
-                path: plexdb.display().to_string(),
-            }])
-            .map_err(|e| e)
+        GrantedCapabilities::from_names(&pool_cfg.capabilities).with_datastores(&[DatastoreGrant {
+            name: name.to_string(),
+            path: plexdb.display().to_string(),
+        }])
     };
 
     // Run 1: realistic generation — the channel's own pool_config, real
@@ -279,7 +279,11 @@ fn main() -> Result<(), String> {
         Some(id) => format!("account {id}"),
         None => "pooled (house-wide)".to_string(),
     };
-    println!("== {} / pool {:?}, scored against {who} ==", cli.channel.display(), cli.pool);
+    println!(
+        "== {} / pool {:?}, scored against {who} ==",
+        cli.channel.display(),
+        cli.pool
+    );
     println!("plugin:  {}", script_path.display());
     println!("plexdb:  {}", plexdb_path.display());
     println!();
@@ -346,7 +350,11 @@ fn format_value(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Array(items) => format!(
             "[{}]",
-            items.iter().map(format_value).collect::<Vec<_>>().join(", ")
+            items
+                .iter()
+                .map(format_value)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => match n.as_f64() {

@@ -33,6 +33,7 @@ fn catalog() -> Catalog {
             entry_id: id.to_string(),
             playback_path: format!("/media/{id}.mkv"),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
     };
@@ -54,6 +55,7 @@ fn catalog() -> Catalog {
             entry_id: id.to_string(),
             playback_path: format!("/media/{id}.mkv"),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
     };

@@ -561,6 +561,7 @@ mod tests {
             entry_id: id.to_string(),
             playback_path: format!("/plex/{id}.mkv"),
             last_seen: None,
+            missing_since: None,
         })
         .unwrap();
     }
@@ -660,6 +661,7 @@ mod tests {
                 entry_id: id.to_string(),
                 playback_path: format!("/data/media/{dir}/fellowship.mkv"),
                 last_seen: None,
+                missing_since: None,
             })
             .unwrap();
         }

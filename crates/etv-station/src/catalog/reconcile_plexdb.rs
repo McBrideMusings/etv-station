@@ -459,6 +459,7 @@ mod tests {
                 entry_id: entry_id.to_string(),
                 playback_path: String::new(),
                 last_seen: None,
+                missing_since: None,
             })
             .unwrap();
         for (ns, value) in guids {

@@ -55,7 +55,7 @@ use std::time::Duration;
 use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
 use time::OffsetDateTime;
 
-use crate::catalog::{Catalog, TagNs, canonical_path, derive_entry_id};
+use crate::catalog::{Catalog, EntrySource, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
     BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, Fallback, Filter,
     ItemEntry, Mode, NoRepeatWithin, Order, QueryEntry, ShowGroup, SourceConfig,
@@ -1383,6 +1383,33 @@ fn reorder_to(items: Vec<ResolvedItem>, ordered_ids: &[String]) -> Vec<ResolvedI
 /// number is not a runtime, it is bad metadata.
 pub(crate) const MAX_CATALOG_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// Which of an entry's provenance rows names the file to play.
+///
+/// Prefer a local-filesystem source (a real path the player can open); fall
+/// back to the first row. Source-specific playback (e.g. a Plex streaming URL)
+/// is deferred to the ingester that defines it.
+///
+/// **A live row always beats a missing one** (ADR 0006). Since a source that
+/// loses its file is marked rather than deleted, an entry can hold both — that
+/// is exactly what a rename under a `local_fs` root leaves behind, because the
+/// canonical path is the row's primary key, so the new path is a new row and
+/// the old one is marked. Picking by source alone would hand the player the
+/// path that no longer exists roughly half the time, sorted by filename.
+///
+/// The last two arms exist so an entry whose rows are *all* missing still
+/// yields a path: the caller is then patching or error-carding a playout file
+/// and wants to know what it used to point at, not `None`.
+pub(crate) fn pick_playback_source(sources: &[EntrySource]) -> Option<&EntrySource> {
+    let live = |s: &&EntrySource| s.missing_since.is_none();
+    let local = |s: &&EntrySource| s.source == crate::catalog::Source::LocalFs;
+    sources
+        .iter()
+        .find(|s| local(s) && live(s))
+        .or_else(|| sources.iter().find(live))
+        .or_else(|| sources.iter().find(local))
+        .or_else(|| sources.first())
+}
+
 /// `Ok(None)` means the catalog knows this item but nothing can play it — the
 /// row carries no playback source at all. That is not a channel misconfiguration
 /// and must not be raised as one: a single hollow row would otherwise take down
@@ -1399,14 +1426,7 @@ fn catalog_item(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("resolved entry {entry_id} vanished from the catalog"))?;
     let sources = catalog.sources_for(entry_id).map_err(|e| e.to_string())?;
-    // Prefer a local-filesystem source (a real path the player can open);
-    // fall back to the first provenance row. Source-specific playback (e.g. a
-    // Plex streaming URL) is deferred to the ingester that defines it.
-    let Some(source) = sources
-        .iter()
-        .find(|s| s.source == crate::catalog::Source::LocalFs)
-        .or_else(|| sources.first())
-    else {
+    let Some(source) = pick_playback_source(&sources) else {
         tracing::warn!(
             event = "item.no_playback_source",
             item = %entry_id,
@@ -2178,6 +2198,7 @@ mod tests {
                 entry_id: id.to_string(),
                 playback_path: format!("/media/lotr/{id}.mkv"),
                 last_seen: None,
+                missing_since: None,
             })
             .unwrap();
         }
@@ -2348,6 +2369,7 @@ mod tests {
                 entry_id: id.to_string(),
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
+                missing_since: None,
             })
             .unwrap();
         }
@@ -2722,6 +2744,7 @@ mod tests {
                 entry_id: id.to_string(),
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
+                missing_since: None,
             })
             .unwrap();
         };
