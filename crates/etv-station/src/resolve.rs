@@ -501,22 +501,18 @@ pub fn resolve_channel_fingerprint_ids(
         let mut block_ids: Vec<String> = Vec::new();
         for entry in include.entries() {
             match entry {
-                Entry::Item(item) => block_ids.push(resolve_item(
-                    item,
-                    None,
-                    None,
-                    identity_roots,
-                    path_index,
-                ).id),
+                Entry::Item(item) => {
+                    block_ids.push(resolve_item(item, None, None, identity_roots, path_index).id)
+                }
                 Entry::Query(query) => {
                     let cat = catalog.ok_or_else(|| {
                         unsupported(format!(
                             "block #{idx}: a query entry needs the catalog to fingerprint"
                         ))
                     })?;
-                    let resolved = cat.resolve_query(&query.query).map_err(|e| {
-                        unsupported(format!("block #{idx}: {e}"))
-                    })?;
+                    let resolved = cat
+                        .resolve_query(&query.query)
+                        .map_err(|e| unsupported(format!("block #{idx}: {e}")))?;
                     block_ids.extend(resolved);
                 }
                 Entry::Collection(collection) => {
