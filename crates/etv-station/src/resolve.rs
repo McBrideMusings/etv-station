@@ -442,6 +442,118 @@ pub fn resolve_channel_with_resume(
     Ok((out, resume_out))
 }
 
+/// Resolve a channel's blocks down to a candidate entry-id fingerprint set
+/// (#182) — the query/pool-source half of resolution, with no scorer
+/// `pick()` call anywhere. Used to detect whether a channel's resolved
+/// inputs changed since the last generation, without paying for a full
+/// scorer run when they have not.
+///
+/// Sorted and deduplicated so the result hashes the same regardless of block
+/// or catalog-query row order — this is a candidate *set*, not the final
+/// scheduled sequence (that still depends on the scorer, ordering, and
+/// resume state this function never touches).
+///
+/// A pattern or sequencer block's pools resolve through
+/// [`crate::pattern::fingerprint_pool_sources`] — pass 1 of the same
+/// catalog-only resolution `resolve_block` runs, so a plugin pool's
+/// candidates still come from its declared `sources()` queries. A flat
+/// block's `entries`/`fallback` resolve through the same catalog-free/
+/// catalog-backed helpers `resolve_block` already uses for them
+/// (`resolve_item`/`resolve_query`/`resolve_collection`/`resolve_fallback`),
+/// deliberately skipping `filter`/`duplicates`/`order`/`mode` — none of
+/// those narrow or reorder the *candidate* set in a way that changes what
+/// the catalog or config contributed, so skipping them only ever makes the
+/// fingerprint change on a superset of the cases that actually matter.
+pub fn resolve_channel_fingerprint_ids(
+    config: &ChannelConfig,
+    path: &Path,
+    identity_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
+    catalog: Option<&Catalog>,
+) -> Result<Vec<String>, ConfigError> {
+    let unsupported = |message: String| ConfigError::Unsupported {
+        path: path.to_path_buf(),
+        message,
+    };
+
+    let mut ids: HashSet<String> = HashSet::new();
+    for (idx, include) in config.rule.blocks.iter().enumerate() {
+        if include.is_pattern() || include.is_sequencer() {
+            let cat = catalog.ok_or_else(|| {
+                unsupported(format!(
+                    "block #{idx}: a pattern/sequencer block needs the catalog to fingerprint"
+                ))
+            })?;
+            let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+            let pool_ids = crate::pattern::fingerprint_pool_sources(
+                cat,
+                &include.pools,
+                &config.groups,
+                base_dir,
+            )
+            .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+            for pool in pool_ids {
+                ids.extend(pool);
+            }
+            continue;
+        }
+
+        let mut block_ids: Vec<String> = Vec::new();
+        for entry in include.entries() {
+            match entry {
+                Entry::Item(item) => block_ids.push(resolve_item(
+                    item,
+                    None,
+                    None,
+                    identity_roots,
+                    path_index,
+                ).id),
+                Entry::Query(query) => {
+                    let cat = catalog.ok_or_else(|| {
+                        unsupported(format!(
+                            "block #{idx}: a query entry needs the catalog to fingerprint"
+                        ))
+                    })?;
+                    let resolved = cat.resolve_query(&query.query).map_err(|e| {
+                        unsupported(format!("block #{idx}: {e}"))
+                    })?;
+                    block_ids.extend(resolved);
+                }
+                Entry::Collection(collection) => {
+                    let cat = catalog.ok_or_else(|| {
+                        unsupported(format!(
+                            "block #{idx}: a collection entry needs the catalog to fingerprint"
+                        ))
+                    })?;
+                    let resolved = resolve_collection(cat, collection, None, None)
+                        .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                    block_ids.extend(resolved.into_iter().map(|item| item.id));
+                }
+                Entry::Include(_) => {
+                    return Err(unsupported(format!(
+                        "block #{idx}: include entries are not implemented yet (#69)"
+                    )));
+                }
+            }
+        }
+
+        if block_ids.is_empty()
+            && let Some(fallback) = &include.fallback
+        {
+            let resolved =
+                resolve_fallback(catalog, fallback, None, None, 0, identity_roots, path_index)
+                    .map_err(|m| unsupported(format!("block #{idx}: fallback: {m}")))?;
+            block_ids.extend(resolved.into_iter().map(|item| item.id));
+        }
+
+        ids.extend(block_ids);
+    }
+
+    let mut out: Vec<String> = ids.into_iter().collect();
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// Every declared show group's member shows must have at least one episode on
 /// record (#165). Checked once, for every declared group, rather than once
 /// per pool that happens to reference one — the same bad title fails the same

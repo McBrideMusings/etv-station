@@ -1162,31 +1162,31 @@ fn parse_picked_item(
 /// source it came from rather than surfacing as a mystery empty pool later, and
 /// saying which file that source was written in so the author knows whether to
 /// open the channel or the script.
-fn compile_and_resolve(
-    catalog: &Catalog,
+/// A script's declared sources: the pool's own `sources` table when it
+/// authored one (#210), otherwise the compiled script's `sources()`. Shared
+/// by [`compile_and_resolve`] (which goes on to materialize each source's
+/// rows for `pick()`) and [`resolve_source_ids`] (which only wants the flat
+/// id set, for a fingerprint — #182).
+///
+/// The pool's table replaces the script's function wholesale, which is also
+/// why `sources()` is not called at all when one is present: a script that
+/// declares none, or whose own would fail, is still usable by a pool that
+/// brought its own queries.
+fn declared_sources(
     engine: &Engine,
+    ast: &rhai::AST,
     script_path: &Path,
     pool_sources: Option<&PoolSources>,
-) -> Result<CachedScript, String> {
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
-
-    // The pool's table replaces the script's function wholesale, which is also
-    // why `sources()` is not called at all when one is present: a script that
-    // declares none, or whose own would fail, is still usable by a pool that
-    // brought its own queries.
-    let declared: Vec<(String, String)> = match pool_sources {
-        Some(table) => table
+) -> Result<Vec<(String, String)>, String> {
+    match pool_sources {
+        Some(table) => Ok(table
             .iter()
             .map(|(name, cel)| (name.clone(), cel.clone()))
-            .collect(),
+            .collect()),
         None => {
             let mut scope = Scope::new();
             let from_script: Map = engine
-                .call_fn(&mut scope, &ast, "sources", ())
+                .call_fn(&mut scope, ast, "sources", ())
                 .map_err(|e| format!("scorer plugin {}: sources(): {e}", script_path.display()))?;
             from_script
                 .into_iter()
@@ -1199,18 +1199,36 @@ fn compile_and_resolve(
                     })?;
                     Ok((name.to_string(), cel))
                 })
-                .collect::<Result<_, String>>()?
+                .collect::<Result<_, String>>()
         }
-    };
+    }
+}
 
-    // Names the file the author has to go and edit. A channel-authored source
-    // that fails is the channel's line, not the script's, and saying "scorer
-    // plugin taste-engine.rhai" about an expression that is not in
-    // taste-engine.rhai sends them to the wrong file.
-    let whose = match pool_sources {
+/// Names the file the author has to go and edit for a source resolution
+/// error. A channel-authored source that fails is the channel's line, not
+/// the script's, and saying "scorer plugin taste-engine.rhai" about an
+/// expression that is not in taste-engine.rhai sends them to the wrong file.
+fn source_error_prefix(script_path: &Path, pool_sources: Option<&PoolSources>) -> String {
+    match pool_sources {
         Some(_) => "channel-authored source".to_string(),
         None => format!("scorer plugin {}: source", script_path.display()),
-    };
+    }
+}
+
+fn compile_and_resolve(
+    catalog: &Catalog,
+    engine: &Engine,
+    script_path: &Path,
+    pool_sources: Option<&PoolSources>,
+) -> Result<CachedScript, String> {
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
+    let ast = engine
+        .compile(&source)
+        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
+
+    let declared = declared_sources(engine, &ast, script_path, pool_sources)?;
+    let whose = source_error_prefix(script_path, pool_sources);
 
     let mut sets = Map::new();
     for (name, cel) in declared {
@@ -1227,6 +1245,41 @@ fn compile_and_resolve(
         // rather than a deep copy of every item map.
         sets: Dynamic::from_map(sets).into_shared(),
     })
+}
+
+/// A plugin pool's candidate entry ids — its declared sources resolved
+/// against the catalog, with no `pick()` call (#182). This is the "the query
+/// itself still runs, the scorer does not" half of the generation
+/// fingerprint: it compiles the script only far enough to read `sources()`
+/// when the pool authored none of its own, and never builds the Dynamic item
+/// maps [`pick`] would rank.
+///
+/// Not cached like [`ScoreCache::prepare`] — the fingerprint is computed at
+/// most once per channel per startup, so a second compile costs far less than
+/// the state a cache would need to thread through.
+pub(crate) fn resolve_source_ids(
+    catalog: &Catalog,
+    script_path: &Path,
+    pool_sources: Option<&PoolSources>,
+) -> Result<Vec<String>, String> {
+    let engine = engine();
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
+    let ast = engine
+        .compile(&source)
+        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
+
+    let declared = declared_sources(&engine, &ast, script_path, pool_sources)?;
+    let whose = source_error_prefix(script_path, pool_sources);
+
+    let mut ids = Vec::new();
+    for (name, cel) in declared {
+        let resolved = catalog
+            .resolve_query(&cel)
+            .map_err(|e| format!("{whose} {name:?} ({cel}): {e}"))?;
+        ids.extend(resolved);
+    }
+    Ok(ids)
 }
 
 /// A pool's own `config`, handed over verbatim. The station reads nothing out

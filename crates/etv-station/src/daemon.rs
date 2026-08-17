@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
 use ersatztv_playout::playout::Playout;
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time_tz::Tz;
 use tokio::select;
@@ -1632,6 +1633,75 @@ mod regen_floor_tests {
     }
 }
 
+/// Hash a channel's would-be regeneration inputs — its resolved candidate
+/// entry-id list (the pool/query half of resolution, no scorer `pick()`),
+/// its config and overlay config bytes, and the resume state entering the
+/// generation being fingerprinted — into the string persisted as `.resume`'s
+/// `fingerprint` (#182).
+///
+/// `resume_pools`/`resume_position` are the caller's choice of *which*
+/// generation's resume state to fingerprint against: the earliest unaired
+/// checkpoint when deciding whether to skip a startup rewind, or the state a
+/// rewind just restored when stamping a fresh fingerprint after regenerating.
+/// Generation is a pure function of `(catalog, config, resume_in)`
+/// (`docs/architecture.md`), and this hashes exactly those three — a match
+/// means nothing about the generation would change.
+// `ids` is computed by the caller, synchronously, before this is called —
+// never here. `resolve_channel_fingerprint_ids` borrows `&Catalog`, and
+// `Catalog` is not `Sync` (it wraps a `RefCell` connection); holding that
+// borrow across this function's own `.await` below would make the
+// `tokio::spawn`ed channel-loop future non-`Send`. Taking the already-owned
+// `ids` instead means nothing catalog-shaped is part of this future's state.
+async fn compute_fingerprint(
+    channel: &LoadedChannel,
+    ids: &[String],
+    resume_pools: &std::collections::BTreeMap<String, crate::resume::PoolResume>,
+    resume_position: usize,
+) -> Result<String, StationError> {
+    // A channel with no overlay hashes a fixed empty input, so a channel that
+    // later adds or removes an overlay still changes the fingerprint (the
+    // overlay bytes go from present to absent, or vice versa) rather than
+    // silently contributing nothing either way.
+    let overlay_bytes = match resolve_overlay_paths(channel) {
+        Some((overlay_config_path, _)) => {
+            tokio::fs::read(&overlay_config_path)
+                .await
+                .map_err(|source| StationError::Io {
+                    path: overlay_config_path,
+                    source,
+                })?
+        }
+        None => Vec::new(),
+    };
+
+    let config_bytes = serde_json::to_vec(&channel.config).map_err(|e| {
+        StationError::Config(ConfigError::Validation {
+            path: channel.config_path.clone(),
+            message: format!("serializing channel config for fingerprint: {e}"),
+        })
+    })?;
+    let resume_in_bytes = serde_json::to_vec(&(resume_pools, resume_position)).map_err(|e| {
+        StationError::Config(ConfigError::Validation {
+            path: channel.config_path.clone(),
+            message: format!("serializing resume state for fingerprint: {e}"),
+        })
+    })?;
+
+    let mut hasher = Sha256::new();
+    hasher.update((ids.len() as u64).to_le_bytes());
+    for id in ids {
+        hasher.update(id.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.update((config_bytes.len() as u64).to_le_bytes());
+    hasher.update(&config_bytes);
+    hasher.update((overlay_bytes.len() as u64).to_le_bytes());
+    hasher.update(&overlay_bytes);
+    hasher.update((resume_in_bytes.len() as u64).to_le_bytes());
+    hasher.update(&resume_in_bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// The emission loop for every channel: **materialize forward**.
 ///
 /// Each pass resolves the channel, lays the resulting sequence end-to-end after
@@ -1726,24 +1796,113 @@ async fn forward_channel_loop(
     // wouldn't reach a pattern channel until its entire written window had
     // played out (#53).
     let now = OffsetDateTime::now_utc();
-    if let Some(regen_from) = resume.rewind_to_unaired(now) {
-        let regen_from = regen_floor(channel, regen_from).await?;
-        let removed = wipe_playout_from(channel, regen_from).await?;
-        // Those airings are no longer scheduled, so they are no longer history.
-        // Because the resume position is a projection of the store, dropping
-        // them is also what rewinds each series — the two cannot disagree.
-        ctx.history_db.truncate_from(&channel.name, regen_from)?;
-        tracing::info!(
-            event = "resume.rewind",
-            channel = %channel.name,
-            from = %regen_from,
-            removed = removed,
-            airings = ctx.history_db.count(&channel.name)?,
-            "rewound to the earliest unaired generation; regenerating it from the current config",
+    // #182: peek the earliest unaired checkpoint without committing to it, so
+    // a byte-identical restart — same catalog, same config, same resume
+    // state — can skip the wipe+regenerate below entirely instead of paying
+    // for it on every start. `peek_unaired` restores nothing; only a
+    // fingerprint mismatch (or the absence of a stored one) reaches the
+    // unconditional rewind that always ran here before.
+    //
+    // A matched fingerprint needs no further bookkeeping: `resume.fingerprint`
+    // already holds it, untouched. A mismatch rewinds and regenerates, and the
+    // fingerprint for the state that rewind restores is stashed here rather
+    // than stamped immediately — `pattern_catch_up` below replaces `resume`
+    // wholesale with each generation's fresh output (fingerprint always
+    // `None`), so stamping before that call would just be overwritten by it.
+    let mut pending_fingerprint: Option<String> = None;
+    if let Some((checkpoint_start, checkpoint_pools, checkpoint_position)) =
+        resume.peek_unaired(now)
+    {
+        // Resolved synchronously, before any `.await`, so the `&Catalog`
+        // borrow it takes never has to be part of an async fn's captured
+        // state (see `compute_fingerprint`'s doc comment).
+        let candidate = match crate::resolve::resolve_channel_fingerprint_ids(
+            &channel.config,
+            &channel.config_path,
+            ctx.identity_roots,
+            ctx.catalog.map(|info| &info.path_index),
+            catalog.as_ref(),
+        ) {
+            Ok(ids) => {
+                compute_fingerprint(channel, &ids, &checkpoint_pools, checkpoint_position).await
+            }
+            Err(e) => Err(StationError::from(e)),
+        };
+        let matched = matches!(
+            &candidate,
+            Ok(fp) if resume.fingerprint.as_deref() == Some(fp.as_str())
         );
+        if matched {
+            tracing::info!(
+                event = "resume.fingerprint_match",
+                channel = %channel.name,
+                from = %checkpoint_start,
+                "catalog, config, and resume state unchanged since the last generation; \
+                 keeping the unaired window as written",
+            );
+        } else {
+            if let Err(err) = &candidate {
+                tracing::warn!(
+                    event = "resume.fingerprint_error",
+                    channel = %channel.name,
+                    error = %err,
+                    "could not compute a generation fingerprint; regenerating as usual",
+                );
+            }
+            // Startup: throw away the future this channel had already
+            // written and generate it again from the config as it stands
+            // now.
+            //
+            // A wholesale wipe is not available: the output depends on
+            // where the pools had advanced to, and that state is gone once
+            // consumed. The checkpoint trail is what makes the same thing
+            // possible here — rewind the pools to the start of the earliest
+            // unaired generation, drop exactly the files from that instant
+            // on, and regenerate. What has already aired, or is airing now,
+            // is untouched. Without this, a config or overlay edit wouldn't
+            // reach a pattern channel until its entire written window had
+            // played out (#53).
+            let regen_from = resume
+                .rewind_to_unaired(now)
+                .expect("peek_unaired just found a checkpoint at the same `now`");
+            let regen_from = regen_floor(channel, regen_from).await?;
+            let removed = wipe_playout_from(channel, regen_from).await?;
+            // Those airings are no longer scheduled, so they are no longer
+            // history. Because the resume position is a projection of the
+            // store, dropping them is also what rewinds each series — the
+            // two cannot disagree.
+            ctx.history_db.truncate_from(&channel.name, regen_from)?;
+            tracing::info!(
+                event = "resume.rewind",
+                channel = %channel.name,
+                from = %regen_from,
+                removed = removed,
+                airings = ctx.history_db.count(&channel.name)?,
+                "rewound to the earliest unaired generation; regenerating it from the current config",
+            );
+            // `rewind_to_unaired` restored exactly `checkpoint_pools` /
+            // `checkpoint_position` onto `resume`, so the candidate already
+            // computed above is the fingerprint of the state this rewind
+            // just committed to — no need to recompute it against `resume`.
+            // A failed compute leaves `pending_fingerprint` at `None`, which
+            // regenerates again next start rather than skipping on a guess.
+            pending_fingerprint = candidate.ok();
+        }
     }
+    // Otherwise: nothing regenerable — either a fresh channel with no
+    // checkpoints yet, or every generation has already started airing.
+    // `rewind_to_unaired` would also no-op here, so there is nothing to skip
+    // and no fingerprint worth comparing.
 
     resume = pattern_catch_up(channel, ctx, &mut catalog, resume, "startup").await?;
+    if let Some(fingerprint) = pending_fingerprint {
+        // Restamp after `pattern_catch_up` — it replaces `resume` wholesale
+        // with each generation's own fresh (fingerprint-less) output, so the
+        // stamp has to land after the last of those replacements, not before
+        // the first.
+        resume.fingerprint = Some(fingerprint);
+        crate::resume::save(&channel.output_folder, &resume).await?;
+    }
 
     let mut interval = tokio::time::interval(channel.config.roll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

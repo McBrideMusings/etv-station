@@ -80,6 +80,7 @@
 //! because another step was added or skipped.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
@@ -895,6 +896,43 @@ pub(crate) fn resolve_pool_sources(
         .into_iter()
         .map(|ids| ids.expect("pass 2 fills every hole pass 1 left"))
         .collect())
+}
+
+/// Every pool's *candidate* entry-id list, for the generation fingerprint
+/// (#182) — [`resolve_pool_sources`]'s pass 1 alone, with a plugin pool's
+/// candidates coming from its declared `sources()` queries
+/// ([`crate::score::resolve_source_ids`]) instead of a `pick()` ranking.
+///
+/// No [`crate::score::ScoreCache`], no rotation, no interleave: this exists
+/// only to detect whether a channel's resolved inputs changed since the last
+/// generation, which is the query half of resolution — the same half pass 1
+/// already runs before any scorer sees the catalog.
+pub(crate) fn fingerprint_pool_sources(
+    catalog: &Catalog,
+    pools: &[Pool],
+    groups: &[ShowGroup],
+    base_dir: &Path,
+) -> Result<Vec<Vec<String>>, String> {
+    let mut out = Vec::with_capacity(pools.len());
+    for cfg in pools {
+        let ids = match (&cfg.expr, &cfg.plugin, !cfg.groups.is_empty()) {
+            (Some(expr), None, false) => catalog.resolve_query(expr).map_err(|e| e.to_string())?,
+            (None, Some(plugin), false) => {
+                let path = crate::score::resolve_plugin_path(base_dir, plugin);
+                crate::score::resolve_source_ids(catalog, &path, cfg.sources.as_ref())
+                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
+            }
+            (None, None, true) => resolve_group_pool(catalog, cfg, groups)?,
+            _ => {
+                return Err(format!(
+                    "pool {:?} must set exactly one of `expr`, `plugin`, or `groups`",
+                    cfg.name
+                ));
+            }
+        };
+        out.push(ids);
+    }
+    Ok(out)
 }
 
 /// Resolve a `groups`-sourced pool's item list (#165): the union of every

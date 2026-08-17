@@ -82,6 +82,16 @@ pub struct ResumeMap {
     /// which bounds the list to the generations covering one window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
+
+    /// A hash of the inputs that produced the unaired window currently on
+    /// disk — the channel's resolved candidate entry-id list, its config and
+    /// overlay config bytes, and the resume state entering the earliest
+    /// unaired generation (#182). `None` on a sidecar written before this
+    /// field existed, or whenever it could not be computed; both decode the
+    /// same as a mismatch, so a missing fingerprint always regenerates
+    /// rather than skipping on a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// The scheduling state immediately before the generation that starts at
@@ -125,6 +135,7 @@ impl ResumeMap {
             pools: BTreeMap::new(),
             position: 0,
             checkpoints: Vec::new(),
+            fingerprint: None,
         }
     }
 
@@ -168,6 +179,29 @@ impl ResumeMap {
         // checkpoints are re-recorded as it goes.
         self.checkpoints.clear();
         Some(earliest.start)
+    }
+
+    /// Non-mutating counterpart to [`rewind_to_unaired`]: the start, pool
+    /// state, and list position of the earliest unaired checkpoint, without
+    /// restoring or clearing anything (#182). `rewind_to_unaired` always
+    /// commits to its rewind, so this is what lets a caller compute a
+    /// candidate fingerprint against the state a rewind *would* restore
+    /// before deciding whether to actually run one.
+    ///
+    /// Elapsed checkpoints are skipped exactly as [`prune_elapsed`] would drop
+    /// them, but nothing is removed — the checkpoints list a caller sees
+    /// after this call is identical to the one before it. Correct without
+    /// pruning first because [`checkpoint`] always pushes in chronological
+    /// order, so the first checkpoint whose `start` is still in the future
+    /// is the same one pruning-then-`.first()` would find.
+    pub fn peek_unaired(
+        &self,
+        now: OffsetDateTime,
+    ) -> Option<(OffsetDateTime, BTreeMap<String, PoolResume>, usize)> {
+        self.checkpoints
+            .iter()
+            .find(|c| c.start > now)
+            .map(|c| (c.start, c.pools.clone(), c.position))
     }
 
     /// Rewind to the generation that was airing at `instant`: restore the pool
@@ -503,6 +537,53 @@ mod tests {
 
         assert_eq!(map.rewind_to(at(8)).unwrap(), at(6));
         assert_eq!(map.position, 40);
+    }
+
+    // ---- fingerprint (#182) -------------------------------------------------
+
+    #[test]
+    fn peek_unaired_returns_the_earliest_unaired_checkpoint_without_mutating() {
+        let mut map = ResumeMap::new();
+        map.pools = pools_with("e0");
+        map.checkpoint(at(0));
+        map.pools = pools_with("e1");
+        map.checkpoint(at(6));
+        map.pools = pools_with("e2");
+        map.checkpoint(at(12));
+        map.pools = pools_with("e3");
+        let before = map.clone();
+
+        let (start, pools, position) = map.peek_unaired(at(8)).unwrap();
+        assert_eq!(start, at(12));
+        assert_eq!(pools, pools_with("e2"));
+        assert_eq!(position, 0);
+        assert_eq!(map, before, "peeking must not mutate the map");
+    }
+
+    #[test]
+    fn peek_unaired_is_none_when_nothing_is_unaired() {
+        let mut map = ResumeMap::new();
+        map.pools = pools_with("e0");
+        map.checkpoint(at(0));
+        assert!(map.peek_unaired(at(9)).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_fingerprint_decodes_as_none() {
+        let dir = tempdir().unwrap();
+        save(dir.path(), &sample()).await.unwrap();
+        let (map, _) = load(dir.path()).await.unwrap();
+        assert_eq!(map.fingerprint, None);
+    }
+
+    #[tokio::test]
+    async fn the_fingerprint_round_trips_through_disk() {
+        let dir = tempdir().unwrap();
+        let mut map = sample();
+        map.fingerprint = Some("deadbeef".to_string());
+        save(dir.path(), &map).await.unwrap();
+        let (loaded, _) = load(dir.path()).await.unwrap();
+        assert_eq!(loaded.fingerprint.as_deref(), Some("deadbeef"));
     }
 
     #[tokio::test]
