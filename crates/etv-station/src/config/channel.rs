@@ -11,10 +11,13 @@ use crate::tautulli::HistoryScope;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChannelConfig {
     /// Optional channel identity override. When unset, the channel's identity
-    /// is its config file's stem (e.g. `diehard.yaml` -> `diehard`). The
-    /// identity drives the log label, the overlay handshake name, and the
-    /// output folder leaf under the station's `output_base`. Must not contain
-    /// path separators.
+    /// is its config file's stem (e.g. `diehard.yaml` -> `diehard`) — or, for
+    /// a file literally named `channel.yaml` (the per-channel-directory
+    /// layout, `channels/<name>/channel.yaml`), its parent directory's name,
+    /// since every file in that layout shares the same stem. The identity
+    /// drives the log label, the overlay handshake name, and the output
+    /// folder leaf under the station's `output_base`. Must not contain path
+    /// separators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 

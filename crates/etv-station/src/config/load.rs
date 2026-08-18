@@ -265,9 +265,18 @@ fn dedup_key(path: &Path) -> PathBuf {
         .collect()
 }
 
-/// Derive a channel's identity: the config's `name` override if set, else the
-/// config file's stem. Rejects an empty identity or one containing path
-/// separators (which would let the derived output folder escape `output_base`).
+/// Derive a channel's identity: the config's `name` override if set, else
+/// derived from the config path. Rejects an empty identity or one containing
+/// path separators (which would let the derived output folder escape
+/// `output_base`).
+///
+/// The derivation has two forms, because a channel file's own name is only
+/// unique under the flat layout (`channels/diehard.yaml` → `diehard`). A
+/// per-channel-directory layout (`channels/<name>/channel.yaml`, deploy's own
+/// shape — see `docs/file-map.md`'s `deploy/appdata/` row) names every file
+/// identically, so a file stem of exactly `channel` falls back to its parent
+/// directory's name instead. Every other stem is used as before — a layout
+/// with real per-file names never triggers the fallback.
 fn resolve_identity(
     station_path: &Path,
     channel_path: &Path,
@@ -275,14 +284,30 @@ fn resolve_identity(
 ) -> Result<String, ConfigError> {
     let identity = match &config.name {
         Some(name) => name.trim().to_string(),
-        None => channel_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-            .ok_or_else(|| ConfigError::Validation {
-                path: channel_path.to_path_buf(),
-                message: "channel config path has no file stem to derive a name from".into(),
-            })?,
+        None => {
+            let stem = channel_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| ConfigError::Validation {
+                    path: channel_path.to_path_buf(),
+                    message: "channel config path has no file stem to derive a name from".into(),
+                })?;
+            if stem == "channel" {
+                channel_path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| ConfigError::Validation {
+                        path: channel_path.to_path_buf(),
+                        message: "a channel.yaml with no name: needs a named parent directory \
+                                  to derive an identity from"
+                            .into(),
+                    })?
+            } else {
+                stem.to_string()
+            }
+        }
     };
     if identity.is_empty() {
         return Err(ConfigError::Validation {
@@ -832,6 +857,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id, "Star Wars Saga");
+    }
+
+    /// The per-channel-directory layout (`channels/<name>/channel.yaml`) names
+    /// every file identically, so the flat-layout default of "the file's own
+    /// stem" would resolve every channel in it to the same identity —
+    /// `channel` — and collide. A channel.yaml with no `name:` falls back to
+    /// its parent directory instead.
+    #[test]
+    fn a_bare_channel_dot_yaml_falls_back_to_its_parent_directory() {
+        let cfg = parse_channel(MINIMAL_RULE);
+        let id = resolve_identity(
+            Path::new("/s/station.yaml"),
+            Path::new("/s/channels/085-hbo/channel.yaml"),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(id, "085-hbo");
+    }
+
+    /// Two different directories under the per-channel layout must resolve to
+    /// two different identities — the regression this fallback exists to fix
+    /// (both channels landed on the literal identity `channel` and collided on
+    /// `output_folder`).
+    #[test]
+    fn two_channel_dot_yaml_files_in_different_directories_get_different_identities() {
+        let cfg = parse_channel(MINIMAL_RULE);
+        let a = resolve_identity(
+            Path::new("/s/station.yaml"),
+            Path::new("/s/channels/001-for-you/channel.yaml"),
+            &cfg,
+        )
+        .unwrap();
+        let b = resolve_identity(
+            Path::new("/s/station.yaml"),
+            Path::new("/s/channels/002-for-pierce/channel.yaml"),
+            &cfg,
+        )
+        .unwrap();
+        assert_ne!(a, b);
+    }
+
+    /// A `channel.yaml` with an explicit `name:` still uses it — the parent-
+    /// directory fallback only applies when nothing else was said.
+    #[test]
+    fn a_bare_channel_dot_yaml_still_honors_an_explicit_name() {
+        let cfg = parse_channel(&format!("name: \"custom-id\"\n{MINIMAL_RULE}"));
+        let id = resolve_identity(
+            Path::new("/s/station.yaml"),
+            Path::new("/s/channels/085-hbo/channel.yaml"),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(id, "custom-id");
     }
 
     fn station_config() -> StationConfig {
