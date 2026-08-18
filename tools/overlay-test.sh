@@ -4,12 +4,12 @@
 # Usage:
 #   ./tools/overlay-test.sh
 #   FIXTURE=ident-45s.mp4 ./tools/overlay-test.sh
-#   CONFIG=crates/etv-overlay/fixtures/watermark_fade.toml ./tools/overlay-test.sh
+#   CONFIG=crates/etv-overlay/fixtures/watermark_fade.yaml ./tools/overlay-test.sh
 set -euo pipefail
 
 FIXTURE="${FIXTURE:-station-bumper-12s.mp4}"
 INPUT="crates/etv-query-test/fixtures/bumpers/${FIXTURE}"
-CONFIG="${CONFIG:-crates/etv-overlay/fixtures/watermark.toml}"
+CONFIG="${CONFIG:-crates/etv-overlay/fixtures/watermark.yaml}"
 OUTPUT="${OUTPUT:-/tmp/etv-overlay-test.mp4}"
 
 bold()  { printf '\033[1m%s\033[0m' "$1"; }

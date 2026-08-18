@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config_carrier::non_finite_message;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OverlaySpec {
     pub width: u32,
@@ -13,8 +11,9 @@ pub struct OverlaySpec {
     pub pixel_format: PixelFormat,
     pub script: Option<PathBuf>,
     /// Arbitrary configuration handed to `script` verbatim, reaching it as the
-    /// `config` constant. Any TOML shape is accepted — tables, arrays, strings,
-    /// numbers, booleans, nested to any depth — and no key is reserved.
+    /// `config` constant. Any YAML shape is accepted — mappings, sequences,
+    /// strings, numbers, booleans, nested to any depth — and no key is
+    /// reserved.
     ///
     /// **Nothing here reads it.** It is converted and passed through, and that
     /// is the whole contract: no validation, no known keys, no injected
@@ -35,26 +34,21 @@ pub struct OverlaySpec {
     /// at fault. An author wanting "never decays" writes a large finite number.
     /// The channel-config side refuses the same value in the same words (#130).
     ///
-    /// **A TOML datetime arrives as the text the author wrote.** TOML has a
-    /// first-class datetime and the carrier type does not, so `date =
-    /// 2026-07-28` reaches the script as the string `"2026-07-28"` — offset,
-    /// local, date-only and time-only forms alike, each rendered in TOML's own
-    /// spelling. Nothing is dropped and nothing needs a reserved key, and it
-    /// makes the two surfaces agree on identical authored text: `date:
-    /// 2026-07-28` in a channel YAML already reaches a scorer as that same
-    /// string. A script wanting a moment rather than a label parses it, on the
-    /// same terms as every other key here — the meaning is the script's.
+    /// **A date arrives as the text the author wrote.** `date: 2026-07-28`
+    /// reaches the script as the string `"2026-07-28"`, which is what a channel
+    /// YAML's `released: 2026-07-28` already hands a scorer. A script wanting a
+    /// moment rather than a label parses it, on the same terms as every other
+    /// key here — the meaning is the script's.
     ///
     /// The same contract the scorer-plugin side carries on
-    /// `etv_station::config::Pool::config`, down to the carrier type: one
-    /// opaque-config value type for the whole project, so a third scripting
-    /// surface inherits the decision instead of picking one by looking at which
-    /// file format it happens to parse. Only the plumbing differs, because a
-    /// scorer receives one `ctx` map and an overlay receives flat scope
-    /// constants.
+    /// `etv_station::config::Pool::config`, down to the carrier type and the
+    /// deserializer: one opaque-config value type for the whole project, read
+    /// through one [`crate::config_carrier::deserialize_config`], so the two
+    /// surfaces cannot drift. Only the plumbing differs, because a scorer
+    /// receives one `ctx` map and an overlay receives flat scope constants.
     #[serde(
         default,
-        deserialize_with = "deserialize_config",
+        deserialize_with = "crate::config_carrier::deserialize_config",
         skip_serializing_if = "Option::is_none"
     )]
     pub config: Option<serde_json::Value>,
@@ -63,59 +57,6 @@ pub struct OverlaySpec {
     /// layers — per-layer scripts are a future extension.
     #[serde(default, alias = "kind", deserialize_with = "deserialize_layers")]
     pub layers: Vec<OverlayKind>,
-}
-
-/// Read [`OverlaySpec::config`] through TOML's own value type before handing it
-/// to the shared carrier, because TOML has one type the carrier does not.
-///
-/// Deserializing the carrier straight from the TOML parser *works*, but a
-/// datetime arrives wrapped in a reserved key the toml crate uses to smuggle it
-/// through serde — a private spelling that would then be what an overlay script
-/// sees. Walking the TOML value instead is the only step where this pair of
-/// formats needs one, and it is what lets the datetime land as plain text.
-fn deserialize_config<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<toml::Value>::deserialize(deserializer)?
-        .map(|value| toml_to_carrier(value, "config"))
-        .transpose()
-        .map_err(serde::de::Error::custom)
-}
-
-/// TOML value → the shared carrier type, mapping the one type TOML has and the
-/// carrier does not: a datetime becomes its TOML text.
-///
-/// Fallible for the one type TOML has that the carrier cannot hold at all — a
-/// non-finite float. `weight = inf` is refused here rather than flattened to
-/// null, and `path` is what lets the error name `config.weight` instead of just
-/// the file. The channel-config side refuses the same value through the same
-/// [`non_finite_message`] (#130).
-pub(crate) fn toml_to_carrier(value: toml::Value, path: &str) -> Result<serde_json::Value, String> {
-    use serde_json::Value as Carrier;
-    Ok(match value {
-        toml::Value::String(s) => Carrier::String(s),
-        toml::Value::Integer(i) => Carrier::Number(i.into()),
-        toml::Value::Float(f) => serde_json::Number::from_f64(f)
-            .map(Carrier::Number)
-            .ok_or_else(|| non_finite_message(path, f))?,
-        toml::Value::Boolean(b) => Carrier::Bool(b),
-        toml::Value::Datetime(d) => Carrier::String(d.to_string()),
-        toml::Value::Array(a) => Carrier::Array(
-            a.into_iter()
-                .enumerate()
-                .map(|(i, v)| toml_to_carrier(v, &format!("{path}[{i}]")))
-                .collect::<Result<_, _>>()?,
-        ),
-        toml::Value::Table(t) => Carrier::Object(
-            t.into_iter()
-                .map(|(k, v)| {
-                    let value = toml_to_carrier(v, &format!("{path}.{k}"))?;
-                    Ok((k, value))
-                })
-                .collect::<Result<_, String>>()?,
-        ),
-    })
 }
 
 fn deserialize_layers<'de, D>(deserializer: D) -> Result<Vec<OverlayKind>, D::Error>
@@ -240,26 +181,68 @@ pub enum Corner {
     BottomLeft,
 }
 
+/// The four fields baked into the fifo's byte layout at spawn: they size the
+/// canvas, the frame buffer, and the `-video_size`/`-framerate`/`-pixel_format`
+/// arguments ETV-next's ffmpeg was started with. A resolved-config swap that
+/// changes any of them cannot be applied to a running process (#48), so they
+/// are compared as a unit rather than field by field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub pixel_format: PixelFormat,
+}
+
+impl std::fmt::Display for Geometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}x{}@{} {}",
+            self.width,
+            self.height,
+            self.framerate,
+            self.pixel_format.ffmpeg_arg()
+        )
+    }
+}
+
 impl OverlaySpec {
-    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+    pub fn from_yaml_str(s: &str) -> Result<Self, serde_norway::Error> {
+        serde_norway::from_str(s)
     }
 
     pub fn from_path(path: &std::path::Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read overlay spec {}: {e}", path.display()))?;
-        let mut spec: Self =
-            Self::from_toml_str(&raw).map_err(|e| anyhow::anyhow!("parse overlay spec: {e}"))?;
-        let base = path.parent();
-        if let Some(script) = spec.script.take() {
-            spec.script = Some(resolve_relative(&script, base));
+        let spec =
+            Self::from_yaml_str(&raw).map_err(|e| anyhow::anyhow!("parse overlay spec: {e}"))?;
+        Ok(spec.with_paths_relative_to(path.parent()))
+    }
+
+    /// Re-root this spec's `script` and every `logo` path against `base`, the
+    /// directory the spec was authored in. Split out from [`Self::from_path`]
+    /// because a spec can also arrive inline in a channel YAML, where the same
+    /// base-relative rule has to hold against a different file's directory.
+    pub fn with_paths_relative_to(mut self, base: Option<&std::path::Path>) -> Self {
+        if let Some(script) = self.script.take() {
+            self.script = Some(resolve_relative(&script, base));
         }
-        for layer in &mut spec.layers {
+        for layer in &mut self.layers {
             if let OverlayKind::Logo { path: logo, .. } = layer {
                 *logo = resolve_relative(logo, base);
             }
         }
-        Ok(spec)
+        self
+    }
+
+    pub fn geometry(&self) -> Geometry {
+        Geometry {
+            width: self.width,
+            height: self.height,
+            framerate: self.framerate,
+            pixel_format: self.pixel_format,
+        }
     }
 
     pub fn frame_byte_len(&self) -> usize {
@@ -284,20 +267,19 @@ mod tests {
 
     #[test]
     fn parses_watermark_config() {
-        let toml = r#"
-width = 1920
-height = 1080
-framerate = 30
-pixel_format = "rgba8"
-
-[kind]
-type = "watermark"
-corner = "top_right"
-margin = 48
-box_size = 200
-color = [255, 100, 100, 200]
+        let yaml = r#"
+width: 1920
+height: 1080
+framerate: 30
+pixel_format: rgba8
+kind:
+  type: watermark
+  corner: top_right
+  margin: 48
+  box_size: 200
+  color: [255, 100, 100, 200]
 "#;
-        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.width, 1920);
         assert_eq!(spec.height, 1080);
         assert_eq!(spec.framerate, 30);
@@ -321,28 +303,25 @@ color = [255, 100, 100, 200]
 
     #[test]
     fn parses_layers_array() {
-        let toml = r#"
-width = 1280
-height = 720
-framerate = 30
-
-[[layers]]
-type = "logo"
-path = "logo.png"
-corner = "bottom_right"
-margin = 24
-height = 96
-
-[[layers]]
-type = "text"
-content = "PIERCE"
-font_family = "Helvetica"
-font_size = 36.0
-color = [255, 255, 255, 230]
-corner = "bottom_right"
-margin = 132
+        let yaml = r#"
+width: 1280
+height: 720
+framerate: 30
+layers:
+  - type: logo
+    path: logo.png
+    corner: bottom_right
+    margin: 24
+    height: 96
+  - type: text
+    content: PIERCE
+    font_family: Helvetica
+    font_size: 36.0
+    color: [255, 255, 255, 230]
+    corner: bottom_right
+    margin: 132
 "#;
-        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.layers.len(), 2);
         assert!(matches!(spec.layers[0], OverlayKind::Logo { .. }));
         assert!(matches!(spec.layers[1], OverlayKind::Text { .. }));
@@ -350,21 +329,20 @@ margin = 132
 
     #[test]
     fn parses_text_overlay() {
-        let toml = r#"
-width = 1280
-height = 720
-framerate = 30
-
-[kind]
-type = "text"
-content = "ETV STATION"
-font_family = "Helvetica"
-font_size = 64.0
-color = [255, 255, 255, 230]
-corner = "bottom_left"
-margin = 40
+        let yaml = r#"
+width: 1280
+height: 720
+framerate: 30
+kind:
+  type: text
+  content: ETV STATION
+  font_family: Helvetica
+  font_size: 64.0
+  color: [255, 255, 255, 230]
+  corner: bottom_left
+  margin: 40
 "#;
-        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.layers.len(), 1);
         match &spec.layers[0] {
             OverlayKind::Text {
@@ -388,16 +366,15 @@ margin = 40
 
     #[test]
     fn text_uses_defaults_when_minimal() {
-        let toml = r#"
-width = 640
-height = 360
-framerate = 25
-
-[kind]
-type = "text"
-content = "hi"
+        let yaml = r#"
+width: 640
+height: 360
+framerate: 25
+kind:
+  type: text
+  content: hi
 "#;
-        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.layers.len(), 1);
         match &spec.layers[0] {
             OverlayKind::Text {
@@ -421,35 +398,33 @@ content = "hi"
 
     #[test]
     fn parses_empty_default() {
-        let toml = r#"
-width = 320
-height = 240
-framerate = 24
+        let yaml = r#"
+width: 320
+height: 240
+framerate: 24
 "#;
-        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.pixel_format, PixelFormat::Rgba8);
         assert!(spec.layers.is_empty());
     }
 
-    /// A `[config]` table parses into the carrier type with its nesting and
+    /// A `config:` mapping parses into the carrier type with its nesting and
     /// scalar types intact — the shape a script reads (#125, #129).
     #[test]
     fn config_parses_into_the_shared_carrier_type() {
-        let toml = r#"
-width = 320
-height = 240
-framerate = 30
-
-[config]
-name = "lower-third"
-
-[config.fade]
-seconds = 0.4
-steps = 3
-enabled = true
-labels = ["a", "b"]
+        let yaml = r#"
+width: 320
+height: 240
+framerate: 30
+config:
+  name: lower-third
+  fade:
+    seconds: 0.4
+    steps: 3
+    enabled: true
+    labels: [a, b]
 "#;
-        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         let config = spec.config.as_ref().unwrap();
         assert_eq!(config["name"], serde_json::json!("lower-third"));
         assert_eq!(config["fade"]["seconds"], serde_json::json!(0.4));
@@ -463,16 +438,15 @@ labels = ["a", "b"]
     /// script as unit with nothing said (#130).
     #[test]
     fn a_non_finite_float_in_config_fails_the_load_and_names_the_key() {
-        let spec =
-            |bag: &str| format!("width = 320\nheight = 240\nframerate = 30\n\n[config]\n{bag}");
+        let spec = |bag: &str| format!("width: 320\nheight: 240\nframerate: 30\nconfig:\n{bag}");
         for (bag, key) in [
-            ("weight = inf\n", "config.weight"),
-            ("weight = nan\n", "config.weight"),
-            ("weight = -inf\n", "config.weight"),
-            ("steps = [1.0, inf]\n", "config.steps[1]"),
-            ("[config.fade]\nweight = nan\n", "config.fade.weight"),
+            ("  weight: .inf\n", "config.weight"),
+            ("  weight: .nan\n", "config.weight"),
+            ("  weight: -.inf\n", "config.weight"),
+            ("  steps: [1.0, .inf]\n", "config.steps[1]"),
+            ("  fade:\n    weight: .nan\n", "config.fade.weight"),
         ] {
-            let err = OverlaySpec::from_toml_str(&spec(bag))
+            let err = OverlaySpec::from_yaml_str(&spec(bag))
                 .expect_err("a non-finite float must fail the load")
                 .to_string();
             assert!(err.contains(key), "error did not name `{key}`: {err}");
@@ -483,29 +457,28 @@ labels = ["a", "b"]
         }
     }
 
-    /// TOML's native datetime — the one type it has that the carrier does not —
-    /// arrives as the text the author wrote, wherever it sits and in every form
-    /// TOML spells it. Nothing is dropped and no reserved key leaks through
-    /// (#129), and this is the same string a channel YAML's `released:
-    /// 2026-07-28` already hands a scorer plugin.
+    /// A date arrives as the text the author wrote, wherever it sits and in
+    /// whichever form it is spelled — the same string a channel YAML's
+    /// `released: 2026-07-28` already hands a scorer plugin (#129). Both
+    /// surfaces now read one format through one deserializer, which is what
+    /// makes that agreement structural rather than a coincidence of two
+    /// conversions.
     #[test]
-    fn a_toml_datetime_arrives_as_its_authored_text() {
-        let toml = r#"
-width = 320
-height = 240
-framerate = 30
-
-[config]
-date = 2026-07-28
-offset = 2026-07-28T10:32:00Z
-local = 2026-07-28T10:32:00
-clock = 10:32:00
-window = [2026-07-28, 2026-07-29]
-
-[config.nested]
-since = 2026-07-28
+    fn a_date_arrives_as_its_authored_text() {
+        let yaml = r#"
+width: 320
+height: 240
+framerate: 30
+config:
+  date: 2026-07-28
+  offset: 2026-07-28T10:32:00Z
+  local: 2026-07-28T10:32:00
+  clock: "10:32:00"
+  window: [2026-07-28, 2026-07-29]
+  nested:
+    since: 2026-07-28
 "#;
-        let spec = OverlaySpec::from_toml_str(toml).unwrap();
+        let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         let config = spec.config.as_ref().unwrap();
         assert_eq!(config["date"], serde_json::json!("2026-07-28"));
         assert_eq!(config["offset"], serde_json::json!("2026-07-28T10:32:00Z"));
@@ -513,23 +486,13 @@ since = 2026-07-28
         assert_eq!(config["clock"], serde_json::json!("10:32:00"));
         assert_eq!(config["window"][1], serde_json::json!("2026-07-29"));
         assert_eq!(config["nested"]["since"], serde_json::json!("2026-07-28"));
-
-        // The toml crate smuggles a datetime through serde under a reserved
-        // key; deserializing the carrier straight from the parser would make
-        // that private spelling the thing a script sees. Nothing here may
-        // contain it at any depth.
-        let rendered = config.to_string();
-        assert!(
-            !rendered.contains("$__toml"),
-            "a toml-private key leaked into the config a script reads: {rendered}"
-        );
     }
 
     /// An unset `config` stays unset — the empty map a script reads is made at
     /// the engine, not injected into the spec.
     #[test]
     fn an_absent_config_stays_absent() {
-        let spec = OverlaySpec::from_toml_str("width = 1\nheight = 1\nframerate = 1\n").unwrap();
+        let spec = OverlaySpec::from_yaml_str("width: 1\nheight: 1\nframerate: 1\n").unwrap();
         assert!(spec.config.is_none());
     }
 

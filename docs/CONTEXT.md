@@ -66,6 +66,10 @@ The periodic pass, run on the same interval as [[catalog refresh]], that walks e
 
 The periodic re-run of catalog ingest (Plex + local-fs) inside the daemon's own loop, on `catalog_refresh_secs`. Replaces the old startup-only ingest, whose freshness window the same config value already governed.
 
+## Overlay cascade
+
+Which overlay config a channel's single `etv-overlay` process runs, resolved station → channel → block (item deferred — no deployed channel uses `Entry::Item`, the only entry kind an item-level override could attach to). Deepest declared level wins as a **whole-config replacement**, never a merge — no per-field override, no stacking multiple configs. Absence of an `overlay:` key at any level means inherit the nearest ancestor's resolved config; an explicit `clear` opts a level out. Content that varies with the playing item (a title, an award fact) is never a cascade concern — that's the script reading item/block metadata at render time, per #174. A resolved-config change at a block boundary hot-reloads into the *same running* overlay process (mtime-polled, same mechanism as [[program metadata]] already reaches the Rhai script); only a `width`/`height`/`framerate`/`pixel_format` change is rejected at load time, since those are baked into the fifo's byte layout and can't swap without restarting ffmpeg's filter chain. See #48 (original decision, TOML-era) and #174 (metadata bridge); station-level and the hot-reload mechanism are amendments made when porting to YAML, not yet reflected in #48's text.
+
 ## Drift
 
 The gap between when a [[daypart]] was meant to start and when it actually does, because the item before it ran past the boundary. Accepted rather than corrected: closing it would mean cutting an item short or leaving dead air, and padding it out is impossible while the library has no interstitials (#85). Bounded by the longest item in the pool.

@@ -15,7 +15,7 @@ roll_interval: "60s"
 retention_days: 1
 
 overlay:
-  config: "../../crates/etv-overlay/fixtures/channel_watermark.toml"
+  file: "../../crates/etv-overlay/fixtures/channel_watermark.yaml"
 
 rule:
   blocks:

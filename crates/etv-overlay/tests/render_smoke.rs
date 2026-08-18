@@ -91,8 +91,8 @@ fn a_config_value_moves_the_rendered_watermark() {
     let mut render_with = |corner: &str| {
         // Through the real load path, so what reaches the script is what an
         // authored overlay spec would put there.
-        let spec = OverlaySpec::from_toml_str(&format!(
-            "width = 320\nheight = 240\nframerate = 30\n\n[config]\ncorner = \"{corner}\"\n"
+        let spec = OverlaySpec::from_yaml_str(&format!(
+            "width: 320\nheight: 240\nframerate: 30\nconfig:\n  corner: {corner}\n"
         ))
         .unwrap();
         let mut engine = RhaiEngine::with_config(base.clone(), spec.config.as_ref());

@@ -275,6 +275,7 @@ mod tests {
         Station {
             config_path: PathBuf::from("/tmp/station.toml"),
             station: crate::config::StationConfig {
+                overlay: None,
                 tz: "UTC".into(),
                 device_id: None,
                 output_base: PathBuf::from("/tmp/out"),
@@ -289,6 +290,7 @@ mod tests {
                 normalization: crate::config::station::empty_normalization_for_test(),
             },
             channels: vec![LoadedChannel {
+                overlays: Default::default(),
                 name: name.to_string(),
                 config_path: path().to_path_buf(),
                 output_folder: PathBuf::from("/tmp/out").join(name),
@@ -311,6 +313,7 @@ mod tests {
 
     fn manual_block(ids: &[&str]) -> BlockInclude {
         BlockInclude {
+            overlay: None,
             block: None,
             program: None,
             guide: None,
@@ -347,6 +350,7 @@ mod tests {
 
     fn manual_block_secs(ids: &[(&str, u64)]) -> BlockInclude {
         BlockInclude {
+            overlay: None,
             block: None,
             program: None,
             guide: None,
@@ -408,6 +412,7 @@ mod tests {
 
     fn shuffled_block(ids: &[&str]) -> BlockInclude {
         BlockInclude {
+            overlay: None,
             block: None,
             program: None,
             guide: None,
@@ -666,6 +671,7 @@ fn pick(ctx) {
 
     fn pattern_block(script: &Path, take: usize) -> BlockInclude {
         BlockInclude {
+            overlay: None,
             block: None,
             program: None,
             guide: None,

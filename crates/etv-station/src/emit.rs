@@ -158,6 +158,7 @@ mod tests {
 
     fn item(id: &str, secs: u64) -> ResolvedItem {
         ResolvedItem {
+            block: 0,
             id: id.into(),
             source: SourceConfig::Lavfi {
                 params: format!("src={id}"),

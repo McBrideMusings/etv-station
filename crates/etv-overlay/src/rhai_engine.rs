@@ -293,12 +293,20 @@ mod tests {
         assert_eq!(state.opacity, 1.0);
     }
 
-    /// A config bag built the way loading a spec builds one — TOML text in,
-    /// carrier value out, through the same conversion
+    /// A config bag built the way loading a spec builds one — YAML text in,
+    /// carrier value out, through the same deserializer
     /// [`OverlaySpec::config`](crate::overlay_spec::OverlaySpec::config) is read
     /// with, so these tests assert on exactly what an authored spec produces.
-    fn toml_config(src: &str) -> serde_json::Value {
-        crate::overlay_spec::toml_to_carrier(toml::from_str::<toml::Value>(src).unwrap(), "config")
+    fn yaml_config(src: &str) -> serde_json::Value {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "crate::config_carrier::deserialize_config")]
+            config: Option<serde_json::Value>,
+        }
+        let indented: String = src.lines().map(|l| format!("  {l}\n")).collect();
+        serde_norway::from_str::<Holder>(&format!("config:\n{indented}"))
+            .unwrap()
+            .config
             .unwrap()
     }
 
@@ -317,14 +325,13 @@ mod tests {
             #{ "visible": true, "opacity": config.fade.seconds }
             "#,
         );
-        let cfg = toml_config(
-            r#"
-name = "lower-third"
-[fade]
-seconds = 0.4
-steps = 3
-enabled = true
-labels = ["a", "b"]
+        let cfg = yaml_config(
+            r#"name: lower-third
+fade:
+  seconds: 0.4
+  steps: 3
+  enabled: true
+  labels: [a, b]
 "#,
         );
         let mut engine = RhaiEngine::with_config(vec![watermark()], Some(&cfg));
@@ -344,7 +351,7 @@ labels = ["a", "b"]
     fn the_same_script_renders_differently_per_config() {
         let script = write_script(r#"#{ "visible": true, "opacity": config.opacity }"#);
         let render = |opacity: &str| {
-            let cfg = toml_config(&format!("opacity = {opacity}\n"));
+            let cfg = yaml_config(&format!("opacity: {opacity}\n"));
             let mut engine = RhaiEngine::with_config(vec![watermark()], Some(&cfg));
             engine.load_script(script.path()).unwrap();
             engine.evaluate(0.0, 0, &ProgramContext::unknown()).opacity
@@ -385,7 +392,7 @@ labels = ["a", "b"]
             #{ "visible": true, "opacity": fade }
             "#,
         );
-        let cfg = toml_config("fade_secconds = 0.2\n");
+        let cfg = yaml_config("fade_secconds: 0.2\n");
         let mut engine = RhaiEngine::with_config(vec![watermark()], Some(&cfg));
         engine.load_script(script.path()).unwrap();
 

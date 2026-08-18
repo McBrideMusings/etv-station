@@ -72,6 +72,14 @@ use crate::resume::{GenerationState, ResumeMap};
 #[derive(Debug)]
 pub struct ResolvedItem {
     pub id: String,
+    /// Which `rule.blocks` index produced this item.
+    ///
+    /// Carried on the item rather than as a span over the list because the list
+    /// is reordered after the blocks are laid down — the constraint pass moves
+    /// items, and the window cut drops them — and an index into a span table
+    /// would quietly point at the wrong block afterwards. The overlay cascade
+    /// reads it to say which config is on screen when (#48).
+    pub block: usize,
     pub source: SourceConfig,
     pub in_point: Option<Duration>,
     pub out_point: Option<Duration>,
@@ -270,7 +278,10 @@ pub fn resolve_channel_with_resume(
             separate_fields.len() + block_items.len(),
             c.separate_by.clone(),
         );
-        out.extend(block_items);
+        out.extend(block_items.into_iter().map(|mut item| {
+            item.block = idx;
+            item
+        }));
         block_spans.push((span_start, out.len(), block_is_pattern));
     }
 
@@ -1528,6 +1539,7 @@ fn catalog_item(
     };
 
     Ok(Some(ResolvedItem {
+        block: 0,
         id: entry.entry_id.clone(),
         source: SourceConfig::Local {
             path: source.playback_path.clone(),
@@ -1569,6 +1581,7 @@ fn resolve_item(
     path_index: Option<&HashMap<String, String>>,
 ) -> ResolvedItem {
     ResolvedItem {
+        block: 0,
         id: derive_item_id(&item.source, identity_roots, path_index),
         source: item.source.clone(),
         in_point: item.in_point,
@@ -1699,6 +1712,7 @@ mod tests {
 
     fn include_with(entries: Vec<Entry>) -> BlockInclude {
         BlockInclude {
+            overlay: None,
             block: None,
             program: None,
             guide: None,

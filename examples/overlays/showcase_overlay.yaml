@@ -1,0 +1,22 @@
+width: 1280
+height: 720
+framerate: 30
+pixel_format: rgba8
+script: scripts/now_next_cycle.rhai
+layers:
+  # Layer 0 — "Now playing: ..." lower-third, white, large
+  - type: text
+    content: "Now playing"
+    font_family: system-ui
+    font_size: 40.0
+    color: [255, 255, 255, 240]
+    corner: bottom_left
+    margin: 48
+  # Layer 1 — "Up next: ..." lower-third, slightly dimmer
+  - type: text
+    content: "Up next"
+    font_family: system-ui
+    font_size: 36.0
+    color: [220, 220, 220, 220]
+    corner: bottom_left
+    margin: 48

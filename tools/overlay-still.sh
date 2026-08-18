@@ -3,10 +3,10 @@
 #
 # Usage:
 #   ./tools/overlay-still.sh
-#   CONFIG=crates/etv-overlay/fixtures/watermark_fade.toml TIME=5 ./tools/overlay-still.sh
+#   CONFIG=crates/etv-overlay/fixtures/watermark_fade.yaml TIME=5 ./tools/overlay-still.sh
 set -euo pipefail
 
-CONFIG="${CONFIG:-crates/etv-overlay/fixtures/watermark.toml}"
+CONFIG="${CONFIG:-crates/etv-overlay/fixtures/watermark.yaml}"
 TIME="${TIME:-0}"
 OUTPUT="${OUTPUT:-/tmp/etv-overlay-still.png}"
 

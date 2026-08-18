@@ -58,7 +58,7 @@ Deliverable: `crates/etv-query-test` — interactive CEL query harness with Plex
 
 **Shipped.** Per-channel `etv-overlay` subprocess renders Vello frames to a fifo etv-next composites on. Rhai scripts read the station-emitted chunked playout JSON to template lower-thirds with the current/next item's title and gate visibility on `item_elapsed` / `item_remaining`. Per-layer overrides (visibility, opacity, content, corner) compose with global `visible`/`opacity`. Sample scripts in `crates/etv-overlay/fixtures/scripts/`: `now_playing.rhai`, `up_next.rhai`, `pulse_watermark.rhai`, `corner_rotate.rhai`, `now_and_next.rhai`.
 
-Out of scope until Phase C: scripted `size`/`color`, channel/block/item overlay cascade (#48). Lottie / `velato` tracked separately (#50).
+Out of scope until Phase C: scripted `size`/`color`. Lottie / `velato` tracked separately (#50).
 
 ### Phase C — Schema overhaul
 
@@ -71,7 +71,7 @@ With the query language picked and graphics rendering working, redesign the chan
 - One emission model. The `LoopForever` rule and its `.anchor` sidecar are gone: every channel materializes forward, and a channel whose list never changes loops by repeating that list. Pool `wrap = "drop"` and the "channel exhausted" state went with them — television does not stop when it reaches the end of its library.
 - Plex catalog ingester + local-FS catalog ingester (bumpers / commercials / errata).
 - Runtime query resolution with snapshot-at-boot and configurable refresh interval.
-- Graphics overlay cascade: channel default → block override → item override.
+- Graphics overlay cascade: station default → channel override → block override, shipped ([#48](https://github.com/McBrideMusings/etv-station/issues/48), [#304](https://github.com/McBrideMusings/etv-station/issues/304)); the per-program/item tier is deferred until a channel needs it (no deployed channel uses `Entry::Item`).
 - Migration script from current `[rule] type = "loop_forever"` configs.
 
 ### Phase D — Plugin boundary and catalog-aware scheduling

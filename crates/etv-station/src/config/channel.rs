@@ -1,8 +1,8 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::overlay::OverlayDecl;
 use super::pool::ShowGroup;
 use super::rule::RuleConfig;
 use crate::guide::GuideConfig;
@@ -94,12 +94,19 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<ShowGroup>,
 
-    /// Optional live overlay. When set, the station daemon supervises an
-    /// `etv-overlay` subprocess that writes RGBA frames to a fifo per
-    /// channel; the emitted playout JSON carries an `overlay` field
-    /// pointing etv-next at that fifo.
-    #[serde(default)]
-    pub overlay: Option<ChannelOverlayConfig>,
+    /// This channel's live overlay — the middle of the three cascade levels
+    /// (station → channel → block, deepest wins outright; see
+    /// [`crate::config::OverlayDecl`]).
+    ///
+    /// Whatever this resolves to with the station's is the channel's **spawn
+    /// config**: it sizes the canvas and the fifo, the station daemon
+    /// supervises an `etv-overlay` subprocess against it, and the rendered
+    /// `channelN.json` carries its geometry so ETV-next's ffmpeg reads frames
+    /// of the right shape. A block-level declaration then swaps script and
+    /// layers inside that running process, which is why it may not disagree
+    /// about geometry (#48, ADR 0007).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<OverlayDecl>,
 }
 
 impl ChannelConfig {
@@ -185,19 +192,6 @@ impl ChannelConfig {
             .max()
             .unwrap_or(0)
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChannelOverlayConfig {
-    /// Path to the etv-overlay TOML config (relative to the channel config
-    /// directory or absolute). The config supplies width / height / framerate
-    /// and the rendering script.
-    pub config: PathBuf,
-
-    /// Path to the fifo the channel + overlay process share. If omitted,
-    /// defaults to `{output_folder}/overlay.fifo`.
-    #[serde(default)]
-    pub fifo_path: Option<PathBuf>,
 }
 
 /// What a scorer plugin is told about, per channel.

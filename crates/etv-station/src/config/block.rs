@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::constraints::Constraints;
 use super::entry::{Entry, Fallback};
+use super::overlay::OverlayDecl;
 use super::pool::{PatternStep, Pool};
 use crate::guide::GuideConfig;
 
@@ -33,6 +34,13 @@ pub struct BlockFile {
     /// levels (channel → block → item).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<GuideConfig>,
+
+    /// Block-level overlay (#48), the deepest of that cascade's three levels
+    /// (station → channel → block). Unlike `guide:` above, this replaces the
+    /// channel's config outright rather than merging field by field — see
+    /// [`crate::config::OverlayDecl`] for why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<OverlayDecl>,
 
     /// `None` means unset — an entries block then resolves to the [`Duplicates`]
     /// default (`collapse`) while a pattern block forces `keep`. Splicing the

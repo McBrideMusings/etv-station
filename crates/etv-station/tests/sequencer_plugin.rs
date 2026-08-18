@@ -252,6 +252,7 @@ fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
+                overlay: None,
                 block: None,
                 program: None,
                 guide: None,

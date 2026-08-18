@@ -1,0 +1,15 @@
+width: 1280
+height: 720
+framerate: 30
+pixel_format: rgba8
+script: scripts/marquee_pulse.rhai
+layers:
+  # Single banner layer near the top of the frame. Content is overwritten per
+  # frame by the Rhai script with either "NOW WATCHING — ..." or "COMING UP — ...".
+  - type: text
+    content: "NOW WATCHING"
+    font_family: system-ui
+    font_size: 44.0
+    color: [255, 220, 80, 240]
+    corner: top_left
+    margin: 56

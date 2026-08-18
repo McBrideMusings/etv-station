@@ -113,6 +113,7 @@ pub(crate) fn playback_error_params(title: &str, reason: &str) -> String {
 /// is no resolved item to rewrite: the channel failed before it produced any.
 pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration) -> ResolvedItem {
     ResolvedItem {
+        block: 0,
         id,
         source: SourceConfig::Lavfi {
             params: card_params("CHANNEL UNAVAILABLE", channel, reason),

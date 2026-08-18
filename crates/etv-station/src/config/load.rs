@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use super::block::BlockFile;
 use super::channel::ChannelConfig;
 use super::entry::Entry;
+use super::overlay::{self, ChannelOverlays};
 use super::source::SourceConfig;
 use super::station::StationConfig;
 use super::validate;
@@ -26,6 +27,11 @@ pub struct LoadedChannel {
     /// relative to the process CWD.
     pub output_folder: PathBuf,
     pub config: ChannelConfig,
+    /// The station → channel → block overlay cascade (#48), already resolved,
+    /// loaded, and path-absolute. Held beside the config rather than inside it
+    /// because resolving it needs the *station's* declaration and the two
+    /// files' directories, none of which a `ChannelConfig` knows on its own.
+    pub overlays: ChannelOverlays,
 }
 
 /// How config loading resolves an environment variable by name. Production
@@ -74,6 +80,18 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
         resolve_blocks(&mut config, &channel_path, env)?;
         validate::validate_channel(&channel_path, &config)?;
         let name = resolve_identity(station_path, &channel_path, &config)?;
+        // After `resolve_blocks`, so a block-file body's own `overlay:` has
+        // already been spliced onto the include and takes part in the cascade.
+        let channel_dir = channel_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let overlays =
+            overlay::resolve_channel(station.overlay.as_ref(), &base, &config, &channel_dir)
+                .map_err(|message| ConfigError::Validation {
+                    path: channel_path.clone(),
+                    message,
+                })?;
         // Verbatim relative to CWD (matching how the daemon writes), NOT joined
         // to the station config's directory — see `validate_output_folders`.
         let output_folder = station.output_base.join(&name);
@@ -82,6 +100,7 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
             config_path: channel_path,
             output_folder,
             config,
+            overlays,
         });
     }
 
@@ -817,6 +836,7 @@ mod tests {
 
     fn station_config() -> StationConfig {
         StationConfig {
+            overlay: None,
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec!["channels/a.yaml".into()],

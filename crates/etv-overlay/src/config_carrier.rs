@@ -1,19 +1,18 @@
 //! The opaque script-config carrier, and the one rule both scripting surfaces
 //! enforce on it.
 //!
-//! A pool's `config:` in a channel config and an overlay spec's `[config]`
-//! table are the same thing wearing two file formats: an arbitrary bag of
-//! values the station never reads, handed to a script verbatim. Both are
+//! A pool's `config:` in a channel config and an overlay spec's own `config:`
+//! are the same thing: an arbitrary bag of values the station never reads,
+//! handed to a script verbatim. Both are
 //! carried as a [`serde_json::Value`] (#129), which can hold every shape either
 //! format expresses with exactly one exception — a non-finite float. `inf`,
 //! `-inf` and `nan` have no representation in it, and left alone they reach the
 //! script as unit, quietly changing what the script does.
 //!
-//! So both surfaces refuse them at load, naming the key (#130). The wording
-//! lives here, once, because the two surfaces reach it by different routes —
-//! the channel side deserializes straight into the carrier, the overlay side
-//! detours through `toml::Value` so a TOML datetime can become its text — and
-//! two spellings of one rule is how these surfaces drifted apart last time.
+//! So both surfaces refuse them at load, naming the key (#130). Since the
+//! overlay spec became YAML (#48) the two reach that refusal through the *same*
+//! [`deserialize_config`] rather than two conversions that had to be kept
+//! saying the same thing — which is how they drifted apart last time.
 
 use std::fmt;
 
@@ -37,13 +36,11 @@ pub fn non_finite_message(path: &str, value: f64) -> String {
 ///
 /// Format-agnostic on purpose: it drives the deserializer through
 /// `deserialize_any`, exactly as [`serde_json::Value`]'s own `Deserialize`
-/// impl does, so a channel config authored in YAML and one authored in TOML
-/// read identically. It differs from the stock impl in one place — a
-/// non-finite float is an error here rather than a silent `null`.
+/// impl does. It differs from the stock impl in one place — a non-finite float
+/// is an error here rather than a silent `null`.
 ///
-/// The overlay surface does not use this, because it has to walk `toml::Value`
-/// first to turn a TOML datetime into its text; it reaches the same refusal
-/// through [`non_finite_message`].
+/// Both surfaces read `config:` through this one function: a pool's in a
+/// channel YAML, and an overlay spec's own.
 pub fn deserialize_config<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: Deserializer<'de>,
@@ -178,45 +175,45 @@ mod tests {
         config: Option<serde_json::Value>,
     }
 
-    fn from_toml(src: &str) -> Result<Option<serde_json::Value>, String> {
-        toml::from_str::<Holder>(src)
+    fn from_yaml(src: &str) -> Result<Option<serde_json::Value>, String> {
+        serde_norway::from_str::<Holder>(src)
             .map(|h| h.config)
             .map_err(|e| e.to_string())
     }
 
     #[test]
     fn a_finite_float_survives() {
-        let config = from_toml("[config]\nweight = 0.5\n").unwrap().unwrap();
+        let config = from_yaml("config:\n  weight: 0.5\n").unwrap().unwrap();
         assert_eq!(config["weight"], serde_json::json!(0.5));
     }
 
     #[test]
     fn an_absent_bag_stays_absent() {
-        assert!(from_toml("").unwrap().is_none());
+        assert!(from_yaml("{}").unwrap().is_none());
     }
 
     #[test]
     fn an_infinite_float_is_refused_and_names_the_key() {
-        let err = from_toml("[config]\nweight = inf\n").unwrap_err();
+        let err = from_yaml("config:\n  weight: .inf\n").unwrap_err();
         assert!(err.contains("config.weight"), "{err}");
         assert!(err.contains("inf"), "{err}");
     }
 
     #[test]
     fn a_nan_float_is_refused_and_names_the_key() {
-        let err = from_toml("[config]\nweight = nan\n").unwrap_err();
+        let err = from_yaml("config:\n  weight: .nan\n").unwrap_err();
         assert!(err.contains("config.weight"), "{err}");
     }
 
     #[test]
     fn a_non_finite_float_inside_an_array_names_its_index() {
-        let err = from_toml("[config]\nsteps = [1.0, -inf]\n").unwrap_err();
+        let err = from_yaml("config:\n  steps: [1.0, -.inf]\n").unwrap_err();
         assert!(err.contains("config.steps[1]"), "{err}");
     }
 
     #[test]
-    fn a_non_finite_float_inside_a_sub_table_names_the_full_path() {
-        let err = from_toml("[config.fade]\nweight = inf\n").unwrap_err();
+    fn a_non_finite_float_inside_a_sub_map_names_the_full_path() {
+        let err = from_yaml("config:\n  fade:\n    weight: .inf\n").unwrap_err();
         assert!(err.contains("config.fade.weight"), "{err}");
     }
 }

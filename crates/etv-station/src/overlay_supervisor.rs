@@ -72,7 +72,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub struct OverlayContext {
     pub channel_name: String,
     pub output_folder: PathBuf,
-    pub overlay_config: PathBuf,
     pub fifo_path: PathBuf,
 }
 
@@ -86,24 +85,16 @@ impl OverlayContext {
     }
 }
 
-/// Resolve the fifo path: explicit if set, else `{output_folder}/overlay.fifo`.
-pub fn resolve_fifo_path(output_folder: &Path, configured: Option<&Path>) -> PathBuf {
-    configured
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| output_folder.join("overlay.fifo"))
-}
-
-/// Resolve the overlay config path: absolute as-is, or relative to the
-/// channel config file's directory.
-pub fn resolve_overlay_config(channel_config_path: &Path, configured: &Path) -> PathBuf {
-    if configured.is_absolute() {
-        configured.to_path_buf()
-    } else {
-        match channel_config_path.parent() {
-            Some(parent) => parent.join(configured),
-            None => configured.to_path_buf(),
-        }
-    }
+/// The fifo a channel's overlay and its ETV-next ffmpeg share:
+/// `{output_folder}/overlay.fifo`.
+///
+/// Derived, not configurable. The path was once overridable per channel and
+/// nothing ever overrode it — the fifo is an implementation detail of a
+/// handshake whose other two files (`.overlay-wanted`, `.overlay-ready`) are
+/// already fixed names in this same folder, and a knob that can only be set
+/// wrong is not a knob.
+pub fn resolve_fifo_path(output_folder: &Path) -> PathBuf {
+    output_folder.join("overlay.fifo")
 }
 
 /// Pre-create the fifo on disk so etv-next can open it for reading any time
@@ -336,15 +327,16 @@ fn spawn_overlay(ctx: &OverlayContext) -> std::io::Result<Child> {
     let binary = overlay_binary_path();
     Command::new(binary)
         .arg("pipe")
-        .arg("--config")
-        .arg(&ctx.overlay_config)
         .arg("--fifo")
         .arg(&ctx.fifo_path)
         .arg("--ready-file")
         .arg(ctx.ready_path())
-        // Source of truth for "what's airing now" — the overlay reads the
-        // station-emitted chunk JSON to populate the per-frame Rhai context
-        // (title, next_title, item_elapsed, item_remaining).
+        // Source of truth for both "what's airing now" and "which overlay
+        // config is on screen": the overlay reads the station-emitted chunk
+        // JSON for the per-frame Rhai context (title, next_title,
+        // item_elapsed, item_remaining) and `overlay.json` beside it for the
+        // spec itself. No `--config` — the config is not a fixed file for the
+        // life of the process any more (#48).
         .arg("--playout-folder")
         .arg(&ctx.output_folder)
         .stdin(Stdio::null())
@@ -374,27 +366,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_fifo_uses_explicit_when_set() {
-        let explicit = PathBuf::from("/tmp/custom.fifo");
-        let resolved = resolve_fifo_path(Path::new("/some/output"), Some(&explicit));
-        assert_eq!(resolved, explicit);
-    }
-
-    #[test]
-    fn resolve_fifo_defaults_under_output_folder() {
-        let resolved = resolve_fifo_path(Path::new("/some/output"), None);
+    fn the_fifo_sits_under_the_channels_output_folder() {
+        let resolved = resolve_fifo_path(Path::new("/some/output"));
         assert_eq!(resolved, PathBuf::from("/some/output/overlay.fifo"));
-    }
-
-    #[test]
-    fn resolve_overlay_config_relative_to_channel_dir() {
-        let channel_path = Path::new("/etc/etv/channels/test.toml");
-        let cfg = Path::new("overlays/watermark.toml");
-        let resolved = resolve_overlay_config(channel_path, cfg);
-        assert_eq!(
-            resolved,
-            PathBuf::from("/etc/etv/channels/overlays/watermark.toml")
-        );
     }
 
     // Reaping a clean exit used to retire `.overlay-wanted` unconditionally.
@@ -423,7 +397,6 @@ mod tests {
         OverlayContext {
             channel_name: "test".into(),
             output_folder: dir.to_path_buf(),
-            overlay_config: dir.join("overlay.toml"),
             fifo_path: dir.join("overlay.fifo"),
         }
     }

@@ -8,6 +8,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use etv_overlay::fifo_writer::{FifoWriter, OpenOutcome, default_fifo_path};
 use etv_overlay::overlay_spec::OverlaySpec;
+use etv_overlay::overlay_timeline::OverlayTimelineSource;
 use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
 use etv_overlay::rhai_engine::{OverlayState, RhaiEngine};
 use etv_overlay::vello_renderer::VelloRenderer;
@@ -120,8 +121,6 @@ enum Cmd {
     /// Render frames directly to a fifo, blocking until the reader disconnects
     Pipe {
         #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
         fifo: PathBuf,
         #[arg(long, default_value_t = false)]
         create_fifo: bool,
@@ -131,13 +130,16 @@ enum Cmd {
         /// image cache miss) so callers can avoid sampling torn frames.
         #[arg(long)]
         ready_file: Option<PathBuf>,
-        /// Folder containing the station-emitted chunked playout JSON for
-        /// this channel. When set, the per-frame Rhai scope is populated with
-        /// `title` / `next_title` / `item_elapsed` / `item_remaining` for the
-        /// item airing at wallclock now. Without it the context fields are
-        /// empty/-1.0 — scripts that don't reference them still work.
+        /// Folder containing the station-emitted chunked playout JSON and
+        /// `overlay.json` for this channel. The per-frame Rhai scope reads
+        /// `title` / `next_title` / `item_elapsed` / `item_remaining` from the
+        /// former; the latter supplies the spawn config (geometry, the
+        /// fallback script and layers) and the per-block overrides the
+        /// station → channel → block cascade resolves (#48). Required: a
+        /// process spawned with nowhere to read either from has nothing to
+        /// render.
         #[arg(long)]
-        playout_folder: Option<PathBuf>,
+        playout_folder: PathBuf,
     },
 }
 
@@ -167,12 +169,11 @@ fn main() -> anyhow::Result<()> {
             keep_fifo,
         } => run_with_ffmpeg(input, config, output, fifo, ffmpeg, keep_fifo),
         Cmd::Pipe {
-            config,
             fifo,
             create_fifo,
             ready_file,
             playout_folder,
-        } => pipe_to_fifo(config, fifo, create_fifo, ready_file, playout_folder),
+        } => pipe_to_fifo(fifo, create_fifo, ready_file, playout_folder),
     }
 }
 
@@ -298,20 +299,46 @@ fn run_with_ffmpeg(
 }
 
 fn pipe_to_fifo(
-    config: PathBuf,
     fifo_path: PathBuf,
     create_fifo: bool,
     ready_file: Option<PathBuf>,
-    playout_folder: Option<PathBuf>,
+    playout_folder: PathBuf,
 ) -> anyhow::Result<()> {
-    let spec = OverlaySpec::from_path(&config)?;
+    // The station's `prepare_generation` writes `overlay.json` for every
+    // channel before it spawns any overlay process, so this loop only ever
+    // turns on the spawn racing that write on the very first tick after it —
+    // bounded rather than open-ended so a station that never wrote one (a
+    // config bug this process can't see) fails loudly instead of hanging.
+    let mut timeline_source = OverlayTimelineSource::new(&playout_folder);
+    let wait_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Err(e) = timeline_source.refresh() {
+            tracing::warn!(error = %e, "overlay timeline refresh failed while waiting for the spawn config");
+        }
+        if timeline_source.is_loaded() {
+            break;
+        }
+        if std::time::Instant::now() >= wait_deadline {
+            anyhow::bail!(
+                "no overlay.json appeared in {} within 10s; the station should have \
+                 written one before spawning this process",
+                playout_folder.display(),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let base = timeline_source
+        .base()
+        .expect("just confirmed the timeline is loaded")
+        .clone();
+
     let mut fifo = if create_fifo {
         FifoWriter::create(fifo_path.clone())?
     } else {
         FifoWriter::attach(fifo_path.clone())
     };
 
-    let mut program_source = playout_folder.map(ProgramContextSource::new);
+    let mut program_source = Some(ProgramContextSource::new(playout_folder));
 
     // Warm the renderer fully BEFORE opening the fifo. wgpu adapter init,
     // vello shader compile, and the first image-cache decode all happen in
@@ -319,8 +346,9 @@ fn pipe_to_fifo(
     // guarantees ffmpeg can't read a partial frame during cold-start: nothing
     // hits the pipe until we have a complete RGBA buffer ready to write.
     // See https://github.com/McBrideMusings/etv-station/issues/54.
-    let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
-    let engine = build_engine(&spec)?;
+    let mut renderer = VelloRenderer::new(base.width, base.height, base.pixel_format)?;
+    let mut active_spec = timeline_source.spec_at(OffsetDateTime::now_utc()).cloned();
+    let mut engine = build_engine_for(active_spec.as_ref())?;
     let start = std::time::Instant::now();
     let initial_ctx = current_context(program_source.as_mut());
     let first_frame = renderer.render_frame(&engine.evaluate(0.0, 0, &initial_ctx))?;
@@ -349,7 +377,7 @@ fn pipe_to_fifo(
         );
     }
 
-    let framerate = spec.framerate.max(1) as f64;
+    let framerate = base.framerate.max(1) as f64;
     let mut frame_index: u64 = 1;
     // Pacing is anchored separately from `start` (which drives animation time)
     // so that a multi-second blocking reopen between playout items doesn't make
@@ -362,6 +390,39 @@ fn pipe_to_fifo(
             tracing::info!("shutdown requested; stopping overlay pipe");
             return Ok(());
         }
+
+        // A block boundary the timeline crossed swaps script + layers in
+        // place — same process, same fifo, same canvas (#48, ADR 0007). The
+        // geometry guard is defense in depth: `config::resolve_channel`
+        // already refuses a mismatched block at load, so this should never
+        // fire against a config the station actually shipped.
+        if let Err(e) = timeline_source.refresh() {
+            tracing::warn!(error = %e, "overlay timeline refresh failed; keeping the last good config");
+        }
+        let wanted = timeline_source.spec_at(OffsetDateTime::now_utc());
+        if wanted != active_spec.as_ref() {
+            match wanted {
+                Some(spec) if spec.geometry() != base.geometry() => {
+                    tracing::warn!(
+                        wanted = %spec.geometry(),
+                        base = %base.geometry(),
+                        "block overlay geometry disagrees with the channel's spawn config; \
+                         keeping the running config",
+                    );
+                }
+                _ => match build_engine_for(wanted) {
+                    Ok(new_engine) => {
+                        tracing::info!("overlay timeline changed; reloaded script and layers");
+                        engine = new_engine;
+                        active_spec = wanted.cloned();
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to load the new overlay config; keeping the running one")
+                    }
+                },
+            }
+        }
+
         let time_seconds = start.elapsed().as_secs_f64();
         let ctx = current_context(program_source.as_mut());
         let state = engine.evaluate(time_seconds, frame_index, &ctx);
@@ -477,6 +538,16 @@ fn build_engine(spec: &OverlaySpec) -> anyhow::Result<RhaiEngine> {
         engine.load_script(script)?;
     }
     Ok(engine)
+}
+
+/// As [`build_engine`], for the resolved-overlay cascade's `Option<&OverlaySpec>`
+/// (#48): `None` — a block that declared `overlay: clear` — is an engine with
+/// no layers and no script, which renders nothing, same as an empty spec would.
+fn build_engine_for(spec: Option<&OverlaySpec>) -> anyhow::Result<RhaiEngine> {
+    match spec {
+        Some(spec) => build_engine(spec),
+        None => Ok(RhaiEngine::new(vec![])),
+    }
 }
 
 fn evaluate_state(spec: &OverlaySpec, time: f64, frame_index: u64) -> anyhow::Result<OverlayState> {

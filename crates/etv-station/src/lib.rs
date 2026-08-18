@@ -14,6 +14,7 @@ pub mod etv_next;
 pub mod guide;
 pub mod history;
 pub mod overlay_supervisor;
+pub mod overlay_timeline;
 pub mod pattern;
 pub mod reconcile;
 pub mod resolve;

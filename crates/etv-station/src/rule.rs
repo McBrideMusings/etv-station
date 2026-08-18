@@ -12,6 +12,31 @@ pub trait Rule {
         from: OffsetDateTime,
         to: OffsetDateTime,
     ) -> Vec<PlayoutItem>;
+
+    /// The same window as [`Self::items_covering`], expressed as which
+    /// `rule.blocks` index is on air over which wall-clock span, with
+    /// consecutive items of one block merged into a single span.
+    ///
+    /// A second method rather than a field on [`PlayoutItem`] because that type
+    /// is ETV-next's, vendored, and ETV-next has no use for a block index; and
+    /// derived from the same walk rather than recomputed by the caller, because
+    /// two walks over the same durations are two chances to disagree about
+    /// where an item starts.
+    fn block_spans_covering(
+        &self,
+        anchor_utc: OffsetDateTime,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Vec<BlockSpan>;
+}
+
+/// One stretch of wall-clock time served by a single block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSpan {
+    pub start: OffsetDateTime,
+    pub finish: OffsetDateTime,
+    /// Index into the channel's `rule.blocks`.
+    pub block: usize,
 }
 
 /// Play a resolved list once, end to end, from a given start.
@@ -76,6 +101,44 @@ impl Rule for Sequential<'_> {
                     item_start_utc,
                     item_finish_utc,
                 ));
+            }
+            item_start_utc = item_finish_utc;
+        }
+        out
+    }
+
+    fn block_spans_covering(
+        &self,
+        start_utc: OffsetDateTime,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Vec<BlockSpan> {
+        let mut out: Vec<BlockSpan> = Vec::new();
+        if self.items.is_empty() || to <= from {
+            return out;
+        }
+
+        let mut item_start_utc = start_utc;
+        for (idx, dur) in self.durations.iter().enumerate() {
+            let item_finish_utc = item_start_utc + time::Duration::seconds_f64(dur.as_secs_f64());
+            if item_start_utc >= to {
+                break;
+            }
+            if item_finish_utc > from {
+                let block = self.items[idx].block;
+                // Merge rather than emit one span per item: the overlay only
+                // changes at a block boundary, and a span per item would make
+                // the timeline as long as the playout for no added meaning.
+                match out.last_mut() {
+                    Some(last) if last.block == block && last.finish == item_start_utc => {
+                        last.finish = item_finish_utc;
+                    }
+                    _ => out.push(BlockSpan {
+                        start: item_start_utc,
+                        finish: item_finish_utc,
+                        block,
+                    }),
+                }
             }
             item_start_utc = item_finish_utc;
         }
@@ -157,6 +220,7 @@ mod tests {
 
     fn lavfi(id: &str, secs: u64) -> ResolvedItem {
         ResolvedItem {
+            block: 0,
             id: id.into(),
             source: SourceConfig::Lavfi {
                 params: format!("src={id}"),

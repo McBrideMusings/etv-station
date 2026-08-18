@@ -944,7 +944,6 @@ async fn run_generation(
                 tracing::info!(
                     event = "overlay.start",
                     channel = %name,
-                    config = %ctx.overlay_config.display(),
                     fifo = %ctx.fifo_path.display(),
                     "starting overlay supervisor",
                 );
@@ -1250,15 +1249,19 @@ async fn recv_signal(sig: Option<&mut tokio::signal::unix::Signal>) {
 }
 
 /// Run every check and side effect a generation needs before its channel and
-/// overlay tasks spawn: parse the station tz, validate each channel's overlay
-/// spec, and create each channel's `output_folder`. The single home for the "is
-/// this config runnable" gate — `run` calls it once per generation on both the
-/// startup and reload paths, so a check added here can never be silently skipped
-/// on one path (the split that let the #34 mkdir slip past the reload gate; see
-/// #90 and docs/adr/0001-reload-generation-revert.md).
+/// overlay tasks spawn: parse the station tz, create each channel's
+/// `output_folder`, and lay down each channel's overlay timeline. The single
+/// home for the "is this config runnable" gate — `run` calls it once per
+/// generation on both the startup and reload paths, so a check added here can
+/// never be silently skipped on one path (the split that let the #34 mkdir slip
+/// past the reload gate; see #90 and docs/adr/0001-reload-generation-revert.md).
+///
+/// Every overlay spec was already parsed by `config::load`, which resolves the
+/// station → channel → block cascade as it reads the files, so a malformed one
+/// has failed the load long before this runs — there is no second parse here to
+/// keep in step with the first.
 async fn prepare_generation(station: &Station) -> Result<&'static Tz, StationError> {
     let tz = tzmod::parse(&station.station.tz)?;
-    validate_overlay_configs(station)?;
     // Create every channel's output_folder before any task spawns — a fresh
     // deploy on empty volumes needs it in place before etv-next's canonicalize
     // reads it and before the overlay supervisor opens its fifo underneath (#34).
@@ -1270,75 +1273,46 @@ async fn prepare_generation(station: &Station) -> Result<&'static Tz, StationErr
                 path: output.clone(),
                 source,
             })?;
+        // Before the supervisor can spawn: the overlay process reads its spawn
+        // config out of this file, so it has to exist by the time one starts.
+        if let Some(base) = channel.overlays.base.as_ref() {
+            crate::overlay_timeline::reset(output, base).await?;
+        }
     }
     Ok(tz)
 }
 
-/// Resolve the (overlay_config_path, fifo_path) pair for a channel, if it has
-/// an overlay configured. Both `build_overlay_context` and
-/// `load_overlay_playout_spec` need the same resolution.
-fn resolve_overlay_paths(channel: &LoadedChannel) -> Option<(PathBuf, PathBuf)> {
-    let cfg = channel.config.overlay.as_ref()?;
-    let overlay_config =
-        overlay_supervisor::resolve_overlay_config(&channel.config_path, &cfg.config);
-    let fifo_path =
-        overlay_supervisor::resolve_fifo_path(&channel.output_folder, cfg.fifo_path.as_deref());
-    Some((overlay_config, fifo_path))
-}
-
 fn build_overlay_context(channel: &LoadedChannel) -> Option<overlay_supervisor::OverlayContext> {
-    let (overlay_config, fifo_path) = resolve_overlay_paths(channel)?;
+    channel.overlays.base.as_ref()?;
     Some(overlay_supervisor::OverlayContext {
         channel_name: channel.name.clone(),
         output_folder: channel.output_folder.clone(),
-        overlay_config,
-        fifo_path,
+        fifo_path: overlay_supervisor::resolve_fifo_path(&channel.output_folder),
     })
 }
 
-/// Parse every channel's overlay config up front so a malformed TOML fails the
-/// daemon at startup instead of silently emitting playout JSON without an
-/// overlay spec while the supervisor crash-loops on the same broken file.
-fn validate_overlay_configs(station: &Station) -> Result<(), StationError> {
-    for channel in &station.channels {
-        let Some((overlay_config_path, _)) = resolve_overlay_paths(channel) else {
-            continue;
-        };
-        etv_overlay::overlay_spec::OverlaySpec::from_path(&overlay_config_path).map_err(|e| {
-            ConfigError::Validation {
-                path: overlay_config_path.clone(),
-                message: format!("overlay config for channel '{}': {e}", channel.name),
-            }
-        })?;
-    }
-    Ok(())
-}
-
+/// The `overlay` block ETV-next reads out of its rendered `channelN.json`.
+///
+/// Its geometry is the **channel's** resolved config, never a block's: it
+/// describes the fifo ETV-next's ffmpeg is about to open, and that fifo is
+/// sized once, at spawn. A block-level config swaps script and layers inside
+/// the already-running process and may not disagree about geometry — which is
+/// checked when the config is read, in
+/// [`config::resolve_channel`](crate::config::resolve_channel), so nothing here
+/// has to re-check it.
 pub(crate) fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySpec> {
-    let (overlay_config_path, fifo_path) = resolve_overlay_paths(channel)?;
-    match etv_overlay::overlay_spec::OverlaySpec::from_path(&overlay_config_path) {
-        Ok(spec) => Some(PlayoutOverlaySpec {
-            fifo_path: fifo_path.to_string_lossy().into_owned(),
-            pixel_format: String::from(spec.pixel_format.ffmpeg_arg()),
-            width: spec.width,
-            height: spec.height,
-            framerate: spec.framerate,
-            x: 0,
-            y: 0,
-        }),
-        Err(e) => {
-            // validate_overlay_configs parsed this at startup, so we only land
-            // here if the file changed between startup and channel init.
-            tracing::error!(
-                event = "overlay.spec_error",
-                channel = %channel.name,
-                error = %e,
-                config = %overlay_config_path.display(),
-                "overlay config re-parse failed after startup validation; emitting playout without overlay spec",
-            );
-            None
-        }
-    }
+    let spec = channel.overlays.base.as_ref()?;
+    Some(PlayoutOverlaySpec {
+        fifo_path: overlay_supervisor::resolve_fifo_path(&channel.output_folder)
+            .to_string_lossy()
+            .into_owned(),
+        pixel_format: String::from(spec.pixel_format.ffmpeg_arg()),
+        width: spec.width,
+        height: spec.height,
+        framerate: spec.framerate,
+        x: 0,
+        y: 0,
+    })
 }
 
 async fn channel_loop(
@@ -1546,6 +1520,7 @@ mod supervisor_tests {
         )
         .expect("fixture channel config parses");
         LoadedChannel {
+            overlays: Default::default(),
             name: "testch".into(),
             config_path: PathBuf::from("testch.toml"),
             output_folder: dir.path().to_path_buf(),
@@ -1588,6 +1563,7 @@ mod supervisor_tests {
         let count = ((target - from).as_seconds_f64() / 1800.0).ceil().max(0.0) as usize;
         let items: Vec<crate::resolve::ResolvedItem> = (0..count)
             .map(|i| crate::resolve::ResolvedItem {
+                block: 0,
                 id: format!("film-{i}"),
                 source: crate::config::SourceConfig::Lavfi {
                     params: "color=c=blue".into(),
@@ -1809,6 +1785,7 @@ mod regen_floor_tests {
         )
         .expect("fixture channel config parses");
         LoadedChannel {
+            overlays: Default::default(),
             name: "testch".into(),
             config_path: PathBuf::from("testch.toml"),
             output_folder: dir.path().to_path_buf(),
@@ -1818,6 +1795,7 @@ mod regen_floor_tests {
 
     fn film(id: &str, secs: u64) -> crate::resolve::ResolvedItem {
         crate::resolve::ResolvedItem {
+            block: 0,
             id: id.into(),
             source: crate::config::SourceConfig::Lavfi {
                 params: format!("src={id}"),
@@ -1959,25 +1937,23 @@ fn channel_input_fingerprint(
         }
     };
 
-    // A channel with no overlay hashes a fixed empty input, so a channel
-    // that later adds or removes an overlay still changes the fingerprint
-    // (the overlay bytes go from present to absent, or vice versa) rather
-    // than silently contributing nothing either way.
-    let overlay_bytes = match resolve_overlay_paths(channel) {
-        Some((overlay_config_path, _)) => match std::fs::read(&overlay_config_path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(
-                    event = "resume.fingerprint_error",
-                    channel = %channel.name,
-                    path = %overlay_config_path.display(),
-                    %error,
-                    "could not read overlay config for a generation fingerprint; regenerating as usual",
-                );
-                return None;
-            }
-        },
-        None => Vec::new(),
+    // The whole resolved cascade, not one file's bytes: an edit anywhere it
+    // reads from — the station's declaration, the channel's, a block's, or a
+    // spec file any of them references — changes this and forces a regeneration
+    // (#182). A channel with no overlay at all serializes to a fixed empty
+    // shape, so adding or removing one still moves the fingerprint rather than
+    // contributing nothing either way.
+    let overlay_bytes = match serde_json::to_vec(&channel.overlays) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                event = "resume.fingerprint_error",
+                channel = %channel.name,
+                %error,
+                "could not serialize the resolved overlay for a generation fingerprint; regenerating as usual",
+            );
+            return None;
+        }
     };
 
     let config_bytes = match serde_json::to_vec(&channel.config) {
@@ -2580,6 +2556,22 @@ async fn pattern_catch_up(
         .await?;
         log_emission(&channel.name, phase, &written, from, to);
 
+        // Which overlay config each block just emitted puts on screen (#48).
+        // Retained on the same horizon `sweep_window` prunes chunk files to,
+        // so the two files agree on how much of the past is still real.
+        let retain_from = OffsetDateTime::now_utc()
+            - time::Duration::days(i64::from(channel.config.retention_days));
+        crate::overlay_timeline::append(
+            output,
+            &channel.overlays,
+            &rule,
+            seq_start,
+            from,
+            to,
+            retain_from,
+        )
+        .await?;
+
         // One play-history row per scheduled airing, in schedule order. The
         // times are the same walk `Sequential` just emitted: items laid end
         // to end from `from`, which is why the whole generation is emitted
@@ -2794,6 +2786,7 @@ mod render_guide_and_attribution_tests {
 
     fn item_with_guide(id: &str, title: &str, guide: Option<GuideConfig>) -> ResolvedItem {
         ResolvedItem {
+            block: 0,
             id: id.into(),
             source: crate::config::SourceConfig::Lavfi {
                 params: "testsrc".into(),
@@ -3735,6 +3728,7 @@ mod history_catalog_tests {
             "rule:\n  blocks:\n    - pools:\n        - name: p\n          {source}\n      pattern:\n        - pool: p\n          take: 1\n"
         );
         LoadedChannel {
+            overlays: Default::default(),
             name: name.to_string(),
             config_path: PathBuf::from(format!("{name}.yaml")),
             output_folder: PathBuf::from(name),

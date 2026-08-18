@@ -303,6 +303,7 @@ mod tests {
 
     fn lavfi_item(id: &str, secs: u64) -> ResolvedItem {
         ResolvedItem {
+            block: 0,
             id: id.into(),
             source: SourceConfig::Lavfi {
                 params: "testsrc".into(),
@@ -332,6 +333,7 @@ mod tests {
     async fn lavfi_without_out_point_errors() {
         let mut cache = DurationCache::default();
         let item = ResolvedItem {
+            block: 0,
             id: "x".into(),
             source: SourceConfig::Lavfi {
                 params: "testsrc".into(),
@@ -354,6 +356,7 @@ mod tests {
     async fn missing_local_file_errors_loudly() {
         let mut cache = DurationCache::default();
         let item = ResolvedItem {
+            block: 0,
             id: "ghost".into(),
             source: SourceConfig::Local {
                 path: "/no/such/path/zzz.mkv".into(),
@@ -374,6 +377,7 @@ mod tests {
 
     fn local_item(id: &str, path: &str) -> ResolvedItem {
         ResolvedItem {
+            block: 0,
             id: id.into(),
             source: SourceConfig::Local { path: path.into() },
             in_point: None,
@@ -448,6 +452,7 @@ mod tests {
     async fn a_config_error_still_fails() {
         let mut cache = DurationCache::default();
         let bad = ResolvedItem {
+            block: 0,
             id: "x".into(),
             source: SourceConfig::Lavfi {
                 params: "testsrc".into(),

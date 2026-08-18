@@ -1029,6 +1029,7 @@ mod tests {
 
     fn inline_block(entries: Vec<Entry>) -> BlockInclude {
         BlockInclude {
+            overlay: None,
             block: None,
             program: None,
             guide: None,
@@ -1211,6 +1212,7 @@ mod tests {
     #[test]
     fn rejects_empty_channels() {
         let s = StationConfig {
+            overlay: None,
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec![],
@@ -1232,6 +1234,7 @@ mod tests {
     #[test]
     fn rejects_empty_output_base() {
         let s = StationConfig {
+            overlay: None,
             tz: "UTC".into(),
             output_base: PathBuf::new(),
             channels: vec!["channels/a.yaml".into()],
@@ -1252,6 +1255,7 @@ mod tests {
     #[test]
     fn rejects_empty_channel_entry() {
         let s = StationConfig {
+            overlay: None,
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec!["  ".into()],

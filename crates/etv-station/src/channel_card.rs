@@ -187,6 +187,7 @@ mod tests {
         )
         .expect("fixture channel config parses");
         LoadedChannel {
+            overlays: Default::default(),
             name: "testch".into(),
             config_path: PathBuf::from("testch.toml"),
             output_folder: dir.to_path_buf(),

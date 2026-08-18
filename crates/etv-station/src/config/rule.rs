@@ -9,6 +9,7 @@ use super::entry::{Entry, Fallback};
 use super::filter::Filter;
 use super::mode::Mode;
 use super::order::Order;
+use super::overlay::OverlayDecl;
 use super::pool::{PatternStep, Pool};
 use crate::guide::GuideConfig;
 
@@ -43,6 +44,14 @@ pub struct BlockInclude {
     /// `program` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<GuideConfig>,
+
+    /// Block-level overlay (#48), deepest level of the station → channel →
+    /// block cascade. Path form: spliced in from the referenced block file's
+    /// own `overlay:` by [`Self::apply_body`], same as `guide` above. Its
+    /// paths still resolve against the *channel* file's directory, matching a
+    /// pool's `plugin:` — see [`crate::config::OverlayDecl`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<OverlayDecl>,
 
     /// Inline form: within-block duplicate policy. `None` resolves to the
     /// [`Duplicates`] default (`collapse`).
@@ -240,6 +249,7 @@ impl BlockInclude {
     pub(super) fn apply_body(&mut self, body: BlockFile) {
         self.program = body.program;
         self.guide = body.guide;
+        self.overlay = body.overlay;
         self.duplicates = body.duplicates;
         self.constraints = body.constraints;
         self.entries = body.entries;

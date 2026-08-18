@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use ersatztv_channel::config::{FfmpegConfig, NormalizationConfig};
 use serde::{Deserialize, Serialize};
 
+use super::overlay::OverlayDecl;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StationConfig {
     #[serde(default = "default_tz")]
@@ -111,6 +113,17 @@ pub struct StationConfig {
     /// this often. `0` disables delta ingest entirely: every pass is full.
     #[serde(default = "default_full_sweep_after_secs")]
     pub full_sweep_after_secs: u64,
+
+    /// The station-wide overlay default — the least specific of the three
+    /// cascade levels (station → channel → block; see
+    /// [`crate::config::OverlayDecl`]).
+    ///
+    /// This is where a house watermark belongs: every channel that says
+    /// nothing inherits it, and a channel that wants its own writes one, with
+    /// no third place to look. Unset means channels start from nothing, which
+    /// is what every station config meant before this key existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<OverlayDecl>,
 
     /// ETV-next's `ffmpeg:` block, deserialized through its own type so a
     /// renamed field fails this build instead of being silently dropped.

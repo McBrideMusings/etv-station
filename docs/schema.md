@@ -454,6 +454,7 @@ full_sweep_after_secs: 86400   # optional — force a full (deletion-catching) r
 | `source_roots` | no — default empty | list of directories the daemon walks to populate the catalog when `catalog_path` is set — an operational choice about what this deployment scans, not used for identity. Empty skips the filesystem scan entirely. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime. |
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
+| `overlay` | no | station-wide overlay default, the least specific level of the cascade every channel inherits from unless it says otherwise — see [Overlay cascade](#overlay-cascade) |
 
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
@@ -493,7 +494,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `roll_interval` | no — default `"3600s"` | duration |
 | `retention_days` | no — default `7` | int |
 | `seed` | no | int — seeds `random` order |
-| `overlay` | no | `{ config, fifo_path? }` |
+| `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
 
 ### Composing blocks — `rule.blocks`
@@ -534,10 +535,56 @@ rule:
 ```
 
 The two forms are interchangeable: at load, a referenced file's body
-(`program` / `duplicates` / `entries` / `fallback`) is copied into the include,
-so a reference and an equivalent inline block resolve identically. `mode`,
-`order`, and `filter` are **composition fields on the include** — they never
-live in the block file body.
+(`program` / `guide` / `overlay` / `duplicates` / `entries` / `fallback`) is
+copied into the include, so a reference and an equivalent inline block resolve
+identically. `mode`, `order`, and `filter` are **composition fields on the
+include** — they never live in the block file body.
+
+### Overlay cascade
+
+`overlay:` is one key, spelled the same way at three levels — the station
+file, a channel file, and a `rule.blocks` entry (or the block file it
+references) — that together resolve to *which whole config* the channel's
+single `etv-overlay` process runs at a given moment (#48). Source:
+`config/overlay.rs` (`OverlayDecl`, `resolve_decl`, `resolve_channel`).
+
+```yaml
+# a value at any of the three levels
+overlay: clear
+
+overlay:
+  file: shared/pierce-overlay.yaml   # reuse a spec file, relative to this file's directory
+
+overlay:                             # or write the spec inline
+  width: 1280
+  height: 720
+  framerate: 30
+  layers:
+    - type: logo
+      path: logo.png
+      corner: bottom_right
+      height: 56
+```
+
+**Resolution is whole-config replace, deepest declared level wins — never a
+merge.** Walking station → channel → block: a level that says nothing
+inherits its ancestor's resolved config unchanged; `clear` means *this level
+draws nothing*, discarding whatever an ancestor resolved; a `file:` reference
+or an inline spec is that whole config, in full, discarding whatever an
+ancestor resolved. Unlike `guide:`'s field-by-field cascade, there is no
+per-field override and no stacking two levels' layers into one render — an
+overlay config is one composed picture, not a bag of independent settings.
+
+**The station → channel resolution is the spawn config.** It is what sizes
+the canvas and the fifo the `etv-overlay` process is spawned with, and its
+`width`/`height`/`framerate`/`pixel_format` are what `channel{N}.json`'s
+`overlay` block reports to ETV-next. A block-level declaration may not
+disagree with the channel's on those four fields — they are baked into the
+fifo's byte layout, so a block that wants different ones fails to load,
+naming the mismatch, rather than being silently ignored or attempting a live
+resize. Only the script and layers may differ per block; see
+`docs/architecture.md`'s Graphics overlay cascade section for how that swap
+reaches the already-running process without a respawn (ADR 0007).
 
 ### Pool `plugin` — items chosen by a scorer script
 
@@ -974,40 +1021,32 @@ fn replay_ttl_days(ctx)      { tunable(ctx, "replay_ttl_days", 30) }
 ```
 
 **This is the project-wide rule for script tunables, not a scorer quirk.** The
-overlay renderer's TOML takes a `config` table on the same terms — arbitrary
+overlay renderer's spec takes a `config` mapping on the same terms — arbitrary
 nesting, nothing validated, absent means an empty map, typos silent — reaching
 its Rhai script as a `config` constant rather than as `ctx.config`, because an
 overlay script is evaluated against flat scope constants while a scorer receives
 one `ctx` map. That is the only difference, and it follows from how each engine
-is invoked rather than from a decision either side made.
+is invoked rather than from a decision either side made. Both surfaces read
+`config:` through the same deserializer (`config_carrier::deserialize_config`),
+so they cannot drift on what a shape means the way two independent conversions
+could.
 
-```toml
-# the overlay TOML named by a channel's `overlay.config`
-script = "lower-third.rhai"
-
-[config]
-corner = "bottom-left"
-
-[config.font]
-family = "Inter"
-size = 42
+```yaml
+# the overlay spec named by a channel's overlay: { file: ... }
+script: lower-third.rhai
+config:
+  corner: bottom-left
+  font:
+    family: Inter
+    size: 42
 ```
 
-Both surfaces carry the bag in one and the same value type internally, so the
-two cannot drift apart on what a shape means. That has one visible consequence:
-**a TOML datetime reaches an overlay script as the text the author wrote.**
-`date = 2026-07-28` arrives as `"2026-07-28"`, and offset, local, and time-only
-values likewise arrive in TOML's own spelling. Nothing is dropped, and it is the
-same string a channel YAML's `date: 2026-07-28` already hands a scorer plugin. A
-script wanting a moment rather than a label parses it — the meaning of a key is
-the script's, here as everywhere else in the bag.
-
-It has one other consequence, and it is the single thing in the bag that can
-fail: **a float that is not a finite number is refused at load, naming the key.**
-`weight: .inf` in a pool's `config:` — or `-.inf`, `.nan`, and `inf`/`nan` in an
-overlay's `[config]` — cannot be carried at all, and would otherwise reach the
-script as unit while the author believed they had written a number. So the
-channel or the spec fails to load instead, with an error like:
+The single thing in the bag that can fail: **a float that is not a finite
+number is refused at load, naming the key.** `weight: .inf` — or `-.inf`,
+`.nan` — in a pool's `config:` or an overlay's `config:` cannot be carried at
+all, and would otherwise reach the script as unit while the author believed
+they had written a number. So the channel or the spec fails to load instead,
+with an error like:
 
 ```
 `config.weights.affinity` is `inf`, but a script config can only carry finite

@@ -350,7 +350,7 @@ With the language picked and graphics working, redesign the user-facing schema:
 - **Unified catalog ingestion.** Plex (primary) + local-FS scan (bumpers / commercials / errata) feed a normalized **sqlite catalog** via `rusqlite`. Sonarr/Radarr deferred unless a Plex gap appears.
 - **sqlite cache, not in-memory or JSON.** Tens of thousands of items rules out per-boot rescans (slow API round-trips) and full-file JSON snapshots (full reparse + RAM-resident). sqlite gives indexed lookups, incremental refresh from Plex's `lastUpdated`, WAL-mode concurrency between refresh writer and query reader, and `sqlite3` shell inspection for debugging. Schema is three tables — `items`, `collections` + `collection_items`, `catalog_meta` (per-source sync timestamps) — plus simple up-only migrations.
 - **Runtime query resolution.** Channel TOML carries live queries; daemon translates them into sqlite reads at boot, snapshots the resolved item list for the chunk window. Stateless determinism preserved — the snapshot is the durable list, the catalog itself is the deterministically-rebuildable substrate.
-- **Graphics overlay cascade.** Channel default → block override → item override, declared in the schema and emitted in the playout JSON.
+- **Graphics overlay cascade.** Station default → channel override → block override, whole-config replace at the deepest level that declares one, resolved at config load and hot-reloaded into the channel's already-running overlay process at each block boundary rather than emitted per playout item (#48; see `docs/architecture.md`'s Graphics overlay cascade section for the shipped shape).
 - **Migration.** One-shot translator script from current `[rule] type = "loop_forever"` configs.
 
 ### Non-goal inversions
@@ -364,7 +364,7 @@ This phase reverses two v1 non-goals explicitly:
 
 - **Encoding decisions** stay etv-next's job. etv-station never invokes ffmpeg for transcoding; only ffprobe for duration.
 - **Real-time control plane** is still deferred — v2+ remains config-file driven with reload signal / file watcher.
-- **Modifying ETV-next** for non-schema reasons. The graphics overlay cascade *does* require an `PlayoutItem` schema extension on the etv-next side; that is a deliberate, planned change to `vendor/etv-next/`, not drift.
+- **Modifying ETV-next** for non-schema reasons. The graphics overlay cascade turned out not to need a `PlayoutItem` schema extension after all: `channel{N}.json`'s `overlay` block already carries the fifo path and geometry a channel spawns with, and every deeper cascade level (down to a single airing block) swaps script and layers inside that already-running process rather than by handing ETV-next anything new per item (#48).
 
 ---
 
