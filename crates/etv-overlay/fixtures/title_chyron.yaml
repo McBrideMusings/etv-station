@@ -1,0 +1,23 @@
+width: 1280
+height: 720
+framerate: 30
+pixel_format: rgba8
+script: scripts/title_chyron.rhai
+config:
+  interval_secs: 12
+  hold_secs: 4
+  slide_secs: 0.5
+  slide_distance_px: 300
+layers:
+  - type: watermark
+    corner: bottom_right
+    margin: 24
+    box_size: 120
+    color: [230, 230, 230, 255]
+  - type: text
+    content: "MOVIE TITLE"
+    font_family: Helvetica
+    font_size: 34.0
+    color: [255, 255, 255, 235]
+    corner: bottom_right
+    margin: 160

@@ -222,6 +222,8 @@ impl VelloRenderer {
                 color,
             } => {
                 let (x0, y0) = corner_origin(*corner, *margin, *box_size, self.width, self.height);
+                let x0 = x0 + layer.offset_x as i64;
+                let y0 = y0 + layer.offset_y as i64;
                 let rect = RoundedRect::new(
                     x0 as f64,
                     y0 as f64,
@@ -245,6 +247,8 @@ impl VelloRenderer {
                 let w = h * aspect;
                 let (x0, y0) =
                     corner_origin_f64(*corner, *margin as f64, w, h, self.width, self.height);
+                let x0 = x0 + layer.offset_x as f64;
+                let y0 = y0 + layer.offset_y as f64;
                 let scale_x = w / image.image.width as f64;
                 let scale_y = h / image.image.height as f64;
                 let transform =
@@ -268,6 +272,8 @@ impl VelloRenderer {
                     *color,
                     *corner,
                     *margin,
+                    layer.offset_x,
+                    layer.offset_y,
                     opacity,
                 );
             }
@@ -285,6 +291,8 @@ impl VelloRenderer {
         color: [u8; 4],
         corner: Corner,
         margin: u32,
+        offset_x: f32,
+        offset_y: f32,
         opacity: f32,
     ) {
         if content.is_empty() {
@@ -312,6 +320,8 @@ impl VelloRenderer {
             self.width,
             self.height,
         );
+        let x0 = x0 + offset_x as f64;
+        let y0 = y0 + offset_y as f64;
 
         let alpha = (color[3] as f32 / 255.0) * opacity;
         let brush = Color::from_rgba8(color[0], color[1], color[2], (alpha * 255.0) as u8);

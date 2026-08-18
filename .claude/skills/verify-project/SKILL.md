@@ -97,6 +97,18 @@ batch — not because anything needs doing, but to confirm nothing did.
 
 ## Verifying a graphics overlay actually reaches the screen
 
+**Fastest check: `admin overlay-watch <channel-dir>`** — no station, no
+ETV-next, no Plex. Loops a background fixture through the real Vello+Rhai
+render and streams it into VLC, hot-reloading on every save to the channel's
+overlay (or the shared file it references). Defaults to a 10x time scale so a
+multi-minute animation cycle (e.g. `title-chyron.rhai`) plays out in seconds.
+This is the right first stop for anything overlay-shaped — layout, color, a
+new script, an animation — and the only one of these that doesn't need a real
+channel or a real stream. Reach for the rest of this section only once the
+isolated render looks right and you need to confirm it survives contact with
+the real station (a script reading real `title`/`item_elapsed`, real PNG
+decode, the fifo/process-supervision path).
+
 The overlay spec lives on the **channel**, in `channel{N}.json` — never on a
 playout item. Check the render first, because it is instant and needs no stream:
 

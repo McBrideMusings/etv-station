@@ -102,6 +102,12 @@ enum Cmd {
         output: PathBuf,
         #[arg(long, default_value_t = 0.0)]
         time: f64,
+        /// Program title fed to the script's `title` scope constant, for
+        /// eyeballing a script that renders differently once a title is
+        /// known (e.g. `now_playing.rhai`, `title_chyron.rhai`). Empty
+        /// (the default) reproduces `ProgramContext::unknown()`.
+        #[arg(long, default_value = "")]
+        title: String,
     },
     /// Pipe overlay frames through ffmpeg and produce a muxed mp4
     Run {
@@ -117,6 +123,30 @@ enum Cmd {
         ffmpeg: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         keep_fifo: bool,
+    },
+    /// Loop a background clip through ffmpeg forever, muxed with the overlay
+    /// and streamed to stdout as mpegts — pipe into `vlc -` for a live
+    /// preview. Polls `config` for edits and hot-reloads the script/layers
+    /// without restarting ffmpeg, so a spec being iterated on updates the
+    /// running stream a few hundred ms after each save.
+    Watch {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        fifo: Option<PathBuf>,
+        #[arg(long)]
+        ffmpeg: Option<PathBuf>,
+        /// Multiplies the clock the Rhai script sees (`time`), so a script
+        /// keyed on a multi-minute cycle can be watched on a compressed
+        /// loop without waiting it out in real time. Output still plays at
+        /// the spec's real framerate; only the animation clock speeds up.
+        #[arg(long, default_value_t = 1.0)]
+        time_scale: f64,
+        /// See `RenderStill --title`.
+        #[arg(long, default_value = "")]
+        title: String,
     },
     /// Render frames directly to a fifo, blocking until the reader disconnects
     Pipe {
@@ -144,7 +174,12 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    // stderr, not stdout: `Cmd::Watch` muxes a live mpegts stream onto its own
+    // stdout for a caller to pipe into `vlc -`, and a log line interleaved
+    // into that byte stream corrupts it. No other subcommand writes anything
+    // meaningful to stdout, so moving logs off it costs nothing there.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("etv_overlay=info,warn")),
@@ -159,7 +194,8 @@ fn main() -> anyhow::Result<()> {
             config,
             output,
             time,
-        } => render_still(config, output, time),
+            title,
+        } => render_still(config, output, time, title),
         Cmd::Run {
             input,
             config,
@@ -168,6 +204,14 @@ fn main() -> anyhow::Result<()> {
             ffmpeg,
             keep_fifo,
         } => run_with_ffmpeg(input, config, output, fifo, ffmpeg, keep_fifo),
+        Cmd::Watch {
+            input,
+            config,
+            fifo,
+            ffmpeg,
+            time_scale,
+            title,
+        } => watch(input, config, fifo, ffmpeg, time_scale, title),
         Cmd::Pipe {
             fifo,
             create_fifo,
@@ -177,10 +221,21 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn render_still(config: PathBuf, output: PathBuf, time: f64) -> anyhow::Result<()> {
+fn program_context_for(title: String) -> ProgramContext {
+    if title.is_empty() {
+        ProgramContext::unknown()
+    } else {
+        ProgramContext {
+            title,
+            ..ProgramContext::unknown()
+        }
+    }
+}
+
+fn render_still(config: PathBuf, output: PathBuf, time: f64, title: String) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&config)?;
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
-    let state = evaluate_state(&spec, time, 0)?;
+    let state = evaluate_state(&spec, time, 0, &program_context_for(title))?;
     let frame = renderer.render_frame(&state)?;
     write_png(&output, spec.width, spec.height, &frame)?;
     tracing::info!(path = %output.display(), "wrote still frame");
@@ -296,6 +351,185 @@ fn run_with_ffmpeg(
     }
     tracing::info!(frames = frame_index, output = %output.display(), "run complete");
     Ok(())
+}
+
+/// How often (in output frames) `watch` restats `config` for a hot-reload. A
+/// once-a-second poll is cheap and comfortably fast enough for eyeballing an
+/// edit-save-look loop; every frame would mean 30 stat(2) calls/sec for no
+/// perceptible gain.
+const CONFIG_POLL_FRAMES: u64 = 30;
+
+fn watch(
+    input: PathBuf,
+    config: PathBuf,
+    fifo: Option<PathBuf>,
+    ffmpeg_bin: Option<PathBuf>,
+    time_scale: f64,
+    title: String,
+) -> anyhow::Result<()> {
+    let mut spec = OverlaySpec::from_path(&config)?;
+    let base_geometry = spec.geometry();
+    let fifo_path = fifo.unwrap_or_else(|| default_fifo_path("watch"));
+    let mut fifo = FifoWriter::create(fifo_path.clone())?;
+
+    let ffmpeg = ffmpeg_bin.unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let filter = "[0:v][1:v]overlay=x=0:y=0:eof_action=pass:format=auto[v]";
+
+    let mut child = Command::new(&ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-stream_loop",
+            "-1",
+            "-i",
+        ])
+        .arg(&input)
+        .args([
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            spec.pixel_format.ffmpeg_arg(),
+            "-video_size",
+        ])
+        .arg(format!("{}x{}", spec.width, spec.height))
+        .args(["-framerate"])
+        .arg(spec.framerate.to_string())
+        .arg("-i")
+        .arg(fifo.path())
+        .args([
+            "-filter_complex",
+            filter,
+            "-map",
+            "[v]",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        // ffmpeg's muxed mpegts IS this process's whole stdout contract for
+        // `watch` — inheriting lets the caller's `| vlc -` read it straight
+        // from ffmpeg with no extra copy through this process.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn ffmpeg: {e}"))?;
+
+    if matches!(
+        fifo.open_for_writing(&SHUTDOWN, None)?,
+        OpenOutcome::Shutdown
+    ) {
+        return Ok(());
+    }
+    let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
+    let mut engine = build_engine(&spec)?;
+    let program = program_context_for(title);
+    let mut last_mtime = fs_mtime(&config);
+
+    let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
+    let mut frame_index: u64 = 0;
+    let mut next_tick = std::time::Instant::now();
+
+    tracing::info!(
+        geometry = %base_geometry,
+        time_scale,
+        config = %config.display(),
+        "watching; edit and save the config to hot-reload",
+    );
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("waitpid ffmpeg: {e}");
+                break;
+            }
+        }
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if frame_index.is_multiple_of(CONFIG_POLL_FRAMES) {
+            let mtime = fs_mtime(&config);
+            if mtime != last_mtime {
+                last_mtime = mtime;
+                match OverlaySpec::from_path(&config) {
+                    Ok(new_spec) if new_spec.geometry() == base_geometry => {
+                        match build_engine(&new_spec) {
+                            Ok(new_engine) => {
+                                spec = new_spec;
+                                engine = new_engine;
+                                tracing::info!("config changed; reloaded script and layers");
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "new config's script failed to load; keeping the running one",
+                            ),
+                        }
+                    }
+                    Ok(new_spec) => tracing::warn!(
+                        new = %new_spec.geometry(),
+                        running = %base_geometry,
+                        "edited config changed geometry, which `watch` can't hot-swap; \
+                         restart to pick it up",
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "edited config failed to parse; keeping the running one",
+                    ),
+                }
+            }
+        }
+
+        let time_seconds = (frame_index as f64 / spec.framerate.max(1) as f64) * time_scale;
+        let state = engine.evaluate(time_seconds, frame_index, &program);
+        let frame = renderer.render_frame(&state)?;
+
+        if let Err(e) = fifo.write_frame(&frame) {
+            if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
+                tracing::info!("ffmpeg closed pipe (reader gone), stopping");
+                break;
+            }
+            tracing::warn!("write frame: {e}");
+            break;
+        }
+
+        frame_index += 1;
+        next_tick += frame_period;
+        let now = std::time::Instant::now();
+        if next_tick > now {
+            thread::sleep(next_tick - now);
+        }
+    }
+
+    drop(fifo);
+    // Unlike `run`'s ffmpeg (finite input, `-shortest`, exits on its own),
+    // `watch`'s background loops forever (`-stream_loop -1`) — dropping the
+    // fifo only EOFs the *other* input, which does not make ffmpeg exit. Every
+    // path out of the loop above (shutdown signal, broken pipe, a write
+    // error) must therefore kill it explicitly, or an interrupted `watch`
+    // leaves ffmpeg running forever with nothing left to stop it.
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+fn fs_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 fn pipe_to_fifo(
@@ -550,9 +784,14 @@ fn build_engine_for(spec: Option<&OverlaySpec>) -> anyhow::Result<RhaiEngine> {
     }
 }
 
-fn evaluate_state(spec: &OverlaySpec, time: f64, frame_index: u64) -> anyhow::Result<OverlayState> {
+fn evaluate_state(
+    spec: &OverlaySpec,
+    time: f64,
+    frame_index: u64,
+    program: &ProgramContext,
+) -> anyhow::Result<OverlayState> {
     let engine = build_engine(spec)?;
-    Ok(engine.evaluate(time, frame_index, &ProgramContext::unknown()))
+    Ok(engine.evaluate(time, frame_index, program))
 }
 
 fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<()> {

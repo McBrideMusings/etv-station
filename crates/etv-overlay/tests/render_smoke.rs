@@ -328,3 +328,107 @@ fn per_layer_invisible_layer_does_not_render() {
         "layer hidden by script should produce no opaque pixels",
     );
 }
+/// `title_chyron.rhai` walks through slide-in, hold, slide-out and idle on a
+/// repeating interval, animating `offset_x` rather than toggling visibility.
+/// Exercised against the real fixture file (not a copy) so a script edit that
+/// breaks the cycle math fails here rather than only being caught by eye in
+/// `admin overlay-watch`.
+#[test]
+fn title_chyron_slides_holds_then_slides_back_on_a_repeating_interval() {
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/scripts/title_chyron.rhai");
+    let text = OverlayKind::Text {
+        content: "placeholder".to_string(),
+        font_family: "system-ui".to_string(),
+        font_size: 34.0,
+        color: [255, 255, 255, 235],
+        corner: Corner::BottomRight,
+        margin: 160,
+    };
+    let mut engine = RhaiEngine::new(vec![OverlayKind::Empty, text]);
+    engine.load_script(&script_path).unwrap();
+
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Die Hard".into();
+
+    // Defaults: interval 300s, slide 0.6s, hold 10s -> slide-out ends at 11.2s.
+    let at = |t: f64| engine.evaluate(t, 0, &ctx).layers[1].clone();
+
+    let no_title = engine.evaluate(0.0, 0, &ProgramContext::unknown()).layers[1].clone();
+    assert!(
+        !no_title.visible,
+        "an unknown title must not draw a chyron for nothing",
+    );
+
+    let start = at(0.0);
+    assert!(start.visible, "slide-in should already be visible at t=0");
+    assert!(
+        (start.offset_x - 360.0).abs() < 1e-4,
+        "at t=0 the chyron should sit fully at slide_distance_px, got {}",
+        start.offset_x,
+    );
+
+    let mid_slide_in = at(0.3);
+    assert!(
+        mid_slide_in.offset_x > 0.0 && mid_slide_in.offset_x < 360.0,
+        "mid slide-in should be partway between distance and 0, got {}",
+        mid_slide_in.offset_x,
+    );
+
+    let held = at(5.0);
+    assert!(held.visible);
+    assert_eq!(
+        held.offset_x, 0.0,
+        "during the hold window the chyron should sit at rest",
+    );
+    match &held.kind {
+        OverlayKind::Text { content, .. } => assert_eq!(content, "Die Hard"),
+        _ => panic!("expected text layer"),
+    }
+
+    let mid_slide_out = at(10.9);
+    assert!(
+        mid_slide_out.offset_x > 0.0 && mid_slide_out.offset_x < 360.0,
+        "mid slide-out should be partway back toward distance, got {}",
+        mid_slide_out.offset_x,
+    );
+
+    let idle = at(60.0);
+    assert!(
+        !idle.visible,
+        "outside the slide/hold window the chyron should be hidden until the next interval",
+    );
+
+    // The interval repeats: t = 300.0 (one full interval later) is the same
+    // phase as t = 0.0.
+    let next_cycle_start = at(300.0);
+    assert!(next_cycle_start.visible);
+    assert!((next_cycle_start.offset_x - 360.0).abs() < 1e-4);
+}
+
+/// The demo fixture (`fixtures/title_chyron.yaml`) sets its cycle timing via
+/// `config:` as real YAML integers, not the float literals the script's own
+/// fallback defaults use — this is what actually exercises the int/float
+/// mixing the bare-default test above doesn't touch.
+#[test]
+fn title_chyron_fixture_config_overrides_the_script_defaults() {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/title_chyron.yaml");
+    let spec = OverlaySpec::from_path(&path).unwrap();
+    let mut engine = RhaiEngine::with_config(spec.layers.clone(), spec.config.as_ref());
+    engine.load_script(spec.script.as_ref().unwrap()).unwrap();
+
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Die Hard".into();
+
+    // Fixture config: interval 12s, hold 4s, slide 0.5s, distance 300px.
+    let held = engine.evaluate(2.0, 0, &ctx).layers[1].clone();
+    assert!(held.visible);
+    assert_eq!(held.offset_x, 0.0);
+
+    let idle = engine.evaluate(8.0, 0, &ctx).layers[1].clone();
+    assert!(
+        !idle.visible,
+        "8s is well past this fixture's slide_out_end (5s), so it must be idle",
+    );
+}

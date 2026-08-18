@@ -18,6 +18,11 @@ pub struct LayerState {
     pub kind: OverlayKind,
     pub visible: bool,
     pub opacity: f32,
+    /// Pixel offset added on top of `corner`/`margin`'s resolved position, for
+    /// a script animating a layer sliding across the frame (a chyron, a pan).
+    /// Zero reproduces the spec's static position exactly.
+    pub offset_x: f32,
+    pub offset_y: f32,
 }
 
 impl LayerState {
@@ -27,6 +32,8 @@ impl LayerState {
             kind,
             visible,
             opacity: 1.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
         }
     }
 }
@@ -200,6 +207,12 @@ fn apply_layer_override(layer: &mut LayerState, map: &rhai::Map) {
     }
     if let Some(opacity) = map.get("opacity").and_then(|v| v.as_float().ok()) {
         layer.opacity = (opacity as f32).clamp(0.0, 1.0);
+    }
+    if let Some(offset_x) = map.get("offset_x").and_then(|v| v.as_float().ok()) {
+        layer.offset_x = offset_x as f32;
+    }
+    if let Some(offset_y) = map.get("offset_y").and_then(|v| v.as_float().ok()) {
+        layer.offset_y = offset_y as f32;
     }
     if let Some(content) = map
         .get("content")
