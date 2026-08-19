@@ -73,3 +73,17 @@ Which overlay config a channel's single `etv-overlay` process runs, resolved sta
 ## Drift
 
 The gap between when a [[daypart]] was meant to start and when it actually does, because the item before it ran past the boundary. Accepted rather than corrected: closing it would mean cutting an item short or leaving dead air, and padding it out is impossible while the library has no interstitials (#85). Bounded by the longest item in the pool.
+
+## Broadcast graphics vocabulary
+
+Borrowed industry terms for the things an overlay draws. None of these are schema keys or code identifiers — they exist here so an overlay author can name what they are building and search for real reference material instead of inventing a word for it. Everything below is one of the [[overlay cascade]]'s layers.
+
+- **Bug** (also **DOG**, "digital on-screen graphic") — the persistent channel mark parked in a corner. `type: logo` is a bug. Every deployed channel here has one.
+- **Chyron** — any machine-generated on-screen text. From the Chyron Corporation, whose character generators the term outlived; **char gen** / **CG** are the equipment words, **Aston** the British equivalent (Aston Broadcast Systems). `shared/title-chyron.rhai` is one.
+- **Lower third** — a chyron in the bottom third of the frame, usually a name-and-role bar. Positional, not a news-only form: "You're watching *Die Hard*" in the same place is still a lower third.
+- **Snipe** — the promotional graphic that slides in over running content to advertise something else, typically what's on next. Distinct from a lower third, which is about what's on *now*.
+- **Now / Next / Later** — the three-item rundown snipe: what's playing, what follows, what follows that. The station only carries a one-item lookahead today (`next_title`), so "Later" needs a second one.
+- **Bumper** — a short branded segment *between* programs rather than an overlay on top of one. **Ident** is the British word for the channel-identity flavour of it.
+- **Squeezeback** (also **L-bar**, **L-wrap**) — the program is scaled down into part of the frame and the freed space carries promo art. Not achievable with an alpha overlay alone; it needs ETV-next's filter chain to scale the video.
+- **Endcap** / **credit squeeze** — the squeezeback specifically applied over a program's closing credits.
+- **On-air branding package** — the whole set as one design artifact: bug, chyron styles, snipes, bumpers. The search term for reference work.

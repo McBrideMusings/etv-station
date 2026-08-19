@@ -34,8 +34,24 @@ pub struct ProgramContext {
     /// `scoring.attribution` on, its last line names who has been watching
     /// (#113) — which is what a lower third would draw.
     pub description: String,
+    /// Season number, or `-1` when the item carries none. Same absent-value
+    /// convention as `item_elapsed`, and the discriminator a script uses to
+    /// tell an episode from a film — the station writes `season`/`episode`
+    /// only for `kind == "episode"` (see `resolve.rs:1456`), so `season >= 0`
+    /// means "this is an episode" without needing a separate kind field.
+    pub season: i64,
+    /// Episode number, or `-1` when absent. See [`Self::season`].
+    pub episode: i64,
+    /// Release / air year, or `-1` when absent. Present on films and episodes
+    /// alike.
+    pub year: i64,
     pub next_title: String,
     pub next_sub_title: String,
+    /// The one-item lookahead's counterparts to [`Self::season`],
+    /// [`Self::episode`] and [`Self::year`], with the same `-1` sentinel.
+    pub next_season: i64,
+    pub next_episode: i64,
+    pub next_year: i64,
     /// Seconds since the current item's `start`. `-1.0` when unknown so
     /// scripts can gate visibility on `item_elapsed >= 0.0 && item_elapsed < 10.0`.
     pub item_elapsed: f64,
@@ -49,8 +65,14 @@ impl ProgramContext {
             title: String::new(),
             sub_title: String::new(),
             description: String::new(),
+            season: -1,
+            episode: -1,
+            year: -1,
             next_title: String::new(),
             next_sub_title: String::new(),
+            next_season: -1,
+            next_episode: -1,
+            next_year: -1,
             item_elapsed: -1.0,
             item_remaining: -1.0,
         }
@@ -89,6 +111,14 @@ struct ProgramRow {
     /// not in ETV-next because the overlay parses these chunk files itself.
     #[serde(default)]
     description: Option<String>,
+    /// Written by the station for episodes only, so its presence is what a
+    /// script reads as "this is an episode" rather than a film.
+    #[serde(default)]
+    season: Option<i64>,
+    #[serde(default)]
+    episode: Option<i64>,
+    #[serde(default)]
+    year: Option<i64>,
 }
 
 /// Loads and caches the channel's chunked playout JSON. Call
@@ -200,35 +230,60 @@ impl ProgramContextSource {
         }
         let next = self.items.get(idx + 1);
 
-        let (title, sub_title) = program_strings(item.program.as_ref());
-        let (next_title, next_sub_title) = program_strings(next.and_then(|n| n.program.as_ref()));
+        let cur = program_fields(item.program.as_ref());
+        let nxt = program_fields(next.and_then(|n| n.program.as_ref()));
         let elapsed = (now - item.start).as_seconds_f64();
         let remaining = (item.finish - now).as_seconds_f64();
 
         ProgramContext {
-            title,
-            sub_title,
+            title: cur.title,
+            sub_title: cur.sub_title,
             description: item
                 .program
                 .as_ref()
                 .and_then(|p| p.description.clone())
                 .unwrap_or_default(),
-            next_title,
-            next_sub_title,
+            season: cur.season,
+            episode: cur.episode,
+            year: cur.year,
+            next_title: nxt.title,
+            next_sub_title: nxt.sub_title,
+            next_season: nxt.season,
+            next_episode: nxt.episode,
+            next_year: nxt.year,
             item_elapsed: elapsed,
             item_remaining: remaining,
         }
     }
 }
 
-fn program_strings(p: Option<&ProgramRow>) -> (String, String) {
+/// The per-item slice of [`ProgramContext`], extracted once so the current
+/// item and the lookahead read the same way.
+#[derive(Default)]
+struct ProgramFields {
+    title: String,
+    sub_title: String,
+    season: i64,
+    episode: i64,
+    year: i64,
+}
+
+fn program_fields(p: Option<&ProgramRow>) -> ProgramFields {
     let Some(p) = p else {
-        return (String::new(), String::new());
+        return ProgramFields {
+            season: -1,
+            episode: -1,
+            year: -1,
+            ..ProgramFields::default()
+        };
     };
-    (
-        p.title.clone().unwrap_or_default(),
-        p.sub_title.clone().unwrap_or_default(),
-    )
+    ProgramFields {
+        title: p.title.clone().unwrap_or_default(),
+        sub_title: p.sub_title.clone().unwrap_or_default(),
+        season: p.season.unwrap_or(-1),
+        episode: p.episode.unwrap_or(-1),
+        year: p.year.unwrap_or(-1),
+    }
 }
 
 fn is_chunk_file(p: &Path) -> bool {
@@ -321,6 +376,84 @@ mod tests {
             src.current_at(datetime!(2026-04-13 00:05 UTC)).description,
             ""
         );
+    }
+
+    /// One episode followed by one film, shaped the way the station really
+    /// writes them: `season`/`episode` only on the episode (`resolve.rs:1456`),
+    /// `year` on both.
+    const MIXED_KINDS_CHUNK: &str = r#"{
+        "version": "test",
+        "items": [
+            {
+                "id": "a",
+                "start": "2026-04-13T00:00:00Z",
+                "finish": "2026-04-13T00:10:00Z",
+                "program": {
+                    "title": "Bob's Burgers",
+                    "sub_title": "Manic Pixie Crap Show",
+                    "season": 12,
+                    "episode": 1,
+                    "year": 2021
+                }
+            },
+            {
+                "id": "b",
+                "start": "2026-04-13T00:10:00Z",
+                "finish": "2026-04-13T00:20:00Z",
+                "program": { "title": "Highest 2 Lowest", "year": 2025 }
+            }
+        ]
+    }"#;
+
+    /// An overlay script formats a film differently from an episode, and the
+    /// only thing it can tell them apart by is whether a season number came
+    /// through. Dropping these fields on the floor here is what made that
+    /// impossible before.
+    #[test]
+    fn carries_season_episode_and_year_for_current_and_next() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), "1_2.json", MIXED_KINDS_CHUNK);
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
+        assert_eq!(ctx.season, 12);
+        assert_eq!(ctx.episode, 1);
+        assert_eq!(ctx.year, 2021);
+        // The lookahead is the film, so it has a year and no season/episode.
+        assert_eq!(ctx.next_title, "Highest 2 Lowest");
+        assert_eq!(ctx.next_year, 2025);
+        assert_eq!(ctx.next_season, -1);
+        assert_eq!(ctx.next_episode, -1);
+    }
+
+    /// A film must not read as season 0 episode 0 — `0` is a legal season per
+    /// the playout schema, so absent has to be a value no real item can hold.
+    #[test]
+    fn an_absent_season_reads_as_minus_one_not_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), "1_2.json", MIXED_KINDS_CHUNK);
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let ctx = src.current_at(datetime!(2026-04-13 00:15 UTC));
+        assert_eq!(ctx.title, "Highest 2 Lowest");
+        assert_eq!(ctx.season, -1);
+        assert_eq!(ctx.episode, -1);
+        assert_eq!(ctx.year, 2025);
+    }
+
+    /// With no item airing there is nothing to format, and a script gating on
+    /// `season >= 0` must not be told the unknown item is a film.
+    #[test]
+    fn unknown_context_reports_every_number_absent() {
+        let ctx = ProgramContext::unknown();
+        assert_eq!(ctx.season, -1);
+        assert_eq!(ctx.episode, -1);
+        assert_eq!(ctx.year, -1);
+        assert_eq!(ctx.next_season, -1);
+        assert_eq!(ctx.next_episode, -1);
+        assert_eq!(ctx.next_year, -1);
     }
 
     #[test]

@@ -40,6 +40,18 @@ fi
 TIME_SCALE="${TIME_SCALE:-10}"
 TITLE="${TITLE:-Preview Movie Title}"
 BG="${BG:-bg-checkerboard-20s.mp4}"
+# Stand-in program metadata for a script that formats differently per item
+# kind (now-next-snipe.rhai). The defaults describe two films, because -1 is
+# "absent" and an absent season is exactly what marks an item as not an
+# episode. To eyeball the series form instead:
+#   SEASON=2 EPISODE=5 NEXT_SEASON=2 NEXT_EPISODE=6 admin overlay-watch <ch>
+NEXT_TITLE="${NEXT_TITLE:-The Next Preview Feature}"
+SEASON="${SEASON:--1}"
+EPISODE="${EPISODE:--1}"
+YEAR="${YEAR:-1988}"
+NEXT_SEASON="${NEXT_SEASON:--1}"
+NEXT_EPISODE="${NEXT_EPISODE:--1}"
+NEXT_YEAR="${NEXT_YEAR:-2019}"
 BG_PATH="crates/etv-query-test/fixtures/bumpers/${BG}"
 VLC="${VLC:-/Applications/VLC.app/Contents/MacOS/vlc}"
 
@@ -103,4 +115,11 @@ printf '%s streaming (time_scale=%s, title=%s) into VLC — Ctrl-C to stop\n' "$
   --config "$SPEC_PATH" \
   --time-scale "$TIME_SCALE" \
   --title "$TITLE" \
+  --season "$SEASON" \
+  --episode "$EPISODE" \
+  --year "$YEAR" \
+  --next-title "$NEXT_TITLE" \
+  --next-season "$NEXT_SEASON" \
+  --next-episode "$NEXT_EPISODE" \
+  --next-year "$NEXT_YEAR" \
   | "$VLC" -q -

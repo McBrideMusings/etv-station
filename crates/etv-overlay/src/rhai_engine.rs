@@ -142,8 +142,17 @@ impl RhaiEngine {
         // credit without the synopsis above it.
         scope.push_constant("description", program.description.clone());
         scope.push_constant("watched_by", watched_by_line(&program.description));
+        // `-1` for absent, per `ProgramContext`. `season >= 0` is how a script
+        // tells an episode from a film, since the station writes season and
+        // episode only for episodes.
+        scope.push_constant("season", program.season);
+        scope.push_constant("episode", program.episode);
+        scope.push_constant("year", program.year);
         scope.push_constant("next_title", program.next_title.clone());
         scope.push_constant("next_sub_title", program.next_sub_title.clone());
+        scope.push_constant("next_season", program.next_season);
+        scope.push_constant("next_episode", program.next_episode);
+        scope.push_constant("next_year", program.next_year);
         scope.push_constant("item_elapsed", program.item_elapsed);
         scope.push_constant("item_remaining", program.item_remaining);
 

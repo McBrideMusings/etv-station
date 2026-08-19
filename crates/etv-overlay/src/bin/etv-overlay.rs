@@ -92,6 +92,49 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// A hand-typed stand-in for the program metadata `Cmd::Pipe` reads out of the
+/// playout JSON, so `render-still` and `watch` can preview a script whose
+/// output depends on it. Every field defaults to the absent value, which
+/// reproduces `ProgramContext::unknown()` when none are passed.
+///
+/// `-1` is absent for the numbers, matching `ProgramContext`: leaving
+/// `--season` off is what makes a preview render as a film rather than an
+/// episode.
+#[derive(clap::Args, Clone)]
+struct PreviewProgram {
+    /// Program title fed to the script's `title` scope constant, for
+    /// eyeballing a script that renders differently once a title is known
+    /// (e.g. `now_playing.rhai`, `title_chyron.rhai`).
+    #[arg(long, default_value = "")]
+    title: String,
+    /// Episode title — the `sub_title` constant.
+    #[arg(long, default_value = "")]
+    sub_title: String,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    season: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    episode: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    year: i64,
+    #[arg(long, default_value = "")]
+    next_title: String,
+    #[arg(long, default_value = "")]
+    next_sub_title: String,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    next_season: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    next_episode: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    next_year: i64,
+    /// Seconds since the current item started, for a script gated on it.
+    /// Negative (the default) is "unknown", same as an absent schedule.
+    #[arg(long, default_value_t = -1.0, allow_negative_numbers = true)]
+    item_elapsed: f64,
+    /// Seconds until the current item ends. See `--item-elapsed`.
+    #[arg(long, default_value_t = -1.0, allow_negative_numbers = true)]
+    item_remaining: f64,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Render a single overlay frame to a PNG file (no ffmpeg)
@@ -102,12 +145,8 @@ enum Cmd {
         output: PathBuf,
         #[arg(long, default_value_t = 0.0)]
         time: f64,
-        /// Program title fed to the script's `title` scope constant, for
-        /// eyeballing a script that renders differently once a title is
-        /// known (e.g. `now_playing.rhai`, `title_chyron.rhai`). Empty
-        /// (the default) reproduces `ProgramContext::unknown()`.
-        #[arg(long, default_value = "")]
-        title: String,
+        #[command(flatten)]
+        program: PreviewProgram,
     },
     /// Pipe overlay frames through ffmpeg and produce a muxed mp4
     Run {
@@ -144,9 +183,8 @@ enum Cmd {
         /// the spec's real framerate; only the animation clock speeds up.
         #[arg(long, default_value_t = 1.0)]
         time_scale: f64,
-        /// See `RenderStill --title`.
-        #[arg(long, default_value = "")]
-        title: String,
+        #[command(flatten)]
+        program: PreviewProgram,
     },
     /// Render frames directly to a fifo, blocking until the reader disconnects
     Pipe {
@@ -194,8 +232,8 @@ fn main() -> anyhow::Result<()> {
             config,
             output,
             time,
-            title,
-        } => render_still(config, output, time, title),
+            program,
+        } => render_still(config, output, time, program),
         Cmd::Run {
             input,
             config,
@@ -210,8 +248,8 @@ fn main() -> anyhow::Result<()> {
             fifo,
             ffmpeg,
             time_scale,
-            title,
-        } => watch(input, config, fifo, ffmpeg, time_scale, title),
+            program,
+        } => watch(input, config, fifo, ffmpeg, time_scale, program),
         Cmd::Pipe {
             fifo,
             create_fifo,
@@ -221,21 +259,33 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn program_context_for(title: String) -> ProgramContext {
-    if title.is_empty() {
-        ProgramContext::unknown()
-    } else {
-        ProgramContext {
-            title,
-            ..ProgramContext::unknown()
-        }
+fn program_context_for(p: PreviewProgram) -> ProgramContext {
+    ProgramContext {
+        title: p.title,
+        sub_title: p.sub_title,
+        description: String::new(),
+        season: p.season,
+        episode: p.episode,
+        year: p.year,
+        next_title: p.next_title,
+        next_sub_title: p.next_sub_title,
+        next_season: p.next_season,
+        next_episode: p.next_episode,
+        next_year: p.next_year,
+        item_elapsed: p.item_elapsed,
+        item_remaining: p.item_remaining,
     }
 }
 
-fn render_still(config: PathBuf, output: PathBuf, time: f64, title: String) -> anyhow::Result<()> {
+fn render_still(
+    config: PathBuf,
+    output: PathBuf,
+    time: f64,
+    program: PreviewProgram,
+) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&config)?;
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
-    let state = evaluate_state(&spec, time, 0, &program_context_for(title))?;
+    let state = evaluate_state(&spec, time, 0, &program_context_for(program))?;
     let frame = renderer.render_frame(&state)?;
     write_png(&output, spec.width, spec.height, &frame)?;
     tracing::info!(path = %output.display(), "wrote still frame");
@@ -406,7 +456,7 @@ fn watch(
     fifo: Option<PathBuf>,
     ffmpeg_bin: Option<PathBuf>,
     time_scale: f64,
-    title: String,
+    preview: PreviewProgram,
 ) -> anyhow::Result<()> {
     let mut spec = OverlaySpec::from_path(&config)?;
     let base_geometry = spec.geometry();
@@ -479,7 +529,7 @@ fn watch(
     }
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
     let mut engine = build_engine(&spec)?;
-    let program = program_context_for(title);
+    let program = program_context_for(preview);
     let mut last_mtime = fs_mtime(&config);
 
     let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
