@@ -7,10 +7,11 @@
 OverlaySpec YAML that `etv-overlay run`/`watch`/`render-still` can load with
 `--config`.
 
-Every channel here declares its overlay one of two ways (verified against
-deploy/appdata/channels/*/channel.yaml, see #316):
+Every channel declares its overlay one of two ways (verified against
+deploy/appdata/channels/*/channel.yaml and examples/channels/*.yaml, see
+#316):
   overlay:
-    file: "some/relative/path.yaml"     # resolved against channel.yaml's dir
+    file: "some/relative/path.yaml"     # resolved against the channel file's dir
   overlay:
     width: ...
     height: ...
@@ -24,8 +25,13 @@ needs the real cascade (a block override, a station default), extend
 etv-station with a `--dump-overlay` mode that reuses `config::overlay`
 directly instead of teaching this script the cascade.
 
+Takes either shape a channel comes in: a directory holding `channel.yaml`
+(deploy/appdata's per-channel layout) or a standalone channel YAML file
+(examples/channels' flat layout).
+
 Usage:
     tools/overlay-extract.py deploy/appdata/channels/054-dragon-ball --out /tmp/spec.yaml
+    tools/overlay-extract.py examples/channels/diehard.yaml --out /tmp/spec.yaml
 """
 import argparse
 import sys
@@ -34,11 +40,11 @@ from pathlib import Path
 import yaml
 
 
-def extract(channel_dir: Path) -> tuple[dict, Path]:
+def extract(channel_path: Path) -> tuple[dict, Path]:
     """Return (resolved spec dict, the file it should be watched for edits)."""
-    channel_yaml = channel_dir / "channel.yaml"
+    channel_yaml = channel_path / "channel.yaml" if channel_path.is_dir() else channel_path
     if not channel_yaml.exists():
-        sys.exit(f"no channel.yaml under {channel_dir}")
+        sys.exit(f"no channel config at {channel_yaml}")
 
     doc = yaml.safe_load(channel_yaml.read_text())
     decl = doc.get("overlay")
@@ -59,11 +65,15 @@ def extract(channel_dir: Path) -> tuple[dict, Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("channel_dir", type=Path, help="deploy/appdata/channels/<N>-<name>")
+    parser.add_argument(
+        "channel_path",
+        type=Path,
+        help="a deploy/appdata/channels/<N>-<name> dir, or an examples/channels/<name>.yaml file",
+    )
     parser.add_argument("--out", type=Path, required=True, help="where to write the spec YAML")
     args = parser.parse_args()
 
-    spec, watch_target = extract(args.channel_dir.resolve())
+    spec, watch_target = extract(args.channel_path.resolve())
     args.out.write_text(yaml.safe_dump(spec, sort_keys=False))
     # Consumed by the calling shell script, which needs to know which file's
     # mtime to poll for edits — the inline channel.yaml, or the shared file

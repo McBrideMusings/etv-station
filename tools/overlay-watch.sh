@@ -6,19 +6,32 @@
 # without a restart.
 #
 # Usage:
-#   ./tools/overlay-watch.sh 054-dragon-ball
+#   ./tools/overlay-watch.sh 054-dragon-ball                    # bare name -> deploy/appdata/channels/<name>
+#   ./tools/overlay-watch.sh deploy/appdata/channels/054-dragon-ball
+#   ./tools/overlay-watch.sh examples/channels/diehard.yaml      # dev-side flat channel file
 #   TIME_SCALE=30 ./tools/overlay-watch.sh 010-pierce   # compress a 5-minute
 #                                                        # cycle into ~10s
 #   TITLE="Die Hard" ./tools/overlay-watch.sh 010-pierce
 #   BG=station-bumper-12s.mp4 ./tools/overlay-watch.sh 054-dragon-ball
 set -u
 
-CHANNEL="${1:?usage: overlay-watch.sh <channel-dir-name, e.g. 054-dragon-ball>}"
-CHANNEL_DIR="deploy/appdata/channels/${CHANNEL}"
+CHANNEL="${1:?usage: overlay-watch.sh <channel path, or a bare deploy/appdata channel name>}"
+# A bare name with no path separator is shorthand for the deploy/appdata
+# layout (the common case, typed by hand); anything with a "/" in it — a
+# deploy/appdata dir or an examples/channels/*.yaml file — is used as-is.
+case "$CHANNEL" in
+  */*) CHANNEL_DIR="$CHANNEL" ;;
+  *) CHANNEL_DIR="deploy/appdata/channels/${CHANNEL}" ;;
+esac
 
-if [ ! -d "$CHANNEL_DIR" ]; then
-  echo "no such channel dir: $CHANNEL_DIR" >&2
+if [ ! -e "$CHANNEL_DIR" ]; then
+  echo "no such channel path: $CHANNEL_DIR" >&2
   exit 1
+fi
+if [ -d "$CHANNEL_DIR" ]; then
+  CHANNEL_YAML="$CHANNEL_DIR/channel.yaml"
+else
+  CHANNEL_YAML="$CHANNEL_DIR"
 fi
 
 # Compressed by default: this is a test loop, not the on-air clock — nobody
@@ -37,7 +50,8 @@ fi
 
 bold() { printf '\033[1m%s\033[0m' "$1"; }
 
-TMP_DIR="$(mktemp -d -t "overlay-watch-${CHANNEL}")"
+TMP_LABEL="$(printf '%s' "$CHANNEL" | tr -c 'A-Za-z0-9._-' '-')"
+TMP_DIR="$(mktemp -d -t "overlay-watch-${TMP_LABEL}")"
 SPEC_PATH="${TMP_DIR}/spec.yaml"
 cleanup() {
   trap - EXIT INT TERM
@@ -46,18 +60,20 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s extracting overlay from %s...\n' "$(bold '==>')" "$CHANNEL_DIR/channel.yaml"
+printf '%s extracting overlay from %s...\n' "$(bold '==>')" "$CHANNEL_YAML"
 WATCH_TARGET="$(uv run tools/overlay-extract.py "$CHANNEL_DIR" --out "$SPEC_PATH")" || exit 1
 
 printf '%s building etv-overlay...\n' "$(bold '==>')"
 cargo build -q -p etv-overlay || exit 1
 
-# Only the inline case needs a re-extraction loop: `channel.yaml` carries the
-# spec inline, so an edit there changes the *decl*, not just a value inside
-# an already-standalone spec file. A `file:` reference already points
+# Only the inline case needs a re-extraction loop: the channel config carries
+# the spec inline, so an edit there changes the *decl*, not just a value
+# inside an already-standalone spec file. A `file:` reference already points
 # `etv-overlay watch` straight at the shared spec (see overlay-extract.py) —
-# that file's own mtime is what it polls, no relay needed.
-if [ "$WATCH_TARGET" = "$(cd "$CHANNEL_DIR" && pwd)/channel.yaml" ]; then
+# that file's own mtime is what it polls, no relay needed. Compared by inode
+# (`-ef`), not path string, since CHANNEL_YAML may be relative and
+# WATCH_TARGET always comes back absolute.
+if [ "$WATCH_TARGET" -ef "$CHANNEL_YAML" ]; then
   printf '%s watching %s for edits (inline overlay)\n' "$(bold '==>')" "$WATCH_TARGET"
   (
     LAST_MTIME=""
