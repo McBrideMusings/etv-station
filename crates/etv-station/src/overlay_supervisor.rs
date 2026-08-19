@@ -69,21 +69,20 @@ use ersatztv_core::{OVERLAY_READY_FILE_NAME, OVERLAY_WANTED_FILE_NAME};
 
 // Every viewer-facing transition this loop detects — a fresh `.overlay-wanted`
 // touch, or the overlay's own `.overlay-ready` file appearing — sits on the
-// critical path of a real tune-in: etv-next's channel worker blocks on
-// `.overlay-ready` for OVERLAY_READY_TIMEOUT (5s) before giving up and
-// proceeding without it, and the station's own HTTP handler blocks the
-// viewer's first request on that same worker. A single fixed-interval poll
-// serving both "did a viewer just arrive" and "is anybody still watching"
-// forces the interactive path to pay the same cadence the background reap
-// path can safely ignore.
+// critical path of a real tune-in, and a single fixed-interval poll serving
+// both that and the background "is anybody still watching" reap check forces
+// the interactive path to pay a cadence the reap path doesn't need.
 //
-// Measured against production (`overlay.spawn` -> `overlay.ready` in
-// station-etv.log): every sample landed at 5.00-5.01s, matching this
-// interval almost exactly and landing just past OVERLAY_READY_TIMEOUT every
-// time — the wait was never close, it was polling-lag, confirmed by grepping
-// real spawn/ready timestamp pairs rather than assumed. A 64-channel lineup
-// polling `stat()` on two marker files this often is a few hundred syscalls a
-// second, immaterial next to the GPU-bound transcodes it is unblocking.
+// This alone does NOT explain the ~5s tune-in tax that used to show up as
+// `overlay.spawn` -> `overlay.ready` landing at a suspiciously exact 5.00-5.01s
+// in station-etv.log — that was a real deadlock (the channel worker waiting on
+// `.overlay-ready` before opening its fifo reader, while the overlay can't
+// touch that marker until a reader opens the fifo), fixed at the source in
+// ersatztv-channel's `signal_overlay_wanted_and_wait_ready`. This constant
+// still matters for how fast a genuinely new viewer's `.overlay-wanted` touch
+// gets noticed. A 64-channel lineup polling `stat()` on two marker files this
+// often is a few hundred syscalls a second, immaterial next to the GPU-bound
+// transcodes it is unblocking.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct OverlayContext {
