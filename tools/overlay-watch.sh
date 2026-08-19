@@ -62,7 +62,14 @@ BG="${BG:-bg-black-20s.mp4}"
 #   KIND=series TITLE="Frasier" SEASON=3 admin overlay-watch 030-comedy
 # `-1` is absent, and an absent season is exactly what marks an item as a film
 # rather than an episode, so the film preset is these fields left at -1.
-KIND="${KIND:-film}"
+# `auto` reads the channel's own `program.categories` (and any episode filter
+# in its pools) to decide which stand-in metadata fits. Nothing can know for
+# certain without a running station, so this is a guess the caller overrides
+# with KIND=film / KIND=series when it guesses wrong.
+KIND="${KIND:-auto}"
+if [ "$KIND" = "auto" ]; then
+  KIND="$(uv run tools/overlay-extract.py "$CHANNEL_DIR" --print-kind)"
+fi
 case "$KIND" in
   film)
     P_TITLE="Preview Movie Title";      P_SUB="";        P_SEASON=-1; P_EPISODE=-1; P_YEAR=1988
@@ -113,24 +120,37 @@ if [ -n "$INTERVAL" ]; then
   EXTRACT_ARGS+=(--set-config "interval_secs=$INTERVAL")
 fi
 
-printf '%s extracting overlay from %s...\n' "$(bold '==>')" "$CHANNEL_YAML"
+# etv-station first, and before the extract rather than after: resolving the
+# cascade is now `etv-station --dump-overlay`'s job (ADR 0008), so the binary
+# has to exist before overlay-extract.py runs, not just before the render.
+printf '%s building etv-station + etv-overlay...\n' "$(bold '==>')"
+cargo build -q -p etv-station -p etv-overlay || exit 1
+
+printf '%s resolving %s'"'"'s overlay...\n' "$(bold '==>')" "$CHANNEL_YAML"
 WATCH_TARGET="$(uv run tools/overlay-extract.py "$CHANNEL_DIR" --out "$SPEC_PATH" ${EXTRACT_ARGS[@]+"${EXTRACT_ARGS[@]}"})" || exit 1
 
-printf '%s building etv-overlay...\n' "$(bold '==>')"
-cargo build -q -p etv-overlay || exit 1
+# Always relay through a re-resolved copy: the spec handed to the renderer is
+# derived (paths absolute, `interval_secs` retimed), never a file on disk, so
+# there is nothing to point the renderer at directly. SPEC_PATH is that copy.
+#
+# Poll every file the resolved spec is built from, not just the channel's own.
+# Since ADR 0008 the shared half of a channel's overlay lives in station.yaml
+# and the Rhai script it names, and those are what an author actually iterates
+# on — watching only the channel file would mean saving the script and seeing
+# nothing change.
+WATCH_FILES=("$WATCH_TARGET")
+for EXTRA in deploy/appdata/station.yaml examples/station.yaml; do
+  [ -f "$EXTRA" ] && WATCH_FILES+=("$EXTRA")
+done
+while IFS= read -r SCRIPT_REF; do
+  [ -n "$SCRIPT_REF" ] && [ -f "$SCRIPT_REF" ] && WATCH_FILES+=("$SCRIPT_REF")
+done < <(grep '^script:' "$SPEC_PATH" | sed 's/^script: *//')
 
-# Always relay through a re-extracted copy, whether the channel carries its
-# overlay inline or points at a shared file with `file:`. Handing
-# `etv-overlay watch` the shared file directly used to be a shortcut for the
-# `file:` case, but it cannot coexist with --set-config: the retimed spec is
-# not what is on disk, so streaming the original would silently ignore the
-# override. WATCH_TARGET is whichever file a human actually edits; SPEC_PATH
-# is the derived copy the renderer polls.
-printf '%s watching %s for edits\n' "$(bold '==>')" "$WATCH_TARGET"
+printf '%s watching %s file(s) for edits\n' "$(bold '==>')" "${#WATCH_FILES[@]}"
 (
   LAST_MTIME=""
   while true; do
-    MTIME=$(stat -f %m "$WATCH_TARGET" 2>/dev/null)
+    MTIME=$(stat -f %m "${WATCH_FILES[@]}" 2>/dev/null | tr '\n' ' ')
     if [ "$MTIME" != "$LAST_MTIME" ]; then
       LAST_MTIME="$MTIME"
       uv run tools/overlay-extract.py "$CHANNEL_DIR" --out "$SPEC_PATH" \

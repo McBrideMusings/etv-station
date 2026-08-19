@@ -47,6 +47,15 @@ examples/overlays/scripts/
 # by nobody.
 deploy/appdata/*
 !deploy/appdata/README.md
+# ...except the shared Rhai overlay scripts. Those are not personal the way a
+# channel's pools are — they are generic graphics code (the Now/Next snipe, the
+# title chyron) that happens to live where the deploy reads from, and leaving
+# them untracked meant a few hundred lines of the actual product had no history
+# and no test. Only `*.rhai`: the logos and the personal overlay YAMLs beside
+# them stay ignored.
+!deploy/appdata/shared/
+deploy/appdata/shared/*
+!deploy/appdata/shared/*.rhai
 tmp-*.log
 
 # Unraid GUI container template — carries this host's appdata/media paths and

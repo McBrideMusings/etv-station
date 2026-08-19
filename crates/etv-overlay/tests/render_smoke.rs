@@ -181,6 +181,7 @@ fn renders_metadata_driven_text() {
         content: "placeholder".to_string(),
         font_family: "system-ui".to_string(),
         font_size: 48.0,
+        letter_spacing: 0.0,
         color: [255, 255, 255, 255],
         corner: Corner::TopLeft,
         margin: 16,
@@ -225,6 +226,7 @@ fn showcase_script_phases() {
         content: "placeholder".to_string(),
         font_family: "system-ui".to_string(),
         font_size: 40.0,
+        letter_spacing: 0.0,
         color: [255, 255, 255, 255],
         corner: Corner::BottomLeft,
         margin: 48,
@@ -233,6 +235,7 @@ fn showcase_script_phases() {
         content: "placeholder".to_string(),
         font_family: "system-ui".to_string(),
         font_size: 36.0,
+        letter_spacing: 0.0,
         color: [220, 220, 220, 220],
         corner: Corner::BottomLeft,
         margin: 48,
@@ -341,6 +344,7 @@ fn title_chyron_slides_holds_then_slides_back_on_a_repeating_interval() {
         content: "placeholder".to_string(),
         font_family: "system-ui".to_string(),
         font_size: 34.0,
+        letter_spacing: 0.0,
         color: [255, 255, 255, 235],
         corner: Corner::BottomRight,
         margin: 160,
@@ -431,4 +435,161 @@ fn title_chyron_fixture_config_overrides_the_script_defaults() {
         !idle.visible,
         "8s is well past this fixture's slide_out_end (5s), so it must be idle",
     );
+}
+
+/// The Now/Next snipe as it actually ships (`deploy/appdata/shared/`), driving
+/// the four station-level layers ADR 0008 put there.
+///
+/// Exercises the deployed file rather than a copy: this script is the graphic
+/// on all 64 channels, and a copy under `fixtures/` would be free to drift from
+/// what is on air without anything noticing.
+fn snipe_engine() -> (RhaiEngine, std::path::PathBuf) {
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/appdata/shared/now-next-snipe.rhai");
+    let text = |size: f32| OverlayKind::Text {
+        content: String::new(),
+        font_family: "Helvetica".to_string(),
+        font_size: size,
+        letter_spacing: 0.0,
+        color: [255, 255, 255, 240],
+        corner: Corner::BottomLeft,
+        margin: 40,
+    };
+    let engine = RhaiEngine::new(vec![
+        OverlayKind::Scrim {
+            edge: etv_overlay::overlay_spec::Edge::Bottom,
+            size: 150,
+            color: [0, 0, 0, 175],
+        },
+        text(14.0),
+        text(23.0),
+        text(16.0),
+    ]);
+    (engine, script_path)
+}
+
+fn episode_context() -> ProgramContext {
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Bob's Burgers".into();
+    ctx.sub_title = "Manic Pixie Crap Show".into();
+    ctx.season = 12;
+    ctx.episode = 1;
+    ctx.year = 2021;
+    ctx.next_title = "Brooklyn Nine-Nine".into();
+    ctx.next_season = 4;
+    ctx.next_episode = 22;
+    ctx
+}
+
+fn content_of(layer: &etv_overlay::rhai_engine::LayerState) -> String {
+    match &layer.kind {
+        OverlayKind::Text { content, .. } => content.clone(),
+        other => panic!("expected a text layer, got {other:?}"),
+    }
+}
+
+/// The two cards must never share the screen — that was the whole point of
+/// making them sequential rather than a stacked pair.
+#[test]
+fn the_snipe_shows_now_and_next_one_at_a_time() {
+    let (mut engine, path) = snipe_engine();
+    engine.load_script(&path).unwrap();
+    let ctx = episode_context();
+
+    // Card geometry: rise .45 + hold 4.5 + fall .35 + stagger .08 = 5.38,
+    // then a .25 gap, so NEXT starts at 5.63 and ends at 11.01.
+    let now = engine.evaluate(2.5, 0, &ctx);
+    assert_eq!(content_of(&now.layers[1]), "NOW");
+    assert_eq!(content_of(&now.layers[2]), "Bob's Burgers  S12E01");
+
+    let next = engine.evaluate(8.0, 0, &ctx);
+    assert_eq!(content_of(&next.layers[1]), "NEXT");
+    // No SxxExx on the NEXT card: what is coming only has to be identifiable.
+    assert_eq!(content_of(&next.layers[2]), "Brooklyn Nine-Nine");
+
+    // And the frame is genuinely clear between cycles.
+    let quiet = engine.evaluate(11.5, 0, &ctx);
+    assert!(
+        quiet.layers.iter().all(|l| !l.visible),
+        "every layer, scrim included, should be gone in the gap",
+    );
+}
+
+/// The episode title is a NOW-card row only. It is also what proves the sub row
+/// is driven independently rather than mirroring the value row.
+#[test]
+fn only_the_now_card_carries_the_episode_title() {
+    let (mut engine, path) = snipe_engine();
+    engine.load_script(&path).unwrap();
+    let ctx = episode_context();
+
+    let now = engine.evaluate(2.5, 0, &ctx);
+    assert!(now.layers[3].visible);
+    assert_eq!(content_of(&now.layers[3]), "Manic Pixie Crap Show");
+
+    let next = engine.evaluate(8.0, 0, &ctx);
+    assert!(
+        !next.layers[3].visible,
+        "the NEXT card has no second row to draw",
+    );
+}
+
+/// One script, both item kinds — the discriminator being `season >= 0`, which
+/// is the only thing distinguishing a film from an episode in the playout JSON.
+#[test]
+fn a_film_formats_with_its_year_instead_of_a_season_and_episode() {
+    let (mut engine, path) = snipe_engine();
+    engine.load_script(&path).unwrap();
+
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Everything Everywhere All at Once".into();
+    ctx.year = 2022;
+
+    let now = engine.evaluate(2.5, 0, &ctx);
+    assert_eq!(
+        content_of(&now.layers[2]),
+        "Everything Everywhere All at Once (2022)",
+    );
+    assert!(
+        !now.layers[3].visible,
+        "a film has no episode title, so the second row stays down",
+    );
+}
+
+/// The scrim exists to make the text readable, so it has to be on screen
+/// whenever the text is — and gone when the text is, rather than sitting on
+/// the frame permanently.
+#[test]
+fn the_scrim_fades_with_the_card_it_protects() {
+    let (mut engine, path) = snipe_engine();
+    engine.load_script(&path).unwrap();
+    let ctx = episode_context();
+
+    let held = engine.evaluate(2.5, 0, &ctx);
+    assert!(held.layers[0].visible);
+    assert!(
+        (held.layers[0].opacity - 1.0).abs() < 1e-3,
+        "fully up while the card is held, got {}",
+        held.layers[0].opacity,
+    );
+
+    let arriving = engine.evaluate(0.2, 0, &ctx);
+    assert!(
+        arriving.layers[0].opacity > 0.0 && arriving.layers[0].opacity < 1.0,
+        "mid-entry the scrim should be part-way in, got {}",
+        arriving.layers[0].opacity,
+    );
+
+    assert!(!engine.evaluate(11.5, 0, &ctx).layers[0].visible);
+}
+
+/// With no schedule loaded there is nothing to advertise, and a channel must
+/// degrade to just its bug rather than an empty plate with empty labels.
+#[test]
+fn an_unknown_program_draws_no_snipe_at_all() {
+    let (mut engine, path) = snipe_engine();
+    engine.load_script(&path).unwrap();
+
+    let state = engine.evaluate(2.5, 0, &ProgramContext::unknown());
+    assert!(state.layers.iter().all(|l| !l.visible));
 }

@@ -564,16 +564,38 @@ overlay:                             # or write the spec inline
       path: logo.png
       corner: bottom_right
       height: 56
+
+overlay:                             # or add to what the level above resolved
+  extend:
+    layers:
+      - type: logo
+        path: logo.png               # relative to THIS file's directory
+        corner: bottom_right
+        height: 56
 ```
 
-**Resolution is whole-config replace, deepest declared level wins — never a
-merge.** Walking station → channel → block: a level that says nothing
+**Resolution replaces by default and appends when asked; deepest declared
+level wins.** Walking station → channel → block: a level that says nothing
 inherits its ancestor's resolved config unchanged; `clear` means *this level
 draws nothing*, discarding whatever an ancestor resolved; a `file:` reference
 or an inline spec is that whole config, in full, discarding whatever an
-ancestor resolved. Unlike `guide:`'s field-by-field cascade, there is no
-per-field override and no stacking two levels' layers into one render — an
-overlay config is one composed picture, not a bag of independent settings.
+ancestor resolved; and `extend:` keeps the ancestor's config and appends its
+layers to the end.
+
+`extend` is the only composition there is — it may add layers, name a
+different `script:`, or replace `config:` wholesale, and that is all. It
+cannot reach inside an inherited layer and carries no geometry, so unlike
+`guide:`'s field-by-field cascade there is still no per-field override. It
+exists because the station has graphics every channel shares (a Now/Next
+snipe) plus one thing only the channel knows (its own logo, at its own size),
+and replacement alone forced all 60 channels to restate the shared half. Each
+level's paths resolve against its own file's directory before its layers are
+appended, so a station layer naming `shared/logo.png` and a channel layer
+naming `logo.png` are both correct in one resolved spec. See ADR 0008.
+
+An `extend` with nothing above it to extend — no ancestor declared a complete
+config, or the nearest one said `clear` — fails at config load naming that,
+rather than resolving to a spec with no geometry.
 
 **The station → channel resolution is the spawn config.** It is what sizes
 the canvas and the fifo the `etv-overlay` process is spawned with, and its
