@@ -359,6 +359,34 @@ fn run_with_ffmpeg(
 /// perceptible gain.
 const CONFIG_POLL_FRAMES: u64 = 30;
 
+/// Kills the wrapped ffmpeg child on drop. `watch`'s background input loops
+/// forever (`-stream_loop -1`), so any exit out of the function — including
+/// an early `?`-propagated return before the render loop even starts, e.g.
+/// `fifo.open_for_writing` seeing a shutdown signal while ffmpeg is still
+/// waiting to attach — must kill it, not just the paths inside the loop's
+/// own body. Wrapping the child means every such exit gets that for free
+/// instead of needing a matching `child.kill()` at each fallible call site.
+struct KillOnDrop(std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
 fn watch(
     input: PathBuf,
     config: PathBuf,
@@ -375,58 +403,60 @@ fn watch(
     let ffmpeg = ffmpeg_bin.unwrap_or_else(|| PathBuf::from("ffmpeg"));
     let filter = "[0:v][1:v]overlay=x=0:y=0:eof_action=pass:format=auto[v]";
 
-    let mut child = Command::new(&ffmpeg)
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-y",
-            "-stream_loop",
-            "-1",
-            "-i",
-        ])
-        .arg(&input)
-        .args([
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            spec.pixel_format.ffmpeg_arg(),
-            "-video_size",
-        ])
-        .arg(format!("{}x{}", spec.width, spec.height))
-        .args(["-framerate"])
-        .arg(spec.framerate.to_string())
-        .arg("-i")
-        .arg(fifo.path())
-        .args([
-            "-filter_complex",
-            filter,
-            "-map",
-            "[v]",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            "veryfast",
-            "-tune",
-            "zerolatency",
-            "-c:a",
-            "aac",
-            "-f",
-            "mpegts",
-            "-",
-        ])
-        .stdin(Stdio::null())
-        // ffmpeg's muxed mpegts IS this process's whole stdout contract for
-        // `watch` — inheriting lets the caller's `| vlc -` read it straight
-        // from ffmpeg with no extra copy through this process.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn ffmpeg: {e}"))?;
+    let mut child = KillOnDrop(
+        Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-y",
+                "-stream_loop",
+                "-1",
+                "-i",
+            ])
+            .arg(&input)
+            .args([
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                spec.pixel_format.ffmpeg_arg(),
+                "-video_size",
+            ])
+            .arg(format!("{}x{}", spec.width, spec.height))
+            .args(["-framerate"])
+            .arg(spec.framerate.to_string())
+            .arg("-i")
+            .arg(fifo.path())
+            .args([
+                "-filter_complex",
+                filter,
+                "-map",
+                "[v]",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-c:a",
+                "aac",
+                "-f",
+                "mpegts",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            // ffmpeg's muxed mpegts IS this process's whole stdout contract for
+            // `watch` — inheriting lets the caller's `| vlc -` read it straight
+            // from ffmpeg with no extra copy through this process.
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn ffmpeg: {e}"))?,
+    );
 
     if matches!(
         fifo.open_for_writing(&SHUTDOWN, None)?,
@@ -518,11 +548,12 @@ fn watch(
 
     drop(fifo);
     // Unlike `run`'s ffmpeg (finite input, `-shortest`, exits on its own),
-    // `watch`'s background loops forever (`-stream_loop -1`) — dropping the
-    // fifo only EOFs the *other* input, which does not make ffmpeg exit. Every
-    // path out of the loop above (shutdown signal, broken pipe, a write
-    // error) must therefore kill it explicitly, or an interrupted `watch`
-    // leaves ffmpeg running forever with nothing left to stop it.
+    // `watch`'s background loops forever (`-stream_loop -1`) and never exits
+    // on its own — dropping the fifo only EOFs the *other* input. `KillOnDrop`
+    // already guarantees the kill on every path out of this function
+    // (including the early returns above, before this point); the explicit
+    // kill+wait here just reaps it deterministically on the common path
+    // instead of leaving that to whenever `child` drops.
     let _ = child.kill();
     let _ = child.wait();
     Ok(())

@@ -56,7 +56,9 @@ Deliverable: `crates/etv-query-test` — interactive CEL query harness with Plex
 
 ### ✅ Phase B — Graphics rendering
 
-**Shipped.** Per-channel `etv-overlay` subprocess renders Vello frames to a fifo etv-next composites on. Rhai scripts read the station-emitted chunked playout JSON to template lower-thirds with the current/next item's title and gate visibility on `item_elapsed` / `item_remaining`. Per-layer overrides (visibility, opacity, content, corner) compose with global `visible`/`opacity`. Sample scripts in `crates/etv-overlay/fixtures/scripts/`: `now_playing.rhai`, `up_next.rhai`, `pulse_watermark.rhai`, `corner_rotate.rhai`, `now_and_next.rhai`.
+**Shipped.** Per-channel `etv-overlay` subprocess renders Vello frames to a fifo etv-next composites on. Rhai scripts read the station-emitted chunked playout JSON to template lower-thirds with the current/next item's title and gate visibility on `item_elapsed` / `item_remaining`. Per-layer overrides (visibility, opacity, content, corner, and — new — `offset_x`/`offset_y`, a pixel offset added on top of `corner`/`margin` for a layer that animates its position, not just its visibility) compose with global `visible`/`opacity`. Sample scripts in `crates/etv-overlay/fixtures/scripts/`: `now_playing.rhai`, `up_next.rhai`, `pulse_watermark.rhai`, `corner_rotate.rhai`, `now_and_next.rhai`, `title_chyron.rhai` (slides the current item's title out from behind a corner logo on a configurable interval — live on the Pierce channels).
+
+Isolated overlay preview: `admin watch` (dev/prod → channel → live/overlay) or `admin overlay-watch <channel>` renders a channel's real overlay over a looping background fixture and streams it into VLC, hot-reloading on save — no station, ETV-next, or Plex needed. `--time-scale` compresses a multi-minute animation cycle for fast iteration.
 
 Out of scope until Phase C: scripted `size`/`color`. Lottie / `velato` tracked separately (#50).
 
