@@ -124,6 +124,29 @@ pub enum OverlayKind {
         #[serde(default = "default_logo_height")]
         height: u32,
     },
+    /// A gradient band along one edge of the frame, opaque at the edge and
+    /// fading to nothing `size` pixels in — the standard way broadcast
+    /// graphics stay readable over content they do not control.
+    ///
+    /// Sized off the frame, never off the text it protects: a plate fitted to
+    /// a string would have to measure shaped text, which nothing outside the
+    /// renderer can do, and would resize on every title. A band that always
+    /// covers the bottom 140px protects whatever is drawn there.
+    ///
+    /// A script animating this should drive `opacity`, not `offset_y` — the
+    /// band is anchored to the edge, and sliding it reveals a hard line where
+    /// the gradient stops.
+    Scrim {
+        #[serde(default = "default_scrim_edge")]
+        edge: Edge,
+        /// How far the band reaches in from its edge, in pixels.
+        #[serde(default = "default_scrim_size")]
+        size: u32,
+        /// The colour at the edge. Its alpha is the band's strongest point;
+        /// the far end is always fully transparent.
+        #[serde(default = "default_scrim_color")]
+        color: [u8; 4],
+    },
     /// Static single-line text overlay (channel banner, "TEST PATTERN", etc).
     /// Dynamic content templating (e.g. `{title}` from program metadata) is
     /// not yet wired — `content` is taken verbatim. See follow-up issue for
@@ -134,6 +157,17 @@ pub enum OverlayKind {
         font_family: String,
         #[serde(default = "default_font_size")]
         font_size: f32,
+        /// Extra space between glyphs, in pixels, added on top of the font's
+        /// own metrics. Negative tightens.
+        ///
+        /// Tracking is size-specific, which is why this is per-layer and not a
+        /// spec-wide setting: an all-caps eyebrow label ("NOW", "NEXT") wants
+        /// roughly +0.05–0.12em to stop reading as cramped, while large
+        /// display text wants slightly negative. Zero — the default — is the
+        /// font's own spacing and reproduces every spec written before this
+        /// field existed.
+        #[serde(default)]
+        letter_spacing: f32,
         #[serde(default = "default_text_color")]
         color: [u8; 4],
         #[serde(default)]
@@ -169,6 +203,32 @@ fn default_font_size() -> f32 {
 
 fn default_text_color() -> [u8; 4] {
     [255, 255, 255, 255]
+}
+
+fn default_scrim_edge() -> Edge {
+    Edge::Bottom
+}
+
+fn default_scrim_size() -> u32 {
+    140
+}
+
+/// Black at 70% is the working default: dark enough to hold white text over a
+/// bright scene, light enough that it does not read as a bar across the frame.
+fn default_scrim_color() -> [u8; 4] {
+    [0, 0, 0, 180]
+}
+
+/// Which side of the frame a [`OverlayKind::Scrim`] is anchored to. Distinct
+/// from [`Corner`] — a band has one edge, not two.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Edge {
+    #[default]
+    Bottom,
+    Top,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -338,6 +398,7 @@ kind:
   content: ETV STATION
   font_family: Helvetica
   font_size: 64.0
+  letter_spacing: 1.5
   color: [255, 255, 255, 230]
   corner: bottom_left
   margin: 40
@@ -349,6 +410,7 @@ kind:
                 content,
                 font_family,
                 font_size,
+                letter_spacing,
                 color,
                 corner,
                 margin,
@@ -356,6 +418,7 @@ kind:
                 assert_eq!(content, "ETV STATION");
                 assert_eq!(font_family, "Helvetica");
                 assert!((*font_size - 64.0).abs() < 1e-4);
+                assert!((*letter_spacing - 1.5).abs() < 1e-4);
                 assert_eq!(*color, [255, 255, 255, 230]);
                 assert_eq!(*corner, Corner::BottomLeft);
                 assert_eq!(*margin, 40);
@@ -381,6 +444,7 @@ kind:
                 content,
                 font_family,
                 font_size,
+                letter_spacing,
                 color,
                 corner,
                 margin,
@@ -388,6 +452,9 @@ kind:
                 assert_eq!(content, "hi");
                 assert_eq!(font_family, "system-ui");
                 assert!((*font_size - 48.0).abs() < 1e-4);
+                // Absent `letter_spacing` is the font's own spacing, so every
+                // spec written before the field existed renders unchanged.
+                assert_eq!(*letter_spacing, 0.0);
                 assert_eq!(*color, [255, 255, 255, 255]);
                 assert_eq!(*corner, Corner::TopRight);
                 assert_eq!(*margin, 32);

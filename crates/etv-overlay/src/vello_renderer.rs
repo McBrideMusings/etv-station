@@ -6,14 +6,14 @@ use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, Layout, LayoutContext,
     PositionedLayoutItem, StyleProperty,
 };
-use vello::kurbo::{Affine, RoundedRect};
+use vello::kurbo::{Affine, Point, Rect, RoundedRect};
 use vello::peniko::{
-    Blob, Color, Fill, ImageAlphaType, ImageBrush as PenikoImage, ImageData, ImageFormat,
+    Blob, Color, Fill, Gradient, ImageAlphaType, ImageBrush as PenikoImage, ImageData, ImageFormat,
 };
 use vello::wgpu;
 use vello::{AaConfig, AaSupport, Glyph, RenderParams, Renderer, RendererOptions, Scene};
 
-use crate::overlay_spec::{Corner, OverlayKind, PixelFormat};
+use crate::overlay_spec::{Corner, Edge, OverlayKind, PixelFormat};
 use crate::rhai_engine::{LayerState, OverlayState};
 
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
@@ -43,11 +43,13 @@ fn build_text_layout(
     content: &str,
     font_family: &str,
     font_size: f32,
+    letter_spacing: f32,
 ) -> Layout<()> {
     let stack = font_stack(font_family);
     let mut builder = layout_context.ranged_builder(font_context, content, 1.0, true);
     builder.push_default(StyleProperty::FontFamily(FontFamily::Source(stack.into())));
     builder.push_default(StyleProperty::FontSize(font_size));
+    builder.push_default(StyleProperty::LetterSpacing(letter_spacing));
     let mut layout = builder.build(content);
     layout.break_all_lines(None);
     layout.align(Alignment::Start, AlignmentOptions::default());
@@ -235,6 +237,47 @@ impl VelloRenderer {
                 let fill = Color::from_rgba8(color[0], color[1], color[2], (alpha * 255.0) as u8);
                 scene.fill(Fill::NonZero, Affine::IDENTITY, fill, None, &rect);
             }
+            OverlayKind::Scrim { edge, size, color } => {
+                // Anchored to the frame edge, so `offset_x`/`offset_y` are
+                // deliberately ignored: translating the band would drag the
+                // transparent end into view and expose a hard cut where the
+                // gradient stops. A script fades a scrim with `opacity`.
+                let (w, h) = (self.width as f64, self.height as f64);
+                let reach = *size as f64;
+                // `rect` is the band; `(from, to)` runs across it, opaque end
+                // first, so one gradient definition serves all four edges.
+                let (rect, from, to) = match edge {
+                    Edge::Bottom => (
+                        Rect::new(0.0, h - reach, w, h),
+                        Point::new(0.0, h),
+                        Point::new(0.0, h - reach),
+                    ),
+                    Edge::Top => (
+                        Rect::new(0.0, 0.0, w, reach),
+                        Point::new(0.0, 0.0),
+                        Point::new(0.0, reach),
+                    ),
+                    Edge::Left => (
+                        Rect::new(0.0, 0.0, reach, h),
+                        Point::new(0.0, 0.0),
+                        Point::new(reach, 0.0),
+                    ),
+                    Edge::Right => (
+                        Rect::new(w - reach, 0.0, w, h),
+                        Point::new(w, 0.0),
+                        Point::new(w - reach, 0.0),
+                    ),
+                };
+                let alpha = (color[3] as f32 / 255.0) * opacity;
+                let near = Color::from_rgba8(color[0], color[1], color[2], (alpha * 255.0) as u8);
+                // The far end keeps the same RGB at zero alpha rather than
+                // going transparent-black: interpolating toward a different
+                // colour is what produces the grey haze a naive scrim shows
+                // over a bright scene.
+                let far = Color::from_rgba8(color[0], color[1], color[2], 0);
+                let brush = Gradient::new_linear(from, to).with_stops([near, far]);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect);
+            }
             OverlayKind::Logo {
                 path,
                 corner,
@@ -260,6 +303,7 @@ impl VelloRenderer {
                 content,
                 font_family,
                 font_size,
+                letter_spacing,
                 color,
                 corner,
                 margin,
@@ -269,6 +313,7 @@ impl VelloRenderer {
                     content,
                     font_family,
                     *font_size,
+                    *letter_spacing,
                     *color,
                     *corner,
                     *margin,
@@ -288,6 +333,7 @@ impl VelloRenderer {
         content: &str,
         font_family: &str,
         font_size: f32,
+        letter_spacing: f32,
         color: [u8; 4],
         corner: Corner,
         margin: u32,
@@ -308,6 +354,7 @@ impl VelloRenderer {
             content,
             font_family,
             font_size,
+            letter_spacing,
         );
 
         let text_w = layout.width() as f64;
@@ -567,6 +614,7 @@ mod tests {
             "Fallback Glyphs 123",
             "NoSuchFontFamilyExists12345",
             32.0,
+            0.0,
         );
 
         let mut total_glyphs = 0usize;

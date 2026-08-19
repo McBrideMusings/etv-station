@@ -262,7 +262,10 @@ fn apply_corner_override(kind: &mut OverlayKind, new_corner: Corner) {
         | OverlayKind::Text { corner, .. } => {
             *corner = new_corner;
         }
-        OverlayKind::Empty => {}
+        // A scrim is anchored to an edge, not a corner, and `Empty` has no
+        // geometry at all — a `corner` override on either is a script bug, and
+        // ignoring it silently is what the content override already does.
+        OverlayKind::Scrim { .. } | OverlayKind::Empty => {}
     }
 }
 
@@ -301,6 +304,7 @@ mod tests {
             content: content.into(),
             font_family: "system-ui".into(),
             font_size: 32.0,
+            letter_spacing: 0.0,
             color: [255, 255, 255, 255],
             corner: Corner::BottomLeft,
             margin: 32,
