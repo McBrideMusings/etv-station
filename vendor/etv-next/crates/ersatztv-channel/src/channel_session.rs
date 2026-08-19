@@ -432,30 +432,7 @@ impl ChannelSession {
         // shared with the etv-station daemon (where it writes playout JSON and
         // the overlay fifo) — not the HLS output folder.
         let playout_folder = self.channel_config.expanded_playout_folder();
-        let wanted = playout_folder.join(OVERLAY_WANTED_FILE_NAME);
-        // Write empty content: creates the marker, or refreshes its mtime so the
-        // producer treats it as a fresh watch request.
-        if let Err(e) = tokio::fs::write(&wanted, b"").await {
-            // Not fatal on its own — the producer may already be running from an
-            // earlier request. If it isn't, the bounded wait below reports it.
-            log::warn!(
-                "failed to touch overlay-wanted marker {}: {e}",
-                wanted.display()
-            );
-        }
-        // Deliberately no wait on `.overlay-ready` before the open below: the
-        // overlay only touches that marker once its own `open_for_writing()`
-        // returns (crates/etv-overlay/src/bin/etv-overlay.rs), and that fifo
-        // rendezvous blocks until a reader attaches — this process is that
-        // reader. Such a wait would be waiting on an effect of the open below,
-        // so it burned its full 5s timeout on every tune-in and proceeded
-        // regardless. The fifo open is the real, correctly-bounded rendezvous.
-        let path = PathBuf::from(fifo_path);
-        tokio::task::spawn_blocking(move || open_overlay_fifo(&path, OVERLAY_WRITER_TIMEOUT))
-            .await
-            .map_err(|e| {
-                ChannelError::StreamFailure(format!("overlay fifo open task failed: {e}"))
-            })?
+        touch_overlay_wanted_and_open_fifo(playout_folder, fifo_path, OVERLAY_WRITER_TIMEOUT).await
     }
 
     async fn transcode(
@@ -1544,6 +1521,24 @@ async fn pump_ffmpeg_stderr(
     }
 }
 
+/// Accumulate one line of ffmpeg's `-progress` stream into `fields`. A
+/// `progress=` line closes out a report: returns it formatted and clears
+/// `fields` for the next one. Any other `key=value` line is folded in and
+/// this returns `None`. A line with no `=` (never emitted by `-progress`,
+/// but ffmpeg's output is not a contract) is ignored rather than panicking.
+fn accumulate_progress_line(line: &str, fields: &mut Vec<String>) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let (key, value) = (key.trim(), value.trim());
+    if key == "progress" {
+        let report = format!("{} progress={value}", fields.join(" "));
+        fields.clear();
+        Some(report)
+    } else {
+        fields.push(format!("{key}={value}"));
+        None
+    }
+}
+
 /// Log the `-progress pipe:1` stream ffmpeg writes to stdout: one `key=value`
 /// line per field (frame, fps, out_time, speed, ...), terminated by
 /// `progress=continue` or `progress=end`, which closes one full report.
@@ -1556,21 +1551,45 @@ async fn log_ffmpeg_progress(stdout: tokio::process::ChildStdout, channel_number
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     let mut fields: Vec<String> = Vec::new();
     while let Ok(Some(line)) = lines.next_line().await {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let (key, value) = (key.trim(), value.trim());
-        if key == "progress" {
-            log::debug!(
-                target: "ffmpeg_progress",
-                "channel {channel_number}: {} progress={value}",
-                fields.join(" ")
-            );
-            fields.clear();
-        } else {
-            fields.push(format!("{key}={value}"));
+        if let Some(report) = accumulate_progress_line(&line, &mut fields) {
+            log::debug!(target: "ffmpeg_progress", "channel {channel_number}: {report}");
         }
     }
+}
+
+/// Touch `.overlay-wanted` in `playout_folder`, signalling the overlay
+/// producer that this channel is watched, then open `fifo_path` for reading —
+/// bounded by `timeout`.
+///
+/// Deliberately no wait on `.overlay-ready` before that open: the overlay
+/// only touches that marker once its own `open_for_writing()` returns
+/// (crates/etv-overlay/src/bin/etv-overlay.rs), and that fifo rendezvous
+/// blocks until a reader attaches — this function's caller is that reader.
+/// Such a wait would be waiting on an effect of the open below, so it burned
+/// its full 5s timeout on every tune-in and proceeded regardless. The fifo
+/// open is the real, correctly-bounded rendezvous — see
+/// `signal_overlay_wanted_does_not_wait_before_opening_the_fifo` below, which
+/// pins the "no preceding wait" behavior directly.
+async fn touch_overlay_wanted_and_open_fifo(
+    playout_folder: &Path,
+    fifo_path: &str,
+    timeout: Duration,
+) -> Result<OverlayFifoReader, ChannelError> {
+    let wanted = playout_folder.join(OVERLAY_WANTED_FILE_NAME);
+    // Write empty content: creates the marker, or refreshes its mtime so the
+    // producer treats it as a fresh watch request.
+    if let Err(e) = tokio::fs::write(&wanted, b"").await {
+        // Not fatal on its own — the producer may already be running from an
+        // earlier request. If it isn't, the bounded wait below reports it.
+        log::warn!(
+            "failed to touch overlay-wanted marker {}: {e}",
+            wanted.display()
+        );
+    }
+    let path = PathBuf::from(fifo_path);
+    tokio::task::spawn_blocking(move || open_overlay_fifo(&path, timeout))
+        .await
+        .map_err(|e| ChannelError::StreamFailure(format!("overlay fifo open task failed: {e}")))?
 }
 
 /// Open the overlay rawvideo fifo for read and wait — bounded by `timeout` —
@@ -2043,5 +2062,80 @@ mod tests {
         assert_eq!(&buf, b"frame");
 
         writer.join().unwrap();
+    }
+
+    /// The regression this guards: `signal_overlay_wanted_and_wait_ready` used
+    /// to wait up to `OVERLAY_READY_TIMEOUT` (5s) on `.overlay-ready` before
+    /// ever calling this — a wait that could never resolve early, since the
+    /// overlay can't touch that marker until a reader (this function) attaches.
+    /// With no writer ever attaching, total wall time must be bounded by the
+    /// `timeout` passed in alone; a reintroduced pre-wait would show up here as
+    /// several extra seconds.
+    #[tokio::test]
+    async fn signal_overlay_wanted_does_not_wait_before_opening_the_fifo() {
+        let fifo_dir = tempfile::tempdir().unwrap();
+        let path = make_fifo(fifo_dir.path());
+        let playout_dir = tempfile::tempdir().unwrap();
+
+        let start = std::time::Instant::now();
+        let result = touch_overlay_wanted_and_open_fifo(
+            playout_dir.path(),
+            path.to_str().unwrap(),
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected a timeout, got an open fifo");
+        assert!(elapsed >= Duration::from_millis(300));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "took {elapsed:?} — a wait longer than the fifo-open timeout regressed"
+        );
+        assert!(
+            playout_dir.path().join(OVERLAY_WANTED_FILE_NAME).exists(),
+            "did not touch the overlay-wanted marker"
+        );
+    }
+
+    #[test]
+    fn accumulate_progress_line_builds_one_report_per_progress_key() {
+        let mut fields = Vec::new();
+
+        assert_eq!(accumulate_progress_line("frame=17", &mut fields), None);
+        assert_eq!(accumulate_progress_line("fps=0.00", &mut fields), None);
+        assert_eq!(accumulate_progress_line("speed=1.33x", &mut fields), None);
+        assert_eq!(
+            accumulate_progress_line("progress=continue", &mut fields),
+            Some("frame=17 fps=0.00 speed=1.33x progress=continue".to_owned())
+        );
+        assert!(fields.is_empty(), "fields must clear after a report closes");
+
+        // A second block starts clean and does not see the first block's fields.
+        assert_eq!(accumulate_progress_line("frame=29", &mut fields), None);
+        assert_eq!(
+            accumulate_progress_line("progress=end", &mut fields),
+            Some("frame=29 progress=end".to_owned())
+        );
+    }
+
+    #[test]
+    fn accumulate_progress_line_ignores_a_line_with_no_equals_sign() {
+        let mut fields = Vec::new();
+        assert_eq!(
+            accumulate_progress_line("not a key value line", &mut fields),
+            None
+        );
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn accumulate_progress_line_trims_whitespace_around_key_and_value() {
+        let mut fields = Vec::new();
+        accumulate_progress_line("  speed = 1x  ", &mut fields);
+        assert_eq!(
+            accumulate_progress_line("progress = continue", &mut fields),
+            Some("speed=1x progress=continue".to_owned())
+        );
     }
 }

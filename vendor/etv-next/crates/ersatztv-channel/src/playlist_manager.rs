@@ -17,6 +17,15 @@ use time::macros::format_description;
 // costs close to SEGMENT_SECONDS of real tune-in wait (see TARGET_BUFFER in
 // ersatztv-channel), so this is the smallest change consistent with a real,
 // citable floor rather than an arbitrary cut.
+//
+// Deliberately sits exactly at that floor rather than above it — considered
+// and rejected adding a cushion, since any number above the cited minimum is
+// back to an arbitrary guess, the thing this constant is trying to avoid. Not
+// a race: a segment only enters `self.segments` (below, in `update`) once its
+// `.ts` file exists on disk AND ffmpeg's own playlist has published a known
+// EXTINF duration for it — ffmpeg doesn't emit that duration until the
+// segment is fully written, so `self.segments.len()` can never count a
+// partial one. The floor is thin by design, not by oversight.
 const MIN_SEGMENTS: usize = 3;
 
 /// How far the newest segment's end may fall behind wall clock — in multiples of
