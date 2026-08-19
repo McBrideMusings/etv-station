@@ -53,17 +53,34 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(60);
 /// How far ahead of wall clock the session keeps its transcode. A player that
 /// tunes in has to be handed several segments at once or it has nothing to play,
 /// so ffmpeg reads this much unthrottled before slowing to wall-clock speed.
+/// Also what a mid-playback rebuild (after [`REBURST_AT_LEAD`] fires) tops the
+/// buffer back up to — see [`reburst_decision`] — which is why this stays large:
+/// [`REBURST_ARM_AT_LEAD`] arms almost immediately once a fresh buffer is built
+/// (this constant already exceeds it), so the real protection against firing
+/// again soon after is the gap down to [`REBURST_AT_LEAD`], not the arm point.
+/// A thin gap there means a single ordinary dip in encode speed can trigger a
+/// second visible restart shortly after the first — a real regression, not a
+/// hypothetical one, so this is sized for that margin rather than for tune-in
+/// speed. See [`INITIAL_BURST`] for the constant that actually governs how long
+/// a first-time viewer waits.
+const TARGET_BUFFER: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 11);
+
+/// How much a *first* tune-in bursts before handing the viewer anything —
+/// deliberately smaller than [`TARGET_BUFFER`], and used only at the one call
+/// site building the very first buffer, before there is a viewer to glitch.
 ///
 /// "Unthrottled" assumes the encode outruns wall clock; on GPU-bound hardware
 /// (deep seek + hwaccel decode + overlay composite) it may not, in which case
 /// this many seconds of buffer costs close to that many real seconds before the
 /// viewer gets anything — confirmed against a real tune-in via the
 /// `ffmpeg_progress` log target, which sat at ~1.0x for this exact pipeline
-/// shape rather than bursting. Kept one segment above [`REBURST_ARM_AT_LEAD`],
-/// same margin that constant keeps over [`REBURST_AT_LEAD`], so the buffer
-/// reliably arms the reburst check before this hardware's realtime deficit
-/// (see [`REBURST_AT_LEAD`]) drains it back down.
-const TARGET_BUFFER: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 7);
+/// shape rather than bursting. This used to be the same constant as
+/// `TARGET_BUFFER`, cut from 11 segments to 7 to shorten that wait — which
+/// also, as an unreviewed side effect, cut the margin a rebuilt buffer has
+/// against [`REBURST_AT_LEAD`] before it can fire again. Splitting the two
+/// keeps the tune-in win without carrying that cost into every mid-playback
+/// rebuild, which needs the larger number.
+const INITIAL_BURST: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 7);
 
 /// Lead at which a still-playing item is restarted to rebuild its buffer.
 ///
@@ -304,8 +321,9 @@ impl ChannelSession {
             }
         });
 
-        // nothing is on disk yet, so the first process bursts the full buffer
-        self.transcode(TARGET_BUFFER, troubleshoot).await?;
+        // nothing is on disk yet, so the first process bursts INITIAL_BURST —
+        // deliberately smaller than TARGET_BUFFER; see that constant's doc.
+        self.transcode(INITIAL_BURST, troubleshoot).await?;
 
         if troubleshoot {
             log::debug!("troubleshooting complete; terminating.");
@@ -425,19 +443,13 @@ impl ChannelSession {
                 wanted.display()
             );
         }
-        // There used to be a bounded wait on `.overlay-ready` here before
-        // opening the fifo for reading. It could never succeed: the overlay
-        // only touches that marker after its own `open_for_writing()` call
-        // returns (crates/etv-overlay/src/bin/etv-overlay.rs), which is a
-        // POSIX fifo rendezvous that itself blocks until a reader attaches —
-        // and this process is that reader. Waiting on the marker before
-        // opening the read end was waiting on an effect of the read end
-        // opening. It always ran the full OVERLAY_READY_TIMEOUT (5s,
-        // confirmed against production: `overlay.spawn` -> `overlay.ready`
-        // landed at 5.00-5.01s on every sampled tune-in) and then proceeded
-        // regardless of whether the file had appeared — the wait's outcome
-        // never changed what happened next, so it bought nothing but delay.
-        // The fifo open below is the real, correctly-bounded rendezvous.
+        // Deliberately no wait on `.overlay-ready` before the open below: the
+        // overlay only touches that marker once its own `open_for_writing()`
+        // returns (crates/etv-overlay/src/bin/etv-overlay.rs), and that fifo
+        // rendezvous blocks until a reader attaches — this process is that
+        // reader. Such a wait would be waiting on an effect of the open below,
+        // so it burned its full 5s timeout on every tune-in and proceeded
+        // regardless. The fifo open is the real, correctly-bounded rendezvous.
         let path = PathBuf::from(fifo_path);
         tokio::task::spawn_blocking(move || open_overlay_fifo(&path, OVERLAY_WRITER_TIMEOUT))
             .await
@@ -869,12 +881,11 @@ impl ChannelSession {
         let envs = pipeline_result.envs();
         log::debug!("optimized pipeline: {}", args.join(" "));
 
-        // Every ffmpeg child reports its own progress (frame/fps/out_time/speed)
-        // on stdout, logged under the `ffmpeg_progress` target — see the reader
-        // task below. Global option, so it must land before the first output
-        // url or ffmpeg reads it as a trailing, unconsumed argument.
-        args.insert(0, Cow::Borrowed("pipe:1"));
-        args.insert(0, Cow::Borrowed("-progress"));
+        // Have ffmpeg report its own progress on stdout; see
+        // [`log_ffmpeg_progress`]. A global option, so it must land before the
+        // first output url or ffmpeg reads it as a trailing, unconsumed
+        // argument.
+        args.splice(0..0, [Cow::Borrowed("-progress"), Cow::Borrowed("pipe:1")]);
 
         self.playlist_manager
             .lock()
@@ -942,55 +953,12 @@ impl ChannelSession {
         )));
 
         let reader_ring = Arc::clone(&ring);
-        let progress_channel_number = self.channel_config.number().to_owned();
+        let channel_number = self.channel_config.number().to_owned();
         let reader_handle = tokio::spawn(async move {
-            let stderr_task = async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    eprintln!("{line}");
-                    if let Ok(mut buf) = reader_ring.lock() {
-                        if buf.len() == STDERR_RING_LINES {
-                            buf.pop_front();
-                        }
-                        buf.push_back(line);
-                    }
-                }
-            };
-
-            // `-progress pipe:1` makes ffmpeg emit a `key=value` line per field,
-            // terminated by `progress=continue`/`progress=end` — one full report
-            // per block. This is a category log, not module-scoped: enable/disable
-            // it independently of everything else in this crate with
-            // `RUST_LOG=debug,ffmpeg_progress=off` (or `=trace` for the field
-            // dump). On by default for now — every tune-in stall this is built to
-            // diagnose is otherwise invisible without externally wrapping the
-            // ffmpeg binary.
-            let progress_task = async move {
-                let mut lines = tokio::io::BufReader::new(stdout).lines();
-                let mut fields: Vec<(String, String)> = Vec::new();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let Some((key, value)) = line.split_once('=') else {
-                        continue;
-                    };
-                    let (key, value) = (key.trim(), value.trim());
-                    if key == "progress" {
-                        log::debug!(
-                            target: "ffmpeg_progress",
-                            "channel {progress_channel_number}: {} progress={value}",
-                            fields
-                                .iter()
-                                .map(|(k, v)| format!("{k}={v}"))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        );
-                        fields.clear();
-                    } else {
-                        fields.push((key.to_owned(), value.to_owned()));
-                    }
-                }
-            };
-
-            tokio::join!(stderr_task, progress_task);
+            tokio::join!(
+                pump_ffmpeg_stderr(stderr, reader_ring),
+                log_ffmpeg_progress(stdout, channel_number),
+            );
         });
 
         log::debug!("waiting for ffmpeg to terminate...");
@@ -1554,6 +1522,53 @@ impl ChannelSession {
         let dossier = builder.build();
         if let Err(err) = dossier.write().await {
             log::error!("failed to save dossier: {err}");
+        }
+    }
+}
+
+/// Mirror ffmpeg's stderr to this process's stderr, keeping the most recent
+/// [`STDERR_RING_LINES`] lines in `ring` for the failure dossier.
+async fn pump_ffmpeg_stderr(
+    stderr: tokio::process::ChildStderr,
+    ring: Arc<std::sync::Mutex<VecDeque<String>>>,
+) {
+    let mut lines = tokio::io::BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        eprintln!("{line}");
+        if let Ok(mut buf) = ring.lock() {
+            if buf.len() == STDERR_RING_LINES {
+                buf.pop_front();
+            }
+            buf.push_back(line);
+        }
+    }
+}
+
+/// Log the `-progress pipe:1` stream ffmpeg writes to stdout: one `key=value`
+/// line per field (frame, fps, out_time, speed, ...), terminated by
+/// `progress=continue` or `progress=end`, which closes one full report.
+///
+/// This is a category log, not a module-scoped one, so it toggles independently
+/// of everything else in this crate: `RUST_LOG=debug,ffmpeg_progress=off`. On by
+/// default for now — the tune-in stalls it exists to diagnose are otherwise
+/// invisible without externally wrapping the ffmpeg binary.
+async fn log_ffmpeg_progress(stdout: tokio::process::ChildStdout, channel_number: String) {
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut fields: Vec<String> = Vec::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if key == "progress" {
+            log::debug!(
+                target: "ffmpeg_progress",
+                "channel {channel_number}: {} progress={value}",
+                fields.join(" ")
+            );
+            fields.clear();
+        } else {
+            fields.push(format!("{key}={value}"));
         }
     }
 }
