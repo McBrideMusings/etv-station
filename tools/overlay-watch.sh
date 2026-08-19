@@ -11,6 +11,7 @@
 #   ./tools/overlay-watch.sh examples/channels/diehard.yaml      # dev-side flat channel file
 #   INTERVAL=4 ./tools/overlay-watch.sh 010-pierce       # cycle even tighter
 #   INTERVAL= ./tools/overlay-watch.sh 010-pierce        # the real on-air gap
+#   KIND=series ./tools/overlay-watch.sh 030-comedy      # episode metadata
 #   TITLE="Die Hard" ./tools/overlay-watch.sh 010-pierce
 #   BG=bg-checkerboard-20s.mp4 ./tools/overlay-watch.sh 036-the-academy  # alpha check
 #   BG=station-bumper-12s.mp4 ./tools/overlay-watch.sh 054-dragon-ball
@@ -48,24 +49,45 @@ TIME_SCALE="${TIME_SCALE:-1}"
 # almost continuously, which is what makes it possible to actually look at.
 # INTERVAL= (empty) leaves the channel's own value alone.
 INTERVAL="${INTERVAL-12}"
-TITLE="${TITLE:-Preview Movie Title}"
 # Solid black, so white text reads. The checkerboard is still here as
 # `BG=bg-checkerboard-20s.mp4` — it exists to prove the overlay's alpha is
 # actually transparent, which is a different question from whether the
 # graphic is legible, and it is terrible at the second job.
 BG="${BG:-bg-black-20s.mp4}"
-# Stand-in program metadata for a script that formats differently per item
-# kind (now-next-snipe.rhai). The defaults describe two films, because -1 is
-# "absent" and an absent season is exactly what marks an item as not an
-# episode. To eyeball the series form instead:
-#   SEASON=2 EPISODE=5 NEXT_SEASON=2 NEXT_EPISODE=6 admin overlay-watch <ch>
-NEXT_TITLE="${NEXT_TITLE:-The Next Preview Feature}"
-SEASON="${SEASON:--1}"
-EPISODE="${EPISODE:--1}"
-YEAR="${YEAR:-1988}"
-NEXT_SEASON="${NEXT_SEASON:--1}"
-NEXT_EPISODE="${NEXT_EPISODE:--1}"
-NEXT_YEAR="${NEXT_YEAR:-2019}"
+# Stand-in program metadata, for a script that formats differently per item
+# kind (now-next-snipe.rhai). There is no station running here, so nothing can
+# infer whether the channel plays films or episodes — KIND picks a coherent
+# set, and any single value below still overrides it:
+#   KIND=series admin overlay-watch 030-comedy
+#   KIND=series TITLE="Frasier" SEASON=3 admin overlay-watch 030-comedy
+# `-1` is absent, and an absent season is exactly what marks an item as a film
+# rather than an episode, so the film preset is these fields left at -1.
+KIND="${KIND:-film}"
+case "$KIND" in
+  film)
+    P_TITLE="Preview Movie Title";      P_SUB="";        P_SEASON=-1; P_EPISODE=-1; P_YEAR=1988
+    P_NEXT_TITLE="The Next Preview Feature"; P_NEXT_SUB="";  P_NEXT_SEASON=-1; P_NEXT_EPISODE=-1; P_NEXT_YEAR=2019
+    ;;
+  series)
+    P_TITLE="Preview Show Name";        P_SUB="The Preview Episode"; P_SEASON=12; P_EPISODE=1; P_YEAR=2021
+    P_NEXT_TITLE="The Next Preview Show"; P_NEXT_SUB="";   P_NEXT_SEASON=4;  P_NEXT_EPISODE=22; P_NEXT_YEAR=2017
+    ;;
+  *)
+    echo "KIND must be 'film' or 'series', got: $KIND" >&2
+    exit 1
+    ;;
+esac
+
+TITLE="${TITLE:-$P_TITLE}"
+SUB_TITLE="${SUB_TITLE:-$P_SUB}"
+NEXT_TITLE="${NEXT_TITLE:-$P_NEXT_TITLE}"
+NEXT_SUB_TITLE="${NEXT_SUB_TITLE:-$P_NEXT_SUB}"
+SEASON="${SEASON:-$P_SEASON}"
+EPISODE="${EPISODE:-$P_EPISODE}"
+YEAR="${YEAR:-$P_YEAR}"
+NEXT_SEASON="${NEXT_SEASON:-$P_NEXT_SEASON}"
+NEXT_EPISODE="${NEXT_EPISODE:-$P_NEXT_EPISODE}"
+NEXT_YEAR="${NEXT_YEAR:-$P_NEXT_YEAR}"
 BG_PATH="crates/etv-query-test/fixtures/bumpers/${BG}"
 VLC="${VLC:-/Applications/VLC.app/Contents/MacOS/vlc}"
 
@@ -130,6 +152,8 @@ printf '%s streaming (time_scale=%s, title=%s) into VLC — Ctrl-C to stop\n' "$
   --config "$SPEC_PATH" \
   --time-scale "$TIME_SCALE" \
   --title "$TITLE" \
+  --sub-title "$SUB_TITLE" \
+  --next-sub-title "$NEXT_SUB_TITLE" \
   --season "$SEASON" \
   --episode "$EPISODE" \
   --year "$YEAR" \
