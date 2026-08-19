@@ -850,9 +850,16 @@ impl ChannelSession {
         let mut pipeline_result =
             pipeline::generate_pipeline(&self.ffmpeg_info, input_settings, output_settings)?;
         pipeline_result.optimize();
-        let args = pipeline_result.args();
+        let mut args = pipeline_result.args();
         let envs = pipeline_result.envs();
         log::debug!("optimized pipeline: {}", args.join(" "));
+
+        // Every ffmpeg child reports its own progress (frame/fps/out_time/speed)
+        // on stdout, logged under the `ffmpeg_progress` target — see the reader
+        // task below. Global option, so it must land before the first output
+        // url or ffmpeg reads it as a trailing, unconsumed argument.
+        args.insert(0, Cow::Borrowed("pipe:1"));
+        args.insert(0, Cow::Borrowed("-progress"));
 
         self.playlist_manager
             .lock()
@@ -868,7 +875,7 @@ impl ChannelSession {
                 envs.iter()
                     .map(|env| (env.key.as_str(), env.value.as_str())),
             )
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         #[cfg(unix)]
@@ -911,22 +918,64 @@ impl ChannelSession {
             .stderr
             .take()
             .ok_or(ChannelError::CaptureFFmpegStderrFailure)?;
+        let stdout = ffmpeg_child
+            .stdout
+            .take()
+            .ok_or(ChannelError::CaptureFFmpegStdoutFailure)?;
         let ring = Arc::new(std::sync::Mutex::new(VecDeque::<String>::with_capacity(
             STDERR_RING_LINES,
         )));
 
         let reader_ring = Arc::clone(&ring);
+        let progress_channel_number = self.channel_config.number().to_owned();
         let reader_handle = tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{line}");
-                if let Ok(mut buf) = reader_ring.lock() {
-                    if buf.len() == STDERR_RING_LINES {
-                        buf.pop_front();
+            let stderr_task = async move {
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("{line}");
+                    if let Ok(mut buf) = reader_ring.lock() {
+                        if buf.len() == STDERR_RING_LINES {
+                            buf.pop_front();
+                        }
+                        buf.push_back(line);
                     }
-                    buf.push_back(line);
                 }
-            }
+            };
+
+            // `-progress pipe:1` makes ffmpeg emit a `key=value` line per field,
+            // terminated by `progress=continue`/`progress=end` — one full report
+            // per block. This is a category log, not module-scoped: enable/disable
+            // it independently of everything else in this crate with
+            // `RUST_LOG=debug,ffmpeg_progress=off` (or `=trace` for the field
+            // dump). On by default for now — every tune-in stall this is built to
+            // diagnose is otherwise invisible without externally wrapping the
+            // ffmpeg binary.
+            let progress_task = async move {
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                let mut fields: Vec<(String, String)> = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Some((key, value)) = line.split_once('=') else {
+                        continue;
+                    };
+                    let (key, value) = (key.trim(), value.trim());
+                    if key == "progress" {
+                        log::debug!(
+                            target: "ffmpeg_progress",
+                            "channel {progress_channel_number}: {} progress={value}",
+                            fields
+                                .iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                        fields.clear();
+                    } else {
+                        fields.push((key.to_owned(), value.to_owned()));
+                    }
+                }
+            };
+
+            tokio::join!(stderr_task, progress_task);
         });
 
         log::debug!("waiting for ffmpeg to terminate...");

@@ -79,6 +79,9 @@ pub enum ChannelError {
     #[error("failed to capture ffmpeg stderr")]
     CaptureFFmpegStderrFailure,
 
+    #[error("failed to capture ffmpeg stdout")]
+    CaptureFFmpegStdoutFailure,
+
     #[error("dynamic source is required")]
     DynamicSourceRequired,
 
