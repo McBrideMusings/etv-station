@@ -67,22 +67,18 @@ use tokio::time;
 // writer.
 use ersatztv_core::{OVERLAY_READY_FILE_NAME, OVERLAY_WANTED_FILE_NAME};
 
-// Every viewer-facing transition this loop detects — a fresh `.overlay-wanted`
-// touch, or the overlay's own `.overlay-ready` file appearing — sits on the
-// critical path of a real tune-in, and a single fixed-interval poll serving
-// both that and the background "is anybody still watching" reap check forces
-// the interactive path to pay a cadence the reap path doesn't need.
+// How fast a new viewer's `.overlay-wanted` touch gets noticed. One
+// fixed-interval poll serves both that tune-in critical path and the background
+// "is anybody still watching" reap, so the interactive path sets the cadence.
 //
-// This alone does NOT explain the ~5s tune-in tax that used to show up as
+// This alone did NOT explain the ~5s tune-in tax that showed up as
 // `overlay.spawn` -> `overlay.ready` landing at a suspiciously exact 5.00-5.01s
 // in station-etv.log — that was a real deadlock (the channel worker waiting on
 // `.overlay-ready` before opening its fifo reader, while the overlay can't
 // touch that marker until a reader opens the fifo), fixed at the source in
-// ersatztv-channel's `signal_overlay_wanted_and_wait_ready`. This constant
-// still matters for how fast a genuinely new viewer's `.overlay-wanted` touch
-// gets noticed. A 64-channel lineup polling `stat()` on two marker files this
-// often is a few hundred syscalls a second, immaterial next to the GPU-bound
-// transcodes it is unblocking.
+// ersatztv-channel's `signal_overlay_wanted_and_wait_ready`. A 64-channel
+// lineup `stat()`-ing two marker files at this rate is a few hundred syscalls a
+// second, immaterial next to the GPU-bound transcodes it is unblocking.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct OverlayContext {
