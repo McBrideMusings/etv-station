@@ -1,22 +1,34 @@
 //! The `overlay:` key, and the station → channel → block cascade behind it
 //! (#48).
 //!
-//! # Whole-config replace, not a field merge
+//! # Replace by default, append when asked
 //!
-//! Every level declares a *complete* overlay config or says nothing. The
-//! deepest level that says something wins outright, discarding whatever an
-//! ancestor resolved — there is no field-by-field merge, no layer-`id`
-//! matching, and no stacking of two scopes' layers into one render. This is
-//! deliberately unlike `guide:`'s cascade ([`crate::guide::GuideConfig`]),
-//! which merges per field: a guide config is a bag of independent strings,
-//! while an overlay config is one composed picture, and half of one picture
-//! over half of another is not a picture.
+//! A level either declares a *complete* overlay config, adds layers to the one
+//! above it, or says nothing. There is still no field-by-field merge and no
+//! layer-`id` matching — unlike `guide:`'s cascade
+//! ([`crate::guide::GuideConfig`]), which merges per field, because a guide
+//! config is a bag of independent strings while an overlay config is one
+//! composed picture, and half of one picture over half of another is not a
+//! picture.
 //!
-//! So the rule is three lines long:
+//! So the rule is four lines long:
 //!
 //! - no `overlay:` key at a level — carry the ancestor's resolution forward
 //! - `overlay: clear` — nothing is drawn, whatever the ancestor said
 //! - a `file:` reference or an inline spec — that config, and only that config
+//! - `overlay: {extend: …}` — the ancestor's config with these layers appended
+//!
+//! Appending is the one form of composition allowed, and it is deliberately
+//! not a merge: an extend can only add layers on top, name a different script,
+//! or replace `config:` wholesale. It cannot reach into an inherited layer, and
+//! it carries no geometry, so the four fields a running overlay process bakes
+//! into its fifo (ADR 0007) can only ever come from the level that declared the
+//! complete spec.
+//!
+//! `extend` exists because replacement alone cannot express the station's
+//! actual shape: graphics every channel shares, plus one thing only the channel
+//! knows (its logo, at its own size). Under replacement each channel had to
+//! restate the shared half, so one graphic lived as 60 copies. See ADR 0008.
 //!
 //! # What `clear` means
 //!
@@ -61,6 +73,47 @@ pub enum OverlayDecl {
     /// where it is used, for a config small enough that a second file would be
     /// the bigger cost.
     Inline(Box<OverlaySpec>),
+    /// `overlay: {extend: {layers: [...]}}` — keep whatever the level above
+    /// resolved to and add to it, rather than restating it.
+    ///
+    /// This exists because replacement alone cannot express the one shape the
+    /// station actually has: graphics every channel shares (a Now/Next snipe,
+    /// its scrim) plus one thing only the channel knows (its own logo, at its
+    /// own size). Under replacement a channel wanting its own bug had to
+    /// restate the shared half too, so the same block was copied into 60
+    /// channel files and every edit to it meant editing 60 files.
+    ///
+    /// An extend carries no geometry, so it cannot reach the four fields a
+    /// running overlay process bakes into its fifo (ADR 0007) — the geometry
+    /// check below has nothing new to catch.
+    Extend(Box<OverlayExtend>),
+}
+
+/// The additive half of a cascade level: what an [`OverlayDecl::Extend`] adds
+/// to the spec it inherits.
+///
+/// Layers append rather than merge by index. Index-merging would make a
+/// channel's file depend on the *order* of layers in a file it does not own,
+/// so inserting a layer at the station level would silently re-target every
+/// channel's override.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayExtend {
+    /// Appended after the inherited layers, so they draw on top.
+    #[serde(default)]
+    pub layers: Vec<etv_overlay::overlay_spec::OverlayKind>,
+    /// Replaces the inherited script when set. A level adding layers a script
+    /// has to drive needs a way to name that script; absent keeps the parent's.
+    #[serde(default)]
+    pub script: Option<PathBuf>,
+    /// Replaces the inherited `config:` wholesale when set — not a per-key
+    /// merge, matching how the rest of the cascade treats a value it owns.
+    #[serde(
+        default,
+        deserialize_with = "etv_overlay::config_carrier::deserialize_config",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub config: Option<serde_json::Value>,
 }
 
 /// The wire shape [`OverlayDecl`] is read through. Separate from the public
@@ -71,6 +124,10 @@ pub enum OverlayDecl {
 enum DeclRepr {
     Keyword(Keyword),
     File { file: PathBuf },
+    // Before `Inline`: an extend is a map, and `OverlaySpec`'s required
+    // width/height/framerate are what stop the two from matching each other,
+    // but only if the narrower shape is tried first.
+    Extend { extend: Box<OverlayExtend> },
     Inline(Box<OverlaySpec>),
 }
 
@@ -90,11 +147,13 @@ impl<'de> Deserialize<'de> for OverlayDecl {
             .map(|repr| match repr {
                 DeclRepr::Keyword(Keyword::Clear) => OverlayDecl::Clear,
                 DeclRepr::File { file } => OverlayDecl::File(file),
+                DeclRepr::Extend { extend } => OverlayDecl::Extend(extend),
                 DeclRepr::Inline(spec) => OverlayDecl::Inline(spec),
             })
             .map_err(|_| {
                 de::Error::custom(
-                    "`overlay:` must be `clear`, a `{file: <path>}` reference, or an inline \
+                    "`overlay:` must be `clear`, a `{file: <path>}` reference, an \
+                     `{extend: {layers: [...]}}` addition to the level above, or an inline \
                      spec with at least `width`, `height` and `framerate`",
                 )
             })
@@ -112,6 +171,12 @@ impl Serialize for OverlayDecl {
                 map.end()
             }
             OverlayDecl::Inline(spec) => spec.serialize(serializer),
+            OverlayDecl::Extend(extend) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("extend", extend)?;
+                map.end()
+            }
         }
     }
 }
@@ -132,16 +197,77 @@ pub fn resolve_decl<'a>(
     station: Option<Level<'a>>,
     channel: Option<Level<'a>>,
     block: Option<Level<'a>>,
-) -> Option<Level<'a>> {
-    let mut resolved = None;
+) -> Vec<Level<'a>> {
+    let mut chain: Vec<Level<'a>> = Vec::new();
     for level in [station, channel, block] {
         match level {
+            // Silence carries the ancestors' resolution forward untouched.
             None => {}
-            Some((OverlayDecl::Clear, _)) => resolved = None,
-            Some(level) => resolved = Some(level),
+            // `clear` means nothing is drawn, so it drops the whole chain and
+            // not just the level above — a deeper `extend` after it then has
+            // nothing to extend, which `load_chain` reports.
+            Some((OverlayDecl::Clear, _)) => chain.clear(),
+            // A complete spec replaces everything before it, exactly as it did
+            // before extend existed.
+            Some(level @ (OverlayDecl::File(_) | OverlayDecl::Inline(_), _)) => {
+                chain.clear();
+                chain.push(level);
+            }
+            // The only additive case: keep what is there and stack on top.
+            Some(level @ (OverlayDecl::Extend(_), _)) => chain.push(level),
         }
     }
-    resolved
+    chain
+}
+
+/// Fold a [`resolve_decl`] chain into one spec, loading each level against its
+/// own base directory.
+///
+/// Each level's paths are re-rooted before its layers are appended, which is
+/// the whole reason a level travels with its directory: a station-level layer
+/// naming `shared/logo.png` and a channel-level layer naming `logo.png` are
+/// both correct, relative to different files, and end up in one spec.
+pub fn load_chain(chain: &[Level<'_>]) -> Result<Option<OverlaySpec>, String> {
+    let mut resolved: Option<OverlaySpec> = None;
+    for (decl, dir) in chain {
+        match decl {
+            OverlayDecl::Clear => {
+                unreachable!("`clear` empties the chain; see `resolve_decl`")
+            }
+            OverlayDecl::File(_) | OverlayDecl::Inline(_) => {
+                resolved = Some(load_decl(decl, dir)?);
+            }
+            OverlayDecl::Extend(extend) => {
+                let Some(base) = resolved.as_mut() else {
+                    return Err(
+                        "`overlay: {extend: …}` has nothing to extend — no level above this one \
+                         declared a complete overlay config (or the nearest one said `clear`). \
+                         Declare the base config at the station or channel level, or write this \
+                         level as a full spec with `width`, `height` and `framerate`."
+                            .to_string(),
+                    );
+                };
+                // Re-root this level's own paths, then append. `with_paths_relative_to`
+                // works on a whole spec, so the layers ride through a scratch
+                // one rather than growing a second path-rewriting routine that
+                // could disagree with it.
+                let scratch = OverlaySpec {
+                    script: extend.script.clone(),
+                    layers: extend.layers.clone(),
+                    ..base.clone()
+                }
+                .with_paths_relative_to(Some(dir));
+                base.layers.extend(scratch.layers);
+                if extend.script.is_some() {
+                    base.script = scratch.script;
+                }
+                if extend.config.is_some() {
+                    base.config = extend.config.clone();
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Load a declaration into a spec with every path made absolute against
@@ -158,6 +284,9 @@ pub fn resolve_decl<'a>(
 pub fn load_decl(decl: &OverlayDecl, base_dir: &Path) -> Result<OverlaySpec, String> {
     match decl {
         OverlayDecl::Clear => unreachable!("`clear` resolves to no spec; see `resolve_decl`"),
+        OverlayDecl::Extend(_) => {
+            unreachable!("an extend is folded onto its base by `load_chain`, never loaded alone")
+        }
         OverlayDecl::File(path) => {
             let full = if path.is_absolute() {
                 path.clone()
@@ -220,20 +349,13 @@ pub fn resolve_channel(
     let station_level = station.map(|d| (d, station_dir));
     let channel_level = channel.overlay.as_ref().map(|d| (d, channel_dir));
 
-    let base = match resolve_decl(station_level, channel_level, None) {
-        Some((decl, dir)) => Some(load_decl(decl, dir)?),
-        None => None,
-    };
+    let base = load_chain(&resolve_decl(station_level, channel_level, None))?;
 
     let mut blocks = Vec::with_capacity(channel.rule.blocks.len());
     for (idx, include) in channel.rule.blocks.iter().enumerate() {
         let block_level = include.overlay.as_ref().map(|d| (d, channel_dir));
-        let resolved = match resolve_decl(station_level, channel_level, block_level) {
-            Some((decl, dir)) => {
-                Some(load_decl(decl, dir).map_err(|e| format!("block #{idx}: overlay: {e}"))?)
-            }
-            None => None,
-        };
+        let resolved = load_chain(&resolve_decl(station_level, channel_level, block_level))
+            .map_err(|e| format!("block #{idx}: overlay: {e}"))?;
 
         if let Some(spec) = resolved.as_ref() {
             let Some(base) = base.as_ref() else {
@@ -355,9 +477,15 @@ mod tests {
         Some((decl, Path::new(dir)))
     }
 
+    /// `resolve_decl` returns the chain to fold, so a test asserting "this one
+    /// level governs" is asserting a one-element chain.
+    fn only<'a>(decl: &'a OverlayDecl, dir: &'a str) -> Vec<Level<'a>> {
+        vec![(decl, Path::new(dir))]
+    }
+
     #[test]
     fn nothing_declared_anywhere_draws_nothing() {
-        assert!(resolve_decl(None, None, None).is_none());
+        assert!(resolve_decl(None, None, None).is_empty());
     }
 
     #[test]
@@ -365,7 +493,7 @@ mod tests {
         let station = OverlayDecl::File("station.yaml".into());
         assert_eq!(
             resolve_decl(at(&station, STATION_DIR), None, None),
-            at(&station, STATION_DIR),
+            only(&station, STATION_DIR),
             "a channel and block that say nothing inherit the station's, \
              including the directory its paths resolve against"
         );
@@ -384,11 +512,11 @@ mod tests {
                 at(&channel, CHANNEL_DIR),
                 at(&block, CHANNEL_DIR),
             ),
-            at(&block, CHANNEL_DIR),
+            only(&block, CHANNEL_DIR),
         );
         assert_eq!(
             resolve_decl(at(&station, STATION_DIR), at(&channel, CHANNEL_DIR), None),
-            at(&channel, CHANNEL_DIR),
+            only(&channel, CHANNEL_DIR),
         );
     }
 
@@ -402,7 +530,7 @@ mod tests {
                 at(&OverlayDecl::Clear, CHANNEL_DIR),
                 None,
             )
-            .is_none()
+            .is_empty()
         );
         assert!(
             resolve_decl(
@@ -410,7 +538,7 @@ mod tests {
                 at(&channel, CHANNEL_DIR),
                 at(&OverlayDecl::Clear, CHANNEL_DIR),
             )
-            .is_none()
+            .is_empty()
         );
     }
 
@@ -425,8 +553,129 @@ mod tests {
                 at(&OverlayDecl::Clear, CHANNEL_DIR),
                 at(&block, CHANNEL_DIR),
             ),
+            only(&block, CHANNEL_DIR),
+        );
+    }
+
+    /// The shape the whole feature exists for: shared graphics declared once at
+    /// the station, one channel-specific layer added per channel, both drawn.
+    #[test]
+    fn an_extend_stacks_onto_its_ancestor_instead_of_replacing_it() {
+        // A station layer to inherit, so the assertion below distinguishes
+        // "appended" from "replaced" — `spec()` alone carries none.
+        let station = OverlayDecl::Inline(Box::new(OverlaySpec {
+            layers: vec![OverlayKind::Watermark {
+                corner: Corner::TopLeft,
+                margin: 8,
+                box_size: 16,
+                color: [1, 2, 3, 4],
+            }],
+            ..spec(1280)
+        }));
+        let channel = decl(
+            "overlay:\n  extend:\n    layers:\n      - type: logo\n        path: logo.png\n        corner: bottom_right\n",
+        );
+        let chain = resolve_decl(at(&station, STATION_DIR), at(&channel, CHANNEL_DIR), None);
+        assert_eq!(
+            chain.len(),
+            2,
+            "both levels contribute, neither is discarded"
+        );
+
+        let resolved = load_chain(&chain).unwrap().unwrap();
+        assert_eq!(resolved.layers.len(), 2, "the station's layer survives");
+        assert!(matches!(resolved.layers[0], OverlayKind::Watermark { .. }));
+        match &resolved.layers[1] {
+            // Appended last so it draws on top, and re-rooted against the
+            // channel's own directory rather than the station's.
+            OverlayKind::Logo { path, .. } => {
+                assert_eq!(path, Path::new(CHANNEL_DIR).join("logo.png").as_path())
+            }
+            other => panic!("expected the channel's logo, got {other:?}"),
+        }
+    }
+
+    /// An extend is a patch, so it needs something to patch. Reaching the
+    /// renderer with no geometry would be a crash at spawn; this is the error
+    /// that stops it at config load instead.
+    #[test]
+    fn an_extend_with_no_ancestor_is_a_load_error() {
+        let channel = decl("overlay:\n  extend:\n    layers: []\n");
+        let chain = resolve_decl(None, at(&channel, CHANNEL_DIR), None);
+        let err = load_chain(&chain).unwrap_err();
+        assert!(
+            err.contains("nothing to extend"),
+            "error should name the actual problem, got: {err}"
+        );
+    }
+
+    /// `clear` drops the chain rather than just the level above it, so a
+    /// channel that cleared and a block that extends do not silently resurrect
+    /// the station's config.
+    #[test]
+    fn an_extend_under_a_cleared_ancestor_has_nothing_to_extend() {
+        let station = OverlayDecl::Inline(Box::new(spec(1280)));
+        let block = decl("overlay:\n  extend:\n    layers: []\n");
+        let chain = resolve_decl(
+            at(&station, STATION_DIR),
+            at(&OverlayDecl::Clear, CHANNEL_DIR),
             at(&block, CHANNEL_DIR),
         );
+        assert!(load_chain(&chain).is_err());
+    }
+
+    /// A level adding layers a script has to drive needs to be able to name
+    /// that script; a level that says nothing about it keeps its ancestor's.
+    #[test]
+    fn an_extend_replaces_the_script_only_when_it_names_one() {
+        let station = OverlayDecl::Inline(Box::new(OverlaySpec {
+            script: Some("station.rhai".into()),
+            ..spec(1280)
+        }));
+
+        let silent = decl("overlay:\n  extend:\n    layers: []\n");
+        let kept = load_chain(&resolve_decl(
+            at(&station, STATION_DIR),
+            at(&silent, CHANNEL_DIR),
+            None,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            kept.script,
+            Some(Path::new(STATION_DIR).join("station.rhai")),
+            "an extend that names no script keeps the station's, still rooted at the station"
+        );
+
+        let overriding = decl("overlay:\n  extend:\n    script: channel.rhai\n    layers: []\n");
+        let replaced = load_chain(&resolve_decl(
+            at(&station, STATION_DIR),
+            at(&overriding, CHANNEL_DIR),
+            None,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            replaced.script,
+            Some(Path::new(CHANNEL_DIR).join("channel.rhai")),
+            "an extend naming a script wins, rooted at its own directory"
+        );
+    }
+
+    /// An extend cannot carry geometry, so the four fields a running overlay
+    /// process bakes into its fifo (ADR 0007) survive the fold untouched.
+    #[test]
+    fn an_extend_cannot_change_geometry() {
+        let station = OverlayDecl::Inline(Box::new(spec(1280)));
+        let channel = decl("overlay:\n  extend:\n    layers: []\n");
+        let resolved = load_chain(&resolve_decl(
+            at(&station, STATION_DIR),
+            at(&channel, CHANNEL_DIR),
+            None,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.geometry(), spec(1280).geometry());
     }
 
     // ---- loading -----------------------------------------------------------

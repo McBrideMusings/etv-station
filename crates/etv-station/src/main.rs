@@ -55,6 +55,24 @@ struct Cli {
     /// code is non-zero when anything mismatches.
     #[arg(long, value_name = "PLEXDB_PATH")]
     reconcile_plexdb: Option<PathBuf>,
+
+    /// Print the named channel's fully-resolved overlay spec as YAML on stdout
+    /// and exit, with every path absolute — what the channel's overlay process
+    /// would actually be spawned with.
+    ///
+    /// The channel is named the way its directory or file is
+    /// (`036-the-academy`), not by number. Exits non-zero if no such channel
+    /// exists or the channel resolves to no overlay at all.
+    ///
+    /// This exists so `tools/overlay-extract.py` (and so `admin overlay-watch`)
+    /// can preview the real cascade instead of reimplementing it. Since ADR
+    /// 0008 a channel may declare only `overlay: {extend: …}`, which carries no
+    /// geometry and means nothing without the station-level spec above it — so
+    /// a preview that reads the channel file alone can no longer resolve one.
+    /// Reusing `config::overlay` here is what keeps the preview and the daemon
+    /// from disagreeing about what is on screen.
+    #[arg(long, value_name = "CHANNEL")]
+    dump_overlay: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -70,6 +88,12 @@ fn main() -> ExitCode {
     // setup, so stdout carries only the folder list for a caller to capture.
     if cli.list_folders {
         return list_folders(&cli.config);
+    }
+
+    // Same reasoning as `--list-folders`: stdout carries only the YAML, so a
+    // caller can redirect it straight into a spec file.
+    if let Some(channel) = cli.dump_overlay.as_deref() {
+        return dump_overlay(&cli.config, channel);
     }
 
     // Tracing comes up before this one, unlike `--list-folders` above: the
@@ -162,6 +186,103 @@ fn list_folders(config_path: &Path) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Print one channel's resolved overlay spec as YAML and exit.
+///
+/// Deliberately the channel's `base` — the station → channel resolution, which
+/// is the spawn config its overlay process actually runs — and not a per-block
+/// resolution: a preview has no schedule, so there is no block to be inside of.
+fn dump_overlay(config_path: &Path, channel_name: &str) -> ExitCode {
+    match resolve_overlay_for(config_path, channel_name) {
+        Ok(yaml) => {
+            print!("{yaml}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("dump-overlay: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Just enough of a config file to find its `overlay:` and, for the station,
+/// where its channels live.
+///
+/// A narrow read rather than `config::load`, on purpose. A full load resolves
+/// pools, which opens every datastore a channel names — so asking "what does
+/// this channel draw" would fail on a deploy host's `${PLEXDB_SNAPSHOT_PATH}`
+/// being absent from the machine running the preview. Nothing about the
+/// cascade needs any of that. The cascade itself is NOT reimplemented here:
+/// `OverlayDecl` is the real type and `resolve_decl`/`load_chain` are the real
+/// functions the daemon uses.
+#[derive(serde::Deserialize)]
+struct OverlayProbe {
+    #[serde(default)]
+    overlay: Option<config::OverlayDecl>,
+    #[serde(default)]
+    channels: Vec<String>,
+}
+
+fn read_probe(path: &Path) -> Result<OverlayProbe, String> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    serde_norway::from_str(&raw).map_err(|e| format!("parsing {}: {e}", path.display()))
+}
+
+fn resolve_overlay_for(config_path: &Path, channel_name: &str) -> Result<String, String> {
+    // Absolute from here down, so the emitted spec's `script:` and logo paths
+    // work from whatever directory the caller later loads it in — a preview
+    // writes the spec to a temp dir and renders it from there.
+    let absolute = config_path
+        .canonicalize()
+        .map_err(|e| format!("resolving {}: {e}", config_path.display()))?;
+    let station_dir = absolute.parent().unwrap_or(Path::new("."));
+    let station = read_probe(&absolute)?;
+
+    // Same globs the loader walks, matched on the name a channel is known by:
+    // its directory (deploy/appdata's layout) or its file stem (examples').
+    let mut channel_path = None;
+    let mut known = Vec::new();
+    for pattern in &station.channels {
+        let full = station_dir.join(pattern);
+        let entries = glob::glob(&full.to_string_lossy())
+            .map_err(|e| format!("bad channels pattern {pattern:?}: {e}"))?;
+        for entry in entries.flatten() {
+            let name = if entry.file_name().and_then(|n| n.to_str()) == Some("channel.yaml") {
+                entry.parent().and_then(|p| p.file_name())
+            } else {
+                entry.file_stem()
+            }
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+            if name == channel_name {
+                channel_path = Some(entry.clone());
+            }
+            known.push(name);
+        }
+    }
+    let Some(channel_path) = channel_path else {
+        known.sort();
+        return Err(format!(
+            "no channel named {channel_name:?}. Known: {}",
+            known.join(", ")
+        ));
+    };
+
+    let channel = read_probe(&channel_path)?;
+    let channel_dir = channel_path.parent().unwrap_or(Path::new("."));
+
+    let station_level = station.overlay.as_ref().map(|d| (d, station_dir));
+    let channel_level = channel.overlay.as_ref().map(|d| (d, channel_dir));
+    let chain = config::resolve_decl(station_level, channel_level, None);
+    let Some(spec) = config::load_chain(&chain)? else {
+        return Err(format!(
+            "channel {channel_name:?} resolves to no overlay (nothing declared, or `clear`)"
+        ));
+    };
+    serde_norway::to_string(&spec).map_err(|e| format!("serializing the resolved overlay: {e}"))
 }
 
 /// Render ETV-next's config from the station config and exit. Progress goes to

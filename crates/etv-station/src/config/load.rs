@@ -54,6 +54,23 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
     load_with_env(station_path, &process_env)
 }
 
+/// Load a station config for a read-only query that only cares about structure
+/// — today, `--dump-overlay`.
+///
+/// Unset `${VAR}` references resolve to a placeholder instead of failing the
+/// load. The daemon must never do this: an unset media root there would mean
+/// scheduling against paths that do not exist. But a caller asking "what does
+/// this channel's overlay resolve to" is asking about the cascade, and failing
+/// that question because a *pool's* snapshot path is unset would make the
+/// overlay preview depend on the deploy host's environment. The placeholder is
+/// deliberately not a valid path, so anything that tries to *use* one fails
+/// loudly rather than reading the wrong file.
+pub fn load_for_inspection(station_path: &Path) -> Result<Station, ConfigError> {
+    load_with_env(station_path, &|var| {
+        Some(process_env(var).unwrap_or_else(|| format!("/nonexistent/unset-env/{var}")))
+    })
+}
+
 fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, ConfigError> {
     let mut station: StationConfig = read_config_file(station_path)?;
     apply_env_overrides(
