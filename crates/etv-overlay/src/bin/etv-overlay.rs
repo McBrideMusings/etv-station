@@ -242,6 +242,39 @@ fn render_still(config: PathBuf, output: PathBuf, time: f64, title: String) -> a
     Ok(())
 }
 
+/// Kills the wrapped ffmpeg child on drop. `run_with_ffmpeg` and `watch` both
+/// spawn ffmpeg, then still have fallible setup between the spawn and their
+/// own explicit `child.kill()`/`wait()` at the end (`fifo.open_for_writing`,
+/// `VelloRenderer::new`, `build_engine`) — an early `?`-propagated return
+/// through any of those, or a shutdown signal arriving while
+/// `open_for_writing` is still waiting for a reader, would otherwise skip
+/// the explicit cleanup and leak the child. Wrapping it means every exit
+/// gets that for free instead of needing a matching `child.kill()` at each
+/// fallible call site. Most load-bearing for `watch`, whose background
+/// input loops forever (`-stream_loop -1`) and never exits on its own;
+/// `run_with_ffmpeg`'s finite input (`-shortest`) would eventually self-exit
+/// even unwrapped, just not as soon as a signal should have stopped it.
+struct KillOnDrop(std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
 fn run_with_ffmpeg(
     input: PathBuf,
     config: PathBuf,
@@ -257,44 +290,52 @@ fn run_with_ffmpeg(
     let ffmpeg = ffmpeg_bin.unwrap_or_else(|| PathBuf::from("ffmpeg"));
     let filter = "[0:v][1:v]overlay=x=0:y=0:eof_action=pass:format=auto[v]";
 
-    let mut child = Command::new(&ffmpeg)
-        .args(["-hide_banner", "-loglevel", "warning", "-y", "-i"])
-        .arg(&input)
-        .args([
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            spec.pixel_format.ffmpeg_arg(),
-            "-video_size",
-        ])
-        .arg(format!("{}x{}", spec.width, spec.height))
-        .args(["-framerate"])
-        .arg(spec.framerate.to_string())
-        .arg("-i")
-        .arg(fifo.path())
-        .args([
-            "-filter_complex",
-            filter,
-            "-map",
-            "[v]",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            "veryfast",
-            "-c:a",
-            "copy",
-            "-shortest",
-        ])
-        .arg(&output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn ffmpeg: {e}"))?;
+    // KillOnDrop, not a bare Child: without it, a shutdown signal arriving
+    // while `open_for_writing` below is still waiting for a reader — the
+    // same early-return race `watch` had — would return before this
+    // function's own `child.wait()` at the bottom ever runs, leaking ffmpeg
+    // for however long it takes this finite-input run to hit `-shortest` and
+    // exit on its own.
+    let mut child = KillOnDrop(
+        Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "warning", "-y", "-i"])
+            .arg(&input)
+            .args([
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                spec.pixel_format.ffmpeg_arg(),
+                "-video_size",
+            ])
+            .arg(format!("{}x{}", spec.width, spec.height))
+            .args(["-framerate"])
+            .arg(spec.framerate.to_string())
+            .arg("-i")
+            .arg(fifo.path())
+            .args([
+                "-filter_complex",
+                filter,
+                "-map",
+                "[v]",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "veryfast",
+                "-c:a",
+                "copy",
+                "-shortest",
+            ])
+            .arg(&output)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn ffmpeg: {e}"))?,
+    );
 
     if matches!(
         fifo.open_for_writing(&SHUTDOWN, None)?,
@@ -358,34 +399,6 @@ fn run_with_ffmpeg(
 /// edit-save-look loop; every frame would mean 30 stat(2) calls/sec for no
 /// perceptible gain.
 const CONFIG_POLL_FRAMES: u64 = 30;
-
-/// Kills the wrapped ffmpeg child on drop. `watch`'s background input loops
-/// forever (`-stream_loop -1`), so any exit out of the function — including
-/// an early `?`-propagated return before the render loop even starts, e.g.
-/// `fifo.open_for_writing` seeing a shutdown signal while ffmpeg is still
-/// waiting to attach — must kill it, not just the paths inside the loop's
-/// own body. Wrapping the child means every such exit gets that for free
-/// instead of needing a matching `child.kill()` at each fallible call site.
-struct KillOnDrop(std::process::Child);
-
-impl std::ops::Deref for KillOnDrop {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for KillOnDrop {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-    }
-}
 
 fn watch(
     input: PathBuf,
