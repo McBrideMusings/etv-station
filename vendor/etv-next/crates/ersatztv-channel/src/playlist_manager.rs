@@ -10,7 +10,14 @@ use ffpipeline::web_vtt::{Cue, format_vtt_ts};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-const MIN_SEGMENTS: usize = 4;
+// 3 segments is the commonly cited floor for a live HLS playlist (e.g. AWS's
+// Kinesis Video Streams HLS docs state a live media playlist should carry a
+// minimum of 3 fragments) — Apple's own authoring spec doesn't appear to
+// enumerate an exact minimum. Was 4; on GPU-bound hardware, each segment here
+// costs close to SEGMENT_SECONDS of real tune-in wait (see TARGET_BUFFER in
+// ersatztv-channel), so this is the smallest change consistent with a real,
+// citable floor rather than an arbitrary cut.
+const MIN_SEGMENTS: usize = 3;
 
 /// How far the newest segment's end may fall behind wall clock — in multiples of
 /// the playlist's target duration — before a session that a viewer is actively
