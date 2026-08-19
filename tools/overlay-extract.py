@@ -58,9 +58,30 @@ def extract(channel_path: Path) -> tuple[dict, Path]:
         if not ref.exists():
             sys.exit(f"{channel_yaml} overlay.file points at missing {ref}")
         spec = yaml.safe_load(ref.read_text())
-        return spec, ref
+        return absolutize(spec, ref.parent), ref
 
-    return decl, channel_yaml
+    return absolutize(decl, channel_yaml.parent), channel_yaml
+
+
+def absolutize(spec: dict, base: Path) -> dict:
+    """Rewrite the spec's relative asset paths to absolute, anchored at `base`.
+
+    etv-overlay resolves `script:` and a layer's `path:` against the directory
+    of the spec file it was handed. This tool hands it a *copy* written to a
+    temp dir, so every relative path in an inline overlay (`path: logo.png` —
+    the shape 60 of the 64 deployed channels use) resolved against the temp
+    dir and failed to open. Anchoring them here to where they were authored
+    means the copy names the same files the original did, rather than the
+    caller having to keep the copy adjacent to the channel dir.
+    """
+    if not isinstance(spec, dict):
+        return spec
+    if isinstance(spec.get("script"), str):
+        spec["script"] = str((base / spec["script"]).resolve())
+    for layer in spec.get("layers") or []:
+        if isinstance(layer, dict) and isinstance(layer.get("path"), str):
+            layer["path"] = str((base / layer["path"]).resolve())
+    return spec
 
 
 def main() -> None:
