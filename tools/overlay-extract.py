@@ -63,6 +63,26 @@ def extract(channel_path: Path) -> tuple[dict, Path]:
     return absolutize(decl, channel_yaml.parent), channel_yaml
 
 
+def override_config(spec: dict, assignments: list[str]) -> dict:
+    """Merge `KEY=VALUE` assignments into the spec's free-form `config:` map.
+
+    The map is handed to the Rhai script unread, so this needs no knowledge of
+    which keys any script accepts. VALUE goes through the YAML loader, so `12`
+    arrives as an int and `false` as a bool — a script comparing against a
+    number would silently take its default if this passed strings through.
+    """
+    if not assignments:
+        return spec
+    config = dict(spec.get("config") or {})
+    for pair in assignments:
+        if "=" not in pair:
+            sys.exit(f"--set-config expects KEY=VALUE, got {pair!r}")
+        key, _, raw = pair.partition("=")
+        config[key.strip()] = yaml.safe_load(raw)
+    spec["config"] = config
+    return spec
+
+
 def absolutize(spec: dict, base: Path) -> dict:
     """Rewrite the spec's relative asset paths to absolute, anchored at `base`.
 
@@ -92,9 +112,21 @@ def main() -> None:
         help="a deploy/appdata/channels/<N>-<name> dir, or an examples/channels/<name>.yaml file",
     )
     parser.add_argument("--out", type=Path, required=True, help="where to write the spec YAML")
+    parser.add_argument(
+        "--set-config",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "override one key in the spec's `config:` map, repeatable. Preview-only "
+            "retiming: a script's on-air interval is minutes long, which is not "
+            "watchable. VALUE is parsed as YAML, so numbers stay numbers."
+        ),
+    )
     args = parser.parse_args()
 
     spec, watch_target = extract(args.channel_path.resolve())
+    spec = override_config(spec, args.set_config)
     args.out.write_text(yaml.safe_dump(spec, sort_keys=False))
     # Consumed by the calling shell script, which needs to know which file's
     # mtime to poll for edits — the inline channel.yaml, or the shared file

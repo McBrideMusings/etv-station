@@ -9,9 +9,10 @@
 #   ./tools/overlay-watch.sh 054-dragon-ball                    # bare name -> deploy/appdata/channels/<name>
 #   ./tools/overlay-watch.sh deploy/appdata/channels/054-dragon-ball
 #   ./tools/overlay-watch.sh examples/channels/diehard.yaml      # dev-side flat channel file
-#   TIME_SCALE=30 ./tools/overlay-watch.sh 010-pierce   # compress a 5-minute
-#                                                        # cycle into ~10s
+#   INTERVAL=4 ./tools/overlay-watch.sh 010-pierce       # cycle even tighter
+#   INTERVAL= ./tools/overlay-watch.sh 010-pierce        # the real on-air gap
 #   TITLE="Die Hard" ./tools/overlay-watch.sh 010-pierce
+#   BG=bg-checkerboard-20s.mp4 ./tools/overlay-watch.sh 036-the-academy  # alpha check
 #   BG=station-bumper-12s.mp4 ./tools/overlay-watch.sh 054-dragon-ball
 set -u
 
@@ -34,12 +35,25 @@ else
   CHANNEL_YAML="$CHANNEL_DIR"
 fi
 
-# Compressed by default: this is a test loop, not the on-air clock — nobody
-# wants to sit through a real 5-minute cycle to see whether a chyron slides
-# the right way. Production (`etv-overlay pipe`) never takes this flag.
-TIME_SCALE="${TIME_SCALE:-10}"
+# Real speed. The animation itself — a slide, a fade — is authored in seconds
+# and should be judged at the speed it will air at; what makes a preview
+# unwatchable is the multi-minute *gap between* cycles, and INTERVAL below
+# shortens that directly instead. Raising TIME_SCALE compresses the animation
+# and the gap together, so a legible 8-second hold becomes an 0.8-second
+# flash. Production (`etv-overlay pipe`) never takes this flag.
+TIME_SCALE="${TIME_SCALE:-1}"
+# Overrides `config.interval_secs` — the key both shipped animated scripts use
+# for "seconds from one cycle's start to the next" (title-chyron.rhai,
+# now-next-snipe.rhai). On air it is 300; at 12 the graphic is on screen
+# almost continuously, which is what makes it possible to actually look at.
+# INTERVAL= (empty) leaves the channel's own value alone.
+INTERVAL="${INTERVAL-12}"
 TITLE="${TITLE:-Preview Movie Title}"
-BG="${BG:-bg-checkerboard-20s.mp4}"
+# Solid black, so white text reads. The checkerboard is still here as
+# `BG=bg-checkerboard-20s.mp4` — it exists to prove the overlay's alpha is
+# actually transparent, which is a different question from whether the
+# graphic is legible, and it is terrible at the second job.
+BG="${BG:-bg-black-20s.mp4}"
 # Stand-in program metadata for a script that formats differently per item
 # kind (now-next-snipe.rhai). The defaults describe two films, because -1 is
 # "absent" and an absent season is exactly what marks an item as not an
@@ -72,37 +86,38 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+EXTRACT_ARGS=()
+if [ -n "$INTERVAL" ]; then
+  EXTRACT_ARGS+=(--set-config "interval_secs=$INTERVAL")
+fi
+
 printf '%s extracting overlay from %s...\n' "$(bold '==>')" "$CHANNEL_YAML"
-WATCH_TARGET="$(uv run tools/overlay-extract.py "$CHANNEL_DIR" --out "$SPEC_PATH")" || exit 1
+WATCH_TARGET="$(uv run tools/overlay-extract.py "$CHANNEL_DIR" --out "$SPEC_PATH" ${EXTRACT_ARGS[@]+"${EXTRACT_ARGS[@]}"})" || exit 1
 
 printf '%s building etv-overlay...\n' "$(bold '==>')"
 cargo build -q -p etv-overlay || exit 1
 
-# Only the inline case needs a re-extraction loop: the channel config carries
-# the spec inline, so an edit there changes the *decl*, not just a value
-# inside an already-standalone spec file. A `file:` reference already points
-# `etv-overlay watch` straight at the shared spec (see overlay-extract.py) —
-# that file's own mtime is what it polls, no relay needed. Compared by inode
-# (`-ef`), not path string, since CHANNEL_YAML may be relative and
-# WATCH_TARGET always comes back absolute.
-if [ "$WATCH_TARGET" -ef "$CHANNEL_YAML" ]; then
-  printf '%s watching %s for edits (inline overlay)\n' "$(bold '==>')" "$WATCH_TARGET"
-  (
-    LAST_MTIME=""
-    while true; do
-      MTIME=$(stat -f %m "$WATCH_TARGET" 2>/dev/null)
-      if [ "$MTIME" != "$LAST_MTIME" ]; then
-        LAST_MTIME="$MTIME"
-        uv run tools/overlay-extract.py "$CHANNEL_DIR" --out "$SPEC_PATH" >/dev/null 2>&1
-      fi
-      sleep 1
-    done
-  ) &
-  REEXTRACT_PID=$!
-else
-  printf '%s watching %s for edits (shared overlay file)\n' "$(bold '==>')" "$WATCH_TARGET"
-  SPEC_PATH="$WATCH_TARGET"
-fi
+# Always relay through a re-extracted copy, whether the channel carries its
+# overlay inline or points at a shared file with `file:`. Handing
+# `etv-overlay watch` the shared file directly used to be a shortcut for the
+# `file:` case, but it cannot coexist with --set-config: the retimed spec is
+# not what is on disk, so streaming the original would silently ignore the
+# override. WATCH_TARGET is whichever file a human actually edits; SPEC_PATH
+# is the derived copy the renderer polls.
+printf '%s watching %s for edits\n' "$(bold '==>')" "$WATCH_TARGET"
+(
+  LAST_MTIME=""
+  while true; do
+    MTIME=$(stat -f %m "$WATCH_TARGET" 2>/dev/null)
+    if [ "$MTIME" != "$LAST_MTIME" ]; then
+      LAST_MTIME="$MTIME"
+      uv run tools/overlay-extract.py "$CHANNEL_DIR" --out "$SPEC_PATH" \
+        ${EXTRACT_ARGS[@]+"${EXTRACT_ARGS[@]}"} >/dev/null 2>&1
+    fi
+    sleep 1
+  done
+) &
+REEXTRACT_PID=$!
 
 printf '%s streaming (time_scale=%s, title=%s) into VLC — Ctrl-C to stop\n' "$(bold '==>')" "$TIME_SCALE" "$TITLE"
 # The built binary directly, not `cargo run` — one less process in the way of
