@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_file};
 
@@ -25,13 +25,6 @@ pub const OVERLAY_WANTED_FILE_NAME: &str = ".overlay-wanted";
 /// its first frame. The channel worker waits for this before opening the fifo so
 /// the first read can't land mid-frame during overlay cold-start.
 pub const OVERLAY_READY_FILE_NAME: &str = ".overlay-ready";
-
-/// How long the channel worker waits for [`OVERLAY_READY_FILE_NAME`] before
-/// going ahead and opening the fifo anyway. On a cold start the marker cannot
-/// appear until a reader has attached (the producer writes its first frame,
-/// then touches the marker), so this wait routinely expires on the first item;
-/// [`OVERLAY_WRITER_TIMEOUT`] is what actually bounds the wait for a writer.
-pub const OVERLAY_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the channel worker holds the overlay fifo open waiting for the
 /// producer to attach and write its first frame. Must comfortably exceed the
@@ -85,19 +78,6 @@ pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io
     }
 
     Ok(())
-}
-
-pub async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if path.exists() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await
-    }
 }
 
 #[cfg(test)]

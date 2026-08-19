@@ -8,9 +8,8 @@ use std::time::Duration;
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, OVERLAY_READY_FILE_NAME, OVERLAY_READY_TIMEOUT, OVERLAY_WANTED_FILE_NAME,
-    OVERLAY_WRITER_POLL_INTERVAL, OVERLAY_WRITER_TIMEOUT, READY_FILE_NAME, empty_folder,
-    wait_for_file,
+    HEARTBEAT_FILE_NAME, OVERLAY_WANTED_FILE_NAME, OVERLAY_WRITER_POLL_INTERVAL,
+    OVERLAY_WRITER_TIMEOUT, READY_FILE_NAME, empty_folder,
 };
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
@@ -426,13 +425,19 @@ impl ChannelSession {
                 wanted.display()
             );
         }
-        let ready = playout_folder.join(OVERLAY_READY_FILE_NAME);
-        if !wait_for_file(&ready, OVERLAY_READY_TIMEOUT).await {
-            log::debug!(
-                "overlay-ready not observed within {OVERLAY_READY_TIMEOUT:?}; waiting for a fifo writer anyway"
-            );
-        }
-
+        // There used to be a bounded wait on `.overlay-ready` here before
+        // opening the fifo for reading. It could never succeed: the overlay
+        // only touches that marker after its own `open_for_writing()` call
+        // returns (crates/etv-overlay/src/bin/etv-overlay.rs), which is a
+        // POSIX fifo rendezvous that itself blocks until a reader attaches —
+        // and this process is that reader. Waiting on the marker before
+        // opening the read end was waiting on an effect of the read end
+        // opening. It always ran the full OVERLAY_READY_TIMEOUT (5s,
+        // confirmed against production: `overlay.spawn` -> `overlay.ready`
+        // landed at 5.00-5.01s on every sampled tune-in) and then proceeded
+        // regardless of whether the file had appeared — the wait's outcome
+        // never changed what happened next, so it bought nothing but delay.
+        // The fifo open below is the real, correctly-bounded rendezvous.
         let path = PathBuf::from(fifo_path);
         tokio::task::spawn_blocking(move || open_overlay_fifo(&path, OVERLAY_WRITER_TIMEOUT))
             .await
