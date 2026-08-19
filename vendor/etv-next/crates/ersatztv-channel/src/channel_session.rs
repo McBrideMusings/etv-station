@@ -53,8 +53,18 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// How far ahead of wall clock the session keeps its transcode. A player that
 /// tunes in has to be handed several segments at once or it has nothing to play,
-/// so ffmpeg reads this much at full speed before slowing to wall-clock speed.
-const TARGET_BUFFER: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 11);
+/// so ffmpeg reads this much unthrottled before slowing to wall-clock speed.
+///
+/// "Unthrottled" assumes the encode outruns wall clock; on GPU-bound hardware
+/// (deep seek + hwaccel decode + overlay composite) it may not, in which case
+/// this many seconds of buffer costs close to that many real seconds before the
+/// viewer gets anything — confirmed against a real tune-in via the
+/// `ffmpeg_progress` log target, which sat at ~1.0x for this exact pipeline
+/// shape rather than bursting. Kept one segment above [`REBURST_ARM_AT_LEAD`],
+/// same margin that constant keeps over [`REBURST_AT_LEAD`], so the buffer
+/// reliably arms the reburst check before this hardware's realtime deficit
+/// (see [`REBURST_AT_LEAD`]) drains it back down.
+const TARGET_BUFFER: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 7);
 
 /// Lead at which a still-playing item is restarted to rebuild its buffer.
 ///
