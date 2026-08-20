@@ -119,17 +119,64 @@ else
     log "WARNING: ETV_DIAG_DIR ($diag_dir) is not writable — no station/etv log capture, no soak probe"
 fi
 
-# Runs "$@" in the background, teeing its combined stdout+stderr to
-# $diag_dir/station-etv.log via process substitution — which, unlike piping
-# into `tee` directly, keeps $! pointing at "$@"'s own pid rather than tee's,
-# so station_pid/etv_pid tracking below is unaffected. Falls back to a plain
-# background start when diag_dir isn't writable.
+# How much ffmpeg-progress history to keep on disk, and how many rolled files.
+# ~150 bytes a line, one line per second per channel: at six channels that is
+# ~78MB/day, so the default keeps roughly a day and a half.
+PROGRESS_LOG_MAX_BYTES="${ETV_PROGRESS_LOG_MAX_BYTES:-67108864}"
+PROGRESS_LOG_KEEP="${ETV_PROGRESS_LOG_KEEP:-2}"
+
+# Runs "$@" in the background, splitting its combined stdout+stderr three ways
+# via process substitution — which, unlike piping into a command directly, keeps
+# $! pointing at "$@"'s own pid rather than the filter's, so station_pid/etv_pid
+# tracking below is unaffected. Falls back to a plain background start when
+# diag_dir isn't writable.
+#
+# ffmpeg_progress is split off from the Docker log driver deliberately. It logs
+# once per second per channel; at six channels that is ~21,600 lines an hour and
+# it had the container's log buffer down to ~2.8 hours of history even after
+# days of uptime — so the record of what led up to a freeze was routinely gone
+# before anyone looked. It is far too useful to switch off (it is the only thing
+# that distinguishes "ffmpeg stopped encoding" from "ffmpeg is encoding and the
+# output is not landing"), so it goes to its own rotated file instead of
+# competing with everything else for the buffer.
+#
+# Everything else still reaches both the Docker log and station-etv.log, which
+# soak-probe.sh greps.
+# The splitter only sorts lines; it never rotates. Rotation by size from inside
+# awk needs system() to interleave correctly with awk's own buffered writes, and
+# that differs between awk implementations — it rotated at 2x the limit when
+# tested. Size is handled by rotate_progress_log() on its own loop below, where
+# it is a plain stat-and-mv and cannot lose a line.
 run_logged() {
     if [ "$diag_ready" -eq 1 ]; then
-        "$@" > >(tee -a "$diag_dir/station-etv.log") 2>&1 &
+        "$@" > >(awk \
+            -v prog="$diag_dir/ffmpeg-progress.log" \
+            -v all="$diag_dir/station-etv.log" '
+            /ffmpeg_progress/ { print >> prog; fflush(prog); next }
+            { print >> all; fflush(all); print; fflush() }
+        ') 2>&1 &
     else
         "$@" &
     fi
+}
+
+# Keep $diag_dir/ffmpeg-progress.log bounded. Called on a slow loop, so a
+# rotation costs one stat and one rename and never blocks a writer.
+rotate_progress_log() {
+    local f="$diag_dir/ffmpeg-progress.log" size i
+    [ -f "$f" ] || return 0
+    size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null) || return 0
+    [ "${size:-0}" -ge "$PROGRESS_LOG_MAX_BYTES" ] || return 0
+    for (( i = PROGRESS_LOG_KEEP; i > 1; i-- )); do
+        mv -f "$f.$(( i - 1 ))" "$f.$i" 2>/dev/null
+    done
+    # Copy-then-truncate, NOT rename. The awk splitter holds this path open for
+    # the container's whole life; renaming it would leave awk appending to the
+    # rolled file forever and the live path would never come back. `print >> f`
+    # opens with O_APPEND, so a truncate makes the next write land at offset 0
+    # instead of leaving a sparse hole.
+    cp -f "$f" "$f.1" 2>/dev/null && : > "$f"
+    log "rotated ffmpeg-progress.log at ${size} bytes (keeping $PROGRESS_LOG_KEEP)"
 }
 
 # These used to be two scripts copied onto the Unraid host by hand and started
@@ -160,6 +207,42 @@ if [ -n "${ETV_DIAG_CAPTURE:-}" ] \
     else
         log "WARNING: ETV_DIAG_CAPTURE is set but $diag_dir is not writable — no capture"
     fi
+fi
+
+# The freeze capture is NOT behind ETV_DIAG_CAPTURE. A freeze is unannounced and
+# rare — one every ~14 minutes across six channels at the worst observed rate,
+# and none at all for hours before that — so a capture that is only on when
+# somebody remembered to turn it on is a capture that is off when it matters.
+# It costs one `ls` per channel per second and writes only when a channel has
+# already stopped producing segments.
+#
+# Watches every channel itself, so adding a channel arms nothing and removing
+# one cleans up nothing. Same non-fatal shape as the diagnostics above: its pid
+# goes in diag_pids so shutdown() reaps it, and it is never fed to the
+# `wait -n` recognized set, so if it dies the stream is unaffected.
+if [ "$diag_ready" -eq 1 ]; then
+    (
+        while true; do
+            ETV_DIAG_DIR="$diag_dir" ETV_HLS_OUTPUT="${ETV_HLS_OUTPUT:-/data/hls}" \
+                /usr/local/bin/two-clock-capture.sh || true
+            # Only reached if the watcher exits, which it should not. Restart it
+            # rather than silently losing capture for the container's lifetime.
+            log "WARNING: two-clock capture exited; restarting in 5s"
+            sleep 5
+        done
+    ) &
+    diag_pids+=($!)
+    log "two-clock freeze capture started (evidence in $diag_dir/two-clock.log)"
+
+    # Keep the split-off progress log bounded. Slow loop: the file only needs
+    # checking often enough that it cannot overshoot badly between looks.
+    (
+        while true; do
+            rotate_progress_log || true
+            sleep "${ETV_PROGRESS_ROTATE_INTERVAL_SECS:-60}"
+        done
+    ) &
+    diag_pids+=($!)
 fi
 
 # 3. The daemon.

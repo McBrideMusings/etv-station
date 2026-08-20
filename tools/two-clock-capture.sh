@@ -1,10 +1,10 @@
 #!/bin/bash
-# Catch a channel freeze in the act and record which side stopped first.
+# Record which side stopped first when a channel freezes.
 #
 # The freeze signature is symmetric from outside: ffmpeg's out_time stops
 # advancing and nothing is logged. "The overlay stopped writing, starving
 # ffmpeg" and "ffmpeg stopped reading, blocking the overlay" look identical.
-# This reads both clocks at the same instant and records the one fact that
+# This reads both clocks at the same instant and records the fact that
 # separates them.
 #
 # Clock 1 -- ffmpeg: the newest HLS segment index for the channel. It advances
@@ -13,118 +13,51 @@
 #            watchdog in crates/etv-overlay/src/phase_watchdog.rs, naming the
 #            phase the frame loop is in and how long it has been there.
 #
-# The discriminator is the kernel wait channel of each process, sampled while
-# both are wedged:
+# The discriminator is each process's kernel wait channel, sampled together
+# with a frames_written delta:
 #
-#   overlay in pipe_write, frames FROZEN               -> ffmpeg stopped first;
-#                                                        the overlay is blocked
-#                                                        writing to a reader that
-#                                                        is not draining.
+#   overlay in pipe_write, frames FROZEN -> ffmpeg stopped first; the overlay is
+#                                           blocked writing to a reader that is
+#                                           not draining.
+#   ffmpeg in pipe_read, overlay feeding -> ffmpeg is not consuming what it is
+#                                           given.
+#   frames still advancing               -> the overlay is not the stalled side;
+#                                           look downstream (input file reads).
 #
 # `pipe_write` on its own proves nothing: one 1280x720 rgba frame is 3.5MB
 # against a 64KB pipe buffer, so a HEALTHY overlay is inside write_all almost
 # all the time. Measured healthy phase_age_ms is 16-241ms. The evidence is
-# frames_written standing still across two heartbeat samples, not the wchan.
-#   ffmpeg  in pipe_read   + overlay elsewhere        -> the overlay stopped
-#                                                        first; ffmpeg is starving
-#                                                        on the fifo. The overlay
-#                                                        heartbeat names the phase.
-#   both in pipe_*                                    -> record it; that is a
-#                                                        genuine mutual block and
-#                                                        the interesting case.
+# frames_written standing still across two samples, not the wchan.
 #
-# Runs ON the Unraid host (needs /proc for both processes and the appdata mount).
+# RUNS INSIDE THE CONTAINER, started by docker/entrypoint.sh. It watches every
+# channel that has an HLS folder, so there is nothing to arm and nothing to
+# re-arm: it comes back with the container, exactly like stream-access-log.py
+# and stream-watch.py beside it. An earlier version ran on the Unraid host and
+# had to be started by hand over ssh -- the same arrangement the comment above
+# those two records having already thrown away, because it died at every
+# restart and was off whenever something finally went wrong.
 #
-#   ./two-clock-capture.sh <etv-next-channel-id> [--gap N] [--rounds N]
+#   two-clock-capture.sh              # watch every channel, forever
+#   two-clock-capture.sh --self-test  # exercise the verdict logic, no host needed
 #
-# Channel id is ETV-next's, not the station's folder number: 032-action is 10.
-# Find it in `curl -s localhost:$ETV_PORT_HOST/channels.m3u`.
+# Env: ETV_HLS_OUTPUT (default /data/hls), ETV_DIAG_DIR (default /data/diag),
+#      ETV_TWO_CLOCK_GAP (default 12 seconds).
 
 set -u
 
-SELF_TEST=0
-[ "${1:-}" = "--self-test" ] && SELF_TEST=1
-
-CHANNEL="${1:-}"
-if [ "$SELF_TEST" -eq 0 ] && { [ -z "$CHANNEL" ] || [ "${CHANNEL#-}" != "$CHANNEL" ]; }; then
-    echo "usage: $0 <etv-next-channel-id> [--gap N] [--rounds N]" >&2
-    echo "       $0 --self-test    # exercise the verdict logic, no host needed" >&2
-    exit 2
-fi
-shift
-
-GAP_TRIGGER=12      # seconds without a new segment before we call it a freeze
-ROUNDS=0            # 0 = run until killed
+HLS_ROOT="${ETV_HLS_OUTPUT:-/data/hls}"
+DIAG="${ETV_DIAG_DIR:-/data/diag}"
+GAP_TRIGGER="${ETV_TWO_CLOCK_GAP:-12}"
 POLL=1
-CAPTURE_EVERY=5     # re-sample this often while still inside a freeze
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --gap) GAP_TRIGGER="$2"; shift 2 ;;
-        --rounds) ROUNDS="$2"; shift 2 ;;
-        *) echo "unknown arg: $1" >&2; exit 2 ;;
-    esac
-done
-
-[ "$SELF_TEST" -eq 1 ] && APPDATA="${ETV_APPDATA:-/tmp}"
-APPDATA="${APPDATA:-${ETV_APPDATA:-/mnt/user/appdata/etv-station}}"
-HLS="$APPDATA/data/hls/$CHANNEL"
-DIAG="$APPDATA/data/diag"
-LOG="$DIAG/two-clock-$CHANNEL.log"
-CONTAINER="${ETV_CONTAINER:-etv-station}"
-
-mkdir -p "$DIAG"
+CAPTURE_EVERY=30      # re-sample this often while a channel stays frozen
+LOG="$DIAG/two-clock.log"
 
 log() { printf '%s %s\n' "$(date -u +%FT%T.%3NZ)" "$*" >> "$LOG"; }
 
-# ------------------------------------------------------------------ procs ----
-# Both processes live inside the container, but their /proc entries are visible
-# from the host under the host pid namespace, which is what lets us read wchan
-# while they are blocked. Match on the fifo/output path so we get THIS channel.
-find_ffmpeg_pid() {
-    pgrep -f "hls/$CHANNEL" 2>/dev/null | while read -r p; do
-        tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q '^ffmpeg' && echo "$p"
-    done | head -1
-}
-
-find_overlay_pid() {
-    pgrep -f "etv-overlay" 2>/dev/null | while read -r p; do
-        tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "playout/.*/overlay.fifo" && {
-            # The overlay is named by station folder, not channel id, so resolve
-            # it through the fifo path recorded in the ffmpeg argv.
-            echo "$p"
-        }
-    done
-}
-
-# The station folder this channel's ffmpeg is actually reading its overlay from.
-overlay_pid_for_channel() {
-    local fpid="$1"
-    local fifo
-    fifo=$(tr '\0' '\n' < "/proc/$fpid/cmdline" 2>/dev/null | grep -m1 'overlay.fifo')
-    [ -z "$fifo" ] && { find_overlay_pid | head -1; return; }
-    local dir
-    dir=$(dirname "$fifo")
-    find_overlay_pid | while read -r p; do
-        tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -q "^$dir/overlay.fifo$" && echo "$p"
-    done | head -1
-}
-
-newest_segment_index() {
-    ls "$HLS" 2>/dev/null | grep -oE '^live[0-9]+\.ts$' | sed 's/[^0-9]//g' \
-        | sed 's/^0*//' | sort -n | tail -1
-}
-
-proc_field() {
-    local pid="$1" file="$2"
-    cat "/proc/$pid/$file" 2>/dev/null | head -1
-}
-
 # ---------------------------------------------------------------- verdict ----
-# Pure: kernel wait channel of each process in, one verdict line out. Kept
-# separate from capture() so it can be exercised without a freeze, a container,
-# or a Linux /proc -- see --self-test.
-# verdict <overlay_wchan> <ffmpeg_wchan> <frames_advanced:yes|no|unknown>
+# Pure: wait channels + whether the overlay produced frames between samples.
+# Kept separate from capture() so it can be exercised without a freeze, a
+# container, or a Linux /proc -- see --self-test.
 verdict() {
     local ow="$1" fw="$2" advanced="${3:-unknown}"
 
@@ -166,114 +99,151 @@ self_test() {
     echo "verdict self-test:"
     # The load-bearing case: pipe_write while frames STILL ADVANCE is healthy,
     # and must never be reported as a stall.
-    check "pipe_write" "do_sys_poll" "yes"  "overlay-alive"                  "healthy overlay resting in pipe_write"
-    check "pipe_write" "pipe_read"   "yes"  "overlay-alive-ffmpeg-starving"  "overlay feeding, ffmpeg not consuming"
-    check "pipe_write" "do_sys_poll" "no"   "ffmpeg-stopped-first"           "overlay frames frozen in pipe_write"
-    check "pipe_write" "pipe_read"   "no"   "mutual-pipe-block"              "both wedged on the fifo"
-    check "futex_wait" "pipe_read"   "no"   "overlay-stopped-first"          "overlay frozen off-pipe, ffmpeg starving"
-    check "do_sys_poll" "pipe_read"  "no"   "overlay-stopped-first"          "overlay frozen polling, ffmpeg starving"
-    check "futex_wait" "futex_wait"  "unknown" "inconclusive"                "neither on a pipe, no frame delta"
-    check "" ""                      "unknown" "inconclusive"                "no processes found"
+    check "pipe_write"  "do_sys_poll" "yes"     "overlay-alive"                  "healthy overlay resting in pipe_write"
+    check "pipe_write"  "pipe_read"   "yes"     "overlay-alive-ffmpeg-starving"  "overlay feeding, ffmpeg not consuming"
+    check "pipe_write"  "do_sys_poll" "no"      "ffmpeg-stopped-first"           "overlay frames frozen in pipe_write"
+    check "pipe_write"  "pipe_read"   "no"      "mutual-pipe-block"              "both wedged on the fifo"
+    check "futex_wait"  "pipe_read"   "no"      "overlay-stopped-first"          "overlay frozen off-pipe, ffmpeg starving"
+    check "do_sys_poll" "pipe_read"   "no"      "overlay-stopped-first"          "overlay frozen polling, ffmpeg starving"
+    check "futex_wait"  "futex_wait"  "unknown" "inconclusive"                   "neither on a pipe, no frame delta"
+    check ""            ""            "unknown" "inconclusive"                   "no processes found"
     if [ "$fails" -eq 0 ]; then echo "verdict self-test: PASS"; return 0; fi
     echo "verdict self-test: $fails FAILED"; return 1
 }
 
+[ "${1:-}" = "--self-test" ] && { self_test; exit $?; }
+
+mkdir -p "$DIAG" 2>/dev/null
+
+# ------------------------------------------------------------------ procs ----
+# Everything here is a sibling process in this container, so /proc is directly
+# readable -- no docker exec, no ssh, no host pid namespace.
+ffmpeg_pid_for() {
+    local ch="$1" p args
+    for p in /proc/[0-9]*; do
+        [ -r "$p/cmdline" ] || continue
+        args=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+        case "$args" in
+            ffmpeg\ *"/hls/$ch/"*) basename "$p"; return ;;
+        esac
+    done
+}
+
+# The overlay fifo this channel's ffmpeg is reading from, resolved through the
+# argv rather than assumed: the overlay is named by station folder while the
+# channel is named by id.
+overlay_fifo_for() {
+    local fpid="$1"
+    tr '\0' '\n' < "/proc/$fpid/cmdline" 2>/dev/null | grep -m1 'overlay\.fifo'
+}
+
+overlay_pid_for_fifo() {
+    local fifo="$1" p args
+    [ -n "$fifo" ] || return
+    for p in /proc/[0-9]*; do
+        [ -r "$p/cmdline" ] || continue
+        args=$(tr '\0' '\n' < "$p/cmdline" 2>/dev/null) || continue
+        case "$args" in
+            *etv-overlay*) printf '%s\n' "$args" | grep -qxF "$fifo" && { basename "$p"; return; } ;;
+        esac
+    done
+}
+
+newest_segment_index() {
+    local ch="$1"
+    ls "$HLS_ROOT/$ch" 2>/dev/null | sed -n 's/^live0*\([0-9][0-9]*\)\.ts$/\1/p' \
+        | sort -n | tail -1
+}
+
+proc_field() {
+    local pid="$1" file="$2"
+    [ -n "$pid" ] || return
+    head -1 "/proc/$pid/$file" 2>/dev/null
+}
+
+frames_from() { printf '%s' "$1" | sed -n 's/.*"frames_written":\([0-9]*\).*/\1/p'; }
+
 # ---------------------------------------------------------------- capture ----
 capture() {
-    local why="$1"
-    local fpid opid
-    fpid=$(find_ffmpeg_pid)
-    opid=""
-    [ -n "$fpid" ] && opid=$(overlay_pid_for_channel "$fpid")
+    local ch="$1" why="$2"
+    local fpid opid fifo hb hb1 hb2 f1 f2 advanced=unknown ow fw
 
-    log "==== CAPTURE ($why) channel=$CHANNEL ffmpeg_pid=${fpid:-none} overlay_pid=${opid:-none}"
+    fpid=$(ffmpeg_pid_for "$ch")
+    fifo=""; opid=""
+    if [ -n "$fpid" ]; then
+        fifo=$(overlay_fifo_for "$fpid")
+        opid=$(overlay_pid_for_fifo "$fifo")
+    fi
 
-    # Clock 1 -- ffmpeg
-    log "  clock1.ffmpeg newest_segment=$(newest_segment_index) hls_dir=$HLS"
+    log "==== CAPTURE ($why) channel=$ch ffmpeg_pid=${fpid:-none} overlay_pid=${opid:-none}"
+    log "  clock1.ffmpeg newest_segment=$(newest_segment_index "$ch") dir=$HLS_ROOT/$ch"
     if [ -n "$fpid" ]; then
         log "  clock1.ffmpeg wchan=$(proc_field "$fpid" wchan) state=$(awk '{print $3}' "/proc/$fpid/stat" 2>/dev/null) syscall=$(proc_field "$fpid" syscall)"
-        log "  clock1.ffmpeg utime_ticks=$(awk '{print $14}' "/proc/$fpid/stat" 2>/dev/null)"
     else
         log "  clock1.ffmpeg NO PROCESS -- session already torn down"
     fi
 
-    # Clock 2 -- overlay. Sampled TWICE so we get a frames_written delta: a
-    # single sample cannot tell a healthy overlay resting in write_all from one
-    # wedged there, because both look identical in wchan.
-    local advanced=unknown
-    if [ -n "$opid" ]; then
-        local fifo hb hb1 hb2 f1 f2
-        fifo=$(tr '\0' '\n' < "/proc/$opid/cmdline" 2>/dev/null | grep -m1 'overlay.fifo')
+    # Clock 2 is sampled TWICE: a single sample cannot tell a healthy overlay
+    # resting in write_all from one wedged there.
+    if [ -n "$opid" ] && [ -n "$fifo" ]; then
         hb="$(dirname "$fifo")/overlay.heartbeat"
         hb1=$(cat "$hb" 2>/dev/null)
         log "  clock2.overlay wchan=$(proc_field "$opid" wchan) state=$(awk '{print $3}' "/proc/$opid/stat" 2>/dev/null) syscall=$(proc_field "$opid" syscall)"
-        log "  clock2.overlay heartbeat.t0=${hb1:-<missing -- build predates the phase watchdog>}"
+        log "  clock2.overlay heartbeat.t0=${hb1:-<missing>}"
         sleep 2
         hb2=$(cat "$hb" 2>/dev/null)
         log "  clock2.overlay heartbeat.t1=${hb2:-<missing>}"
-        f1=$(printf '%s' "$hb1" | sed -n 's/.*"frames_written":\([0-9]*\).*/\1/p')
-        f2=$(printf '%s' "$hb2" | sed -n 's/.*"frames_written":\([0-9]*\).*/\1/p')
+        f1=$(frames_from "$hb1"); f2=$(frames_from "$hb2")
         if [ -n "$f1" ] && [ -n "$f2" ]; then
             if [ "$f2" -gt "$f1" ]; then advanced=yes; else advanced=no; fi
             log "  clock2.overlay frames_written $f1 -> $f2 over 2s (advanced=$advanced)"
         else
             log "  clock2.overlay frames_written unreadable; verdict will be inconclusive"
         fi
-        log "  clock2.overlay utime_ticks=$(awk '{print $14}' "/proc/$opid/stat" 2>/dev/null)"
     else
-        log "  clock2.overlay NO PROCESS"
+        log "  clock2.overlay NO PROCESS (fifo='${fifo:-none}') -- channel may have no overlay configured"
     fi
 
-    # ---- the verdict ----
-    local ow fw
-    ow=$(proc_field "${opid:-0}" wchan)
-    fw=$(proc_field "${fpid:-0}" wchan)
+    ow=$(proc_field "$opid" wchan); fw=$(proc_field "$fpid" wchan)
     log "  $(verdict "$ow" "$fw" "$advanced")"
-
-    # Recent container log for this channel, for the timeline around the freeze.
-    docker logs --since 3m "$CONTAINER" 2>&1 \
-        | grep -E "channel $CHANNEL |overlay.phase_stall" \
-        | grep -v ffmpeg_progress | tail -15 \
-        | sed 's/^/  ctx /' >> "$LOG" 2>/dev/null
 }
 
-if [ "$SELF_TEST" -eq 1 ]; then self_test; exit $?; fi
+# ------------------------------------------------------------------- loop ----
+log "two-clock capture started (watching $HLS_ROOT/*, gap_trigger=${GAP_TRIGGER}s)"
 
-log "two-clock capture armed: channel=$CHANNEL gap_trigger=${GAP_TRIGGER}s log=$LOG"
-echo "armed; watching channel $CHANNEL -- results land in $LOG"
-
-last_idx=$(newest_segment_index)
-last_change=$(date +%s)
-in_gap=0
-rounds_done=0
-last_capture=0
+declare -A last_idx last_change in_gap last_capture
 
 while true; do
-    sleep "$POLL"
-    idx=$(newest_segment_index)
     now=$(date +%s)
+    for dir in "$HLS_ROOT"/*/; do
+        [ -d "$dir" ] || continue
+        ch=$(basename "$dir")
+        case "$ch" in ''|*[!0-9]*) continue ;; esac   # numeric channel dirs only
 
-    if [ "${idx:-}" != "${last_idx:-}" ]; then
-        if [ "$in_gap" -eq 1 ]; then
-            log "RECOVERED after $(( now - last_change ))s; segment index $last_idx -> $idx"
-            in_gap=0
-            rounds_done=$(( rounds_done + 1 ))
-            [ "$ROUNDS" -gt 0 ] && [ "$rounds_done" -ge "$ROUNDS" ] && { log "done"; exit 0; }
-        fi
-        last_idx="$idx"
-        last_change="$now"
-        continue
-    fi
+        idx=$(newest_segment_index "$ch")
+        [ -n "$idx" ] || continue                      # nothing served yet
 
-    gap=$(( now - last_change ))
-    if [ "$gap" -ge "$GAP_TRIGGER" ]; then
-        if [ "$in_gap" -eq 0 ]; then
-            in_gap=1
-            last_capture="$now"
-            capture "gap=${gap}s first"
-        elif [ $(( now - last_capture )) -ge "$CAPTURE_EVERY" ]; then
-            last_capture="$now"
-            capture "gap=${gap}s ongoing"
+        if [ "${last_idx[$ch]:-}" != "$idx" ]; then
+            if [ "${in_gap[$ch]:-0}" -eq 1 ]; then
+                log "RECOVERED channel=$ch after $(( now - ${last_change[$ch]} ))s; segment ${last_idx[$ch]} -> $idx"
+                in_gap[$ch]=0
+            fi
+            last_idx[$ch]="$idx"
+            last_change[$ch]="$now"
+            continue
         fi
-    fi
+
+        gap=$(( now - ${last_change[$ch]:-$now} ))
+        if [ "$gap" -ge "$GAP_TRIGGER" ]; then
+            if [ "${in_gap[$ch]:-0}" -eq 0 ]; then
+                in_gap[$ch]=1
+                last_capture[$ch]="$now"
+                capture "$ch" "gap=${gap}s first"
+            elif [ $(( now - ${last_capture[$ch]:-0} )) -ge "$CAPTURE_EVERY" ]; then
+                last_capture[$ch]="$now"
+                capture "$ch" "gap=${gap}s ongoing"
+            fi
+        fi
+    done
+    sleep "$POLL"
 done
