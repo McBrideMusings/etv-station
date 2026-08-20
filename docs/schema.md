@@ -22,6 +22,30 @@ page shows every example in **YAML**, the format the project standardizes on.
 | `channels/*.yaml` | playout window + rule that composes blocks |
 | `blocks/*.yaml` | `program` defaults + `entries` list |
 
+### Unknown keys
+
+An unrecognised key is **ignored, not refused** — the config still loads and
+the file parses as though the key did not exist.
+
+Each unrecognised path is logged once per file at WARN with
+`event = "config.unknown_keys"`, fields `path = <config file>` and
+`keys = <comma-joined dotted paths>`. The paths come from `serde_ignored`, so
+they track the structs and cannot drift.
+
+**Why the strictness was traded away:** Config lives in a bind-mounted volume
+that outlives the container while the parser ships inside the image, so
+rolling the image back across a config-schema addition put a newer config in
+front of an older parser. A field like `attribution: true` (added to the schema
+after a deployment) would crashloop an older image 11 times on every start.
+`deny_unknown_fields` made the rollback path useless exactly when it was
+reached for — the scenario that should be the safest was the worst failure mode.
+
+**What it costs and where to look:** A misspelling (`selekt: random` instead
+of `select: random`) reads as the field being unset, so the pool silently takes
+the `round_robin` default and airs something wrong without saying why. When a
+channel does not behave as written, grep the station log for
+`config.unknown_keys` — the warning names the file and the unrecognised keys.
+
 ## Block file
 
 The unit of reuse. A block file is program defaults + a duplicates policy + a
@@ -347,7 +371,7 @@ mode:
 ### Filter
 
 Narrow the resolved item list. Source: `config/filter.rs`. Unknown fields are
-rejected.
+ignored and warned about; see [Unknown keys](#unknown-keys).
 
 | Field | Type |
 |---|---|
@@ -502,7 +526,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 Each entry under `rule.blocks` is a **block include** (`config/rule.rs`,
 `BlockInclude`). It either **references a block file** or **inlines the block
 body**, and carries the composition fields `mode` / `order` / `filter`. Unknown
-fields are rejected.
+fields are ignored and warned about; see [Unknown keys](#unknown-keys).
 
 **Reference form** — body lives in a separate file:
 
