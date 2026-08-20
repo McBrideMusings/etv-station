@@ -30,12 +30,19 @@ tree gets its own documented commands: the vendored one adds `--locked`, taken
 from `vendor/etv-next/CLAUDE.md`. Every selected check runs in both trees even
 after one fails, then the summary names which failed and the exit status is 1.
 
-Green baseline (2026-08-20): parent 824 tests, `vendor/etv-next` 148 tests
+Green baseline (2026-08-20): parent 832 tests, `vendor/etv-next` 148 tests
 (404 ignored), clippy and fmt clean in both.
 
 `crates/etv-overlay/tests/watch_teardown.rs:106` ("sanity: ffmpeg child should be
 running") has an unguarded race, tracked as **#322**. If only that fails, re-run
 it; do not chase it.
+
+`determinism::tests::a_plugin_reading_wall_clock_time_is_caught`
+(`crates/etv-station/src/determinism.rs:718`) is flaky the same way: the fixture
+reads Rhai's own wall clock, and when both passes land inside the same tick the
+two schedules match and the test panics with "the two passes matched". Observed
+2026-08-20 passing and failing on back-to-back runs of the identical tree. Re-run
+it; if it is the only failure, the tree is green.
 
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
