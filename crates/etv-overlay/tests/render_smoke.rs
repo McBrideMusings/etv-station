@@ -61,6 +61,57 @@ fn renders_watermark_with_visible_box() {
     );
 }
 
+/// A logo pointing at a file that cannot be decoded as a PNG must not fail
+/// `render_frame` — the frame still comes out, and every other layer
+/// (a sibling watermark here) still draws. Losing the logo is cosmetic;
+/// losing the whole frame would starve the channel's HLS fifo of a writer
+/// and black out the channel (#302).
+#[test]
+fn an_undecodable_logo_drops_only_its_layer() {
+    let mut renderer = match VelloRenderer::new(320, 240, PixelFormat::Rgba8) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: no GPU available ({e})");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let bad_logo = dir.path().join("not_a_png.png");
+    std::fs::write(&bad_logo, b"this is not a png file").unwrap();
+
+    let state = OverlayState::from_layers(vec![
+        OverlayKind::Logo {
+            path: bad_logo,
+            corner: Corner::TopLeft,
+            margin: 10,
+            height: 40,
+        },
+        OverlayKind::Watermark {
+            corner: Corner::TopRight,
+            margin: 20,
+            box_size: 80,
+            color: [200, 30, 30, 255],
+        },
+    ]);
+
+    let frame = renderer
+        .render_frame(&state)
+        .expect("an undecodable logo must not fail the whole render");
+    assert_eq!(frame.len(), 320 * 240 * 4);
+
+    // The sibling watermark still drew: top-right box spans x in [220, 300],
+    // y in [20, 100] — the bad logo cost only its own layer.
+    let x = 260usize;
+    let y = 60usize;
+    let idx = (y * 320 + x) * 4;
+    assert!(
+        frame[idx + 3] > 100,
+        "watermark should still render even though the logo failed to decode, got alpha={}",
+        frame[idx + 3]
+    );
+}
+
 /// A config value reaches the rendered pixels, not merely the script's scope
 /// (#125). One script, one layer set, two configs naming different corners —
 /// the watermark lands in a different place on the frame each time.

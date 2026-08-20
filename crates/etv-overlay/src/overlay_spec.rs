@@ -113,9 +113,11 @@ pub enum OverlayKind {
     },
     /// Drop a PNG into one of the four corners (e.g. a TV channel logo).
     /// Aspect ratio is preserved; `height` controls the rendered height in
-    /// pixels and width is derived from the image's aspect. Source must be an
-    /// 8-bit RGB or RGBA PNG; other formats (16-bit, palette) are rejected at
-    /// decode time.
+    /// pixels and width is derived from the image's aspect. Grayscale,
+    /// grayscale+alpha, palette, and 16-bit PNGs are normalized to 8-bit
+    /// RGB/RGBA at decode time; a source that still cannot be decoded (a
+    /// genuinely corrupt file, or a missing path) drops just this layer —
+    /// logged once — rather than failing the whole render (#302).
     Logo {
         path: PathBuf,
         corner: Corner,

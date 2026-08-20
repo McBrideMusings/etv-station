@@ -67,10 +67,16 @@ pub struct VelloRenderer {
     height: u32,
     padded_bytes_per_row: u32,
     unpadded_bytes_per_row: u32,
-    image_cache: HashMap<PathBuf, PenikoImage>,
+    // `None` caches a decode failure so a logo that keeps failing every frame
+    // (missing file, unsupported format) is only ever opened and decoded once
+    // per process, not 30x/sec. Fixing the file in place doesn't clear this
+    // cache — the overlay process needs a restart to pick it up, which the
+    // supervisor already does on config reload.
+    image_cache: HashMap<PathBuf, Option<PenikoImage>>,
     font_context: FontContext,
     layout_context: LayoutContext<()>,
     warned_missing_glyphs: HashSet<String>,
+    warned_bad_images: HashSet<PathBuf>,
 }
 
 impl VelloRenderer {
@@ -160,6 +166,7 @@ impl VelloRenderer {
             font_context,
             layout_context: LayoutContext::new(),
             warned_missing_glyphs: HashSet::new(),
+            warned_bad_images: HashSet::new(),
         })
     }
 
@@ -284,7 +291,14 @@ impl VelloRenderer {
                 margin,
                 height: logo_height,
             } => {
-                let image = self.load_or_get_image(path)?.clone();
+                // A logo that cannot be decoded drops just this layer instead
+                // of taking the whole render down: every other layer still
+                // draws, render_frame still returns a full frame, and the
+                // fifo keeps a writer (#302).
+                let Some(image) = self.load_or_get_image(path) else {
+                    return Ok(());
+                };
+                let image = image.clone();
                 let aspect = image.image.width as f64 / image.image.height as f64;
                 let h = *logo_height as f64;
                 let w = h * aspect;
@@ -416,12 +430,33 @@ impl VelloRenderer {
         }
     }
 
-    fn load_or_get_image(&mut self, path: &Path) -> anyhow::Result<&PenikoImage> {
+    /// Infallible: a PNG that cannot be decoded is not a render failure, only
+    /// a missing layer. Logs once per path (not once per frame) and caches
+    /// the negative result so a persistently bad logo is opened and decoded
+    /// exactly once, not on every frame.
+    fn load_or_get_image(&mut self, path: &Path) -> Option<&PenikoImage> {
         use std::collections::hash_map::Entry;
-        match self.image_cache.entry(path.to_path_buf()) {
-            Entry::Occupied(e) => Ok(e.into_mut()),
-            Entry::Vacant(e) => Ok(e.insert(decode_png(path)?)),
-        }
+        let warned = &mut self.warned_bad_images;
+        let slot = match self.image_cache.entry(path.to_path_buf()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let decoded = match decode_png(path) {
+                    Ok(image) => Some(image),
+                    Err(err) => {
+                        if warned.insert(path.to_path_buf()) {
+                            tracing::error!(
+                                path = %path.display(),
+                                error = %err,
+                                "logo image could not be decoded; dropping this layer and continuing to render",
+                            );
+                        }
+                        None
+                    }
+                };
+                e.insert(decoded)
+            }
+        };
+        slot.as_ref()
     }
 
     fn copy_target_to_buffer(&self) {
@@ -524,23 +559,35 @@ fn corner_origin_f64(
 fn decode_png(path: &Path) -> anyhow::Result<PenikoImage> {
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("open logo {}: {e}", path.display()))?;
-    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    // Folds 16-bit -> 8-bit, sub-8-bit -> 8-bit, Indexed -> Rgb/Rgba, and
+    // Grayscale+tRNS -> GrayscaleAlpha at read time. It does NOT fold
+    // Grayscale/8 or GrayscaleAlpha/8 into RGB — those are handled below by
+    // matching on the decoded OutputInfo, not the on-disk color type. Must be
+    // set before read_info(); setting it on the Reader afterwards has no
+    // effect on the already-computed output buffer size.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder
         .read_info()
         .map_err(|e| anyhow::anyhow!("read png info {}: {e}", path.display()))?;
-    let info = reader.info().clone();
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let frame_info = reader
         .next_frame(&mut buf)
         .map_err(|e| anyhow::anyhow!("decode png {}: {e}", path.display()))?;
     buf.truncate(frame_info.buffer_size());
 
-    let rgba = match (info.color_type, info.bit_depth) {
+    // Match on `frame_info` (the OutputInfo from `next_frame`), not
+    // `reader.info()` — the latter still reports the file's on-disk format
+    // after a transformation, which would silently mis-expand a normalized
+    // buffer.
+    let rgba = match (frame_info.color_type, frame_info.bit_depth) {
         (png::ColorType::Rgba, png::BitDepth::Eight) => buf,
         (png::ColorType::Rgb, png::BitDepth::Eight) => expand_rgb_to_rgba(&buf),
+        (png::ColorType::Grayscale, png::BitDepth::Eight) => expand_gray_to_rgba(&buf),
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => expand_gray_alpha_to_rgba(&buf),
         (ct, bd) => {
             anyhow::bail!(
-                "unsupported PNG format ({ct:?}/{bd:?}) in {}; convert to 8-bit RGBA first",
+                "unsupported PNG format ({ct:?}/{bd:?}) in {} after normalization",
                 path.display()
             );
         }
@@ -550,8 +597,8 @@ fn decode_png(path: &Path) -> anyhow::Result<PenikoImage> {
         data: Blob::from(rgba),
         format: ImageFormat::Rgba8,
         alpha_type: ImageAlphaType::Alpha,
-        width: info.width,
-        height: info.height,
+        width: frame_info.width,
+        height: frame_info.height,
     }))
 }
 
@@ -560,6 +607,23 @@ fn expand_rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     for chunk in rgb.chunks_exact(3) {
         out.extend_from_slice(chunk);
         out.push(255);
+    }
+    out
+}
+
+fn expand_gray_to_rgba(gray: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(gray.len() * 4);
+    for &sample in gray {
+        out.extend_from_slice(&[sample, sample, sample, 255]);
+    }
+    out
+}
+
+fn expand_gray_alpha_to_rgba(gray_alpha: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(gray_alpha.len() * 2);
+    for chunk in gray_alpha.chunks_exact(2) {
+        let (sample, alpha) = (chunk[0], chunk[1]);
+        out.extend_from_slice(&[sample, sample, sample, alpha]);
     }
     out
 }
@@ -669,5 +733,120 @@ mod tests {
         let (x, y) = corner_origin(Corner::BottomLeft, 24, 100, 1280, 720);
         assert_eq!(x, 24);
         assert_eq!(y, 720 - 24 - 100);
+    }
+
+    /// Writes a small PNG with the given color type/depth using the `png`
+    /// crate's own encoder, so these tests exercise `decode_png` against a
+    /// real file rather than a hand-built byte string.
+    fn write_png(
+        dir: &std::path::Path,
+        name: &str,
+        color_type: png::ColorType,
+        bit_depth: png::BitDepth,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> PathBuf {
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(color_type);
+        encoder.set_depth(bit_depth);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(data).unwrap();
+        path
+    }
+
+    #[test]
+    fn decode_png_expands_grayscale_eight() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2x1, mid-grey (128) then white (255).
+        let path = write_png(
+            dir.path(),
+            "gray.png",
+            png::ColorType::Grayscale,
+            png::BitDepth::Eight,
+            2,
+            1,
+            &[128, 255],
+        );
+        let image = decode_png(&path).expect("grayscale/8 should decode");
+        let data = image.image.data.data();
+        assert_eq!(data.len(), 8);
+        // First pixel: mid-grey replicated into r/g/b, alpha opaque.
+        assert_eq!(&data[0..4], &[128, 128, 128, 255]);
+        assert_eq!(&data[4..8], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn decode_png_expands_grayscale_alpha_eight() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1x1, grey=100 at half alpha=128.
+        let path = write_png(
+            dir.path(),
+            "gray_alpha.png",
+            png::ColorType::GrayscaleAlpha,
+            png::BitDepth::Eight,
+            1,
+            1,
+            &[100, 128],
+        );
+        let image = decode_png(&path).expect("grayscale-alpha/8 should decode");
+        let data = image.image.data.data();
+        assert_eq!(data.len(), 4);
+        assert_eq!(&data[0..4], &[100, 100, 100, 128]);
+    }
+
+    #[test]
+    fn decode_png_expands_indexed_eight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexed.png");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 1, 1);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        // Palette entry 0 = pure red.
+        encoder.set_palette(vec![255u8, 0, 0]);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0u8]).unwrap();
+        drop(writer);
+
+        let image = decode_png(&path).expect("indexed/8 should decode");
+        let data = image.image.data.data();
+        assert_eq!(data.len(), 4);
+        assert_eq!(&data[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn decode_png_normalizes_sixteen_bit_rgba() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1x1 RGBA/16: each sample is 2 bytes big-endian. 0xFFFF -> 255,
+        // 0x0000 -> 0 after STRIP_16.
+        let path = write_png(
+            dir.path(),
+            "rgba16.png",
+            png::ColorType::Rgba,
+            png::BitDepth::Sixteen,
+            1,
+            1,
+            &[0xFF, 0xFF, 0x00, 0x00, 0x80, 0x00, 0xFF, 0xFF],
+        );
+        let image = decode_png(&path).expect("rgba/16 should decode");
+        let data = image.image.data.data();
+        assert_eq!(data.len(), 4);
+        assert_eq!(data[0], 255);
+        assert_eq!(data[1], 0);
+        assert_eq!(data[3], 255);
+    }
+
+    #[test]
+    fn decode_png_still_errors_on_garbage_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_a_png.png");
+        std::fs::write(&path, b"this is not a png file").unwrap();
+        assert!(
+            decode_png(&path).is_err(),
+            "garbage bytes must still fail to decode, exercising the drop-the-layer path",
+        );
     }
 }
