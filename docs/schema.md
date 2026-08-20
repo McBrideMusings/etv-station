@@ -468,6 +468,7 @@ identity_roots:
 catalog_path: /var/lib/etv-station/catalog.db   # optional — enables query channels
 catalog_refresh_secs: 900      # optional — trust the catalog this long without asking Plex
 full_sweep_after_secs: 86400   # optional — force a full (deletion-catching) re-read this often
+seed: 1138                     # optional — every channel with no seed: of its own inherits this, salted per channel
 ```
 
 | Field | Required | Type / default |
@@ -479,7 +480,7 @@ full_sweep_after_secs: 86400   # optional — force a full (deletion-catching) r
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
 | `overlay` | no | station-wide overlay default, the least specific level of the cascade every channel inherits from unless it says otherwise — see [Overlay cascade](#overlay-cascade) |
-
+| `seed` | no — default unset | int — station-wide random seed. Every channel that sets no `seed:` of its own inherits it, **salted with that channel's folder name** — see [Seed cascade](#seed-cascade). Unset means every unseeded channel keeps drawing a fresh wall-clock seed on every generation. |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
 
@@ -517,7 +518,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `chunk_hours` | no — default `6` | int — playout file size only; it does not bound a generation |
 | `roll_interval` | no — default `"3600s"` | duration |
 | `retention_days` | no — default `7` | int |
-| `seed` | no | int — seeds `random` order |
+| `seed` | no — inherited from the station `seed` when unset | int — seeds `random` order and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's folder name, then to a fresh wall-clock seed — see [Seed cascade](#seed-cascade). |
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
 
@@ -563,6 +564,37 @@ The two forms are interchangeable: at load, a referenced file's body
 copied into the include, so a reference and an equivalent inline block resolve
 identically. `mode`, `order`, and `filter` are **composition fields on the
 include** — they never live in the block file body.
+
+### Seed cascade
+
+A channel's seed resolves in this order, first hit wins:
+
+1. **The channel's own `seed:`.** Pinned by hand, unaffected by anything the
+   station says.
+2. **The station `seed:`, salted with the channel's folder name.** Applied at
+   config-load time, so everything downstream still reads one field.
+3. **A fresh wall-clock seed** — only when neither is set. The channel
+   reshuffles on every generation, and the daemon logs this at INFO naming the
+   channel, so an unseeded channel is visible in the startup log rather than
+   silent.
+
+Step 2 is what makes the determinism guarantee (`determinism.rs`) true in the
+daemon and not only in `--check-determinism`: without a pinned seed, every
+catalog refresh that changes a channel's candidate set reshuffles its whole
+future window, because the regen draws a new seed from the clock.
+
+**Why the inherited seed is salted.** Nothing in the seeded draw mixes in
+anything channel-specific — the shuffle consumes the seed as raw PRNG state,
+and a pattern roll mixes only `(seed, cycle, step, nonce)`. Handing every
+channel the same station number verbatim would make any two channels with the
+same candidate multiset produce the *identical* order. The salt is the
+channel's **folder name** — its identity on disk — and deliberately not its
+channel number, which is a presentation detail; renumbering a channel must not
+reshuffle it.
+
+The derivation is a fixed algorithm (FNV-1a over the name, then the SplitMix64
+finalizer), not `DefaultHasher`, so one pinned station seed reproduces the same
+per-channel seeds on every machine and every release.
 
 ### Overlay cascade
 

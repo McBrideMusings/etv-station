@@ -6,7 +6,7 @@ use super::channel::ChannelConfig;
 use super::entry::Entry;
 use super::overlay::{self, ChannelOverlays};
 use super::source::SourceConfig;
-use super::station::StationConfig;
+use super::station::{self, StationConfig};
 use super::validate;
 use crate::errors::ConfigError;
 
@@ -97,6 +97,7 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
         resolve_blocks(&mut config, &channel_path, env)?;
         validate::validate_channel(&channel_path, &config)?;
         let name = resolve_identity(station_path, &channel_path, &config)?;
+        apply_station_seed(&mut config, station.seed, &name);
         // After `resolve_blocks`, so a block-file body's own `overlay:` has
         // already been spliced onto the include and takes part in the cascade.
         let channel_dir = channel_path
@@ -294,6 +295,36 @@ fn dedup_key(path: &Path) -> PathBuf {
 /// identically, so a file stem of exactly `channel` falls back to its parent
 /// directory's name instead. Every other stem is used as before — a layout
 /// with real per-file names never triggers the fallback.
+/// Cascade the station `seed` onto one channel that declared none (#324), the
+/// same station → channel shape `overlay` already uses: merge it into the
+/// `ChannelConfig` here at load time, so `resolve.rs`'s
+/// `config.seed.unwrap_or_else(fresh_seed)` keeps reading exactly one field and
+/// there is no second place to look for a seed.
+///
+/// The inherited value is salted with `name` — the channel's folder name, the
+/// leaf its output folder is derived from — because the SplitMix64 chain mixes
+/// in nothing channel-specific on its own. Without the salt, every channel
+/// under one station seed with the same candidate multiset would produce the
+/// *same* shuffle. See [`derive_channel_seed`].
+///
+/// A channel that set its own `seed:` is left alone. With neither set, this
+/// logs at INFO naming the channel, so a channel still drawing a wall-clock
+/// seed on every generation is visible in the startup log rather than silent.
+fn apply_station_seed(config: &mut ChannelConfig, station_seed: Option<u64>, name: &str) {
+    if config.seed.is_some() {
+        return;
+    }
+    match station_seed {
+        Some(station_seed) => {
+            config.seed = Some(station::derive_channel_seed(station_seed, name));
+        }
+        None => tracing::info!(
+            channel = %name,
+            "no channel seed and no station seed: this channel reshuffles on every generation"
+        ),
+    }
+}
+
 fn resolve_identity(
     station_path: &Path,
     channel_path: &Path,
@@ -929,9 +960,54 @@ mod tests {
         assert_eq!(id, "custom-id");
     }
 
+    /// A channel that said nothing inherits the station seed (#324) — the
+    /// whole point: 37 production channels had no `seed:` and drew a fresh
+    /// wall-clock one on every regeneration.
+    #[test]
+    fn a_channel_with_no_seed_inherits_the_station_seed() {
+        let mut cfg = parse_channel(MINIMAL_RULE);
+        apply_station_seed(&mut cfg, Some(42), "001-for-you");
+        assert_eq!(
+            cfg.seed,
+            Some(station::derive_channel_seed(42, "001-for-you"))
+        );
+    }
+
+    /// The salt is the reason this is not a one-liner. Two channels with the
+    /// same pools under one station seed must not receive the same number, or
+    /// `seeded_shuffle` hands them the identical permutation.
+    #[test]
+    fn two_channels_inheriting_one_station_seed_get_different_seeds() {
+        let mut a = parse_channel(MINIMAL_RULE);
+        let mut b = parse_channel(MINIMAL_RULE);
+        apply_station_seed(&mut a, Some(42), "001-for-you");
+        apply_station_seed(&mut b, Some(42), "002-for-pierce");
+        assert!(a.seed.is_some());
+        assert_ne!(a.seed, b.seed);
+    }
+
+    /// A channel that pinned its own seed is untouched by the station value.
+    #[test]
+    fn an_explicit_channel_seed_beats_the_station_seed() {
+        let mut cfg = parse_channel(&format!("seed: 7\n{MINIMAL_RULE}"));
+        apply_station_seed(&mut cfg, Some(42), "001-for-you");
+        assert_eq!(cfg.seed, Some(7));
+    }
+
+    /// Neither set leaves the field alone, so `resolve.rs` still falls through
+    /// to `fresh_seed()` — behavior unchanged for a station that never adopts
+    /// this key.
+    #[test]
+    fn no_station_seed_leaves_an_unseeded_channel_unseeded() {
+        let mut cfg = parse_channel(MINIMAL_RULE);
+        apply_station_seed(&mut cfg, None, "001-for-you");
+        assert_eq!(cfg.seed, None);
+    }
+
     fn station_config() -> StationConfig {
         StationConfig {
             overlay: None,
+            seed: None,
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec!["channels/a.yaml".into()],

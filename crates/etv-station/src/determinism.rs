@@ -276,6 +276,7 @@ mod tests {
             config_path: PathBuf::from("/tmp/station.toml"),
             station: crate::config::StationConfig {
                 overlay: None,
+                seed: None,
                 tz: "UTC".into(),
                 device_id: None,
                 output_base: PathBuf::from("/tmp/out"),

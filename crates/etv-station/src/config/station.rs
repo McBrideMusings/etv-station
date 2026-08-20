@@ -125,6 +125,24 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<OverlayDecl>,
 
+    /// The station-wide random seed — the station level of the same
+    /// station → channel cascade `overlay` uses. Every channel that sets no
+    /// `seed:` of its own inherits it at load time, so a config with this set
+    /// has no channel left drawing wall-clock entropy (#324).
+    ///
+    /// **Channels do not receive this value verbatim.** Nothing in the
+    /// SplitMix64 chain mixes in anything channel-specific — `seeded_shuffle`
+    /// consumes the seed as raw state, and `RollKey::u64_at` mixes only
+    /// `(seed, cycle, step, nonce)` — so handing two channels the same number
+    /// would make any two with the same candidate multiset shuffle
+    /// *identically*. [`derive_channel_seed`] salts it with the channel's
+    /// folder name first.
+    ///
+    /// Unset means channels fall back to a fresh per-generation seed, which is
+    /// what every station config meant before this key existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+
     /// ETV-next's `ffmpeg:` block, deserialized through its own type so a
     /// renamed field fails this build instead of being silently dropped.
     /// Every field defaults, so `ffmpeg:` can be omitted entirely.
@@ -137,6 +155,33 @@ pub struct StationConfig {
     /// empty one that ETV-next then rejects (`audio`/`video` are required
     /// there too).
     pub normalization: NormalizationConfig,
+}
+
+/// Mix a station [`seed`](StationConfig::seed) with one channel's folder name
+/// into the seed that channel actually uses.
+///
+/// The salt is the **folder name**, not the channel number: the folder name is
+/// the channel's identity on disk, while the number is a presentation detail
+/// (#263 makes it separately declarable), and renumbering a channel must not
+/// reshuffle it.
+///
+/// Fixed algorithms end to end — FNV-1a over the name, then the SplitMix64
+/// finalizer — rather than `DefaultHasher`, whose output is explicitly not
+/// stable across builds. A pinned station seed therefore reproduces the same
+/// per-channel seed on every machine and every release, which is the whole
+/// point of pinning one.
+pub fn derive_channel_seed(station_seed: u64, channel_name: &str) -> u64 {
+    let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
+    for byte in channel_name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    let mut z = station_seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(hash);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// 15 minutes: long enough that a restart-heavy editing session pays the ingest
@@ -170,4 +215,47 @@ pub(crate) fn default_ffmpeg() -> FfmpegConfig {
 pub(crate) fn empty_normalization_for_test() -> NormalizationConfig {
     serde_json::from_value(serde_json::json!({"audio": {}, "video": {}}))
         .expect("audio/video with no fields set is a valid NormalizationConfig")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_channel_seed;
+
+    /// Fixed algorithm, fixed output. A pinned station seed has to reproduce
+    /// the same channel seed on every machine and every release, so this holds
+    /// a golden value rather than only comparing two live calls.
+    #[test]
+    fn derivation_is_stable_across_builds() {
+        assert_eq!(
+            derive_channel_seed(42, "001-for-you"),
+            derive_channel_seed(42, "001-for-you")
+        );
+        assert_eq!(
+            derive_channel_seed(42, "001-for-you"),
+            9_370_805_649_482_762_113
+        );
+    }
+
+    /// Different folder names diverge; the same folder name under a different
+    /// station seed diverges too.
+    #[test]
+    fn derivation_separates_channels_and_stations() {
+        assert_ne!(
+            derive_channel_seed(42, "001-for-you"),
+            derive_channel_seed(42, "002-for-pierce")
+        );
+        assert_ne!(
+            derive_channel_seed(42, "001-for-you"),
+            derive_channel_seed(43, "001-for-you")
+        );
+    }
+
+    /// The station seed is not passed through to any channel verbatim — that
+    /// is the failure mode the salt exists to prevent.
+    #[test]
+    fn no_channel_receives_the_station_seed_unchanged() {
+        for name in ["001-for-you", "002-for-pierce", "003-for-madi"] {
+            assert_ne!(derive_channel_seed(42, name), 42);
+        }
+    }
 }

@@ -262,4 +262,34 @@ mod tests {
                 .is_empty()
         );
     }
+    /// The #324 acceptance criterion, at the layer that would have broken:
+    /// two channels with the identical candidate multiset, both inheriting one
+    /// station seed, must not land on the same permutation. Handing them the
+    /// station seed verbatim does exactly that — `seeded_shuffle` takes the
+    /// seed as raw SplitMix64 state and mixes in nothing channel-specific.
+    #[test]
+    fn two_channels_inheriting_one_station_seed_shuffle_differently() {
+        let pool: Vec<String> = (0..40).map(|i| format!("id-{i:02}")).collect();
+
+        let mut verbatim_a = pool.clone();
+        let mut verbatim_b = pool.clone();
+        super::seeded_shuffle(&mut verbatim_a, 42);
+        super::seeded_shuffle(&mut verbatim_b, 42);
+        assert_eq!(
+            verbatim_a, verbatim_b,
+            "unsalted inheritance correlates channels — the reason the salt exists"
+        );
+
+        let mut a = pool.clone();
+        let mut b = pool.clone();
+        super::seeded_shuffle(
+            &mut a,
+            crate::config::derive_channel_seed(42, "001-for-you"),
+        );
+        super::seeded_shuffle(
+            &mut b,
+            crate::config::derive_channel_seed(42, "002-for-pierce"),
+        );
+        assert_ne!(a, b);
+    }
 }

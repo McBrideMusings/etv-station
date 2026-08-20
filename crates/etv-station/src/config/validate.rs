@@ -1213,6 +1213,7 @@ mod tests {
     fn rejects_empty_channels() {
         let s = StationConfig {
             overlay: None,
+            seed: None,
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec![],
@@ -1235,6 +1236,7 @@ mod tests {
     fn rejects_empty_output_base() {
         let s = StationConfig {
             overlay: None,
+            seed: None,
             tz: "UTC".into(),
             output_base: PathBuf::new(),
             channels: vec!["channels/a.yaml".into()],
@@ -1256,6 +1258,7 @@ mod tests {
     fn rejects_empty_channel_entry() {
         let s = StationConfig {
             overlay: None,
+            seed: None,
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec!["  ".into()],
