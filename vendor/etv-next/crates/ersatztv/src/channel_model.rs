@@ -111,10 +111,15 @@ impl ChannelModel {
             overlay_paths.push(overlay_path);
         }
 
+        let config_base = tokio::fs::read_to_string(&channel_config)
+            .await
+            .map_err(|e| LineupError::ChannelConfigRead {
+                path: channel_config.display().to_string(),
+                source: e,
+            })?;
+
         let mut merged: serde_json::Value = serde_json::Value::Null;
-        if let Ok(config_base) = tokio::fs::read_to_string(&channel_config).await
-            && let Ok(value) = serde_json::from_str(&config_base)
-        {
+        if let Ok(value) = serde_json::from_str(&config_base) {
             merged = value;
         }
 
@@ -134,7 +139,7 @@ impl ChannelModel {
 
         let subtitle = hint.normalization.subtitle;
 
-        let playout_folder = read_playout_folder(&channel_config).await?;
+        let playout_folder = read_playout_folder(&channel_config, &config_base).await?;
 
         Ok(ChannelModel {
             number: channel.number.clone(),
@@ -215,16 +220,12 @@ impl ChannelModel {
 /// any of that — it only turns the shared resolver's outcome into the two
 /// errors below, since `resolve_relative_paths` never fails outright (it
 /// falls back to a best-effort path instead of erroring).
-async fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, LineupError> {
-    let body = tokio::fs::read_to_string(channel_config_path)
-        .await
-        .map_err(|e| LineupError::ChannelConfigRead {
-            path: channel_config_path.display().to_string(),
-            source: e,
-        })?;
-
+async fn read_playout_folder(
+    channel_config_path: &Path,
+    body: &str,
+) -> Result<PathBuf, LineupError> {
     let parsed: ChannelConfigPlayoutOnly =
-        serde_json::from_str(&body).map_err(|e| LineupError::ChannelConfigParse {
+        serde_json::from_str(body).map_err(|e| LineupError::ChannelConfigParse {
             path: channel_config_path.display().to_string(),
             source: e,
         })?;
@@ -274,19 +275,19 @@ async fn read_playout_folder(channel_config_path: &Path) -> Result<PathBuf, Line
 mod tests {
     use super::*;
 
-    async fn write_channel_config(dir: &Path, folder: &str) -> PathBuf {
+    async fn write_channel_config(dir: &Path, folder: &str) -> (PathBuf, String) {
         let cfg_path = dir.join("channel.json");
         let body = serde_json::json!({ "playout": { "folder": folder } }).to_string();
-        tokio::fs::write(&cfg_path, body).await.unwrap();
-        cfg_path
+        tokio::fs::write(&cfg_path, &body).await.unwrap();
+        (cfg_path, body)
     }
 
     #[tokio::test]
     async fn missing_playout_folder_raises_resolve_error() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg_path = write_channel_config(dir.path(), "does-not-exist").await;
+        let (cfg_path, body) = write_channel_config(dir.path(), "does-not-exist").await;
 
-        let err = read_playout_folder(&cfg_path).await.unwrap_err();
+        let err = read_playout_folder(&cfg_path, &body).await.unwrap_err();
 
         match err {
             LineupError::PlayoutFolderResolve { path, .. } => {
@@ -315,9 +316,9 @@ mod tests {
     #[tokio::test]
     async fn a_name_that_merely_starts_with_a_tilde_is_not_a_failed_expansion() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg_path = write_channel_config(dir.path(), "~otheruser/movies").await;
+        let (cfg_path, body) = write_channel_config(dir.path(), "~otheruser/movies").await;
 
-        let err = read_playout_folder(&cfg_path).await.unwrap_err();
+        let err = read_playout_folder(&cfg_path, &body).await.unwrap_err();
 
         match err {
             LineupError::PlayoutFolderResolve { path, .. } => {
@@ -338,9 +339,9 @@ mod tests {
         tokio::fs::create_dir_all(dir.path().join("~backup/media"))
             .await
             .unwrap();
-        let cfg_path = write_channel_config(dir.path(), "~backup/media").await;
+        let (cfg_path, body) = write_channel_config(dir.path(), "~backup/media").await;
 
-        let resolved = read_playout_folder(&cfg_path)
+        let resolved = read_playout_folder(&cfg_path, &body)
             .await
             .expect("a real directory whose name starts with ~ must resolve");
 
@@ -355,9 +356,9 @@ mod tests {
     #[tokio::test]
     async fn expandable_tilde_does_not_raise_expand_error() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg_path = write_channel_config(dir.path(), "~").await;
+        let (cfg_path, body) = write_channel_config(dir.path(), "~").await;
 
-        let resolved = read_playout_folder(&cfg_path)
+        let resolved = read_playout_folder(&cfg_path, &body)
             .await
             .expect("a bare ~ should expand to the real home directory and canonicalize");
 
