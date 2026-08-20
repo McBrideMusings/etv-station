@@ -9,6 +9,37 @@ Rust daemon that schedules channels and writes playout JSON. It ships as a Docke
 container on Unraid, but the useful local loop is running the debug binary against
 `examples/` and watching channels roll.
 
+## Before you commit: run both workspaces
+
+`etv-station` is **two cargo workspaces**. The parent at the repo root, and
+`vendor/etv-next/`, which has its own `[workspace]` and is *excluded* from the
+parent — a `cargo test --workspace` or `cargo clippy --workspace` run at the root
+never touches a single file under `vendor/etv-next/`. That gap let a clippy
+`items_after_test_module` error (#305) pass every check, merge, and sit on `main`
+for three orchestrate rounds.
+
+```bash
+./tools/verify-all.sh              # test + clippy + fmt --check, BOTH workspaces
+./tools/verify-all.sh lint         # just clippy, still both
+./tools/verify-all.sh test         # just tests, still both
+```
+
+The script is the only place the command list lives — `CLAUDE.md` and `admin.toml`
+(`admin test` / `admin vet` / `admin fmt`) call it rather than repeating it. Each
+tree gets its own documented commands: the vendored one adds `--locked`, taken
+from `vendor/etv-next/CLAUDE.md`. Every selected check runs in both trees even
+after one fails, then the summary names which failed and the exit status is 1.
+
+Green baseline (2026-08-20): parent 824 tests, `vendor/etv-next` 148 tests
+(404 ignored), clippy and fmt clean in both.
+
+`crates/etv-overlay/tests/watch_teardown.rs:106` ("sanity: ffmpeg child should be
+running") has an unguarded race, tracked as **#322**. If only that fails, re-run
+it; do not chase it.
+
+Passing this is necessary, not sufficient — the rest of this skill is booting the
+daemon and watching it actually do its job.
+
 ## The handle
 
 ```bash

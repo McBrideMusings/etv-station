@@ -30,7 +30,7 @@ The copy and its drift guard are one step, not two: `crates/etv-station/tests/ve
 
 ## Build & run
 
-This is a Cargo workspace with three application crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer) — plus the vendored `vendor/plexdb-reader` (see above). `vendor/etv-next` is its own workspace, excluded from this one and consumed as a path dependency.
+This is a Cargo workspace with three application crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer) — plus the vendored `vendor/plexdb-reader` (see above). `vendor/etv-next` is its own workspace, excluded from this one and consumed as a path dependency — so a bare `cargo test/clippy --workspace` at the root never checks it. Use `./tools/verify-all.sh`, which runs each tree with its own documented commands and fails if either fails.
 
 The common operations:
 
@@ -38,9 +38,8 @@ The common operations:
 ./tools/dev-run.sh                       # run station daemon + ETV-next together (integration test)
 ./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
 ./tools/verify-integration.sh            # smoke test: start dev stack, probe HTTP endpoints, verify clean shutdown
-cargo test --workspace                   # run workspace tests
-cargo clippy --workspace --all-features --all-targets -- -D clippy::all   # lint, exactly as CI runs it
-cargo +nightly fmt --all                 # format
+./tools/verify-all.sh                    # test + clippy + fmt --check in BOTH workspaces
+./tools/verify-all.sh test|lint|fmt      # one check, still across both workspaces
 bun run docs:dev                         # serve VitePress docs on http://localhost:5193
 ./tools/overlay-test.sh                  # render a Vello overlay onto a bumper fixture and open the mp4
 ./tools/overlay-still.sh                 # render a single overlay frame to PNG and open it
