@@ -74,6 +74,18 @@ Which overlay config a channel's single `etv-overlay` process runs, resolved sta
 
 The gap between when a [[daypart]] was meant to start and when it actually does, because the item before it ran past the boundary. Accepted rather than corrected: closing it would mean cutting an item short or leaving dead air, and padding it out is impossible while the library has no interstitials (#85). Bounded by the longest item in the pool.
 
+## Why line
+
+The one sentence a For You channel shows explaining why the item on screen was picked — "Because you watch neo-noir and *Blade Runner*". Composed in the overlay, never by the station: the [[scorer plugin]] records a [[reason set]] on the item it picked, and the channel's own overlay config supplies only a lead and a joiner, so two channels voice the same reasons differently with no plugin change. The sentence joins the reasons' bare labels and never inspects their kind, which is why it reads the same in any order. Only ever exists for an item a plugin picked — a plain `expr` pool attaches nothing, so an episode on these channels has no why line.
+
+## Reason
+
+One recorded justification for a pick, and the atom a [[why line]] is built from. Two kinds, which the sentence deliberately does not distinguish: a **keyword**, a taste attribute the pick shares with the viewer's vector, and a **bridge title**, an already-watched title that shares that attribute. A reason carries the share of the pick's own matched weight it accounts for — never a raw weight, because the underlying taste vector is an unnormalised running total whose scale differs per account and grows with watch history. A keyword can be strong evidence and bad copy at the same time (`woman director` scores honestly and reads as nonsense), so a denied keyword still counts toward the score and is only barred from becoming a reason.
+
+## Reason set
+
+Every [[reason]] a pick cleared the share threshold with, ranked, plus which of them the scorer chose to say out loud. Both halves are recorded at pick time and carried untouched to the playout JSON: the choice is seeded, so re-running a generation shows a viewer the same sentence it showed them before, and the unchosen reasons survive as the evidence for why a line read the way it did. Selection cannot happen at render time — the overlay script runs per frame and holds no seed and no memory.
+
 ## Broadcast graphics vocabulary
 
 Borrowed industry terms for the things an overlay draws. None of these are schema keys or code identifiers — they exist here so an overlay author can name what they are building and search for real reference material instead of inventing a word for it. Everything below is one of the [[overlay cascade]]'s layers.
