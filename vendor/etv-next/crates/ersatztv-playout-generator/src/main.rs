@@ -81,7 +81,7 @@ async fn resolve_output_folder(args: &Args) -> Result<GeneratorConfig, PlayoutGe
         let lineup_config = ersatztv::config::from_file(lineup).await?;
         if let Some(channel) = lineup_config.channels.iter().find(|c| &c.number == number) {
             let channel_config_file =
-                ersatztv::validate_config_path(lineup_parent, &channel.config)?;
+                ersatztv::validate_config_path(lineup_parent, &channel.config).await?;
 
             let base_parent =
                 channel_config_file
@@ -94,7 +94,8 @@ async fn resolve_output_folder(args: &Args) -> Result<GeneratorConfig, PlayoutGe
             ersatztv_core::resolve_relative_paths(&mut merged, base_parent, PATH_FIELDS);
 
             for overlay_rel in &channel.overlays {
-                let overlay_path = ersatztv::validate_config_path(lineup_parent, overlay_rel)?;
+                let overlay_path =
+                    ersatztv::validate_config_path(lineup_parent, overlay_rel).await?;
                 let overlay_parent =
                     overlay_path
                         .parent()
