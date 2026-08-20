@@ -71,37 +71,6 @@ pub async fn main() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use ersatztv_core::STALL_EXIT_CODE;
-
-    use super::*;
-
-    #[test]
-    fn idle_timeout_exits_zero() {
-        let err = ChannelError::IdleTimeout("test timeout".into());
-        assert_eq!(exit_code(&err), 0);
-    }
-
-    #[test]
-    fn segment_stall_exits_stall_code() {
-        let err = ChannelError::SegmentStall("test stall".into());
-        assert_eq!(exit_code(&err), STALL_EXIT_CODE);
-    }
-
-    #[test]
-    fn stalled_exits_stall_code() {
-        let err = ChannelError::Stalled("test stalled".into());
-        assert_eq!(exit_code(&err), STALL_EXIT_CODE);
-    }
-
-    #[test]
-    fn other_errors_exit_one() {
-        let err = ChannelError::StreamFailure("test stream failure".into());
-        assert_eq!(exit_code(&err), 1);
-    }
-}
-
 async fn run() -> Result<(), ChannelError> {
     let args = Args::parse();
 
@@ -145,5 +114,36 @@ async fn run() -> Result<(), ChannelError> {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ersatztv_core::STALL_EXIT_CODE;
+
+    use super::*;
+
+    #[test]
+    fn idle_timeout_exits_zero() {
+        let err = ChannelError::IdleTimeout("test timeout".into());
+        assert_eq!(exit_code(&err), 0);
+    }
+
+    #[test]
+    fn segment_stall_exits_stall_code() {
+        let err = ChannelError::SegmentStall("test stall".into());
+        assert_eq!(exit_code(&err), STALL_EXIT_CODE);
+    }
+
+    #[test]
+    fn stalled_exits_stall_code() {
+        let err = ChannelError::Stalled("test stalled".into());
+        assert_eq!(exit_code(&err), STALL_EXIT_CODE);
+    }
+
+    #[test]
+    fn other_errors_exit_one() {
+        let err = ChannelError::StreamFailure("test stream failure".into());
+        assert_eq!(exit_code(&err), 1);
     }
 }
