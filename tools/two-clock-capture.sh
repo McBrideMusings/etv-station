@@ -118,16 +118,29 @@ mkdir -p "$DIAG" 2>/dev/null
 # ------------------------------------------------------------------ procs ----
 # Everything here is a sibling process in this container, so /proc is directly
 # readable -- no docker exec, no ssh, no host pid namespace.
-ffmpeg_pid_for() {
-    local ch="$1" p args
+# Scan /proc ONCE per tick and map channel -> ffmpeg pid. Doing this per channel
+# instead would re-walk every process for every channel every second, which on a
+# lineup with dozens of channels is a lot of work to answer one question.
+declare -A FFMPEG_PID
+scan_ffmpeg_pids() {
+    local p args ch
+    FFMPEG_PID=()
     for p in /proc/[0-9]*; do
         [ -r "$p/cmdline" ] || continue
         args=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
         case "$args" in
-            ffmpeg\ *"/hls/$ch/"*) basename "$p"; return ;;
+            ffmpeg\ *"$HLS_ROOT/"*)
+                ch=${args##*"$HLS_ROOT/"}
+                ch=${ch%%/*}
+                case "$ch" in
+                    ''|*[!0-9]*) continue ;;
+                    *) FFMPEG_PID[$ch]=$(basename "$p") ;;
+                esac ;;
         esac
     done
 }
+
+ffmpeg_pid_for() { printf '%s' "${FFMPEG_PID[$1]:-}"; }
 
 # The overlay fifo this channel's ffmpeg is reading from, resolved through the
 # argv rather than assumed: the overlay is named by station folder while the
@@ -215,6 +228,7 @@ declare -A last_idx last_change in_gap last_capture
 
 while true; do
     now=$(date +%s)
+    scan_ffmpeg_pids
     for dir in "$HLS_ROOT"/*/; do
         [ -d "$dir" ] || continue
         ch=$(basename "$dir")
@@ -222,6 +236,20 @@ while true; do
 
         idx=$(newest_segment_index "$ch")
         [ -n "$idx" ] || continue                      # nothing served yet
+
+        # A channel with no ffmpeg is not frozen, it is simply not running —
+        # nobody is watching it, or the session was torn down. Its HLS folder
+        # keeps the segments from the last session forever, so without this the
+        # segment index sits still and every stale folder reports a permanent
+        # freeze. Only a channel that HAS a transcode can stall.
+        if [ -z "$(ffmpeg_pid_for "$ch")" ]; then
+            if [ "${in_gap[$ch]:-0}" -eq 1 ]; then
+                log "channel=$ch session ended; no longer watching for a stall"
+                in_gap[$ch]=0
+            fi
+            unset "last_idx[$ch]" "last_change[$ch]"
+            continue
+        fi
 
         if [ "${last_idx[$ch]:-}" != "$idx" ]; then
             if [ "${in_gap[$ch]:-0}" -eq 1 ]; then
