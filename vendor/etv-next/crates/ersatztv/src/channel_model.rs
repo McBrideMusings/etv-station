@@ -103,11 +103,11 @@ impl ChannelModel {
             .parent()
             .ok_or(LineupError::LineupConfigNoParent)?;
 
-        let channel_config = ersatztv::validate_config_path(parent, &channel.config)?;
+        let channel_config = ersatztv::validate_config_path(parent, &channel.config).await?;
 
         let mut overlay_paths: Vec<PathBuf> = Vec::new();
         for overlay in &channel.overlays {
-            let overlay_path = ersatztv::validate_config_path(parent, overlay)?;
+            let overlay_path = ersatztv::validate_config_path(parent, overlay).await?;
             overlay_paths.push(overlay_path);
         }
 
