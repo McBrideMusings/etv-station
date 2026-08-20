@@ -174,13 +174,13 @@ fn write_metadata<W: std::io::Write>(
     if let Some(credits) = &meta.credits {
         write_credits(w, credits)?;
     }
+    if let Some(year) = meta.year {
+        write_text_element(w, "date", &year.to_string())?;
+    }
     if let Some(categories) = &meta.categories {
         for category in categories {
             write_text_element(w, "category", category)?;
         }
-    }
-    if let Some(year) = meta.year {
-        write_text_element(w, "date", &year.to_string())?;
     }
     if let Some(url) = &meta.artwork_url {
         let resolved = resolve_icon_url(url, base_url);
@@ -610,6 +610,7 @@ mod tests {
         assert!(xml.contains("<title>The Title</title>"), "{xml}");
         assert!(xml.contains("<sub-title>The Episode</sub-title>"), "{xml}");
         assert!(xml.contains("<desc>A &amp; B &lt; C</desc>"), "{xml}");
+        assert!(xml.contains("<date>2026</date>"), "{xml}");
         assert!(xml.contains("<category>Drama</category>"), "{xml}");
         assert!(xml.contains("<category>Sci-Fi</category>"), "{xml}");
         assert!(xml.contains("<episode-num>S02E05</episode-num>"), "{xml}");
@@ -632,10 +633,10 @@ mod tests {
         assert!(xml.contains("<value>4 / 5</value>"), "{xml}");
 
         // XMLTV is order-sensitive: verify both the top-level placement of
-        // the new elements against the DTD (`credits?` before `category*`;
-        // `country*` after `icon*`, before `episode-num*`; `star-rating*`
-        // after `rating*`) and the required child order inside `<credits>`
-        // (director, actor, writer).
+        // the new elements against the DTD (`credits?` before `date?` before
+        // `category*`; `country*` after `icon*`, before `episode-num*`;
+        // `star-rating*` after `rating*`) and the required child order inside
+        // `<credits>` (director, actor, writer).
         let full_open = r#"<programme start="20260430120000 +0000" stop="20260430123000 +0000" channel="ersatztv.1">"#;
         let full_idx = xml.find(full_open).expect("populated programme present");
         let full_close_idx = xml[full_idx..].find("</programme>").unwrap() + full_idx;
@@ -643,6 +644,7 @@ mod tests {
 
         let desc_pos = full_body.find("<desc>").unwrap();
         let credits_pos = full_body.find("<credits>").unwrap();
+        let date_pos = full_body.find("<date>").unwrap();
         let category_pos = full_body.find("<category>").unwrap();
         let icon_pos = full_body.find("<icon ").unwrap();
         let country_pos = full_body.find("<country>").unwrap();
@@ -651,8 +653,12 @@ mod tests {
         let star_rating_pos = full_body.find("<star-rating>").unwrap();
         assert!(desc_pos < credits_pos, "credits should follow desc");
         assert!(
-            credits_pos < category_pos,
-            "credits should precede category per the XMLTV DTD"
+            credits_pos < date_pos,
+            "date should follow credits per the XMLTV DTD"
+        );
+        assert!(
+            date_pos < category_pos,
+            "category should follow date per the XMLTV DTD"
         );
         assert!(icon_pos < country_pos, "country should follow icon");
         assert!(
