@@ -80,7 +80,9 @@ impl ChannelSession {
             watcher.abort();
             match &status {
                 Ok(s) if s.success() => {
-                    log::debug!("channel {channel_number} exited cleanly");
+                    log::info!(
+                        "channel {channel_number} exited cleanly (idle shutdown or normal stop)"
+                    );
                 }
                 Ok(s) => {
                     log::warn!("channel {channel_number} exited with status {s}");

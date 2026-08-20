@@ -41,28 +41,63 @@ enum Commands {
     },
 }
 
+/// Determine the process exit code for a channel error.
+///
+/// IdleTimeout is a successful end of a session (the channel reached its
+/// configured timeout with no viewers), so it exits 0 and is handled by the
+/// supervisor's s.success() arm. SegmentStall and Stalled are specific verdicts
+/// that the stream stopped reaching viewers and deserve their own exit code for
+/// supervisor differentiation. Everything else is a failure.
+fn exit_code(err: &ChannelError) -> i32 {
+    match err {
+        ChannelError::IdleTimeout(_) => 0,
+        ChannelError::SegmentStall(_) | ChannelError::Stalled(_) => ersatztv_core::STALL_EXIT_CODE,
+        _ => 1,
+    }
+}
+
 #[tokio::main]
 pub async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
     if let Err(err) = run().await {
-        match err {
+        match &err {
             ChannelError::IdleTimeout(_) => log::info!("{err}"),
             _ => log::error!("{err}"),
         };
 
-        // Report the two "stopped reaching the viewer" verdicts with their own
-        // exit code. The server counts those as failures no matter how long the
-        // run lasted; anything else keeps the ordinary code and is judged on
-        // uptime as before. See `ersatztv_core::STALL_EXIT_CODE`.
-        let code = match err {
-            ChannelError::SegmentStall(_) | ChannelError::Stalled(_) => {
-                ersatztv_core::STALL_EXIT_CODE
-            }
-            _ => 1,
-        };
-
+        let code = exit_code(&err);
         std::process::exit(code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ersatztv_core::STALL_EXIT_CODE;
+
+    #[test]
+    fn idle_timeout_exits_zero() {
+        let err = ChannelError::IdleTimeout("test timeout".into());
+        assert_eq!(exit_code(&err), 0);
+    }
+
+    #[test]
+    fn segment_stall_exits_stall_code() {
+        let err = ChannelError::SegmentStall("test stall".into());
+        assert_eq!(exit_code(&err), STALL_EXIT_CODE);
+    }
+
+    #[test]
+    fn stalled_exits_stall_code() {
+        let err = ChannelError::Stalled("test stalled".into());
+        assert_eq!(exit_code(&err), STALL_EXIT_CODE);
+    }
+
+    #[test]
+    fn other_errors_exit_one() {
+        let err = ChannelError::StreamFailure("test stream failure".into());
+        assert_eq!(exit_code(&err), 1);
     }
 }
 
