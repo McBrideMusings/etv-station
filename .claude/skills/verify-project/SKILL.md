@@ -110,6 +110,40 @@ rather than silent". Seeing it in a production log means that channel still
 redraws a wall-clock seed on every regeneration and reshuffles its whole future
 window whenever a catalog refresh changes its candidate set.
 
+## Verifying two builds emit the same schedule (playout-JSON parity)
+
+For a change that should not alter what airs — a config-format migration, a
+refactor of the resolve path — generate with both builds and compare. Do **not**
+compare bytes. The daemon anchors the first item at wall-clock now
+(`daemon.rs:2078`, `resolve.rs:155`), so two runs minutes apart share no
+timestamp and no trailing chunk filename; on a 64-channel config, 0 of 331 files
+match byte-for-byte even when the binary and config are identical. Compare after
+re-anchoring each channel's items to an offset from its own first start.
+
+The harness from #310 does this, in `tmp/claude/parity/` (gitignored, rebuild it
+if it's gone — `run.sh` is ~30 lines):
+
+```bash
+bash run.sh <label> <binary> <config-dir>     # one generation, own output + catalog copy
+python3 diff_norm.py out-<a> out-<b>          # time-normalized; this is the verdict
+python3 diff.py out-<a> out-<b>               # byte + per-item overlay-field comparison
+```
+
+Three rules that make the result mean something:
+
+- **Always run a control.** Same binary, same config, second run. Its differing
+  count is the floor; only channels that differ in the experiment *and not* in
+  the control are real. Without it you cannot tell a regression from ordinary
+  run-to-run drift.
+- **Pin the catalog.** Copy `tmp/catalog.db` per run and start with no
+  `PLEX_URL`/`PLEX_TOKEN`, or an ingest between the two runs changes the library
+  underneath you. Rewrite `entry_sources.playback_path` from `/media/` to
+  `/Volumes/media/library/` in the copy — otherwise every item resolves to a
+  "file not found" card and the `source` field is never really compared.
+- **Keep the two config trees at the same path depth**, or better, mask the path.
+  A channel that fails validation emits a card whose text embeds its own config
+  path, which then reads as a false difference.
+
 ## Verifying the catalog refresh and the reconciliation sweep
 
 **Nothing here is an operation anyone runs.** Both are timers inside the daemon:
