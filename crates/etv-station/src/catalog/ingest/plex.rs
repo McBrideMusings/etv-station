@@ -214,7 +214,9 @@ pub struct PlexIngestStats {
     pub entries_written: usize,
     /// `plex` provenance rows upserted (one per item).
     pub sources_written: usize,
-    /// Items that inherited an existing entry_id by path-match (FS↔Plex dedup).
+    /// Items that inherited an existing entry_id — either pinned to this
+    /// item's Plex ratingKey by a prior pass (ADR 0009), a GUID match onto
+    /// another entry, or a path-match (FS↔Plex dedup).
     pub inherited: usize,
     /// Movies and episodes this pass wrote with no summary — Plex reported
     /// none and none was already on file. Logged rather than assumed (#186):
@@ -303,10 +305,14 @@ pub fn ingest_items(
     };
     for item in items {
         let canonical = canonical_path(&item.playback_path, &roots);
-        // Identity precedence (locked #47 model): (1) a GUID already known to the
-        // catalog wins, so every file sharing it collapses onto one entry and the
-        // external-id row never flips; (2) a path-match onto a prior entry
-        // (FS↔Plex dedup); (3) a fresh derivation (strongest GUID, else `fs:`).
+        // Identity precedence (locked #47 model, pin added by #279/ADR 0009):
+        // (1) this item's own Plex ratingKey, if a prior pass already pinned it
+        // to an entry — pinned for life, so a later re-match that changes which
+        // GUID Plex reports can never re-derive a different id out from under
+        // it; (2) a GUID already known to the catalog wins, so every *other*
+        // file sharing it collapses onto one entry and the external-id row
+        // never flips; (3) a path-match onto a prior entry (FS↔Plex dedup);
+        // (4) a fresh derivation (strongest GUID, else `fs:`).
         let entry_id = match resolve_existing(catalog, item, index.get(&canonical))? {
             Some(existing) => {
                 stats.inherited += 1;
@@ -738,14 +744,20 @@ pub fn ingest(
     Ok(stats)
 }
 
-/// Resolve the entry an item should attach to, if any: a GUID the catalog
-/// already knows takes precedence (so every file sharing it collapses onto one
-/// entry), then a path-match on the canonical path. `None` → mint a fresh id.
+/// Resolve the entry an item should attach to, if any: the entry this exact
+/// Plex `ratingKey` was already pinned to on a prior pass takes precedence
+/// over everything else (a rating key's identity never moves once minted —
+/// ADR 0009, mirroring plex-db-ex ADR-0008), then a GUID the catalog already
+/// knows (so every *other* file sharing it collapses onto one entry), then a
+/// path-match on the canonical path. `None` → mint a fresh id.
 fn resolve_existing(
     catalog: &Catalog,
     item: &PlexItem,
     path_match: Option<&String>,
 ) -> Result<Option<String>, CatalogError> {
+    if let Some(id) = catalog.entry_id_for_source(Source::Plex, &item.rating_key)? {
+        return Ok(Some(id));
+    }
     for (ns, value) in &item.external_ids {
         if let Some(id) = catalog.entry_id_for_external_id(*ns, value)? {
             return Ok(Some(id));
@@ -2372,6 +2384,94 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].source, Source::Plex);
         assert_eq!(sources[0].source_id, "plex-1");
+    }
+
+    #[test]
+    fn a_rating_key_pinned_by_a_prior_pass_survives_a_stronger_guid_arriving() {
+        // First pass: Plex only reports a tmdb GUID, so the id derives from it.
+        let cat = Catalog::open_in_memory().unwrap();
+        let first = movie(
+            "rk-a",
+            "/data/media/movies/Alien.mkv",
+            &[(ExternalNs::Tmdb, "2316")],
+        );
+        let stats1 = ingest_items(&cat, &[first], &["/data/media".into()]).unwrap();
+        assert_eq!(stats1.inherited, 0);
+        assert_eq!(cat.all_entry_ids().unwrap(), vec!["tmdb:2316".to_string()]);
+
+        // Second pass: same ratingKey, Plex now also reports an imdb GUID
+        // (a higher-priority namespace than tmdb) — a fresh derivation would
+        // mint "imdb:tt0386676" here. The rating-key pin must keep it on
+        // "tmdb:2316" instead (ADR 0009).
+        let second = movie(
+            "rk-a",
+            "/data/media/movies/Alien.mkv",
+            &[(ExternalNs::Tmdb, "2316"), (ExternalNs::Imdb, "tt0386676")],
+        );
+        let stats2 = ingest_items(&cat, &[second], &["/data/media".into()]).unwrap();
+        assert_eq!(
+            stats2.inherited, 1,
+            "the rating-key pin counts as inherited"
+        );
+        assert_eq!(
+            cat.all_entry_ids().unwrap(),
+            vec!["tmdb:2316".to_string()],
+            "the pinned id must not move when a stronger GUID arrives"
+        );
+        // The newly-seen imdb GUID is still recorded and reachable onto the
+        // pinned entry, so acceptance criterion 2 holds even though the id
+        // itself never moved.
+        assert_eq!(
+            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt0386676")
+                .unwrap(),
+            Some("tmdb:2316".to_string())
+        );
+    }
+
+    #[test]
+    fn a_first_seen_rating_key_still_derives_normally() {
+        // Guards against the pin branch swallowing an item the catalog has
+        // never seen this ratingKey for — must fall through to derivation.
+        let cat = Catalog::open_in_memory().unwrap();
+        let item = movie(
+            "rk-new",
+            "/data/media/movies/Predator.mkv",
+            &[(ExternalNs::Imdb, "tt0093773")],
+        );
+        let stats = ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
+        assert_eq!(stats.inherited, 0);
+        assert_eq!(
+            cat.all_entry_ids().unwrap(),
+            vec!["imdb:tt0093773".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_rating_key_pin_wins_over_a_changed_playback_path() {
+        // First pass: no GUID at all, so the id is a path hash of the
+        // original playback path.
+        let cat = Catalog::open_in_memory().unwrap();
+        let first = movie("rk-b", "/data/media/movies/Predator.mkv", &[]);
+        let stats1 = ingest_items(&cat, &[first], &["/data/media".into()]).unwrap();
+        assert_eq!(stats1.inherited, 0);
+        let fs_id = cat.all_entry_ids().unwrap()[0].clone();
+        assert!(fs_id.starts_with("fs:"));
+
+        // Second pass: same ratingKey, but Plex now reports a different
+        // playback path (e.g. the file was renamed) and still no GUID. A
+        // path-match against the new canonical path would miss entirely and
+        // a fresh derivation would mint a different fs: id. The rating-key
+        // pin must resolve onto the original entry regardless.
+        let second = movie("rk-b", "/data/media/movies/Predator (2018).mkv", &[]);
+        let stats2 = ingest_items(&cat, &[second], &["/data/media".into()]).unwrap();
+        assert_eq!(stats2.inherited, 1);
+        assert_eq!(cat.all_entry_ids().unwrap(), vec![fs_id.clone()]);
+        let sources = cat.sources_for(&fs_id).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].playback_path, "/data/media/movies/Predator (2018).mkv",
+            "the provenance row's path still updates even though the id is pinned"
+        );
     }
 
     #[test]
