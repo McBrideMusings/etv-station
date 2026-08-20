@@ -73,8 +73,9 @@ pub async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ersatztv_core::STALL_EXIT_CODE;
+
+    use super::*;
 
     #[test]
     fn idle_timeout_exits_zero() {
