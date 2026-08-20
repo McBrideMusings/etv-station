@@ -239,7 +239,8 @@ impl ChannelSession {
                 generated_subtitle_playlist_file: generated_subtitle_output_file,
                 ffmpeg_playlist_file: ffmpeg_output_file.to_owned(),
             },
-        );
+        )
+        .await;
 
         let playlist_manager = Arc::new(Mutex::new(playlist_manager));
 

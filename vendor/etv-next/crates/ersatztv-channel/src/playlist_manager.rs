@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_channel::error::ChannelError;
-use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT};
+use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, SEQUENCE_FILE_NAME};
 use ffpipeline::pipeline::PtsOffset;
 use ffpipeline::web_vtt::{Cue, format_vtt_ts};
 use time::OffsetDateTime;
@@ -64,6 +64,7 @@ pub struct PlaylistManager {
     output_folder: PathBuf,
     ready_file: PathBuf,
     heartbeat_file: PathBuf,
+    sequence_file: PathBuf,
     generated_playlist_file: String,
     /// `None` on a channel that burns subtitles into the picture — there are no
     /// `.vtt` files for a subtitle playlist to point at, so none is written.
@@ -91,6 +92,24 @@ pub struct PlaylistManager {
     last_progress: OffsetDateTime,
 }
 
+/// The sequence counters a session carries across worker restarts, persisted to
+/// [`SEQUENCE_FILE_NAME`] in the output folder.
+///
+/// Both fields name what the *next* segment must be numbered, not what the last
+/// one was, so seeding a fresh [`PlaylistManager`] is a plain assignment with no
+/// off-by-one to get wrong at the call site.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SequenceState {
+    /// `EXT-X-MEDIA-SEQUENCE` the next segment produced on this session takes.
+    /// Strictly above every sequence number already published, so a client that
+    /// discards anything at or below what it has already consumed still accepts
+    /// the first segment of the new worker.
+    next_media_sequence: u64,
+    /// `EXT-X-DISCONTINUITY-SEQUENCE` in force once the segments held now have
+    /// all been trimmed away.
+    next_discontinuity_sequence: u64,
+}
+
 #[derive(Clone)]
 struct Segment {
     path: String,
@@ -105,7 +124,15 @@ pub struct PlaylistManagerOutputFiles {
 }
 
 impl PlaylistManager {
-    pub fn new(
+    /// Build a manager for `output_folder`, resuming the session's sequence
+    /// numbering if a previous worker left its counters behind.
+    ///
+    /// Resuming is the normal case, not the exceptional one: a client holds one
+    /// session URL across every worker restart under it, so the numbering it
+    /// sees has to keep climbing even though the process producing it did not
+    /// survive. A missing or unreadable counter file means a genuinely new
+    /// session and starts at zero.
+    pub async fn new(
         channel_start_time: OffsetDateTime,
         target_duration: u32,
         output_folder: PathBuf,
@@ -113,11 +140,15 @@ impl PlaylistManager {
         output_files: PlaylistManagerOutputFiles,
     ) -> PlaylistManager {
         let heartbeat_file = output_folder.join(HEARTBEAT_FILE_NAME);
+        let sequence_file = output_folder.join(SEQUENCE_FILE_NAME);
+
+        let resumed = read_sequence_state(&sequence_file).await;
 
         PlaylistManager {
             output_folder,
             ready_file,
             heartbeat_file,
+            sequence_file,
             generated_playlist_file: output_files.generated_playlist_file,
             ffmpeg_playlist_file: output_files.ffmpeg_playlist_file,
             generated_subtitle_playlist_file: output_files.generated_subtitle_playlist_file,
@@ -125,12 +156,18 @@ impl PlaylistManager {
 
             segments: VecDeque::new(),
             discontinuity_before: HashSet::new(),
-            media_sequence: 0,
-            last_served_media_sequence: 0,
-            discontinuity_sequence: 0,
+            media_sequence: resumed.next_media_sequence,
+            last_served_media_sequence: resumed.next_media_sequence,
+            discontinuity_sequence: resumed.next_discontinuity_sequence,
             target_duration,
             target_duration_f64: target_duration as f64,
-            pending_discontinuity: false,
+            // A resumed session's first segment comes from a different encoder
+            // run than the last one a client consumed — new PTS base, possibly
+            // new codec parameters — so it needs an EXT-X-DISCONTINUITY ahead of
+            // it. Continuing the sequence numbering without that tag would tell
+            // the client the two spliced cleanly, which is the one claim a
+            // restart cannot make.
+            pending_discontinuity: resumed != SequenceState::default(),
             last_segment_end: channel_start_time,
             current_session_start: channel_start_time,
 
@@ -322,6 +359,14 @@ impl PlaylistManager {
             .await?;
         }
 
+        // Persist the counters *after* the playlist naming them is on disk, so
+        // the file can only ever promise numbering that has already been
+        // published. Crashing between the two costs a restart the reuse of a few
+        // sequence numbers no client was served — the harmless direction. The
+        // reverse order would let a crash advertise numbers that never shipped,
+        // leaving a permanent gap in the sequence.
+        self.persist_sequence_state().await?;
+
         if !self.ready && self.segments.len() >= MIN_SEGMENTS {
             tokio::fs::write(&self.ready_file, b"").await?;
             self.ready = true;
@@ -363,6 +408,32 @@ impl PlaylistManager {
             }
         }
 
+        Ok(())
+    }
+
+    /// The counters a worker taking over this session folder must start from.
+    ///
+    /// `next_media_sequence` counts past every segment currently held, not just
+    /// those a trim has already dropped: all of them have been published under
+    /// this session's numbering, and a successor that reused any of those
+    /// numbers for different content would be offering a client segments it has
+    /// grounds to discard.
+    fn sequence_state(&self) -> SequenceState {
+        SequenceState {
+            next_media_sequence: self.media_sequence + self.segments.len() as u64,
+            next_discontinuity_sequence: self.discontinuity_sequence
+                + self
+                    .segments
+                    .iter()
+                    .filter(|s| self.discontinuity_before.contains(&s.path))
+                    .count() as u64,
+        }
+    }
+
+    async fn persist_sequence_state(&self) -> Result<(), ChannelError> {
+        let state = serde_json::to_string(&self.sequence_state())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        write_atomically(&self.output_folder, &self.sequence_file, state).await?;
         Ok(())
     }
 
@@ -466,6 +537,34 @@ impl PlaylistManager {
     }
 }
 
+/// Read a session's persisted sequence counters, or [`SequenceState::default`]
+/// when there are none to read.
+///
+/// Every failure route lands on the default deliberately. A missing file is the
+/// ordinary first-run case; a truncated or malformed one is a file that was
+/// being written when the process died. Neither is worth refusing to start a
+/// channel over — the cost of falling back is that one already-tuned client
+/// freezes until it re-tunes, which is exactly what happened before any of this
+/// was persisted, and the cost of propagating the error is a channel that will
+/// not start at all.
+async fn read_sequence_state(path: &Path) -> SequenceState {
+    let Ok(contents) = tokio::fs::read_to_string(path).await else {
+        return SequenceState::default();
+    };
+    match serde_json::from_str(&contents) {
+        Ok(state) => state,
+        Err(e) => {
+            log::warn!(
+                "ignoring unreadable sequence file {}: {e}; this session's segment numbering \
+                 restarts from zero and any client already tuned to it will freeze until it \
+                 re-tunes",
+                path.display()
+            );
+            SequenceState::default()
+        }
+    }
+}
+
 /// Write `contents` to `destination` in a single step no reader can catch
 /// half-finished: fill a temp file in `folder` — the same folder the
 /// destination lives in, so the rename cannot cross filesystems — then rename
@@ -560,7 +659,7 @@ mod tests {
     /// A manager whose newest segment ends at `last_segment_end`. Passing that as
     /// the channel start time is how a session that has never produced a segment
     /// looks too — the field only ever advances when one is added.
-    fn manager(dir: &Path, last_segment_end: OffsetDateTime) -> PlaylistManager {
+    async fn manager(dir: &Path, last_segment_end: OffsetDateTime) -> PlaylistManager {
         let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
 
         PlaylistManager::new(
@@ -574,6 +673,7 @@ mod tests {
                 ffmpeg_playlist_file: file("ffmpeg.m3u8"),
             },
         )
+        .await
     }
 
     async fn watch(dir: &Path) {
@@ -593,7 +693,8 @@ mod tests {
         let mut pm = manager(
             dir.path(),
             OffsetDateTime::now_utc() + time::Duration::minutes(1),
-        );
+        )
+        .await;
         pm.update().await.unwrap();
 
         assert_eq!(pm.abort(), None);
@@ -607,7 +708,8 @@ mod tests {
         let mut pm = manager(
             dir.path(),
             OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS - 5),
-        );
+        )
+        .await;
         pm.update().await.unwrap();
 
         assert_eq!(pm.abort(), None);
@@ -621,7 +723,8 @@ mod tests {
         let mut pm = manager(
             dir.path(),
             OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS + 5),
-        );
+        )
+        .await;
         pm.update().await.unwrap();
 
         assert_eq!(pm.abort(), Some(SessionAbort::SegmentStall));
@@ -636,7 +739,8 @@ mod tests {
         let mut pm = manager(
             dir.path(),
             OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS + 5),
-        );
+        )
+        .await;
         pm.update().await.unwrap();
 
         assert_eq!(pm.abort(), None);
@@ -655,7 +759,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         watch(dir.path()).await;
 
-        let mut pm = manager(dir.path(), OffsetDateTime::now_utc());
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
         pm.update().await.unwrap();
 
         for name in ["live.m3u8", "live_sub.m3u8"] {
@@ -666,5 +770,131 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o644, "{name} should be 0644, was {mode:o}");
         }
+    }
+
+    /// Give `pm` `count` segments, as `update` would once ffmpeg had written
+    /// them, without needing ffmpeg to have written anything.
+    fn push_segments(pm: &mut PlaylistManager, count: usize) {
+        for i in 0..count {
+            let program_date_time = pm.last_segment_end;
+            pm.segments.push_back(Segment {
+                path: format!("live{i:06}.ts"),
+                duration: pm.target_duration_f64,
+                program_date_time,
+            });
+            pm.last_segment_end += Duration::from_secs_f64(pm.target_duration_f64);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_session_numbers_from_zero() {
+        let dir = TempDir::new().unwrap();
+
+        let pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert_eq!(pm.media_sequence, 0);
+        assert_eq!(pm.discontinuity_sequence, 0);
+        assert!(
+            !pm.pending_discontinuity,
+            "nothing precedes the first segment of a new session, so there is \
+             nothing for it to be discontinuous with"
+        );
+    }
+
+    /// The freeze this whole mechanism exists to prevent: a worker exits, the
+    /// server wipes the folder and respawns it, and the replacement must not
+    /// hand a still-tuned client segment numbers it has already consumed.
+    #[tokio::test]
+    async fn a_restarted_worker_numbers_above_every_segment_the_last_one_published() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut first = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        push_segments(&mut first, 12);
+        first.media_sequence = 138;
+        first.update().await.unwrap();
+
+        // 138 already trimmed away plus the 12 still held: the client may have
+        // consumed through 149, so 150 is the first number free to reuse.
+        assert_eq!(first.sequence_state().next_media_sequence, 150);
+
+        ersatztv_core::empty_folder(dir.path()).await.unwrap();
+        let second = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert_eq!(second.media_sequence, 150);
+        assert_eq!(second.last_served_media_sequence, 150);
+        assert!(
+            second.pending_discontinuity,
+            "a resumed session's first segment comes from a different encoder run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_worker_carries_the_discontinuity_count_forward() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut first = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        push_segments(&mut first, 4);
+        first.discontinuity_sequence = 2;
+        first
+            .discontinuity_before
+            .insert("live000002.ts".to_owned());
+        first.update().await.unwrap();
+
+        // Two already trimmed past, one still held ahead of a live segment.
+        assert_eq!(first.sequence_state().next_discontinuity_sequence, 3);
+
+        ersatztv_core::empty_folder(dir.path()).await.unwrap();
+        let second = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert_eq!(second.discontinuity_sequence, 3);
+    }
+
+    /// A counter file caught half-written by a crash must not stop the channel
+    /// from starting — the cost of ignoring it is one client re-tuning, and the
+    /// cost of refusing is a channel nobody can watch.
+    #[tokio::test]
+    async fn a_corrupt_sequence_file_is_ignored_rather_than_fatal() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join(SEQUENCE_FILE_NAME), b"{\"next_media_seq")
+            .await
+            .unwrap();
+
+        let pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert_eq!(pm.media_sequence, 0);
+    }
+
+    /// The published playlist is the promise; the counter file must never
+    /// advertise numbering that playlist did not carry.
+    #[tokio::test]
+    async fn the_persisted_counter_never_runs_ahead_of_the_published_playlist() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        push_segments(&mut pm, 6);
+        pm.update().await.unwrap();
+
+        let playlist = tokio::fs::read_to_string(dir.path().join("live.m3u8"))
+            .await
+            .unwrap();
+        let published: u64 = playlist
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+            .expect("playlist carries a media sequence")
+            .parse()
+            .unwrap();
+        let segments_listed = playlist.lines().filter(|l| l.ends_with(".ts")).count() as u64;
+
+        let persisted: SequenceState = serde_json::from_str(
+            &tokio::fs::read_to_string(dir.path().join(SEQUENCE_FILE_NAME))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(persisted.next_media_sequence, published + segments_listed);
     }
 }

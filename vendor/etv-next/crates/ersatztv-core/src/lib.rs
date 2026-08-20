@@ -14,6 +14,24 @@ pub const READY_FILE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const HEARTBEAT_FILE_NAME: &str = ".heartbeat";
 pub const HEARTBEAT_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Carries a session's HLS sequence counters across a worker restart, so a new
+/// worker numbers its first segment above the last one the previous worker
+/// published.
+///
+/// A client polls one URL — `/session/{channel}/live.m3u8` — for the life of its
+/// tune-in, and RFC 8216 §6.2.1 requires `EXT-X-MEDIA-SEQUENCE` never to
+/// decrease across that URL's lifetime. But the worker is a process that exits
+/// and respawns under a client that never noticed, and each respawn wipes the
+/// output folder ([`empty_folder`]) and builds a fresh
+/// `PlaylistManager` starting at zero. The in-memory monotonic clamp there only
+/// spans one process, which is the one span where the counter was never going to
+/// go backwards anyway.
+///
+/// So the counters live here instead, in the session folder, which outlives any
+/// one worker. [`empty_folder`] preserves this file by name for that reason: the
+/// wipe clears the session's *media*, not its *identity*.
+pub const SEQUENCE_FILE_NAME: &str = ".sequence";
+
 /// Touched by the channel worker before it opens a live overlay's rawvideo fifo
 /// for read. Its presence tells the overlay producer (the separate etv-station
 /// daemon) that this channel is now being watched and its overlay process
@@ -60,6 +78,16 @@ pub const STALL_EXIT_CODE: i32 = 75;
 
 pub const VERSION: &str = env!("ETV_VERSION_STRING");
 
+/// Empty a session's output folder, keeping the folder itself and
+/// [`SEQUENCE_FILE_NAME`].
+///
+/// The sequence file survives because it is the one thing in here that is not
+/// media: it records how far this session's segment numbering has already got,
+/// and a client still polling the session URL holds the other half of that
+/// agreement. Deleting it is what let a respawn renumber from zero underneath a
+/// player that had already consumed segment 150 — the player then discards every
+/// lower-numbered segment the new worker offers and freezes on its last decoded
+/// frame. See [`SEQUENCE_FILE_NAME`].
 pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io::Error> {
     if !output_folder.exists() {
         create_dir_all(output_folder).await?;
@@ -67,6 +95,9 @@ pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io
 
     let mut entries = read_dir(output_folder).await?;
     while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name() == std::ffi::OsStr::new(SEQUENCE_FILE_NAME) {
+            continue;
+        }
         if let Ok(file_type) = entry.file_type().await {
             if file_type.is_dir() {
                 Box::pin(empty_folder(&entry.path())).await?;
@@ -82,7 +113,32 @@ pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io
 
 #[cfg(test)]
 mod empty_folder_tests {
-    use super::empty_folder;
+    use super::{SEQUENCE_FILE_NAME, empty_folder};
+
+    /// The sequence file is the session's identity, not its media, and a client
+    /// still polling the session URL depends on it outliving the wipe. Delete it
+    /// and the next worker renumbers from zero under that client, which freezes
+    /// on its last decoded frame.
+    #[tokio::test]
+    async fn keeps_the_sequence_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        tokio::fs::write(root.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(SEQUENCE_FILE_NAME), b"{}")
+            .await
+            .unwrap();
+
+        empty_folder(root).await.unwrap();
+
+        assert!(!root.join("live000000.ts").exists(), "media should be gone");
+        assert!(
+            root.join(SEQUENCE_FILE_NAME).exists(),
+            "the sequence file must survive the wipe"
+        );
+    }
 
     /// The case this exists for: a channel's HLS output folder — `.ts`
     /// segments, `.vtt` sidecars, and nested report directories — must come
