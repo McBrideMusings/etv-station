@@ -127,7 +127,10 @@ scan_ffmpeg_pids() {
     FFMPEG_PID=()
     for p in /proc/[0-9]*; do
         [ -r "$p/cmdline" ] || continue
-        args=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+        # Brace-wrap the redirection: a process can exit between the glob and
+        # this read, and `2>/dev/null` on `tr` alone does not suppress the
+        # shell's own "No such file or directory" for a failed `<`.
+        args=$({ tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null) || continue
         case "$args" in
             ffmpeg\ *"$HLS_ROOT/"*)
                 ch=${args##*"$HLS_ROOT/"}
@@ -147,7 +150,7 @@ ffmpeg_pid_for() { printf '%s' "${FFMPEG_PID[$1]:-}"; }
 # channel is named by id.
 overlay_fifo_for() {
     local fpid="$1"
-    tr '\0' '\n' < "/proc/$fpid/cmdline" 2>/dev/null | grep -m1 'overlay\.fifo'
+    { tr '\0' '\n' < "/proc/$fpid/cmdline"; } 2>/dev/null | grep -m1 'overlay\.fifo'
 }
 
 overlay_pid_for_fifo() {
@@ -155,7 +158,7 @@ overlay_pid_for_fifo() {
     [ -n "$fifo" ] || return
     for p in /proc/[0-9]*; do
         [ -r "$p/cmdline" ] || continue
-        args=$(tr '\0' '\n' < "$p/cmdline" 2>/dev/null) || continue
+        args=$({ tr '\0' '\n' < "$p/cmdline"; } 2>/dev/null) || continue
         case "$args" in
             *etv-overlay*) printf '%s\n' "$args" | grep -qxF "$fifo" && { basename "$p"; return; } ;;
         esac

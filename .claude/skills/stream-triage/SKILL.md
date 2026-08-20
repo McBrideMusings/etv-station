@@ -63,13 +63,13 @@ problem is client-side or already over.
 | Clock | Where | Healthy looks like |
 |---|---|---|
 | Viewer | `data/diag/access.log` | steady `GET /session/<N>/liveNNNNNN.ts 200/206` |
-| ffmpeg | container log, `ffmpeg_progress` | `out_time` advancing 1:1 with wall clock, `fps` ≈ source fps |
+| ffmpeg | `data/diag/ffmpeg-progress.log` | `out_time` advancing 1:1 with wall clock, `fps` ≈ source fps |
 | Overlay | `data/playout/<folder>/overlay.heartbeat` | `frames_written` climbing |
 
 ```sh
-# ffmpeg clock
+# ffmpeg clock (its own file — NOT the container log; see below)
 ssh "$UNRAID_USER@$UNRAID_HOST" \
-  "docker logs --since 5m etv-station 2>&1 | grep 'channel <N>' | grep ffmpeg_progress | tail -3"
+  "docker exec etv-station sh -c 'grep \"channel <N>:\" /data/diag/ffmpeg-progress.log | tail -3'"
 
 # overlay clock (sample twice; a single sample proves nothing — see below)
 ssh "$UNRAID_USER@$UNRAID_HOST" \
@@ -96,14 +96,19 @@ Many clients do not survive that even when the server is healthy again, so
 
 ## Step 3 — rule on which side stopped
 
+**There is nothing to arm.** The capture runs inside the container, started by
+`docker/entrypoint.sh`, watching every channel that has a running transcode. It
+comes back with the container and it is not behind `ETV_DIAG_CAPTURE` — a freeze
+is unannounced, so a capture you have to remember to switch on is off when it
+matters. Just read what it already recorded:
+
 ```sh
-# already installed at /mnt/user/appdata/etv-station/two-clock-capture.sh
 ssh "$UNRAID_USER@$UNRAID_HOST" \
-  "bash /mnt/user/appdata/etv-station/two-clock-capture.sh <N> --gap 12"
+  "docker exec etv-station sh -c 'grep -A6 \"channel=<N>\" /data/diag/two-clock.log | tail -40'"
 ```
 
-Arm it *before* the freeze; it polls the segment index and captures on a gap.
-Results land in `data/diag/two-clock-<N>.log`. Verdicts:
+Confirm it is alive with `docker logs etv-station 2>&1 | grep two-clock`, which
+should show `two-clock freeze capture started`. Verdicts:
 
 | Verdict | Means | Go look at |
 |---|---|---|
@@ -113,7 +118,12 @@ Results land in `data/diag/two-clock-<N>.log`. Verdicts:
 | `mutual-pipe-block` | both wedged on the fifo | genuine deadlock, the most interesting case |
 
 `--self-test` exercises the verdict logic with no host and no freeze. Run it
-after editing the script.
+after editing the script — locally, or in the container with
+`docker exec etv-station two-clock-capture.sh --self-test`.
+
+A channel with no ffmpeg is skipped rather than reported: its HLS folder keeps
+the last session's segments forever, so an idle channel would otherwise look
+permanently frozen.
 
 ## Readings that mean nothing (do not re-derive these)
 
@@ -131,12 +141,24 @@ after editing the script.
   the detector, so "it paused briefly at an item boundary" does not explain a
   stall.
 
-## The container log window is short
+## Where the progress history lives
 
-`ffmpeg_progress` logs once per second per channel. With six channels that is
-~21,600 lines/hour, and the docker buffer holds roughly **2.8 hours** even
-though the container may have been up for days. Check before concluding anything
-about rates or onset:
+`ffmpeg_progress` no longer goes to the Docker log driver. It logs once per
+second per channel — ~21,600 lines/hour at six channels — and used to hold the
+buffer down to ~2.8 hours of history even after days of uptime, so the record
+leading up to a freeze was routinely gone before anyone looked. It now has its
+own rotated file:
+
+```sh
+ssh "$UNRAID_USER@$UNRAID_HOST" \
+  "docker exec etv-station sh -c 'grep \"channel <N>:\" /data/diag/ffmpeg-progress.log | tail -20'"
+```
+
+Rolled files are `ffmpeg-progress.log.1`, `.2`. Size and count are
+`ETV_PROGRESS_LOG_MAX_BYTES` (64MB) and `ETV_PROGRESS_LOG_KEEP` (2).
+
+The Docker log still holds everything else, but check its span before claiming
+anything about rates or onset — that mistake has been made in this repo:
 
 ```sh
 ssh "$UNRAID_USER@$UNRAID_HOST" \
@@ -221,12 +243,14 @@ Neither of these needs the host.
 ```sh
 ./tools/overlay-stall-repro.sh --dur 15 --write-secs 5 --pause-secs 8
 ./tools/overlay-heartbeat-check.sh
+./tools/progress-split-check.sh
 ```
 
 The first proves a silent writer wedges ffmpeg (`stall` arm), a closing writer
 does not (`close`), and a resuming one recovers (`resume`). The second proves
-the overlay's own clock reports correctly when the *reader* stops. Both exit
-non-zero on failure, so they work as pass/fail loops.
+the overlay's own clock reports correctly when the *reader* stops. The third
+covers the progress-log split and its rotation. All three exit non-zero on
+failure, so they work as pass/fail loops.
 
 ## Escalation checklist
 
