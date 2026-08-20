@@ -32,4 +32,4 @@ pub use pool::{
 };
 pub use rule::{BlockInclude, RuleConfig};
 pub use source::SourceConfig;
-pub use station::StationConfig;
+pub use station::{StationConfig, derive_channel_seed};

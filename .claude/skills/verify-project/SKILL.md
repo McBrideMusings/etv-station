@@ -77,6 +77,32 @@ from a previous one.
 already built. To force real work, change the channel config or clear that channel's
 output dir.
 
+## Verifying the seed cascade
+
+A channel with no `seed:` inherits the station `seed:`, salted with the
+channel's folder name (#324). Two surfaces prove it:
+
+```bash
+cargo test -p etv-station --test station_seed_cascade   # load() → derived, salted, stable seeds
+```
+
+At the daemon, boot the same config twice — once with `seed:` on the station
+file, once without — and read the startup log:
+
+```
+# station seed set: nothing about seeds in the log, channels just load
+INFO etv_station: loaded channel event="channel.load" channel=alpha …
+
+# station seed absent: one INFO line per unseeded channel, naming it
+INFO etv_station::config::load: no channel seed and no station seed:
+     this channel reshuffles on every generation channel=alpha
+```
+
+That second line is the pass condition for "an unseeded channel is visible
+rather than silent". Seeing it in a production log means that channel still
+redraws a wall-clock seed on every regeneration and reshuffles its whole future
+window whenever a catalog refresh changes its candidate set.
+
 ## Verifying the catalog refresh and the reconciliation sweep
 
 **Nothing here is an operation anyone runs.** Both are timers inside the daemon:
