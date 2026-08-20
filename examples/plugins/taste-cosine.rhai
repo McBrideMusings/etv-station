@@ -142,15 +142,38 @@ fn pick(ctx) {
 
     let seed = ctx.seed;
 
-    // The scoring is written out here rather than called as a helper, and
-    // that is a performance decision: Rhai passes arguments by value, so a
-    // helper taking the fetched enrichment map or the weights map would
-    // clone one of them on every candidate — #172 measured exactly this
-    // shape of helper call at 124s against 13s for the same arithmetic
-    // inlined, on an 84,722-item library. `mix32`/`hash_str`/`unit_at` above
-    // take only a handful of scalars and one short string each, so calling
-    // them per candidate below costs nothing comparable — nothing here
-    // holds a copy of a library-sized collection.
+    // Document-frequency pass (#294): how many candidates carry each
+    // keyword, and how many candidates carry any `ns` fact at all. Feeds the
+    // idf factor below, which is what keeps a title with one keyword shared
+    // by every candidate in the pool from tying a title with several rare,
+    // distinctive ones.
+    //
+    // This pass is written out here rather than called as a helper, and so
+    // is the scoring loop below it — that is a performance decision: Rhai
+    // passes arguments by value, so a helper taking the fetched enrichment
+    // map or the weights map would clone one of them on every candidate —
+    // #172 measured exactly this shape of helper call at 124s against 13s
+    // for the same arithmetic inlined, on an 84,722-item library.
+    // `mix32`/`hash_str`/`unit_at` above take only a handful of scalars and
+    // one short string each, so calling them per candidate below costs
+    // nothing comparable — nothing here holds a copy of a library-sized
+    // collection.
+    let df = #{};
+    let doc_count = 0;
+    for item in items {
+        let facts = enrichment[item.entry_id];
+        if facts != () {
+            doc_count += 1;
+            for f in facts {
+                if f.namespace == ns {
+                    let k = f.key + "\x01" + f.value;
+                    let c = df[k];
+                    df[k] = if c == () { 1 } else { c + 1 };
+                }
+            }
+        }
+    }
+
     let scored = [];
     for item in items {
         let id = item.entry_id;
@@ -163,24 +186,36 @@ fn pick(ctx) {
         let on_profile = [];
         if facts != () {
             eligible = true;
-            let n = facts.len;
+            let n = 0;
             let sum = 0.0;
             for f in facts {
                 if f.namespace == ns {
-                    let w = weights[f.key + "\x01" + f.value];
+                    n += 1;
+                    let k = f.key + "\x01" + f.value;
+                    let w = weights[k];
                     if w != () {
-                        sum += w;
+                        // idf: a keyword every candidate carries scales by
+                        // exactly 1.0 (doc_count / df == 1, ln == 0); a
+                        // keyword only a few candidates carry scales up —
+                        // ln(doc_count / df) grows as df shrinks. df[k] is
+                        // always >= 1 here, since this very candidate
+                        // contributed to it above, so no divide-by-zero.
+                        sum += w * (1.0 + (doc_count.to_float() / df[k].to_float()).ln());
                         on_profile.push(f.value);
                     }
                 }
             }
-            // Cosine: the sum of pooled weights over the candidate's own
-            // keywords, divided by the square root of its keyword count —
-            // not the raw sum (a heavily-tagged title would win on tag
-            // count alone, regardless of subject) and not the plain mean
-            // (one lucky keyword would tie the maximum possible score, and
-            // a fifth of this library's movies have no keywords at all).
-            // See #254's worked table.
+            // Cosine: the sum of idf-scaled pooled weights over the
+            // candidate's own in-namespace keywords, divided by the square
+            // root of that same keyword count — not the raw sum (a
+            // heavily-tagged title would win on tag count alone, regardless
+            // of subject) and not the plain mean (one lucky keyword would
+            // tie the maximum possible score, and a fifth of this library's
+            // movies have no keywords at all). The idf factor above is what
+            // keeps a title whose one keyword sits on every candidate from
+            // tying a title with several keywords few candidates share
+            // (#294) — the sqrt divisor is unchanged and still does its own
+            // job of not over-rewarding tag count. See #254's worked table.
             if n > 0 { score = sum / n.to_float().sqrt(); }
         }
         scored.push(#{

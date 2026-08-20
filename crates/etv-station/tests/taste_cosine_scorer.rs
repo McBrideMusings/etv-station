@@ -71,8 +71,16 @@ fn write_taste_fixture(path: &Path) {
                  ('mov-a', 'movie'), ('mov-b', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie');
              -- mov-a: keywords contact + time, watched once below — this is what
              -- defines the pooled weights (0.5 each: sqrt(1 play) / 2 keywords).
-             -- mov-c: contact only (on-profile) -> 0.5 / sqrt(1) = 0.5.
-             -- mov-d: time (on-profile) + desert (off-profile) -> 0.5 / sqrt(2).
+             -- Of the four titles, three carry an in-namespace fact at all
+             -- (mov-a, mov-c, mov-d; mov-b has none) so doc_count = 3, and the
+             -- keyword document frequencies are contact=2 (mov-a, mov-c),
+             -- time=2 (mov-a, mov-d), desert=1 (mov-d only) (#294).
+             -- mov-c: contact only (on-profile, df 2 of 3 -> idf factor
+             --   1 + ln(3/2)) -> 0.5 * (1 + ln(3/2)) / sqrt(1).
+             -- mov-d: time (on-profile, df 2 of 3 -> idf factor 1 + ln(3/2))
+             --   + desert (off-profile, contributes nothing to the sum, but
+             --   still counts toward the sqrt(n) divisor) ->
+             --   0.5 * (1 + ln(3/2)) / sqrt(2).
              -- mov-b: no keywords at all -> ineligible, score 0.0.
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
                  ('mov-a', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
@@ -370,13 +378,18 @@ fn the_committed_example_plugin_runs_and_scores_correctly() {
         "highest cosine score first, entry_id breaking the score-0.0 tie: {ids:?}"
     );
 
-    // mov-d carries "time" (on profile, weight 0.5 — mov-a's lone play
-    // split across its two keywords) and "desert" (off profile, weight 0):
-    // sum 0.5, divided by sqrt(2) keywords — #254's worked table, applied to
-    // this fixture's own numbers rather than restated abstractly.
+    // mov-d carries "time" (on profile, weight 0.5 — mov-a's lone play split
+    // across its two keywords — scaled by the idf factor 1 + ln(doc_count /
+    // df), where doc_count is 3 (mov-a, mov-c, mov-d each carry a fact;
+    // mov-b carries none) and "time"'s own df is 2 (mov-a, mov-d)) and
+    // "desert" (off profile, contributes 0 to the sum but still counts
+    // toward the sqrt(n) divisor): sum 0.5 * (1 + ln(3/2)), divided by
+    // sqrt(2) keywords — #254's worked table, extended by #294's idf term,
+    // applied to this fixture's own numbers rather than restated
+    // abstractly.
     let mov_d = picked.iter().find(|p| p.id == "mov-d").unwrap();
     let score = mov_d.metadata.as_ref().unwrap()["score"].as_f64().unwrap();
-    let expected = 0.5 / 2.0_f64.sqrt();
+    let expected = 0.5 * (1.0 + (3.0_f64 / 2.0).ln()) / 2.0_f64.sqrt();
     assert!(
         (score - expected).abs() < 1e-9,
         "mov-d score = {score}, expected {expected}"
@@ -528,6 +541,83 @@ fn exploration_fraction_lands_roughly_one_in_five() {
         ratio > 0.10 && ratio < 0.30,
         "expected roughly 1 in 5 slots to come from the explore draw, got {ratio} \
          ({explore_count}/{total})"
+    );
+}
+
+/// A store for #294's regression case: one played title ("seed") defines
+/// equal weights for a common keyword and a rare one, four candidates carry
+/// only the common keyword, one carries only the rare one, and one carries
+/// both — enough to hand-compute every idf factor below.
+fn write_idf_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('seed', 'movie'),
+                 ('gen1', 'movie'), ('gen2', 'movie'), ('gen3', 'movie'), ('gen4', 'movie'),
+                 ('rare1', 'movie'), ('multi', 'movie');
+             -- seed: common + rare, watched once -> pooled weight 0.5 each
+             -- (sqrt(1 play) / 2 keywords), same as write_taste_fixture above.
+             -- Six candidates carry an in-namespace fact (gen1-4, rare1,
+             -- multi), so doc_count = 6. df(common) = 5 (gen1-4, multi);
+             -- df(rare) = 2 (rare1, multi).
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('seed',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('seed',  'tmdb_keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00'),
+                 ('gen1',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('gen2',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('gen3',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('gen4',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('rare1', 'tmdb_keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00'),
+                 ('multi', 'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('multi', 'tmdb_keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00');
+             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+                 ('h1', 'seed', 42, 1700000000);",
+        )
+        .unwrap();
+}
+
+/// #294's regression: before the idf factor, `sum / sqrt(n)` scored every
+/// single-keyword title purely on that keyword's pooled weight, so a
+/// candidate carrying the pool's most generic keyword (on almost everything)
+/// tied a candidate carrying a keyword only a couple of titles share. Under
+/// the fixed scorer, `gen1`'s lone `common` keyword (df 5 of 6) and `rare1`'s
+/// lone `rare` keyword (df 2 of 6) carry the same *weight* but different
+/// idf, so `rare1` must outrank `gen1` even though the old code tied them —
+/// and `multi`, which carries both keywords, must outrank both.
+#[test]
+fn a_rare_shared_keyword_outranks_a_common_one_and_no_tie_holds_rank_one() {
+    let cat = catalog_of(["gen1", "gen2", "gen3", "gen4", "rare1", "multi"]);
+    let scorer = Scorer::new(&cat, write_idf_fixture);
+    let picked = scorer.pick("movies", 0, 6, Some(0.0));
+
+    let multi = score_of(&picked, "multi");
+    let rare1 = score_of(&picked, "rare1");
+    let gen1 = score_of(&picked, "gen1");
+
+    assert!(
+        multi > rare1,
+        "the multi-keyword title must outrank the rare-single-keyword one: \
+         multi={multi}, rare1={rare1}"
+    );
+    assert!(
+        rare1 > gen1,
+        "a rare shared keyword must outrank a common one of equal weight: \
+         rare1={rare1}, gen1={gen1}"
+    );
+
+    // Rank order: no candidate before it ties its score, i.e. rank 1 is held
+    // by exactly one title, not a multi-way tie the old sqrt(n)-only
+    // normalization would have produced here.
+    let top_score = picked[0].metadata.as_ref().unwrap()["score"]
+        .as_f64()
+        .unwrap();
+    let tied_at_top = picked
+        .iter()
+        .filter(|p| p.metadata.as_ref().unwrap()["score"].as_f64().unwrap() == top_score)
+        .count();
+    assert_eq!(
+        tied_at_top, 1,
+        "rank 1 must be held by exactly one title, not a tie: {picked:?}"
     );
 }
 
