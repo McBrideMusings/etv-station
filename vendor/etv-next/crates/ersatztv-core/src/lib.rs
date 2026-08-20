@@ -101,7 +101,25 @@ pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io
         if let Ok(file_type) = entry.file_type().await {
             if file_type.is_dir() {
                 Box::pin(empty_folder(&entry.path())).await?;
-                remove_dir(entry.path()).await?;
+                // The recursion above deliberately preserves SEQUENCE_FILE_NAME,
+                // so a child that had one is still non-empty and cannot be
+                // removed. That is not a failure: it is this function's own
+                // preservation rule observed one level up, and the folder is a
+                // live session's identity that the next worker will reuse.
+                //
+                // Treating it as fatal took the whole server down at startup —
+                // `main` empties the output root, which recurses into every
+                // channel session folder, keeps each `.sequence`, and then tried
+                // to rmdir them. Any channel whose media had already been
+                // cleared left a folder containing nothing but `.sequence`, and
+                // the process exited with "Directory not empty (os error 39)"
+                // before serving anything. One leftover dotfile could take the
+                // entire lineup offline until somebody deleted it by hand.
+                match remove_dir(entry.path()).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(e) => return Err(e),
+                }
             } else {
                 remove_file(entry.path()).await?;
             }
@@ -167,6 +185,66 @@ mod empty_folder_tests {
         assert!(
             entries.next_entry().await.unwrap().is_none(),
             "no files or directories should remain"
+        );
+    }
+
+    /// The startup shape, and the regression this guards: `main` empties the
+    /// output ROOT, which recurses into each channel's session folder. Those
+    /// folders keep their `.sequence`, so they are still non-empty when the
+    /// recursion returns and tries to remove them.
+    ///
+    /// This used to abort the whole wipe with "Directory not empty (os error
+    /// 39)" and take the server down before it served anything — on 2026-08-20
+    /// two channels whose media had already been cleared left folders holding
+    /// nothing but `.sequence`, and the container restart-looped until the files
+    /// were deleted by hand. A leftover dotfile must never cost the lineup.
+    #[tokio::test]
+    async fn a_child_session_folder_keeping_its_sequence_file_does_not_fail_the_wipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Channel 5: media already cleared, only the sequence file left. This is
+        // the exact shape that took production down.
+        let ch5 = root.join("5");
+        tokio::fs::create_dir(&ch5).await.unwrap();
+        tokio::fs::write(ch5.join(SEQUENCE_FILE_NAME), b"{}")
+            .await
+            .unwrap();
+
+        // Channel 9: still has media alongside its sequence file.
+        let ch9 = root.join("9");
+        tokio::fs::create_dir(&ch9).await.unwrap();
+        tokio::fs::write(ch9.join(SEQUENCE_FILE_NAME), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(ch9.join("live000042.ts"), b"segment")
+            .await
+            .unwrap();
+
+        // A genuinely stale folder with no identity to preserve still goes.
+        let stale = root.join("77");
+        tokio::fs::create_dir(&stale).await.unwrap();
+        tokio::fs::write(stale.join("live000001.ts"), b"segment")
+            .await
+            .unwrap();
+
+        empty_folder(root).await.unwrap();
+
+        assert!(
+            ch5.join(SEQUENCE_FILE_NAME).exists(),
+            "channel 5 keeps its identity across the wipe"
+        );
+        assert!(
+            ch9.join(SEQUENCE_FILE_NAME).exists(),
+            "channel 9 keeps its identity across the wipe"
+        );
+        assert!(
+            !ch9.join("live000042.ts").exists(),
+            "channel 9's media is still cleared"
+        );
+        assert!(
+            !stale.exists(),
+            "a folder with nothing to preserve is still removed"
         );
     }
 
