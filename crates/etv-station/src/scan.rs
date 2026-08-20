@@ -54,32 +54,39 @@ pub async fn scan_output_folder(folder: &Path) -> Result<Vec<DiscoveredFile>, St
     Ok(out)
 }
 
-/// The furthest instant any discovered file reaches, read from the items'
-/// real finish times rather than trusted from the filename — the same way
-/// [`first_coverage_gap`] reads item spans instead of filenames. A chunk is
-/// *named* for its boundary even when its last item keeps airing past it (a
-/// movie straddling the seam is written into both neighbouring chunk files on
-/// purpose), so trusting the filename here would under-claim the frontier and
-/// stop forward materialization early (the #154 defect).
+/// The furthest instant any discovered file reaches, checking only the frontier
+/// chunk (last file) for items straddling past its filename finish.
 ///
-/// A file that can't be read or parsed as a `Playout` (blank, garbage, or a
-/// sidecar this scan shouldn't have matched) falls back to its filename
-/// finish rather than being skipped, so a single unreadable file can't hide
-/// the frontier the daemon resumes from.
+/// Only the frontier chunk can hold an item past every filename finish: per
+/// docs/adr/0003-one-file-per-chunk-honest-names.md, an item straddling a
+/// boundary is emitted whole into both neighbouring chunks, so earlier chunks'
+/// filename finish is authoritative. Therefore only the last file is opened and
+/// parsed; every earlier file uses its filename finish without I/O.
+///
+/// A frontier file that can't be read or parsed falls back to its filename
+/// finish, so a single unreadable frontier file can't hide the materialization
+/// frontier.
+///
+/// Requires `files` sorted by `start` (as returned by `scan_output_folder`) and
+/// the full unfiltered scan result; a filtered slice would violate the invariant.
 pub async fn highest_finish(files: &[DiscoveredFile]) -> Option<OffsetDateTime> {
-    let mut max: Option<OffsetDateTime> = None;
-    for f in files {
-        let mut finish = f.finish;
-        if let Ok(bytes) = tokio::fs::read(&f.path).await
-            && let Ok(playout) = serde_json::from_slice::<Playout>(&bytes)
-            && let Some(item_finish) = playout.items.iter().map(|item| item.finish).max()
-            && item_finish > finish
-        {
-            finish = item_finish;
-        }
-        max = Some(max.map_or(finish, |m| m.max(finish)));
+    let (last, rest) = files.split_last()?;
+
+    // Compute max filename finish for all earlier files (no I/O needed).
+    let mut max = rest.iter().map(|f| f.finish).max().unwrap_or(last.finish);
+
+    // Read and parse only the last file, falling back to its filename finish if needed.
+    let mut last_finish = last.finish;
+    if let Ok(bytes) = tokio::fs::read(&last.path).await
+        && let Ok(playout) = serde_json::from_slice::<Playout>(&bytes)
+        && let Some(item_finish) = playout.items.iter().map(|item| item.finish).max()
+        && item_finish > last_finish
+    {
+        last_finish = item_finish;
     }
-    max
+
+    max = max.max(last_finish);
+    Some(max)
 }
 
 /// What one sweep removed, split by which end of the window it fell off.
@@ -644,5 +651,49 @@ mod tests {
         assert_eq!(files[0].start, start);
         assert_eq!(files[0].finish, finish);
         assert_eq!(highest_finish(&files).await, Some(finish));
+    }
+
+    #[tokio::test]
+    async fn highest_finish_ignores_earlier_files_over_claims() {
+        // The fix: earlier files' filename finish is authoritative, even if their
+        // contents over-claim beyond it. Only the frontier (last) file is opened.
+        let dir = tempdir().unwrap();
+
+        // Earlier file named [12:00, 13:00] but holding an item until 20:00.
+        // In the old code, this would bump the result; in the fix, it's ignored.
+        write_playout(
+            dir.path(),
+            datetime!(2026-08-09 12:00 UTC),
+            datetime!(2026-08-09 13:00 UTC),
+            &[(
+                datetime!(2026-08-09 12:00 UTC),
+                datetime!(2026-08-09 20:00 UTC), // Over-claims way past the name
+            )],
+        )
+        .await;
+
+        // Frontier file with its own straddling item.
+        write_playout(
+            dir.path(),
+            datetime!(2026-08-09 13:00 UTC),
+            datetime!(2026-08-09 14:00 UTC),
+            &[(
+                datetime!(2026-08-09 13:00 UTC),
+                datetime!(2026-08-09 16:00 UTC), // Straddles past its name
+            )],
+        )
+        .await;
+
+        let files = scan_output_folder(dir.path()).await.unwrap();
+        assert_eq!(files.len(), 2, "should have 2 files");
+
+        let finish = highest_finish(&files).await;
+        // Should return the frontier item's finish (16:00), NOT the earlier
+        // file's over-claimed finish (20:00).
+        assert_eq!(
+            finish,
+            Some(datetime!(2026-08-09 16:00 UTC)),
+            "highest_finish should use only frontier file's items, ignoring earlier over-claims",
+        );
     }
 }
