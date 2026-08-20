@@ -243,3 +243,39 @@ with ETV-next. For the HTTP surface locally use `admin dev` (daemon + ETV-next),
   a code change is `image`. `files` is the cheap one and is also the one that historically
   broke ownership on arrival — see the `post_sync` chown comment in `admin.toml`.
 - Remote log tailing is `admin diag` (access log + stream events over ssh).
+
+## Diagnosing a frozen channel (the overlay fifo)
+
+A channel that freezes while somebody is watching shows the same symptom from
+outside no matter which side broke: ffmpeg's `out_time` and frame counter stop
+advancing, ffmpeg's stderr stays empty, and ETV-next's stall detector kills the
+session ~60s later with exit 75. Three tools separate the causes.
+
+| Tool | Runs where | Answers |
+|---|---|---|
+| `./tools/overlay-stall-repro.sh` | local | Does a silent overlay writer wedge ffmpeg? (yes — deterministic) |
+| `./tools/overlay-heartbeat-check.sh` | local | Does the overlay's own clock report correctly when the reader stops? |
+| `./tools/two-clock-capture.sh <ch>` | Unraid host | Which side stopped first, during a real freeze |
+
+`overlay-stall-repro.sh` runs three arms. `stall` (writer goes quiet holding the
+fifo open) wedges the graph with an empty stderr; `close` (writer closes) exits
+cleanly; `resume` (writer pauses then resumes) recovers fully. So a freeze needs
+**≥60s of continuous writer silence** to trip the detector — a short hiccup at an
+item boundary is invisible.
+
+`two-clock-capture.sh` takes an ETV-next channel id, not the station folder
+number (`032-action` is channel 10 — check `/channels.m3u`). It watches the HLS
+segment index and, on a gap, records both clocks plus each process's kernel wait
+channel, then prints a verdict. `--self-test` exercises the verdict logic with no
+host and no freeze.
+
+**`pipe_write` on its own is not evidence.** One 1280x720 rgba frame is 3.5MB
+against a 64KB pipe buffer, so a healthy overlay sits inside `write_all` nearly
+all the time — measured healthy `phase_age_ms` is 16-241ms. The discriminator is
+`frames_written` standing still across two heartbeat samples, which is why the
+capture samples twice before ruling.
+
+The overlay half is `crates/etv-overlay/src/phase_watchdog.rs`: the frame loop
+marks its phase, a watchdog thread writes `overlay.heartbeat` beside the fifo
+once a second and logs `overlay.phase_stall` on a 1/2/4/8s backoff. Cost in the
+frame loop is two relaxed atomic stores per phase.

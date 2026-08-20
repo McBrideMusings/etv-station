@@ -1,6 +1,7 @@
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use clap::{Parser, Subcommand};
 use etv_overlay::fifo_writer::{FifoWriter, OpenOutcome, default_fifo_path};
 use etv_overlay::overlay_spec::OverlaySpec;
 use etv_overlay::overlay_timeline::OverlayTimelineSource;
+use etv_overlay::phase_watchdog::{self, Phase, PhaseWatch};
 use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
 use etv_overlay::rhai_engine::{OverlayState, RhaiEngine};
 use etv_overlay::vello_renderer::VelloRenderer;
@@ -678,6 +680,12 @@ fn pipe_to_fifo(
     let mut active_spec = timeline_source.spec_at(OffsetDateTime::now_utc()).cloned();
     let mut engine = build_engine_for(active_spec.as_ref())?;
     let start = std::time::Instant::now();
+    // The overlay half of the two-clock instrumentation. The heartbeat lands
+    // beside the fifo so anything that can see the channel's playout folder can
+    // read what the frame loop is doing without attaching to the process.
+    let watch = PhaseWatch::new();
+    let heartbeat_path = fifo.path().with_file_name("overlay.heartbeat");
+    let watchdog = phase_watchdog::spawn(Arc::clone(&watch), heartbeat_path);
     let initial_ctx = current_context(program_source.as_mut());
     let first_frame = renderer.render_frame(&engine.evaluate(0.0, 0, &initial_ctx))?;
     tracing::info!(
@@ -691,7 +699,7 @@ fn pipe_to_fifo(
         OpenOutcome::Opened => {}
         OpenOutcome::Shutdown | OpenOutcome::Idle => return Ok(()),
     }
-    match write_frame_resilient(&mut fifo, &first_frame, &SHUTDOWN, IDLE_TIMEOUT)? {
+    match write_frame_resilient(&mut fifo, &first_frame, &SHUTDOWN, IDLE_TIMEOUT, &watch)? {
         FrameWrite::Written | FrameWrite::Reopened => {}
         FrameWrite::Shutdown | FrameWrite::Idle => return Ok(()),
     }
@@ -716,6 +724,8 @@ fn pipe_to_fifo(
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             tracing::info!("shutdown requested; stopping overlay pipe");
+            watch.stop();
+            let _ = watchdog.join();
             return Ok(());
         }
 
@@ -724,6 +734,7 @@ fn pipe_to_fifo(
         // geometry guard is defense in depth: `config::resolve_channel`
         // already refuses a mismatched block at load, so this should never
         // fire against a config the station actually shipped.
+        watch.enter(Phase::TimelineRefresh);
         if let Err(e) = timeline_source.refresh() {
             tracing::warn!(error = %e, "overlay timeline refresh failed; keeping the last good config");
         }
@@ -738,24 +749,31 @@ fn pipe_to_fifo(
                          keeping the running config",
                     );
                 }
-                _ => match build_engine_for(wanted) {
-                    Ok(new_engine) => {
-                        tracing::info!("overlay timeline changed; reloaded script and layers");
-                        engine = new_engine;
-                        active_spec = wanted.cloned();
+                _ => {
+                    watch.enter(Phase::EngineReload);
+                    let built = build_engine_for(wanted);
+                    match built {
+                        Ok(new_engine) => {
+                            tracing::info!("overlay timeline changed; reloaded script and layers");
+                            engine = new_engine;
+                            active_spec = wanted.cloned();
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to load the new overlay config; keeping the running one")
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to load the new overlay config; keeping the running one")
-                    }
-                },
+                }
             }
         }
 
         let time_seconds = start.elapsed().as_secs_f64();
+        watch.enter(Phase::ProgramContext);
         let ctx = current_context(program_source.as_mut());
+        watch.enter(Phase::Evaluate);
         let state = engine.evaluate(time_seconds, frame_index, &ctx);
+        watch.enter(Phase::Render);
         let frame = renderer.render_frame(&state)?;
-        match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN, IDLE_TIMEOUT)? {
+        match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN, IDLE_TIMEOUT, &watch)? {
             FrameWrite::Written => {}
             FrameWrite::Reopened => {
                 pace_start = std::time::Instant::now();
@@ -763,12 +781,16 @@ fn pipe_to_fifo(
             }
             FrameWrite::Shutdown => {
                 tracing::info!("shutdown requested; stopping overlay pipe");
+                watch.stop();
+                let _ = watchdog.join();
                 return Ok(());
             }
             FrameWrite::Idle => {
                 tracing::info!(
                     "no reader for {IDLE_TIMEOUT:?}; channel no longer watched, exiting"
                 );
+                watch.stop();
+                let _ = watchdog.join();
                 return Ok(());
             }
         }
@@ -777,6 +799,7 @@ fn pipe_to_fifo(
         // f64-based offset so a 24/7 daemon doesn't truncate at u32 wrap (~1657 days at 30 fps).
         let target = pace_start + Duration::from_secs_f64(paced_frames as f64 / framerate);
         let now = std::time::Instant::now();
+        watch.enter(Phase::Pacing);
         if target > now {
             thread::sleep(target - now);
         }
@@ -794,14 +817,17 @@ fn write_frame_resilient(
     frame: &[u8],
     shutdown: &AtomicBool,
     idle_timeout: Duration,
+    watch: &PhaseWatch,
 ) -> anyhow::Result<FrameWrite> {
     let mut reopened = false;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(FrameWrite::Shutdown);
         }
+        watch.enter(Phase::WriteFifo);
         match fifo.write_frame(frame) {
             Ok(()) => {
+                watch.frame_written();
                 return Ok(if reopened {
                     FrameWrite::Reopened
                 } else {
@@ -823,6 +849,7 @@ fn write_frame_resilient(
                 // channel for good. Idle means "no reader since the last one
                 // left", so measure it from here.
                 let deadline = std::time::Instant::now() + idle_timeout;
+                watch.enter(Phase::ReopenWait);
                 match fifo.reopen(shutdown, Some(deadline))? {
                     OpenOutcome::Opened => reopened = true,
                     OpenOutcome::Shutdown => return Ok(FrameWrite::Shutdown),
@@ -965,7 +992,8 @@ mod tests {
             OpenOutcome::Opened
         );
         let started = Instant::now();
-        let outcome = write_frame_resilient(&mut fifo, &frame, &shutdown, IDLE).unwrap();
+        let outcome =
+            write_frame_resilient(&mut fifo, &frame, &shutdown, IDLE, &PhaseWatch::new()).unwrap();
 
         assert!(
             matches!(outcome, FrameWrite::Reopened),
