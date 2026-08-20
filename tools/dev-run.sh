@@ -108,7 +108,7 @@ done <<< "$folders_output"
 # is a fact of the config, not of how fast its first generation ran, so the
 # folders are made here, up front, for all of them. An empty folder resolves
 # fine; ETV-next just reports no playout for the current time until the station
-# fills it, which is what wait_for_folders below is for.
+# fills it, which is what wait_for_first_emit below is for.
 if [ "${#output_folders[@]}" -gt 0 ]; then
   for folder in "${output_folders[@]}"; do mkdir -p "$folder"; done
 fi
@@ -158,10 +158,20 @@ cat <<EOF
 [dev]   http://127.0.0.1:${ETV_PORT}/xmltv.xml
 EOF
 
+# The station's output is teed to a log so the readiness wait below can read its
+# structured events (#38) without stealing the stream from the console. The exit
+# sentinel is appended to the log only — never printed — and is what turns "the
+# station died" into an immediate failure instead of a 180s timeout.
+station_log="tmp/dev-run-station.log"
+station_exit_marker="__station-exited__"
+: > "$station_log"
+
 (
   ETV_STATION_TZ="${ETV_STATION_TZ:-UTC}" \
     cargo run -p etv-station --bin etv-station -- --config "$STATION_CONFIG" 2>&1 \
+    | tee -a "$station_log" \
     | while IFS= read -r l; do printf '[station] %s\n' "$l"; done
+  printf '%s %s\n' "$station_exit_marker" "${PIPESTATUS[0]}" >> "$station_log"
 ) &
 
 # Build both etv-next binaries up-front so the channel subprocess exists when
@@ -170,35 +180,58 @@ echo "[dev] building etv-next binaries..."
 cargo build --manifest-path vendor/etv-next/Cargo.toml --bin ersatztv --bin ersatztv-channel 2>&1 \
   | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 
-# Wait (up to 60s) for the station to emit its first playout JSON in every
-# channel folder. Otherwise etv-next's loader spams "unable to find playout JSON
-# file for time …" until station catches up on cold builds.
+# Wait for the station to report that every channel's playout window is on disk,
+# by reading the `playout.first_emit` event it logs at the end of each channel's
+# startup catch-up (#38). Without this wait, etv-next's loader spams "unable to
+# find playout JSON file for time …" until the station catches up on cold builds.
 #
-# A single foreground loop polls all folders each tick and drops them as they
-# become ready, so the readiness window is max(per-folder), not sum — one slow
-# channel (e.g. a cold ffprobe cache fill) no longer blocks the others. This
+# This reads the station's own log rather than polling the folders, so the three
+# things a filesystem glob could not tell apart are now distinguishable: ready
+# (the event arrived), still working (no event yet, station alive), and dead (the
+# exit sentinel arrived) — the last of which fails immediately instead of sitting
+# out the deadline.
+#
+# Matching is on the `folder` field, which the daemon logs as the same resolved
+# path `--list-folders` printed, so the two cannot drift. The pattern tolerates
+# both `--log-format` renderings: `folder=path` in pretty, `"folder":"path"` in
+# json. A single foreground loop checks all folders each tick and drops them as
+# they land, so the readiness window is max(per-channel), not sum. It
 # deliberately avoids backgrounded per-folder jobs: under `set -m` (load-bearing
-# for the teardown trap) each finishing poll emits a job-control "[n]+ Done"
-# notice, cluttering the otherwise-clean prefixed output (#89). The glob is a
-# cheap filesystem check with no per-folder blocking work, so folding the polls
-# into one process costs nothing.
-# 180s, not 60s: with `catalog_path` set the daemon ingests the whole catalog
-# before any channel loop starts, and a Plex library of ~85k entries takes well
-# over a minute. Timing out here is no longer fatal to a channel (the folders
-# already exist, so ETV-next keeps it in the lineup either way), but a deadline
-# shorter than a normal startup makes the warning meaningless.
-wait_for_folders() {
+# for the teardown trap) each finishing job emits a "[n]+ Done" notice that
+# clutters the otherwise-clean prefixed output (#89).
+#
+# 180s: with `catalog_path` set the daemon ingests the whole catalog before any
+# channel loop starts, and a Plex library of ~85k entries takes well over a
+# minute. A timeout is not fatal to a channel (the folders already exist, so
+# ETV-next keeps it in the lineup either way), so it warns rather than aborting —
+# unlike a dead station, which has nothing left to wait for.
+wait_for_first_emit() {
   local deadline=$((SECONDS + 180))
   local pending=("$@")
-  local still folder
-  echo "[dev] waiting for station to emit first playout JSON in ${#pending[@]} folder(s)..."
+  local still folder pattern status esc seen
+  # The pretty formatter wraps every field name in SGR colour codes, so the raw
+  # line reads `<esc>[3mfolder<esc>[0m<esc>[2m=<esc>[0mexamples/output/test` —
+  # `folder=` never appears adjacent. Strip the escapes before matching rather
+  # than dropping the field-name anchor, which is what makes the match exact.
+  esc=$(printf '\033')
+  echo "[dev] waiting for station to report first playout in ${#pending[@]} folder(s)..."
   while [ "${#pending[@]}" -gt 0 ] && [ "$SECONDS" -lt "$deadline" ]; do
+    seen=$(grep -F 'playout.first_emit' "$station_log" 2>/dev/null | sed "s,${esc}\[[0-9;]*m,,g")
     still=()
     for folder in "${pending[@]}"; do
-      compgen -G "$folder/*.json" >/dev/null 2>&1 || still+=("$folder")
+      # A trailing boundary is what keeps one folder from matching another it is
+      # a prefix of — `examples/output/lotr` must not answer for
+      # `examples/output/lotr-theatrical`.
+      pattern="folder\"?[=:]\"?$(printf '%s' "$folder" | sed 's,[][\.*^$(){}?+|],\\&,g')(\"|[[:space:]]|\$)"
+      printf '%s\n' "$seen" | grep -qE "$pattern" || still+=("$folder")
     done
     if [ "${#still[@]}" -eq 0 ]; then
       return 0
+    fi
+    if status=$(grep -F "$station_exit_marker" "$station_log" 2>/dev/null); then
+      echo "[dev] the station exited (${status##* }) before reporting playout for ${still[*]}" >&2
+      echo "[dev] see the [station] output above for why; aborting" >&2
+      exit 1
     fi
     pending=("${still[@]}")
     sleep 0.5
@@ -208,7 +241,7 @@ wait_for_folders() {
 }
 
 if [ "${#output_folders[@]}" -gt 0 ]; then
-  wait_for_folders "${output_folders[@]}"
+  wait_for_first_emit "${output_folders[@]}"
 fi
 
 (

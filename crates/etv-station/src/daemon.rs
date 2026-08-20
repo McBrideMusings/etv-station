@@ -2284,7 +2284,8 @@ async fn pattern_catch_up(
         .max(now);
     // Only the first generation of a channel with nothing written yet joins its
     // list mid-way from a past `anchor`; see the phase calculation below.
-    let mut first_generation = existing.is_empty();
+    let started_empty = existing.is_empty();
+    let mut first_generation = started_empty;
 
     // Watch history is read at most once per station tick per audience — not
     // once per generation, and not once per channel. A catch-up chains many
@@ -2624,6 +2625,25 @@ async fn pattern_catch_up(
         );
     }
     cache.save(output).await?;
+
+    // The "this channel has playout on disk" marker `tools/dev-run.sh` waits on
+    // instead of polling the folder for `*.json` (#38). Emitted at the end of the
+    // startup catch-up, once the fact is true either way — this pass generated
+    // the window, or a previous run had already written it and the catch-up had
+    // nothing to add.
+    //
+    // Deliberately not emitted when the startup catch-up produced nothing on an
+    // empty folder: a channel that bailed out at `pattern.zero_length` has no
+    // playout, and staying silent is what lets a waiter tell "still working" from
+    // "never coming" rather than watching a folder that will stay empty forever.
+    if phase == "startup" && (!started_empty || generations > 0) {
+        tracing::info!(
+            event = "playout.first_emit",
+            channel = %channel.name,
+            folder = %output.display(),
+            "channel's playout window is on disk",
+        );
+    }
 
     Ok(resume)
 }
