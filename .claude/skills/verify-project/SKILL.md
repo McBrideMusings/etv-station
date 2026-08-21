@@ -332,6 +332,36 @@ in to the channel and re-run for a current answer.
 
 Locally, against a `admin dev` run: `tools/verify-accel.sh --local <diag-dir>`.
 
+## Backups — what rollback actually protects
+
+`admin backup` snapshots the host state that has no second copy, into
+`$ETV_STATION_BACKUP_DIR/<UTC-stamp>/`, keeping the newest 10. Every `admin
+deploy` runs it first.
+
+What matters and why, so nobody "optimises" the list later:
+
+- `playout/history.db` — the only record of what each channel has aired
+  (`deploy/appdata/README.md:60`). Lose it and all 64 channels reset their
+  resume position.
+- `.device_id` — cannot be regenerated (`etv_next.rs:267-276`). A new one makes
+  Plex silently drop the channel mapping for every channel.
+- `catalog.db` — nominally rebuildable, but a rebuild can miss renamed files
+  (the 2026-08-16 Radarr incident), so treat it as expensive to lose.
+
+Deliberately excluded: `artwork/` (24 GB, re-fetchable) and `diag/` (704 MB,
+disposable). That exclusion is why a snapshot is ~198 MB and 8 seconds.
+
+Two safety properties worth not breaking:
+
+- **A missing source file fails the run.** It used to count as a skip, which
+  meant a wrong path produced an empty snapshot that then pruned the good ones.
+- **Pruning happens only after a verified snapshot** — every database is
+  reopened and `PRAGMA quick_check`'d first. A failed run prunes nothing and
+  leaves its partial directory as evidence.
+
+The pre-deploy run is stale-gated (`ETV_STATION_BACKUP_IF_STALE=1`), so a
+`--dry-run` cannot churn the retention window; `admin backup` always snapshots.
+
 ## Gotchas
 
 - The first Plex ingest reads the whole library and genuinely takes minutes
