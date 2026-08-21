@@ -56,6 +56,31 @@ The subtree pull is the whole mechanical half of an upstream sync; the judgement
 
 Required env for the deploy workflow lives in `.env` (gitignored). See `.env.example` for the shape.
 
+## Media discovery skills
+
+`.claude/skills/{plex,radarr,sonarr}/` query a media server and hand back channel
+YAML you can paste into `examples/channels/`. Building a channel by hand means
+knowing a title's on-disk path, its genres and its artwork; these ask the server
+that already knows.
+
+Each reads its connection from the environment and refuses to guess — nothing is
+hardcoded, and no credential lives in the skill:
+
+| Skill | Variables |
+|---|---|
+| `/plex` | `PLEX_URL`, `PLEX_TOKEN` |
+| `/radarr` | `RADARR_URL`, `RADARR_API_KEY` |
+| `/sonarr` | `SONARR_URL`, `SONARR_API_KEY` |
+
+Optional for all three: `MEDIA_PATH_FROM` / `MEDIA_PATH_TO`, which remap the path
+prefix the server reports onto the one the station mounts. All of them are in
+`.env.example`; copy it to `.env` and fill in the ones you have. A skill whose
+variables are unset stops and asks rather than proceeding.
+
+`PLEX_URL` and `PLEX_TOKEN` are the same pair the daemon's own catalog ingester
+reads (`PlexEnv::from_env`), so configuring the skill configures the ingest too.
+Radarr and Sonarr are discovery conveniences only — the daemon never contacts them.
+
 ## Documentation
 
 This project has a VitePress docs site under `docs/`. Run `bun run docs:dev` to read it on `http://localhost:5193`.
