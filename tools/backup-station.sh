@@ -61,11 +61,17 @@ note() { printf '  %s\n' "$*"; }
 # Copy one sqlite database through the online backup API, then prove the result
 # opens and is structurally sound. An unverified backup is worse than none: it
 # reads as protection right up to the moment it is needed.
+# A MISSING SOURCE IS A FAILURE, NOT A SKIP. This is the whole ballgame: if a
+# absent file counted as success, a run with the wrong path, an unmounted share
+# or a renamed database would produce an EMPTY snapshot, report OK, and then
+# prune the real ones away. Caught by test-prune.sh, which pointed
+# ETV_STATION_DATA at /nonexistent and watched 3 good snapshots become 1.
 snap_db() {
     local src="$1" name="$2"
     if [ ! -f "$src" ]; then
-        note "SKIP $name (not present at $src)"
-        return 0
+        note "FAIL $name (not present at $src)"
+        fail=1
+        return 1
     fi
     if ! sqlite3 "$src" ".backup '$dest/$name'" 2>/dev/null; then
         note "FAIL $name (.backup errored)"
@@ -85,8 +91,9 @@ snap_db() {
 copy_path() {
     local src="$1" name="$2"
     if [ ! -e "$src" ]; then
-        note "SKIP $name (not present)"
-        return 0
+        note "FAIL $name (not present at $src)"
+        fail=1
+        return 1
     fi
     if cp -a "$src" "$dest/$name" 2>/dev/null; then
         note "ok   $name"
@@ -114,7 +121,9 @@ fi
 {
     printf 'taken %s\n' "$stamp"
     printf 'host  %s\n' "$(uname -n)"
-    ( cd "$dest" && find . -type f -exec sha256sum {} + 2>/dev/null | sort -k2 )
+    # Exclude the manifest itself: it is being written by this very block, so
+    # hashing it records the digest of a partial file that can never verify.
+    ( cd "$dest" && find . -type f ! -name MANIFEST.txt -exec sha256sum {} + 2>/dev/null | sort -k2 )
 } > "$dest/MANIFEST.txt" 2>/dev/null
 
 # Prune ONLY after a fully verified snapshot. Pruning on a failed run is how a
