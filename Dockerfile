@@ -149,6 +149,14 @@ COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py /usr/local/bin/
 COPY --chmod=755 tools/probe-checks.sh tools/soak-probe.sh /usr/local/bin/
 COPY --chmod=755 tools/two-clock-capture.sh /usr/local/bin/
+# The ffmpeg probe ships IN THE IMAGE, not scp'd onto the host. It used to be
+# host-only state that every `admin deploy files` destroyed, so the one thing
+# that can tell "ffmpeg stopped encoding" from "ffmpeg is encoding and the
+# output is not landing" — and the only proof a channel is on the GPU rather
+# than silently on the CPU (#258) — kept disappearing and had to be re-applied
+# by hand. In the image it cannot be lost: it survives every deploy, every
+# restart, every container recreate.
+COPY --chmod=755 tools/ffmpeg-probe.sh /usr/local/bin/ffmpeg-probe.sh
 
 # Config lives on a bind mount; the playout folders and the HLS working set are
 # written under /data so a restart resumes from what the daemon already emitted.

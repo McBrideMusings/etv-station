@@ -13,10 +13,20 @@
 # second carrying `frame`, `out_time_ms` and `speed`, so a gap with a live
 # progress stream and a gap with a dead one are different bugs.
 #
-# Install: mount at /config/ffmpeg-probe.sh (chmod +x) and set
-#   "ffmpeg": { "ffmpeg_path": "/config/ffmpeg-probe.sh" }
-# for one channel via presentation.json. Removing that key removes the probe;
-# nothing else has to be undone.
+# It is ALWAYS ON, and nothing has to be done to keep it that way. The script
+# ships in the image (see the COPY in Dockerfile) and `ffmpeg.ffmpeg_path` in
+# deploy/appdata/station.yaml names it, so the station daemon writes it into
+# every channelN.json on every render. It therefore survives restarts, deploys
+# and container recreates.
+#
+# It used to be host-only state — scp'd to the appdata volume and referenced
+# from normalization.default.json — which meant every `admin deploy files` wiped
+# it and it had to be re-applied by hand. That is why the argv logs went stale
+# between 2026-08-15 and 2026-08-21 with nobody noticing. Do not reintroduce a
+# host-side copy: the image copy is the only one.
+#
+# To turn it off, set `ffmpeg_path: ""` in station.yaml and redeploy. Channels
+# run identically without it.
 
 REAL="${ETV_PROBE_REAL_FFMPEG:-/usr/local/bin/ffmpeg}"
 DIAG="${ETV_PROBE_DIAG_DIR:-/data/diag}"
@@ -65,6 +75,28 @@ progress="$DIAG/ffmpeg-progress-ch${channel}-${stamp}-$$.log"
 ls -1t "$DIAG"/ffmpeg-progress-ch${channel}-*.log 2>/dev/null | tail -n +9 | while read -r old; do
     rm -f "$old" 2>/dev/null
 done
+
+# Cap the argv log too. It is append-only and, now that the probe is on
+# permanently, would otherwise grow without bound on a channel that respawns a
+# lot. Trim to the last ARGV_KEEP_LINES lines, then drop the leading partial
+# block so the file always starts at a `=== ` header.
+#
+# A concurrent spawn appending between the tail and the mv loses its record.
+# That is acceptable here and nowhere else: every consumer (verify-accel.sh,
+# stall-bisect.sh, readrate-sweep.sh) reads only the NEWEST block, and the
+# rename itself is atomic, so the file is never seen half-written. Trimming only
+# above the threshold keeps the window rare.
+ARGV_KEEP_LINES="${ETV_PROBE_ARGV_KEEP_LINES:-2000}"
+argv_lines=$(wc -l < "$argv_log" 2>/dev/null || echo 0)
+if [ "${argv_lines:-0}" -gt $((ARGV_KEEP_LINES * 2)) ]; then
+    argv_tmp="$argv_log.trim.$$"
+    if tail -n "$ARGV_KEEP_LINES" "$argv_log" 2>/dev/null |
+        awk 'started || /^=== /{started=1; print}' > "$argv_tmp" 2>/dev/null; then
+        mv "$argv_tmp" "$argv_log" 2>/dev/null || rm -f "$argv_tmp" 2>/dev/null
+    else
+        rm -f "$argv_tmp" 2>/dev/null
+    fi
+fi
 
 # `exec`, and no pipeline. ETV-next stops a session by signalling the process it
 # spawned; if this script stayed alive as a pipeline parent, the signal would
