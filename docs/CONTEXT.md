@@ -99,3 +99,7 @@ Borrowed industry terms for the things an overlay draws. None of these are schem
 - **Squeezeback** (also **L-bar**, **L-wrap**) — the program is scaled down into part of the frame and the freed space carries promo art. Not achievable with an alpha overlay alone; it needs ETV-next's filter chain to scale the video.
 - **Endcap** / **credit squeeze** — the squeezeback specifically applied over a program's closing credits.
 - **On-air branding package** — the whole set as one design artifact: bug, chyron styles, snipes, bumpers. The search term for reference work.
+
+## Regeneration fingerprint
+
+The hash stamped on a [[generation]]'s checkpoint recording what its author declared: the channel's config bytes and its resolved [[overlay cascade]] bytes. Compared at channel-loop startup — daemon start or SIGHUP, never the catalog refresh timer — and a mismatch rewinds the channel to its earliest unaired checkpoint. Deliberately blind to the catalog: which entries the pools resolve to is not part of it, so a film arriving in Plex never moves a slot that has already been published. See ADR 0010.
