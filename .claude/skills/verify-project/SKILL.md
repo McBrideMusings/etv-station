@@ -318,11 +318,17 @@ thing that separates them, which is why the check reads
 Expected values are read from `deploy/unraid-template.xml`, so the check asserts
 the host matches the repo rather than asking the host what it's set to.
 
-**It depends on the host ffmpeg probe**, which is host-only state and is wiped by
-every `admin deploy files` — a run reporting "no ffmpeg-argv-ch*.log found" means
-the probe needs re-applying (commands in `CLAUDE.local.md`), not that encoding is
-broken. A channel must also have played since the probe was installed, since the
-log is only written when a transcode starts.
+**It reads the ffmpeg probe's argv logs.** The probe ships in the image
+(`Dockerfile`) and is wired by `ffmpeg.ffmpeg_path` in
+`deploy/appdata/station.yaml`, so it is always on — there is no re-apply step and
+no host-side copy. A run reporting "no ffmpeg-argv-ch*.log found" means no
+channel has transcoded since the container last started, not that the probe is
+missing: the log is only written when a transcode begins, and only a channel
+someone is watching transcodes at all.
+
+A `STALE` verdict means the same thing in miniature — that channel's newest argv
+is older than `STALE_DAYS` (3), so it proves the GPU worked then, not now. Tune
+in to the channel and re-run for a current answer.
 
 Locally, against a `admin dev` run: `tools/verify-accel.sh --local <diag-dir>`.
 

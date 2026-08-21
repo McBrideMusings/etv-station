@@ -552,6 +552,73 @@ mod tests {
         render_channels(channels, &ffmpeg(), &normalization(), opts, device_id)
     }
 
+    /// `ffmpeg.ffmpeg_path` must reach EVERY rendered channel, unaltered.
+    ///
+    /// In production that path is the instrumented wrapper
+    /// (`/usr/local/bin/ffmpeg-probe.sh`, set in `deploy/appdata/station.yaml`),
+    /// and it is what records the argv proving a channel encodes on the GPU
+    /// instead of silently on the CPU (#258) — plus the `-progress` stream that
+    /// makes a freeze diagnosable at all. A render that dropped it, or wrote it
+    /// to only the first channel, would take the instrumentation off every
+    /// channel with nothing anywhere saying so: the station keeps running and
+    /// the logs look identical. That is exactly how it went stale unnoticed for
+    /// six days before it was baked into the image, so it gets a test.
+    #[test]
+    fn ffmpeg_path_reaches_every_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = "/usr/local/bin/ffmpeg-probe.sh";
+        let ffmpeg: FfmpegConfig =
+            serde_json::from_value(serde_json::json!({"ffmpeg_path": probe})).unwrap();
+
+        let folders: Vec<PathBuf> = (1..=3).map(|n| dir.path().join(format!("ch{n}"))).collect();
+        render_channels(
+            &chans(&folders),
+            &ffmpeg,
+            &normalization(),
+            &opts(dir.path()),
+            "device",
+        )
+        .unwrap();
+
+        for number in 1..=3 {
+            let path = dir.path().join(format!("channel{number}.json"));
+            let body: Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                body["ffmpeg"]["ffmpeg_path"], probe,
+                "channel{number}.json lost the probe path"
+            );
+        }
+    }
+
+    /// The opposite direction: an empty `ffmpeg_path` must stay absent rather
+    /// than becoming the literal string "", which ETV-next would try to exec.
+    #[test]
+    fn empty_ffmpeg_path_renders_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffmpeg: FfmpegConfig =
+            serde_json::from_value(serde_json::json!({"ffmpeg_path": ""})).unwrap();
+
+        let folders = vec![dir.path().join("ch1")];
+        render_channels(
+            &chans(&folders),
+            &ffmpeg,
+            &normalization(),
+            &opts(dir.path()),
+            "device",
+        )
+        .unwrap();
+
+        let body: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("channel1.json")).unwrap())
+                .unwrap();
+        assert!(
+            body["ffmpeg"]["ffmpeg_path"].is_null(),
+            "empty ffmpeg_path should render as null, got {}",
+            body["ffmpeg"]["ffmpeg_path"]
+        );
+    }
+
     /// No `display_name:` authored on any channel and no overlay — every one
     /// falls back to its identity, same as before those fields existed.
     fn chans(folders: &[PathBuf]) -> Vec<ChannelRender> {
