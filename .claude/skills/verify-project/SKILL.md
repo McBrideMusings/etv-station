@@ -260,6 +260,31 @@ happily rolling channels and nothing ever listened. Those URLs are the container
 with ETV-next. For the HTTP surface locally use `admin dev` (daemon + ETV-next), not
 `admin dev-station`.
 
+## Verifying hardware encoding (#258)
+
+`admin verify-accel` — read-only, over ssh, touches no container.
+
+**Codec name proves nothing here.** A software encode and a VAAPI encode both
+produce H.264, so `ffprobe` on a segment reports `h264` either way, and ETV-next
+logs a fallback to software only at DEBUG. The ffmpeg command line is the only
+thing that separates them, which is why the check reads
+`data/diag/ffmpeg-argv-ch<N>.log` and asserts, per channel's newest transcode:
+
+- the expected encoder is present (`h264_vaapi` for `ETV_ACCEL=vaapi`)
+- `libx264` is **absent** — its presence is the fallback fingerprint
+- the configured render node (`/dev/dri/renderD128`) appears in the argv
+
+Expected values are read from `deploy/unraid-template.xml`, so the check asserts
+the host matches the repo rather than asking the host what it's set to.
+
+**It depends on the host ffmpeg probe**, which is host-only state and is wiped by
+every `admin deploy files` — a run reporting "no ffmpeg-argv-ch*.log found" means
+the probe needs re-applying (commands in `CLAUDE.local.md`), not that encoding is
+broken. A channel must also have played since the probe was installed, since the
+log is only written when a transcode starts.
+
+Locally, against a `admin dev` run: `tools/verify-accel.sh --local <diag-dir>`.
+
 ## Gotchas
 
 - The first Plex ingest reads the whole library and genuinely takes minutes
