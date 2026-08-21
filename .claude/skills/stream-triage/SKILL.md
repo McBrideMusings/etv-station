@@ -116,6 +116,15 @@ should show `two-clock freeze capture started`. Verdicts:
 | `overlay-stopped-first` | overlay frames frozen off-pipe | the heartbeat `phase` names which phase hung |
 | `overlay-alive` | overlay still feeding; freeze is downstream | ffmpeg's input read — the array, disk spin-up, `/mnt/user` pressure |
 | `mutual-pipe-block` | both wedged on the fifo | genuine deadlock, the most interesting case |
+| `no-overlay-ffmpeg-futex` | no overlay in the graph; ffmpeg parked on a futex | contention or an internal lock — read the `cpu_ticks` delta on the same capture |
+| `no-overlay-but-on-a-pipe` | no overlay, yet blocked on a pipe | some other pipe in the graph |
+| `no-overlay-ffmpeg-elsewhere` | no overlay; blocked outside a pipe or futex | the input read or the output write |
+| `no-overlay-ffmpeg-gone` | session already torn down | nothing to attribute |
+
+The `no-overlay-*` classes are not rare. As of 2026-08-21 **no** running transcode
+had an overlay input at all while five overlay renderers ran idle (#295), so most
+stalls land here. `cpu_ticks x -> y (advanced=yes)` on a futex means contention or
+a spin; `advanced=no` means a genuine wedge. Same wchan, opposite meanings.
 
 `--self-test` exercises the verdict logic with no host and no freeze. Run it
 after editing the script — locally, or in the container with
@@ -188,14 +197,30 @@ tvOS clients show as `iPlayTV/...` or `VLC/... LibVLC/...`.
 Then follow that IP through the log around the freeze:
 
 ```sh
+# segment fetches only — this is the client's real clock
 ssh "$UNRAID_USER@$UNRAID_HOST" \
-  "grep '<viewer-ip>' /mnt/user/appdata/etv-station/data/diag/access.log | tail -40"
+  "grep '/session/<N>/live0' /mnt/user/appdata/etv-station/data/diag/access.log \
+   | grep '<viewer-ip>' | grep '>' | tail -20"
 ```
+
+> **VLC uses two sockets, and reading the wrong one inverts the answer.**
+> One connection polls `live.m3u8`, a *different* one fetches `.ts` segments
+> (observed: `52889` polling, `52888` fetching). A plain `tail` of the access log
+> can show nothing but playlist requests and look exactly like a client that has
+> stopped asking for media when it is streaming fine. **Filter by request path,
+> never by recency.** This produced a confidently wrong diagnosis on 2026-08-21,
+> including a retracted claim about sequence regression.
 
 Read it for:
 
-- **requests stop entirely** → the client gave up; it will not come back without
-  a re-tune.
+- **playlist polls continue but segment fetches stop** → the client froze while
+  the server stayed healthy. Confirm by checking the encoder over the same window
+  in `ffmpeg-progress.log` and that `two-clock.log` has no capture for that
+  channel. Proven case: 2026-08-21 channel 10, 92s client gap with `out_time`
+  advancing 1:1 and `fps` steady at 24.03 throughout (#265). Detecting this
+  automatically is #328.
+- **requests stop entirely, playlist included** → the client gave up; it will not
+  come back without a re-tune.
 - **same segment requested repeatedly** → the client is retrying; the playlist
   moved under it (discontinuity) or the segment 404s.
 - **requests continue, latency climbs** → buffering, not a freeze. Look at
