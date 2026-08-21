@@ -51,6 +51,23 @@ command -v sqlite3 >/dev/null 2>&1 || {
     exit 2
 }
 
+# The pre-deploy snapshot sets ETV_STATION_BACKUP_IF_STALE=1, which makes this a
+# no-op when a snapshot already exists from the last few minutes. Without it,
+# every `admin deploy --dry-run` took a real 198 MB snapshot and consumed a
+# retention slot, so ten dry runs would have evicted every genuine snapshot —
+# a safety mechanism destroying the thing it protects. `admin backup` does not
+# set it, so an explicit backup is always taken.
+if [ "${ETV_STATION_BACKUP_IF_STALE:-0}" = "1" ]; then
+    min_interval="${ETV_STATION_BACKUP_MIN_INTERVAL:-600}"
+    newest=$(find "$ETV_STATION_BACKUP_DIR" -mindepth 2 -maxdepth 2 -name MANIFEST.txt \
+        -newermt "-${min_interval} seconds" -print -quit 2>/dev/null)
+    if [ -n "$newest" ]; then
+        echo "skip: a verified snapshot from the last ${min_interval}s already exists"
+        echo "      ($(dirname "$newest"))"
+        exit 0
+    fi
+fi
+
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 dest="$ETV_STATION_BACKUP_DIR/$stamp"
 mkdir -p "$dest" || { echo "fatal: cannot create $dest" >&2; exit 2; }
