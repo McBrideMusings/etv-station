@@ -58,8 +58,29 @@ log() { printf '%s %s\n' "$(date -u +%FT%T.%3NZ)" "$*" >> "$LOG"; }
 # Pure: wait channels + whether the overlay produced frames between samples.
 # Kept separate from capture() so it can be exercised without a freeze, a
 # container, or a Linux /proc -- see --self-test.
+# verdict <overlay_wchan> <ffmpeg_wchan> <frames_advanced> [has_overlay] [cpu_advanced]
 verdict() {
-    local ow="$1" fw="$2" advanced="${3:-unknown}"
+    local ow="$1" fw="$2" advanced="${3:-unknown}" has_overlay="${4:-yes}" cpu="${5:-unknown}"
+
+    # A pipeline with no overlay input cannot be starved by the overlay, so the
+    # two-clock question does not apply and "inconclusive" buries the finding.
+    # Not hypothetical: on 2026-08-21 channels 1 and 4 stalled repeatedly with no
+    # overlay in the graph at all, wedged in futex_wait_queue rather than on any
+    # pipe, and all 145 captures read as inconclusive.
+    if [ "$has_overlay" = "no" ]; then
+        local spin="wedged"
+        [ "$cpu" = "yes" ] && spin="burning CPU"
+        case "$fw" in
+            *pipe_read*|*pipe_write*)
+                echo "VERDICT no-overlay-but-on-a-pipe ($spin in '$fw' with no overlay input -- some OTHER pipe in the graph is blocked)"; return ;;
+            *futex*)
+                echo "VERDICT no-overlay-ffmpeg-futex ($spin in '$fw'; no overlay in the pipeline, so the overlay cannot be the cause -- an internal ffmpeg lock or thread wait)"; return ;;
+            "")
+                echo "VERDICT no-overlay-ffmpeg-gone (no overlay input and no ffmpeg process; the session was already torn down)"; return ;;
+            *)
+                echo "VERDICT no-overlay-ffmpeg-elsewhere ($spin in '$fw'; no overlay in the pipeline, so look at the input read or the output write)"; return ;;
+        esac
+    fi
 
     # The overlay is still doing its job if it put frames in the pipe between
     # samples, whatever wchan caught it in. That rules it out as the stalled
@@ -96,6 +117,14 @@ self_test() {
             *) echo "  FAIL $desc"; echo "       want: $want"; echo "       got : $got"; fails=$(( fails + 1 )) ;;
         esac
     }
+    check_no() {
+        local got want desc
+        got=$(verdict "" "$1" "unknown" "no" "unknown"); want="$2"; desc="$3"
+        case "$got" in
+            "VERDICT $want"*) echo "  ok   $desc" ;;
+            *) echo "  FAIL $desc"; echo "       want: $want"; echo "       got : $got"; fails=$(( fails + 1 )) ;;
+        esac
+    }
     echo "verdict self-test:"
     # The load-bearing case: pipe_write while frames STILL ADVANCE is healthy,
     # and must never be reported as a stall.
@@ -107,6 +136,12 @@ self_test() {
     check "do_sys_poll" "pipe_read"   "no"      "overlay-stopped-first"          "overlay frozen polling, ffmpeg starving"
     check "futex_wait"  "futex_wait"  "unknown" "inconclusive"                   "neither on a pipe, no frame delta"
     check ""            ""            "unknown" "inconclusive"                   "no processes found"
+    # No overlay in the pipeline: the two-clock question does not apply, and the
+    # answer must name what ffmpeg is actually stuck on instead of "inconclusive".
+    check_no "futex_wait_queue" "no-overlay-ffmpeg-futex"     "no overlay, ffmpeg in futex"
+    check_no "pipe_read"        "no-overlay-but-on-a-pipe"    "no overlay, but blocked on some other pipe"
+    check_no ""                 "no-overlay-ffmpeg-gone"      "no overlay, ffmpeg already gone"
+    check_no "do_sys_poll"      "no-overlay-ffmpeg-elsewhere" "no overlay, ffmpeg blocked elsewhere"
     if [ "$fails" -eq 0 ]; then echo "verdict self-test: PASS"; return 0; fi
     echo "verdict self-test: $fails FAILED"; return 1
 }
@@ -191,10 +226,15 @@ capture() {
         opid=$(overlay_pid_for_fifo "$fifo")
     fi
 
-    log "==== CAPTURE ($why) channel=$ch ffmpeg_pid=${fpid:-none} overlay_pid=${opid:-none}"
+    log "==== CAPTURE ($why) channel=$ch ffmpeg_pid=${fpid:-none} overlay_pid=${opid:-none} overlay_in_pipeline=$( [ -n "$fifo" ] && echo yes || echo no )"
     log "  clock1.ffmpeg newest_segment=$(newest_segment_index "$ch") dir=$HLS_ROOT/$ch"
+    local cpu=unknown u1 u2
     if [ -n "$fpid" ]; then
+        u1=$(awk '{print $14+$15}' "/proc/$fpid/stat" 2>/dev/null)
         log "  clock1.ffmpeg wchan=$(proc_field "$fpid" wchan) state=$(awk '{print $3}' "/proc/$fpid/stat" 2>/dev/null) syscall=$(proc_field "$fpid" syscall)"
+        # Which THREAD is stuck matters for a futex wedge: one blocked worker
+        # with the rest idle reads differently from every thread parked.
+        log "  clock1.ffmpeg threads=$( { for t in /proc/$fpid/task/[0-9]*; do head -1 "$t/wchan" 2>/dev/null; echo; done; } 2>/dev/null | sort | uniq -c | tr '\n' ' ' )"
     else
         log "  clock1.ffmpeg NO PROCESS -- session already torn down"
     fi
@@ -220,8 +260,18 @@ capture() {
         log "  clock2.overlay NO PROCESS (fifo='${fifo:-none}') -- channel may have no overlay configured"
     fi
 
+    # A futex wait that still accrues CPU is a spin or contention; one that does
+    # not is a genuine wedge. Same wchan, opposite meanings.
+    if [ -n "$fpid" ] && [ -n "${u1:-}" ]; then
+        u2=$(awk '{print $14+$15}' "/proc/$fpid/stat" 2>/dev/null)
+        if [ -n "$u2" ]; then
+            if [ "$u2" -gt "$u1" ]; then cpu=yes; else cpu=no; fi
+            log "  clock1.ffmpeg cpu_ticks $u1 -> $u2 (advanced=$cpu)"
+        fi
+    fi
+
     ow=$(proc_field "$opid" wchan); fw=$(proc_field "$fpid" wchan)
-    log "  $(verdict "$ow" "$fw" "$advanced")"
+    log "  $(verdict "$ow" "$fw" "$advanced" "$( [ -n "$fifo" ] && echo yes || echo no )" "$cpu")"
 }
 
 # ------------------------------------------------------------------- loop ----
