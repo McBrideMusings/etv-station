@@ -45,6 +45,7 @@ bun run docs:dev                         # serve VitePress docs on http://localh
 ./tools/overlay-still.sh                 # render a single overlay frame to PNG and open it
 admin overlay-watch <channel-dir>        # live isolated overlay preview in VLC, hot-reloads on save
 admin verify-accel                       # prove channels encode on the GPU, not silently on the CPU
+admin backup                             # snapshot history.db / catalog.db / .device_id on the host
 
 git subtree pull --prefix=vendor/etv-next etv-upstream main --squash   # absorb upstream ErsatzTV/next
 ```
