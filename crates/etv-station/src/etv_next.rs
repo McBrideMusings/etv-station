@@ -582,8 +582,7 @@ mod tests {
 
         for number in 1..=3 {
             let path = dir.path().join(format!("channel{number}.json"));
-            let body: Value =
-                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(
                 body["ffmpeg"]["ffmpeg_path"], probe,
                 "channel{number}.json lost the probe path"
