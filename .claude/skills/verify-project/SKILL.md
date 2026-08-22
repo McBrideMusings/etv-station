@@ -416,6 +416,48 @@ in to the channel and re-run for a current answer.
 
 Locally, against a `admin dev` run: `tools/verify-accel.sh --local <diag-dir>`.
 
+## Verifying no sub-segment transcodes (#339)
+
+`admin verify-no-slivers` — read-only, over ssh, touches no container.
+
+A **sliver** is an ffmpeg invocation whose `-t` is shorter than its own
+`-hls_time`: a full process spawn, deep seek, hwaccel decode init and overlay
+composite to emit a fraction of one segment. On 2026-08-22 prod had three —
+channel 2 at 153ms, channel 1 at 1336ms, channel 9 at 3619ms, all against
+`-hls_time 4`.
+
+**It is not a scheduling defect, and the playout JSON is the wrong place to
+look.** Every item the station emits is a whole catalog item; an item straddling
+a chunk boundary is re-emitted whole in both chunks. The sliver is made by
+`reburst_decision` in
+`vendor/etv-next/crates/ersatztv-channel/src/channel_session.rs`, which restarts
+a still-playing item once its buffer lead drains below `REBURST_AT_LEAD` (20s).
+Before #339 it did that without asking whether any of the item was left, so a
+reburst firing a second before an item ended handed its replacement 153ms of
+work. The fix gates firing on `remaining > REBURST_AT_LEAD`, where `remaining` is
+`item.finish - last_segment_end`.
+
+The container log names the restart, and it is **not** an exit-75 stall:
+
+```
+lead down to 18s while still playing; restarting the item to rebuild the buffer
+resuming the same item from 2026-08-21 20:31:18.460403686 +00:00:00
+```
+
+The check reads **every** invocation in each `ffmpeg-argv-ch<N>.log`, not just
+the newest — a sliver is rare, and verify-accel's newest-block-only approach
+would miss all three of the ones above. The segment length comes from each
+invocation's own `-hls_time`, because it is a compile-time constant
+(`SEGMENT_SECONDS` in `vendor/etv-next/crates/ffpipeline/src/pipeline.rs:36`) and
+not a `station.yaml` key.
+
+Locally, against a `admin dev` run: `tools/verify-no-slivers.sh --local <diag-dir>`.
+
+**A pass on a freshly restarted container proves little.** Rebursts need an item
+to have been playing long enough to build and then drain a lead, so a short run
+has no chance to produce one. The meaningful read is against a host that has been
+up for hours with channels being watched.
+
 ## Backups — what rollback actually protects
 
 `admin backup` snapshots the host state that has no second copy, into

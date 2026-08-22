@@ -94,6 +94,30 @@ A respawn resets `EXT-X-MEDIA-SEQUENCE` and bumps `EXT-X-DISCONTINUITY-SEQUENCE`
 Many clients do not survive that even when the server is healthy again, so
 "server recovered, screen still frozen" is expected — tell the user to re-tune.
 
+### The reburst signature — a restart that is not a stall
+
+```
+lead down to 18s while still playing; restarting the item to rebuild the buffer
+resuming the same item from 2026-08-21 20:31:18.460403686 +00:00:00
+```
+
+This is `reburst_decision` in
+`vendor/etv-next/crates/ersatztv-channel/src/channel_session.rs` deliberately
+killing a *healthy* ffmpeg because its lead drained below 20s, then resuming the
+same item from the segment frontier. Exit 75 is absent — do not read it as a
+stall.
+
+Pair each one with the `-t` the replacement was handed:
+
+```sh
+ssh "$UNRAID_USER@$UNRAID_HOST" \
+  "grep -A1 -x -- '-t' /mnt/user/appdata/etv-station/data/diag/ffmpeg-argv-ch<N>.log | grep -E '^[0-9]+ms$' | tr -d 'ms' | sort -n | head -3"
+```
+
+Anything under 4000ms is shorter than one HLS segment and should no longer
+happen — #339 gated the reburst on `remaining > REBURST_AT_LEAD`. A sliver
+reappearing means that gate regressed.
+
 ## Step 3 — rule on which side stopped
 
 **There is nothing to arm.** The capture runs inside the container, started by
