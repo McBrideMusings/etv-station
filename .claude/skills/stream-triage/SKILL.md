@@ -200,12 +200,30 @@ Consequences for anyone triaging this:
   Expect roughly one per item per channel, clustering at item ends.
 - **A viewer's freeze is the respawn, not the encode.** The encode already
   delivered every frame of the item before the kill.
-- **Do not go looking for a starved pipe or a slow array read.** Channels 4 and 5
-  have no overlay and no pipe in the media path at all — file in, file out — and
-  they stall at the same rate as the channels that do.
-- **The two-clock `no-overlay-ffmpeg-futex` verdicts are consistent with this.**
-  All 21-22 threads parked on futexes with `cpu_ticks advanced=no` is what a
-  process with no work left and a shutdown that never completes looks like.
+
+### Why it would not exit — solved, 2026-08-22 (#348)
+
+`overlay_vaapi` did not set `eof_action=pass`. Without it, framesync keeps the
+graph running once the **main** input reaches EOF, driven by the secondary input
+— which is the overlay fifo, a producer with no end. Every frame it emits past
+the main's last one is dropped by the encoder, so `frame` and `out_time` freeze,
+the output never reaches the `-t` that would let ffmpeg exit, and it sits there
+until the 60s detector kills it.
+
+`-t` comes from the catalog duration and routinely overshoots the real decoded
+media by a few milliseconds — channel 4's `-t` was 1262480ms against an
+`out_time` that froze at 1262344ms, 136ms short — so the main input hits EOF
+first on essentially every item. That is the "one per item per channel" rate.
+
+**`drop_frames` is the discriminator, and it is the one field nobody was
+reading.** A wedged ffmpeg leaves it flat; this one climbs ~15/s while `frame`
+and `out_time` sit still. Climbing means ffmpeg is alive and spinning, not
+deadlocked — check it before reading a frozen `frame=` as a wedge.
+
+Fixed in `crates/ffpipeline/src/accel/vaapi.rs` by setting `eof_action=pass`,
+matching what the software `overlay` in `overlay_filter.rs` already did.
+`shortest=1` and `repeatlast=0` also break the hang; `shortest=1` was rejected
+because it ends the video the instant the overlay writer dies.
 
 ### Reading the verdicts
 
@@ -228,11 +246,11 @@ script reads whichever is present, so it works either side of that deploy.
   against a 64KB pipe buffer, so a *healthy* overlay sits inside `write_all`
   almost all the time. Measured healthy `phase_age_ms` is 16-241ms. The
   discriminator is `frames_written` standing still across two samples.
-- **Missing `eof_action` on `overlay_vaapi` is a dead end.** Software `overlay`
-  sets `eof_action=pass` and the hardware variants don't, which looks damning.
-  But framesync's default is `repeat`, and a writer that *closes* the fifo lets
-  ffmpeg finish cleanly — proven by the `close` arm of the repro. Only a writer
-  that goes quiet *while holding the fifo open* wedges anything.
+- **Missing `eof_action` on `overlay_vaapi` was NOT a dead end** — it was the
+  cause of #348, fixed 2026-08-22. This entry used to say otherwise, on the
+  reasoning that the *writer* side behaves fine either way. That reasoning was
+  sound and irrelevant: the failing case is the **main** input reaching EOF, not
+  the secondary. See Step 3b.
 - **A short overlay hiccup is survivable.** The `resume` arm shows ffmpeg catches
   up fully after a pause. A freeze needs **≥60s of continuous silence** to trip
   the detector, so "it paused briefly at an item boundary" does not explain a

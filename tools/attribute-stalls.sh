@@ -40,6 +40,15 @@
 # same signature. The assignment is read from `ffmpeg-argv-ch<N>.log`, whose
 # `=== <ts> pid=<pid>` headers let the right invocation be picked by time.
 #
+# That bug was #348, fixed 2026-08-22: `overlay_vaapi` did not set
+# `eof_action=pass`, so once the MAIN input hit EOF — which it does on nearly
+# every item, because `-t` comes from the catalog duration and overshoots the
+# real media by a few ms — framesync kept the graph alive on the never-ending
+# overlay fifo. ffmpeg spun there dropping ~15 frames/s, never reached its `-t`,
+# and never exited. A COMPLETED-BUT-WOULD-NOT-EXIT row after that fix is a NEW
+# problem, not the known one. `drop_frames` in the progress stream separates a
+# spin (climbing) from a genuine wedge (flat); this script does not read it yet.
+#
 # TWO SOURCES, AND WHY
 #
 # Until b6f5ac8 the probe appended its own `-progress` to a per-channel file,
