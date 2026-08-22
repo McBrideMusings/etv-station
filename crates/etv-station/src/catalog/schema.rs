@@ -141,6 +141,63 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE entries ADD COLUMN missing_since TEXT;
     ALTER TABLE entry_sources ADD COLUMN missing_since TEXT;
     "#,
+    // v8 — an external id is only unique *within a media type* (#340).
+    //
+    // TMDB and TVDB number movies and episodes in separate id spaces, so the
+    // same integer names two different works. Plex reports the bare number
+    // with no type qualifier. Keyed on `(namespace, value)` alone, the two
+    // collapse: the movie *Spider-Man: Brand New Day* and *Dragon Ball Z*
+    // S3E27 both carry tmdb `969681`, so the episode inherited the movie's
+    // `entry_id` and overwrote its guide row — channel 20, a movies-only
+    // channel, aired a 144-minute film billed as "Dragon Ball Z, S3E27". Two
+    // more pairs did the same. Across the live library 1,479 `(ns, value)`
+    // pairs are shared across kinds: 821 tmdb, 658 tvdb, 0 imdb — IMDb's
+    // tt-numbers are one space across every media type, which is why only the
+    // other two collide.
+    //
+    // `plex-db-ex` reached the same conclusion first (its issue #23) and keys
+    // its own `external_ids` on `(ns, value, kind)`. This is that fix on this
+    // side.
+    //
+    // The rebuild carries every existing row forward, stamped with its
+    // entry's own `type`. Then the repair: a `ratingKey` is pinned to its
+    // entry for life (ADR 0009), so the entries that already merged stay
+    // merged no matter what the key becomes. Deleting them (FK cascade takes
+    // their sources, external ids, tags and collection rows) and clearing the
+    // ingest cursor forces the next start into a full pass, which re-mints
+    // each rating key under the id it should have had. 1,446 entries on the
+    // live catalog. A legitimate multi-file dedupe (one title as 4K and
+    // 1080p) is deleted too and re-merges correctly on that pass, since both
+    // files share a kind as well as an id.
+    r#"
+    DROP INDEX idx_entry_external_ids_entry;
+    ALTER TABLE entry_external_ids RENAME TO entry_external_ids_untyped;
+
+    CREATE TABLE entry_external_ids (
+        namespace TEXT NOT NULL,
+        value     TEXT NOT NULL,
+        kind      TEXT NOT NULL,
+        entry_id  TEXT NOT NULL REFERENCES entries(entry_id) ON DELETE CASCADE,
+        PRIMARY KEY (namespace, value, kind)
+    );
+    CREATE INDEX idx_entry_external_ids_entry ON entry_external_ids(entry_id);
+
+    INSERT INTO entry_external_ids (namespace, value, kind, entry_id)
+        SELECT x.namespace, x.value, e.type, x.entry_id
+          FROM entry_external_ids_untyped x
+          JOIN entries e ON e.entry_id = x.entry_id;
+
+    DROP TABLE entry_external_ids_untyped;
+
+    DELETE FROM entries WHERE entry_id IN (
+        SELECT entry_id FROM entry_sources
+         WHERE source = 'plex'
+         GROUP BY entry_id
+        HAVING COUNT(*) > 1
+    );
+
+    DELETE FROM catalog_meta WHERE key = 'last_plex_ingest';
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.
@@ -182,6 +239,12 @@ mod tests {
     /// an older binary left a real `catalog.db`.
     fn at_version(version: usize) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        // Exactly what `Catalog::init` does before calling `apply`, and not
+        // incidental: v8's repair leans on FK cascade to take a deleted entry's
+        // sources and external ids with it. Left to whatever the linked SQLite
+        // was compiled to default to, the test would pass or fail on a build
+        // flag rather than on the migration.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL);")
             .unwrap();
         for (i, ddl) in MIGRATIONS.iter().take(version).enumerate() {
@@ -223,6 +286,104 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(remaining, vec!["genre=Ident".to_string()]);
+    }
+
+    /// v8's repair, on the shape #340 actually found in prod: the film
+    /// *Spider-Man: Brand New Day* and *Dragon Ball Z* S3E27 merged onto one
+    /// entry via their shared tmdb number, leaving a hybrid row — the movie's
+    /// title, year and 144-minute runtime carrying the episode's show, season
+    /// and episode. A rating key is pinned to its entry for life (ADR 0009), so
+    /// the merge cannot unwind on its own; the upgrade has to take the row out
+    /// and send the next start back to Plex for both of them.
+    #[test]
+    fn upgrading_deletes_a_merged_entry_and_forces_a_full_reingest() {
+        let conn = at_version(7);
+        conn.execute_batch(
+            "INSERT INTO entries (entry_id, type, title, show, season, episode, primary_source)
+                 VALUES ('imdb:tt22084616', 'movie', 'Spider-Man: Brand New Day',
+                         'Dragon Ball Z', 3, 27, 'plex');
+             INSERT INTO entries (entry_id, type, title, primary_source)
+                 VALUES ('imdb:tt8814476', 'movie', 'Supergirl', 'plex');
+             INSERT INTO entry_sources (source, source_id, entry_id, playback_path) VALUES
+                 ('plex', '171939', 'imdb:tt22084616', '/media/movies/spider-man.mkv'),
+                 ('plex', '25088',  'imdb:tt22084616', '/media/television/dbz-s03e27.mkv'),
+                 ('plex', '999',    'imdb:tt8814476',  '/media/movies/supergirl.mp4');
+             INSERT INTO entry_external_ids (namespace, value, entry_id) VALUES
+                 ('imdb', 'tt22084616', 'imdb:tt22084616'),
+                 ('tmdb', '969681',     'imdb:tt22084616'),
+                 ('imdb', 'tt8814476',  'imdb:tt8814476');
+             INSERT INTO catalog_meta (key, value) VALUES ('last_plex_ingest', '1755000000');",
+        )
+        .unwrap();
+
+        apply(&conn).unwrap();
+
+        let survivors: Vec<String> = conn
+            .prepare("SELECT entry_id FROM entries ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            survivors,
+            vec!["imdb:tt8814476".to_string()],
+            "the entry two rating keys merged onto is deleted; the clean one stays",
+        );
+
+        // FK cascade takes the merged entry's provenance with it, so neither
+        // rating key is pinned any more and the full pass re-mints both.
+        let sources: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entry_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sources, 1);
+
+        // The survivor's external ids carry forward, now stamped with its type.
+        let carried: Vec<String> = conn
+            .prepare("SELECT namespace || '/' || value || '/' || kind FROM entry_external_ids")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(carried, vec!["imdb/tt8814476/movie".to_string()]);
+
+        let cursor: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM catalog_meta WHERE key = 'last_plex_ingest'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, 0, "the cleared cursor is what forces the full pass");
+    }
+
+    /// The same integer in one namespace, two media types, two entries — the
+    /// state v1's `(namespace, value)` key could not represent at all.
+    #[test]
+    fn one_external_id_can_name_a_movie_and_an_episode_at_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO entries (entry_id, type, title, primary_source) VALUES
+                 ('imdb:tt22084616', 'movie',   'Spider-Man: Brand New Day', 'plex'),
+                 ('imdb:tt0976417',  'episode', 'The Last Wish',             'plex');
+             INSERT INTO entry_external_ids (namespace, value, kind, entry_id) VALUES
+                 ('tmdb', '969681', 'movie',   'imdb:tt22084616'),
+                 ('tmdb', '969681', 'episode', 'imdb:tt0976417');",
+        )
+        .unwrap();
+
+        let entry_id: String = conn
+            .query_row(
+                "SELECT entry_id FROM entry_external_ids
+                  WHERE namespace = 'tmdb' AND value = '969681' AND kind = 'movie'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(entry_id, "imdb:tt22084616");
     }
 
     #[test]

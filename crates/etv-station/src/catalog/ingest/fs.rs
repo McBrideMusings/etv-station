@@ -667,7 +667,7 @@ mod tests {
         )
         .unwrap();
         let id = cat.all_entry_ids().unwrap()[0].clone();
-        cat.add_external_id(ExternalNs::Imdb, "tt-swept", &id)
+        cat.add_external_id(ExternalNs::Imdb, "tt-swept", "video", &id)
             .unwrap();
         assert_eq!(
             cat.resolve_query(r#"item.fs_dir == "bumpers""#).unwrap(),
@@ -691,7 +691,7 @@ mod tests {
             "a missing entry must not be schedulable",
         );
         assert_eq!(
-            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt-swept")
+            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt-swept", "video")
                 .unwrap(),
             Some(id),
             "the external id must keep resolving — that is what makes the file resurfacing a re-match rather than a fresh entry",

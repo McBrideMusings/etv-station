@@ -463,7 +463,9 @@ mod tests {
             })
             .unwrap();
         for (ns, value) in guids {
-            catalog.add_external_id(*ns, value, entry_id).unwrap();
+            catalog
+                .add_external_id(*ns, value, "movie", entry_id)
+                .unwrap();
         }
     }
 

@@ -429,12 +429,14 @@ impl Catalog {
         &self,
         namespace: ExternalNs,
         value: &str,
+        kind: &str,
         entry_id: &str,
     ) -> Result<(), CatalogError> {
         self.conn.execute(
-            "INSERT INTO entry_external_ids (namespace, value, entry_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT(namespace, value) DO UPDATE SET entry_id=excluded.entry_id",
-            params![namespace.as_str(), value, entry_id],
+            "INSERT INTO entry_external_ids (namespace, value, kind, entry_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(namespace, value, kind) DO UPDATE SET entry_id=excluded.entry_id",
+            params![namespace.as_str(), value, kind, entry_id],
         )?;
         Ok(())
     }
@@ -573,16 +575,25 @@ impl Catalog {
 
     /// The `entry_id` an external GUID resolves to, if any — the GUID-first half
     /// of ingest identity: every source sharing a GUID collapses onto one entry.
+    ///
+    /// `kind` is the media type the GUID was reported *for*, and is part of the
+    /// key rather than a filter on it (#340). TMDB and TVDB number movies and
+    /// episodes in separate id spaces, so tmdb `969681` is one work as a movie
+    /// and a different one as an episode; without the kind the two collapse and
+    /// a film inherits a TV episode's guide row. IMDb's tt-numbers are a single
+    /// space across every type, so the kind simply never separates two of those.
     pub fn entry_id_for_external_id(
         &self,
         namespace: ExternalNs,
         value: &str,
+        kind: &str,
     ) -> Result<Option<String>, CatalogError> {
         let row = self
             .conn
             .query_row(
-                "SELECT entry_id FROM entry_external_ids WHERE namespace = ?1 AND value = ?2",
-                params![namespace.as_str(), value],
+                "SELECT entry_id FROM entry_external_ids
+                  WHERE namespace = ?1 AND value = ?2 AND kind = ?3",
+                params![namespace.as_str(), value, kind],
                 |r| r.get::<_, String>(0),
             )
             .optional()?;
@@ -1140,7 +1151,8 @@ mod tests {
                 missing_since: None,
             })
             .unwrap();
-            c.add_external_id(ExternalNs::Imdb, id, id).unwrap();
+            c.add_external_id(ExternalNs::Imdb, id, "movie", id)
+                .unwrap();
         }
         // Only `tt-gone`'s source went unseen by this pass.
         c.conn
@@ -1165,7 +1177,7 @@ mod tests {
         assert_eq!(gone.title, "Die Hard");
         assert!(gone.missing_since.is_some());
         assert_eq!(
-            c.entry_id_for_external_id(ExternalNs::Imdb, "imdb:tt-gone")
+            c.entry_id_for_external_id(ExternalNs::Imdb, "imdb:tt-gone", "movie")
                 .unwrap(),
             Some("imdb:tt-gone".to_string()),
         );
@@ -1384,9 +1396,9 @@ mod tests {
             Source::Plex,
         ))
         .unwrap();
-        c.add_external_id(ExternalNs::Imdb, "tt1375666", "imdb:tt1375666")
+        c.add_external_id(ExternalNs::Imdb, "tt1375666", "movie", "imdb:tt1375666")
             .unwrap();
-        c.add_external_id(ExternalNs::Tmdb, "27205", "imdb:tt1375666")
+        c.add_external_id(ExternalNs::Tmdb, "27205", "movie", "imdb:tt1375666")
             .unwrap();
         let entry_id: String = c
             .conn

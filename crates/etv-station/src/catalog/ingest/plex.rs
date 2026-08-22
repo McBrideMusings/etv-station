@@ -328,7 +328,7 @@ pub fn ingest_items(
         let existing = catalog.entry(&entry_id)?;
         let mut entry = Entry::new(
             &entry_id,
-            non_empty(&item.kind).unwrap_or("video"),
+            entry_kind(item),
             merged(
                 non_empty(&item.title),
                 existing.as_ref().map(|e| e.title.clone()),
@@ -444,9 +444,12 @@ pub fn ingest_items(
         stats.entries_written += 1;
 
         // Record every GUID so the entry is reachable by any of them, even when
-        // an inherited (e.g. `fs:`) id is what the entry is keyed under.
+        // an inherited (e.g. `fs:`) id is what the entry is keyed under. Stored
+        // under this item's own media type, which is half the key (#340) — the
+        // same tmdb/tvdb number means one work as a movie and another as an
+        // episode.
         for (ns, value) in &item.external_ids {
-            catalog.add_external_id(*ns, value, &entry_id)?;
+            catalog.add_external_id(*ns, value, entry_kind(item), &entry_id)?;
         }
 
         catalog.add_source(&EntrySource {
@@ -750,6 +753,13 @@ pub fn ingest(
 /// ADR 0009, mirroring plex-db-ex ADR-0008), then a GUID the catalog already
 /// knows (so every *other* file sharing it collapses onto one entry), then a
 /// path-match on the canonical path. `None` → mint a fresh id.
+///
+/// The GUID step matches within this item's own media type (#340). A movie and
+/// a TV episode can carry the same tmdb or tvdb number — those two id spaces
+/// are partitioned by type and Plex reports the bare number — and matching
+/// across the partition is what made channel 20 bill a 144-minute film as
+/// "Dragon Ball Z, S3E27". Two files that really are the same title still
+/// collapse onto one entry: they share a kind as well as an id.
 fn resolve_existing(
     catalog: &Catalog,
     item: &PlexItem,
@@ -759,11 +769,20 @@ fn resolve_existing(
         return Ok(Some(id));
     }
     for (ns, value) in &item.external_ids {
-        if let Some(id) = catalog.entry_id_for_external_id(*ns, value)? {
+        if let Some(id) = catalog.entry_id_for_external_id(*ns, value, entry_kind(item))? {
             return Ok(Some(id));
         }
     }
     Ok(path_match.cloned())
+}
+
+/// The media type an item is stored under: what Plex called it, or `"video"`
+/// when Plex said nothing. One function because the value has to be the same in
+/// two places — `entries.type`, and the `kind` half of every external-id key
+/// (#340). If the two ever disagreed, a lookup would miss the row the write put
+/// down and every re-ingest would mint a second entry for the same title.
+fn entry_kind(item: &PlexItem) -> &str {
+    non_empty(&item.kind).unwrap_or("video")
 }
 
 /// `Some(s)` when `s` is not blank, else `None`.
@@ -2253,6 +2272,112 @@ mod tests {
         );
     }
 
+    /// #340, with the real GUIDs off the live library. Plex reported tmdb
+    /// `969681` for *both* the 2026 film *Spider-Man: Brand New Day* (rating
+    /// key 171939) and *Dragon Ball Z* S3E27 (rating key 25088) — TMDB numbers
+    /// movies and episodes in separate id spaces and Plex hands over the bare
+    /// number, so one integer names two different works. Their IMDb ids differ,
+    /// so nothing about the identity *rule* is wrong; it was the GUID-inherit
+    /// step in `resolve_existing` matching across the type partition.
+    ///
+    /// Collapsed, channel 20 — every pool a movie collection — aired the film
+    /// for 2h42m billed as "Dragon Ball Z, S3E27, The Last Wish", with the
+    /// series' artwork and the movie's own title demoted to `sub-title`. Two
+    /// more pairs did the same on that one channel, and 1,446 entries on the
+    /// live catalog carried more than one Plex rating key.
+    #[test]
+    fn a_movie_and_an_episode_sharing_a_tmdb_id_stay_two_entries() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut film = movie(
+            "171939",
+            "/data/media/movies/Spider-Man Brand New Day (2026)/spider-man.mkv",
+            &[
+                (ExternalNs::Imdb, "tt22084616"),
+                (ExternalNs::Tmdb, "969681"),
+            ],
+        );
+        film.title = "Spider-Man: Brand New Day".into();
+        film.duration_ms = Some(8_672_320);
+
+        let mut ep = movie(
+            "25088",
+            "/data/media/television/Dragon Ball Z (1989)/Season 03/s03e27.mkv",
+            &[
+                (ExternalNs::Imdb, "tt0976417"),
+                (ExternalNs::Tmdb, "969681"),
+            ],
+        );
+        ep.kind = "episode".into();
+        ep.title = "The Last Wish".into();
+        ep.show = Some("Dragon Ball Z".into());
+        ep.season = Some(3);
+        ep.episode = Some(27);
+        ep.duration_ms = Some(1_453_472);
+
+        ingest_items(&cat, &[film, ep], &["/data/media".into()]).unwrap();
+
+        let film_id = cat
+            .entry_id_for_source(Source::Plex, "171939")
+            .unwrap()
+            .unwrap();
+        let ep_id = cat
+            .entry_id_for_source(Source::Plex, "25088")
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            film_id, ep_id,
+            "a shared tmdb number must not merge a film into a TV episode",
+        );
+
+        // The film's guide row is the assertion that matters — this is what the
+        // XMLTV writer reads, and every field of it was wrong on channel 20.
+        let got = cat.entry(&film_id).unwrap().unwrap();
+        assert_eq!(got.title, "Spider-Man: Brand New Day");
+        assert_eq!(got.kind, "movie");
+        assert_eq!(got.show, None, "a movie has no series name");
+        assert_eq!(got.season, None);
+        assert_eq!(got.episode, None);
+        assert_eq!(got.duration_ms, Some(8_672_320));
+
+        // Each id resolves within its own type, and never across.
+        assert_eq!(
+            cat.entry_id_for_external_id(ExternalNs::Tmdb, "969681", "movie")
+                .unwrap(),
+            Some(film_id),
+        );
+        assert_eq!(
+            cat.entry_id_for_external_id(ExternalNs::Tmdb, "969681", "episode")
+                .unwrap(),
+            Some(ep_id),
+        );
+    }
+
+    /// The other half of the same key: two files that really are one title
+    /// still collapse onto one entry, because they share a kind as well as an
+    /// id. This is the 4K + 1080p dedupe #340's fix must not break.
+    #[test]
+    fn two_files_of_one_movie_still_collapse_onto_one_entry() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let hd = movie(
+            "1001",
+            "/data/media/movies/Die Hard/1080p.mkv",
+            &[(ExternalNs::Imdb, "tt0095016")],
+        );
+        let uhd = movie(
+            "1002",
+            "/data/media/4k/Die Hard/2160p.mkv",
+            &[(ExternalNs::Imdb, "tt0095016")],
+        );
+
+        ingest_items(&cat, &[hd, uhd], &["/data/media".into()]).unwrap();
+
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 1);
+        assert_eq!(
+            cat.entry_id_for_source(Source::Plex, "1001").unwrap(),
+            cat.entry_id_for_source(Source::Plex, "1002").unwrap(),
+        );
+    }
+
     /// The bug #274 exists to fix: two shows that happen to share a title must
     /// not collapse into one series. Both here are literally titled "The
     /// Office" — the UK original and the US remake — with different Plex
@@ -2422,7 +2547,7 @@ mod tests {
         // pinned entry, so acceptance criterion 2 holds even though the id
         // itself never moved.
         assert_eq!(
-            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt0386676")
+            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt0386676", "movie")
                 .unwrap(),
             Some("tmdb:2316".to_string())
         );
@@ -3775,7 +3900,7 @@ mod tests {
         );
         assert_eq!(cat.sources_for("imdb:tt0095016").unwrap().len(), 2);
         assert_eq!(
-            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt0095016")
+            cat.entry_id_for_external_id(ExternalNs::Imdb, "tt0095016", "movie")
                 .unwrap(),
             Some("imdb:tt0095016".to_string())
         );

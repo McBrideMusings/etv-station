@@ -213,6 +213,70 @@ zero means the station just repaired chunks that would otherwise have aired
 black. `admin logs | grep reconcile` is the check after a big Radarr rename
 batch — not because anything needs doing, but to confirm nothing did.
 
+## Verifying no two Plex items share one catalog entry (#340)
+
+The symptom is a guide row, not a crash: a movie airing under a TV series'
+title, artwork, season and episode. Channel 20 aired *Spider-Man: Brand New Day*
+for 2h42m billed as "Dragon Ball Z, S3E27, The Last Wish". The cause is two Plex
+rating keys collapsing onto one `entry_id`, which happened whenever a movie and
+an episode shared a tmdb or tvdb number — those id spaces are partitioned by
+media type and Plex reports the bare number.
+
+**Read the guide first.** Every pool on `020-trending` is a movie collection, so
+any season/episode on it is a defect:
+
+```sh
+uv run tools/epg-browser.py channel ersatztv.6
+```
+
+Look for: no programme with a non-null `season` or `episode`, and no `sub_title`.
+One is enough to fail.
+
+**Then ask the catalog directly.** This is the invariant, and it is one query —
+the entry a rating key is pinned to is pinned for life (ADR 0009), so a merge
+that gets in never unwinds on its own:
+
+```sh
+ssh "$UNRAID_USER@$UNRAID_HOST" "sqlite3 -readonly \
+  /mnt/user/appdata/etv-station/data/catalog.db \
+  'select count(*) from (select entry_id from entry_sources where source = \"plex\" \
+    group by entry_id having count(*) > 1)'"
+```
+
+Look for: `0`. It read 1,446 before the v8 migration. A non-zero count that is
+*not* a genuine multi-file dedupe (one title held as both 4K and 1080p — those
+share a kind, so they are supposed to collapse) means the type partition leaked
+again. To tell them apart, compare each entry's rating keys against the
+`plex-db-ex` snapshot's `external_ids.kind`.
+
+**Locally**, the same invariant is two unit tests, and they are cheaper than
+either check above:
+
+```sh
+cargo test -p etv-station --lib catalog::ingest::plex::tests::a_movie_and_an_episode
+cargo test -p etv-station --lib catalog::schema
+```
+
+The first ingests the real colliding pair and asserts they stay two entries with
+the film's own title, no `show`, no season and no episode. The second drives the
+v8 migration over a v7 catalog holding a merged row and asserts the row is
+deleted, the FK cascade took its provenance, and `last_plex_ingest` is cleared —
+that cleared cursor is the whole repair, because it is what forces the next start
+into a full pass instead of a delta.
+
+**After deploying a schema change, confirm the migration actually ran** rather
+than assuming it did:
+
+```sh
+ssh "$UNRAID_USER@$UNRAID_HOST" "sqlite3 -readonly \
+  /mnt/user/appdata/etv-station/data/catalog.db 'select max(version) from schema_version'"
+```
+
+Look for: the current `SCHEMA_VERSION` in `crates/etv-station/src/catalog/schema.rs`
+(the length of `MIGRATIONS`). A v8 deploy also re-walks the whole library once,
+so the first `catalog.ingest.plex` line after it reads `mode="full"` and takes
+minutes, not seconds. That is the repair working, not a hang.
+
 ## Verifying a graphics overlay actually reaches the screen
 
 **Fastest check: `admin overlay-watch <channel-dir>`** — no station, no
