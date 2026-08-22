@@ -700,7 +700,7 @@ def run_tui(host: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", help="explicit station URL, e.g. http://100.114.249.118:8419")
+    parser.add_argument("--host", help="explicit station URL, e.g. http://station.example:8419")
     parser.add_argument("--local", action="store_true", help="target local dev (127.0.0.1:8409)")
     parser.add_argument("--prod", action="store_true", help="target prod (PROD_URL, the default)")
     sub = parser.add_subparsers(dest="command")

@@ -39,7 +39,7 @@ def fixture() -> tuple[dict, list]:
             tvg_id=f"ersatztv.{n}",
             name=name,
             logo=None,
-            stream_url=f"http://100.114.249.118:8419/channel/{n}.m3u8",
+            stream_url=f"http://station.example:8419/channel/{n}.m3u8",
         )
         for n, name in ((1, "001-for-you"), (2, "002-for-pierce"))
     }
@@ -58,7 +58,7 @@ def fixture() -> tuple[dict, list]:
                 episode=3,
                 categories=["Action", "Comedy", "Drama"],
                 rating="TV-MA",
-                icon="http://100.114.249.118:8419/artwork/imdb_tt28754309.jpg",
+                icon="http://station.example:8419/artwork/imdb_tt28754309.jpg",
             )
         )
     return channels, progs
