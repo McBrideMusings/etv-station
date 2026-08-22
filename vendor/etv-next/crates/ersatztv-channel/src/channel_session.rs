@@ -994,10 +994,14 @@ impl ChannelSession {
                     loop {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         let playlist_manager = self.playlist_manager.lock().await;
-                        let lead = *playlist_manager.last_segment_end() - OffsetDateTime::now_utc();
+                        let segment_frontier = *playlist_manager.last_segment_end();
                         drop(playlist_manager);
+                        let lead = segment_frontier - OffsetDateTime::now_utc();
+                        // What a restart would actually be assigned: the item
+                        // from the frontier it would resume at to its finish.
+                        let remaining = current_item.finish - segment_frontier;
                         let fire;
-                        (armed, fire) = reburst_decision(armed, lead);
+                        (armed, fire) = reburst_decision(armed, lead, remaining);
                         if fire {
                             break lead;
                         }
@@ -1709,9 +1713,27 @@ fn clear_nonblocking(file: &std::fs::File) -> Result<(), ChannelError> {
 /// Returns the next `armed` state and whether to fire now. Split out from the
 /// select arm that drives it because the arming half is the part that is easy to
 /// get wrong and impossible to observe once it is inside a `tokio::select!`.
-fn reburst_decision(armed: bool, lead: time::Duration) -> (bool, bool) {
+///
+/// `remaining` is how much of the item is still untranscoded — the gap between
+/// the item's finish and the segment frontier the restart would resume from.
+/// A reburst rebuilds the buffer for the *rest of the item*, so when there is no
+/// meaningful rest left it buys nothing and costs everything: it kills a healthy
+/// ffmpeg and respawns one whose entire assignment is a fraction of a segment.
+/// Measured in production on 2026-08-22: channel 2 fired at `20:30:59Z` with the
+/// item finishing at `20:31:18.613Z`, and the replacement process was handed
+/// `-t 153ms` against `-hls_time 4` — 3.8% of one segment. Channel 1 got
+/// `-t 1336ms` the same way at `20:47:34Z`.
+///
+/// Holding fire is safe rather than merely cheaper. Firing requires the lead to
+/// be at or below [`REBURST_AT_LEAD`], and this gate only holds fire when the
+/// remaining content is shorter than that same lead — so the running process has
+/// more buffer in hand than it has work left, even at the 0.69x read rate
+/// measured on a busy machine. The item then ends normally, which drops the
+/// state to [`ChannelSessionState::Zero`], and the next item builds a fresh
+/// [`INITIAL_BURST`] from its own beginning.
+fn reburst_decision(armed: bool, lead: time::Duration, remaining: time::Duration) -> (bool, bool) {
     if armed {
-        (true, lead <= REBURST_AT_LEAD)
+        (true, lead <= REBURST_AT_LEAD && remaining > REBURST_AT_LEAD)
     } else {
         // Arming needs a lead that has actually been built. Firing on the way UP
         // would restart the item forever without ever playing any of it.
@@ -1848,23 +1870,31 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
 mod reburst_tests {
     use super::*;
 
+    /// Most of these cases are about the lead, not about how much item is left,
+    /// so they pass a remaining that is comfortably long enough to restart.
+    const PLENTY_REMAINING: time::Duration = time::Duration::minutes(20);
+
     /// A fresh item starts with no lead at all. Firing here would kill the
     /// transcode before it had produced anything, restart it, and do the same
     /// again — the film would never play.
     #[test]
     fn a_lead_still_being_built_does_not_fire() {
-        let (armed, fire) = reburst_decision(false, time::Duration::seconds(0));
+        let (armed, fire) = reburst_decision(false, time::Duration::seconds(0), PLENTY_REMAINING);
         assert!(!armed, "must not arm before the lead is built");
         assert!(!fire);
 
-        let (armed, fire) = reburst_decision(false, REBURST_AT_LEAD - time::Duration::seconds(1));
+        let (armed, fire) = reburst_decision(
+            false,
+            REBURST_AT_LEAD - time::Duration::seconds(1),
+            PLENTY_REMAINING,
+        );
         assert!(!armed, "a lead below the arming level is still the way up");
         assert!(!fire, "firing on the way up would restart the item forever");
     }
 
     #[test]
     fn arming_needs_the_lead_to_reach_the_arming_level() {
-        let (armed, fire) = reburst_decision(false, REBURST_ARM_AT_LEAD);
+        let (armed, fire) = reburst_decision(false, REBURST_ARM_AT_LEAD, PLENTY_REMAINING);
         assert!(armed);
         assert!(
             !fire,
@@ -1876,14 +1906,18 @@ mod reburst_tests {
     /// transcode running under wall-clock speed.
     #[test]
     fn an_armed_item_fires_once_the_lead_drains() {
-        let (armed, fire) = reburst_decision(true, REBURST_AT_LEAD);
+        let (armed, fire) = reburst_decision(true, REBURST_AT_LEAD, PLENTY_REMAINING);
         assert!(
             armed,
             "arming survives so a recovering lead cannot disarm it"
         );
         assert!(fire);
 
-        let (_, fire) = reburst_decision(true, REBURST_AT_LEAD + time::Duration::seconds(1));
+        let (_, fire) = reburst_decision(
+            true,
+            REBURST_AT_LEAD + time::Duration::seconds(1),
+            PLENTY_REMAINING,
+        );
         assert!(!fire, "still has lead to spare");
     }
 
@@ -1891,8 +1925,63 @@ mod reburst_tests {
     /// the encoder. It must fire, not be treated as an unreachable state.
     #[test]
     fn a_negative_lead_fires() {
-        let (_, fire) = reburst_decision(true, time::Duration::seconds(-30));
+        let (_, fire) = reburst_decision(true, time::Duration::seconds(-30), PLENTY_REMAINING);
         assert!(fire);
+    }
+
+    /// The real production case, replayed. Channel 2 fired at `20:30:59Z` with
+    /// the item finishing at `20:31:18.613Z` and the segment frontier already at
+    /// `20:31:18.460Z`, so the restart's whole assignment was 153ms — 3.8% of one
+    /// 4s segment. Channel 1's was 1336ms the same way. Both must hold fire.
+    #[test]
+    fn a_sub_segment_remainder_does_not_fire() {
+        for remaining in [
+            time::Duration::milliseconds(153),
+            time::Duration::milliseconds(1336),
+            time::Duration::milliseconds(3619),
+        ] {
+            let (armed, fire) = reburst_decision(true, REBURST_AT_LEAD, remaining);
+            assert!(armed, "holding fire must not disarm the check");
+            assert!(
+                !fire,
+                "restarting to transcode {}ms buys nothing and kills a healthy ffmpeg",
+                remaining.whole_milliseconds()
+            );
+        }
+    }
+
+    /// The boundary. Firing needs the lead at or below [`REBURST_AT_LEAD`], so
+    /// holding fire while `remaining <= REBURST_AT_LEAD` leaves the running
+    /// process with at least as much buffer as it has work left.
+    #[test]
+    fn the_remaining_gate_sits_at_the_firing_lead() {
+        let (_, fire) = reburst_decision(true, REBURST_AT_LEAD, REBURST_AT_LEAD);
+        assert!(!fire, "as much work left as buffer in hand — let it finish");
+
+        let (_, fire) = reburst_decision(
+            true,
+            REBURST_AT_LEAD,
+            REBURST_AT_LEAD + time::Duration::seconds(1),
+        );
+        assert!(
+            fire,
+            "more item left than lead: the restart has work to buy"
+        );
+    }
+
+    /// An item whose frontier has passed its finish is fully transcoded. A
+    /// negative remaining must read as "nothing left", not wrap into firing.
+    #[test]
+    fn a_fully_transcoded_item_does_not_fire() {
+        let (_, fire) = reburst_decision(true, time::Duration::seconds(-30), time::Duration::ZERO);
+        assert!(!fire);
+
+        let (_, fire) = reburst_decision(
+            true,
+            time::Duration::seconds(-30),
+            time::Duration::seconds(-5),
+        );
+        assert!(!fire, "the frontier is already past the item's finish");
     }
 
     /// The threshold has to leave room for the respawn itself. A channel takes
