@@ -1724,13 +1724,17 @@ fn clear_nonblocking(file: &std::fs::File) -> Result<(), ChannelError> {
 /// `-t 153ms` against `-hls_time 4` — 3.8% of one segment. Channel 1 got
 /// `-t 1336ms` the same way at `20:47:34Z`.
 ///
-/// Holding fire is safe rather than merely cheaper. Firing requires the lead to
-/// be at or below [`REBURST_AT_LEAD`], and this gate only holds fire when the
-/// remaining content is shorter than that same lead — so the running process has
-/// more buffer in hand than it has work left, even at the 0.69x read rate
-/// measured on a busy machine. The item then ends normally, which drops the
-/// state to [`ChannelSessionState::Zero`], and the next item builds a fresh
-/// [`INITIAL_BURST`] from its own beginning.
+/// The threshold is [`REBURST_AT_LEAD`] because that constant is already sized
+/// against the respawn — see its own docs: "set above the 4-10s a respawn takes".
+/// What a restart buys is a *fresh* process reading unthrottled, so it needs
+/// enough content left to burst through before the respawn cost eats the gain.
+/// Under this threshold there is less item left than a respawn costs, so the
+/// replacement cannot come out ahead however far behind the old one had fallen —
+/// this holds fire even on a negative lead, where the restart would spend 4-10s
+/// producing nothing and then face the same remaining work at the same speed.
+/// The item ends within [`REBURST_AT_LEAD`] either way, and ending normally is
+/// what drops the state to [`ChannelSessionState::Zero`] so the next item builds
+/// a fresh [`INITIAL_BURST`] from its own beginning.
 fn reburst_decision(armed: bool, lead: time::Duration, remaining: time::Duration) -> (bool, bool) {
     if armed {
         (true, lead <= REBURST_AT_LEAD && remaining > REBURST_AT_LEAD)
@@ -1950,23 +1954,34 @@ mod reburst_tests {
         }
     }
 
-    /// The boundary. Firing needs the lead at or below [`REBURST_AT_LEAD`], so
-    /// holding fire while `remaining <= REBURST_AT_LEAD` leaves the running
-    /// process with at least as much buffer as it has work left.
+    /// The boundary sits at [`REBURST_AT_LEAD`] because that constant is already
+    /// sized above what a respawn costs. Below it, the item ends before a
+    /// replacement process could burst through what is left.
     #[test]
-    fn the_remaining_gate_sits_at_the_firing_lead() {
+    fn the_remaining_gate_sits_at_the_respawn_cost() {
         let (_, fire) = reburst_decision(true, REBURST_AT_LEAD, REBURST_AT_LEAD);
-        assert!(!fire, "as much work left as buffer in hand — let it finish");
+        assert!(!fire, "less item left than a respawn costs — let it finish");
 
         let (_, fire) = reburst_decision(
             true,
             REBURST_AT_LEAD,
             REBURST_AT_LEAD + time::Duration::seconds(1),
         );
-        assert!(
-            fire,
-            "more item left than lead: the restart has work to buy"
+        assert!(fire, "enough item left for a fresh burst to pay for itself");
+    }
+
+    /// A lead deep in the negative with the item nearly over is the case the
+    /// respawn-cost argument has to carry on its own: there is no buffer in hand,
+    /// and firing anyway would spend 4-10s producing nothing before facing the
+    /// same remaining work at the same speed.
+    #[test]
+    fn a_negative_lead_does_not_fire_on_a_nearly_finished_item() {
+        let (_, fire) = reburst_decision(
+            true,
+            time::Duration::seconds(-30),
+            time::Duration::seconds(5),
         );
+        assert!(!fire, "a respawn cannot outrun 5s of work it has 5s to do");
     }
 
     /// An item whose frontier has passed its finish is fully transcoded. A
