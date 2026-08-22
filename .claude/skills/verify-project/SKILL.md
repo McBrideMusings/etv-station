@@ -52,6 +52,18 @@ directly at another size with `uv run tools/epg-layout-check.py 128 40`. The
 three-column layout it replaced needed 128 columns before titles clipped, which
 is wider than a split pane.
 
+`admin epg`'s action must stay `kind = "shell-passthrough"` with `interactive =
+true`. That is the only action kind that hands the child this terminal's stdin
+and stdout directly. It was `kind = "interactive-shell"` until 2026-08-21, which
+launches with `stdout=subprocess.PIPE` and ignores `interactive` entirely — the
+flag is only read by the shell-passthrough factory. `shutil.get_terminal_size()`
+then saw no tty and returned its 80x24 fallback, so the TUI composited a 24-row
+frame into a 45-row pane and the rows below its footer kept a stale copy of an
+earlier frame. Measured in a 120x45 pty: the piped path reports `isatty=False,
+size=(80, 24)`; the passthrough path reports `isatty=True, size=(120, 45)`. If
+the TUI ever renders duplicated or half-height again, check that kind first —
+`epg-layout-check.py` cannot see this, since it never touches a terminal.
+
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
 
