@@ -44,6 +44,14 @@ two schedules match and the test panics with "the two passes matched". Observed
 2026-08-20 passing and failing on back-to-back runs of the identical tree. Re-run
 it; if it is the only failure, the tree is green.
 
+`tools/epg-browser.py` is Python, so `verify-all.sh` never touches it. `admin
+test` runs `tools/epg-layout-check.py` alongside the cargo trees: it drives the
+real TUI under Textual's headless driver against fixture data (no network, no
+station) at 80x24 and fails if any pane spills past the terminal edge. Run it
+directly at another size with `uv run tools/epg-layout-check.py 128 40`. The
+three-column layout it replaced needed 128 columns before titles clipped, which
+is wider than a split pane.
+
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
 

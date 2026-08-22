@@ -321,19 +321,30 @@ def cmd_artwork_check(host: str, channel_id: str | None) -> None:
 # --- Textual TUI -------------------------------------------------------------
 
 
-def run_tui(host: str) -> None:
+def build_app(host: str):
+    """Construct the TUI without running it. Split from run_tui so
+    tools/epg-layout-check.py can drive the same app under Textual's headless
+    test driver and assert the layout still fits a narrow terminal."""
     from rich.markup import escape
     from textual.app import App, ComposeResult
-    from textual.containers import Horizontal, VerticalScroll
+    from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.widgets import Footer, Header, ListItem, ListView, Label, Static
 
     class EpgBrowserApp(App):
         ENABLE_COMMAND_PALETTE = False
+        # Two rows, not three columns. Three side-by-side panes needed 128
+        # columns before anything clipped (34+1 channels, 40+1 programmes, 52
+        # for the widest detail line — the full stream URL), which is wider
+        # than a laptop terminal or a split pane. Stacking detail underneath
+        # drops the minimum to 76 and hands the detail pane the full terminal
+        # width, which is the pane that actually wanted it: URLs, a `desc`
+        # paragraph, a comma-joined category list. Vertical space is the cheap
+        # axis — the programme list never fills a terminal's height.
         CSS = """
-        Horizontal { height: 1fr; }
+        #top { height: 2fr; }
         #channels { width: 34; border-right: solid $accent; }
-        #programmes { width: 40; border-right: solid $accent; }
-        #detail { padding: 0 1; }
+        #programmes { width: 1fr; min-width: 40; }
+        #detail { height: 1fr; border-top: solid $accent; padding: 0 1; }
         """
         BINDINGS = [
             ("r", "refresh", "Refresh"),
@@ -366,9 +377,10 @@ def run_tui(host: str) -> None:
 
         def compose(self) -> ComposeResult:
             yield Header()
-            with Horizontal():
-                yield ListView(id="channels")
-                yield ListView(id="programmes")
+            with Vertical():
+                with Horizontal(id="top"):
+                    yield ListView(id="channels")
+                    yield ListView(id="programmes")
                 with VerticalScroll(id="detail"):
                     yield Static("Loading…", id="detail-body", markup=True)
             yield Footer()
@@ -676,7 +688,11 @@ def run_tui(host: str) -> None:
             ET.ElementTree(root).write(out_path, encoding="unicode", xml_declaration=True)
             subprocess.run(["subl", str(out_path)])
 
-    EpgBrowserApp(host).run()
+    return EpgBrowserApp(host)
+
+
+def run_tui(host: str) -> None:
+    build_app(host).run()
 
 
 # --- entry point -------------------------------------------------------------
