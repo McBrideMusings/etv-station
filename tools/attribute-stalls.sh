@@ -275,3 +275,7 @@ printf -- '---------------------------------------------------------------------
 printf 'encoder-stopped-first=%s consumer-stopped-first=%s completed-but-hung=%s no-data-or-ambiguous=%s\n' \
   "$n_enc" "$n_con" "$n_done" "$n_none"
 echo "A NO-PROGRESS-DATA row is a gap in instrumentation, not an unattributable stall."
+
+# Non-zero means some stall could not be attributed, which is a hole in the
+# instrumentation worth fixing. It is deliberately NOT keyed on stalls existing.
+[ "$n_none" -eq 0 ]
