@@ -493,10 +493,33 @@ impl OverlayKindOp for VaapiOverlay {
     }
 
     fn as_arg(&self, location: Option<FramePoint>) -> Option<String> {
+        // eof_action=pass for the same reason the software `overlay` sets it
+        // (see overlay_filter.rs), plus one this filter has of its own: without
+        // it, framesync keeps the graph running once the MAIN input reaches EOF,
+        // driven by the still-live secondary input. When that secondary is the
+        // overlay fifo — a producer that never ends — every frame it emits past
+        // the main's last one is dropped by the encoder, `frame` and `out_time`
+        // freeze, and ffmpeg never reaches the `-t` that would let it exit. It
+        // sits there dropping ~15 frames/s until the 60s stall detector kills it
+        // with exit 75, which is what a viewer sees as a freeze at every item
+        // boundary. `-t` is derived from the catalog duration and routinely
+        // overshoots the real decoded media by a few ms, so the main input hits
+        // EOF first on essentially every item — 54 of 59 kills over 13 hours.
+        //
+        // Measured against the deployed pipeline: main input 10s with `-t 30s`
+        // hangs indefinitely (drop_frames climbing 15/s) without this option and
+        // exits on its own with it. `shortest=1` also breaks the hang, but ends
+        // the video the instant the overlay writer dies; `eof_action=pass` keeps
+        // the main video running to its full duration in that case.
         if let Some(location) = location {
-            Some(format!("overlay_vaapi=x={}:y={}", location.x, location.y))
+            Some(format!(
+                "overlay_vaapi=x={}:y={}:eof_action=pass",
+                location.x, location.y
+            ))
         } else {
-            Some(String::from("overlay_vaapi=x=(W-w)/2:y=(H-h)/2"))
+            Some(String::from(
+                "overlay_vaapi=x=(W-w)/2:y=(H-h)/2:eof_action=pass",
+            ))
         }
     }
 }
@@ -556,6 +579,25 @@ mod tests {
             hwaccels: HashSet::new(),
             video_filters,
             preferred_filters: HashMap::new(),
+        }
+    }
+
+    /// Without `eof_action=pass`, framesync keeps `overlay_vaapi` running after
+    /// the MAIN input reaches EOF, driven by the secondary input. When that
+    /// secondary is the live overlay fifo — a producer with no end — ffmpeg
+    /// never finishes its output, never exits, and is killed by the 60s stall
+    /// detector at every item boundary. Losing this option puts that back.
+    #[test]
+    fn vaapi_overlay_does_not_outlive_its_main_input() {
+        for arg in [
+            VaapiOverlay.as_arg(Some(FramePoint { x: 0, y: 0 })).unwrap(),
+            VaapiOverlay.as_arg(None).unwrap(),
+        ] {
+            assert!(
+                arg.contains("eof_action=pass"),
+                "overlay_vaapi must set eof_action=pass or ffmpeg hangs at every \
+                 item boundary; got {arg}"
+            );
         }
     }
 
