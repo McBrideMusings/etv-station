@@ -166,8 +166,20 @@ scan_ffmpeg_pids() {
         # this read, and `2>/dev/null` on `tr` alone does not suppress the
         # shell's own "No such file or directory" for a failed `<`.
         args=$({ tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null) || continue
+        # Match argv[0] as a bare name OR as an absolute path. ETV-next spawns
+        # `ffmpeg.ffmpeg_path` from station.yaml, which names the probe wrapper,
+        # and tools/ffmpeg-probe.sh execs the real binary by absolute path -- so
+        # argv[0] is `/usr/local/bin/ffmpeg`, never bare `ffmpeg`. A bare-only
+        # pattern therefore matched ZERO live transcodes, ffmpeg_pid_for()
+        # returned empty for every channel, and the "no ffmpeg means not frozen"
+        # branch below skipped all of them. That blinded this script for 25
+        # stalls between 2026-08-21 15:58Z (11:58am ET) and 00:51Z (8:51pm ET)
+        # while it looked healthy in `ps`.
+        #
+        # `*/ffmpeg\ *` cannot match the wrapper itself: `ffmpeg-probe.sh ` has
+        # no space directly after `ffmpeg`.
         case "$args" in
-            ffmpeg\ *"$HLS_ROOT/"*)
+            ffmpeg\ *"$HLS_ROOT/"*|*/ffmpeg\ *"$HLS_ROOT/"*)
                 ch=${args##*"$HLS_ROOT/"}
                 ch=${ch%%/*}
                 case "$ch" in
