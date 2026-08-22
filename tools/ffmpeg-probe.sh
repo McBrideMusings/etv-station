@@ -3,15 +3,24 @@
 #
 # ETV-next runs whatever `ffmpeg.ffmpeg_path` in a channel config points at, so
 # pointing one channel at this script instruments that channel and nothing else.
-# It changes no argument ETV-next chose: it records the argv, appends
-# `-progress`, and execs the real binary.
+# It changes NO argument ETV-next chose — it records the argv and execs the real
+# binary, nothing more.
 #
-# `-progress` is the whole point. When a channel stops emitting segments, the
-# container log says only "no segments produced for 76s" — which cannot tell you
-# whether ffmpeg stopped encoding, or kept encoding while its output failed to
-# land. The progress stream answers that directly: ffmpeg writes a block every
-# second carrying `frame`, `out_time_ms` and `speed`, so a gap with a live
-# progress stream and a gap with a dead one are different bugs.
+# THIS SCRIPT MUST NOT ADD `-progress`, and that is not a style preference.
+# ETV-next already splices `-progress pipe:1` in at argv position 0
+# (channel_session.rs:866) and pumps that stream into the `ffmpeg_progress` log
+# target (channel_session.rs:1556), which docker/entrypoint.sh splits into the
+# rotated /data/diag/ffmpeg-progress.log. ffmpeg's `-progress` is a single AVIO
+# target, so a second one silently REPLACES the first: appending one here sent
+# the stream to a per-channel file and left ETV-next reading a stdout that never
+# received a byte. The daemon log went dead at 2026-08-21 15:57Z (11:57am ET),
+# one minute before the always-on probe first ran, and stayed dead through 25
+# stalls -- with `ffmpeg_progress` the only silent target out of eight while
+# DEBUG logging was demonstrably on (627 lines).
+#
+# The daemon log is also the better record on every axis: it timestamps each
+# report, interleaves every channel in one file so two channels can be compared
+# at the same instant, and keeps 64MB x 3 rather than the last 8 sessions.
 #
 # It is ALWAYS ON, and nothing has to be done to keep it that way. The script
 # ships in the image (see the COPY in Dockerfile) and `ffmpeg.ffmpeg_path` in
@@ -45,17 +54,13 @@ for a in "$@"; do
     esac
 done
 
-stamp=$(date -u +%Y%m%dT%H%M%S)
-
 # Capability probes (`-hwaccels`, `-filters`, …) run constantly and are not
-# transcodes. Instrumenting them would bury the run we care about, and adding
-# -progress to them would be meaningless.
+# transcodes. Instrumenting them would bury the run we care about.
 if [ -z "$channel" ]; then
     exec "$REAL" "$@"
 fi
 
 argv_log="$DIAG/ffmpeg-argv-ch${channel}.log"
-progress="$DIAG/ffmpeg-progress-ch${channel}-${stamp}-$$.log"
 
 # One argument per line, not a single space-joined line. Media paths routinely
 # contain spaces — "Hidalgo (2004) {imdb-tt0317648}/…" — so a space-joined
@@ -63,20 +68,12 @@ progress="$DIAG/ffmpeg-progress-ch${channel}-${stamp}-$$.log"
 # opens the wrong file.
 {
     printf '=== %s pid=%s channel=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$channel"
-    printf 'progress=%s\n' "$progress"
     printf 'argv_begin\n'
     for a in "$@"; do printf '%s\n' "$a"; done
     printf 'argv_end\n'
 } >> "$argv_log" 2>/dev/null
 
-# Keep only the last few runs per channel so a respawn loop cannot fill the
-# volume — the interesting run is always the most recent one.
-# shellcheck disable=SC2012
-ls -1t "$DIAG"/ffmpeg-progress-ch${channel}-*.log 2>/dev/null | tail -n +9 | while read -r old; do
-    rm -f "$old" 2>/dev/null
-done
-
-# Cap the argv log too. It is append-only and, now that the probe is on
+# Cap the argv log. It is append-only and, now that the probe is on
 # permanently, would otherwise grow without bound on a channel that respawns a
 # lot. Trim to the last ARGV_KEEP_LINES lines, then drop the leading partial
 # block so the file always starts at a `=== ` header.
@@ -104,5 +101,7 @@ fi
 # rules out teeing stderr here — ETV-next already captures ffmpeg's stderr into
 # the container log, so nothing is lost by leaving it alone.
 #
-# -progress goes last so it cannot land between an option and its value.
-exec "$REAL" "$@" -progress "$progress"
+# It rules out teeing STDOUT for the same reason, which is why restoring the
+# daemon's progress log had to be a removal rather than a tee: stdout carries
+# ETV-next's own `-progress pipe:1` and must reach it unmolested.
+exec "$REAL" "$@"

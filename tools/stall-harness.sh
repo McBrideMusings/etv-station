@@ -116,15 +116,18 @@ capture() {
     # Is ffmpeg still encoding? The progress stream is the direct answer: a live
     # stream during a gap means frames are being produced and the output is not
     # landing; a frozen one means the encode itself stopped.
-    local prog
-    prog=$(ls -1t "$DIAG"/ffmpeg-progress-ch"$CHANNEL"-*.log 2>/dev/null | head -1)
-    if [ -n "$prog" ]; then
-        log "  progress file: $prog (mtime $(date -u -r "$prog" +%H:%M:%S), age $(( $(date +%s) - $(stat -c %Y "$prog") ))s)"
-        log "  progress tail:"
-        grep -E '^(frame|fps|out_time|speed|drop_frames|dup_frames)=' "$prog" 2>/dev/null \
+    # Read the daemon's progress log, not a per-channel file. tools/ffmpeg-probe.sh
+    # used to append its own `-progress`, which replaced ETV-next's `-progress
+    # pipe:1` and killed the daemon log; the probe no longer does that, so this
+    # is the only progress record there is. It is also the better one: every line
+    # is timestamped, so a stale tail is visible without stat'ing a file.
+    local prog="$DIAG/ffmpeg-progress.log"
+    if [ -s "$prog" ]; then
+        log "  progress tail (channel $CHANNEL, from $(basename "$prog")):"
+        grep "channel $CHANNEL:" "$prog" 2>/dev/null \
             | tail -12 | sed 's/^/    /' >> "$LOG"
     else
-        log "  no progress file — is ffmpeg_path pointed at tools/ffmpeg-probe.sh?"
+        log "  no $prog — is the ffmpeg_progress DEBUG target on, and is docker/entrypoint.sh splitting it?"
     fi
 
     # Process and per-thread state. A gap where every thread sits in

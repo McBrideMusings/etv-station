@@ -383,7 +383,23 @@ session ~60s later with exit 75. Three tools separate the causes.
 |---|---|---|
 | `./tools/overlay-stall-repro.sh` | local | Does a silent overlay writer wedge ffmpeg? (yes — deterministic) |
 | `./tools/overlay-heartbeat-check.sh` | local | Does the overlay's own clock report correctly when the reader stops? |
-| `./tools/two-clock-capture.sh <ch>` | Unraid host | Which side stopped first, during a real freeze |
+| `./tools/ffmpeg-probe-check.sh` | local | Does the probe wrapper still pass argv through untouched? |
+| `./tools/progress-split-check.sh` | local | Does `ffmpeg_progress` land in its own rotated file and off stdout? |
+| `./tools/two-clock-capture.sh --self-test` | local | Does the verdict logic still classify all 12 wait-channel shapes? |
+| `two-clock.log` in the container | Unraid host | Which side stopped first, during a real freeze |
+
+`two-clock-capture.sh` takes no channel argument and is not started by hand:
+`docker/entrypoint.sh` runs it in the container, watching every channel with a
+live transcode, so it comes back with the container. Read its evidence with
+`docker exec etv-station sh -c 'grep -A6 "channel=<N>" /data/diag/two-clock.log'`.
+
+**Both of the first two telemetry paths have failed silently before, which is why
+they now have checks.** `two-clock-capture.sh` matched ffmpeg by a bare `ffmpeg `
+argv[0] while `tools/ffmpeg-probe.sh` execs the real binary by absolute path — it
+matched zero processes and recorded nothing across 25 stalls. And the probe
+appended a second `-progress`, which replaced ETV-next's `-progress pipe:1` and
+left `/data/diag/ffmpeg-progress.log` empty. Neither failure logged anything; both
+looked healthy in `ps`. When a diagnostic goes quiet, suspect the diagnostic.
 
 `overlay-stall-repro.sh` runs three arms. `stall` (writer goes quiet holding the
 fifo open) wedges the graph with an empty stderr; `close` (writer closes) exits

@@ -121,9 +121,11 @@ should show `two-clock freeze capture started`. Verdicts:
 | `no-overlay-ffmpeg-elsewhere` | no overlay; blocked outside a pipe or futex | the input read or the output write |
 | `no-overlay-ffmpeg-gone` | session already torn down | nothing to attribute |
 
-The `no-overlay-*` classes are not rare. As of 2026-08-21 **no** running transcode
-had an overlay input at all while five overlay renderers ran idle (#295), so most
-stalls land here. `cpu_ticks x -> y (advanced=yes)` on a futex means contention or
+The `no-overlay-*` classes are not rare, but **do not assume them**. That was true
+on 2026-08-21 morning (#295) and had reversed by that evening: all six live
+transcodes carried `[1:0]hwupload[v_s0];[v_m0][v_s0]overlay_vaapi` in their
+filter_complex. Read the current graph out of `ffmpeg-argv-ch<N>.log` rather than
+trusting either state. `cpu_ticks x -> y (advanced=yes)` on a futex means contention or
 a spin; `advanced=no` means a genuine wedge. Same wchan, opposite meanings.
 
 `--self-test` exercises the verdict logic with no host and no freeze. Run it
