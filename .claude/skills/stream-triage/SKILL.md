@@ -160,6 +160,68 @@ A channel with no ffmpeg is skipped rather than reported: its HLS folder keeps
 the last session's segments forever, so an idle channel would otherwise look
 permanently frozen.
 
+## Step 3b — attribute it in one command (#327)
+
+`tools/attribute-stalls.sh` answers "which side stopped first" for every exit-75
+kill in the container log, without ssh'ing around by hand:
+
+```sh
+tools/attribute-stalls.sh              # every stall
+tools/attribute-stalls.sh --channel 4  # one channel
+```
+
+It cross-checks two independent clocks. The **overrun** comes from the argv log:
+an invocation handed `-t X` at time `T` should exit at `T+X`, so `kill - (T+X)`
+says how long ffmpeg outlived its own assignment. The **flatline** comes from the
+progress stream: how long `frame=` sat unchanged before the kill. When those two
+agree, the verdict is solid.
+
+### What it found on 2026-08-22, and why it settles #327
+
+**54 of 59 stalls over 13 hours were `COMPLETED-BUT-WOULD-NOT-EXIT`** — across
+channels 1, 2, 4, 5, 9 and 30. 2 were `ENCODER-STOPPED-FIRST` (a genuine
+mid-item wedge), 0 were `CONSUMER-STOPPED-FIRST`, and 3 had no progress data.
+
+So **neither** of the two hypotheses in the issue is what usually happens.
+ffmpeg does not stop producing partway through an item, and it does not keep
+producing while its output fails to land. It encodes **exactly** the duration it
+was assigned, reaches the last frame, and then does not terminate. 60s later the
+stall detector kills it with exit 75, which is `STALL_THRESHOLD` doing its job.
+
+The two clocks agree to the second, which is what makes it airtight — e.g.
+channel 4 killed at 02:49:49Z hit its `-t` of 1262480ms at 02:48:50Z: 59s of
+overrun against 59s of frame flatline. Channel 30's `-t 11008ms` case (frame=264
+= the whole assignment, killed 68s later) is not the outlier it looked like; it
+is the general case at small scale.
+
+Consequences for anyone triaging this:
+
+- **`exit status: 75` is mostly an item-boundary event, not a mid-item freeze.**
+  Expect roughly one per item per channel, clustering at item ends.
+- **A viewer's freeze is the respawn, not the encode.** The encode already
+  delivered every frame of the item before the kill.
+- **Do not go looking for a starved pipe or a slow array read.** Channels 4 and 5
+  have no overlay and no pipe in the media path at all — file in, file out — and
+  they stall at the same rate as the channels that do.
+- **The two-clock `no-overlay-ffmpeg-futex` verdicts are consistent with this.**
+  All 21-22 threads parked on futexes with `cpu_ticks advanced=no` is what a
+  process with no work left and a shutdown that never completes looks like.
+
+### Reading the verdicts
+
+| Verdict | Means |
+|---|---|
+| `COMPLETED-BUT-WOULD-NOT-EXIT` | reached its `-t`, then hung. The #327 majority |
+| `ENCODER-STOPPED-FIRST` | frames stopped with the item's end still far off |
+| `CONSUMER-STOPPED-FIRST` | ffmpeg still emitting frames at the kill |
+| `NO-PROGRESS-DATA` | instrumentation gap, not an unattributable stall |
+
+`[per-session]` / `[rotated]` / `[argv-only]` names which source backed the
+flatline. Images older than `b6f5ac8` have per-session
+`ffmpeg-progress-ch<N>-*.log` files and an empty rotated log, because that
+probe's own `-progress` replaced ETV-next's; newer images have the reverse. The
+script reads whichever is present, so it works either side of that deploy.
+
 ## Readings that mean nothing (do not re-derive these)
 
 - **`pipe_write` alone is not evidence.** One 1280x720 rgba frame is 3.5MB
@@ -309,6 +371,8 @@ Work down; stop when one answers it.
 
 1. Is it broken now, read through `docker exec`? (Step 1)
 2. Does the container log show exit 75, and what is `consecutive failures`?
+   Run `tools/attribute-stalls.sh` before theorising — most exit-75 kills are
+   ffmpeg refusing to exit at the end of its item (Step 3b), not a freeze.
 3. Did the client stop requesting, or keep retrying? (access log)
 4. What did `two-clock-capture` rule, if armed?
 5. Is `/mnt/user` under pressure, or are there disk errors in `dmesg`?
