@@ -14,6 +14,9 @@ pub enum ChannelError {
     #[error("failed to expand playout folder")]
     ChannelConfigExpandPlayoutFolder,
 
+    #[error(transparent)]
+    PathResolve(#[from] ersatztv_core::PathResolveError),
+
     #[error("failed to expand output folder")]
     ChannelConfigExpandOutputFolder,
 

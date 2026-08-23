@@ -40,6 +40,9 @@ pub enum LineupError {
         source: std::io::Error,
     },
 
+    #[error(transparent)]
+    PathResolve(#[from] ersatztv_core::PathResolveError),
+
     #[error("no channels have been loaded; please review your lineup config")]
     NoChannelsLoaded,
 

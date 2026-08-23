@@ -470,6 +470,7 @@ dependencies = [
  "serde_json",
  "simple-expand-tilde",
  "tempfile",
+ "thiserror",
  "tokio",
 ]
 

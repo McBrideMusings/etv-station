@@ -561,7 +561,7 @@ impl ChannelConfig {
             let mut v: Value = serde_json::from_str(config_string.as_str())
                 .map_err(|e| ChannelError::ChannelConfigFailure(e.to_string()))?;
 
-            ersatztv_core::resolve_relative_paths(&mut v, &relative_to, PATH_FIELDS);
+            ersatztv_core::resolve_relative_paths(&mut v, &relative_to, PATH_FIELDS)?;
 
             ersatztv_core::deep_merge(&mut config_value, v);
         }
