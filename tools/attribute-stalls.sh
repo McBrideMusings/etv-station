@@ -46,8 +46,12 @@
 # real media by a few ms — framesync kept the graph alive on the never-ending
 # overlay fifo. ffmpeg spun there dropping ~15 frames/s, never reached its `-t`,
 # and never exited. A COMPLETED-BUT-WOULD-NOT-EXIT row after that fix is a NEW
-# problem, not the known one. `drop_frames` in the progress stream separates a
-# spin (climbing) from a genuine wedge (flat); this script does not read it yet.
+# problem, not the known one. The DROPS column (sourced from the same
+# `drop_frames` field in the progress block the flatline already comes from)
+# separates the two: climbing means ffmpeg was alive and discarding, exactly
+# the #348 spin, fixed in a4d013b; flat means a genuine new hang.
+# ENCODER-STOPPED-FIRST splits the same way — flat is the mid-item wedge #327
+# left unexplained; climbing means ffmpeg was alive, not deadlocked.
 #
 # TWO SOURCES, AND WHY
 #
@@ -79,8 +83,10 @@ set -uo pipefail
 FLATLINE_MIN_S=45   # at/above this, the encoder had clearly stopped
 HEALTHY_MAX_S=5     # at/below this, ffmpeg was still producing at the kill
 WINDOW_S=150        # how far back of a kill to read progress
+DROPS_MIN_DELTA=5   # at/above this many dropped frames in the window, ffmpeg
+                     # was alive and discarding, not wedged (below is jitter)
 
-usage() { sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,74p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 MODE=remote; LOCAL_DIR=; ONLY_CHANNEL=; AT=
 
@@ -131,7 +137,9 @@ rotated_newest="$(run 'cat "$DIAG"/ffmpeg-progress.log 2>/dev/null | tail -1 | s
 [ -n "$rotated_newest" ] || rotated_newest="(empty)"
 
 # Last frame CHANGE and the final counters for <channel> in the window ending at
-# <kill>. Prints: <last_change_ts> <final_frame> <final_out_time_us>
+# <kill>. Prints:
+#   <last_change_ts> <final_frame> <final_out_time_us> <drops_at_change> <final_drops>
+# The trailing pair is a snapshot, not a delta — the reader computes the rate.
 progress_window() {
   ch="$1"; from="$2"; to="$3"
   run '
@@ -141,17 +149,18 @@ progress_window() {
       index(\$0, ch) == 0 { next }
       { ts = substr(\$1, 2) }
       ts < from || ts > to { next }
-      { fr = \"\"; ot = \"\"
+      { fr = \"\"; ot = \"\"; dr = \"\"
         for (i = 1; i <= NF; i++) {
           if (\$i ~ /^frame=/)       fr = substr(\$i, 7)
           if (\$i ~ /^out_time_us=/) ot = substr(\$i, 13)
+          if (\$i ~ /^drop_frames=/) dr = substr(\$i, 13)
         }
         if (fr == \"\") next
         seen = 1
-        if (fr != prev) { change = ts; prev = fr }
-        lastfr = fr; lastot = ot
+        if (fr != prev) { change = ts; prev = fr; dr0 = dr }
+        lastfr = fr; lastot = ot; lastdr = dr
       }
-      END { if (seen) print change, lastfr, lastot }
+      END { if (seen) print change, lastfr, lastot, dr0, lastdr }
     "'
 }
 
@@ -164,7 +173,8 @@ progress_window() {
 #
 # Weaker than the rotated log in one specific way: only the LAST stall of a
 # session leaves an mtime, so a session that stalled, recovered, and stalled
-# again is attributable once. Prints: <flatline_s> <final_frame> <final_out_us>
+# again is attributable once. Prints:
+#   <flatline_s> <final_frame> <final_out_us> <drops_at_flatline_start> <final_drops>
 legacy_window() {
   ch="$1"; kill_ts="$2"
   run '
@@ -178,9 +188,10 @@ legacy_window() {
       st=$(date -u -d "$(echo "$s" | sed -E "s/(....)(..)(..)T(..)(..)(..)/\1-\2-\3 \4:\5:\6/") UTC" +%s 2>/dev/null) || continue
       span=$((mt - st)); [ "$span" -gt 30 ] || continue
       awk -v span="$span" "
-        /^frame=/ { n++; if (\$0 == last) flat++; else flat = 1; last = \$0; lf = substr(\$0, 7) }
+        /^frame=/ { n++; if (\$0 == last) flat++; else { flat = 1; pend = 1 }; last = \$0; lf = substr(\$0, 7) }
         /^out_time_us=/ { lo = substr(\$0, 13) }
-        END { if (n > 10) printf \"%.0f %s %s\n\", flat / (n / span), lf, (lo == \"\" ? 0 : lo) }
+        /^drop_frames=/ { ld = substr(\$0, 13); if (pend) { d0 = ld; pend = 0 } }
+        END { if (n > 10) printf \"%.0f %s %s %s %s\n\", flat / (n / span), lf, (lo == \"\" ? 0 : lo), (d0 == \"\" ? 0 : d0), (ld == \"\" ? 0 : ld) }
       " "$f"
       break
     done'
@@ -213,8 +224,8 @@ if [ -z "$events" ]; then
 fi
 
 echo "rotated progress log newest line: $rotated_newest"
-printf '%-22s %-4s %10s  %s\n' KILLED-AT CH FLATLINE VERDICT
-printf -- '-------------------------------------------------------------------------------------------\n'
+printf '%-22s %-4s %10s %12s  %s\n' KILLED-AT CH FLATLINE DROPS VERDICT
+printf -- '-------------------------------------------------------------------------------------------------------\n'
 
 n_enc=0; n_con=0; n_done=0; n_none=0
 
@@ -224,7 +235,7 @@ while read -r ts ch; do
 
   from="$(shift_ts "$ts" "-$WINDOW_S")"
   to="$(shift_ts "$ts" 5)"
-  read -r change final_frame final_ot <<EOF
+  read -r change final_frame final_ot drops_at_start final_drops <<EOF
 $(progress_window "$ch" "$from" "$to")
 EOF
 
@@ -233,7 +244,7 @@ EOF
     flat_s="$(delta_s "$ts" "$change")"
   else
     src=per-session
-    read -r flat_s final_frame final_ot <<EOF
+    read -r flat_s final_frame final_ot drops_at_start final_drops <<EOF
 $(legacy_window "$ch" "$ts")
 EOF
   fi
@@ -241,6 +252,26 @@ EOF
   # The overrun check below reads only the argv log, so a kill with no progress
   # data at all is still attributable — just without the corroborating flatline.
   [ -n "${flat_s:-}" ] || { flat_s="?"; src=argv-only; }
+
+  # Whether ffmpeg was alive-and-discarding (drops climbing) or genuinely
+  # wedged (drops flat) across the flatline window just measured. Guarded
+  # against both missing progress data and flat_s being the literal "?".
+  drops_disp="-"; drops_state="?"
+  if [ -n "${drops_at_start:-}" ] && [ -n "${final_drops:-}" ]; then
+    drops_delta=$(( final_drops - drops_at_start ))
+    if [ "$drops_delta" -ge "$DROPS_MIN_DELTA" ] 2>/dev/null; then
+      drops_state=climbing
+      if [ "$flat_s" != "?" ] && [ "$flat_s" -gt 0 ] 2>/dev/null; then
+        drops_rate=$(( drops_delta / flat_s ))
+        drops_disp="+${drops_delta}@${drops_rate}/s"
+      else
+        drops_disp="+${drops_delta}"
+      fi
+    else
+      drops_state=flat
+      drops_disp="flat"
+    fi
+  fi
 
   # How long past its own assigned end did ffmpeg survive? An invocation given
   # `-t X` should exit at start+X. When the kill lands ~STALL_THRESHOLD after
@@ -256,23 +287,35 @@ EOF
   fi
 
   if [ -n "$overrun" ] && [ "$overrun" -ge 30 ] 2>/dev/null && [ "$overrun" -le 100 ] 2>/dev/null; then
-    printf '%-22s %-4s %9ss  %s\n' "$ts" "$ch" "$flat_s" \
-      "COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later) [$src]"
+    if [ "$drops_state" = climbing ]; then
+      verdict="COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later; drops climbing -- the #348 class, fixed in a4d013b, should not appear on an image carrying that fix) [$src]"
+    elif [ "$drops_state" = flat ]; then
+      verdict="COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later; drops flat -- NOT the #348 class, a new hang) [$src]"
+    else
+      verdict="COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later) [$src]"
+    fi
+    printf '%-22s %-4s %9ss %12s  %s\n' "$ts" "$ch" "$flat_s" "$drops_disp" "$verdict"
     n_done=$((n_done+1))
   elif [ "$flat_s" = "?" ]; then
-    printf '%-22s %-4s %10s  %s\n' "$ts" "$ch" "-" \
+    printf '%-22s %-4s %10s %12s  %s\n' "$ts" "$ch" "-" "$drops_disp" \
       "NO-PROGRESS-DATA (and ${overrun:-no}s overrun does not match a completed item)"
     n_none=$((n_none+1))
   elif [ "$flat_s" -ge "$FLATLINE_MIN_S" ] 2>/dev/null; then
-    printf '%-22s %-4s %9ss  %s\n' "$ts" "$ch" "$flat_s" \
-      "ENCODER-STOPPED-FIRST (wedged mid-item, ${overrun:-?}s vs its -t, last frame=$final_frame) [$src]"
+    if [ "$drops_state" = flat ]; then
+      verdict="ENCODER-STOPPED-FIRST (wedged mid-item, ${overrun:-?}s vs its -t, last frame=$final_frame; drops flat -- genuine wedge, the #327 2-of-59 case) [$src]"
+    elif [ "$drops_state" = climbing ]; then
+      verdict="ENCODER-STOPPED-FIRST (wedged mid-item, ${overrun:-?}s vs its -t, last frame=$final_frame; drops climbing -- ffmpeg was alive and discarding, not deadlocked) [$src]"
+    else
+      verdict="ENCODER-STOPPED-FIRST (wedged mid-item, ${overrun:-?}s vs its -t, last frame=$final_frame) [$src]"
+    fi
+    printf '%-22s %-4s %9ss %12s  %s\n' "$ts" "$ch" "$flat_s" "$drops_disp" "$verdict"
     n_enc=$((n_enc+1))
   elif [ "$flat_s" -le "$HEALTHY_MAX_S" ] 2>/dev/null; then
-    printf '%-22s %-4s %9ss  %s\n' "$ts" "$ch" "$flat_s" \
+    printf '%-22s %-4s %9ss %12s  %s\n' "$ts" "$ch" "$flat_s" "$drops_disp" \
       "CONSUMER-STOPPED-FIRST (ffmpeg still producing at the kill, frame=$final_frame) [$src]"
     n_con=$((n_con+1))
   else
-    printf '%-22s %-4s %9ss  %s\n' "$ts" "$ch" "$flat_s" \
+    printf '%-22s %-4s %9ss %12s  %s\n' "$ts" "$ch" "$flat_s" "$drops_disp" \
       "AMBIGUOUS (neither side is clearly first) [$src]"
     n_none=$((n_none+1))
   fi
@@ -280,7 +323,7 @@ done <<EOF
 $events
 EOF
 
-printf -- '-------------------------------------------------------------------------------------------\n'
+printf -- '-------------------------------------------------------------------------------------------------------\n'
 printf 'encoder-stopped-first=%s consumer-stopped-first=%s completed-but-hung=%s no-data-or-ambiguous=%s\n' \
   "$n_enc" "$n_con" "$n_done" "$n_none"
 echo "A NO-PROGRESS-DATA row is a gap in instrumentation, not an unattributable stall."
