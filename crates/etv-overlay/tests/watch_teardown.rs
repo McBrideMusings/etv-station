@@ -53,14 +53,14 @@ fn find_child_pid(parent_pid: i32, deadline: Instant) -> Option<i32> {
             let (Some(pid), Some(ppid)) = (cols.next(), cols.next()) else {
                 continue;
             };
-            if ppid.parse::<i32>() == Ok(parent_pid) {
-                if let Ok(pid_i32) = pid.parse::<i32>() {
-                    // Confirm the PID is actually alive before returning it.
-                    // If it's dead, the loop will retry and find it again if it was
-                    // respawned, or timeout if the child process has truly exited.
-                    if is_alive(pid_i32) {
-                        return Some(pid_i32);
-                    }
+            if ppid.parse::<i32>() == Ok(parent_pid)
+                && let Ok(pid_i32) = pid.parse::<i32>()
+            {
+                // Confirm the PID is actually alive before returning it.
+                // If it's dead, the loop will retry and find it again if it was
+                // respawned, or timeout if the child process has truly exited.
+                if is_alive(pid_i32) {
+                    return Some(pid_i32);
                 }
             }
         }
