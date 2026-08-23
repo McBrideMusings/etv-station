@@ -19,6 +19,10 @@
 # Nothing here touches the running channel: every variant writes to its own
 # scratch directory and none of them serves anybody.
 #
+# A variant that exits non-zero (e.g. a failed transcode due to a missing input)
+# prints FAILED with no throughput rate and is never reported as fastest. The
+# script exits non-zero if any variant failed.
+#
 #   ./stall-bisect.sh [channel] [seconds]
 
 set -u
@@ -30,6 +34,7 @@ DIAG="$APPDATA/data/diag"
 ARGV_LOG="$DIAG/ffmpeg-argv-ch${CHANNEL}.log"
 SCRATCH="/tmp/stall-bisect-$CHANNEL"
 OUT="$DIAG/stall-bisect.log"
+FAILED_VARIANTS=()
 
 [ -r "$ARGV_LOG" ] || { echo "no argv log at $ARGV_LOG — is ffmpeg_path pointed at ffmpeg-probe.sh?" >&2; exit 1; }
 
@@ -73,9 +78,9 @@ run_variant() {
     local t0 t1
     t0=$(date +%s)
     # Same uid as the real container. Without it the variant runs as the image's
-    # default user, cannot write its segments, and every run "finishes" in a
-    # second or two with a permission error — which reads as an implausibly fast
-    # result rather than as a failure.
+    # default user, cannot write its segments. Any non-zero exit code is reported
+    # as FAILED with no throughput multiple, so a failed variant is never selected
+    # as fastest.
     docker run --rm --device /dev/dri \
         --user "$RUN_AS" \
         -e LIBVA_DRIVER_NAME=iHD \
@@ -86,8 +91,13 @@ run_variant() {
     local rc=$?
     t1=$(date +%s)
     local wall=$(( t1 - t0 ))
+    if [ "$rc" -ne 0 ]; then
+        FAILED_VARIANTS+=("$name")
+        log "    FAILED rc=$rc after ${wall}s — nothing was transcoded, no throughput number; see $OUT"
+        return 1
+    fi
     [ "$wall" -eq 0 ] && wall=1
-    log "    rc=$rc wall=${wall}s for ${DUR}s of video => $(awk -v d="$DUR" -v w="$wall" 'BEGIN{printf "%.2fx", d/w}')"
+    log "    rc=0 wall=${wall}s for ${DUR}s of video => $(awk -v d="$DUR" -v w="$wall" 'BEGIN{printf "%.2fx", d/w}')"
 }
 
 # Rebuild the argv, applying substitutions. Reads the recorded argv and emits a
@@ -135,4 +145,9 @@ rm -rf "${APPDATA:?}/data/hls/bisect$CHANNEL"
 mapfile -t A_THROTTLE < <(build 0 /scratch/local 0)
 run_variant "throttled (readrate exactly as ETV-next set it)" "${A_THROTTLE[@]}"
 
-log "bisect complete — full ffmpeg output above in $OUT"
+if [ "${#FAILED_VARIANTS[@]}" -gt 0 ]; then
+    log "bisect INCOMPLETE — these variants failed and have no rate: ${FAILED_VARIANTS[*]}"
+    exit 1
+else
+    log "bisect complete — full ffmpeg output above in $OUT"
+fi
