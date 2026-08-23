@@ -15,10 +15,19 @@
 //!
 //! `examples/overlays/` is not covered: those parse through the overlay crate's
 //! own loader, which reroots script and logo paths as it reads.
+//!
+//! Block-file coverage is split in two (#360). `examples/samples/blocks/`
+//! holds a tracked, generic fixture and is always present, so it is parsed
+//! unconditionally — that is the coverage this test ships. `examples/blocks/`
+//! is gitignored personal channel content: present with real files on a
+//! machine that authored its own channels, absent on a fresh clone or a
+//! worktree. It is parsed only when it exists, as an opportunistic local
+//! check, and stays silent rather than failing when it is legitimately
+//! empty.
 
 use std::path::{Path, PathBuf};
 
-use etv_station::config::{BlockFile, read_channel, read_station};
+use etv_station::config::{read_channel, read_station, BlockFile};
 
 /// The repo root, from this crate's manifest directory.
 fn examples_dir() -> PathBuf {
@@ -51,6 +60,21 @@ fn configs_in(dir: &Path) -> Vec<PathBuf> {
         dir.display()
     );
     found
+}
+
+/// Like [`configs_in`], but for a directory that is legitimately absent —
+/// gitignored personal content that exists only on the machine that authored
+/// it, never on a fresh clone or a git worktree (#360). Missing entirely
+/// means "nothing to check": returns empty rather than failing. A directory
+/// that *does* exist is still handed to `configs_in`, so a present-but-empty
+/// leftover or a malformed file inside it still fails loudly — the local
+/// check only stops biting when the directory is gone, not when it's broken.
+fn optional_configs_in(dir: &Path) -> Vec<PathBuf> {
+    if dir.is_dir() {
+        configs_in(dir)
+    } else {
+        Vec::new()
+    }
 }
 
 #[test]
@@ -102,15 +126,31 @@ fn every_sample_channel_config_sets_display_name() {
     }
 }
 
+/// Parses `path` as a `BlockFile`, panicking with the path on failure.
+fn assert_parses_as_block_file(path: &Path) {
+    let text = std::fs::read_to_string(path).expect("readable block file");
+    serde_norway::from_str::<BlockFile>(&text).unwrap_or_else(|e| {
+        panic!(
+            "{} no longer deserializes as a BlockFile: {e}",
+            path.display()
+        )
+    });
+}
+
+/// Tracked coverage (always present) plus an opportunistic local check
+/// (present only on a machine with personal channels) — see the module doc
+/// comment and #360.
 #[test]
 fn every_example_block_file_parses() {
-    for path in configs_in(&examples_dir().join("blocks")) {
-        let text = std::fs::read_to_string(&path).expect("readable block file");
-        serde_norway::from_str::<BlockFile>(&text).unwrap_or_else(|e| {
-            panic!(
-                "{} no longer deserializes as a BlockFile: {e}",
-                path.display()
-            )
-        });
+    let root = examples_dir();
+
+    // Shipped coverage: a generic fixture that exists on every clone.
+    for path in configs_in(&root.join("samples").join("blocks")) {
+        assert_parses_as_block_file(&path);
+    }
+
+    // Opportunistic: gitignored personal blocks, parsed only if present.
+    for path in optional_configs_in(&root.join("blocks")) {
+        assert_parses_as_block_file(&path);
     }
 }
