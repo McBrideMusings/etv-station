@@ -26,6 +26,9 @@ pub enum PlayoutGeneratorError {
     #[error("lineup error: {0}")]
     LineupError(#[from] ersatztv::error::LineupError),
 
+    #[error(transparent)]
+    PathResolve(#[from] ersatztv_core::PathResolveError),
+
     #[error("failed to load channel JSON file: {0}")]
     ChannelJsonLoadError(String),
 

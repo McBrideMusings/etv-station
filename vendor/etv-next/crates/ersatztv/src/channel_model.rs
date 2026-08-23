@@ -217,9 +217,10 @@ impl ChannelModel {
 /// Resolves `playout.folder` the same way `ersatztv-channel` does: through
 /// `ersatztv_core::resolve_relative_paths`, which owns tilde-expansion and
 /// relative-path joining for both crates. This function does not reimplement
-/// any of that — it only turns the shared resolver's outcome into the two
-/// errors below, since `resolve_relative_paths` never fails outright (it
-/// falls back to a best-effort path instead of erroring).
+/// any of that — it only turns the shared resolver's outcome into the errors
+/// below. `resolve_relative_paths` can itself fail, when the resolved path
+/// is not valid UTF-8; that failure is propagated as `LineupError::PathResolve`
+/// rather than silently writing a corrupted path back into the config.
 async fn read_playout_folder(
     channel_config_path: &Path,
     body: &str,
@@ -237,7 +238,7 @@ async fn read_playout_folder(
         )))?;
 
     let mut value = serde_json::json!({ "playout": { "folder": parsed.playout.folder } });
-    ersatztv_core::resolve_relative_paths(&mut value, parent, &["/playout/folder"]);
+    ersatztv_core::resolve_relative_paths(&mut value, parent, &["/playout/folder"])?;
 
     let resolved = value
         .pointer("/playout/folder")
@@ -393,5 +394,39 @@ mod tests {
             .expect("a real directory with a literal ~ in the middle must resolve");
 
         assert!(resolved.ends_with("movies/~/reruns"), "got {resolved:?}");
+    }
+
+    // A channel config directory (base_dir for the resolver) whose name is not
+    // valid UTF-8 must surface as LineupError::PathResolve, not the ordinary
+    // PlayoutFolderResolve "no such file" — the latter would misdiagnose a
+    // lossy-conversion corruption as a missing directory (#246). The JSON
+    // folder string itself is necessarily valid UTF-8 (serde_json::Value::String
+    // guarantees it), so the invalid bytes have to come from the directory the
+    // channel config lives in, not the folder field.
+    //
+    // Gated to Linux, not just `unix`: ext4 (and this daemon's Linux Docker
+    // production target) stores filenames as arbitrary byte sequences, but
+    // macOS's APFS validates UTF-8 at the filesystem layer and refuses to
+    // create a directory named with an invalid byte sequence in the first
+    // place (`EILSEQ`) — before the resolver under test ever runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_utf8_base_dir_raises_path_resolve_error() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bad_dir = dir.path().join(OsStr::from_bytes(b"bad\xFFname"));
+        tokio::fs::create_dir_all(bad_dir.join("media"))
+            .await
+            .unwrap();
+        let (cfg_path, body) = write_channel_config(&bad_dir, "media").await;
+
+        let err = read_playout_folder(&cfg_path, &body).await.unwrap_err();
+
+        match err {
+            LineupError::PathResolve(_) => {}
+            other => panic!("expected PathResolve, got: {other}"),
+        }
     }
 }

@@ -129,7 +129,7 @@ pub async fn from_file(path: &PathBuf) -> Result<LineupConfig, LineupError> {
     let mut lineup_value: serde_json::Value = serde_json::from_str(&config_string)
         .map_err(|e| LineupError::LineupConfigFailure(e.to_string()))?;
     let lineup_parent = path.parent().ok_or(LineupError::LineupConfigNoParent)?;
-    ersatztv_core::resolve_relative_paths(&mut lineup_value, lineup_parent, PATH_FIELDS);
+    ersatztv_core::resolve_relative_paths(&mut lineup_value, lineup_parent, PATH_FIELDS)?;
     let lineup_config: LineupConfig = serde_json::from_value(lineup_value)
         .map_err(|e| LineupError::LineupConfigFailure(e.to_string()))?;
     Ok(lineup_config)

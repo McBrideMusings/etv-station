@@ -6,7 +6,7 @@ mod merge;
 mod path_resolve;
 
 pub use merge::deep_merge;
-pub use path_resolve::resolve_relative_paths;
+pub use path_resolve::{PathResolveError, resolve_relative_paths};
 
 pub const READY_FILE_NAME: &str = ".ready";
 pub const READY_FILE_TIMEOUT: Duration = Duration::from_secs(30);

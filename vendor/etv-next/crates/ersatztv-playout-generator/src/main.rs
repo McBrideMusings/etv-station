@@ -91,7 +91,7 @@ async fn resolve_output_folder(args: &Args) -> Result<GeneratorConfig, PlayoutGe
                     ))?;
             let base = tokio::fs::read_to_string(channel_config_file.clone()).await?;
             let mut merged: serde_json::Value = serde_json::from_str(&base)?;
-            ersatztv_core::resolve_relative_paths(&mut merged, base_parent, PATH_FIELDS);
+            ersatztv_core::resolve_relative_paths(&mut merged, base_parent, PATH_FIELDS)?;
 
             for overlay_rel in &channel.overlays {
                 let overlay_path =
@@ -108,7 +108,7 @@ async fn resolve_output_folder(args: &Args) -> Result<GeneratorConfig, PlayoutGe
                     &mut overlay_value,
                     overlay_parent,
                     PATH_FIELDS,
-                );
+                )?;
                 ersatztv_core::deep_merge(&mut merged, overlay_value);
             }
 
