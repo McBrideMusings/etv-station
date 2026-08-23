@@ -590,7 +590,9 @@ mod tests {
     #[test]
     fn vaapi_overlay_does_not_outlive_its_main_input() {
         for arg in [
-            VaapiOverlay.as_arg(Some(FramePoint { x: 0, y: 0 })).unwrap(),
+            VaapiOverlay
+                .as_arg(Some(FramePoint { x: 0, y: 0 }))
+                .unwrap(),
             VaapiOverlay.as_arg(None).unwrap(),
         ] {
             assert!(
