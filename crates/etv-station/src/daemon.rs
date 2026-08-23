@@ -1153,25 +1153,28 @@ async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>, kind: Re
     else {
         return;
     };
-    match crate::reconcile::reconcile_playout_paths(
-        &station.channels,
-        Path::new(path),
-        OffsetDateTime::now_utc(),
-    )
-    .await
-    {
-        Ok(counts) if counts.changed_anything() => tracing::info!(
+    log_reconcile_outcome(
+        crate::reconcile::reconcile_playout_paths(
+            &station.channels,
+            Path::new(path),
+            OffsetDateTime::now_utc(),
+        )
+        .await,
+    );
+}
+
+/// Log the outcome of one reconciliation sweep. Unconditional at INFO: a sweep
+/// that changed nothing is the healthy steady state, and it has to be
+/// distinguishable from a sweep that never ran (#301).
+fn log_reconcile_outcome(outcome: Result<crate::reconcile::ReconcileCounts, StationError>) {
+    match outcome {
+        Ok(counts) => tracing::info!(
             event = "reconcile.swept",
             files_examined = counts.files_examined,
             files_rewritten = counts.files_rewritten,
             paths_patched = counts.paths_patched,
             items_carded = counts.items_carded,
-            "reconciled already-written playout against the refreshed catalog",
-        ),
-        Ok(counts) => tracing::debug!(
-            event = "reconcile.clean",
-            files_examined = counts.files_examined,
-            "playout on disk already agrees with the catalog",
+            "reconciliation sweep complete",
         ),
         Err(e) => tracing::error!(
             event = "reconcile.failed",
@@ -3248,7 +3251,7 @@ mod shared_history_tests {
     /// returned guard lives. `#[tokio::test]` runs a current-thread runtime, so
     /// every `.await` in the test body is polled on this same thread and stays
     /// under it.
-    fn count_events(
+    pub(super) fn count_events(
         name: &'static str,
     ) -> (Arc<StdMutex<usize>>, tracing::subscriber::DefaultGuard) {
         let seen = Arc::new(StdMutex::new(0));
@@ -3722,6 +3725,28 @@ mod shared_history_tests {
         let scope = HistoryScope::User("0".into());
         let err = translate_tautulli_id_to_plex(0, &scope, &[], &accounts).unwrap_err();
         assert!(err.contains('0'));
+    }
+}
+
+/// #301: a reconciliation sweep must announce itself at INFO whether or not it
+/// changed anything, so "ran and found nothing" is distinguishable in the logs
+/// from "never ran".
+#[cfg(test)]
+mod reconcile_log_tests {
+    use super::shared_history_tests::count_events;
+    use super::*;
+
+    /// The whole point of #301: a sweep that changed nothing still says so, at
+    /// INFO. Before the fix this path logged `reconcile.clean` at DEBUG, so a
+    /// prod log at INFO was byte-identical to the sweep never running.
+    #[test]
+    fn a_sweep_that_changed_nothing_still_logs_reconcile_swept() {
+        let (seen, _guard) = count_events("reconcile.swept");
+        log_reconcile_outcome(Ok(crate::reconcile::ReconcileCounts {
+            files_examined: 356,
+            ..Default::default()
+        }));
+        assert_eq!(*seen.lock().unwrap(), 1);
     }
 }
 

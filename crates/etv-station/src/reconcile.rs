@@ -67,13 +67,6 @@ pub struct ReconcileCounts {
     pub items_carded: usize,
 }
 
-impl ReconcileCounts {
-    /// Whether anything changed — what the caller logs on.
-    pub fn changed_anything(self) -> bool {
-        self.files_rewritten > 0
-    }
-}
-
 /// Sweep every channel's output folder. `catalog_path` is the station catalog,
 /// opened read-only for the duration; `now` bounds which files are still worth
 /// touching.
@@ -619,7 +612,6 @@ mod tests {
 
         assert_eq!(counts.files_examined, 1);
         assert_eq!(counts.files_rewritten, 0);
-        assert!(!counts.changed_anything());
         assert_eq!(
             tokio::fs::metadata(&file)
                 .await
