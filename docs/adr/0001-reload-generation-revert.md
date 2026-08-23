@@ -6,6 +6,8 @@ The station daemon reloads config on SIGHUP by tearing down the current generati
 
 The reload contract is "a bad edit keeps the previous config running." That was only half-honoured: config *parse* failures fell back to the previous config, but generation-setup failures (`tzmod::parse`, `validate_overlay_configs`, and — after #34 — the `create_dir_all` mkdir) used `?` and killed the daemon. The mkdir case is the live one: an uncreatable `output_folder` (disk full, an unmounted volume, a permissions blip) on reload would tear down healthy channels. See #90.
 
+> **Note, 2026-08:** `validate_overlay_configs` was removed in 6d2f39c (the station → channel → block overlay cascade). Overlay specs are now resolved and validated during `config::load` — `config::overlay::resolve_channel`, called from `config/load.rs` — so there is no separate overlay-validation pass at `prepare_generation` time.
+
 ## What we chose, and the rejected alternatives
 
 - **One prepare path, not two.** `prepare_generation` is the single home for every "is this config runnable" check; `run` calls it once per generation on both the startup and reload paths, and the reload's `config::load` no longer re-validates. The bug existed precisely because checks were split across two load paths, so `load_and_validate` gained tz+overlay but nobody added mkdir to it — a check added in one place silently skipped the other.
