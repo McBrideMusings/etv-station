@@ -1,0 +1,59 @@
+# Tracked worked example of the referenced-block-file schema (`BlockFile`).
+#
+# This is the shipped coverage for `every_example_block_file_parses` in
+# crates/etv-station/tests/examples_configs_parse.rs (#360) — the one block
+# file that is guaranteed to exist on every clone and every worktree, unlike
+# the personal files under examples/blocks/ (gitignored, present only on a
+# machine that authored its own channels). That test parses this file
+# unconditionally; it treats examples/blocks/ as present-if-you-have-it.
+#
+# It lives in a blocks/ subdirectory, not flat in examples/samples/, on
+# purpose: examples/station.yaml registers channels via the glob
+# `samples/*.yaml`, and the channel-config tests
+# (every_example_channel_config_parses, every_sample_channel_config_sets_
+# display_name) walk examples/samples/ non-recursively looking for
+# ChannelConfig files. A block file sitting flat there would be
+# misinterpreted as a broken channel by all three. `configs_in()` is
+# deliberately non-recursive, so this subdirectory is invisible to them.
+#
+# Sources are synthetic ffmpeg lavfi patterns (same technique as
+# ../../channels/lavfi-test.yaml) so nothing here points at real media or a
+# personal path — this directory is tracked and nothing personal belongs in
+# it.
+
+program:
+  title: "Test Pattern Block"
+  categories: ["Test"]
+
+duplicates: keep
+
+entries:
+  - kind: item
+    in_point: "0s"
+    out_point: "30s"
+    source:
+      kind: lavfi
+      params: "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+    program:
+      title: "Color Bars"
+      description: "30-second SMPTE-style test pattern with reference tone."
+
+  - kind: item
+    in_point: "0s"
+    out_point: "60s"
+    source:
+      kind: lavfi
+      params: "smptebars=size=1280x720:rate=30 [out0]; sine=frequency=880 [out1]"
+    program:
+      title: "SMPTE Bars"
+      description: "Standard SMPTE pattern for one minute with 880 Hz tone."
+
+  - kind: item
+    in_point: "0s"
+    out_point: "90s"
+    source:
+      kind: lavfi
+      params: "mandelbrot=size=1280x720:rate=30 [out0]; sine=frequency=220 [out1]"
+    program:
+      title: "Mandelbrot"
+      description: "Animated mandelbrot zoom for 90 seconds with low tone."

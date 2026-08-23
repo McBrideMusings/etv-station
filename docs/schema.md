@@ -1486,7 +1486,8 @@ The committed samples under `examples/` are authored in YAML:
 | Trending Mix (pools + pattern interleave) | `examples/samples/trending-mix.yaml` |
 | For You (taste-scored via a plugin) | `examples/samples/foryou.yaml` |
 | Worked example scorer plugin | `examples/plugins/taste-cosine.rhai` |
-| Star Wars timeline block (8 items, manual order) | `examples/blocks/starwars-timeline.yaml` |
-| Die Hard block (1 item) | `examples/blocks/diehard.yaml` |
+| Test pattern block (3 lavfi items, tracked) | `examples/samples/blocks/lavfi-block.yaml` |
+| Star Wars timeline block (8 items, manual order, local-only) | `examples/blocks/starwars-timeline.yaml` |
+| Die Hard block (1 item, local-only) | `examples/blocks/diehard.yaml` |
 
 Copy one and adjust the paths and metadata to author a new channel or block.
