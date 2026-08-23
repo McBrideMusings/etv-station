@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use etv_station::config::{read_channel, read_station, BlockFile};
+use etv_station::config::{BlockFile, read_channel, read_station};
 
 /// The repo root, from this crate's manifest directory.
 fn examples_dir() -> PathBuf {
