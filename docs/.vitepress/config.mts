@@ -47,6 +47,7 @@ export default defineConfig({
         text: 'Decisions (ADRs)',
         collapsed: false,
         items: [
+          { text: 'About these ADRs', link: '/adr/' },
           { text: '0001 — Reload reverts to last-known-good', link: '/adr/0001-reload-generation-revert' },
           { text: '0002 — A scorer plugin replaces a pool\'s expr', link: '/adr/0002-scorer-plugin-replaces-a-pool-expr' },
           { text: '0003 — One file per chunk, honest names', link: '/adr/0003-one-file-per-chunk-honest-names' },
