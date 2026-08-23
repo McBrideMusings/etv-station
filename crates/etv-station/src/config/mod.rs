@@ -19,7 +19,7 @@ pub use channel::{ChannelConfig, ScoringConfig};
 pub use constraints::{Constraints, NoRepeatWithin};
 pub use entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
-pub use load::{LoadedChannel, Station, load, load_for_inspection, read_channel};
+pub use load::{LoadedChannel, Station, load, load_for_inspection, read_channel, read_station};
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};
 pub use overlay::{

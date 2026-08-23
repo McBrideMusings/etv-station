@@ -495,6 +495,15 @@ pub fn read_channel(path: &Path) -> Result<ChannelConfig, ConfigError> {
     read_config_file(path)
 }
 
+/// Read and deserialize a single station config file, picking TOML or YAML by
+/// extension. Raw parse only — does not expand the channel list, apply env
+/// overrides, or validate (that happens inside [`load`]). Useful for asking
+/// whether a station file still matches [`StationConfig`] without needing the
+/// catalog, media, or env the full load demands.
+pub fn read_station(path: &Path) -> Result<StationConfig, ConfigError> {
+    read_config_file(path)
+}
+
 /// Read any config file — station, channel, or block — picking the deserializer
 /// by extension: `.yaml`/`.yml` parse as YAML (`serde_norway`), everything else
 /// as TOML. The station, channel, and block serde types are format-agnostic, so

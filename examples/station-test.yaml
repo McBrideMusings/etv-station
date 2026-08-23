@@ -7,3 +7,25 @@ channels:
 
 # No catalog for the test configuration - lavfi channels don't need one
 catalog_path: tmp/catalog.db
+
+# `normalization` is required and deliberately has no serde default. `accel` is
+# left unset on purpose, unlike examples/station.yaml: this config's whole point
+# is running anywhere with no host setup, and a lavfi test pattern does not need
+# hardware encoding.
+normalization:
+  audio:
+    format: aac
+    bitrate_kbps: 192
+    buffer_kbps: 384
+    channels: 2
+    sample_rate_hz: 48000
+    normalize_loudness: false
+  video:
+    format: h264
+    bit_depth: 8
+    width: 1280
+    height: 720
+    bitrate_kbps: 2000
+    buffer_kbps: 4000
+  subtitle:
+    mode: convert
