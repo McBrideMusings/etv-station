@@ -170,11 +170,14 @@ tools/attribute-stalls.sh              # every stall
 tools/attribute-stalls.sh --channel 4  # one channel
 ```
 
-It cross-checks two independent clocks. The **overrun** comes from the argv log:
-an invocation handed `-t X` at time `T` should exit at `T+X`, so `kill - (T+X)`
-says how long ffmpeg outlived its own assignment. The **flatline** comes from the
-progress stream: how long `frame=` sat unchanged before the kill. When those two
-agree, the verdict is solid.
+It cross-checks three signals, all sourced from the same progress block. The
+**overrun** comes from the argv log: an invocation handed `-t X` at time `T`
+should exit at `T+X`, so `kill - (T+X)` says how long ffmpeg outlived its own
+assignment. The **flatline** comes from the progress stream: how long `frame=`
+sat unchanged before the kill. When overrun and flatline agree, the verdict is
+solid. The **DROPS** column adds a third: whether `drop_frames` was climbing
+(ffmpeg alive and discarding) or flat (a genuine wedge) across that same
+flatline window — see below.
 
 ### What it found on 2026-08-22, and why it settles #327
 
@@ -215,10 +218,11 @@ media by a few milliseconds — channel 4's `-t` was 1262480ms against an
 `out_time` that froze at 1262344ms, 136ms short — so the main input hits EOF
 first on essentially every item. That is the "one per item per channel" rate.
 
-**`drop_frames` is the discriminator, and it is the one field nobody was
-reading.** A wedged ffmpeg leaves it flat; this one climbs ~15/s while `frame`
-and `out_time` sit still. Climbing means ffmpeg is alive and spinning, not
-deadlocked — check it before reading a frozen `frame=` as a wedge.
+**`drop_frames` is the discriminator, and `tools/attribute-stalls.sh` now reads
+it** as the DROPS column beside FLATLINE. A wedged ffmpeg leaves it flat; this
+one climbed ~15/s while `frame` and `out_time` sat still. Climbing means ffmpeg
+is alive and spinning, not deadlocked — the verdict says so directly now
+instead of requiring a second look at a frozen `frame=`.
 
 Fixed in `crates/ffpipeline/src/accel/vaapi.rs` by setting `eof_action=pass`,
 matching what the software `overlay` in `overlay_filter.rs` already did.
@@ -227,12 +231,18 @@ because it ends the video the instant the overlay writer dies.
 
 ### Reading the verdicts
 
-| Verdict | Means |
-|---|---|
-| `COMPLETED-BUT-WOULD-NOT-EXIT` | reached its `-t`, then hung. The #327 majority |
-| `ENCODER-STOPPED-FIRST` | frames stopped with the item's end still far off |
-| `CONSUMER-STOPPED-FIRST` | ffmpeg still emitting frames at the kill |
-| `NO-PROGRESS-DATA` | instrumentation gap, not an unattributable stall |
+| Verdict | DROPS | Means |
+|---|---|---|
+| `COMPLETED-BUT-WOULD-NOT-EXIT` | climbing | reached its `-t`, then spun. The #348 class, fixed in `a4d013b` — should not appear on an image carrying that fix |
+| `COMPLETED-BUT-WOULD-NOT-EXIT` | flat | reached its `-t`, then genuinely hung. NOT #348 — a new problem |
+| `ENCODER-STOPPED-FIRST` | flat | frames stopped with the item's end still far off, and nothing was moving — the genuine mid-item wedge (the 2-of-59 case #327 left unexplained) |
+| `ENCODER-STOPPED-FIRST` | climbing | frames stopped with the item's end still far off, but ffmpeg was alive and discarding — not a deadlock |
+| `CONSUMER-STOPPED-FIRST` | — | ffmpeg still emitting frames at the kill |
+| `NO-PROGRESS-DATA` | — | instrumentation gap, not an unattributable stall |
+
+The DROPS column reads `+N@Rate/s` (climbing), `flat`, or `-` (no progress
+data backed the row) — sourced from `drop_frames` in the same progress block
+the flatline already comes from.
 
 `[per-session]` / `[rotated]` / `[argv-only]` names which source backed the
 flatline. Images older than `b6f5ac8` have per-session
