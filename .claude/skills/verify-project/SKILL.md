@@ -201,11 +201,12 @@ INFO … event="reconcile.path_patched" item=imdb:tt0095016 was=/media/old.mkv n
 INFO … event="reconcile.swept" files_examined=4 files_rewritten=1 paths_patched=1 items_carded=0
 ```
 
-`event="reconcile.clean"` at DEBUG is the steady state — playout already agrees
-with the catalog, and nothing was rewritten. A file's mtime is the ground truth:
-a clean sweep must not touch it. Delete the media file instead of renaming it and
-the same tick logs `event="reconcile.item_carded"` and the slot becomes a black
-card that still carries the title in the guide.
+`event="reconcile.swept"` at INFO fires on every sweep, including one where
+nothing changed — that's the healthy steady state where playout already agrees
+with the catalog. A file's mtime is the ground truth: a no-op sweep must not
+touch it. The absence of this line means the sweep did not run. Delete the media
+file instead of renaming it and the same tick logs `event="reconcile.item_carded"`
+and the slot becomes a black card that still carries the title in the guide.
 
 On the deployed container the same three lines are the whole story, and the
 counters are the thing to read: a `reconcile.swept` with `paths_patched` above
