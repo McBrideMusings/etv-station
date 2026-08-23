@@ -56,9 +56,7 @@ pub fn resolve_relative_paths(
 
 #[cfg(all(test, unix))]
 mod tests {
-    #[cfg(target_os = "linux")]
     use std::ffi::OsStr;
-    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
@@ -93,18 +91,14 @@ mod tests {
     /// `PathResolveError::NonUtf8` naming the offending pointer rather than
     /// silently writing a U+FFFD-corrupted string back into the JSON value.
     ///
-    /// Gated to Linux, not just `unix`: ext4 (and this daemon's Linux Docker
-    /// production target) stores filenames as arbitrary byte sequences, but
-    /// macOS's APFS validates UTF-8 at the filesystem layer and refuses to
-    /// create a directory named with an invalid byte sequence in the first
-    /// place (`EILSEQ`) — before `resolve_relative_paths` ever runs.
-    #[cfg(target_os = "linux")]
+    /// Does not require creating a directory with invalid UTF-8: `canonicalize()`
+    /// fails on the non-existent path, falling back to `base_dir.join(expanded)`,
+    /// which still carries the invalid bytes and hits `to_string_lossy`'s
+    /// `Cow::Owned` arm on the same line whether the directory exists or not.
     #[test]
     fn non_utf8_base_dir_is_reported_not_silently_corrupted() {
         let dir = tempfile::tempdir().unwrap();
         let bad_dir = dir.path().join(OsStr::from_bytes(b"bad\xFFname"));
-        std::fs::create_dir_all(&bad_dir).unwrap();
-        std::fs::create_dir_all(bad_dir.join("media")).unwrap();
 
         let mut value = serde_json::json!({ "playout": { "folder": "media" } });
         let err = resolve_relative_paths(&mut value, &bad_dir, &["/playout/folder"]).unwrap_err();
