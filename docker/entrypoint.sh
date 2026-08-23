@@ -125,6 +125,15 @@ fi
 PROGRESS_LOG_MAX_BYTES="${ETV_PROGRESS_LOG_MAX_BYTES:-67108864}"
 PROGRESS_LOG_KEEP="${ETV_PROGRESS_LOG_KEEP:-2}"
 
+# How much station-etv.log to keep on disk, and how many rolled files (#299).
+# station-etv.log only carries the two daemons' non-progress output —
+# ffmpeg_progress is already split off above — so its volume is far below the
+# progress log's. 32MB x 2 keeps a worst case of ~96MB on /data for the whole
+# tee, still holds days of history for the soak (#20), and soak-probe.sh only
+# ever needs the window since its last hourly run, not the full history.
+STATION_LOG_MAX_BYTES="${ETV_STATION_LOG_MAX_BYTES:-33554432}"
+STATION_LOG_KEEP="${ETV_STATION_LOG_KEEP:-2}"
+
 # Runs "$@" in the background, splitting its combined stdout+stderr three ways
 # via process substitution — which, unlike piping into a command directly, keeps
 # $! pointing at "$@"'s own pid rather than the filter's, so station_pid/etv_pid
@@ -145,8 +154,9 @@ PROGRESS_LOG_KEEP="${ETV_PROGRESS_LOG_KEEP:-2}"
 # The splitter only sorts lines; it never rotates. Rotation by size from inside
 # awk needs system() to interleave correctly with awk's own buffered writes, and
 # that differs between awk implementations — it rotated at 2x the limit when
-# tested. Size is handled by rotate_progress_log() on its own loop below, where
-# it is a plain stat-and-mv and cannot lose a line.
+# tested. Size is handled by rotate_log() on its own loop below, where it is a
+# plain stat-and-cp and cannot lose a line. The same reasoning is why
+# station-etv.log's cap (#299) is also done there rather than inside this awk.
 run_logged() {
     if [ "$diag_ready" -eq 1 ]; then
         "$@" > >(awk \
@@ -160,14 +170,18 @@ run_logged() {
     fi
 }
 
-# Keep $diag_dir/ffmpeg-progress.log bounded. Called on a slow loop, so a
-# rotation costs one stat and one rename and never blocks a writer.
-rotate_progress_log() {
-    local f="$diag_dir/ffmpeg-progress.log" size i
+# Keep a log bounded by size. Called on a slow loop, so a rotation costs one
+# stat and one copy-then-truncate and never blocks a writer. Generalized from
+# the ffmpeg-progress-only version (#299) so the same shape covers
+# station-etv.log too — both are held open for the container's whole life by
+# a long-lived writer (the awk splitter below), so both need the same
+# copy-then-truncate treatment, never a rename.
+rotate_log() {
+    local f="$1" max_bytes="$2" keep="$3" size i
     [ -f "$f" ] || return 0
     size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null) || return 0
-    [ "${size:-0}" -ge "$PROGRESS_LOG_MAX_BYTES" ] || return 0
-    for (( i = PROGRESS_LOG_KEEP; i > 1; i-- )); do
+    [ "${size:-0}" -ge "$max_bytes" ] || return 0
+    for (( i = keep; i > 1; i-- )); do
         mv -f "$f.$(( i - 1 ))" "$f.$i" 2>/dev/null
     done
     # Copy-then-truncate, NOT rename. The awk splitter holds this path open for
@@ -176,7 +190,7 @@ rotate_progress_log() {
     # opens with O_APPEND, so a truncate makes the next write land at offset 0
     # instead of leaving a sparse hole.
     cp -f "$f" "$f.1" 2>/dev/null && : > "$f"
-    log "rotated ffmpeg-progress.log at ${size} bytes (keeping $PROGRESS_LOG_KEEP)"
+    log "rotated $(basename "$f") at ${size} bytes (keeping $keep)"
 }
 
 # These used to be two scripts copied onto the Unraid host by hand and started
@@ -234,11 +248,13 @@ if [ "$diag_ready" -eq 1 ]; then
     diag_pids+=($!)
     log "two-clock freeze capture started (evidence in $diag_dir/two-clock.log)"
 
-    # Keep the split-off progress log bounded. Slow loop: the file only needs
-    # checking often enough that it cannot overshoot badly between looks.
+    # Keep the split-off progress log, and station-etv.log (#299), bounded.
+    # Slow loop: the files only need checking often enough that they cannot
+    # overshoot badly between looks.
     (
         while true; do
-            rotate_progress_log || true
+            rotate_log "$diag_dir/ffmpeg-progress.log" "$PROGRESS_LOG_MAX_BYTES" "$PROGRESS_LOG_KEEP" || true
+            rotate_log "$diag_dir/station-etv.log" "$STATION_LOG_MAX_BYTES" "$STATION_LOG_KEEP" || true
             sleep "${ETV_PROGRESS_ROTATE_INTERVAL_SECS:-60}"
         done
     ) &

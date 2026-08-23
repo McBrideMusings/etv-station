@@ -13,7 +13,9 @@
 #      soak-probe.sh greps.
 #   2. rotation is copy-then-truncate, NOT rename. A long-lived awk writer holds
 #      the path open; renaming it would leave awk appending to the rolled file
-#      forever and the live path would never come back.
+#      forever and the live path would never come back. This now also covers
+#      station-etv.log's own size cap (#299), which rotate_log() in
+#      docker/entrypoint.sh handles the same way.
 #
 #   ./tools/progress-split-check.sh
 #
@@ -35,15 +37,17 @@ splitter() {
     '
 }
 
-# Mirror the entrypoint's rotate_progress_log().
+# Mirror the entrypoint's rotate_log() (parameterized in #299; used for both
+# ffmpeg-progress.log and station-etv.log there).
 PROGRESS_LOG_MAX_BYTES=8000
 PROGRESS_LOG_KEEP=2
-rotate_progress_log() {
-    local f="$prog" size i
+STATION_LOG_KEEP=2
+rotate_log() {
+    local f="$1" max_bytes="$2" keep="$3" size i
     [ -f "$f" ] || return 0
     size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null) || return 0
-    [ "${size:-0}" -ge "$PROGRESS_LOG_MAX_BYTES" ] || return 0
-    for (( i = PROGRESS_LOG_KEEP; i > 1; i-- )); do
+    [ "${size:-0}" -ge "$max_bytes" ] || return 0
+    for (( i = keep; i > 1; i-- )); do
         mv -f "$f.$(( i - 1 ))" "$f.$i" 2>/dev/null
     done
     cp -f "$f" "$f.1" 2>/dev/null && : > "$f"
@@ -62,10 +66,21 @@ for i in $(seq 1 350); do
     if [ $(( i % 100 )) -eq 0 ] && [ "$i" -lt 350 ]; then
         emit "[2026-08-20T18:00:00Z ERROR ersatztv_channel] channel 13 terminated after ffmpeg stall"
         sleep 0.2
-        rotate_progress_log
+        rotate_log "$prog" "$PROGRESS_LOG_MAX_BYTES" "$PROGRESS_LOG_KEEP"
     fi
 done
 sleep 0.5
+
+# station-etv.log rotation (#299), demonstrated as a second phase with the
+# same live writer still attached (fd 9 still open): pick a threshold at the
+# log's current size so rotate_log is guaranteed to fire on the next call,
+# fire it, then emit one more line through the SAME fifo and confirm it
+# lands in the freshly truncated live file rather than the rolled one.
+STATION_LOG_MAX_BYTES=$(stat -c %s "$all" 2>/dev/null || stat -f %z "$all" 2>/dev/null)
+rotate_log "$all" "$STATION_LOG_MAX_BYTES" "$STATION_LOG_KEEP"
+emit "[2026-08-20T18:00:00Z ERROR ersatztv_channel] channel 13 terminated after ffmpeg stall (post-rotation)"
+sleep 0.3
+
 exec 9>&-
 wait "$SPLIT_PID" 2>/dev/null
 
@@ -78,17 +93,22 @@ else
 fi
 
 n=$(grep -c "terminated after ffmpeg stall" "$W/stdout.txt" 2>/dev/null || echo 0)
-if [ "$n" -eq 3 ]; then
-    echo "  ok   all 3 non-progress lines reached stdout"
+if [ "$n" -eq 4 ]; then
+    echo "  ok   all 4 non-progress lines reached stdout (3 pre-rotation + 1 post)"
 else
-    echo "  FAIL expected 3 stall lines on stdout, got $n"; fails=$((fails+1))
+    echo "  FAIL expected 4 stall lines on stdout, got $n"; fails=$((fails+1))
 fi
 
-n=$(grep -c "terminated after ffmpeg stall" "$all" 2>/dev/null || echo 0)
-if [ "$n" -eq 3 ]; then
-    echo "  ok   non-progress lines also reached station-etv.log"
+# $all was rotated once (below) after the 3 in-loop stall lines, then took
+# one more post-rotation line, so those 3 now live in $all.1 and the live
+# file holds only the post-rotation one — checked together here (splitter
+# reached station-etv.log at all) and individually further down (rotation
+# actually moved the old content and kept the writer on the live path).
+n=$(cat "$all" "$all".1 2>/dev/null | grep -c "terminated after ffmpeg stall")
+if [ "$n" -eq 4 ]; then
+    echo "  ok   all 4 non-progress lines reached station-etv.log (3 pre-rotation + 1 post)"
 else
-    echo "  FAIL expected 3 in station-etv.log, got $n"; fails=$((fails+1))
+    echo "  FAIL expected 4 stall lines across station-etv.log + .1, got $n"; fails=$((fails+1))
 fi
 
 # The load-bearing one: the writer must still be feeding the LIVE path after
@@ -117,6 +137,36 @@ if [ "$rolled" -le "$PROGRESS_LOG_KEEP" ]; then
     echo "  ok   kept $rolled rolled file(s), within keep=$PROGRESS_LOG_KEEP"
 else
     echo "  FAIL kept $rolled rolled files, expected <= $PROGRESS_LOG_KEEP"; fails=$((fails+1))
+fi
+
+# station-etv.log (#299): the same load-bearing check as for the progress
+# log above — it too is held open by the splitter's `print >> all` for the
+# container's whole life, so a rotation must leave the writer still feeding
+# the LIVE path, not the rolled one.
+if grep -q "post-rotation" "$all" 2>/dev/null; then
+    echo "  ok   station-etv.log still receiving after rotation (post-rotation line landed live)"
+else
+    echo "  FAIL post-rotation line missing from live station-etv.log — writer followed the rolled file"; fails=$((fails+1))
+fi
+
+if grep -q "post-rotation" "$all".1 2>/dev/null; then
+    echo "  FAIL post-rotation line leaked into the rolled file — truncate ran after the write, not before"; fails=$((fails+1))
+else
+    echo "  ok   rolled station-etv.log.1 holds only the pre-rotation content"
+fi
+
+pre_in_rolled=$(grep -c "terminated after ffmpeg stall" "$all".1 2>/dev/null || echo 0)
+if [ "$pre_in_rolled" -eq 3 ]; then
+    echo "  ok   all 3 pre-rotation lines preserved in station-etv.log.1"
+else
+    echo "  FAIL expected 3 pre-rotation lines in station-etv.log.1, got $pre_in_rolled"; fails=$((fails+1))
+fi
+
+rolled_all=$(ls "$all".* 2>/dev/null | wc -l | tr -d ' ')
+if [ "$rolled_all" -le "$STATION_LOG_KEEP" ]; then
+    echo "  ok   kept $rolled_all rolled station-etv.log file(s), within keep=$STATION_LOG_KEEP"
+else
+    echo "  FAIL kept $rolled_all rolled station-etv.log files, expected <= $STATION_LOG_KEEP"; fails=$((fails+1))
 fi
 
 echo
