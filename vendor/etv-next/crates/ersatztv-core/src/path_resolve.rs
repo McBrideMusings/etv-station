@@ -79,7 +79,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolved,
-            dir.path().join("media").canonicalize().unwrap().to_str().unwrap()
+            dir.path()
+                .join("media")
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
         );
     }
 
