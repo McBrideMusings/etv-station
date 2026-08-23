@@ -179,8 +179,12 @@ pub struct PlexItem {
     pub absolute_episode: Option<i64>,
     pub year: Option<i64>,
     /// Plex `originallyAvailableAt` (`YYYY-MM-DD`); `None` when Plex has no
-    /// value for this item.
+    /// value for this item, or reports an empty string — normalised so the
+    /// merge never overwrites an existing release date with a blank one.
     pub release_date: Option<String>,
+    /// Plex `contentRating`; `None` when Plex has no value or reports an
+    /// empty string, normalised so the merge never overwrites an existing
+    /// content rating with a blank one.
     pub content_rating: Option<String>,
     /// Plex `summary` — the synopsis text. Feeds `entries.summary` and, from
     /// there, `ProgramMetadata.description` for the XMLTV guide (#186). `None`
@@ -952,7 +956,14 @@ fn to_plex_item(
         playback_path: translate(raw_path),
         title: m.title.clone().unwrap_or_default(),
         library: library.and_then(non_empty).map(str::to_string),
-        show: m.grandparent_title.clone(),
+        // Blank show title normalises to `None`, same as summary/edition/studio
+        // below, so the merge never overwrites an existing show name with an
+        // empty string.
+        show: m
+            .grandparent_title
+            .as_deref()
+            .and_then(non_empty)
+            .map(str::to_string),
         show_rating_key: is_episode
             .then_some(m.grandparent_rating_key.clone())
             .flatten(),
@@ -964,9 +975,23 @@ fn to_plex_item(
         episode: is_episode.then_some(m.index).flatten(),
         absolute_episode: is_episode.then_some(m.absolute_index).flatten(),
         year: m.year,
-        release_date: m.originally_available_at.clone(),
+        // Blank release date normalises to `None`, same as summary/edition/
+        // studio below, so the merge never overwrites an existing release
+        // date with an empty string.
+        release_date: m
+            .originally_available_at
+            .as_deref()
+            .and_then(non_empty)
+            .map(str::to_string),
         kind,
-        content_rating: m.content_rating.clone(),
+        // Blank content rating normalises to `None`, same as summary/edition/
+        // studio below, so the merge never overwrites an existing content
+        // rating with an empty string.
+        content_rating: m
+            .content_rating
+            .as_deref()
+            .and_then(non_empty)
+            .map(str::to_string),
         // Blank summary normalises to `None`, same as edition/studio below, so
         // the merge never overwrites an existing summary with an empty string.
         summary: m.summary.as_deref().and_then(non_empty).map(str::to_string),
@@ -2691,6 +2716,52 @@ mod tests {
         let m: PlexMetadata = serde_json::from_str(json).unwrap();
         let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
         assert_eq!(item.release_date, None);
+    }
+
+    /// #208: a blank `originallyAvailableAt`/`contentRating`/`grandparentTitle`
+    /// must normalise to `None` at parse time, and a merge pass that ingests
+    /// those blanks over an existing catalog entry must not clobber the real
+    /// values already on record — same merge-safety contract `summary`/
+    /// `edition`/`studio` already have.
+    #[test]
+    fn blank_release_date_and_content_rating_and_show_do_not_clobber_existing_values() {
+        let json = r#"{
+            "ratingKey": "12345",
+            "type": "episode",
+            "title": "Pilot",
+            "originallyAvailableAt": "",
+            "contentRating": "",
+            "grandparentTitle": "",
+            "Media": [{"Part": [{"file": "/media/pilot.mkv"}]}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
+        assert_eq!(item.release_date, None);
+        assert_eq!(item.content_rating, None);
+        assert_eq!(item.show, None);
+
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let mut item = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
+        item.release_date = Some("1988-07-15".into());
+        item.content_rating = Some("R".into());
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+
+        item.release_date = None;
+        item.content_rating = None;
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+
+        let e = cat.entry("imdb:tt-a").unwrap().unwrap();
+        assert_eq!(
+            e.release_date.as_deref(),
+            Some("1988-07-15"),
+            "a blank originallyAvailableAt must not clear an existing release date"
+        );
+        assert_eq!(
+            e.content_rating.as_deref(),
+            Some("R"),
+            "a blank contentRating must not clear an existing content rating"
+        );
     }
 
     #[test]
