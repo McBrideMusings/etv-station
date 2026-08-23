@@ -49,7 +49,9 @@
 # problem, not the known one. The DROPS column (sourced from the same
 # `drop_frames` field in the progress block the flatline already comes from)
 # separates the two: climbing means ffmpeg was alive and discarding, exactly
-# the #348 spin, fixed in a4d013b; flat means a genuine new hang.
+# the #348 spin, fixed in a4d013b; flat means a genuine new hang; `-` means the
+# progress block carried no `drop_frames` field at all, so neither climbing nor
+# flat can be asserted.
 # ENCODER-STOPPED-FIRST splits the same way — flat is the mid-item wedge #327
 # left unexplained; climbing means ffmpeg was alive, not deadlocked.
 #
@@ -191,7 +193,7 @@ legacy_window() {
         /^frame=/ { n++; if (\$0 == last) flat++; else { flat = 1; pend = 1 }; last = \$0; lf = substr(\$0, 7) }
         /^out_time_us=/ { lo = substr(\$0, 13) }
         /^drop_frames=/ { ld = substr(\$0, 13); if (pend) { d0 = ld; pend = 0 } }
-        END { if (n > 10) printf \"%.0f %s %s %s %s\n\", flat / (n / span), lf, (lo == \"\" ? 0 : lo), (d0 == \"\" ? 0 : d0), (ld == \"\" ? 0 : ld) }
+        END { if (n > 10) printf \"%.0f %s %s %s %s\n\", flat / (n / span), lf, (lo == \"\" ? 0 : lo), d0, ld }
       " "$f"
       break
     done'
@@ -292,7 +294,7 @@ EOF
     elif [ "$drops_state" = flat ]; then
       verdict="COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later; drops flat -- NOT the #348 class, a new hang) [$src]"
     else
-      verdict="COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later) [$src]"
+      verdict="COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later; no drop_frames data -- cannot tell a spin from a wedge) [$src]"
     fi
     printf '%-22s %-4s %9ss %12s  %s\n' "$ts" "$ch" "$flat_s" "$drops_disp" "$verdict"
     n_done=$((n_done+1))
@@ -306,7 +308,7 @@ EOF
     elif [ "$drops_state" = climbing ]; then
       verdict="ENCODER-STOPPED-FIRST (wedged mid-item, ${overrun:-?}s vs its -t, last frame=$final_frame; drops climbing -- ffmpeg was alive and discarding, not deadlocked) [$src]"
     else
-      verdict="ENCODER-STOPPED-FIRST (wedged mid-item, ${overrun:-?}s vs its -t, last frame=$final_frame) [$src]"
+      verdict="ENCODER-STOPPED-FIRST (wedged mid-item, ${overrun:-?}s vs its -t, last frame=$final_frame; no drop_frames data -- cannot tell a spin from a wedge) [$src]"
     fi
     printf '%-22s %-4s %9ss %12s  %s\n' "$ts" "$ch" "$flat_s" "$drops_disp" "$verdict"
     n_enc=$((n_enc+1))
