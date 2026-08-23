@@ -368,4 +368,30 @@ mod tests {
             "tilde should have been expanded, not passed through"
         );
     }
+
+    // A literal directory named `~` that appears somewhere other than the
+    // first path component must never be mistaken for a failed tilde-expansion.
+    // The guard only checks whether the raw first component is exactly `~`
+    // — if it is, and the resolved path still contains a bare `~` component,
+    // then expansion failed. But a path like `movies/~/reruns` has a raw
+    // first component of `movies`, so the guard never fires, and the path
+    // should resolve normally as long as the directory exists.
+    //
+    // This test catches regressions that would loosen the guard to match any
+    // `~` component in the resolved path, rather than comparing only against
+    // the raw value's own first component.
+    #[tokio::test]
+    async fn a_literal_tilde_directory_in_the_middle_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("movies/~/reruns"))
+            .await
+            .unwrap();
+        let (cfg_path, body) = write_channel_config(dir.path(), "movies/~/reruns").await;
+
+        let resolved = read_playout_folder(&cfg_path, &body)
+            .await
+            .expect("a real directory with a literal ~ in the middle must resolve");
+
+        assert!(resolved.ends_with("movies/~/reruns"), "got {resolved:?}");
+    }
 }
