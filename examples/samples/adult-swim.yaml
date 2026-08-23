@@ -27,6 +27,7 @@
 # Registered in examples/station.yaml via the `samples/*.yaml` glob. Resolves
 # to nothing unless the station's `catalog_path` points at a populated
 # catalog with these shows in it.
+display_name: "Adult Swim"
 window_days: 1
 roll_interval: "60s"
 retention_days: 1
