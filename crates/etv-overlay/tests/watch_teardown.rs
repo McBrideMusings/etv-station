@@ -41,6 +41,9 @@ fn is_alive(pid: i32) -> bool {
 /// The ffmpeg child's pid, found by scanning `ps` for a process whose parent
 /// is `parent_pid` — portable enough across macOS/BSD and Linux `ps`, unlike
 /// GNU-only `--ppid`.
+///
+/// Returns a PID only after confirming it is alive. This closes the race where
+/// the process might exit between the `ps` scan and the caller's check.
 fn find_child_pid(parent_pid: i32, deadline: Instant) -> Option<i32> {
     while Instant::now() < deadline {
         let out = Command::new("ps").args(["-Ao", "pid,ppid"]).output().ok()?;
@@ -51,7 +54,14 @@ fn find_child_pid(parent_pid: i32, deadline: Instant) -> Option<i32> {
                 continue;
             };
             if ppid.parse::<i32>() == Ok(parent_pid) {
-                return pid.parse().ok();
+                if let Ok(pid_i32) = pid.parse::<i32>() {
+                    // Confirm the PID is actually alive before returning it.
+                    // If it's dead, the loop will retry and find it again if it was
+                    // respawned, or timeout if the child process has truly exited.
+                    if is_alive(pid_i32) {
+                        return Some(pid_i32);
+                    }
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -97,15 +107,11 @@ fn sigterm_during_reader_wait_kills_the_ffmpeg_child_too() {
 
     let watch_pid = child.id() as i32;
     let ffmpeg_pid = find_child_pid(watch_pid, Instant::now() + Duration::from_secs(5))
-        .expect("etv-overlay watch never spawned an ffmpeg child within 5s");
+        .expect("etv-overlay watch never spawned a live ffmpeg child within 5s");
 
     assert!(
         is_alive(watch_pid),
         "sanity: watch process should be running"
-    );
-    assert!(
-        is_alive(ffmpeg_pid),
-        "sanity: ffmpeg child should be running"
     );
 
     kill(Pid::from_raw(watch_pid), Signal::SIGTERM).expect("send SIGTERM");
