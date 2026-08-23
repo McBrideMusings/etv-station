@@ -787,6 +787,69 @@ fn taste_vector_to_dynamic(vector: plexdb_reader::TasteVector) -> Dynamic {
     Dynamic::from_map(m)
 }
 
+thread_local! {
+    /// Per-thread override for the `timestamp()`/`elapsed()` pair a plugin sees.
+    ///
+    /// `None` (the default, on every thread) means both delegate to the real
+    /// wall clock — production behaviour is unchanged. [`determinism::check`]
+    /// sets this around each of its two generation passes so a plugin that
+    /// reads the clock produces a *different* value by construction, rather
+    /// than by however the OS happened to schedule two spin loops.
+    static PLUGIN_CLOCK: std::cell::Cell<Option<TestClock>> = const { std::cell::Cell::new(None) };
+}
+
+/// A fake clock that advances by `step` seconds on every read, so a plugin's
+/// `while elapsed(t0) < window { … }` spin loop still terminates — a pinned
+/// constant would spin forever.
+#[derive(Clone, Copy)]
+struct TestClock {
+    next: f64,
+    step: f64,
+}
+
+/// Read the current plugin-visible clock value, in seconds, advancing the
+/// thread-local override (if one is set) by its step.
+fn clock_read() -> f64 {
+    PLUGIN_CLOCK.with(|cell| match cell.get() {
+        Some(clock) => {
+            cell.set(Some(TestClock {
+                next: clock.next + clock.step,
+                ..clock
+            }));
+            clock.next
+        }
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64(),
+    })
+}
+
+/// RAII guard restoring the previous [`PLUGIN_CLOCK`] value on drop, including
+/// on an early return via `?` — a leaked override would leave a later, real
+/// generation on the same thread reading a fake clock.
+pub(crate) struct ClockGuard(Option<TestClock>);
+
+impl Drop for ClockGuard {
+    fn drop(&mut self) {
+        PLUGIN_CLOCK.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Override the plugin-visible clock on this thread: the first read returns
+/// `start` seconds, and every subsequent read advances by `step` seconds.
+/// Restored to whatever was set before (normally `None`, meaning real time)
+/// when the returned guard drops.
+///
+/// Plugin evaluation is synchronous on the calling thread — no `thread::spawn`
+/// or rayon in [`resolve`](crate::resolve), this module, or
+/// [`sequence`](crate::sequence) — so the override set here is exactly what a
+/// plugin's `timestamp()`/`elapsed()` calls observe during this scope.
+pub(crate) fn set_plugin_clock(start: f64, step: f64) -> ClockGuard {
+    let previous = PLUGIN_CLOCK.with(|cell| cell.replace(Some(TestClock { next: start, step })));
+    ClockGuard(previous)
+}
+
 /// The Rhai engine every plugin call uses.
 ///
 /// The nesting limits are set explicitly because Rhai's defaults are lower in a
@@ -810,6 +873,14 @@ fn taste_vector_to_dynamic(vector: plexdb_reader::TasteVector) -> Dynamic {
 /// [`Datastore`] (#181) is registered here unconditionally too, for the same
 /// reason `ScoreCtx` is — harmless when nothing constructs one, and it keeps
 /// every plugin call sharing one engine configuration.
+///
+/// `timestamp()`/`elapsed()` are registered here unconditionally too, for the
+/// same "one shared configuration" reason: they shadow rhai's own built-ins
+/// (which read the real, uninjectable clock) with a pair backed by
+/// [`PLUGIN_CLOCK`]. With the thread-local unset that pair delegates straight
+/// to the real clock, so this changes nothing for any shipped plugin — a
+/// `grep` over `deploy/appdata/plugins/*.rhai` finds no caller of either
+/// today. [`determinism::check`] is the only caller of [`set_plugin_clock`].
 pub(crate) fn engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
@@ -833,6 +904,9 @@ pub(crate) fn engine() -> Engine {
         .register_fn("edges_to", Datastore::edges_to)
         .register_fn("taste_vector_for", Datastore::taste_vector_for)
         .register_fn("pooled_taste_vector", Datastore::pooled_taste_vector);
+    engine
+        .register_fn("timestamp", clock_read)
+        .register_fn("elapsed", |t0: f64| clock_read() - t0);
     engine
 }
 

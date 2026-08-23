@@ -24,6 +24,7 @@ use crate::daemon::window_duration;
 use crate::errors::StationError;
 use crate::resolve::resolve_channel_with_resume;
 use crate::resume::GenerationState;
+use crate::score;
 use crate::score::ScoreInputs;
 
 /// Hint handed to a scorer plugin as `ctx.target_count`. The check has no
@@ -96,6 +97,13 @@ impl DeterminismReport {
 /// underlying bug in this engine: neither is derivable from anything but that
 /// clock.
 ///
+/// That clock is injected, not merely read: [`score::set_plugin_clock`] is set
+/// to a different start/step around each of the two passes below, so a plugin
+/// that calls `timestamp()`/`elapsed()` sees a different value in pass B *by
+/// construction*. Earlier this relied on two real spin loops racing the OS
+/// scheduler to land on different counts, which a busy machine could
+/// coincidentally make agree — this no longer depends on scheduling at all.
+///
 /// # Hook coverage
 ///
 /// This diffs the final resolved `entry_id` sequence
@@ -145,24 +153,40 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
     // report a correct daypart script as non-reproducible.
     let window_start = OffsetDateTime::now_utc();
 
-    let a = generate_once(
-        channel,
-        &station.station.identity_roots,
-        catalog.as_ref(),
-        &state,
-        &scoring,
-        fill,
-        window_start,
-    )?;
-    let b = generate_once(
-        channel,
-        &station.station.identity_roots,
-        catalog.as_ref(),
-        &state,
-        &scoring,
-        fill,
-        window_start,
-    )?;
+    // Two distinct clock steps, so a plugin reading `timestamp()`/`elapsed()`
+    // sees a different value in pass B by construction — see "What this
+    // catches" above. The base stays near zero (not wall-clock seconds) and
+    // the steps stay coarse so a plugin's `spins * 1000003` arithmetic can't
+    // overflow i64 even under a very small step. `ceil(0.02 / step)` differs
+    // clearly between the two so a fixture spinning to a fixed window can
+    // never land on the same count for both.
+    const CLOCK_STEP_A: f64 = 0.001;
+    const CLOCK_STEP_B: f64 = 0.004;
+
+    let a = {
+        let _clock = score::set_plugin_clock(0.0, CLOCK_STEP_A);
+        generate_once(
+            channel,
+            &station.station.identity_roots,
+            catalog.as_ref(),
+            &state,
+            &scoring,
+            fill,
+            window_start,
+        )?
+    };
+    let b = {
+        let _clock = score::set_plugin_clock(0.0, CLOCK_STEP_B);
+        generate_once(
+            channel,
+            &station.station.identity_roots,
+            catalog.as_ref(),
+            &state,
+            &scoring,
+            fill,
+            window_start,
+        )?
+    };
 
     Ok(diff_report(channel_name, &a, &b))
 }
@@ -545,13 +569,13 @@ mod tests {
     /// unseeded randomness": with nothing else nondeterministic to read in
     /// this engine, they are the same bug.
     ///
-    /// The mixing (xor-shift over each item's index, folded with the raw
-    /// nanosecond reading) is deliberate rather than a plain reverse-if-odd:
-    /// a coin-flip decision has a real chance of landing the same way twice
-    /// in a row, which would make this test flaky. Requiring the *whole*
-    /// nanosecond reading (not a low bit of it) to match between two
-    /// independent measurements to produce the same order is, in practice,
-    /// never going to coincidentally pass.
+    /// `timestamp()`/`elapsed()` are backed by [`score::set_plugin_clock`]
+    /// here, not the real OS clock: [`check`] sets a different step around
+    /// each pass, so the spin count below — and therefore `seed` — differs
+    /// between the two passes by construction (#314). The mixing (xor-shift
+    /// over each item's index) still matters on top of that: it turns a
+    /// different seed into a genuinely different permutation rather than
+    /// just a different starting rotation of the same one.
     const WALL_CLOCK_PLUGIN: &str = r#"
 fn hooks() { ["pool_provider"] }
 fn capabilities() { ["catalog_read"] }
@@ -560,25 +584,11 @@ fn pick(ctx) {
     let ids = [];
     for item in ctx.sets.movies { ids.push(item.entry_id); }
 
-    // Spin until the clock has demonstrably moved, and seed from how many
-    // iterations that took rather than from the reading itself. A fixed-size
-    // busy loop plus `elapsed()` was the first shape of this and it is not
-    // reliable: on an idle machine the loop finishes inside one tick of the
-    // clock's resolution, both passes read the same elapsed value, and the
-    // fixture is then perfectly deterministic - which fails this test for the
-    // opposite of the reason it is checking. The spin count over a fixed wall
-    // window varies with load and scheduling and is essentially never equal
-    // twice.
+    // Spin until the clock has moved past the window, and seed from how many
+    // iterations that took plus the final reading.
     let t0 = timestamp();
     let spins = 0;
     while elapsed(t0) < 0.02 { spins += 1; }
-    // The spin count carries essentially all of the entropy here: this clock's
-    // resolution is coarse enough that the reading at loop exit is the same
-    // number every run, so folding it in costs nothing and removes nothing.
-    // The 20ms window is what makes the count reliable — at 2ms the counts
-    // repeated outright about one run in fifteen, and an identical count is an
-    // identical schedule, which fails this test for the opposite of the reason
-    // it checks.
     // Reduced into the modulus immediately: unbounded, this reaches ~1e11,
     // and the key below then multiplies it past what an i64 holds.
     let seed = (spins * 1000003 + (elapsed(t0) * 1000000000.0).to_int()) % 999999937;
