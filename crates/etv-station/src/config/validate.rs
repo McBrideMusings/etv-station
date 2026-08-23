@@ -124,6 +124,15 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         });
     }
 
+    if channel.display_name.is_none() {
+        tracing::warn!(
+            event = "channel.display_name_defaulted",
+            path = %path.display(),
+            "channel has no display_name, so it will air under its folder identity - \
+             set display_name to control what the guide and the M3U lineup show"
+        );
+    }
+
     validate_taste_scope(path, channel)?;
     validate_show_groups(path, &channel.groups)?;
     validate_guide(path, "channel", channel.guide.as_ref())?;
@@ -2227,6 +2236,97 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
             )
         });
         result.unwrap();
+        assert!(events.is_empty(), "events = {events:?}");
+    }
+
+    // ---- display_name defaulted at load (#343) -----------------------------
+
+    /// One captured `channel.display_name_defaulted` event, with the fields
+    /// the tests below check against.
+    #[derive(Default, Clone, Debug)]
+    struct DisplayNameEvent {
+        event: String,
+        path: Option<String>,
+    }
+
+    /// Runs `f` under a subscriber that records every
+    /// `channel.display_name_defaulted` event emitted, in order, so a test
+    /// can assert either that one fired naming a given path or that none
+    /// fired at all.
+    fn capture_display_name_events<T>(f: impl FnOnce() -> T) -> (T, Vec<DisplayNameEvent>) {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct FieldVisitor(DisplayNameEvent);
+        impl Visit for FieldVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.0.event = value.to_string();
+                }
+            }
+            // `%path.display()` is a `Display` field, so it records via
+            // `record_debug`, not `record_str` — same reasoning as the
+            // `%grant.path` field captured in `capture_datastore_age_events`
+            // above.
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "path" {
+                    self.0.path = Some(format!("{value:?}"));
+                }
+            }
+        }
+
+        struct CaptureDisplayNameEvents(Arc<Mutex<Vec<DisplayNameEvent>>>);
+        impl<S: tracing::Subscriber> Layer<S> for CaptureDisplayNameEvents {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                if visitor.0.event == "channel.display_name_defaulted" {
+                    self.0.lock().unwrap().push(visitor.0);
+                }
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureDisplayNameEvents(Arc::clone(&seen)));
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let events = seen.lock().unwrap().clone();
+        (result, events)
+    }
+
+    /// A channel with no `display_name` set logs exactly one
+    /// `channel.display_name_defaulted` warning naming the config path, and
+    /// the load still succeeds — the warning warns, it does not refuse (#343).
+    #[test]
+    fn a_channel_with_no_display_name_logs_a_warning_naming_the_path() {
+        let path = dummy_path();
+        let channel = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        assert!(channel.display_name.is_none());
+
+        let (result, events) = capture_display_name_events(|| validate_channel(&path, &channel));
+        result.unwrap();
+
+        assert_eq!(events.len(), 1, "events = {events:?}");
+        assert_eq!(
+            events[0].path.as_deref(),
+            Some(path.to_str().unwrap()),
+            "events = {events:?}"
+        );
+    }
+
+    /// A channel that sets `display_name` logs no such warning (#343).
+    #[test]
+    fn a_channel_with_display_name_set_logs_no_warning() {
+        let mut channel = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        channel.display_name = Some("Something".into());
+
+        let (result, events) =
+            capture_display_name_events(|| validate_channel(&dummy_path(), &channel));
+        result.unwrap();
+
         assert!(events.is_empty(), "events = {events:?}");
     }
 

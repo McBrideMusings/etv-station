@@ -68,6 +68,7 @@
 # is proven openable before any plugin ever runs. Its resolution is also
 # proven by the `foryou_sample` acceptance test, against a hand-built
 # fixture store.
+display_name: "For You"
 window_days: 1
 roll_interval: "60s"
 retention_days: 1

@@ -80,6 +80,28 @@ fn every_example_channel_config_parses() {
     }
 }
 
+/// Every tracked sample under `examples/samples/` sets `display_name` (#343)
+/// — a copied sample should air under the name it schedules, not the folder
+/// slug it happened to be checked out into. `examples/channels/` is exempt:
+/// `.gitignore` keeps everything there but `lavfi-test.yaml` untracked and
+/// personal, and this test only covers what a copier would find committed.
+#[test]
+fn every_sample_channel_config_sets_display_name() {
+    for path in configs_in(&examples_dir().join("samples")) {
+        let channel = read_channel(&path).unwrap_or_else(|e| {
+            panic!(
+                "{} no longer deserializes as a ChannelConfig: {e}",
+                path.display()
+            )
+        });
+        assert!(
+            channel.display_name.is_some(),
+            "{} has no display_name, so it would air under its folder identity",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn every_example_block_file_parses() {
     for path in configs_in(&examples_dir().join("blocks")) {
