@@ -146,9 +146,18 @@ cargo build -p etv-overlay 2>&1 \
 # playout folders it reads are derived from where the station writes (never
 # hand-authored to match). Same binary, same flag the container entrypoint runs,
 # so dev and prod render through one code path.
+etv_next_dir="${ETV_NEXT_DIR:-examples/etv-next}"
+mkdir -p "$etv_next_dir"
+
 cargo run -q -p etv-station --bin etv-station -- \
-  --config "$STATION_CONFIG" --render-etv-next "${ETV_NEXT_DIR:-examples/etv-next}" \
-  | while IFS= read -r l; do printf '[dev] %s\n' "$l"; done
+  --config "$STATION_CONFIG" --render-etv-next "$etv_next_dir" \
+  2>&1 | while IFS= read -r l; do printf '[dev] %s\n' "$l"; done
+render_status=${PIPESTATUS[0]}
+
+if [ "$render_status" -ne 0 ]; then
+  echo "[dev] station --render-etv-next failed (exit $render_status); aborting before building etv-next" >&2
+  exit 1
+fi
 
 cat <<EOF
 [dev] streams will appear at (point your IPTV app at the .m3u lineup):
