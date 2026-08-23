@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -190,10 +190,15 @@ def current_and_next(
     return current, nxt
 
 
-def _fmt_dt(dt: datetime) -> str:
+def _fmt_dt(dt: datetime, today: date | None = None) -> str:
     """Weekday-qualified so a two-day-old entry can't be misread as "later
     today" — a bare %H:%M is exactly what made the schedule gap in #292 look
-    like an upcoming show instead of a stale listing days in the past."""
+    like an upcoming show instead of a stale listing days in the past. When a
+    reference date is provided via `today`, drops the weekday prefix for blocks
+    that fall on today (saving 4 characters) since the weekday only earns its
+    place once the list runs past midnight."""
+    if today is not None and dt.date() == today:
+        return dt.strftime("%H:%M")
     return dt.strftime("%a %H:%M")
 
 
@@ -516,7 +521,7 @@ def build_app(host: str):
                     text = escape(_title(overlapping[0])) if overlapping else "[red]— off-air —[/red]"
                 else:
                     text = escape(" → ".join(_title(seg) for seg in overlapping))
-                label = f"{marker} {_fmt_dt(cur)}  {text}"
+                label = f"{marker} {_fmt_dt(cur, today=now.date())}  {text}"
                 lv.append(ListItem(Label(label), name="block"))
                 self.programme_rows.append(("block", cur, overlapping))
                 if keep_kind == "block" and cur == keep_block_start:
