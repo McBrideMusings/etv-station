@@ -2722,9 +2722,14 @@ mod tests {
     /// must normalise to `None` at parse time, and a merge pass that ingests
     /// those blanks over an existing catalog entry must not clobber the real
     /// values already on record — same merge-safety contract `summary`/
-    /// `edition`/`studio` already have.
+    /// `edition`/`studio` already have. Part 1 covers parse-time normalisation
+    /// via a direct JSON→PlexItem conversion. Part 2 covers the merge via a
+    /// two-pass ingest over a movie entry (release_date/content_rating) and via
+    /// a three-pass ingest over an episode entry (show via blank grandparentTitle
+    /// round-tripped through to_plex_item).
     #[test]
     fn blank_release_date_and_content_rating_and_show_do_not_clobber_existing_values() {
+        // Part 1: parse-time normalisation — blanks become None
         let json = r#"{
             "ratingKey": "12345",
             "type": "episode",
@@ -2740,8 +2745,11 @@ mod tests {
         assert_eq!(item.content_rating, None);
         assert_eq!(item.show, None);
 
+        // Part 2: merge-time preservation — Plex blanks do not overwrite existing values
         let cat = Catalog::open_in_memory().unwrap();
         let roots = ["/data/media".to_string()];
+
+        // Release date / content rating on a movie
         let mut item = movie("rk-a", "/data/media/m/a.mkv", &[(ExternalNs::Imdb, "tt-a")]);
         item.release_date = Some("1988-07-15".into());
         item.content_rating = Some("R".into());
@@ -2761,6 +2769,44 @@ mod tests {
             e.content_rating.as_deref(),
             Some("R"),
             "a blank contentRating must not clear an existing content rating"
+        );
+
+        // Show on an episode — seed with show, re-ingest with blank grandparentTitle
+        // through to_plex_item to exercise the guard.
+        let mut ep = movie(
+            "plex-ep1",
+            "/data/media/tv/office/s01e01.mkv",
+            &[(ExternalNs::Imdb, "tt-ep")],
+        );
+        ep.kind = "episode".into();
+        ep.title = "Pilot".into();
+        ep.show = Some("The Office".into());
+        ep.show_rating_key = Some("81044".into());
+        ep.season = Some(1);
+        ep.episode = Some(1);
+        ingest_items(&cat, std::slice::from_ref(&ep), &roots).unwrap();
+
+        // Re-ingest the same episode with blank grandparentTitle through to_plex_item
+        let json = r#"{
+            "ratingKey": "plex-ep1",
+            "type": "episode",
+            "title": "Pilot",
+            "grandparentTitle": "",
+            "grandparentRatingKey": "81044",
+            "parentIndex": 1,
+            "index": 1,
+            "Media": [{"Part": [{"file": "/data/media/tv/office/s01e01.mkv"}]}],
+            "Guid": [{"id": "imdb://tt-ep"}]
+        }"#;
+        let m: PlexMetadata = serde_json::from_str(json).unwrap();
+        let item = to_plex_item(&m, None, None, |p| p.to_string()).unwrap();
+        ingest_items(&cat, std::slice::from_ref(&item), &roots).unwrap();
+
+        let e = cat.entry("imdb:tt-ep").unwrap().unwrap();
+        assert_eq!(
+            e.show.as_deref(),
+            Some("The Office"),
+            "a blank grandparentTitle must not clear an existing show"
         );
     }
 
