@@ -176,8 +176,9 @@ should exit at `T+X`, so `kill - (T+X)` says how long ffmpeg outlived its own
 assignment. The **flatline** comes from the progress stream: how long `frame=`
 sat unchanged before the kill. When overrun and flatline agree, the verdict is
 solid. The **DROPS** column adds a third: whether `drop_frames` was climbing
-(ffmpeg alive and discarding) or flat (a genuine wedge) across that same
-flatline window — see below.
+(ffmpeg alive and discarding), flat (a genuine wedge), reset (counter went
+backwards, window spans a respawn), or absent across that same flatline window
+— see below.
 
 ### What it found on 2026-08-22, and why it settles #327
 
@@ -233,6 +234,7 @@ because it ends the video the instant the overlay writer dies.
 
 | Verdict | DROPS | Means |
 |---|---|---|
+| `COUNTER-RESET` | reset | the window spans an ffmpeg respawn (drop_frames counter went backwards), so neither the flatline nor the drops clock measures one continuous invocation — not attributable |
 | `COMPLETED-BUT-WOULD-NOT-EXIT` | climbing | reached its `-t`, then spun. The #348 class, fixed in `a4d013b` — should not appear on an image carrying that fix |
 | `COMPLETED-BUT-WOULD-NOT-EXIT` | flat | reached its `-t`, then genuinely hung. NOT #348 — a new problem |
 | `ENCODER-STOPPED-FIRST` | flat | frames stopped with the item's end still far off, and nothing was moving — the genuine mid-item wedge (the 2-of-59 case #327 left unexplained) |
@@ -240,9 +242,9 @@ because it ends the video the instant the overlay writer dies.
 | `CONSUMER-STOPPED-FIRST` | — | ffmpeg still emitting frames at the kill |
 | `NO-PROGRESS-DATA` | — | instrumentation gap, not an unattributable stall |
 
-The DROPS column reads `+N@Rate/s` (climbing), `flat`, or `-` (no progress
-data backed the row) — sourced from `drop_frames` in the same progress block
-the flatline already comes from.
+The DROPS column reads `+N@Rate/s` (climbing), `flat`, a negative number (reset,
+counter went backwards), or `-` (no progress data backed the row) — sourced
+from `drop_frames` in the same progress block the flatline already comes from.
 
 `[per-session]` / `[rotated]` / `[argv-only]` names which source backed the
 flatline. Images older than `b6f5ac8` have per-session
