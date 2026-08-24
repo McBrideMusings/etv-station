@@ -49,9 +49,12 @@
 # problem, not the known one. The DROPS column (sourced from the same
 # `drop_frames` field in the progress block the flatline already comes from)
 # separates the two: climbing means ffmpeg was alive and discarding, exactly
-# the #348 spin, fixed in a4d013b; flat means a genuine new hang; `-` means the
-# progress block carried no `drop_frames` field at all, so neither climbing nor
-# flat can be asserted.
+# the #348 spin, fixed in a4d013b; flat means a genuine new hang; reset means
+# the counter went backwards (window spans an ffmpeg respawn), so the verdict is
+# not trustworthy; `-` means the progress block carried no `drop_frames` field
+# at all, so neither climbing nor flat can be asserted. Reset means the window
+# is not attributable; the three splits (climbing/flat/no-data) apply to the
+# overrun and flatline verdicts above the reset check.
 # ENCODER-STOPPED-FIRST splits the same way — flat is the mid-item wedge #327
 # left unexplained; climbing means ffmpeg was alive, not deadlocked.
 #
@@ -256,12 +259,16 @@ EOF
   [ -n "${flat_s:-}" ] || { flat_s="?"; src=argv-only; }
 
   # Whether ffmpeg was alive-and-discarding (drops climbing) or genuinely
-  # wedged (drops flat) across the flatline window just measured. Guarded
-  # against both missing progress data and flat_s being the literal "?".
+  # wedged (drops flat) across the flatline window just measured, or whether
+  # the window spans an ffmpeg respawn (drops reset). Guarded against both
+  # missing progress data and flat_s being the literal "?".
   drops_disp="-"; drops_state="?"
   if [ -n "${drops_at_start:-}" ] && [ -n "${final_drops:-}" ]; then
     drops_delta=$(( final_drops - drops_at_start ))
-    if [ "$drops_delta" -ge "$DROPS_MIN_DELTA" ] 2>/dev/null; then
+    if [ "$drops_delta" -lt 0 ] 2>/dev/null; then
+      drops_state=reset
+      drops_disp="${drops_delta}"
+    elif [ "$drops_delta" -ge "$DROPS_MIN_DELTA" ] 2>/dev/null; then
       drops_state=climbing
       if [ "$flat_s" != "?" ] && [ "$flat_s" -gt 0 ] 2>/dev/null; then
         drops_rate=$(( drops_delta / flat_s ))
@@ -288,7 +295,11 @@ EOF
     overrun="$(delta_s "$ts" "$pred")"
   fi
 
-  if [ -n "$overrun" ] && [ "$overrun" -ge 30 ] 2>/dev/null && [ "$overrun" -le 100 ] 2>/dev/null; then
+  if [ "$drops_state" = reset ]; then
+    printf '%-22s %-4s %9ss %12s  %s\n' "$ts" "$ch" "$flat_s" "$drops_disp" \
+      "COUNTER-RESET (drop_frames went backwards -- the window spans an ffmpeg respawn, so neither the flatline nor the drops clock measures one continuous invocation; not attributable) [$src]"
+    n_none=$((n_none+1))
+  elif [ -n "$overrun" ] && [ "$overrun" -ge 30 ] 2>/dev/null && [ "$overrun" -le 100 ] 2>/dev/null; then
     if [ "$drops_state" = climbing ]; then
       verdict="COMPLETED-BUT-WOULD-NOT-EXIT (hit its -t of $inv_t at $pred, killed ${overrun}s later; drops climbing -- the #348 class, fixed in a4d013b, should not appear on an image carrying that fix) [$src]"
     elif [ "$drops_state" = flat ]; then
