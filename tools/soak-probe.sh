@@ -20,11 +20,21 @@
 #                                   already use.
 #   SOAK_PROBE_CHANNEL             sampled channel number (default 1)
 #   SOAK_PROBE_MIN_COVERAGE_DAYS   required XMLTV lookahead, in days (default 7)
-#   SOAK_PROBE_KEEP                max files kept in soak-probe-failures/ and
-#                                  xmltv-samples/ (default 8, same retention
-#                                  count as tools/ffmpeg-probe.sh's argv log —
-#                                  also enough to cover the 7-day soak (#20)
-#                                  plus one extra day of XMLTV samples)
+#   SOAK_PROBE_KEEP                max files kept in xmltv-samples/ (default
+#                                  8). Sized for ONE FILE PER UTC DAY: the
+#                                  7-day soak (#20) plus one day in flight =
+#                                  8. Also the same count tools/ffmpeg-probe.sh
+#                                  uses for its argv log.
+#   SOAK_PROBE_FAILURE_KEEP        max files kept in soak-probe-failures/
+#                                  (default 192). Sized for ONE FILE PER
+#                                  FAILING PROBE at the docker/entrypoint.sh
+#                                  default hourly interval (24/day): 8 days x
+#                                  24 = 192, mirroring xmltv's 7-day-soak +
+#                                  1-day-headroom shape. Re-derive this if
+#                                  SOAK_PROBE_INTERVAL_SECS ever changes —
+#                                  a shorter interval means more failures/day
+#                                  and needs a bigger count to still cover a
+#                                  full 7-day soak.
 set -u
 
 # shellcheck source=tools/probe-checks.sh
@@ -35,6 +45,7 @@ set -u
 : "${SOAK_PROBE_CHANNEL:=1}"
 : "${SOAK_PROBE_MIN_COVERAGE_DAYS:=7}"
 : "${SOAK_PROBE_KEEP:=8}"
+: "${SOAK_PROBE_FAILURE_KEEP:=192}"
 
 BASE_URL="http://127.0.0.1:${ETV_PORT}"
 STATION_LOG="${ETV_DIAG_DIR}/station-etv.log"
@@ -176,20 +187,20 @@ if [ -n "$saved_marker" ]; then
   if [ "$current_marker" != "$saved_marker" ]; then
     start_line=1
   fi
-elif [ -n "$saved_line" ]; then
-  # Legacy or not-yet-armed state (upgrade from a bare-integer state file, or
-  # this is the run right after one was written before .1 existed yet): fall
-  # back to the old shrink heuristic for this one run rather than rescanning
-  # the whole log — resuming from the saved offset is still correct unless a
-  # rotation actually happened, and next probe onward is armed via the marker
-  # recorded below.
-  if [ "$end_line" -lt "$saved_line" ]; then
-    start_line=1
-  fi
 fi
 
 # A manual truncate (no .1 written) still needs to reset the scan — belt and
-# suspenders alongside the marker check above.
+# suspenders alongside the marker check above. This single unconditional
+# check also covers the legacy/not-yet-armed case (an upgrade from a
+# bare-integer state file, or the run right after one was written before .1
+# existed yet, i.e. saved_marker=="" && saved_line!=""): falling back to the
+# old shrink heuristic there is still correct unless a rotation actually
+# happened, and the next probe onward is armed via the marker recorded below.
+# That case used to have its own copy of this exact condition in an `elif`
+# branch above — a strict subset of this unconditional one, which also
+# reaches the armed case (a manual truncate that writes no .1, leaving the
+# marker unchanged) that the elif copy could never reach — so only this copy
+# is kept.
 if [ -n "$saved_line" ] && [ "$end_line" -lt "$saved_line" ]; then
   start_line=1
 fi
@@ -249,9 +260,12 @@ if [ "$overall" = "fail" ]; then
 fi
 
 # Trim both retained-artifact dirs every run (#299), not only on a run that
-# writes to them — an already-oversized dir (e.g. SOAK_PROBE_KEEP lowered
-# after the fact) still shrinks back down.
-trim_dir "$FAILURE_DIR" "$SOAK_PROBE_KEEP"
+# writes to them — an already-oversized dir (e.g. SOAK_PROBE_KEEP or
+# SOAK_PROBE_FAILURE_KEEP lowered after the fact) still shrinks back down.
+# The two dirs fill at very different rates (one xmltv sample per day vs. up
+# to one failure per hourly probe, #356), so each gets its own count rather
+# than sharing SOAK_PROBE_KEEP.
+trim_dir "$FAILURE_DIR" "$SOAK_PROBE_FAILURE_KEEP"
 trim_dir "$XMLTV_SAMPLE_DIR" "$SOAK_PROBE_KEEP"
 
 [ "$overall" = "pass" ]
