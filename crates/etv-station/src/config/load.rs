@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::block::BlockFile;
 use super::channel::ChannelConfig;
-use super::entry::Entry;
+use super::entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
 use super::overlay::{self, ChannelOverlays};
 use super::source::SourceConfig;
 use super::station::{self, StationConfig};
@@ -526,6 +526,14 @@ pub fn read_station(path: &Path) -> Result<StationConfig, ConfigError> {
 /// through. `serde_ignored` collects those paths from the deserializer itself,
 /// so nothing here keeps a second list of field names that could drift from the
 /// structs.
+///
+/// `Entry` and `Fallback` are internally tagged (`#[serde(tag = "kind")]`), so
+/// serde buffers their content before picking a variant and `serde_ignored`'s
+/// callback never sees inside — a typo inside an `entries:` list produced no
+/// warning at all (#334). [`collect_entry_unknown_keys`] closes that: a second,
+/// best-effort pass over the same file's raw parsed tree that re-checks each
+/// `entries:` element and `fallback:` map against its own concrete variant
+/// struct, feeding anything it finds into the same `ignored` list below.
 fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
     let is_yaml = path
         .extension()
@@ -555,6 +563,22 @@ fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Co
         })?
     };
 
+    // Second, best-effort pass: `serde_ignored` above is blind inside any
+    // internally-tagged enum (`Entry`, `Fallback`), because serde buffers
+    // that content before choosing a variant. Re-parse the same contents into
+    // a raw, untyped tree and re-check every `entries:` element and
+    // `fallback:` map against its own concrete struct. Never lets a failure
+    // here fail the load — this is a diagnostic on top of a parse that
+    // already succeeded above.
+    let raw: Option<serde_json::Value> = if is_yaml {
+        serde_norway::from_str(&contents).ok()
+    } else {
+        toml::from_str(&contents).ok()
+    };
+    if let Some(raw) = raw {
+        collect_entry_unknown_keys(&raw, "", &mut ignored);
+    }
+
     if !ignored.is_empty() {
         tracing::warn!(
             event = "config.unknown_keys",
@@ -567,6 +591,116 @@ fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Co
     }
 
     Ok(parsed)
+}
+
+/// Exists purely so the compiler enforces coverage: this function is never
+/// called, but adding a new [`Entry`] variant fails this `match` to compile
+/// until [`check_entry_unknown_keys`]'s string-tag match below is updated to
+/// match — mirroring [`Entry::kind_name`](super::entry::Entry::kind_name).
+#[allow(dead_code)]
+fn assert_entry_kinds_covered(entry: &Entry) {
+    match entry {
+        Entry::Item(_) => {}
+        Entry::Query(_) => {}
+        Entry::Collection(_) => {}
+        Entry::Include(_) => {}
+    }
+}
+
+/// Same purpose as [`assert_entry_kinds_covered`], for [`Fallback`].
+#[allow(dead_code)]
+fn assert_fallback_kinds_covered(fallback: &Fallback) {
+    match fallback {
+        Fallback::Query(_) => {}
+        Fallback::Item(_) => {}
+    }
+}
+
+/// Walks a parsed-but-untyped document looking for `entries:` lists and
+/// `fallback:` maps — the two internally-tagged-enum sites [`read_config_file`]'s
+/// primary `serde_ignored` pass cannot see inside (see its doc comment).
+/// `prefix` accumulates the dotted path to the current node (e.g.
+/// `"rule.blocks.0."`) so a reported key reads like
+/// `rule.blocks.0.entries.2.id` — enough to find which entry.
+fn collect_entry_unknown_keys(node: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Array(entries)) = map.get("entries") {
+                for (i, entry) in entries.iter().enumerate() {
+                    check_entry_unknown_keys(entry, &format!("{prefix}entries.{i}"), out);
+                }
+            }
+            if let Some(fallback) = map.get("fallback") {
+                check_fallback_unknown_keys(fallback, &format!("{prefix}fallback"), out);
+            }
+            for (key, value) in map {
+                collect_entry_unknown_keys(value, &format!("{prefix}{key}."), out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, value) in items.iter().enumerate() {
+                collect_entry_unknown_keys(value, &format!("{prefix}{i}."), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One element of an `entries:` list: dispatch on its `kind` tag to the
+/// matching concrete struct. An element with no string `kind` is left alone —
+/// either the typed parse above already rejected it, or the tag itself is
+/// unrecognised, which is a separate (and separately reported, at the enum
+/// level) problem from an unknown *field*.
+fn check_entry_unknown_keys(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    let Some(kind) = value.get("kind").and_then(|k| k.as_str()) else {
+        return;
+    };
+    match kind {
+        "item" => check_variant_unknown_keys::<ItemEntry>(value, prefix, out),
+        "query" => check_variant_unknown_keys::<QueryEntry>(value, prefix, out),
+        "collection" => check_variant_unknown_keys::<CollectionEntry>(value, prefix, out),
+        "include" => check_variant_unknown_keys::<IncludeEntry>(value, prefix, out),
+        _ => {}
+    }
+}
+
+/// A block's `fallback:` map — the other internally-tagged enum in
+/// `config/entry.rs`. Same dispatch shape as [`check_entry_unknown_keys`],
+/// over [`Fallback`]'s two variants instead of [`Entry`]'s four.
+fn check_fallback_unknown_keys(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    let Some(kind) = value.get("kind").and_then(|k| k.as_str()) else {
+        return;
+    };
+    match kind {
+        "query" => check_variant_unknown_keys::<QueryEntry>(value, prefix, out),
+        "item" => check_variant_unknown_keys::<ItemEntry>(value, prefix, out),
+        _ => {}
+    }
+}
+
+/// Re-deserializes one entry/fallback element into its concrete variant type
+/// `T` and runs `serde_ignored` over that — the check `serde_ignored` cannot
+/// perform through the internally-tagged enum wrapper, because by the time it
+/// sees the enum the content is already buffered. `kind` is stripped before
+/// deserializing: it is the enum's tag, not a field of `T`, and left in place
+/// it would report as unknown on every well-formed entry. Errors from the
+/// inner deserialize are discarded — this is a diagnostic pass layered on a
+/// parse that already succeeded, and it must never refuse a config the typed
+/// parse accepted.
+fn check_variant_unknown_keys<T: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    let mut map = map.clone();
+    map.remove("kind");
+    let stripped = serde_json::Value::Object(map);
+    let _: Result<T, _> = serde_ignored::deserialize(stripped, |p| {
+        out.push(format!("{prefix}.{p}"));
+    });
 }
 
 #[cfg(test)]
@@ -1180,5 +1314,221 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("control characters"));
+    }
+
+    // --- #334: unknown keys inside `entries:`/`fallback:` -------------------
+    //
+    // `Entry`/`Fallback` are internally tagged, so the primary `serde_ignored`
+    // pass in `read_config_file` cannot see inside them. These exercise the
+    // second pass directly against `serde_json::Value`, which is cheaper and
+    // more direct than round-tripping every case through a real file.
+
+    #[test]
+    fn collect_entry_unknown_keys_reports_a_bogus_key_in_an_item_entry() {
+        // Exact shape from #334: `id` reads like a plausible field but is not
+        // one on `ItemEntry` — identity is derived from `source`, never
+        // authored.
+        let doc = serde_json::json!({
+            "rule": {"blocks": [{"mode": "all", "order": "manual", "entries": [
+                {"kind": "item", "id": "die-hard-1988",
+                 "source": {"kind": "local", "path": "/data/media/Die.Hard.mkv"}}
+            ]}]}
+        });
+        let mut out = Vec::new();
+        collect_entry_unknown_keys(&doc, "", &mut out);
+        assert_eq!(out, vec!["rule.blocks.0.entries.0.id"]);
+    }
+
+    #[test]
+    fn collect_entry_unknown_keys_reports_a_bogus_key_in_a_query_entry() {
+        let doc = serde_json::json!({
+            "rule": {"blocks": [{"mode": "all", "entries": [
+                {"kind": "query", "query": "kind == \"movie\"", "typo_field": true}
+            ]}]}
+        });
+        let mut out = Vec::new();
+        collect_entry_unknown_keys(&doc, "", &mut out);
+        assert_eq!(out, vec!["rule.blocks.0.entries.0.typo_field"]);
+    }
+
+    #[test]
+    fn collect_entry_unknown_keys_reports_a_bogus_key_in_a_collection_entry() {
+        let doc = serde_json::json!({
+            "rule": {"blocks": [{"mode": "all", "entries": [
+                {"kind": "collection", "name": "Die Hard Saga", "sort": "asc"}
+            ]}]}
+        });
+        let mut out = Vec::new();
+        collect_entry_unknown_keys(&doc, "", &mut out);
+        assert_eq!(out, vec!["rule.blocks.0.entries.0.sort"]);
+    }
+
+    #[test]
+    fn collect_entry_unknown_keys_reports_a_bogus_key_in_an_include_entry() {
+        let doc = serde_json::json!({
+            "rule": {"blocks": [{"mode": "all", "entries": [
+                {"kind": "include", "block": "bumpers.yaml", "shuffle": true}
+            ]}]}
+        });
+        let mut out = Vec::new();
+        collect_entry_unknown_keys(&doc, "", &mut out);
+        assert_eq!(out, vec!["rule.blocks.0.entries.0.shuffle"]);
+    }
+
+    #[test]
+    fn collect_entry_unknown_keys_reports_a_bogus_key_in_a_fallback() {
+        let doc = serde_json::json!({
+            "rule": {"blocks": [{"mode": "all", "entries": [],
+                "fallback": {"kind": "query", "query": "kind == \"movie\"", "oops": 1}}]}
+        });
+        let mut out = Vec::new();
+        collect_entry_unknown_keys(&doc, "", &mut out);
+        assert_eq!(out, vec!["rule.blocks.0.fallback.oops"]);
+    }
+
+    #[test]
+    fn collect_entry_unknown_keys_reports_nothing_for_a_correct_entry() {
+        // Also proves the internal tag `kind` itself is never reported —
+        // stripping it before the inner deserialize is required for exactly
+        // this case.
+        let doc = serde_json::json!({
+            "rule": {"blocks": [{"mode": "all", "order": "manual", "entries": [
+                {"kind": "item",
+                 "source": {"kind": "local", "path": "/data/media/Die.Hard.mkv"}}
+            ]}]}
+        });
+        let mut out = Vec::new();
+        collect_entry_unknown_keys(&doc, "", &mut out);
+        assert!(out.is_empty(), "out = {out:?}");
+    }
+
+    #[test]
+    fn collect_entry_unknown_keys_ignores_an_entry_with_no_recognised_kind() {
+        // A `kind` the enum tag itself does not know is a separate, already-
+        // reported problem (the typed parse rejects it outright) — this pass
+        // must not also try to guess a struct for it.
+        let doc = serde_json::json!({
+            "rule": {"blocks": [{"mode": "all", "entries": [
+                {"kind": "bogus_kind", "whatever": 1}
+            ]}]}
+        });
+        let mut out = Vec::new();
+        collect_entry_unknown_keys(&doc, "", &mut out);
+        assert!(out.is_empty(), "out = {out:?}");
+    }
+
+    /// Captures `event = "config.unknown_keys"` warnings emitted during `f`,
+    /// pairing the event name with the `keys` field's rendered value. Mirrors
+    /// `validate.rs`'s `capture_datastore_age_events` — `keys` is a `%`-
+    /// (Display-)formatted `String`, which tracing records via
+    /// `record_debug`, not `record_str`.
+    fn capture_unknown_keys_events<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            event: String,
+            keys: Option<String>,
+        }
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "keys" {
+                    self.keys = Some(format!("{value:?}"));
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.event = value.to_string();
+                }
+            }
+        }
+
+        struct CaptureUnknownKeys(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for CaptureUnknownKeys {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                if visitor.event == "config.unknown_keys"
+                    && let Some(keys) = visitor.keys
+                {
+                    self.0.lock().unwrap().push(keys);
+                }
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureUnknownKeys(Arc::clone(&seen)));
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let events = seen.lock().unwrap().clone();
+        (result, events)
+    }
+
+    /// End-to-end proof, through the real `read_channel` entry point: a typo
+    /// inside an `item` entry is now named in the same `config.unknown_keys`
+    /// warning a top-level typo already produced. Deleting the
+    /// `collect_entry_unknown_keys` call from `read_config_file` makes this
+    /// fail — the pass emits nothing, which is the exact silence #334 reports.
+    #[test]
+    fn read_channel_warns_on_a_bogus_key_inside_an_item_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel_path = dir.path().join("channel.yaml");
+        std::fs::write(
+            &channel_path,
+            "rule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        \
+             - kind: item\n          id: \"die-hard-1988\"\n          source:\n            \
+             kind: local\n            path: \"/data/media/Die.Hard.mkv\"\n",
+        )
+        .unwrap();
+
+        let (result, events) = capture_unknown_keys_events(|| read_channel(&channel_path));
+        result.expect("config should still load despite the unknown key");
+        assert!(
+            events.iter().any(|keys| keys.contains("entries.0.id")),
+            "events = {events:?}"
+        );
+    }
+
+    /// The corrected version of the same channel produces no warning at all.
+    #[test]
+    fn read_channel_is_silent_on_a_correctly_spelled_item_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel_path = dir.path().join("channel.yaml");
+        std::fs::write(
+            &channel_path,
+            "rule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        \
+             - kind: item\n          source:\n            kind: local\n            \
+             path: \"/data/media/Die.Hard.mkv\"\n",
+        )
+        .unwrap();
+
+        let (result, events) = capture_unknown_keys_events(|| read_channel(&channel_path));
+        result.expect("a correctly spelled entry must still load");
+        assert!(events.is_empty(), "events = {events:?}");
+    }
+
+    /// Same holds for a non-`item` kind end to end, not just via the direct
+    /// unit test above.
+    #[test]
+    fn read_channel_warns_on_a_bogus_key_inside_a_query_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel_path = dir.path().join("channel.yaml");
+        std::fs::write(
+            &channel_path,
+            "rule:\n  blocks:\n    - mode: all\n      entries:\n        \
+             - kind: query\n          query: 'kind == \"movie\"'\n          typo_field: true\n",
+        )
+        .unwrap();
+
+        let (result, events) = capture_unknown_keys_events(|| read_channel(&channel_path));
+        result.expect("config should still load despite the unknown key");
+        assert!(
+            events
+                .iter()
+                .any(|keys| keys.contains("entries.0.typo_field")),
+            "events = {events:?}"
+        );
     }
 }

@@ -29,8 +29,18 @@ the file parses as though the key did not exist.
 
 Each unrecognised path is logged once per file at WARN with
 `event = "config.unknown_keys"`, fields `path = <config file>` and
-`keys = <comma-joined dotted paths>`. The paths come from `serde_ignored`, so
-they track the structs and cannot drift.
+`keys = <comma-joined dotted paths>`.
+
+Most paths come from a single `serde_ignored` pass over the whole file, so
+they track the structs and cannot drift. `entries:` and `fallback:` are the
+exception: each is an internally-tagged enum (`kind: item` / `kind: query` /
+…), and serde buffers an internally-tagged variant's content before choosing
+one, so that one pass cannot see inside it. A second, best-effort pass
+re-checks every `entries:` element and `fallback:` map against its own
+concrete struct (`ItemEntry`, `QueryEntry`, `CollectionEntry`, `IncludeEntry`)
+and feeds anything it finds into the same warning. Those paths carry the
+entry's position, e.g. `rule.blocks.0.entries.2.id` — enough to find which
+entry, not just which file.
 
 **Why the strictness was traded away:** Config lives in a bind-mounted volume
 that outlives the container while the parser ships inside the image, so
