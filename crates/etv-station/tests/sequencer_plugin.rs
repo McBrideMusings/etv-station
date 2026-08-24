@@ -17,7 +17,7 @@ use etv_station::config::{
 use etv_station::resolve::resolve_channel_with_resume;
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreEnv, ScoreInputs};
-use etv_station::sequence::{build, Window};
+use etv_station::sequence::{Window, build};
 use time::macros::datetime;
 
 /// One two-episode show (`spotlight`'s pool) and four movies (`discovery`'s
