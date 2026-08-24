@@ -38,6 +38,7 @@ set -u
 
 BASE_URL="http://127.0.0.1:${ETV_PORT}"
 STATION_LOG="${ETV_DIAG_DIR}/station-etv.log"
+ROLLED_LOG="${STATION_LOG}.1"
 RESULT_LOG="${ETV_DIAG_DIR}/soak-probe.log"
 STATE_FILE="${ETV_DIAG_DIR}/soak-probe.state"
 FAILURE_DIR="${ETV_DIAG_DIR}/soak-probe-failures"
@@ -59,6 +60,25 @@ now_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 # and a macOS dev shell. Best-effort and silent: a soak probe must never fail
 # because its own housekeeping hit a permission error or a `head`/`tail`
 # quirk, so every failure mode here is swallowed and this always returns 0.
+# rotate_log() in docker/entrypoint.sh is copy-then-truncate, not rename — a
+# long-lived awk writer holds station-etv.log open for the container's whole
+# life, so the live path's inode never changes at rotation and cannot be used
+# to detect one. What DOES change at every rotation is station-etv.log.1: it
+# is (re)written by `cp -f f f.1` each time rotate_log fires. This prints an
+# identity token for that file — mtime:size:inode — or "none" when it does
+# not exist yet. With ETV_STATION_LOG_KEEP=1 the .1 inode can be reused
+# across rotations (mv shuffles .1 -> .2 first only when keep > 1), so mtime
+# and size ride along precisely so identity still changes when inode alone
+# would not. Never aborts the probe: any stat failure (missing file, a
+# platform whose stat flags differ) yields "none" under `set -u` alone (no
+# -e), which the caller treats as "not yet armed" rather than a rotation.
+rolled_marker() {
+  local f="$1" marker
+  [ -f "$f" ] || { printf 'none'; return 0; }
+  marker="$(stat -c '%Y:%s:%i' "$f" 2>/dev/null || stat -f '%m:%z:%i' "$f" 2>/dev/null || true)"
+  [ -n "$marker" ] && printf '%s' "$marker" || printf 'none'
+}
+
 trim_dir() {
   local dir="$1" keep="$2" count excess
   [ -d "$dir" ] || return 0
@@ -120,13 +140,26 @@ fi
 # would be skipped by every future probe — silently defeating the
 # "zero-tolerance" contract documented in probe-checks.sh. One snapshot means
 # a line written after it is simply left for the next probe to see.
+#
+# Rotation is detected from station-etv.log.1's identity (#355), not from the
+# live file's line count shrinking. entrypoint.sh's rotate_log() runs on its
+# own interval (default 60s), independent of this probe's schedule (default
+# hourly) — a rotation followed by enough writes to regrow the live file past
+# the old saved line count before the NEXT probe runs makes the shrink
+# invisible, and start_line would then resume at an offset pointing into
+# unrelated post-rotation content: exactly the skipped-lines gap this check
+# exists to close. station-etv.log.1 is (re)written by rotate_log() at every
+# rotation and never touched between rotations, so its mtime:size:inode
+# marker changes if-and-only-if a rotation happened, regardless of how fast
+# the live file regrows afterward.
 start_line=1
-saved_numeric=""
+saved_line=""
+saved_marker=""
 if [ -f "$STATE_FILE" ]; then
-  saved="$(cat "$STATE_FILE" 2>/dev/null || true)"
-  case "$saved" in
-    '' | *[!0-9]*) start_line=1 ;;
-    *) start_line=$((saved + 1)); saved_numeric="$saved" ;;
+  read -r saved_line saved_marker <"$STATE_FILE" 2>/dev/null || true
+  case "$saved_line" in
+    '' | *[!0-9]*) saved_line="" ;;
+    *) start_line=$((saved_line + 1)) ;;
   esac
 fi
 
@@ -134,19 +167,30 @@ end_line=0
 [ -f "$STATION_LOG" ] && end_line="$(wc -l <"$STATION_LOG" 2>/dev/null | tr -d ' ')"
 [ -n "$end_line" ] || end_line=0
 
-# entrypoint.sh's station-etv.log size cap (#299) copy-then-truncates the log
-# in place once it crosses STATION_LOG_MAX_BYTES, so end_line can legitimately
-# be smaller than the previous probe's saved line count — that is not the log
-# going backwards, it is a rotation. Compare against the saved count itself
-# (not start_line=saved+1, which is always one past end_line on an ordinary
-# "nothing new written" run and would misfire every time). Without this,
-# start_line would sit past end_line after a real rotation,
-# probe_check_log_window would see an empty window and report pass on
-# nothing, and every line written between the rotation and the log regrowing
-# past the old count would be silently unscanned — exactly the
-# zero-tolerance contract this check exists to enforce. Restart the scan from
-# line 1 of the (now-truncated) live file.
-if [ -n "$saved_numeric" ] && [ "$end_line" -lt "$saved_numeric" ]; then
+current_marker="$(rolled_marker "$ROLLED_LOG")"
+
+if [ -n "$saved_marker" ]; then
+  # Armed: a prior probe recorded a marker, so any change — including .1
+  # appearing for the first time — is a rotation, however much the live file
+  # has regrown since.
+  if [ "$current_marker" != "$saved_marker" ]; then
+    start_line=1
+  fi
+elif [ -n "$saved_line" ]; then
+  # Legacy or not-yet-armed state (upgrade from a bare-integer state file, or
+  # this is the run right after one was written before .1 existed yet): fall
+  # back to the old shrink heuristic for this one run rather than rescanning
+  # the whole log — resuming from the saved offset is still correct unless a
+  # rotation actually happened, and next probe onward is armed via the marker
+  # recorded below.
+  if [ "$end_line" -lt "$saved_line" ]; then
+    start_line=1
+  fi
+fi
+
+# A manual truncate (no .1 written) still needs to reset the scan — belt and
+# suspenders alongside the marker check above.
+if [ -n "$saved_line" ] && [ "$end_line" -lt "$saved_line" ]; then
   start_line=1
 fi
 
@@ -154,9 +198,15 @@ run_check "log_scan" probe_check_log_window "$STATION_LOG" "$start_line" "$end_l
 
 # Advance the state file to the snapshot taken above (not a fresh read),
 # regardless of pass/fail, so a failure's lines are never re-reported as new
-# on the next probe.
+# on the next probe. The marker is always written (even when end_line is 0,
+# e.g. probing right after a rotation truncated the live file to empty) so
+# the NEXT probe is armed to detect a rotation from this run onward; only the
+# line count is gated on end_line>0 to avoid recording a bogus "0" over a
+# real prior count on a transient empty read.
 if [ "$end_line" -gt 0 ]; then
-  printf '%s' "$end_line" >"$STATE_FILE"
+  printf '%s %s\n' "$end_line" "$current_marker" >"$STATE_FILE"
+else
+  printf '%s %s\n' "${saved_line:-0}" "$current_marker" >"$STATE_FILE"
 fi
 
 # One XMLTV sample per calendar day (UTC) — evidence for #20 without keeping
