@@ -907,10 +907,12 @@ channel resolved, or unit `()` on a pooled channel — see below).
 
 `ctx.seed` is an integer: the channel's resolved `seed` (authored, or a fresh
 value drawn once per generation when unset — #46) mixed with the asking pool's
-name. It is the only source of entropy a script has that survives the
-determinism check below — Rhai's own `timestamp()`/`elapsed()` is the other
-one, and reading either fails the check by design (see "The determinism
-contract").
+name. It is the source of entropy meant for a script to shuffle with. Rhai's
+own `timestamp()`/`elapsed()` are legal to read too — they answer a clock
+fixed for this generation (seeded from `window_start`, never the real wall
+clock, #357), not a source of nondeterminism — but they carry no seed of their
+own, so a script wanting reproducible randomness should still derive it from
+`ctx.seed` (see "The determinism contract").
 
 Two pools of one channel naming the same script get different `ctx.seed`
 values — mixing the pool's own name into the channel's seed is what keeps two
@@ -948,9 +950,9 @@ script receives it, whether or not the channel is `single_user`-scoped.
 
 ### The determinism contract
 
-A plugin must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — the same inputs the station itself is pure over. Nothing in `ctx` is optional to use instead of an ambient read: `ctx.now` is unix seconds at generation time, handed in precisely so a script never has to call the clock itself, and `ctx.history` / `ctx.recent` are the only watch/replay state a script sees. A script that reads Rhai's own `timestamp()`/`elapsed()`, or ranks by anything else not reachable through `ctx`, produces a different schedule from the same inputs — and the schedule still looks completely valid, so nothing errors and nothing on screen says which run is "right".
+A plugin must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — the same inputs the station itself is pure over. Nothing in `ctx` is optional to use instead of an ambient read: `ctx.now` is unix seconds at generation time, handed in precisely so a script never has to call the clock itself, and `ctx.history` / `ctx.recent` are the only watch/replay state a script sees. Rhai's own `timestamp()`/`elapsed()` are pure too as of #357 — they read a clock fixed to this generation's `window_start`, not the real wall clock, so two generations of the same channel see the same value and a script reading either produces the same schedule both times. A script ranking by anything else not reachable through `ctx` — an unordered iteration whose order Rhai does not guarantee, for instance — can still produce a different schedule from the same inputs, and the schedule still looks completely valid, so nothing errors and nothing on screen says which run is "right".
 
-`etv-station --check-determinism <channel>` generates the named channel twice from identical inputs (config, catalog snapshot, seed, and — the empty, stateless kind — resume state) and diffs the two resulting schedules. It reports identical, or the first airing position where they disagree and both entry ids there, so the failure names a place to start rather than a bare "not reproducible". It measures only: it does not fix a plugin that fails it, and it is a debug check, not part of normal generation.
+`etv-station --check-determinism <channel>` generates the named channel twice from identical inputs (config, catalog snapshot, seed, and — the empty, stateless kind — resume state) and diffs the two resulting schedules. It reports identical, or the first airing position where they disagree and both entry ids there, so the failure names a place to start rather than a bare "not reproducible". It is a debug check, not part of normal generation.
 
 ### Writing a plugin that finishes
 

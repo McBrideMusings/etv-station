@@ -5,11 +5,14 @@
 //! Reproducible generation is a stated property of the system: pin a seed and
 //! the same catalog, config, and resume state produce the same schedule. That
 //! holds for everything the station does itself, because every random choice
-//! is seeded from the channel `seed` plus a position. A plugin can break it
-//! silently — a Rhai script that reads wall-clock time or iterates something
-//! whose order is not stable produces a different schedule every run, and the
-//! schedule still looks completely valid. This module measures that; it does
-//! not fix it (out of scope — see the issue).
+//! is seeded from the channel `seed` plus a position, and a plugin's
+//! `timestamp()`/`elapsed()` reads a clock fixed per generation rather than
+//! the real wall clock (`score::PLUGIN_CLOCK`, seeded in
+//! [`resolve_channel_with_resume`]) — so neither vector can make a plugin
+//! disagree with itself across two passes given the same pinned inputs. This
+//! module exercises three of the pinned inputs below (no plugin at all, an
+//! unseeded `random` block, and resume-state isolation across a cut entries
+//! list) and confirms each still reproduces.
 //!
 //! Not part of normal generation. A debug check, wired to its own CLI flag in
 //! `main.rs`, never called from [`crate::daemon`].
@@ -24,7 +27,6 @@ use crate::daemon::window_duration;
 use crate::errors::StationError;
 use crate::resolve::resolve_channel_with_resume;
 use crate::resume::GenerationState;
-use crate::score;
 use crate::score::ScoreInputs;
 
 /// Hint handed to a scorer plugin as `ctx.target_count`. The check has no
@@ -90,19 +92,14 @@ impl DeterminismReport {
 /// # What this catches
 ///
 /// A plugin whose `pick()` depends on anything outside those pinned inputs
-/// disagrees between the two passes and is caught here. Rhai's sandbox has no
-/// OS clock, environment, file I/O, or RNG of its own — `timestamp()` /
-/// `elapsed()` (Rhai's own wall clock) is the one vector it exposes, which is
-/// why "reads wall-clock time" and "uses unseeded randomness" are the same
-/// underlying bug in this engine: neither is derivable from anything but that
-/// clock.
-///
-/// That clock is injected, not merely read: [`score::set_plugin_clock`] is set
-/// to a different start/step around each of the two passes below, so a plugin
-/// that calls `timestamp()`/`elapsed()` sees a different value in pass B *by
-/// construction*. Earlier this relied on two real spin loops racing the OS
-/// scheduler to land on different counts, which a busy machine could
-/// coincidentally make agree — this no longer depends on scheduling at all.
+/// disagrees between the two passes and is caught here. `timestamp()`/
+/// `elapsed()` are no longer such a dependency — both read
+/// `score::PLUGIN_CLOCK`, fixed per generation, not the real wall clock — so
+/// this check no longer needs to force the clock to differ between passes to
+/// prove that. Both passes below go through [`resolve_channel_with_resume`]
+/// with the same `window_start`, so both inherit the same fixed plugin clock
+/// by construction, same as two real generations at the same `window_start`
+/// would.
 ///
 /// # Hook coverage
 ///
@@ -153,40 +150,24 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
     // report a correct daypart script as non-reproducible.
     let window_start = OffsetDateTime::now_utc();
 
-    // Two distinct clock steps, so a plugin reading `timestamp()`/`elapsed()`
-    // sees a different value in pass B by construction — see "What this
-    // catches" above. The base stays near zero (not wall-clock seconds) and
-    // the steps stay coarse so a plugin's `spins * 1000003` arithmetic can't
-    // overflow i64 even under a very small step. `ceil(0.02 / step)` differs
-    // clearly between the two so a fixture spinning to a fixed window can
-    // never land on the same count for both.
-    const CLOCK_STEP_A: f64 = 0.001;
-    const CLOCK_STEP_B: f64 = 0.004;
-
-    let a = {
-        let _clock = score::set_plugin_clock(0.0, CLOCK_STEP_A);
-        generate_once(
-            channel,
-            &station.station.identity_roots,
-            catalog.as_ref(),
-            &state,
-            &scoring,
-            fill,
-            window_start,
-        )?
-    };
-    let b = {
-        let _clock = score::set_plugin_clock(0.0, CLOCK_STEP_B);
-        generate_once(
-            channel,
-            &station.station.identity_roots,
-            catalog.as_ref(),
-            &state,
-            &scoring,
-            fill,
-            window_start,
-        )?
-    };
+    let a = generate_once(
+        channel,
+        &station.station.identity_roots,
+        catalog.as_ref(),
+        &state,
+        &scoring,
+        fill,
+        window_start,
+    )?;
+    let b = generate_once(
+        channel,
+        &station.station.identity_roots,
+        catalog.as_ref(),
+        &state,
+        &scoring,
+        fill,
+        window_start,
+    )?;
 
     Ok(diff_report(channel_name, &a, &b))
 }
@@ -530,7 +511,7 @@ mod tests {
         assert_eq!(report.pass_b_len, 3);
     }
 
-    // ---- a plugin reading Rhai's own wall clock is caught -------------------
+    // ---- a plugin shuffling from ctx.seed reproduces ------------------------
 
     /// Writes a file-backed catalog (not in-memory — the check reopens it by
     /// path, exactly as it would a real one) and drops the writable handle,
@@ -561,69 +542,12 @@ mod tests {
         p
     }
 
-    /// A scorer that reorders its result from Rhai's own `timestamp()` /
-    /// `elapsed()` instead of the deterministic `ctx.now` the station hands
-    /// it — the exact contract violation #168 exists to catch. Rhai's
-    /// sandbox has no OS clock, environment, file I/O, or RNG of its own, so
-    /// this one vector stands in for both "reads wall-clock time" and "uses
-    /// unseeded randomness": with nothing else nondeterministic to read in
-    /// this engine, they are the same bug.
-    ///
-    /// `timestamp()`/`elapsed()` are backed by [`score::set_plugin_clock`]
-    /// here, not the real OS clock: [`check`] sets a different step around
-    /// each pass, so the spin count below — and therefore `seed` — differs
-    /// between the two passes by construction (#314). The mixing (xor-shift
-    /// over each item's index) still matters on top of that: it turns a
-    /// different seed into a genuinely different permutation rather than
-    /// just a different starting rotation of the same one.
-    const WALL_CLOCK_PLUGIN: &str = r#"
-fn hooks() { ["pool_provider"] }
-fn capabilities() { ["catalog_read"] }
-fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) {
-    let ids = [];
-    for item in ctx.sets.movies { ids.push(item.entry_id); }
-
-    // Spin until the clock has moved past the window, and seed from how many
-    // iterations that took plus the final reading.
-    let t0 = timestamp();
-    let spins = 0;
-    while elapsed(t0) < 0.02 { spins += 1; }
-    // Reduced into the modulus immediately: unbounded, this reaches ~1e11,
-    // and the key below then multiplies it past what an i64 holds.
-    let seed = (spins * 1000003 + (elapsed(t0) * 1000000000.0).to_int()) % 999999937;
-
-    // A per-item key that wraps around a large modulus as `idx` grows, so its
-    // sort order is not just "seed's magnitude shifted by a constant" — two
-    // different seeds land the wraparounds at different items and produce a
-    // genuinely different permutation, not merely a different starting
-    // rotation of the same one.
-    //
-    // The multiplier is what makes that true. Without it — plain
-    // `seed * (idx + 1)` — nothing wraps until `seed` exceeds an eighth of the
-    // modulus, so for every realistic seed the keys rise monotonically with
-    // `idx` and the sort is the identity permutation no matter what the clock
-    // said. That made this fixture perfectly deterministic on an idle machine,
-    // which fails this test for the exact opposite of the reason it checks.
-    let scored = [];
-    let idx = 0;
-    for id in ids {
-        let key = ((seed + 1) * (idx + 1) * 7919) % 999999937;
-        scored.push(#{ id: id, key: key });
-        idx += 1;
-    }
-    scored.sort(|a, b| if a.key < b.key { -1 } else if a.key > b.key { 1 } else { 0 });
-
-    let out = [];
-    for s in scored { out.push(s.id); }
-    out
-}
-"#;
-
     /// A scorer that shuffles purely from `ctx.seed` (#255, ADR 0005) —
-    /// no clock read at all — using the same key/sort mixing shape as
-    /// [`WALL_CLOCK_PLUGIN`] above, so the only variable between the two
-    /// fixtures is where the entropy comes from.
+    /// this engine's sandbox has no OS clock, environment, file I/O, or RNG
+    /// of its own reachable by a plugin (`timestamp()`/`elapsed()` read a
+    /// clock fixed per generation, not real wall-clock time — #357), so
+    /// `ctx.seed` is the only entropy a pool-provider plugin has to shuffle
+    /// with.
     const CTX_SEED_PLUGIN: &str = r#"
 fn hooks() { ["pool_provider"] }
 fn capabilities() { ["catalog_read"] }
@@ -632,10 +556,9 @@ fn pick(ctx) {
     let ids = [];
     for item in ctx.sets.movies { ids.push(item.entry_id); }
 
-    // Reduced into the modulus immediately, exactly as the wall-clock
-    // fixture reduces its own reading — `ctx.seed` is a full 63-bit value
-    // and multiplying it by `idx + 1` and 7919 unreduced overflows Rhai's
-    // checked i64 multiplication.
+    // Reduced into the modulus immediately — `ctx.seed` is a full 63-bit
+    // value and multiplying it by `idx + 1` and 7919 unreduced overflows
+    // Rhai's checked i64 multiplication.
     let seed = ctx.seed % 999999937;
 
     let scored = [];
@@ -705,45 +628,11 @@ fn pick(ctx) {
         }
     }
 
-    #[test]
-    fn a_plugin_reading_wall_clock_time_is_caught() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = write_plugin(&dir, WALL_CLOCK_PLUGIN);
-        let ids = ["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"];
-        let catalog_path = dir.path().join("catalog.db");
-        catalog_with_movies(&catalog_path, &ids);
-
-        let cfg = base_channel(
-            RuleConfig {
-                blocks: vec![pattern_block(&script, ids.len())],
-            },
-            None,
-        );
-        let mut station = station_with(
-            "wobbly",
-            cfg,
-            Some(catalog_path.to_string_lossy().into_owned()),
-        );
-        let report = check(&mut station, "wobbly").unwrap();
-        assert!(
-            !report.is_identical(),
-            "a plugin reading Rhai's own wall clock must be caught, but the two \
-             passes matched — either the fixture failed to introduce real \
-             per-call variation, or the check pinned something it should not have"
-        );
-        let diff = report.difference.unwrap();
-        assert!(diff.entry_a.is_some());
-        assert!(diff.entry_b.is_some());
-        assert_ne!(diff.entry_a, diff.entry_b);
-    }
-
-    /// The reason `ctx.seed` exists: a scorer that shuffles from it instead
-    /// of Rhai's own wall clock passes the check (#255, ADR 0005) — the
-    /// opposite assertion from the wall-clock fixture above, over an
-    /// otherwise identical mixing shape. The channel starts unseeded, so
-    /// this also covers "an unseeded channel still works": `check` pins one
-    /// fresh seed before either pass, and that pinned value is what reaches
-    /// the script both times.
+    /// The reason `ctx.seed` exists: a scorer that shuffles from it passes
+    /// the check (#255, ADR 0005). The channel starts unseeded, so this also
+    /// covers "an unseeded channel still works": `check` pins one fresh seed
+    /// before either pass, and that pinned value is what reaches the script
+    /// both times.
     #[test]
     fn a_plugin_picking_from_ctx_seed_passes() {
         let dir = tempfile::tempdir().unwrap();
