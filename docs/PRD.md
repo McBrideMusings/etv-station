@@ -112,7 +112,7 @@ There is **one** model, not one per rule. An earlier design had a separate "Loop
 **Determinism**
 Generation is a pure function of `(catalog, config, resume_in)`: the same three inputs always produce the same items and the same `resume_out`. This is what makes regeneration after a config edit safe.
 
-Purity extends to plugins: a `plugin:` pool's script must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — no wall-clock read, no unseeded randomness, no iteration order a script cannot control. `etv-station --check-determinism <channel>` generates a channel twice from identical inputs and diffs the two schedules, naming the first differing position and both entry ids, so a plugin that breaks this silently is caught rather than shipped (#168). It measures only — it does not make anything deterministic that is not already.
+Purity extends to plugins: a `plugin:` pool's script must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — no unseeded randomness, no iteration order a script cannot control. A real wall-clock read is not reachable from plugin scope at all (#357): Rhai's own `timestamp()`/`elapsed()` are backed by a clock fixed to the generation's own `window_start`, so a script that reads them still produces the same schedule from the same inputs. `etv-station --check-determinism <channel>` generates a channel twice from identical inputs and diffs the two schedules, naming the first differing position and both entry ids, so a plugin that breaks this silently — via unseeded randomness or uncontrolled iteration order — is caught rather than shipped (#168).
 
 ### Pattern interleave (Phase C)
 

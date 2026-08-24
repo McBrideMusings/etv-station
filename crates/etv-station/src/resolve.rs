@@ -182,8 +182,10 @@ pub fn resolve_channel(
 /// block (#169, [`crate::sequence`]) reads it as `ctx.window.from`, which is
 /// what lets a daypart script ask "what hour does this generation start at"
 /// rather than "what hour is it while the daemon happens to be computing
-/// this". Nothing else in the resolve pipeline reads a live clock (see this
-/// module's own doc), so a `pattern` or `entries` block ignores it entirely.
+/// this". It also seeds a plugin's `timestamp()`/`elapsed()` clock (see
+/// below) — that is the only other place in the resolve pipeline any clock
+/// is read, and it is this fixed value, never the real one, so a `pattern` or
+/// `entries` block that ignores `window_start` is genuinely unaffected by it.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_channel_with_resume(
     config: &ChannelConfig,
@@ -196,6 +198,18 @@ pub fn resolve_channel_with_resume(
     fill: Option<Duration>,
     window_start: OffsetDateTime,
 ) -> Result<(Vec<ResolvedItem>, ResumeMap), ConfigError> {
+    // Every generation reads one fixed clock: a plugin's `timestamp()`/
+    // `elapsed()` calls see `window_start`, advancing by
+    // `score::PLUGIN_CLOCK_STEP` per read, for the whole resolve. Two runs of
+    // the same generation (same `window_start`) therefore see identical
+    // clock values, so a plugin cannot vary its output on wall-clock time.
+    // Held for the whole function body; the guard restores the previous
+    // value (normally unset) on drop, including on an early `?` return.
+    let _clock = crate::score::set_plugin_clock(
+        window_start.unix_timestamp() as f64,
+        crate::score::PLUGIN_CLOCK_STEP,
+    );
+
     // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
     // one draws fresh entropy so an unseeded `random` block reshuffles each
     // generation (#46 "unset = fresh per generation").

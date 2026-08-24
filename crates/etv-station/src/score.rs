@@ -787,18 +787,31 @@ fn taste_vector_to_dynamic(vector: plexdb_reader::TasteVector) -> Dynamic {
     Dynamic::from_map(m)
 }
 
+/// The step (in seconds) [`crate::resolve::resolve_channel_with_resume`] seeds
+/// the plugin clock with, next to [`TestClock`] — the type that consumes it.
+///
+/// 1 ms: coarse enough to be exactly representable when added to a
+/// `window_start` unix-second base (~1.8e9, where an `f64` ulp is ~2.4e-7s —
+/// far below 1ms), and small enough that a plugin's `while elapsed(t0) < 0.02
+/// { … }` reads roughly 20 times rather than distorting its timing
+/// arithmetic. Non-zero so a spin loop still terminates.
+pub(crate) const PLUGIN_CLOCK_STEP: f64 = 0.001;
+
 thread_local! {
     /// Per-thread override for the `timestamp()`/`elapsed()` pair a plugin sees.
     ///
-    /// `None` (the default, on every thread) means both delegate to the real
-    /// wall clock — production behaviour is unchanged. [`determinism::check`]
-    /// sets this around each of its two generation passes so a plugin that
-    /// reads the clock produces a *different* value by construction, rather
-    /// than by however the OS happened to schedule two spin loops.
+    /// `None` is the value on a thread before any generation has run on it —
+    /// there is no production path that reads a plugin clock while this is
+    /// `None`. [`crate::resolve::resolve_channel_with_resume`] sets it at the
+    /// top of every resolve, seeded from that generation's own `window_start`,
+    /// so two runs of the same generation see the same clock and a plugin
+    /// cannot vary its output on wall-clock time. [`crate::determinism::check`]'s
+    /// two passes go through that same funnel and so inherit the same fixed
+    /// clock.
     static PLUGIN_CLOCK: std::cell::Cell<Option<TestClock>> = const { std::cell::Cell::new(None) };
 }
 
-/// A fake clock that advances by `step` seconds on every read, so a plugin's
+/// A clock that advances by `step` seconds on every read, so a plugin's
 /// `while elapsed(t0) < window { … }` spin loop still terminates — a pinned
 /// constant would spin forever.
 #[derive(Clone, Copy)]
@@ -809,25 +822,31 @@ struct TestClock {
 
 /// Read the current plugin-visible clock value, in seconds, advancing the
 /// thread-local override (if one is set) by its step.
+///
+/// The `None` arm is unreachable in production: every generation goes through
+/// [`crate::resolve::resolve_channel_with_resume`], which sets [`PLUGIN_CLOCK`]
+/// before any plugin runs. It stays a deterministic fallback rather than a
+/// panic so a stray direct call to `engine()` (e.g. `declared_hooks`,
+/// `declared_capabilities`, which only compile a script and never call it)
+/// can't crash — a real wall-clock read is not reachable from plugin scope at
+/// all, on any path.
 fn clock_read() -> f64 {
-    PLUGIN_CLOCK.with(|cell| match cell.get() {
-        Some(clock) => {
-            cell.set(Some(TestClock {
-                next: clock.next + clock.step,
-                ..clock
-            }));
-            clock.next
-        }
-        None => std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64(),
+    PLUGIN_CLOCK.with(|cell| {
+        let clock = cell.get().unwrap_or(TestClock {
+            next: 0.0,
+            step: PLUGIN_CLOCK_STEP,
+        });
+        cell.set(Some(TestClock {
+            next: clock.next + clock.step,
+            ..clock
+        }));
+        clock.next
     })
 }
 
 /// RAII guard restoring the previous [`PLUGIN_CLOCK`] value on drop, including
-/// on an early return via `?` — a leaked override would leave a later, real
-/// generation on the same thread reading a fake clock.
+/// on an early return via `?` — a leaked override would leave a later
+/// generation on the same thread reading a stale clock instead of its own.
 pub(crate) struct ClockGuard(Option<TestClock>);
 
 impl Drop for ClockGuard {
@@ -836,10 +855,9 @@ impl Drop for ClockGuard {
     }
 }
 
-/// Override the plugin-visible clock on this thread: the first read returns
+/// Set the plugin-visible clock on this thread: the first read returns
 /// `start` seconds, and every subsequent read advances by `step` seconds.
-/// Restored to whatever was set before (normally `None`, meaning real time)
-/// when the returned guard drops.
+/// Restored to whatever was set before when the returned guard drops.
 ///
 /// Plugin evaluation is synchronous on the calling thread — no `thread::spawn`
 /// or rayon in [`resolve`](crate::resolve), this module, or
@@ -876,11 +894,14 @@ pub(crate) fn set_plugin_clock(start: f64, step: f64) -> ClockGuard {
 ///
 /// `timestamp()`/`elapsed()` are registered here unconditionally too, for the
 /// same "one shared configuration" reason: they shadow rhai's own built-ins
-/// (which read the real, uninjectable clock) with a pair backed by
-/// [`PLUGIN_CLOCK`]. With the thread-local unset that pair delegates straight
-/// to the real clock, so this changes nothing for any shipped plugin — a
-/// `grep` over `deploy/appdata/plugins/*.rhai` finds no caller of either
-/// today. [`determinism::check`] is the only caller of [`set_plugin_clock`].
+/// (which read the real, unfixed wall clock) with a pair backed by
+/// [`PLUGIN_CLOCK`], which every generation seeds from its own `window_start`
+/// in [`crate::resolve::resolve_channel_with_resume`] before any plugin runs
+/// — so a plugin reading either function sees a value fixed for that
+/// generation, not the real clock. [`crate::determinism::check`]'s two passes
+/// go through that same funnel and so share one call to [`set_plugin_clock`]
+/// rather than setting it
+/// themselves.
 pub(crate) fn engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
