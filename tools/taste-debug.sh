@@ -71,13 +71,16 @@ has_flag() {
   return 1
 }
 
+# No argument is the list mode, not a usage error: it answers "which channels
+# can I explain?". It exits 0 so `admin taste-debug` doesn't report the answer
+# as a failed step.
 if [ "$#" -eq 0 ]; then
-  echo "Usage: admin taste-debug <channel> [-- taste-debug flags]" >&2
-  echo "       admin taste-debug --channel <path> [flags]   (raw passthrough)" >&2
-  echo >&2
-  echo "Available channels:" >&2
-  list_plugin_channels >&2
-  exit 1
+  echo "Usage: admin taste-debug <channel> [-- taste-debug flags]"
+  echo "       admin taste-debug --channel <path> [flags]   (raw passthrough)"
+  echo
+  echo "Available channels:"
+  list_plugin_channels
+  exit 0
 fi
 
 args=()
