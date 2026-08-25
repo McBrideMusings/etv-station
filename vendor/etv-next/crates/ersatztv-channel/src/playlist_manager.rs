@@ -449,13 +449,12 @@ impl PlaylistManager {
 
         let (skip, limit) = match max_segments {
             Some(max) => {
-                let anchor = OffsetDateTime::now_utc() - Duration::from_secs(1200u64);
-
-                let candidate_skip = self
-                    .segments
-                    .iter()
-                    .position(|s| s.program_date_time >= anchor)
-                    .unwrap_or_else(|| self.segments.len().saturating_sub(max));
+                // The live edge, always: the newest `max` segments held. The
+                // session encodes ahead of wall clock, so a wall-clock cutoff
+                // cannot select this window — every held segment is newer than
+                // any such cutoff, and the window would pin itself to the
+                // oldest of a growing backlog.
+                let candidate_skip = self.segments.len().saturating_sub(max);
 
                 // monotonic clamp
                 let candidate_ms = self.media_sequence + candidate_skip as u64;
@@ -896,5 +895,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(persisted.next_media_sequence, published + segments_listed);
+    }
+
+    /// The freeze this guards: the session encodes ahead of wall clock, so the
+    /// two-minute trim releases nothing and segments pile up. Publishing the
+    /// oldest ten of that pile ends the window on a segment the client consumed
+    /// a minute ago, leaving it nothing to fetch — it polls, backs off, and
+    /// stops. The window has to sit at the live edge, not at the tail of the
+    /// backlog.
+    #[tokio::test]
+    async fn the_published_window_tracks_the_newest_segments() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        push_segments(&mut pm, 25);
+        pm.update().await.unwrap();
+
+        let playlist = tokio::fs::read_to_string(dir.path().join("live.m3u8"))
+            .await
+            .unwrap();
+        let listed: Vec<&str> = playlist.lines().filter(|l| l.ends_with(".ts")).collect();
+        let published: u64 = playlist
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+            .expect("playlist carries a media sequence")
+            .parse()
+            .unwrap();
+
+        assert_eq!(listed.len(), 10);
+        assert_eq!(
+            listed.last().copied(),
+            Some("live000024.ts"),
+            "the window must end on the newest segment held, not the tenth"
+        );
+        assert_eq!(listed.first().copied(), Some("live000015.ts"));
+        assert_eq!(published, 15);
     }
 }
