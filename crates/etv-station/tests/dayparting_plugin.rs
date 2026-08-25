@@ -231,6 +231,55 @@ fn the_sequencer_prefers_an_item_that_fits_the_remaining_slot() {
     );
 }
 
+/// A pool's pointer must advance in the caller's map after each pick, not
+/// reset to the same index every visit (#211: `pick_item` used to write the
+/// advanced pointer into a by-value copy of `pointers` that Rhai drops when
+/// the function returns, so every call re-scanned from index 0 and picked
+/// the pool's first fitting item forever). A single lone pool spanning the
+/// whole window should walk through all six of its distinct items rather
+/// than repeating the first one.
+#[test]
+fn the_pool_pointer_advances_across_successive_picks() {
+    let cat = Catalog::open_in_memory().unwrap();
+    for letter in ["A", "B", "C", "D", "E", "F"] {
+        add_movie(
+            &cat,
+            &format!("{letter}-item"),
+            &format!("{letter} Show"),
+            Some(3_600_000), // 60 min, so 6 items exactly fill 6 hours
+        );
+    }
+
+    let pools = vec![pool(
+        "default",
+        "item.title in [\"A Show\", \"B Show\", \"C Show\", \"D Show\", \"E Show\", \"F Show\"]",
+        None,
+    )];
+
+    let ids = run(
+        &cat,
+        &pools,
+        Some("UTC"),
+        datetime!(2026-04-13 00:00:00 UTC),
+        6 * 3600,
+    )
+    .unwrap();
+
+    assert_eq!(ids.len(), 6, "got {ids:?}");
+    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        6,
+        "the pointer should walk all six distinct items, not repeat one: {ids:?}"
+    );
+    for pair in ids.windows(2) {
+        assert_ne!(
+            pair[0], pair[1],
+            "no two adjacent picks should be the same item: {ids:?}"
+        );
+    }
+}
+
 /// Two dayparts claiming the same local hour fail `arrange()`, naming both
 /// pools rather than picking a winner (#14 decision 6).
 #[test]

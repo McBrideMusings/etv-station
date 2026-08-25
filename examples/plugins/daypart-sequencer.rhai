@@ -178,19 +178,26 @@ fn next_boundary(cursor, current, dayparts, default_pool) {
 // `all_weekdays()` is a function.
 fn unmeasured_duration_ms() { 1_800_000 }
 
-// The next item this pool airs: whichever of its resolved items fits inside
-// `remaining_secs`, scanned in the pool's own order starting at its current
-// pointer so a pool that fits nothing this visit still advances instead of
-// stalling on the same item forever. When nothing fits, the item at the
-// pointer plays anyway — the daypart starts late rather than truncating it
-// or leaving the slot dark (#14 decision 3). `()` only when the pool has no
-// items at all.
-fn pick_item(name, pools, pointers, remaining_secs) {
+// The index of the next item this pool airs: whichever of its resolved
+// items fits inside `remaining_secs`, scanned in the pool's own order
+// starting at `ptr` so a pool that fits nothing this visit still advances
+// instead of stalling on the same item forever. When nothing fits, the item
+// at the pointer plays anyway — the daypart starts late rather than
+// truncating it or leaving the slot dark (#14 decision 3). `()` only when
+// the pool has no items at all.
+//
+// Returns the chosen index rather than the item, and takes `ptr` as a plain
+// value rather than the pointer map itself — a Rhai script function receives
+// its arguments by value, so a map parameter it wrote into (`pointers[name]
+// = ...`) would only ever mutate a copy that is dropped when the call
+// returns (#211). `arrange()` owns the `pointers` map and advances it itself
+// after this returns, which is what makes that bug unrepresentable here
+// rather than merely fixed.
+fn pick_index(name, pools, ptr, remaining_secs) {
     let items = pools[name];
     let n = items.len;
     if n == 0 { return (); }
     let remaining_ms = remaining_secs * 1000;
-    let ptr = pointers[name];
     let chosen = -1;
     for k in 0..n {
         let idx = (ptr + k) % n;
@@ -202,8 +209,7 @@ fn pick_item(name, pools, pointers, remaining_secs) {
         }
     }
     if chosen == -1 { chosen = ptr % n; }
-    pointers[name] = (chosen + 1) % n;
-    items[chosen]
+    chosen
 }
 
 fn arrange(ctx) {
@@ -228,13 +234,20 @@ fn arrange(ctx) {
         let remaining = boundary - cursor;
         if remaining < 1 { remaining = 1; }
 
-        let item = pick_item(active, ctx.pools, pointers, remaining);
-        if item == () && active != default_pool {
+        let chosen_pool = active;
+        let idx = pick_index(chosen_pool, ctx.pools, pointers[chosen_pool], remaining);
+        if idx == () && active != default_pool {
             // This daypart's own pool is empty — the default fills the slot
-            // rather than leaving it dark.
-            item = pick_item(default_pool, ctx.pools, pointers, remaining);
+            // rather than leaving it dark. The pointer that advances below
+            // must be the default pool's, not the empty daypart's.
+            chosen_pool = default_pool;
+            idx = pick_index(chosen_pool, ctx.pools, pointers[chosen_pool], remaining);
         }
-        if item == () { break; } // every pool involved is empty; nothing to lay.
+        if idx == () { break; } // every pool involved is empty; nothing to lay.
+
+        let items = ctx.pools[chosen_pool];
+        pointers[chosen_pool] = (idx + 1) % items.len;
+        let item = items[idx];
 
         out.push(item.entry_id);
         let dur_ms = item.duration_ms;
