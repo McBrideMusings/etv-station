@@ -105,7 +105,7 @@ fn run(
             fill: Some(Duration::from_secs(fill_secs)),
         },
     )
-    .map(|(ids, _, _, _)| ids)
+    .map(|b| b.ids)
 }
 
 /// A block naming the sequencer places each pool in its declared hour range,

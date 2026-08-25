@@ -17,7 +17,7 @@ use etv_station::config::{
 use etv_station::resolve::resolve_channel_with_resume;
 use etv_station::resume::GenerationState;
 use etv_station::score::{ScoreEnv, ScoreInputs};
-use etv_station::sequence::{Window, build};
+use etv_station::sequence::{BlockBuild, Window, build};
 use time::macros::datetime;
 
 /// One two-episode show (`spotlight`'s pool) and four movies (`discovery`'s
@@ -141,7 +141,7 @@ fn the_committed_example_interleaves_a_resuming_and_a_restarting_pool() {
     let mut state = GenerationState::empty();
     state.cursor.insert("show:pilot".into(), "ep-1".to_string());
 
-    let (ids, resume, _, _) = build(
+    let BlockBuild { ids, resume, .. } = build(
         &cat,
         &pools,
         &[],
@@ -179,7 +179,7 @@ fn the_committed_example_starts_spotlight_at_the_top_with_no_cursor() {
     let pools = vec![spotlight_pool(), discovery_pool()];
     let inputs = ScoreInputs::default();
 
-    let (ids, _, _, _) = build(
+    let BlockBuild { ids, .. } = build(
         &cat,
         &pools,
         &[],
