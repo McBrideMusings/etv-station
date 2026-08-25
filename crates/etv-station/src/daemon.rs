@@ -2651,6 +2651,201 @@ async fn pattern_catch_up(
     Ok(resume)
 }
 
+/// Guards the property #308 exists for: the swap right above
+/// (`let checkpoints = std::mem::take(&mut resume.checkpoints); resume =
+/// resume_out; resume.checkpoints = checkpoints;`) is what keeps a
+/// generation's fingerprint alive across `resume = resume_out` — see
+/// `resume_fingerprint_survives_generation_tests` below. Move the
+/// fingerprint back onto `ResumeMap` and this swap silently drops it again.
+#[cfg(test)]
+mod resume_fingerprint_survives_generation_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// window_days=1 (24h) against three ~3h entries (9h/generation) chains
+    /// 2-3 generations per `pattern_catch_up` call — enough to exercise the
+    /// `resume = resume_out` swap more than once, without the ~240 tiny
+    /// generations a 30s entry list would produce for the same window.
+    fn ch(dir: &tempfile::TempDir) -> LoadedChannel {
+        let config: ChannelConfig = toml::from_str(
+            r#"
+window_days = 1
+chunk_hours = 6
+roll_interval = "1h"
+
+[[rule.blocks]]
+mode = "all"
+order = "manual"
+
+[[rule.blocks.entries]]
+kind = "item"
+in_point = "0s"
+out_point = "3h"
+[rule.blocks.entries.source]
+kind = "lavfi"
+params = "color=c=blue [out0]"
+
+[[rule.blocks.entries]]
+kind = "item"
+in_point = "0s"
+out_point = "3h"
+[rule.blocks.entries.source]
+kind = "lavfi"
+params = "color=c=red [out0]"
+
+[[rule.blocks.entries]]
+kind = "item"
+in_point = "0s"
+out_point = "3h"
+[rule.blocks.entries.source]
+kind = "lavfi"
+params = "color=c=green [out0]"
+"#,
+        )
+        .expect("fixture channel config parses");
+        LoadedChannel {
+            overlays: Default::default(),
+            name: "testch".into(),
+            config_path: PathBuf::from("testch.toml"),
+            output_folder: dir.path().to_path_buf(),
+            config,
+        }
+    }
+
+    fn ctx<'a>(
+        history: &'a SharedHistory,
+        history_db: &'a HistoryDb,
+        tz: &'static Tz,
+    ) -> StationContext<'a> {
+        StationContext {
+            tz,
+            identity_roots: &[],
+            catalog: None,
+            history,
+            history_db,
+        }
+    }
+
+    /// Assertion 2 below (`unaired_inputs_match`) is the actual startup
+    /// decision at the top of `forward_channel_loop` (`event =
+    /// "resume.skip"` vs `event = "resume.rewind"`) — not a proxy for it.
+    /// Under the pre-2058edd design, `resume = resume_out` replaces the
+    /// whole map with `resolve_channel_with_resume`'s fresh `ResumeMap::new()`
+    /// (which carries only `pools`/`position`) on the very first generation,
+    /// so this returns `false` there where it must return `true` here.
+    #[tokio::test]
+    async fn a_generation_pass_leaves_every_unaired_checkpoint_fingerprinted() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = HistoryDb::open_in_memory().unwrap();
+        let mut catalog: Option<Catalog> = None;
+
+        let resume = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            crate::resume::ResumeMap::new(),
+            "startup",
+        )
+        .await
+        .expect("a hermetic lavfi channel resolves cleanly");
+
+        let now = OffsetDateTime::now_utc();
+        let fp = channel_input_fingerprint(&channel, ctx(&history, &history_db, tz), None)
+            .expect("a manual entries block always fingerprints");
+
+        let unaired: Vec<_> = resume
+            .checkpoints
+            .iter()
+            .filter(|c| c.start > now)
+            .collect();
+        assert!(
+            !unaired.is_empty(),
+            "the fixture must chain more than one generation, or this test \
+             passes vacuously against a reverted fix",
+        );
+        assert!(
+            unaired
+                .iter()
+                .all(|c| c.inputs.as_deref() == Some(fp.as_str())),
+            "every unaired checkpoint must still carry the fingerprint after \
+             `resume = resume_out` ran on each generation",
+        );
+
+        // The literal decision a restart makes: true means it logs
+        // event="resume.skip", false means event="resume.rewind".
+        assert!(
+            resume.unaired_inputs_match(now, &fp),
+            "a restart right after this pass must see the fingerprint intact \
+             and skip rather than rewind",
+        );
+    }
+
+    /// Encodes the issue title literally: a roll tick fired after startup
+    /// must not wipe the fingerprints the startup pass just stamped, even
+    /// when the roll tick itself generates nothing new (the window is
+    /// already covered, so it hits `chunk.skip` and returns its input
+    /// map essentially unchanged) — the trail from startup must still read
+    /// intact afterwards.
+    #[tokio::test]
+    async fn a_roll_tick_after_the_window_is_covered_keeps_the_fingerprints() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = HistoryDb::open_in_memory().unwrap();
+        let mut catalog: Option<Catalog> = None;
+
+        let after_startup = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            crate::resume::ResumeMap::new(),
+            "startup",
+        )
+        .await
+        .expect("startup pass resolves cleanly");
+
+        let after_roll = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            after_startup,
+            "roll",
+        )
+        .await
+        .expect("roll pass resolves cleanly");
+
+        let now = OffsetDateTime::now_utc();
+        let fp = channel_input_fingerprint(&channel, ctx(&history, &history_db, tz), None)
+            .expect("a manual entries block always fingerprints");
+
+        let unaired: Vec<_> = after_roll
+            .checkpoints
+            .iter()
+            .filter(|c| c.start > now)
+            .collect();
+        assert!(
+            !unaired.is_empty(),
+            "a roll tick must not drop the trail entirely"
+        );
+        assert!(
+            unaired
+                .iter()
+                .all(|c| c.inputs.as_deref() == Some(fp.as_str())),
+            "a roll tick after the window is covered must not wipe the \
+             fingerprints the startup pass stamped",
+        );
+        assert!(
+            after_roll.unaired_inputs_match(now, &fp),
+            "a restart issued after this roll tick must still see \
+             event=\"resume.skip\", not event=\"resume.rewind\"",
+        );
+    }
+}
+
 /// Render each item's cascaded `guide:` template (#158) and, on a channel
 /// that opted in, append the #113 "watched recently by" line — the one pass
 /// that needs the schedule (each item's own start/finish, a one-item
