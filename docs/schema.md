@@ -327,6 +327,14 @@ passed through verbatim into `<star-rating><value>`.
 Set on a block's `program:` for defaults; set on an entry's `program:` to
 override per item. Item values win over block defaults.
 
+For an item resolved against the catalog (a `query`/`collection` entry, or an
+`item` entry with no inline `program:`), `credits` and `country` default from
+the catalog's `director`/`cast`/`writer`/`country` tags — no config needed,
+same as `description` (catalog `summary`) and `categories` (catalog genre
+tags). Catalog tags carry no character name, so every `credits.actor[].role`
+from this path is unset. `star_rating` has no catalog-backed source at all;
+it is populated only by an inline `program:` block.
+
 ## Value types
 
 ### Order
