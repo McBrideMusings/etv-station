@@ -296,7 +296,44 @@ struct SharedHistory {
     /// ask. Scopes come from the channel list, which is fixed for the life of a
     /// generation, so this cannot grow without bound under a running station.
     state: tokio::sync::Mutex<HashMap<HistoryScope, HistoryCache>>,
+    /// The station-wide Plex `/accounts` cache (#283) — **not** keyed by
+    /// [`HistoryScope`], unlike `state` above. `/accounts` takes no scope
+    /// parameter and returns the same server-wide list for every asker, so
+    /// every `single_user` scope resolving inside one refresh window shares
+    /// this one fetch — one level up from #126/#112's per-audience Tautulli
+    /// cache, which still varies by scope because Tautulli's history genuinely
+    /// does. `None` before the first fetch.
+    ///
+    /// Locked independently of `state`. [`Self::resolve_account_id`] runs
+    /// under `state`'s lock (called from [`Self::refresh`] while it is held),
+    /// so this mutex must only ever be acquired *underneath* `state`, never
+    /// the reverse — [`Self::plex_accounts`] touches only this field and
+    /// nothing else, which is what keeps that ordering safe.
+    accounts: tokio::sync::Mutex<Option<PlexAccountsCache>>,
+    /// How `accounts` is actually fetched — a seam so tests can count calls
+    /// without a live Plex server. Production installs a closure wrapping
+    /// [`crate::catalog::ingest::plex::fetch_accounts`]; only tests reach for
+    /// [`Self::with_accounts_fetch`] to install a counting one.
+    accounts_fetch: PlexAccountsFetch,
 }
+
+/// The result of one station-wide `/accounts` fetch (#283), cached whole
+/// rather than keyed by scope — see the doc on [`SharedHistory::accounts`]
+/// for why. `Err` is cached too, as the already-formatted failure string,
+/// so an unreachable Plex costs one call per refresh window rather than one
+/// per scope still asking; `PlexIngestError` itself is not `Clone`, which is
+/// why the message is stored instead of the error.
+struct PlexAccountsCache {
+    fetched_at: tokio::time::Instant,
+    result: Result<Arc<[PlexAccount]>, String>,
+}
+
+/// A fetcher for the station-wide `/accounts` list (#283), owning its
+/// [`PlexEnv`] rather than borrowing one, because the call it wraps runs on a
+/// `spawn_blocking` thread and must be `'static`. Production wraps
+/// [`crate::catalog::ingest::plex::fetch_accounts`]; a test installs a
+/// counting stand-in through [`SharedHistory::with_accounts_fetch`].
+type PlexAccountsFetch = Arc<dyn Fn(PlexEnv) -> Result<Vec<PlexAccount>, String> + Send + Sync>;
 
 struct HistoryCache {
     /// `None` until the first fetch. Tokio's clock, so tests can advance it.
@@ -337,7 +374,22 @@ impl SharedHistory {
             plex,
             refresh_after,
             state: tokio::sync::Mutex::new(HashMap::new()),
+            accounts: tokio::sync::Mutex::new(None),
+            accounts_fetch: Arc::new(|env| {
+                crate::catalog::ingest::plex::fetch_accounts(&env).map_err(|e| {
+                    format!("fetching plex accounts to resolve a taste_scope account id: {e}")
+                })
+            }),
         }
+    }
+
+    /// Test-only seam (#283): install a counting or failing fetcher in place
+    /// of the default live `/accounts` call, so a test can assert how many
+    /// times it actually ran without contacting a real Plex server.
+    #[cfg(test)]
+    fn with_accounts_fetch(mut self, f: PlexAccountsFetch) -> Self {
+        self.accounts_fetch = f;
+        self
     }
 
     /// The history to generate `scope`'s channels against right now, fetching it
@@ -493,6 +545,12 @@ impl SharedHistory {
     /// channel rank against an empty vector without anything in the logs
     /// saying why (#281's whole point, same rule #278 set for the Tautulli
     /// side).
+    ///
+    /// The `/accounts` listing both steps check against is fetched by
+    /// [`Self::plex_accounts`] once per station per refresh window (#283),
+    /// not once per call here — every `single_user` scope resolving inside
+    /// that window shares the one fetch, since `/accounts` has no scope
+    /// parameter to vary by.
     async fn resolve_account_id(
         &self,
         scope: &HistoryScope,
@@ -508,15 +566,37 @@ impl SharedHistory {
                  account id (#281)",
             ));
         };
-        let accounts =
-            tokio::task::spawn_blocking(move || crate::catalog::ingest::plex::fetch_accounts(&env))
-                .await
-                .map_err(|e| format!("plex accounts fetch panicked: {e}"))?
-                .map_err(|e| {
-                    format!("fetching plex accounts to resolve a taste_scope account id: {e}")
-                })?;
+        let accounts = self.plex_accounts(env).await?;
 
         translate_tautulli_id_to_plex(tautulli_id, scope, rows, &accounts).map(Some)
+    }
+
+    /// The station-wide `/accounts` list (#283), fetched once per
+    /// `refresh_after` window and shared by every `single_user` scope that
+    /// resolves inside it — see the doc on [`Self::accounts`] for why one
+    /// fetch answers every scope.
+    ///
+    /// Locks only `self.accounts`, never `self.state` — [`Self::refresh`]
+    /// already holds `state` when it reaches [`Self::resolve_account_id`],
+    /// so acquiring `state` from here would deadlock against it.
+    async fn plex_accounts(&self, env: PlexEnv) -> Result<Arc<[PlexAccount]>, String> {
+        let mut accounts = self.accounts.lock().await;
+        if let Some(cache) = accounts.as_ref()
+            && cache.fetched_at.elapsed() < self.refresh_after
+        {
+            return cache.result.clone();
+        }
+        let fetch = Arc::clone(&self.accounts_fetch);
+        let result = tokio::task::spawn_blocking(move || fetch(env))
+            .await
+            .map_err(|e| format!("plex accounts fetch panicked: {e}"))
+            .and_then(|r| r)
+            .map(|list| Arc::from(list) as Arc<[PlexAccount]>);
+        *accounts = Some(PlexAccountsCache {
+            fetched_at: tokio::time::Instant::now(),
+            result: result.clone(),
+        });
+        result
     }
 }
 
@@ -3920,6 +4000,111 @@ mod shared_history_tests {
         let scope = HistoryScope::User("0".into());
         let err = translate_tautulli_id_to_plex(0, &scope, &[], &accounts).unwrap_err();
         assert!(err.contains('0'));
+    }
+
+    // ---- Plex /accounts caching (#283) ---------------------------------------
+
+    /// A `PlexEnv` good enough to move through the fetch seam — nothing here
+    /// ever reaches a real socket, since every test in this section installs
+    /// its own fetcher via [`SharedHistory::with_accounts_fetch`].
+    fn fake_plex_env() -> PlexEnv {
+        PlexEnv {
+            base_url: "http://plex.invalid".to_string(),
+            token: "t".to_string(),
+            path_from: String::new(),
+            path_to: String::new(),
+        }
+    }
+
+    /// A fetcher that counts every call in `calls` and always returns the
+    /// same three-account roster, so a digit-authored `single_user` scope can
+    /// resolve by direct id match with no rows involved.
+    fn counting_accounts_fetch(calls: Arc<std::sync::atomic::AtomicUsize>) -> PlexAccountsFetch {
+        Arc::new(move |_env| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                plex_account(501, "Pierce"),
+                plex_account(502, "Madi"),
+                plex_account(503, "Sam"),
+            ])
+        })
+    }
+
+    /// The acceptance criterion: three `single_user` scopes, each resolved
+    /// inside the same refresh window, share one `/accounts` fetch between
+    /// them rather than one apiece.
+    #[tokio::test(start_paused = true)]
+    async fn n_single_user_scopes_in_one_window_share_one_accounts_fetch() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let history =
+            SharedHistory::new(None, None, Some(fake_plex_env()), Duration::from_secs(3600))
+                .with_accounts_fetch(counting_accounts_fetch(Arc::clone(&calls)));
+
+        for (digit, expected) in [("501", 501), ("502", 502), ("503", 503)] {
+            let scope = HistoryScope::User(digit.to_string());
+            assert_eq!(history.account_id(&scope).await, Ok(Some(expected)));
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "three scopes inside one refresh window must make exactly one /accounts fetch",
+        );
+    }
+
+    /// The cache is a window, not a one-shot: once `refresh_after` has passed,
+    /// the next scope to resolve triggers a fresh `/accounts` fetch.
+    #[tokio::test(start_paused = true)]
+    async fn the_accounts_cache_turns_over_after_the_refresh_window() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let history =
+            SharedHistory::new(None, None, Some(fake_plex_env()), Duration::from_secs(60))
+                .with_accounts_fetch(counting_accounts_fetch(Arc::clone(&calls)));
+
+        let scope = HistoryScope::User("501".to_string());
+        assert_eq!(history.account_id(&scope).await, Ok(Some(501)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(history.account_id(&scope).await, Ok(Some(501)));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a scope resolving past the window must refetch",
+        );
+    }
+
+    /// Caching the failure too (not just a success) is what keeps an
+    /// unreachable Plex to one call per window instead of one per scope —
+    /// without this, a down server would make N calls, the same problem
+    /// #283 exists to fix, just on the error path.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_accounts_fetch_is_cached_for_the_window() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_fetch = Arc::clone(&calls);
+        let history =
+            SharedHistory::new(None, None, Some(fake_plex_env()), Duration::from_secs(3600))
+                .with_accounts_fetch(Arc::new(move |_env| {
+                    calls_for_fetch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err("plex is unreachable".to_string())
+                }));
+
+        for digit in ["501", "502", "503"] {
+            let scope = HistoryScope::User(digit.to_string());
+            let err = history.account_id(&scope).await.unwrap_err();
+            assert!(
+                err.contains("plex is unreachable"),
+                "must surface the cached failure: {err}",
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a failing fetch must still be cached for the window, not retried per scope",
+        );
     }
 }
 
