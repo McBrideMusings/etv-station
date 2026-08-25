@@ -52,7 +52,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
-use ersatztv_playout::playout::{PlayoutItemSource, ProgramMetadata};
+use ersatztv_playout::playout::{Actor, Credits, PlayoutItemSource, ProgramMetadata};
 use time::OffsetDateTime;
 
 use crate::catalog::{Catalog, EntrySource, TagNs, canonical_path, derive_entry_id};
@@ -1487,6 +1487,23 @@ fn catalog_item(
         Some(genres.clone())
     };
 
+    // #248: `<credits>`/`<country>` populate the same way `categories` does
+    // above — straight from the catalog's tags, no `guide:` config required.
+    // Fetched once here and reused by `GuideFields` below (one clone per
+    // list, same pattern as `genres`).
+    let cast = catalog
+        .tags_for(entry_id, TagNs::Cast)
+        .map_err(|e| e.to_string())?;
+    let directors = catalog
+        .tags_for(entry_id, TagNs::Director)
+        .map_err(|e| e.to_string())?;
+    let writers = catalog
+        .tags_for(entry_id, TagNs::Writer)
+        .map_err(|e| e.to_string())?;
+    let countries = catalog
+        .tags_for(entry_id, TagNs::Country)
+        .map_err(|e| e.to_string())?;
+
     let program = ProgramMetadata {
         title: Some(title),
         sub_title,
@@ -1513,15 +1530,43 @@ fn catalog_item(
             .as_deref()
             .map(|filename| format!("/artwork/{filename}")),
         year: as_u32(entry.year),
-        // Not sourced from the catalog yet — populating these from the
-        // `cast`/`writer`/`director`/`country` tag namespaces is separate
-        // producer-side work, tracked as a follow-up. (The same tags ARE
-        // exposed to the `guide:` template surface below, as `{cast}` etc —
-        // this is specifically about the structured `<credits>`/`<country>`
-        // XMLTV elements, split to etv-next-station#35 per #158's "the guide
-        // stops at what ETV-next already emits".)
-        credits: None,
-        country: None,
+        // #248 default: the catalog's `director`/`cast`/`writer` tags, when
+        // any exist, with no `guide:` config needed. `None` (not
+        // `Some(vec![])`/`Some(Box::default())`) when all three are empty, so
+        // the `skip_serializing_if` on this field still elides `<credits>`
+        // instead of emitting an empty one. Catalog `tags` rows are a bare
+        // `value` string with no character name, so every `Actor.role` here
+        // is `None` — role is populated only by an inline `program:` block,
+        // never sourced from the catalog. Unlike `categories`/`description`
+        // above, an explicit block/channel `program.credits` wins over this
+        // catalog fallback rather than the other way — left `None` here so
+        // `merge_program`'s item-then-defaults pick falls through to it.
+        credits: if defaults.is_some_and(|d| d.credits.is_some())
+            || (cast.is_empty() && directors.is_empty() && writers.is_empty())
+        {
+            None
+        } else {
+            Some(Box::new(Credits {
+                director: directors.clone(),
+                actor: cast
+                    .iter()
+                    .cloned()
+                    .map(|name| Actor { name, role: None })
+                    .collect(),
+                writer: writers.clone(),
+            }))
+        },
+        // #248 default: the catalog's `country` tag, same cascade as `credits`
+        // above — an explicit `program.country` config wins over it.
+        country: if defaults.is_some_and(|d| d.country.is_some()) || countries.is_empty() {
+            None
+        } else {
+            Some(countries.clone())
+        },
+        // Nothing in the catalog schema maps to a star rating — no
+        // `rating`/`audience_rating` column, no tag namespace carries one —
+        // so this stays `None` from the catalog path by design. The only
+        // source is an inline `program:` block.
         star_rating: None,
     };
 
@@ -1536,18 +1581,10 @@ fn catalog_item(
             .duration_ms
             .filter(|ms| *ms > 0)
             .map(|ms| Duration::from_millis(ms as u64)),
-        cast: catalog
-            .tags_for(entry_id, TagNs::Cast)
-            .map_err(|e| e.to_string())?,
-        directors: catalog
-            .tags_for(entry_id, TagNs::Director)
-            .map_err(|e| e.to_string())?,
-        writers: catalog
-            .tags_for(entry_id, TagNs::Writer)
-            .map_err(|e| e.to_string())?,
-        countries: catalog
-            .tags_for(entry_id, TagNs::Country)
-            .map_err(|e| e.to_string())?,
+        cast,
+        directors,
+        writers,
+        countries,
         genres,
         summary: entry.summary.clone(),
     };
@@ -2289,6 +2326,92 @@ mod tests {
         );
         let without_summary = items.iter().find(|i| i.id == "imdb:tt0167261").unwrap();
         assert_eq!(without_summary.program.as_ref().unwrap().description, None);
+    }
+
+    /// #248: `director`/`cast`/`writer`/`country` tags populate
+    /// `ProgramMetadata.credits`/`country` with no `guide:` config needed.
+    /// Catalog tag rows carry no character name, so every actor's role is
+    /// `None`; `tags_for` sorts `ORDER BY value`, so assert alphabetised.
+    #[test]
+    fn catalog_tags_populate_program_credits_and_country() {
+        let cat = seeded_catalog();
+        cat.add_tag("imdb:tt0120737", TagNs::Director, "Peter Jackson")
+            .unwrap();
+        cat.add_tag("imdb:tt0120737", TagNs::Cast, "Elijah Wood")
+            .unwrap();
+        cat.add_tag("imdb:tt0120737", TagNs::Cast, "Ian McKellen")
+            .unwrap();
+        cat.add_tag("imdb:tt0120737", TagNs::Writer, "Fran Walsh")
+            .unwrap();
+        cat.add_tag("imdb:tt0120737", TagNs::Country, "New Zealand")
+            .unwrap();
+
+        let inc = query_block(
+            "item.title.contains(\"Ring\") || item.title.contains(\"Tower\") || item.title.contains(\"King\")",
+            Order::parse("release_date:asc").unwrap(),
+        );
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+
+        let tagged = items.iter().find(|i| i.id == "imdb:tt0120737").unwrap();
+        let credits = tagged.program.as_ref().unwrap().credits.as_ref().unwrap();
+        assert_eq!(credits.director, vec!["Peter Jackson".to_string()]);
+        assert_eq!(credits.writer, vec!["Fran Walsh".to_string()]);
+        let actor_names: Vec<&str> = credits.actor.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(actor_names, vec!["Elijah Wood", "Ian McKellen"]);
+        assert!(
+            credits.actor.iter().all(|a| a.role.is_none()),
+            "catalog tags carry no character name; every actor role must be None"
+        );
+        assert_eq!(
+            tagged.program.as_ref().unwrap().country,
+            Some(vec!["New Zealand".to_string()])
+        );
+        assert_eq!(tagged.program.as_ref().unwrap().star_rating, None);
+
+        // An entry with no tags at all must emit None, not an empty Some(_) —
+        // that's what keeps the vendored xmltv writer's skip correct.
+        let untagged = items.iter().find(|i| i.id == "imdb:tt0167261").unwrap();
+        assert!(untagged.program.as_ref().unwrap().credits.is_none());
+        assert_eq!(untagged.program.as_ref().unwrap().country, None);
+    }
+
+    /// An inline `program:` block still wins over the catalog-supplied
+    /// credits/country, exactly like every other `ProgramMetadata` field.
+    #[test]
+    fn inline_program_overrides_catalog_credits_and_country() {
+        let cat = seeded_catalog();
+        cat.add_tag("imdb:tt0120737", TagNs::Director, "Peter Jackson")
+            .unwrap();
+        cat.add_tag("imdb:tt0120737", TagNs::Country, "New Zealand")
+            .unwrap();
+
+        let mut inc = query_block(
+            "item.title.contains(\"Ring\")",
+            Order::parse("release_date:asc").unwrap(),
+        );
+        inc.program = Some(ProgramMetadata {
+            title: None,
+            sub_title: None,
+            description: None,
+            season: None,
+            episode: None,
+            categories: None,
+            content_rating: None,
+            artwork_url: None,
+            year: None,
+            credits: Some(Box::new(Credits {
+                director: vec!["Override Director".into()],
+                actor: vec![],
+                writer: vec![],
+            })),
+            country: Some(vec!["Wonderland".into()]),
+            star_rating: None,
+        });
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        let p = items[0].program.as_ref().unwrap();
+        let credits = p.credits.as_ref().unwrap();
+        assert_eq!(credits.director, vec!["Override Director".to_string()]);
+        assert_eq!(p.country, Some(vec!["Wonderland".to_string()]));
     }
 
     // ---- block fallback (#97) ----------------------------------------------
