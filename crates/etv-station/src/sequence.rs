@@ -75,7 +75,7 @@
 //!   pattern walk gives a cycle, translated to the sequencer's atomic unit
 //!   (an item, since there is no cycle).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -86,6 +86,7 @@ use time_tz::{OffsetDateTimeExt, Tz};
 use crate::catalog::Catalog;
 use crate::config::{Constraints, Pool, ShowGroup};
 use crate::guide::GuideConfig;
+pub use crate::pattern::BlockBuild;
 use crate::resume::{GenerationState, PoolResume};
 
 /// The window bounds a sequencer script sees (ADR 0004).
@@ -117,7 +118,6 @@ pub struct Window {
 /// a pattern block uses, so a `plugin:` pool here gets `ctx.seed` exactly as
 /// one under `pattern:` does (#255).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
 pub fn build(
     catalog: &Catalog,
     pools: &[Pool],
@@ -128,15 +128,7 @@ pub fn build(
     seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
     window: Window,
-) -> Result<
-    (
-        Vec<String>,
-        BTreeMap<String, PoolResume>,
-        HashMap<String, serde_json::Value>,
-        HashMap<String, GuideConfig>,
-    ),
-    String,
-> {
+) -> Result<BlockBuild, String> {
     let mut score_cache = crate::score::ScoreCache::default();
     let pool_id_lists = crate::pattern::resolve_pool_sources(
         catalog,
@@ -269,7 +261,12 @@ pub fn build(
         }
     }
 
-    Ok((arranged, resume_out, metadata_out, guide_out))
+    Ok(BlockBuild {
+        ids: arranged,
+        resume: resume_out,
+        metadata: metadata_out,
+        guides: guide_out,
+    })
 }
 
 /// Compile `sequencer` and call its `arrange(ctx)`, returning the raw
@@ -443,6 +440,8 @@ fn truncate_to_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use crate::catalog::{Entry as CatEntry, EntrySource, Source};
     use crate::config::{Advance, GroupBy, OnShort, Order, Rotate, Select};
     use crate::resume::ResumeMap;
@@ -549,7 +548,7 @@ fn arrange(ctx) {
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],
@@ -588,7 +587,7 @@ fn arrange(ctx) {
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],
@@ -643,7 +642,7 @@ fn arrange(ctx) {
         let mut state = GenerationState::empty();
         state.cursor.insert("show:got".into(), "got-e2".to_string());
 
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],
@@ -709,7 +708,7 @@ fn arrange(ctx) { ["mov-1"] }
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],
@@ -751,7 +750,7 @@ fn arrange(ctx) {
         }];
         // Every episode is 30s; a 65s window fits two whole episodes and
         // then the one that crosses the boundary — three, not all four.
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],
@@ -792,7 +791,7 @@ fn arrange(ctx) {
             p.order = Some(Order::parse("show:asc,season:asc,episode:asc").unwrap());
             p
         }];
-        let (_, resume, _, _) = build(
+        let BlockBuild { resume, .. } = build(
             &cat,
             &pools,
             &[],
@@ -832,7 +831,7 @@ fn arrange(ctx) { ["mov-1"] }
             pool("movies", "item.type == \"movie\""),
             pool("shows", "item.type == \"episode\""),
         ];
-        let (_, resume, _, _) = build(
+        let BlockBuild { resume, .. } = build(
             &cat,
             &pools,
             &[],
@@ -879,7 +878,7 @@ fn arrange(ctx) {
             cursor: BTreeMap::new(),
             tail: Vec::new(),
         };
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],
@@ -917,7 +916,7 @@ fn arrange(ctx) {
         let cat = catalog();
         let mut movies = pool("movies", "item.type == \"movie\"");
         movies.config = Some(serde_json::json!({"hour_start": 20}));
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &[movies],
             &[],
@@ -954,7 +953,7 @@ fn arrange(ctx) {
         );
         let cat = catalog();
         let pools = vec![pool("movies", "item.type == \"movie\"")];
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],
@@ -1006,7 +1005,7 @@ fn arrange(ctx) {
             inputs: &inputs,
             base_dir: std::path::Path::new("."),
         };
-        let (ids, _, _, _) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &pools,
             &[],

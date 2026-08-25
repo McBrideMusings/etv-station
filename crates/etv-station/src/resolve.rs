@@ -909,7 +909,12 @@ fn resolve_block(
             inputs: scoring,
             base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
         };
-        let (ids, pools, metadata, pool_guides) = crate::pattern::build(
+        let crate::pattern::BlockBuild {
+            ids,
+            resume: pools,
+            metadata,
+            guides: pool_guides,
+        } = crate::pattern::build(
             cat,
             &include.pools,
             groups,
@@ -956,7 +961,12 @@ fn resolve_block(
             .as_ref()
             .expect("resolve_block reaches this branch only when `sequencer` is set");
         let script_path = crate::score::resolve_plugin_path(base_dir, sequencer);
-        let (ids, pools, metadata, pool_guides) = crate::sequence::build(
+        let crate::pattern::BlockBuild {
+            ids,
+            resume: pools,
+            metadata,
+            guides: pool_guides,
+        } = crate::sequence::build(
             cat,
             &include.pools,
             groups,

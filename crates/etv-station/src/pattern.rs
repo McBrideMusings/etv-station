@@ -647,8 +647,21 @@ pub(crate) fn mix_seed(a: u64, b: u64) -> u64 {
 /// Nothing new is persisted to make this work: the walk already stops on a
 /// cycle boundary and already hands back each pool's rotation, so the next
 /// generation resumes from where this one stopped exactly as it does today.
+/// What one block's pool walk produced — shared by [`build`] (the pattern
+/// walk) and `sequence::build` (#291), which return the identical shape.
+#[derive(Debug)]
+pub struct BlockBuild {
+    /// The drawn entry ids, in air order.
+    pub ids: Vec<String>,
+    /// Per-pool resume state for the `.resume` sidecar.
+    pub resume: BTreeMap<String, PoolResume>,
+    /// Flattened `entry_id -> metadata` from `ScoreCache::picked_extras`.
+    pub metadata: HashMap<String, serde_json::Value>,
+    /// This pool's own `guide:` per drawn `entry_id` (#289).
+    pub guides: HashMap<String, GuideConfig>,
+}
+
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
 pub fn build(
     catalog: &Catalog,
     pools: &[Pool],
@@ -660,15 +673,7 @@ pub fn build(
     seed: u64,
     score_env: crate::score::ScoreEnv<'_>,
     fill: Option<Duration>,
-) -> Result<
-    (
-        Vec<String>,
-        BTreeMap<String, PoolResume>,
-        HashMap<String, serde_json::Value>,
-        HashMap<String, GuideConfig>,
-    ),
-    String,
-> {
+) -> Result<BlockBuild, String> {
     // An authored `cycles` is the author saying how long a pass runs, and the
     // window does not get to argue with it. Only a derived count is bounded.
     let budget = fill.filter(|_| cycles.is_none());
@@ -781,12 +786,18 @@ pub fn build(
     // #173 to read. See [`flatten_picked_extras`] (#203) for why the pool
     // half of the key is dropped here.
     let metadata_out = flatten_picked_extras(score_cache.picked_extras);
-    Ok((out, resume_out, metadata_out, guide_out))
+    Ok(BlockBuild {
+        ids: out,
+        resume: resume_out,
+        metadata: metadata_out,
+        guides: guide_out,
+    })
 }
 
 /// Flatten `ScoreCache::picked_extras`'s metadata half down to a plain
 /// `entry_id`-keyed map — the shape both [`build`] (the pattern walk) and
-/// `sequence::build` return to their shared caller, `resolve::resolve_block`,
+/// `sequence::build` return in [`BlockBuild`] to their shared caller,
+/// `resolve::resolve_block`,
 /// which only ever sees a flat drawn-id list with no pool label left on any
 /// one of them. Two pools that both draw the same id and both attach
 /// metadata therefore collide here exactly as they already do for
@@ -1643,7 +1654,7 @@ mod tests {
             None,
         )
         .expect("pattern builds")
-        .0
+        .ids
     }
 
     /// The whole point of #155: one visit airs one season, in order, and stops
@@ -1935,7 +1946,11 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = franchise_catalog();
-        let (ids, pool_state, _metadata, _guide) = build(
+        let BlockBuild {
+            ids,
+            resume: pool_state,
+            ..
+        } = build(
             &cat,
             &pools,
             &groups,
@@ -2109,7 +2124,11 @@ mod tests {
         seed: u64,
     ) -> (Vec<String>, GenerationState) {
         let cat = catalog();
-        let (ids, pool_state, _metadata, _guide) = build(
+        let BlockBuild {
+            ids,
+            resume: pool_state,
+            ..
+        } = build(
             &cat,
             &pools,
             &[],
@@ -2637,7 +2656,7 @@ mod tests {
     #[test]
     fn take_all_is_not_capped_by_max_take() {
         let cat = catalog();
-        let (ids, _, _metadata, _guide) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &[shows_pool()],
             &[],
@@ -2663,7 +2682,7 @@ mod tests {
         let mut p = movies_pool();
         p.expr = Some("item.type == \"nonesuch\"".into());
         let cat = catalog();
-        let (ids, _, _metadata, _guide) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &[p],
             &[],
@@ -2717,7 +2736,7 @@ mod tests {
     ) -> (Vec<String>, BTreeMap<String, PoolResume>) {
         let mut movies = movies_pool();
         movies.advance = Advance::Resume;
-        let (ids, resume, _metadata, _guide) = build(
+        let BlockBuild { ids, resume, .. } = build(
             cat,
             &[movies],
             &[],
@@ -2880,7 +2899,7 @@ mod tests {
             None,
         )
         .expect("pattern builds")
-        .0
+        .ids
     }
 
     /// The pool's own list is reordered so the first draw does not repeat what
@@ -2967,7 +2986,7 @@ mod tests {
         let cat = movies_with_a_long_one();
         let mut movies = movies_pool();
         movies.constraints = Some(no_repeat_within(Duration::from_secs(90 * 60)));
-        let (ids, _, _metadata, _guide) = build(
+        let BlockBuild { ids, .. } = build(
             &cat,
             &[movies],
             &[],
