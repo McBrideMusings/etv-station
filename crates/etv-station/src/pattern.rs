@@ -101,6 +101,8 @@ pub const MAX_CYCLES: usize = 10_000;
 /// `Vec::with_capacity(take)` in [`PoolRuntime::serve`]. `take = "all"` needs
 /// no cap — it is resolved from the series a visit picked, so it is bounded by
 /// the pools' own sizes rather than by anything an author or a script typed.
+/// Enforced at config load (config/validate.rs and score.rs) and at the
+/// allocation sites in [`PoolRuntime::visit`] and [`PoolRuntime::serve`].
 pub const MAX_TAKE: usize = 10_000;
 
 /// How many times a constrained `select = "random"` pool redraws before giving
@@ -389,9 +391,9 @@ impl PoolRuntime<'_> {
     }
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
-    fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Vec<String> {
+    fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Result<Vec<String>, String> {
         if take == Take::Count(0) || self.is_dry() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         match self.cfg.rotate {
             // A new series every item is just `take` one-item visits. `all` is
@@ -404,14 +406,17 @@ impl PoolRuntime<'_> {
             // `take`.
             Rotate::Slot => {
                 let n = take.count().unwrap_or(1);
+                if n > MAX_TAKE {
+                    return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
+                }
                 let mut out = Vec::with_capacity(n);
                 for slot in 0..n {
                     if self.is_dry() {
                         break;
                     }
-                    out.extend(self.serve(Take::Count(1), from, roll, slot as u64));
+                    out.extend(self.serve(Take::Count(1), from, roll, slot as u64)?);
                 }
-                out
+                Ok(out)
             }
             Rotate::Visit => self.serve(take, from, roll, 0),
         }
@@ -424,7 +429,7 @@ impl PoolRuntime<'_> {
     /// A series' own take override (#173) stands in for `want` only under
     /// `rotate = "visit"` — the one draw that asks for the step's own `take`
     /// (see the comment in `visit`).
-    fn serve(&mut self, want: Take, from: TakeFrom, roll: &RollKey, nonce: u64) -> Vec<String> {
+    fn serve(&mut self, want: Take, from: TakeFrom, roll: &RollKey, nonce: u64) -> Result<Vec<String>, String> {
         let first = self.eligible_pick(roll, nonce);
         let override_take = match self.cfg.rotate {
             Rotate::Visit => first.and_then(|si| self.take_override_for(si)),
@@ -443,8 +448,20 @@ impl PoolRuntime<'_> {
             (Some(n), _, _) => n,
             (None, Take::Count(n), _) => n,
             (None, Take::All, Some(si)) => self.series[si].remaining(),
-            (None, Take::All, None) => return Vec::new(),
+            (None, Take::All, None) => return Ok(Vec::new()),
         };
+        // Guard only the authored/typed-in arms: the plugin per-entry override
+        // and the step's own count. `take = "all"` is bounded by the pools'
+        // sizes (via `series[si].remaining()`), not by MAX_TAKE.
+        match (override_take, want) {
+            (Some(n), _) if n > MAX_TAKE => {
+                return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
+            }
+            (None, Take::Count(n)) if n > MAX_TAKE => {
+                return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
+            }
+            _ => {}
+        }
         // `end` and `random` name an absolute place in the series, so they set
         // the cursor before the first draw — which is exactly why they ignore
         // the resume point. "The last three episodes" that continued from
@@ -523,7 +540,7 @@ impl PoolRuntime<'_> {
                 si
             };
         }
-        out
+        Ok(out)
     }
 
     /// This pool's state to persist for the next window.
@@ -720,7 +737,7 @@ pub fn build(
             let idx = *by_name
                 .get(step.pool.as_str())
                 .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
-            let drawn = runtimes[idx].visit(step.take, step.from, &roll);
+            let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
             if budget.is_some() {
                 laid += runtimes[idx].runtime_of(&drawn);
             }
@@ -2562,6 +2579,72 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("maximum"), "err = {err}");
+    }
+
+    /// A take value at the serve allocation site (Rotate::Visit) beyond MAX_TAKE
+    /// is a backstop error.
+    #[test]
+    fn a_take_beyond_the_cap_at_serve_is_an_error() {
+        let cat = catalog();
+        let err = build(
+            &cat,
+            &[movies_pool()],
+            &[],
+            &[step("movies", MAX_TAKE + 1)],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            0,
+            test_env(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("maximum"), "err = {err}");
+    }
+
+    /// A take value at the visit/Slot allocation site (Rotate::Slot) beyond
+    /// MAX_TAKE is a backstop error.
+    #[test]
+    fn a_take_beyond_the_cap_at_visit_slot_is_an_error() {
+        let mut p = shows_pool();
+        p.rotate = Rotate::Slot;
+        let cat = catalog();
+        let err = build(
+            &cat,
+            &[p],
+            &[],
+            &[step("shows", MAX_TAKE + 1)],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            0,
+            test_env(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("maximum"), "err = {err}");
+    }
+
+    /// A take = "all" is not capped by MAX_TAKE — it is bounded by the
+    /// series' size alone, so a pool with fewer items than MAX_TAKE emits
+    /// all its items.
+    #[test]
+    fn take_all_is_not_capped_by_max_take() {
+        let cat = catalog();
+        let (ids, _, _metadata, _guide) = build(
+            &cat,
+            &[shows_pool()],
+            &[],
+            &[step_all("shows")],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            0,
+            test_env(),
+            None,
+        )
+        .expect("take = all should not be capped");
+        assert!(!ids.is_empty(), "take = all must emit at least the items in the series");
     }
 
     /// An empty pool contributes nothing rather than erroring — the channel's
