@@ -429,7 +429,13 @@ impl PoolRuntime<'_> {
     /// A series' own take override (#173) stands in for `want` only under
     /// `rotate = "visit"` — the one draw that asks for the step's own `take`
     /// (see the comment in `visit`).
-    fn serve(&mut self, want: Take, from: TakeFrom, roll: &RollKey, nonce: u64) -> Result<Vec<String>, String> {
+    fn serve(
+        &mut self,
+        want: Take,
+        from: TakeFrom,
+        roll: &RollKey,
+        nonce: u64,
+    ) -> Result<Vec<String>, String> {
         let first = self.eligible_pick(roll, nonce);
         let override_take = match self.cfg.rotate {
             Rotate::Visit => first.and_then(|si| self.take_override_for(si)),
@@ -2644,7 +2650,10 @@ mod tests {
             None,
         )
         .expect("take = all should not be capped");
-        assert!(!ids.is_empty(), "take = all must emit at least the items in the series");
+        assert!(
+            !ids.is_empty(),
+            "take = all must emit at least the items in the series"
+        );
     }
 
     /// An empty pool contributes nothing rather than erroring — the channel's
