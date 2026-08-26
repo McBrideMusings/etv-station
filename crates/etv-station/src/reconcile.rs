@@ -26,8 +26,15 @@
 //! - the entry resolves to a different path → rewrite the path in place;
 //! - the entry is **missing** (ADR 0006) → replace the item with an error card,
 //!   which is the same screen a file that fails to probe already gets;
-//! - the path still matches, or the id is not a catalog entry at all (an inline
-//!   item, an authored `lavfi` source, a card already placed) → leave it alone.
+//! - the path still matches the catalog's, but is gone from disk → logged and
+//!   counted, **not repaired**. Plex does not bump an item's `updatedAt` when
+//!   the file behind it is renamed, so a delta ingest never learns the catalog
+//!   itself is stale — the catalog and the playout can agree on a dead path.
+//!   Fixing that needs a targeted single-item Plex re-resolve, which does not
+//!   exist yet; that is the deliberately deferred repair half of #300;
+//! - the path still matches and is present on disk, or the id is not a catalog
+//!   entry at all (an inline item, an authored `lavfi` source, a card already
+//!   placed) → leave it alone.
 //!
 //! Only the `source` field of an item changes. `start`, `finish`, and `program`
 //! are untouched, so the timeline and the guide say exactly what they said
@@ -65,6 +72,12 @@ pub struct ReconcileCounts {
     pub paths_patched: usize,
     /// Items replaced with an error card because their entry is missing.
     pub items_carded: usize,
+    /// Items whose file is gone from disk and which the sweep cannot repair —
+    /// the catalog and the playout agree on a path, and that path does not
+    /// exist. This is the count that used to be invisible: a delta ingest
+    /// never notices a rename, so both sides can be stale together and the
+    /// old comparison-only sweep reported `Unchanged`.
+    pub items_path_missing: usize,
 }
 
 /// Sweep every channel's output folder. `catalog_path` is the station catalog,
@@ -106,12 +119,12 @@ pub async fn reconcile_playout_paths(
             }
             counts.files_examined += 1;
             match reconcile_one_file(&catalog, &file.path, now).await {
-                Ok(Some(file_counts)) => {
-                    counts.files_rewritten += 1;
+                Ok(file_counts) => {
+                    counts.files_rewritten += file_counts.files_rewritten;
                     counts.paths_patched += file_counts.paths_patched;
                     counts.items_carded += file_counts.items_carded;
+                    counts.items_path_missing += file_counts.items_path_missing;
                 }
-                Ok(None) => {}
                 Err(e) => tracing::warn!(
                     event = "reconcile.file_failed",
                     channel = %channel.name,
@@ -126,13 +139,14 @@ pub async fn reconcile_playout_paths(
     Ok(counts)
 }
 
-/// Reconcile one playout file. `Ok(None)` means nothing needed changing and
-/// nothing was written.
+/// Reconcile one playout file. Always returns counts, even when nothing was
+/// written — a missing-path finding mutates no item, so it must be countable
+/// without a rewrite happening.
 async fn reconcile_one_file(
     catalog: &Catalog,
     path: &Path,
     now: OffsetDateTime,
-) -> Result<Option<ReconcileCounts>, String> {
+) -> Result<ReconcileCounts, String> {
     let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     let mut playout: Playout = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
 
@@ -144,20 +158,22 @@ async fn reconcile_one_file(
         if item.finish <= now {
             continue;
         }
-        match reconcile_item(catalog, item)? {
+        match reconcile_item(catalog, item).await? {
             ItemOutcome::Unchanged => {}
             ItemOutcome::PathPatched => counts.paths_patched += 1,
             ItemOutcome::Carded => counts.items_carded += 1,
+            ItemOutcome::PathMissing => counts.items_path_missing += 1,
         }
     }
 
     if counts.paths_patched == 0 && counts.items_carded == 0 {
-        return Ok(None);
+        return Ok(counts);
     }
     atomic_write_json(path, &playout)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Some(counts))
+    counts.files_rewritten = 1;
+    Ok(counts)
 }
 
 /// What [`reconcile_item`] did to one item.
@@ -165,11 +181,24 @@ enum ItemOutcome {
     Unchanged,
     PathPatched,
     Carded,
+    /// The catalog and the playout agree on a path, and that path is not on
+    /// disk. Nothing is repaired here — see the module doc's note on #300's
+    /// deferred repair half.
+    PathMissing,
+}
+
+/// The title to log an item under: its program title, falling back to the
+/// catalog id when the playout carries none.
+fn item_title(item: &PlayoutItem) -> String {
+    item.program
+        .as_ref()
+        .and_then(|p| p.title.clone())
+        .unwrap_or_else(|| item.id.clone())
 }
 
 /// Re-resolve one item against the catalog, mutating its `source` if the
 /// catalog now disagrees with what the file says.
-fn reconcile_item(catalog: &Catalog, item: &mut PlayoutItem) -> Result<ItemOutcome, String> {
+async fn reconcile_item(catalog: &Catalog, item: &mut PlayoutItem) -> Result<ItemOutcome, String> {
     // Only a local path can go stale under us. An authored `lavfi` (the smoke
     // channel, an already-placed error card) or an `http` source names no file
     // this catalog owns, so there is nothing here to re-resolve — and skipping
@@ -188,11 +217,7 @@ fn reconcile_item(catalog: &Catalog, item: &mut PlayoutItem) -> Result<ItemOutco
     };
 
     if entry.missing_since.is_some() {
-        let title = item
-            .program
-            .as_ref()
-            .and_then(|p| p.title.clone())
-            .unwrap_or_else(|| item.id.clone());
+        let title = item_title(item);
         item.source = Some(PlayoutItemSource::Lavfi {
             params: crate::error_card::playback_error_params(
                 &title,
@@ -219,6 +244,25 @@ fn reconcile_item(catalog: &Catalog, item: &mut PlayoutItem) -> Result<ItemOutco
         return Ok(ItemOutcome::Unchanged);
     };
     if source.playback_path == current {
+        // The catalog and the playout agree — but Plex does not bump an
+        // item's `updatedAt` when the file behind it is renamed, so a delta
+        // ingest never learns the catalog's own path went stale. Both sides
+        // can agree on a dead path. Treat an errored stat (EACCES, a briefly
+        // unmounted media root) as present: only a definitive "no" counts,
+        // so a whole root going offline does not produce a false-positive
+        // storm.
+        if !tokio::fs::try_exists(&current).await.unwrap_or(true) {
+            let title = item_title(item);
+            tracing::warn!(
+                event = "reconcile.path_missing",
+                item = %item.id,
+                title = %title,
+                path = %current,
+                "the catalog and the playout agree on a path that is not on disk; \
+                 this item will air black until the next full ingest re-resolves it",
+            );
+            return Ok(ItemOutcome::PathMissing);
+        }
         return Ok(ItemOutcome::Unchanged);
     }
 
@@ -589,12 +633,14 @@ mod tests {
     #[tokio::test]
     async fn a_clean_sweep_rewrites_no_files() {
         let dir = TempDir::new().unwrap();
-        let db = catalog_at(&dir, "imdb:tt1", "/media/Die Hard (1988).mkv");
+        let media_path = dir.path().join("Die Hard (1988).mkv");
+        tokio::fs::write(&media_path, b"fixture").await.unwrap();
+        let db = catalog_at(&dir, "imdb:tt1", media_path.to_str().unwrap());
         let file = write_playout(
             &dir,
             vec![item(
                 "imdb:tt1",
-                "/media/Die Hard (1988).mkv",
+                media_path.to_str().unwrap(),
                 datetime!(2026-08-16 13:00:00 UTC),
                 datetime!(2026-08-16 15:00:00 UTC),
             )],
@@ -613,6 +659,10 @@ mod tests {
         assert_eq!(counts.files_examined, 1);
         assert_eq!(counts.files_rewritten, 0);
         assert_eq!(
+            counts.items_path_missing, 0,
+            "the file exists on disk, so this must not be flagged missing",
+        );
+        assert_eq!(
             tokio::fs::metadata(&file)
                 .await
                 .unwrap()
@@ -620,5 +670,72 @@ mod tests {
                 .unwrap(),
             before,
         );
+    }
+
+    /// The exact incident shape from #300: a Radarr rename changes the file on
+    /// disk but never touches the catalog row (Plex does not bump `updatedAt`
+    /// on a rename), so the catalog and the playout still agree with each
+    /// other — on a path that no longer exists. The old comparison-only sweep
+    /// reported this `Unchanged`; detection must not.
+    #[tokio::test]
+    async fn a_path_that_is_gone_from_disk_is_not_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let dead_path = dir.path().join("Die Hard (1988).mkv");
+        // Deliberately never created.
+        let db = catalog_at(&dir, "imdb:tt1", dead_path.to_str().unwrap());
+        let file = write_playout(
+            &dir,
+            vec![item(
+                "imdb:tt1",
+                dead_path.to_str().unwrap(),
+                datetime!(2026-08-16 13:00:00 UTC),
+                datetime!(2026-08-16 15:00:00 UTC),
+            )],
+        )
+        .await;
+
+        let counts = reconcile_playout_paths(&[channel(&dir)], &db, now())
+            .await
+            .unwrap();
+
+        assert_eq!(counts.items_path_missing, 1);
+        assert_eq!(counts.paths_patched, 0);
+        assert_eq!(counts.items_carded, 0);
+        assert_eq!(
+            counts.files_rewritten, 0,
+            "detection only — the item is not mutated, so nothing is written",
+        );
+        // The item's source is untouched: same `Local` path, still there.
+        assert_eq!(
+            source_path(&items_at(&file).await[0]),
+            Some(dead_path.to_str().unwrap()),
+        );
+    }
+
+    /// Sibling of the above with the file present: the same path, on disk,
+    /// must still report `Unchanged` and write nothing.
+    #[tokio::test]
+    async fn a_path_that_exists_is_still_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let live_path = dir.path().join("Die Hard (1988).mkv");
+        tokio::fs::write(&live_path, b"fixture").await.unwrap();
+        let db = catalog_at(&dir, "imdb:tt1", live_path.to_str().unwrap());
+        write_playout(
+            &dir,
+            vec![item(
+                "imdb:tt1",
+                live_path.to_str().unwrap(),
+                datetime!(2026-08-16 13:00:00 UTC),
+                datetime!(2026-08-16 15:00:00 UTC),
+            )],
+        )
+        .await;
+
+        let counts = reconcile_playout_paths(&[channel(&dir)], &db, now())
+            .await
+            .unwrap();
+
+        assert_eq!(counts.items_path_missing, 0);
+        assert_eq!(counts.files_rewritten, 0);
     }
 }
