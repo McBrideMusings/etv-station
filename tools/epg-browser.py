@@ -74,6 +74,7 @@ class Channel:
     name: str
     logo: str | None
     stream_url: str
+    number: int | None = None
 
 
 @dataclass
@@ -100,28 +101,48 @@ class Programme:
 
 EXTINF_RE = re.compile(
     r'#EXTINF:-1(?:\s+tvg-id="(?P<tvg_id>[^"]*)")?'
+    r'(?:\s+tvg-chno="(?P<tvg_chno>[^"]*)")?'
     r'(?:\s+tvg-name="(?P<tvg_name>[^"]*)")?'
     r'(?:\s+tvg-logo="(?P<tvg_logo>[^"]*)")?'
     r'(?:\s+group-title="(?P<group>[^"]*)")?'
     r",\s*(?P<display>.*)"
 )
 
+# The station does not emit `tvg-chno` (#375), so the number a client actually
+# dials has to be recovered from the id ETV-next assigns — `ersatztv.<N>`,
+# where N is `index + 1` over the roster (crates/etv-station/src/etv_next.rs:355).
+# Read `tvg-chno` first anyway, so this keeps working the day #375 lands and
+# stops guessing the moment the real number is on the wire.
+TVG_ID_NUM_RE = re.compile(r"\.(\d+)$")
+
+
+def channel_number(tvg_chno: str | None, tvg_id: str, position: int) -> int | None:
+    if tvg_chno and tvg_chno.strip().isdigit():
+        return int(tvg_chno.strip())
+    m = TVG_ID_NUM_RE.search(tvg_id)
+    if m:
+        return int(m.group(1))
+    return position or None
+
 
 def parse_channels_m3u(text: str) -> dict[str, Channel]:
     channels: dict[str, Channel] = {}
     lines = [ln for ln in text.splitlines() if ln.strip()]
     i = 0
+    position = 0
     while i < len(lines):
         line = lines[i]
         if line.startswith("#EXTINF"):
             m = EXTINF_RE.match(line)
             stream_url = lines[i + 1].strip() if i + 1 < len(lines) else ""
             if m and m.group("tvg_id"):
+                position += 1
                 channels[m.group("tvg_id")] = Channel(
                     tvg_id=m.group("tvg_id"),
                     name=m.group("tvg_name") or m.group("display") or m.group("tvg_id"),
                     logo=m.group("tvg_logo") or None,
                     stream_url=stream_url,
+                    number=channel_number(m.group("tvg_chno"), m.group("tvg_id"), position),
                 )
             i += 2
         else:
@@ -249,6 +270,7 @@ def cmd_channels(host: str) -> None:
         out.append(
             {
                 "id": tvg_id,
+                "number": chan.number,
                 "name": chan.name,
                 "stream_url": chan.stream_url,
                 "current": current.to_json() if current else None,
@@ -265,6 +287,7 @@ def cmd_channel(host: str, channel_id: str) -> None:
         sys.exit(1)
     out = {
         "id": chan.tvg_id,
+        "number": chan.number,
         "name": chan.name,
         "stream_url": chan.stream_url,
         "programmes": [p.to_json() for p in programmes_for(programmes, channel_id)],
@@ -406,9 +429,10 @@ def build_app(host: str):
             for tvg_id, chan in self.channels.items():
                 current, _ = current_and_next(self.programmes, tvg_id, now)
                 subtitle = current.title if current and current.title else self._gap_subtitle(tvg_id, now)
+                num = f"{chan.number:>3}  " if chan.number is not None else ""
                 lv.append(
                     ListItem(
-                        Label(f"{escape(chan.name)}\n[dim]{escape(subtitle)}[/dim]"),
+                        Label(f"[dim]{num}[/dim]{escape(chan.name)}\n[dim]{' ' * len(num)}{escape(subtitle)}[/dim]"),
                         name=tvg_id,
                     )
                 )
@@ -454,6 +478,18 @@ def build_app(host: str):
             all_progs = programmes_for(self.programmes, self.selected_channel)
             progs_fwd = [p for p in all_progs if p.stop > now]
 
+            # Every slot row carries the channel number, not just the pane
+            # header. The rows are what gets selected and copied out of the
+            # terminal, and a copied block of times and titles that doesn't say
+            # which of 64 channels it came from can't be pasted into an issue.
+            selected = self.channels.get(self.selected_channel)
+            chan_num = selected.number if selected else None
+            chan_tag = f"[dim]ch{chan_num:<3}[/dim] " if chan_num is not None else ""
+            # Rendered width of chan_tag, markup stripped — continuation lines
+            # hang off this, so it has to be what the terminal draws, not the
+            # length of the markup string.
+            chan_tag_w = len(f"ch{chan_num:<3} ") if chan_num is not None else 0
+
             if not progs_fwd:
                 last = max(all_progs, key=lambda p: p.stop) if all_progs else None
                 if last is None:
@@ -496,6 +532,9 @@ def build_app(host: str):
             def _title(seg: tuple[Programme | None, datetime, datetime]) -> str:
                 return (seg[0].title or "(untitled)") if seg[0] else "— off-air —"
 
+            def _seg_text(seg: tuple[Programme | None, datetime, datetime]) -> str:
+                return escape(_title(seg)) if seg[0] else "[red]— off-air —[/red]"
+
             select_idx = 0
             seg_i = 0
             cur = block_start
@@ -512,16 +551,24 @@ def build_app(host: str):
                     seg_i += 1
                 is_first = row_count == 0
                 marker = "▶" if is_first else " "
-                # One line per block, always — no separate CHANGEOVER row. A
-                # block a single show fully occupies just shows its title; a
-                # block where a boundary falls shows "A → B" inline. The exact
-                # boundary timestamp(s) and full fields for both shows live in
-                # the detail pane only, not here.
-                if len(overlapping) <= 1:
-                    text = escape(_title(overlapping[0])) if overlapping else "[red]— off-air —[/red]"
+                time_str = _fmt_dt(cur, today=now.date())
+                # One line per programme in the block. The block's own clock
+                # anchors the first line; every segment after it gets its real
+                # unrounded start time, so a mid-block changeover reads as the
+                # minute it actually happens rather than being implied by an
+                # arrow. A block one show fully occupies is still a single row.
+                # Three-way changeovers just add a third line instead of
+                # truncating, and each line keeps the full title column, which
+                # the old inline "A → B" spent on the second title.
+                if not overlapping:
+                    lines_out = [f"{marker} {chan_tag}{time_str}  [red]— off-air —[/red]"]
                 else:
-                    text = escape(" → ".join(_title(seg) for seg in overlapping))
-                label = f"{marker} {_fmt_dt(cur, today=now.date())}  {text}"
+                    lines_out = [f"{marker} {chan_tag}{time_str}  {_seg_text(overlapping[0])}"]
+                    hang = " " * (2 + chan_tag_w)
+                    for seg in overlapping[1:]:
+                        stamp = _fmt_dt(seg[1], today=now.date()).rjust(len(time_str))
+                        lines_out.append(f"{hang}[dim]{stamp}[/dim]› {_seg_text(seg)}")
+                label = "\n".join(lines_out)
                 lv.append(ListItem(Label(label), name="block"))
                 self.programme_rows.append(("block", cur, overlapping))
                 if keep_kind == "block" and cur == keep_block_start:
@@ -547,6 +594,21 @@ def build_app(host: str):
             lv.index = select_idx
             self.refresh_detail()
 
+        @staticmethod
+        def _programme_headline(p: Programme) -> str:
+            """One self-describing line naming the item: show, season/episode,
+            episode title. The labelled fields below it are still the full
+            record — this exists so the first line of a copied detail pane
+            already says which episode it is, instead of just the series."""
+            bits = [escape(p.title or "(untitled)")]
+            if p.season is not None and p.episode is not None:
+                bits.append(f"S{p.season:02d}E{p.episode:02d}")
+            elif p.episode is not None:
+                bits.append(f"E{p.episode:02d}")
+            if p.sub_title:
+                bits.append(f"“{escape(p.sub_title)}”")
+            return "  ·  ".join(bits)
+
         def _programme_fields(self, p: Programme) -> list[str]:
             def field(label: str, value: object) -> str:
                 if value in (None, "", []):
@@ -557,7 +619,12 @@ def build_app(host: str):
                 field("title", p.title),
                 field("sub-title", p.sub_title),
                 field("desc", p.desc),
-                field("season/episode", f"S{p.season}E{p.episode}" if p.season and p.episode else None),
+                field(
+                    "season/episode",
+                    f"S{p.season:02d}E{p.episode:02d}"
+                    if p.season is not None and p.episode is not None
+                    else None,
+                ),
                 field("categories", ", ".join(p.categories) if p.categories else None),
                 field("rating", p.rating),
                 field("star-rating", p.star_rating),
@@ -602,8 +669,9 @@ def build_app(host: str):
                 body.update("No channel selected.")
                 return
             chan = self.channels[self.selected_channel]
+            chan_no = f"ch{chan.number}  " if chan.number is not None else ""
             lines = [
-                f"[b]{escape(chan.name)}[/b]  ({escape(chan.tvg_id)})",
+                f"[b]{chan_no}{escape(chan.name)}[/b]  ({escape(chan.tvg_id)})",
                 f'stream: [link="{chan.stream_url}"]{escape(chan.stream_url)}[/link]',
                 f'guide:  [link="{self.host}/xmltv.xml"]{escape(self.host)}/xmltv.xml[/link]',
                 "",
@@ -639,6 +707,7 @@ def build_app(host: str):
                                 continue
                             heading = "Selected show" if len(segments) == 1 else ("Ends this block" if i == 0 else "Begins this block")
                             lines.append(f"[b]{heading}[/b]  ({_fmt_dt_sec(s)} → {_fmt_dt_sec(e)})")
+                            lines.append(f"  [b]{self._programme_headline(p)}[/b]")
                             lines.extend(self._programme_fields(p))
                             lines.append("")
             body.update("\n".join(lines))
