@@ -16,9 +16,12 @@ pub struct StationConfig {
     /// to be redone by hand.
     ///
     /// Leave it unset and one is minted on first run and kept in
-    /// `{output_base}/.device_id`, which lives on the data volume and so
-    /// survives container recreates and image rebuilds. Set it here and that
-    /// value wins — the file is not consulted.
+    /// `{station-config-dir}/.device_id` — beside the station config rather
+    /// than on the data volume, because `/data` is disposable (playout JSON
+    /// is rewritten every roll, `catalog.db` is a rebuildable cache) and
+    /// clearing it to force a catalog rebuild would otherwise mint a new id
+    /// and drop Plex's channel mapping. Set it here and that value wins —
+    /// the file is not consulted.
     ///
     /// The generated id cannot live in the rendered `lineup.json`: the
     /// container regenerates that file from this config at every start, so a
