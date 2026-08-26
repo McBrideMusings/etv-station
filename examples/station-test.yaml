@@ -1,3 +1,12 @@
+# THE committed no-media/no-Plex local verification config — see
+# .claude/skills/verify-project/SKILL.md. One lavfi channel, nothing on disk to
+# mount, no ${VAR} expansions, so it boots on any machine with no setup.
+#
+# Run it from the repo root: `output_base` below resolves against the process's
+# current working directory, while each entry under `channels:` resolves
+# against THIS file's own directory — that asymmetry is why this file must
+# live under examples/ and why the invocation is `--config
+# examples/station-test.yaml` run from the repo root, not from within examples/.
 tz: "America/Chicago"
 
 output_base: examples/output
@@ -5,8 +14,15 @@ output_base: examples/output
 channels:
   - channels/lavfi-test.yaml
 
-# No catalog for the test configuration - lavfi channels don't need one
+# lavfi channels synthesize their own frames and need no media catalog, but the
+# key is still required — this is where it lives on disk.
 catalog_path: tmp/catalog.db
+
+# Long enough that a second local boot with Plex configured takes the
+# catalog.ingest.plex_skipped path instead of re-contacting Plex (default is
+# 900s). This does NOT help the first boot with a catalog file — that one still
+# runs a full ingest before the channel loop starts; see the SKILL.md caveat.
+catalog_refresh_secs: 86400
 
 # `normalization` is required and deliberately has no serde default. `accel` is
 # left unset on purpose, unlike examples/station.yaml: this config's whole point
