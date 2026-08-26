@@ -192,6 +192,8 @@ A channel does **not** declare its own output folder. The daemon derives it as `
 
 A top-level station file (`station.toml` or `station.yaml`) declares `output_base` and lists the channel configs — mirrors how ETV-next's `lineup.json` lists its channels. It also carries the station-wide time zone (see below). Each `channels` entry is a literal path or a glob (e.g. `channels/*.yaml`) resolved relative to the station file; a glob expands to every match. The `ETV_STATION_OUTPUT_BASE` environment variable overrides `output_base` at runtime (the Docker-friendly knob), the same way `ETV_STATION_TZ` overrides `tz`.
 
+The station file also declares an optional `device_id` — how Plex tells this tuner apart from every other one it has seen. Set, it is used verbatim as the tuner identity ETV-next reports to Plex. Unset, one is minted on first run and stored at `{station-config-dir}/.device_id` — beside the station config rather than on the data volume, so that clearing the data volume to force a catalog rebuild can't wipe it out, and it can't live in the rendered `lineup.json` either, since the container regenerates that file from the station config at every start. This matters because Plex keys a DVR's entire channel mapping on this id, so a value that changes between restarts reads as a new tuner and costs a full remap by hand.
+
 ## Time zone
 
 The station file declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.
