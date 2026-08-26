@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,7 +33,10 @@ spec.loader.exec_module(epgb)
 
 def fixture() -> tuple[dict, list]:
     """Two channels and a back-to-back run of long-titled shows, so the
-    programme rows include a worst-case "A → B" changeover line."""
+    programme rows include a worst-case changeover block — one that renders as
+    a block line plus a hanging line for the incoming show. `number` is set
+    because every row is prefixed with the channel number, and a fixture
+    without one measures a row six characters narrower than prod draws."""
     now = datetime.now(timezone.utc)
     channels = {
         f"ersatztv.{n}": epgb.Channel(
@@ -40,6 +44,7 @@ def fixture() -> tuple[dict, list]:
             name=name,
             logo=None,
             stream_url=f"http://station.example:8419/channel/{n}.m3u8",
+            number=n,
         )
         for n, name in ((1, "001-for-you"), (2, "002-for-pierce"))
     }
@@ -64,10 +69,17 @@ def fixture() -> tuple[dict, list]:
     return channels, progs
 
 
+MARKUP_RE = re.compile(r"\[/?[a-z][^\]]*\]")
+
+
 def _label_text(label) -> str:
+    """The text the terminal actually draws. Rich markup tags are stripped —
+    a row is styled with [dim]…[/dim] around the channel number and the
+    season/episode suffix, and counting those tags as characters overstates
+    every row by ~11 and reports clipping that isn't there."""
     for attr in ("content", "_content", "renderable"):
         if hasattr(label, attr):
-            return str(getattr(label, attr))
+            return MARKUP_RE.sub("", str(getattr(label, attr)))
     return ""
 
 

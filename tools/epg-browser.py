@@ -532,8 +532,35 @@ def build_app(host: str):
             def _title(seg: tuple[Programme | None, datetime, datetime]) -> str:
                 return (seg[0].title or "(untitled)") if seg[0] else "— off-air —"
 
-            def _seg_text(seg: tuple[Programme | None, datetime, datetime]) -> str:
-                return escape(_title(seg)) if seg[0] else "[red]— off-air —[/red]"
+            # Usable row width, read off the live pane so the elision below
+            # tracks a resized terminal instead of a number baked in here. Zero
+            # before the first layout pass, hence the fallback.
+            pane_w = self.query_one("#programmes", ListView).size.width or 46
+
+            def _seg_text(seg: tuple[Programme | None, datetime, datetime], prefix_w: int) -> str:
+                """Row text for one segment: the show, plus its season/episode
+                when it has one. Without it a single-series channel renders as
+                a screen of identical titles, and a row copied out of the list
+                names the series but not the episode. Films and specials carry
+                no episode-num and keep the bare title."""
+                if seg[0] is None:
+                    return "[red]— off-air —[/red]"
+                p = seg[0]
+                if p.season is not None and p.episode is not None:
+                    suffix = f" - S{p.season:02d}E{p.episode:02d}"
+                elif p.episode is not None:
+                    suffix = f" - E{p.episode:02d}"
+                else:
+                    suffix = ""
+                # The episode number is the part that must survive a narrow
+                # pane. It sits at the end of the row, so left to itself it is
+                # the first thing clipped off — elide the title instead, which
+                # stays recognisable at half length while "S01E04" does not.
+                title = _title(seg)
+                budget = pane_w - prefix_w - len(suffix)
+                if budget >= 4 and len(title) > budget:
+                    title = title[: budget - 1] + "…"
+                return escape(title) + (f"[dim]{escape(suffix)}[/dim]" if suffix else "")
 
             select_idx = 0
             seg_i = 0
@@ -560,14 +587,15 @@ def build_app(host: str):
                 # Three-way changeovers just add a third line instead of
                 # truncating, and each line keeps the full title column, which
                 # the old inline "A → B" spent on the second title.
+                prefix_w = 2 + chan_tag_w + len(time_str) + 2
                 if not overlapping:
                     lines_out = [f"{marker} {chan_tag}{time_str}  [red]— off-air —[/red]"]
                 else:
-                    lines_out = [f"{marker} {chan_tag}{time_str}  {_seg_text(overlapping[0])}"]
+                    lines_out = [f"{marker} {chan_tag}{time_str}  {_seg_text(overlapping[0], prefix_w)}"]
                     hang = " " * (2 + chan_tag_w)
                     for seg in overlapping[1:]:
                         stamp = _fmt_dt(seg[1], today=now.date()).rjust(len(time_str))
-                        lines_out.append(f"{hang}[dim]{stamp}[/dim]› {_seg_text(seg)}")
+                        lines_out.append(f"{hang}[dim]{stamp}[/dim]› {_seg_text(seg, prefix_w)}")
                 label = "\n".join(lines_out)
                 lv.append(ListItem(Label(label), name="block"))
                 self.programme_rows.append(("block", cur, overlapping))
