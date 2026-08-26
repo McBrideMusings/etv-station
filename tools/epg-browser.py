@@ -211,21 +211,31 @@ def current_and_next(
     return current, nxt
 
 
-def _fmt_dt(dt: datetime, today: date | None = None) -> str:
+def _fmt_dt(dt: datetime, today: date | None = None, with_date: bool = False) -> str:
     """Weekday-qualified so a two-day-old entry can't be misread as "later
     today" — a bare %H:%M is exactly what made the schedule gap in #292 look
     like an upcoming show instead of a stale listing days in the past. When a
     reference date is provided via `today`, drops the weekday prefix for blocks
     that fall on today (saving 4 characters) since the weekday only earns its
-    place once the list runs past midnight."""
+    place once the list runs past midnight.
+
+    `with_date` swaps the weekday for the calendar date. The weekday only
+    disambiguates a window under seven days wide: history mode reaches back
+    exactly seven, so its oldest rows land on the same weekday as today and
+    "Wed 16:30" stops meaning anything. Two characters wider, and unambiguous
+    at any depth."""
     if today is not None and dt.date() == today:
         return dt.strftime("%H:%M")
+    if with_date:
+        return dt.strftime("%m-%d %H:%M")
     return dt.strftime("%a %H:%M")
 
 
-def _fmt_dt_sec(dt: datetime) -> str:
+def _fmt_dt_sec(dt: datetime, with_date: bool = False) -> str:
     """Same as _fmt_dt but with seconds — used for real programme-boundary
     timestamps (changeovers, EPG-data cutoffs), never for block labels."""
+    if with_date:
+        return dt.strftime("%m-%d %H:%M:%S")
     return dt.strftime("%a %H:%M:%S")
 
 
@@ -376,6 +386,7 @@ def build_app(host: str):
         """
         BINDINGS = [
             ("r", "refresh", "Refresh"),
+            ("h", "toggle_history", "History ↕"),
             ("v", "open_vlc", "Stream in VLC"),
             ("a", "open_artwork", "Artwork preview"),
             ("s", "open_sublime", "XML in Sublime"),
@@ -390,6 +401,12 @@ def build_app(host: str):
         # this is what makes the top block roll from e.g. 15:45 to 16:00 live
         BLOCK_MINUTES = 15  # width of one row in the shows sidebar
         BLOCK_SAFETY_CAP = 2000  # ~20 days of blocks — a runaway-loop backstop, not a UX truncation
+        # How far back history mode reaches, when the guide still holds that
+        # much. The station's default `retention_days` is 7, so in practice the
+        # retained data runs out first and this never truncates — it is here so
+        # a channel with a longer retention can't produce a list nobody can
+        # scroll, not to hide anything at the usual setting.
+        HISTORY_DAYS = 7
 
         def __init__(self, host: str) -> None:
             super().__init__()
@@ -397,10 +414,14 @@ def build_app(host: str):
             self.channels: dict[str, Channel] = {}
             self.programmes: list[Programme] = []
             self.selected_channel: str | None = None
+            # False: now at the top, reading forward. True: history mode — now
+            # at the BOTTOM, reading back. See _load_programmes.
+            self.history = False
             # Parallel to #programmes items. Each entry is either:
             #   ("block", block_start, segments)  — segments: list[(Programme|None, start, stop)]
-            #   ("end", end_bound, None)          — the "Last EPG data: ..." closing row
-            #   ("empty", None, last_known_programme_or_None)  — nothing live/future at all
+            #   ("end", end_bound, None)          — "Last EPG data: ..."; forward mode, last row
+            #   ("start", win_start, None)        — "Start of retained history"; history mode, FIRST row
+            #   ("empty", None, last_known_programme_or_None)  — nothing to show in this direction
             self.programme_rows: list[tuple[str, datetime | None, object]] = []
 
         def compose(self) -> ComposeResult:
@@ -415,6 +436,7 @@ def build_app(host: str):
 
         def on_mount(self) -> None:
             self.title = f"epg-browser — {self.host}"
+            self._sync_mode_subtitle()
             self.action_refresh()
             self.query_one("#channels", ListView).focus()
             self.set_interval(self.REFRESH_SECS, self.action_refresh)
@@ -455,15 +477,29 @@ def build_app(host: str):
 
         def _load_programmes(self, keep_selection: bool = False) -> None:
             """(Re)populate the #programmes sidebar as fixed BLOCK_MINUTES-wide
-            rows, clock-aligned, starting at the block containing `now` and
-            reading forward only — an EPG never scrolls back through history to
-            find the live edge. Every block is rendered, on-air or off-air, all
-            the way to the real end of known EPG data; nothing is summarized or
-            capped, so a scheduling gap is exactly as long on screen as it is
-            in reality. On a fresh channel switch the top (now) block is
-            selected; on a periodic rebuild, whatever block the user had
+            rows, clock-aligned. Every block is rendered, on-air or off-air;
+            nothing is summarized or capped, so a scheduling gap is exactly as
+            long on screen as it is in reality.
+
+            Two directions, toggled with `h`:
+
+            - **Forward** (default) — the window is [now, end of known EPG].
+              The now block is the first row and the list reads downward into
+              the future, which is what an EPG is for: find the live edge, then
+              scroll down to see what's coming.
+            - **History** — the window is [now - HISTORY_DAYS, now], clamped to
+              the oldest programme the guide still holds. Rows stay in
+              chronological order, so the now block is the *last* row and the
+              list is entered at the bottom: you scroll UP to go back in time.
+              Travelling upward instead of downward is the point — it is the
+              cue that the list is pointing the other way, and it matches how
+              every scrollback reads.
+
+            Both directions put the block containing `now` under the ▶ marker
+            and select it on a fresh channel switch; it is simply at opposite
+            ends of the list. On a periodic rebuild, whatever block the user had
             highlighted stays highlighted (by its real start time, not row
-            index, since the list shifts every time the top block rolls over)."""
+            index, since the list shifts every time a block rolls over)."""
             lv = self.query_one("#programmes", ListView)
             keep_kind = None
             keep_block_start = None
@@ -476,7 +512,11 @@ def build_app(host: str):
                 return
             now = datetime.now(timezone.utc)
             all_progs = programmes_for(self.programmes, self.selected_channel)
-            progs_fwd = [p for p in all_progs if p.stop > now]
+            if self.history:
+                horizon = now - timedelta(days=self.HISTORY_DAYS)
+                progs_win = [p for p in all_progs if p.stop > horizon and p.start < now]
+            else:
+                progs_win = [p for p in all_progs if p.stop > now]
 
             # Every slot row carries the channel number, not just the pane
             # header. The rows are what gets selected and copied out of the
@@ -490,9 +530,15 @@ def build_app(host: str):
             # length of the markup string.
             chan_tag_w = len(f"ch{chan_num:<3} ") if chan_num is not None else 0
 
-            if not progs_fwd:
+            if not progs_win:
                 last = max(all_progs, key=lambda p: p.stop) if all_progs else None
-                if last is None:
+                if self.history:
+                    head = "[red]⚠ No EPG history retained[/red]"
+                    detail = f"[dim]   nothing aired in the last {self.HISTORY_DAYS} days is still in the guide[/dim]"
+                    if last is None:
+                        detail = "[dim]   no programme data at all for this channel[/dim]"
+                    label = f"{head}\n{detail}"
+                elif last is None:
                     label = "[red]⚠ No EPG scheduled right now[/red]\n[dim]   no programme data at all for this channel[/dim]"
                 else:
                     ago = _fmt_span((now - last.stop).total_seconds())
@@ -507,24 +553,29 @@ def build_app(host: str):
                 self.refresh_detail()
                 return
 
-            block_start = self._floor_block(now, self.BLOCK_MINUTES)
-            end_bound = progs_fwd[-1].stop  # real timestamp where known EPG data actually ends
+            # The window both modes render, as real unrounded timestamps. One
+            # end is always `now` — the difference is which end.
+            if self.history:
+                win_start = max(horizon, min(p.start for p in progs_win))
+                end_bound = now
+            else:
+                win_start = now
+                end_bound = progs_win[-1].stop  # where known EPG data actually ends
 
-            # Sweep progs_fwd into a flat list of (programme_or_None, start, stop)
-            # segments covering [now, end_bound) with zero gaps between them and
-            # real (unrounded) boundary timestamps — this is what lets a single
-            # 15m block contain a mid-block changeover. Anchored at `now`, not
-            # `block_start`: a show that already finished airing before `now`
-            # but whose slot falls inside the still-visible current block must
-            # never render as a phantom "off-air" gap — nothing before `now`
-            # is real content or a real gap, it's just history, and history
-            # doesn't get shown here at all.
+            # Sweep progs_win into a flat list of (programme_or_None, start, stop)
+            # segments covering [win_start, end_bound) with zero gaps between
+            # them and real (unrounded) boundary timestamps — this is what lets
+            # a single 15m block contain a mid-block changeover. Clamped to the
+            # window at both ends: a show that runs past either edge must render
+            # as content up to the edge, never as a phantom "off-air" gap.
             segments: list[tuple[Programme | None, datetime, datetime]] = []
-            cursor = now
-            for p in progs_fwd:
+            cursor = win_start
+            for p in progs_win:
+                if p.stop <= win_start:
+                    continue
                 if p.start > cursor:
                     segments.append((None, cursor, min(p.start, end_bound)))
-                segments.append((p, max(p.start, now), p.stop))
+                segments.append((p, max(p.start, win_start), min(p.stop, end_bound)))
                 cursor = p.stop
                 if cursor >= end_bound:
                     break
@@ -562,9 +613,24 @@ def build_app(host: str):
                     title = title[: budget - 1] + "…"
                 return escape(title) + (f"[dim]{escape(suffix)}[/dim]" if suffix else "")
 
+            # History mode's bound row is the FIRST row, not the last: the list
+            # reads oldest-at-top, so "this is as far back as the guide goes"
+            # belongs above the oldest block, where scrolling up runs into it.
+            if self.history:
+                lv.append(
+                    ListItem(
+                        Label(
+                            f"[yellow]⏶ Start of retained EPG: {_fmt_dt_sec(win_start, with_date=True)}[/yellow]\n"
+                            "[dim]   nothing older than this is still in the guide[/dim]"
+                        ),
+                        name="start",
+                    )
+                )
+                self.programme_rows.append(("start", win_start, None))
+
             select_idx = 0
             seg_i = 0
-            cur = block_start
+            cur = self._floor_block(win_start, self.BLOCK_MINUTES)
             step = timedelta(minutes=self.BLOCK_MINUTES)
             row_count = 0
             while cur < end_bound and row_count < self.BLOCK_SAFETY_CAP:
@@ -576,9 +642,12 @@ def build_app(host: str):
                     i += 1
                 while seg_i < len(segments) and segments[seg_i][2] <= block_end:
                     seg_i += 1
-                is_first = row_count == 0
-                marker = "▶" if is_first else " "
-                time_str = _fmt_dt(cur, today=now.date())
+                # The ▶ marks the block containing `now` in both directions —
+                # row 0 going forward, the last row going back. Testing for
+                # `now` rather than row position is what makes that one rule.
+                is_now = cur <= now < block_end
+                marker = "▶" if is_now else " "
+                time_str = _fmt_dt(cur, today=now.date(), with_date=self.history)
                 # One line per programme in the block. The block's own clock
                 # anchors the first line; every segment after it gets its real
                 # unrounded start time, so a mid-block changeover reads as the
@@ -594,30 +663,37 @@ def build_app(host: str):
                     lines_out = [f"{marker} {chan_tag}{time_str}  {_seg_text(overlapping[0], prefix_w)}"]
                     hang = " " * (2 + chan_tag_w)
                     for seg in overlapping[1:]:
-                        stamp = _fmt_dt(seg[1], today=now.date()).rjust(len(time_str))
+                        stamp = _fmt_dt(seg[1], today=now.date(), with_date=self.history).rjust(len(time_str))
                         lines_out.append(f"{hang}[dim]{stamp}[/dim]› {_seg_text(seg, prefix_w)}")
                 label = "\n".join(lines_out)
                 lv.append(ListItem(Label(label), name="block"))
+                row_idx = len(self.programme_rows)
                 self.programme_rows.append(("block", cur, overlapping))
                 if keep_kind == "block" and cur == keep_block_start:
-                    select_idx = row_count
-                elif keep_kind != "block" and keep_kind != "end" and is_first:
-                    select_idx = row_count
+                    select_idx = row_idx
+                elif keep_kind not in ("block", "end", "start") and is_now:
+                    select_idx = row_idx
                 cur = block_end
                 row_count += 1
 
-            lv.append(
-                ListItem(
-                    Label(
-                        f"[red]⚠ Last EPG data: {_fmt_dt_sec(end_bound)}[/red]\n"
-                        "[dim]   nothing scheduled after this[/dim]"
-                    ),
-                    name="end",
+            # Forward mode's bound row closes the list. History mode already
+            # opened with its own bound row and ends at `now`, which is not an
+            # edge of the data — there is nothing to say down there.
+            if not self.history:
+                lv.append(
+                    ListItem(
+                        Label(
+                            f"[red]⚠ Last EPG data: {_fmt_dt_sec(end_bound)}[/red]\n"
+                            "[dim]   nothing scheduled after this[/dim]"
+                        ),
+                        name="end",
+                    )
                 )
-            )
-            self.programme_rows.append(("end", end_bound, None))
-            if keep_kind == "end":
-                select_idx = len(self.programme_rows) - 1
+                self.programme_rows.append(("end", end_bound, None))
+                if keep_kind == "end":
+                    select_idx = len(self.programme_rows) - 1
+            elif keep_kind == "start":
+                select_idx = 0
 
             lv.index = select_idx
             self.refresh_detail()
@@ -691,6 +767,24 @@ def build_app(host: str):
         def action_focus_programmes(self) -> None:
             self.query_one("#programmes", ListView).focus()
 
+        def action_toggle_history(self) -> None:
+            """Flip the list between reading forward from now and reading back
+            to the oldest retained programme. Selection is not carried across —
+            the two windows only touch at `now`, so the honest landing spot in
+            either direction is the now block, which is what a rebuild with
+            keep_selection=False picks."""
+            self.history = not self.history
+            self._sync_mode_subtitle()
+            self._load_programmes()
+            self.query_one("#programmes", ListView).focus()
+
+        def _sync_mode_subtitle(self) -> None:
+            self.sub_title = (
+                f"history — last {self.HISTORY_DAYS}d, now at the bottom, scroll up"
+                if self.history
+                else "live — now at the top, scroll down"
+            )
+
         def refresh_detail(self) -> None:
             body = self.query_one("#detail-body", Static)
             if self.selected_channel is None:
@@ -712,7 +806,10 @@ def build_app(host: str):
             if row is None:
                 lines.append("[dim]No block selected.[/dim]")
             else:
-                kind, _, payload = row
+                # The bound rows carry their timestamp in the middle slot and
+                # nothing in the payload — reading `payload` here crashed on
+                # None the moment the "Last EPG data" row was selected.
+                kind, row_ts, payload = row
                 if kind == "empty":
                     lines.append("[b]status: no live schedule[/b]")
                     if payload is not None:
@@ -721,8 +818,14 @@ def build_app(host: str):
                     else:
                         lines.append("[dim]No EPG data for this channel at all.[/dim]")
                 elif kind == "end":
-                    lines.append(f"[b]End of known EPG data[/b]  ({_fmt_dt_sec(payload)})")
+                    lines.append(f"[b]End of known EPG data[/b]  ({_fmt_dt_sec(row_ts)})")
                     lines.append("[dim]Nothing has been generated past this point.[/dim]")
+                elif kind == "start":
+                    lines.append(f"[b]Start of retained EPG[/b]  ({_fmt_dt_sec(row_ts, with_date=True)})")
+                    lines.append(
+                        f"[dim]The guide holds nothing older. History mode reaches back at most "
+                        f"{self.HISTORY_DAYS} days; the retention sweep may have cut it shorter.[/dim]"
+                    )
                 else:  # "block"
                     segments: list[tuple[Programme | None, datetime, datetime]] = payload
                     if len(segments) == 1 and segments[0][0] is None:
