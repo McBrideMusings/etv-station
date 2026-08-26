@@ -1254,6 +1254,7 @@ fn log_reconcile_outcome(outcome: Result<crate::reconcile::ReconcileCounts, Stat
             files_rewritten = counts.files_rewritten,
             paths_patched = counts.paths_patched,
             items_carded = counts.items_carded,
+            items_path_missing = counts.items_path_missing,
             "reconciliation sweep complete",
         ),
         Err(e) => tracing::error!(
