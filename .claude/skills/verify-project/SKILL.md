@@ -83,6 +83,18 @@ set -a; . ./.env; set +a
 ./target/debug/etv-station --config examples/station.yaml
 ```
 
+For a quick local check that needs no media on disk and no Plex reachable at all, use
+`examples/station-test.yaml` instead — one lavfi channel, no `${…}` expansions, so nothing
+needs sourcing. Run it from the repo root with Plex's env vars explicitly unset (see
+blocker 3 below for why that matters):
+
+```bash
+env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
+  ./target/debug/etv-station --config examples/station-test.yaml
+```
+
+Reaches `event="playout.first_emit"` in about 15 seconds.
+
 ## What a pass looks like
 
 Channel load lines first, then rolling. Observed on a good run (2026-08-12):
@@ -103,6 +115,42 @@ from a previous one.
 `chunk.skip` with "window already materialized" is a pass, not a stall: the window was
 already built. To force real work, change the channel config or clear that channel's
 output dir.
+
+## Verifying a restart's resume decision (skip vs rewind)
+
+On startup, `daemon.rs:2181`/`:2211` decides, per channel, whether a written-but-unaired
+future survives a restart or gets thrown away and regenerated:
+
+- `event="resume.skip"` — the catalog, config, and overlay fingerprint matched what was
+  true when the unaired window was written, so it is kept as-is.
+- `event="resume.rewind" from=… removed=… airings=…` — it did not match, so the daemon
+  rewound to the earliest unaired generation, wiped the playout JSON from there on, and is
+  regenerating it from the current config.
+
+Recipe, using the no-media/no-Plex config:
+
+```bash
+env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
+  ./target/debug/etv-station --config examples/station-test.yaml
+# wait for: event="chunk.write" channel=test
+# Ctrl-C (SIGINT)
+env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
+  ./target/debug/etv-station --config examples/station-test.yaml
+# read the startup line: resume.skip or resume.rewind
+```
+
+Nothing changed between the two boots → expect `resume.skip`. To force the rewind arm,
+edit `examples/channels/lavfi-test.yaml` (e.g. change `program.title`) between the two
+boots — and revert that edit before committing anything, since this file is tracked.
+
+**Neither line appearing is a legitimate outcome, not a failure.** Both are gated on
+`has_unaired` (daemon.rs ~2168): a channel with no checkpoints in the future — nothing
+written yet, or everything already aired — logs neither line, because there is nothing to
+decide between.
+
+Artifacts live under `examples/output/test/`: `.resume`, `.history`, and
+`<start>_<end>.json` files. `examples/output/` is gitignored, so nothing here needs
+cleanup before a commit.
 
 ## Verifying the seed cascade
 
@@ -341,7 +389,7 @@ for f in sorted(glob.glob('deploy/appdata/channels/*/logo.png') + glob.glob('dep
 ffmpeg -y -i bad.png -pix_fmt rgba fixed.png   # the fix; alpha survives
 ```
 
-## Two blockers you will hit, and how to get past them
+## Three blockers you will hit, and how to get past them
 
 **1. `PLEXDB_SNAPSHOT_PATH` is not in `.env`.** `examples/samples/foryou.yaml` references
 it, and config validation resolves env vars eagerly, so the daemon exits before serving:
@@ -364,19 +412,30 @@ store today, so it cannot satisfy this reader. Until the reader is rebuilt again
 matching plex-db-ex, the sample channels cannot load at all — this is a real
 incompatibility between the two projects, not a config mistake.
 
-**The workaround that gets the daemon up:** drop the sample channels. `examples/station.yaml`
-registers them with a glob, so copy it inside `examples/` (paths resolve relative to the
-config file — a copy under `tmp/` fails with `channel pattern "channels/*.yaml" matched no
-files`) and comment out the samples line:
+**The workaround that gets the daemon up:** drop the sample channels. Use the committed
+`examples/station-test.yaml` — it already registers only `channels/lavfi-test.yaml`, no
+`samples/*.yaml` glob, so neither blocker above can fire:
 
 ```bash
-sed 's|^  - samples/\*\.yaml|# samples excluded|' examples/station.yaml > examples/verify-smoke.yaml
-set -a; . ./.env; set +a
-./target/debug/etv-station --config examples/verify-smoke.yaml
-rm examples/verify-smoke.yaml     # it is untracked; delete it when done
+env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
+  ./target/debug/etv-station --config examples/station-test.yaml
 ```
 
-That boots clean and rolls all of `examples/channels/`.
+That boots clean and rolls the one lavfi channel. Do not hand-author a throwaway sibling
+config for this — `examples/station-test.yaml` is tracked precisely so nobody has to.
+
+**3. A configured Plex blocks the channel loop from ever starting.** In `daemon.rs`, the
+startup ingest (`catalog.ingest.fs` → `catalog.ingest.plex_start mode="full"`) runs to
+completion before any channel task rolls. With `PLEX_URL`/`PLEX_TOKEN` set, that means a
+real library read taking minutes, and the daemon never reaches the resume path most local
+verification actually wants to watch. Unset them with `env -u` as shown above rather than
+relying on `.env` not having them — `admin dev-station` sources `.env`, which may set them,
+so use the raw binary invocation for this, not the admin task.
+
+`examples/station-test.yaml`'s `catalog_refresh_secs: 86400` only helps *subsequent* boots
+once a catalog already exists on disk (`plex_ingest_plan` takes `PlexIngestPlan::Skip` and
+logs `event="catalog.ingest.plex_skipped"`) — the first boot with Plex configured still
+pays the full ingest regardless of that setting. `env -u` is what actually avoids it.
 
 ## The HTTP surface is not the daemon
 
