@@ -213,6 +213,22 @@ struct PoolRuntime<'a> {
     /// back by the draw (#173) in place of the step's own `take` for whichever
     /// series the override's id belongs to. Empty for every non-plugin pool.
     take_overrides: HashMap<String, usize>,
+
+    /// Every id drawn from this pool so far in this generation (#382).
+    ///
+    /// Not a constraint — [`Self::recent`] is what enforces spacing. This
+    /// answers a different question: has the pool got anything left that has
+    /// not aired yet this generation, or is the next visit forced to repeat?
+    drawn: HashSet<String>,
+
+    /// The source has been asked for more and had nothing to give, so wrapping
+    /// is now the honest answer and it is not asked again (#382).
+    exhausted: bool,
+
+    /// How many times the source has been re-asked this generation, capped so a
+    /// source that keeps answering without ever supplying anything new cannot
+    /// spin the walk.
+    refills: usize,
 }
 
 impl PoolRuntime<'_> {
@@ -367,7 +383,69 @@ impl PoolRuntime<'_> {
         if s.cursor >= s.ids.len() {
             s.cursor = 0;
         }
+        self.drawn.extend(out.iter().cloned());
         out
+    }
+
+    /// How many ids this pool holds across every series.
+    fn total_ids(&self) -> usize {
+        self.series.iter().map(|s| s.ids.len()).sum()
+    }
+
+    /// Everything this pool holds has already aired this generation, so the
+    /// next visit repeats unless the source can supply more (#382).
+    ///
+    /// Deliberately not "a series ran off its end": a pool rotates through many
+    /// series and one of them finishing says nothing about whether the pool has
+    /// unplayed content left. Only when *all* of it has been drawn is a repeat
+    /// actually forced.
+    fn is_drained(&self) -> bool {
+        !self.series.is_empty() && self.drawn.len() >= self.total_ids()
+    }
+
+    /// Append series this pool does not already have, merging their keys and
+    /// runtimes. Returns how many ids landed.
+    ///
+    /// Only whole new series are taken. An id that belongs to a series already
+    /// in the rotation is dropped rather than spliced in: that series has a
+    /// live cursor, and inserting behind it would either replay what it has
+    /// already aired or skip what it has not. Every plugin-ranked film is its
+    /// own series of one (a movie has no `show_id`), which is the case this
+    /// exists to serve, so nothing is lost there.
+    fn extend_with(
+        &mut self,
+        series: Vec<Series>,
+        keys: PoolKeys,
+        runtimes: HashMap<String, Duration>,
+    ) -> usize {
+        let known: HashSet<String> = self.series.iter().map(|s| s.key.clone()).collect();
+        let first_new = self.series.len();
+        let mut added = 0;
+        for s in series {
+            if known.contains(&s.key) {
+                continue;
+            }
+            added += s.ids.len();
+            self.series.push(s);
+        }
+        if added == 0 {
+            return 0;
+        }
+        // Serve the arrivals next. The rotation is parked on a series that has
+        // already aired — that is what being drained means — so leaving it there
+        // would replay that series on the very visit the refill was fetched for.
+        self.rotation = first_new;
+        self.keys.groups.extend(keys.groups);
+        self.keys.durations.extend(keys.durations);
+        self.runtimes.extend(runtimes);
+        // The mean backs every unmeasured item's length, so it has to follow the
+        // pool it now describes rather than stay pinned to the first answer.
+        if !self.runtimes.is_empty() {
+            self.mean_runtime =
+                self.runtimes.values().sum::<Duration>() / self.runtimes.len() as u32;
+            self.keys.mean_duration = self.mean_runtime;
+        }
+        added
     }
 
     /// The take override attached to any id in this series (#166's plugin
@@ -764,6 +842,33 @@ pub fn build(
             let idx = *by_name
                 .get(step.pool.as_str())
                 .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
+            // Everything this pool holds has aired already, so this visit would
+            // repeat. Ask the source for more before drawing rather than after,
+            // and only wrap once it says it has nothing (#382).
+            if runtimes[idx].is_drained() && !runtimes[idx].exhausted {
+                let added = refill_pool(
+                    catalog,
+                    &pools[idx],
+                    &mut runtimes[idx],
+                    block_constraints,
+                    state,
+                    &mut score_cache,
+                    seed,
+                    score_env,
+                    budget.is_some(),
+                )?;
+                if added == 0 {
+                    // Not a failure. The source is genuinely out, so the
+                    // rotation wraps from here on and nothing asks again.
+                    runtimes[idx].exhausted = true;
+                    tracing::debug!(
+                        event = "pool.exhausted",
+                        pool = %pools[idx].name,
+                        held = runtimes[idx].total_ids(),
+                        "pool has aired everything its source can supply; repeating from the top",
+                    );
+                }
+            }
             let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
             if budget.is_some() {
                 laid += runtimes[idx].runtime_of(&drawn);
@@ -1039,6 +1144,111 @@ fn resolve_group_pool(
     Ok(ids)
 }
 
+/// How many times one pool may re-ask its source in a single generation.
+///
+/// A backstop, not a budget: a source that answers honestly either supplies
+/// something new or supplies nothing, and the nothing case stops the asking on
+/// its own. This only bounds a source that keeps returning content the pool
+/// already holds — which would otherwise re-ask on every visit forever.
+const MAX_REFILLS: usize = 8;
+
+/// How much bigger each successive ask is than what the pool already holds.
+const REFILL_STEP: usize = 32;
+
+/// Ask a drained pool's source for content it has not already used (#382).
+///
+/// Returns how many ids landed. Zero means the source is out, which is a
+/// legitimate answer and not an error: a channel built on 15 Bond films cannot
+/// fill 24 hours without repeating one, and that is the config's own arithmetic
+/// rather than a fault. The caller marks the pool exhausted and lets the
+/// rotation wrap, silently.
+///
+/// **Only a `plugin:` pool can be re-asked.** An `expr:` or `groups:` pool
+/// resolved the complete matching set the first time — `resolve_query` returns
+/// every entry that matches, not a page of them — so a drained query pool *is*
+/// an exhausted source and asking again would return byte-identical ids. That
+/// is what makes the two cases above come out right without either channel
+/// declaring how much content it has: the small channels are query pools and
+/// wrap immediately, the For-You channels are plugin pools and refill.
+///
+/// This needs no change to the plugin contract. `pick(ctx)` is an ordinary call
+/// and `ctx.recent` / `ctx.target_count` are ordinary fields the station fills
+/// in, so re-asking with more of both is using the contract as written. A script
+/// that ignores `ctx.recent` simply returns its same ranked head, the filter
+/// below drops all of it, and the pool is treated as exhausted — degraded, not
+/// broken.
+#[allow(clippy::too_many_arguments)]
+fn refill_pool(
+    catalog: &Catalog,
+    cfg: &Pool,
+    rt: &mut PoolRuntime<'_>,
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    score_cache: &mut crate::score::ScoreCache,
+    seed: u64,
+    score_env: crate::score::ScoreEnv<'_>,
+    want_runtimes: bool,
+) -> Result<usize, String> {
+    let Some(plugin) = cfg.plugin.as_ref() else {
+        return Ok(0);
+    };
+    if rt.refills >= MAX_REFILLS {
+        return Ok(0);
+    }
+    rt.refills += 1;
+
+    let path = score_env.resolve_path(plugin);
+    let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities)
+        .with_datastores(&cfg.datastores)
+        .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+
+    // What the pool has already aired this generation is exactly what it must
+    // not be handed again, so it goes on top of the channel's own recency tail
+    // rather than replacing it.
+    let mut inputs = score_env.inputs.clone();
+    inputs.recent.extend(rt.drawn.iter().cloned());
+    inputs.target_count = rt.total_ids() + REFILL_STEP;
+
+    let picked = crate::score::pick(
+        score_cache,
+        &path,
+        cfg.sources.as_ref(),
+        &inputs,
+        seed,
+        &cfg.name,
+        cfg.config.as_ref(),
+        granted,
+    )
+    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+    score_cache.record_picked(&cfg.name, &picked);
+
+    let have: HashSet<&str> = rt
+        .series
+        .iter()
+        .flat_map(|s| s.ids.iter().map(String::as_str))
+        .collect();
+    let fresh: Vec<String> = picked
+        .into_iter()
+        .map(|p| p.id)
+        .filter(|id| !have.contains(id.as_str()))
+        .collect();
+    if fresh.is_empty() {
+        return Ok(0);
+    }
+
+    // Same seam projection the first resolution used, narrowed to the arrivals.
+    let own: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+    let seam: Vec<String> = state
+        .tail
+        .iter()
+        .filter(|id| own.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let (series, _limits, keys, runtimes, _mean) =
+        resolve_pool_series(catalog, cfg, fresh, block_constraints, &seam, want_runtimes)?;
+    Ok(rt.extend_with(series, keys, runtimes))
+}
+
 /// Enough cycles for the largest pool to drain once. Each pool needs
 /// `ceil(remaining / take-per-cycle)` visits' worth; the pattern runs the max,
 /// so shorter pools repeat under their own `wrap` while the longest plays out.
@@ -1298,6 +1508,9 @@ fn pool_runtime<'a>(
         runtimes: pool_durations,
         mean_runtime: mean_duration,
         take_overrides,
+        drawn: HashSet::new(),
+        exhausted: false,
+        refills: 0,
     };
     // Seeded through the same path a draw takes, so the window is trimmed to
     // `reach` by one rule rather than two.
@@ -3175,6 +3388,114 @@ mod tests {
                 .len(),
             3,
             "the pool's whole contents air before anything comes round again: {ids:?}",
+        );
+    }
+
+    /// A pool sized by `ctx.target_count` runs dry mid-generation and asks its
+    /// source for more rather than replaying what it already aired (#382).
+    ///
+    /// The script here honours `ctx.recent` and `ctx.target_count`, which is all
+    /// the refill needs — no change to the plugin contract. Starting at
+    /// `target_count = 1`, the pool holds one film; without the refill the three
+    /// draws would be `mov-1, mov-1, mov-1`.
+    #[test]
+    fn a_drained_plugin_pool_asks_its_source_for_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("more.rhai");
+        std::fs::write(
+            &script,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let out = [];
+    for item in ctx.sets.movies {
+        if !ctx.recent.contains(item.entry_id) { out.push(item.entry_id); }
+    }
+    out.truncate(ctx.target_count);
+    out
+}
+"#,
+        )
+        .unwrap();
+
+        let cat = catalog();
+        // The script reads `ctx.sets`, so this pool has to grant what it uses.
+        let pool = Pool {
+            capabilities: vec!["catalog_read".into()],
+            ..plugin_pool(&script)
+        };
+        let inputs = crate::score::ScoreInputs {
+            target_count: 1,
+            ..Default::default()
+        };
+        let env = crate::score::ScoreEnv {
+            inputs: &inputs,
+            base_dir: std::path::Path::new("."),
+        };
+        let BlockBuild { ids, .. } = build(
+            &cat,
+            std::slice::from_ref(&pool),
+            &[],
+            &[step("movies", 1)],
+            Some(3),
+            None,
+            &GenerationState::empty(),
+            0,
+            env,
+            None,
+        )
+        .expect("pattern builds");
+        assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3"], "{ids:?}");
+    }
+
+    /// A source with nothing more to give wraps, silently, and the walk
+    /// terminates (#382).
+    ///
+    /// This is the 007 / Lord of the Rings / single-show case: 15 films cannot
+    /// fill 24 hours without one airing twice, and that is the config's own
+    /// arithmetic rather than a fault. The script ignores `ctx.recent` and
+    /// always returns the same two ids, so every refill comes back with nothing
+    /// new — the pool is marked exhausted and stops asking.
+    #[test]
+    fn an_exhausted_source_wraps_rather_than_asking_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fixed.rhai");
+        std::fs::write(
+            &script,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) { ["mov-1", "mov-2"] }
+"#,
+        )
+        .unwrap();
+
+        let cat = catalog();
+        let pool = plugin_pool(&script);
+        let inputs = crate::score::ScoreInputs {
+            target_count: 2,
+            ..Default::default()
+        };
+        let env = crate::score::ScoreEnv {
+            inputs: &inputs,
+            base_dir: std::path::Path::new("."),
+        };
+        let BlockBuild { ids, .. } = build(
+            &cat,
+            std::slice::from_ref(&pool),
+            &[],
+            &[step("movies", 1)],
+            Some(4),
+            None,
+            &GenerationState::empty(),
+            0,
+            env,
+            None,
+        )
+        .expect("an exhausted source is not an error");
+        assert_eq!(
+            ids,
+            vec!["mov-1", "mov-2", "mov-1", "mov-2"],
+            "the pool should wrap its two films, not stall or error: {ids:?}",
         );
     }
 
