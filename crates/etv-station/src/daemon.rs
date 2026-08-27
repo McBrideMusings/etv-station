@@ -1816,6 +1816,38 @@ async fn wipe_playout_from(
     Ok(removed)
 }
 
+/// The instant the ledger may be truncated from after a wipe: where the
+/// generation loop will actually resume.
+///
+/// **Not `wiped_from`.** [`wipe_playout_from`] deliberately spares the chunk
+/// file that *contains* `wiped_from` — it also holds earlier items that are
+/// still valid — so coverage, and the airings describing it, survive past that
+/// instant. The generation loop then picks up at the surviving frontier. Cutting
+/// history at `wiped_from` instead deletes the rows for everything in between,
+/// and nothing ever rewrites them: the schedule stays on disk and still airs
+/// while the ledger forgets it.
+///
+/// A channel whose ledger has that hole reads as having no past. Its
+/// `advance = "resume"` pools restart every series at the top, and its
+/// adjacency seam — the only thing that stops a `no_repeat_within` rule being
+/// evaluated against an empty history — stops seeing what just aired. Both fail
+/// silently, because within any single generation there was no clash to report.
+///
+/// Both wipe sites call this rather than each doing the arithmetic: two copies
+/// of "where does the ledger get cut" is how they came to disagree in the first
+/// place.
+async fn ledger_cut_after_wipe(
+    output: &Path,
+    wiped_from: OffsetDateTime,
+) -> Result<OffsetDateTime, StationError> {
+    Ok(
+        scan::highest_finish(&scan::scan_output_folder(output).await?)
+            .await
+            .unwrap_or(wiped_from)
+            .max(wiped_from),
+    )
+}
+
 /// The earliest instant it is safe to wipe and regenerate from, given a raw
 /// `from` (a chunk boundary or checkpoint instant with no guarantee of
 /// landing on an item boundary).
@@ -1934,6 +1966,60 @@ mod regen_floor_tests {
             anchor + time::Duration::hours(8),
             "must not land inside the still-airing film"
         );
+    }
+
+    /// The ledger is cut where regeneration resumes, not where the wipe began.
+    ///
+    /// Same #153 shape: the wipe spares the chunk containing the boundary, so
+    /// seven hours of film still air past it. Cutting history at `boundary`
+    /// deletes those rows and the generation loop — which resumes at the
+    /// surviving frontier — never rewrites them, so the schedule stays on disk
+    /// while the ledger forgets it. Both wipe sites (`resume.rewind` and
+    /// `coverage.heal`) got this wrong; they now share this one function.
+    #[tokio::test]
+    async fn the_ledger_cut_follows_the_surviving_frontier() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let boundary = datetime!(2026-01-01 06:00 UTC);
+        let anchor = boundary - time::Duration::hours(1);
+        let items = vec![film("fellowship", 8 * 3600)];
+        let durations = vec![Duration::from_secs(8 * 3600)];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+        wipe_playout_from(&channel, boundary).await.unwrap();
+
+        let cut = ledger_cut_after_wipe(&channel.output_folder, boundary)
+            .await
+            .unwrap();
+        assert_eq!(
+            cut,
+            anchor + time::Duration::hours(8),
+            "cutting at the wipe point would drop rows for a film that still airs",
+        );
+    }
+
+    /// Nothing survived the wipe, so the wipe point is the honest cut — there
+    /// is no coverage past it to describe.
+    #[tokio::test]
+    async fn the_ledger_cut_is_the_wipe_point_when_nothing_survives() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let boundary = datetime!(2026-01-01 06:00 UTC);
+        let cut = ledger_cut_after_wipe(&channel.output_folder, boundary)
+            .await
+            .unwrap();
+        assert_eq!(cut, boundary);
     }
 
     /// A chunk whose content fills it exactly, with nothing straddling the
@@ -2207,11 +2293,21 @@ async fn forward_channel_loop(
             // history. Because the resume position is a projection of the
             // store, dropping them is also what rewinds each series — the
             // two cannot disagree.
-            ctx.history_db.truncate_from(&channel.name, regen_from)?;
+            //
+            // Truncate from where regeneration will actually resume, for the
+            // same reason the coverage heal does: `wipe_playout_from` spares
+            // the chunk file containing `regen_from`, so coverage — and the
+            // airings describing it — survive past that instant, and the
+            // generation loop below picks up at the surviving frontier rather
+            // than at `regen_from`. Truncating from `regen_from` deleted the
+            // rows in between and nothing rewrote them.
+            let resume_at = ledger_cut_after_wipe(&channel.output_folder, regen_from).await?;
+            ctx.history_db.truncate_from(&channel.name, resume_at)?;
             tracing::info!(
                 event = "resume.rewind",
                 channel = %channel.name,
                 from = %regen_from,
+                truncated_from = %resume_at,
                 removed = removed,
                 airings = ctx.history_db.count(&channel.name)?,
                 "rewound to the earliest unaired generation; regenerating it from the current config",
@@ -2354,10 +2450,7 @@ async fn pattern_catch_up(
         // still aired. Both consumers read the result as "this channel has no
         // past" — the resume cursor restarts every series at its top, and the
         // adjacency seam stops seeing what just aired.
-        let resume_at = scan::highest_finish(&scan::scan_output_folder(output).await?)
-            .await
-            .unwrap_or(regen_from)
-            .max(regen_from);
+        let resume_at = ledger_cut_after_wipe(output, regen_from).await?;
         ctx.history_db.truncate_from(&channel.name, resume_at)?;
         crate::resume::save(output, &resume).await?;
         tracing::warn!(
