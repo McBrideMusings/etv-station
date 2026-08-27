@@ -536,11 +536,27 @@ impl PoolRuntime<'_> {
         // Park the rotation. A series that served the whole visit alone has had
         // its turn, so the next visit starts after it; one that only partly
         // served keeps its place so the next visit continues it.
+        //
+        // "Partly served" has to mean *this series still has more to give*, not
+        // merely that it supplied less than the visit's whole `take`. When
+        // `on_short` fills a visit from several series, the last one supplied
+        // only the remainder — and if it ran dry doing so, keeping its place
+        // replays it on the very next visit. A pool whose series each hold one
+        // item (every plugin-ranked film, which has no `show_id` and so is its
+        // own series of one) hits this on every single visit: `take = 2` draws
+        // series r and r+1 but parks at r+1, so each film airs twice, one visit
+        // apart — the `[A,B] [B,C] [C,D]` walk, not a wrap and not a pool that
+        // was too small.
+        //
+        // `take_from` returns a drained series to cursor 0, so that is the test
+        // for "nothing left". A series parked mid-list keeps its place and is
+        // continued, which is what `rotate = "visit"` promises.
         if let Some(si) = last
             && self.cfg.select == Select::RoundRobin
         {
             let served_all = contributed.get(&si).copied().unwrap_or(0) >= take;
-            self.rotation = if served_all {
+            let drained = self.series[si].cursor == 0;
+            self.rotation = if served_all || drained {
                 self.series_after(si).unwrap_or(si)
             } else {
                 si
@@ -3085,13 +3101,23 @@ mod tests {
         assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3"]);
     }
 
-    /// The regression the live drive caught: a pool's repeats are made by the
-    /// *rotation*, not by its list order. `take = 2` over one-item series parks
-    /// the rotation on the series that only half-filled the visit, so the next
-    /// visit opens on the same film. Unconstrained that is the documented
-    /// `on_short` behaviour; under `no_repeat_within` it has to be skipped past.
+    /// A pool's repeats are made by the *rotation*, not by its list order.
+    ///
+    /// `take = 2` over one-item series used to park the rotation on the series
+    /// that supplied only the visit's remainder, so the next visit opened on
+    /// the same film and every film aired twice, one visit apart. 6d5ed55 saw
+    /// that ("the rotation holds its place on a half-filled visit") and built
+    /// `no_repeat_within` over the top of it; this test's baseline then pinned
+    /// the replay as correct. It was not correct — a series that ran dry has
+    /// had its turn, whatever fraction of the visit it managed to fill — and
+    /// `serve` now moves past a drained series. A channel that never declared
+    /// `no_repeat_within` (nothing forces one) got the raw behaviour.
+    ///
+    /// So the baseline is inverted: unconstrained, the rotation must now walk
+    /// its films without repeating. The constraint half still stands, because a
+    /// pool makes repeats more ways than this one.
     #[test]
-    fn a_pool_constraint_stops_the_rotation_replaying_a_series() {
+    fn the_rotation_does_not_replay_a_series_it_drained() {
         let plain = build_pools(
             &[movies_pool()],
             &[step("movies", 2)],
@@ -3099,11 +3125,9 @@ mod tests {
             None,
             &GenerationState::empty(),
         );
-        // Baseline: the parking rule really does replay mov-2 back-to-back, so
-        // the assertion below is testing something that would otherwise fail.
         assert!(
-            plain.windows(2).any(|w| w[0] == w[1]),
-            "expected the unconstrained rotation to repeat: {plain:?}"
+            plain.windows(2).all(|w| w[0] != w[1]),
+            "a drained series must not open the next visit: {plain:?}"
         );
 
         let mut movies = movies_pool();
@@ -3119,6 +3143,38 @@ mod tests {
         assert!(
             ids.windows(2).all(|w| w[0] != w[1]),
             "a draw repeats under no_repeat_within = 1: {ids:?}"
+        );
+    }
+
+    /// The live shape, asserted exactly: a `take = 2` step over a pool of
+    /// one-item series walks two *new* films per visit.
+    ///
+    /// 002-for-pierce aired `[WIKYTL, Guardians] [Guardians, Grinch]
+    /// [Grinch, Marvels] [Marvels, Captain Marvel]` — the `[A,B] [B,C] [C,D]`
+    /// walk this pins against. Every plugin-ranked film is its own series of
+    /// one (a movie has no `show_id`), so the pool hit it on every visit, and
+    /// no pool size would have helped: the rotation advanced one place per two
+    /// items drawn.
+    #[test]
+    fn a_two_take_visit_over_one_item_series_advances_two_places() {
+        let ids = build_pools(
+            &[movies_pool()],
+            &[step("movies", 2)],
+            Some(2),
+            None,
+            &GenerationState::empty(),
+        );
+        // Two new films per visit. The fixture holds three, so the fourth draw
+        // wraps — that is a pool genuinely played out, which is what wrapping
+        // is for, and it is the one repeat this walk is allowed to make.
+        assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3", "mov-1"], "{ids:?}");
+        assert_eq!(
+            ids[..3]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "the pool's whole contents air before anything comes round again: {ids:?}",
         );
     }
 
