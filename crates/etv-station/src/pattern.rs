@@ -3499,6 +3499,32 @@ fn pick(ctx) { ["mov-1", "mov-2"] }
         );
     }
 
+    /// A block-level temporal `no_repeat_within` must reject what the
+    /// generation seam says has just aired.
+    ///
+    /// The seam is the only thing standing between two generations: a pool with
+    /// `advance = "restart"` reopens on its highest-ranked item every
+    /// generation, so if the seam does not carry the previous generation's tail
+    /// into the draw check, the same film opens every generation and nothing is
+    /// logged — no violation is counted, because within any single generation
+    /// there was no clash to force.
+    #[test]
+    fn a_temporal_no_repeat_rejects_what_the_seam_just_aired() {
+        let block = no_repeat_within(Duration::from_secs(24 * 60 * 60));
+        let ids = build_pools(
+            &[movies_pool()],
+            &[step("movies", 1)],
+            Some(1),
+            Some(&block),
+            &aired(&["mov-1"]),
+        );
+        assert_ne!(
+            ids.first().map(String::as_str),
+            Some("mov-1"),
+            "the seam says mov-1 just aired, so a 24h rule must not open on it: {ids:?}",
+        );
+    }
+
     /// The gap is counted in draws, so a wider one spaces the pool further —
     /// three distinct films before any may come round again.
     #[test]
