@@ -73,6 +73,29 @@ struct Cli {
     /// from disagreeing about what is on screen.
     #[arg(long, value_name = "CHANNEL")]
     dump_overlay: Option<String>,
+
+    /// Repair the play-history ledger from the playout files on disk, then
+    /// exit. A one-shot: it inserts only the airings the ledger is missing and
+    /// writes nothing else, so re-running it on a healthy station is a no-op.
+    ///
+    /// The ledger is written at generation time alongside the chunk JSON, so
+    /// the two normally agree. A coverage heal used to truncate the ledger from
+    /// the instant its wipe *started* while regeneration resumed at the
+    /// surviving frontier, dropping rows for schedule that was still on disk
+    /// and still aired. That is fixed at its source; this repairs the damage it
+    /// already did — a channel whose ledger has a hole reads as having no past,
+    /// so its resume cursor restarts every series and its adjacency seam stops
+    /// seeing what just aired.
+    ///
+    /// Only what is still on disk can be recovered: `retention_days` prunes
+    /// elapsed chunk files, and a hole older than that window is gone.
+    #[arg(long)]
+    backfill_history: bool,
+
+    /// With `--backfill-history`, report what would be written and write
+    /// nothing.
+    #[arg(long, requires = "backfill_history")]
+    dry_run: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -114,6 +137,10 @@ fn main() -> ExitCode {
 
     if let Some(plexdb_path) = cli.reconcile_plexdb.as_deref() {
         return reconcile_plexdb_cmd(&cli.config, plexdb_path);
+    }
+
+    if cli.backfill_history {
+        return backfill_history(&cli.config, cli.dry_run);
     }
 
     init_tracing(cli.log_format);
@@ -321,6 +348,98 @@ fn render_etv_next(config_path: &Path, out_dir: &Path) -> ExitCode {
 /// code carries the verdict as well as failure, so a script driving this in
 /// CI can rely on the exit code alone: 0 only for a proven-identical pair of
 /// passes.
+/// Repair every channel's play-history ledger from its playout files.
+///
+/// Prints one line per channel that was missing rows and a total, so a healthy
+/// station prints only the total. Exits non-zero when the pass itself fails —
+/// finding nothing to repair is success, not failure.
+fn backfill_history(config_path: &Path, dry_run: bool) -> ExitCode {
+    let station = match config::load(config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("backfill-history: failed to load configuration: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Read-only: the repair reads `show_id` per entry and writes nothing here.
+    // A missing catalog is not fatal — the rows still go in, but episodes land
+    // without their show, which leaves those series unable to resume. Say so
+    // rather than silently writing a half-useful ledger.
+    let catalog = match station.station.catalog_path.as_deref() {
+        Some(path) => match Catalog::open_readonly(path) {
+            Ok(c) => Some(c),
+            Err(err) => {
+                eprintln!(
+                    "backfill-history: WARNING: cannot open catalog at {path} ({err}); episodes \
+                     will be recorded without their show_id and those series will not resume",
+                );
+                None
+            }
+        },
+        None => {
+            eprintln!(
+                "backfill-history: WARNING: station config sets no catalog_path; episodes will \
+                 be recorded without their show_id and those series will not resume",
+            );
+            None
+        }
+    };
+
+    let history_db =
+        match etv_station::history::HistoryDb::open(station.station.output_base.join("history.db"))
+        {
+            Ok(db) => db,
+            Err(err) => {
+                eprintln!("backfill-history: failed to open history db: {err}");
+                return ExitCode::from(1);
+            }
+        };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("backfill-history: failed to start tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let report = match runtime.block_on(etv_station::backfill::run(
+        &station,
+        &history_db,
+        catalog.as_ref(),
+        dry_run,
+    )) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("backfill-history: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let verb = if dry_run { "would insert" } else { "inserted" };
+    for repair in report.repaired() {
+        let span = match (repair.filled_from, repair.filled_to) {
+            (Some(from), Some(to)) => format!(" covering {from} .. {to}"),
+            _ => String::new(),
+        };
+        println!(
+            "backfill-history: {} — {} {} of {} airings on disk{span}",
+            repair.channel, verb, repair.inserted, repair.on_disk,
+        );
+    }
+    println!(
+        "backfill-history: {} channels, {} airings on disk, {verb} {}",
+        report.channels.len(),
+        report.on_disk(),
+        report.inserted(),
+    );
+    ExitCode::SUCCESS
+}
+
 fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
     let mut station = match config::load(config_path) {
         Ok(s) => s,

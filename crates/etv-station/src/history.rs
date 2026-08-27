@@ -47,7 +47,7 @@
 //! what the old file path carried implicitly; a shared table has to carry it
 //! explicitly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -132,6 +132,12 @@ pub enum HistoryError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A `start_ns` that is not a representable instant. Only reachable through
+    /// a row this module did not write, since [`to_ns`] round-trips everything
+    /// it stores.
+    #[error("history row has an unrepresentable start_ns: {ns}")]
+    CorruptTimestamp { ns: i64 },
 }
 
 /// Ordered migrations for the history database. Same discipline as the
@@ -196,6 +202,14 @@ fn apply_migrations(conn: &Connection) -> Result<(), HistoryError> {
 /// integer never has to represent a leap second or an ambiguous local time.
 fn to_ns(dt: OffsetDateTime) -> i64 {
     dt.unix_timestamp_nanos() as i64
+}
+
+/// The inverse of [`to_ns`], for the one caller that hands instants back out
+/// ([`HistoryDb::airing_keys`]). A value this rejects is not a timestamp this
+/// module ever wrote, so it is a corrupt row rather than a rounding question.
+fn from_ns(ns: i64) -> Result<OffsetDateTime, HistoryError> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns))
+        .map_err(|_| HistoryError::CorruptTimestamp { ns })
 }
 
 /// What one call to [`HistoryDb::migrate_channel`] did.
@@ -350,6 +364,77 @@ impl HistoryDb {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every `(entry_id, start)` pair on record for `channel`.
+    ///
+    /// The identity a repair pass compares on: an airing is "already known" if
+    /// this channel has a row for that entry at that instant. Exposed as
+    /// `OffsetDateTime` so the nanosecond storage key stays inside this module.
+    pub fn airing_keys(
+        &self,
+        channel: &str,
+    ) -> Result<HashSet<(String, OffsetDateTime)>, HistoryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT entry_id, start_ns FROM airings WHERE channel = ?1")?;
+        let rows = stmt.query_map(params![channel], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = HashSet::new();
+        for row in rows {
+            let (entry_id, ns) = row?;
+            out.insert((entry_id, from_ns(ns)?));
+        }
+        Ok(out)
+    }
+
+    /// Insert only the airings this channel does not already hold, keyed on
+    /// `(entry_id, start)`. Returns how many rows were written.
+    ///
+    /// [`Self::record`] inserts unconditionally, which is right for a
+    /// generation laying down a schedule it has just computed — nothing it
+    /// emits can already be on record. A repair pass ([`crate::backfill`])
+    /// replays airings straight off the playout files, most of which the
+    /// ledger already holds, so it needs the other semantic. Doing the dedupe
+    /// here rather than in the caller is what keeps the nanosecond key an
+    /// implementation detail of this module.
+    ///
+    /// One read of the channel's keys, then one transaction: a channel's whole
+    /// ledger is a few thousand rows, and the alternative is a round trip per
+    /// candidate item.
+    pub fn record_missing(
+        &self,
+        channel: &str,
+        records: &[PlayRecord],
+    ) -> Result<usize, HistoryError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut present: HashSet<(String, i64)> = HashSet::new();
+        {
+            let mut stmt =
+                tx.prepare("SELECT entry_id, start_ns FROM airings WHERE channel = ?1")?;
+            let rows = stmt.query_map(params![channel], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                present.insert(row?);
+            }
+        }
+        let mut inserted = 0;
+        for r in records {
+            // `insert` returns false when the pair was already there, which
+            // also de-duplicates within `records` itself — two playout files
+            // naming the same airing cannot double-count.
+            if present.insert((r.entry_id.clone(), to_ns(r.start))) {
+                insert_record(&tx, channel, r)?;
+                inserted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 
     /// What each series on `channel` played last — the resume cursor,

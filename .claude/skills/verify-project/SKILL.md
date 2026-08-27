@@ -116,6 +116,37 @@ from a previous one.
 already built. To force real work, change the channel config or clear that channel's
 output dir.
 
+## Verifying the ledger has no holes (`--backfill-history`)
+
+Every airing in a channel's playout JSON must have a row in `playout/history.db`. When it
+does not, that channel reads as having no past: its `advance = "resume"` pools restart every
+series at its top, and the adjacency seam stops seeing what just aired. The symptom on
+screen is a channel replaying the same few titles and the same first three episodes of every
+show, forever.
+
+The dry run is the check — it reports what is missing and writes nothing:
+
+```bash
+./target/debug/etv-station --config examples/station-test.yaml --backfill-history --dry-run
+# healthy: "N channels, M airings on disk, would insert 0"
+# damaged: one line per channel naming the count and the span it would fill
+```
+
+Drop `--dry-run` to repair. It inserts only what is missing, so a second run must report
+`inserted 0` — that idempotence is the thing to assert, not the first run's count.
+
+Against prod it is `admin backfill-history [--dry-run]`, which runs it inside the container.
+It recovers only what is still on disk; `retention_days` prunes elapsed chunks, so a hole
+older than that window is unrecoverable and the count will not add up to the damage.
+
+The hole this repairs came from the coverage-heal path truncating history from the instant
+its wipe started while regeneration resumed at the surviving frontier
+(`daemon.rs`, `coverage.heal`). That is fixed, and
+`a_coverage_heal_keeps_rows_for_the_airings_it_leaves_on_disk` in `daemon.rs` is the
+regression test — it punches a hole *inside* a chunk (not by deleting the file, which makes
+`regen_from` and the frontier coincide and loses nothing) and asserts no airing on disk ends
+up without a row.
+
 ## Verifying a restart's resume decision (skip vs rewind)
 
 On startup, `daemon.rs:2181`/`:2211` decides, per channel, whether a written-but-unaired
