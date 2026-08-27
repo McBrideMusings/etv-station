@@ -2344,7 +2344,21 @@ async fn pattern_catch_up(
         // if it survives, else leave the pools as they are and accept a possible
         // seam glitch — either way the black is gone once the loop regenerates.
         resume.rewind_to(regen_from);
-        ctx.history_db.truncate_from(&channel.name, regen_from)?;
+        // Truncate the ledger from where regeneration will actually resume, not
+        // from `regen_from`. The wipe deliberately spares the chunk file that
+        // *contains* `regen_from`, so coverage — and the airings describing it —
+        // survive past that instant. Truncating from `regen_from` deleted those
+        // rows, and the generation loop below then picked up at the surviving
+        // frontier, so nothing ever rewrote them: each heal punched a hole in
+        // the ledger exactly as wide as the chunk it spared, for content that
+        // still aired. Both consumers read the result as "this channel has no
+        // past" — the resume cursor restarts every series at its top, and the
+        // adjacency seam stops seeing what just aired.
+        let resume_at = scan::highest_finish(&scan::scan_output_folder(output).await?)
+            .await
+            .unwrap_or(regen_from)
+            .max(regen_from);
+        ctx.history_db.truncate_from(&channel.name, resume_at)?;
         crate::resume::save(output, &resume).await?;
         tracing::warn!(
             event = "coverage.heal",
@@ -2352,6 +2366,7 @@ async fn pattern_catch_up(
             phase = phase,
             gap = %gap,
             regen_from = %regen_from,
+            truncated_from = %resume_at,
             removed = removed,
             "coverage hole found; wiped the affected chunk onward to regenerate it",
         );
@@ -2805,6 +2820,171 @@ params = "color=c=green [out0]"
             history,
             history_db,
         }
+    }
+
+    /// Every airing the playout files describe, oldest first.
+    async fn airings_on_disk(folder: &Path) -> Vec<(String, OffsetDateTime)> {
+        let mut files = scan::scan_output_folder(folder).await.unwrap();
+        files.sort_by_key(|f| f.start);
+        let mut out = Vec::new();
+        for file in &files {
+            let bytes = tokio::fs::read(&file.path).await.unwrap();
+            let playout: ersatztv_playout::playout::Playout =
+                serde_json::from_slice(&bytes).unwrap();
+            for item in playout.items {
+                out.push((item.id, item.start));
+            }
+        }
+        out.sort_by_key(|(_, start)| *start);
+        out
+    }
+
+    /// A coverage heal must not delete ledger rows for airings it leaves on
+    /// disk.
+    ///
+    /// `wipe_playout_from` deliberately spares the chunk file *containing*
+    /// `regen_from`, so coverage survives past that instant — but the heal used
+    /// to truncate the ledger from `regen_from` anyway, and the generation loop
+    /// then resumed at the surviving frontier rather than at `regen_from`. The
+    /// rows in between were deleted and nothing ever rewrote them, so each heal
+    /// punched a hole in the ledger the width of the chunk it had just spared,
+    /// for schedule that still aired.
+    ///
+    /// The invariant asserted here is the one that matters to every consumer of
+    /// the ledger: **an airing that is on disk has a row.** A ledger that fails
+    /// it reads as "this channel has no past", which restarts every series at
+    /// its top (`pattern::pool_runtime`'s resume block) and blinds the
+    /// adjacency seam to what just aired.
+    /// Like [`ch`] but with items that do not divide the chunk, so one
+    /// straddles every chunk boundary. That is what makes `regen_floor` advance
+    /// `regen_from` *into* a chunk rather than land on its edge — and a
+    /// `regen_from` inside a chunk is what makes `wipe_playout_from` spare that
+    /// chunk, leaving coverage (and airings) past the instant the heal wiped
+    /// from. Without a straddle there is no spared chunk and nothing to lose.
+    fn ch_straddling(dir: &tempfile::TempDir) -> LoadedChannel {
+        let entry = |color: &str| {
+            format!(
+                r#"
+[[rule.blocks.entries]]
+kind = "item"
+in_point = "0s"
+out_point = "2h30m"
+[rule.blocks.entries.source]
+kind = "lavfi"
+params = "color=c={color} [out0]"
+"#
+            )
+        };
+        let config: ChannelConfig = toml::from_str(&format!(
+            r#"
+window_days = 1
+chunk_hours = 6
+roll_interval = "1h"
+
+[[rule.blocks]]
+mode = "all"
+order = "manual"
+{}{}{}"#,
+            entry("blue"),
+            entry("red"),
+            entry("green"),
+        ))
+        .expect("fixture channel config parses");
+        LoadedChannel {
+            overlays: Default::default(),
+            name: "straddlech".into(),
+            config_path: PathBuf::from("straddlech.toml"),
+            output_folder: dir.path().to_path_buf(),
+            config,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_coverage_heal_keeps_rows_for_the_airings_it_leaves_on_disk() {
+        let dir = tempdir().unwrap();
+        let channel = ch_straddling(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = HistoryDb::open_in_memory().unwrap();
+        let mut catalog: Option<Catalog> = None;
+
+        let resume = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            crate::resume::ResumeMap::new(),
+            "startup",
+        )
+        .await
+        .expect("a hermetic lavfi channel resolves cleanly");
+
+        let files = {
+            let mut f = scan::scan_output_folder(&channel.output_folder)
+                .await
+                .unwrap();
+            f.sort_by_key(|x| x.start);
+            f
+        };
+        assert!(
+            files.len() >= 3,
+            "need a middle chunk to punch out; got {} files",
+            files.len(),
+        );
+
+        // Punch the hole *inside* a chunk rather than by deleting the file, so
+        // that chunk keeps items on the far side of the gap. That is the shape
+        // that loses rows: the gap sits inside chunk N, so `boundary` is chunk
+        // N's start, `regen_floor` advances past it to the straddling finish of
+        // chunk N-1, and `wipe_playout_from` then spares chunk N — whose later
+        // items keep airing while the ledger is truncated from the earlier
+        // instant. Deleting the whole file instead makes `regen_from` and the
+        // surviving frontier coincide, and nothing is lost.
+        let holed = files[1].path.clone();
+        let bytes = tokio::fs::read(&holed).await.unwrap();
+        let mut doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let items = doc
+            .get_mut("items")
+            .and_then(|i| i.as_array_mut())
+            .expect("a chunk file has an items array");
+        assert!(
+            items.len() >= 3,
+            "need a chunk with items on both sides of the hole; got {}",
+            items.len(),
+        );
+        items.remove(1);
+        tokio::fs::write(&holed, serde_json::to_vec(&doc).unwrap())
+            .await
+            .unwrap();
+
+        // Startup phase so the heal scans the whole window rather than the next
+        // two roll intervals — the hole is hours out, not at the playhead.
+        pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            resume,
+            "startup",
+        )
+        .await
+        .expect("the heal regenerates the wiped span");
+
+        let on_disk = airings_on_disk(&channel.output_folder).await;
+        assert!(
+            !on_disk.is_empty(),
+            "the channel should still have playout after healing",
+        );
+        let recorded = history_db.airing_keys(&channel.name).unwrap();
+        let orphaned: Vec<_> = on_disk
+            .iter()
+            .filter(|key| !recorded.contains(*key))
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "{} airings are on disk with no ledger row; first is {:?}. A heal truncated \
+             history past what it actually wiped.",
+            orphaned.len(),
+            orphaned.first(),
+        );
     }
 
     /// Assertion 2 below (`unaired_inputs_match`) is the actual startup
