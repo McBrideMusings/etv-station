@@ -269,6 +269,7 @@ pub enum PipelineInput {
     Overlay {
         input_source: InputSource,
         path: String,
+        read_rate: ReadRate,
     },
 }
 
@@ -552,6 +553,17 @@ impl Pipeline {
                     framerate: overlay.framerate,
                 }),
                 path: overlay.fifo_path.clone(),
+                // Paced independent of the main video's own read_rate (which is
+                // Unthrottled for live/lavfi sources): the overlay writer only
+                // ever produces frames at wall-clock speed, and pacing ffmpeg's
+                // reads of this pipe to match is what keeps a whole frame sitting
+                // in the pipe by the time ffmpeg reads it. Without this, ffmpeg
+                // drains the pipe as fast as it can loop, outrunning the writer
+                // and handing the rawvideo demuxer a partial frame — which it
+                // treats as fatal rather than retrying.
+                read_rate: ReadRate::Realtime {
+                    initial_burst: Duration::ZERO,
+                },
             });
 
             let secondary_initial_state = FrameState {
@@ -962,10 +974,13 @@ impl Pipeline {
                     watermark_label = Some(format!("{}:{}", watermark_input_index, index))
                 }
                 PipelineInput::Overlay {
-                    input_source, path, ..
+                    input_source,
+                    path,
+                    read_rate,
                 } => {
                     if !distinct_paths.contains(&path.as_str()) {
                         distinct_paths.push(path.as_str());
+                        result.extend(read_rate.as_args());
                         result.extend(input_source.args_for_input());
                         result.extend(args!["-i", path.to_owned()]);
                     }
@@ -1234,6 +1249,155 @@ mod tests {
         assert!(
             args.contains("overlay"),
             "expected an overlay filter drawing the picture subtitle onto the video; args: {args}"
+        );
+    }
+
+    /// Regression test for the black/silence fallback dying with
+    /// `[rawvideo] Invalid buffer size, packet size N < expected frame_size M`.
+    ///
+    /// The fallback's main video track is `-f lavfi color=black`, which has no
+    /// file behind it for `-readrate` to pace — see [`ReadRate`]'s docs. That
+    /// left ffmpeg free to drain the live overlay rawvideo pipe as fast as it
+    /// could loop, handing the demuxer short reads whenever it outran the
+    /// overlay writer. Pins that the overlay input gets its own `-readrate`,
+    /// independent of the main video's, so it stays paced even when nothing
+    /// else in the graph is.
+    #[test]
+    fn overlay_pipe_is_read_rate_limited_even_when_main_video_is_unthrottled() {
+        use time::OffsetDateTime;
+
+        use crate::frame_rate::FrameRate;
+        use crate::frame_size::FrameSize;
+        use crate::input::{InputSource, LavfiInputSource, OverlayInput, ProbedInput};
+        use crate::output_format::OutputFormat;
+        use crate::output_settings::{AudioOutputSettings, ScalingMode};
+        use crate::probe::{
+            CodecType, ProbeResult, ProbeResultAudioStream, ProbeResultColorParams,
+            ProbeResultStream, ProbeResultVideoStream,
+        };
+
+        let path = String::from("color=c=black:s=1280x720");
+        let source = InputSource::Lavfi(LavfiInputSource {
+            params: path.clone(),
+        });
+
+        let video_stream = ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
+            stream_index: 0,
+            codec: String::from("rawvideo"),
+            codec_type: CodecType::Video,
+            profile: String::new(),
+            height: Some(720),
+            width: Some(1280),
+            frame_rate: FrameRate::default(),
+            sample_aspect_ratio: Some(String::from("1:1")),
+            display_aspect_ratio: None,
+            pix_fmt: String::from("yuv420p"),
+            color_params: ProbeResultColorParams {
+                color_range: None,
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+            },
+            field_order: None,
+            language: None,
+        }));
+        let audio_stream = ProbeResultStream::Audio(ProbeResultAudioStream {
+            stream_index: 0,
+            codec: String::from("pcm_s16le"),
+            channels: 2,
+        });
+
+        let probe_result = ProbeResult {
+            path: path.clone(),
+            streams: vec![video_stream, audio_stream],
+            duration: None,
+            format_name: None,
+        };
+
+        let probed = |stream_index: Option<u32>| ProbedInput {
+            input_source: source.clone(),
+            probe_result: probe_result.clone(),
+            in_point: Duration::ZERO,
+            out_point: Duration::from_secs(60),
+            stream_index,
+        };
+
+        let input_settings = InputSettings {
+            start: OffsetDateTime::UNIX_EPOCH,
+            audio_input: probed(None),
+            video_input: probed(None),
+            subtitle_input: None,
+            watermark_input: None,
+            overlay_input: Some(OverlayInput {
+                fifo_path: String::from("pipe:10"),
+                pixel_format: String::from("rgba"),
+                width: 1280,
+                height: 720,
+                framerate: 30,
+                x: 0,
+                y: 0,
+            }),
+            subtitle_language_tag: String::from("en"),
+        };
+
+        let output_settings = OutputSettings {
+            audio: AudioOutputSettings {
+                format: Some(AudioFormat::Aac),
+                bitrate: Some(Kbps(192)),
+                buffer: Some(Kbps(384)),
+                channels: Some(2),
+                sample_rate: Some(Hz(48000)),
+                loudness: None,
+            },
+            video_format: Some(VideoFormat::H264),
+            bit_depth: Some(8),
+            video_bitrate: Some(Kbps(5000)),
+            video_buffer: Some(Kbps(10000)),
+            video_size: Some(FrameSize {
+                width: 1280,
+                height: 720,
+            }),
+            scaling_mode: ScalingMode::ScaleAndPad,
+            filter_options: VideoFilterOptions::default(),
+            deinterlace: false,
+            accel: None,
+            format: OutputFormat::Hls {
+                playlist: String::from("/tmp/live.m3u8"),
+                segment_template: String::from("/tmp/segment_%03d.ts"),
+                troubleshoot: false,
+            },
+            pts_offset: None,
+            // Mirrors the black/silence fallback: a lavfi source has no file
+            // for `-readrate` to pace, so ffmpeg reads it unthrottled.
+            read_rate: ReadRate::Unthrottled,
+            frame_rate: None,
+            subtitle_mode: SubtitleMode::Burn,
+            fonts_folder: None,
+            subtitle_force_style: None,
+            reports_folder: None,
+            report_id: None,
+        };
+
+        let ffmpeg_info = FfmpegInfo::default();
+        let mut pipeline = Pipeline::full(&ffmpeg_info, input_settings, output_settings)
+            .expect("pipeline should build for a lavfi source with a live overlay");
+        pipeline.optimize();
+        let args = pipeline.args();
+
+        let pipe_index = args
+            .iter()
+            .position(|a| a == "pipe:10")
+            .expect("overlay input path pipe:10 should appear in the ffmpeg args");
+        let readrate_immediately_precedes_pipe = args.get(..pipe_index).is_some_and(|before| {
+            before
+                .windows(2)
+                .rev()
+                .take(10)
+                .any(|pair| pair == ["-readrate", "1.0"])
+        });
+        assert!(
+            readrate_immediately_precedes_pipe,
+            "expected -readrate 1.0 in the overlay input's own arg block, right before pipe:10; args: {args:?}"
         );
     }
 }
