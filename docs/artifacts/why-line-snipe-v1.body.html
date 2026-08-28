@@ -1,0 +1,353 @@
+<style>
+  /* Copied verbatim from deploy/appdata/station.yaml overlay.layers and
+     shared/now-next-snipe.rhai's config defaults — not imported. Every number
+     below is the one the Vello renderer actually uses. */
+  :root {
+    --ov-font: Helvetica, "Helvetica Neue", Arial, sans-serif;
+    --scrim-h: 150px;
+    --scrim-a: 0.686;   /* [0,0,0,175] */
+    --label-size: 14px; --label-a: 0.588;  /* [255,255,255,150] */
+    --value-size: 23px; --value-a: 0.961;  /* [255,255,255,245] */
+    --sub-size: 16px;   --sub-a: 0.667;    /* [255,255,255,170] */
+    --margin: 40px;     /* every text layer's corner margin */
+    --indent: 76px;     /* value_indent_px */
+    --sub-row: 26px;    /* sub_row_px */
+  }
+
+  /* Broadcast graphics are judged against a dark surround, not a document
+     page — the prototype brings its own ground. */
+  .sn-wrap {
+    background: #0a0c11;
+    padding: 26px 24px 48px;
+    min-height: 100%;
+    width: 100%;
+    box-sizing: border-box;
+    overflow-x: hidden;
+    display: flex; flex-direction: column; align-items: center; gap: 20px;
+  }
+
+  /* The frame is authored at exactly 1280x720 so every px below is the px the
+     renderer uses; the stage scales the whole thing down when the viewport is
+     narrower, rather than cropping it. */
+  .sn-stage { flex: none; overflow: hidden; }
+  .sn-frame {
+    position: relative;
+    width: 1280px; height: 720px;
+    transform-origin: top left;
+    overflow: hidden;
+    font-family: var(--ov-font);
+    background:
+      radial-gradient(70% 90% at 26% 30%, #33506e 0%, rgba(0,0,0,0) 62%),
+      radial-gradient(90% 110% at 80% 82%, #7a4a1e 0%, #2b1a0d 40%, rgba(0,0,0,0) 72%),
+      linear-gradient(#0a0f18, #05070c);
+  }
+  /* Something with edges under the graphic, so the scrim is doing real work. */
+  .sn-frame::before {
+    content: "";
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(101deg, rgba(255,255,255,0.055) 0 3px, rgba(0,0,0,0) 3px 26px);
+    pointer-events: none;
+  }
+
+  .sn-scrim {
+    position: absolute; left: 0; right: 0; bottom: 0; height: var(--scrim-h);
+    /* vello_renderer.rs:249 — a scrim is a gradient across the whole band,
+       opaque at the frame edge, zero alpha at `size`. Not a flat plate. */
+    background: linear-gradient(to top, rgba(0,0,0,var(--scrim-a)) 0%, rgba(0,0,0,0) 100%);
+    will-change: opacity;
+  }
+
+  .sn-row { position: absolute; left: 0; bottom: 0; white-space: nowrap; will-change: transform, opacity; }
+  .sn-label { font-size: var(--label-size); color: rgba(255,255,255,var(--label-a)); letter-spacing: 0.16em; font-weight: 700; }
+  .sn-value { font-size: var(--value-size); color: rgba(255,255,255,var(--value-a)); font-weight: 500; }
+  .sn-sub   { font-size: var(--sub-size);  color: rgba(255,255,255,var(--sub-a)); }
+  .sn-value .sn-inline { font-size: 15px; color: rgba(255,255,255,0.52); }
+
+  /* The 1280px right edge, so an overrunning line is visibly overrunning and
+     not just "off screen somewhere". */
+  .sn-frame[data-edge="on"]::after {
+    content: "";
+    position: absolute; top: 0; bottom: 0; right: 0; width: 2px;
+    background: rgba(255, 96, 72, 0.85);
+  }
+
+  /* A zero-height probe: the honest available width, measured without
+     measuring anything this script writes to. */
+  .sn-probe { width: 100%; height: 0; }
+
+  .sn-meta {
+    width: 100%; max-width: 1280px;
+    display: flex; gap: 26px; align-items: baseline; flex-wrap: wrap;
+    font-family: var(--ov-font); font-size: 12px;
+    color: rgba(255,255,255,0.45); letter-spacing: 0.05em;
+  }
+  .sn-meta b { color: rgba(255,255,255,0.82); font-weight: 600; }
+  .sn-meta code { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: rgba(255,255,255,0.62); }
+
+  .sn-note {
+    width: 100%; max-width: 1280px;
+    font-family: var(--ov-font); font-size: 13px; line-height: 1.6;
+    color: rgba(255,255,255,0.52);
+  }
+  .sn-note b { color: rgba(255,255,255,0.88); font-weight: 600; }
+  .sn-note code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: rgba(255,255,255,0.7); }
+</style>
+
+<nav data-axis="why" data-label="Why case">
+  <button data-value="bridge">Bridge title<em>Because you watched Heat</em></button>
+  <button data-value="keyword">Keyword rung<em>the fallback when nothing watched matches</em></button>
+  <button data-value="explore">Explore pick<em>source = "explore" — a different sentence</em></button>
+  <button data-value="overflow">Overflow<em>48 chars against a 40-char clip</em></button>
+  <button data-value="none">No why<em>an episode: plain expr pool, no metadata</em></button>
+</nav>
+
+<nav data-axis="speed" data-label="Playback">
+  <button data-value="1">Real time<em>rise 0.45s, hold 4.5s, fall 0.35s</em></button>
+  <button data-value="0.3">0.3&times;<em>watch the stagger cascade</em></button>
+  <button data-value="hold">Freeze on NOW<em>judge the typography still</em></button>
+</nav>
+
+<aside data-rail-note><b>Scope.</b> The NOW card only — NEXT stays one row by decision. Cycle is 12s here; production <code>interval_secs</code> is 300. Every colour, size and margin is read off <code>deploy/appdata/station.yaml</code>; every easing curve is ported from <code>now-next-snipe.rhai</code>.</aside>
+
+<template data-variant="Subtitle" data-motion data-caption="Today's layer-3 treatment, unchanged — only the string is new">
+  <div class="sn-wrap" data-cfg='{"mode":"row","x":"indent","size":16,"alpha":0.667,"italic":false,"tint":null,"subRow":26,"delay":"cascade","fade":false,"lead":null}'>
+    <div class="sn-probe"></div>
+    <div class="sn-stage">
+      <div class="sn-frame" data-edge="on">
+        <div class="sn-scrim"></div>
+        <div class="sn-row sn-label"></div>
+        <div class="sn-row sn-value"></div>
+        <div class="sn-row sn-sub"></div>
+      </div>
+    </div>
+    <div class="sn-meta"><span data-scale>1:1</span> <b>Subtitle</b> <span>16px · α 0.667 · x = 116 · row +26 · third stagger beat (0.16s)</span> <code>sub_row_px: 26</code></div>
+    <p class="sn-note"><b>Axis: none — this is the control.</b> The why line inherits the row the episode title already uses, at the size and alpha the spec already declares. Nothing in the renderer, the layer list, or the motion changes; only the text the script puts in layer 3. <b>Cost:</b> it reads as a sub-title of the film — the thing a viewer scans past — when it is the one line on this channel that isn't about the film at all. And at <code>sub_row_px: 26</code> against a 23px value row, the two rows sit about 7px apart: tight enough that they group as one block rather than as a statement and a footnote.</p>
+  </div>
+</template>
+
+<template data-variant="Annotation" data-motion data-caption="Its own voice — pulled to the label column, lighter, marked">
+  <div class="sn-wrap" data-cfg='{"mode":"row","x":"label","size":15,"alpha":0.5,"italic":true,"tint":null,"subRow":34,"delay":"cascade","fade":false,"lead":"—"}'>
+    <div class="sn-probe"></div>
+    <div class="sn-stage">
+      <div class="sn-frame" data-edge="on">
+        <div class="sn-scrim"></div>
+        <div class="sn-row sn-label"></div>
+        <div class="sn-row sn-value"></div>
+        <div class="sn-row sn-sub"></div>
+      </div>
+    </div>
+    <div class="sn-meta"><span data-scale>1:1</span> <b>Annotation</b> <span>15px · α 0.50 · italic · x = 40 (label column) · row +34 · em-dash lead</span> <code>value_indent_px: 0</code></div>
+    <p class="sn-note"><b>Axis: typographic differentiation.</b> The why line drops out of the value column back to the label column, so it starts left of the title rather than under it — a margin note, not a continuation. Italic and a lower alpha put it a register below the title in voice as well as in weight, and the em-dash lead reads as an aside in ordinary written English. Row gap widened from 26 to 34 so the two lines stop grouping. <b>Cost:</b> italic Helvetica at 15px over moving video is the least legible combination on offer here. And it breaks the left edge the label/value grid establishes: the why line starts at x = 40 while the title starts at x = 116, so the card carries two left margins instead of one. Frame width is not the problem — the longest realistic why line measures out around 400px in a 1280px frame.</p>
+  </div>
+</template>
+
+<template data-variant="Aside" data-motion data-caption="Arrives late and by fade alone, after the card has settled">
+  <div class="sn-wrap" data-cfg='{"mode":"row","x":"indent","size":16,"alpha":0.72,"italic":false,"tint":"warm","subRow":30,"delay":"late","fade":true,"lead":null}'>
+    <div class="sn-probe"></div>
+    <div class="sn-stage">
+      <div class="sn-frame" data-edge="on">
+        <div class="sn-scrim"></div>
+        <div class="sn-row sn-label"></div>
+        <div class="sn-row sn-value"></div>
+        <div class="sn-row sn-sub"></div>
+      </div>
+    </div>
+    <div class="sn-meta"><span data-scale>1:1</span> <b>Aside</b> <span>16px · α 0.72 · warm tint · x = 116 · row +30 · arrives rise + 0.55s, opacity only, no translate</span> <code>stagger_secs: n/a</code></div>
+    <p class="sn-note"><b>Axis: motion timing.</b> Every other variant assembles the why line as the card's third stagger beat, which says it is part of the card. This one lets the card land and finish, then fades the why in half a second later with no travel at all — so it reads as a thing the station adds after telling you what is on, which is what it is. Opacity without translate is the only way to arrive without competing with a card that has already stopped moving. <b>Cost:</b> it eats 0.55s of a 4.5s hold, so the line is fully legible for under four seconds. And a second entrance in a graphic that already had one is a motion budget most channels would not spend (see <code>design.md</code> Lens 1 — this surface is seen once per 300s, which is what licenses it here).</p>
+  </div>
+</template>
+
+<template data-variant="Inline" data-motion data-caption="No second row — a dimmer clause on the title line itself">
+  <div class="sn-wrap" data-cfg='{"mode":"inline","x":"indent","size":15,"alpha":0.52,"italic":false,"tint":null,"subRow":0,"delay":"cascade","fade":false,"lead":"·"}'>
+    <div class="sn-probe"></div>
+    <div class="sn-stage">
+      <div class="sn-frame" data-edge="on">
+        <div class="sn-scrim"></div>
+        <div class="sn-row sn-label"></div>
+        <div class="sn-row sn-value"></div>
+        <div class="sn-row sn-sub"></div>
+      </div>
+    </div>
+    <div class="sn-meta"><span data-scale>1:1</span> <b>Inline</b> <span>15px · α 0.52 · appended to the value row after a middot · sub row unused</span> <code>sub_row_px: 0</code></div>
+    <p class="sn-note"><b>Axis: layout.</b> The card stays one row. The why becomes a clause on the title line, set smaller and dimmer after a middot, so the whole card is one sentence read left to right and the eye never has to drop a line. It also leaves layer 3 free, which means an episode's <code>sub_title</code> and a film's why line stop competing for the same row on any channel that ever gets both. <b>Cost:</b> the two facts fuse into one line, so the why has no emphasis of its own — it reads as a trailing qualifier on the title rather than as the station saying something. Width holds for now: the longest case here ends around x = 830 of 1280, measured. That headroom is spent the moment <code>max_chars</code> rises above 40, and there is no second row left to fall back to.</p>
+  </div>
+</template>
+
+<script>
+  (function () {
+    // ---- ported verbatim from now-next-snipe.rhai -----------------------
+    function easeOutCubic(p) { var q = 1 - p; return 1 - q * q * q; }
+    function easeOutBack(p, s) { var q = p - 1; return 1 + (s + 1) * q * q * q + s * q * q; }
+    function easeInCubic(p) { return p * p * p; }
+
+    function elementAt(lt, delay, rise, hold, fall, distance, overshoot) {
+      var t = lt - delay;
+      if (t < 0) return { alpha: 0, dx: -distance };
+      if (t < rise) {
+        var p = t / rise;
+        return { alpha: easeOutCubic(p), dx: -distance * (1 - easeOutBack(p, overshoot)) };
+      }
+      var held = t - rise;
+      if (held < hold) return { alpha: 1, dx: 0 };
+      var leaving = held - hold;
+      if (leaving < fall) {
+        var q = leaving / fall;
+        return { alpha: 1 - easeInCubic(q), dx: -distance * easeInCubic(q) };
+      }
+      return { alpha: 0, dx: -distance };
+    }
+
+    // ---- the script's config defaults ----------------------------------
+    var RISE = 0.45, HOLD = 4.5, FALL = 0.35, GAP = 0.25,
+        STAGGER = 0.08, DIST = 140, OVERSHOOT = 0.9,
+        INTERVAL = 12;   // production default is 300; shortened so it loops
+
+    // ---- realistic content, one set per ladder rung --------------------
+    var CASES = {
+      bridge:   { now: "Highest 2 Lowest (2025)", why: "Because you watched Heat" },
+      keyword:  { now: "The Long Goodbye (1973)", why: "Because you watch neo-noir" },
+      explore:  { now: "Fallen Angels (1995)",    why: "A wildcard — nobody here has touched this" },
+      overflow: { now: "The Assassination of Jesse James by…", why: "Because Madi watched The Ballad of Buster Scruggs" },
+      none:     { now: "Paris, Texas (1984)",     why: "" }
+    };
+    var NEXT_TITLE = "Chungking Express (1994)";
+
+    var state = { why: "bridge", speed: "1" };
+    var t0 = performance.now();
+
+    // Fit the 1280x720 frame to whatever width the device frame gives us,
+    // rather than cropping its left edge off. Driven off the viewport, never
+    // off a measured element — measuring something this writes to is how a
+    // resize loop starts.
+    var lastK = null;
+    function fit() {
+      var probe = document.querySelector(".sn-probe");
+      if (!probe) return;
+      var avail = probe.offsetWidth;
+      if (avail <= 0) return;
+      var k = Math.min(1, avail / 1280);
+      if (k === lastK) return;
+      lastK = k;
+      document.querySelectorAll(".sn-stage").forEach(function (stage) {
+        var frame = stage.querySelector(".sn-frame");
+        if (!frame) return;
+        frame.style.transform = "scale(" + k + ")";
+        stage.style.width = (1280 * k) + "px";
+        stage.style.height = (720 * k) + "px";
+      });
+      document.querySelectorAll("[data-scale]").forEach(function (el) {
+        el.textContent = k === 1 ? "1:1" : Math.round(k * 100) + "%";
+      });
+    }
+    addEventListener("resize", fit);
+
+    function cfgOf(wrap) {
+      try { return JSON.parse(wrap.getAttribute("data-cfg")); } catch (e) { return null; }
+    }
+
+    function tick(nowMs) {
+      fit();
+      document.querySelectorAll(".sn-wrap").forEach(function (wrap) {
+        var cfg = cfgOf(wrap);
+        if (!cfg) return;
+        var frame = wrap.querySelector(".sn-frame");
+        var elScrim = wrap.querySelector(".sn-scrim");
+        var elLabel = wrap.querySelector(".sn-label");
+        var elValue = wrap.querySelector(".sn-value");
+        var elSub = wrap.querySelector(".sn-sub");
+        if (!frame || !elScrim || !elLabel || !elValue || !elSub) return;
+
+        var c = CASES[state.why];
+        var hasWhy = c.why !== "";
+        var frozen = state.speed === "hold";
+        var rate = frozen ? 1 : parseFloat(state.speed);
+
+        var cardLen = RISE + HOLD + FALL + STAGGER;
+        var nextStart = cardLen + GAP;
+
+        var t;
+        if (frozen) {
+          t = RISE + 1.2;                       // parked mid-hold, everything settled
+        } else {
+          t = (((nowMs - t0) / 1000) * rate) % INTERVAL;
+        }
+
+        // Which card, and how far into its own timeline.
+        var label = "", value = "", lt = -1, isNow = false;
+        if (t < cardLen) { label = "NOW"; value = c.now; lt = t; isNow = true; }
+        else if (t >= nextStart && t < nextStart + cardLen) { label = "NEXT"; value = NEXT_TITLE; lt = t - nextStart; }
+
+        var showing = lt >= 0 && value !== "";
+        var mLabel = showing ? elementAt(lt, 0, RISE, HOLD, FALL, DIST, OVERSHOOT) : { alpha: 0, dx: -DIST };
+        var mValue = showing ? elementAt(lt, STAGGER, RISE, HOLD, FALL, DIST, OVERSHOOT) : { alpha: 0, dx: -DIST };
+
+        // The why line's own timing is the variant's whole motion axis.
+        var mSub;
+        if (!showing || !isNow || !hasWhy || cfg.mode === "inline") {
+          mSub = { alpha: 0, dx: -DIST };
+        } else if (cfg.delay === "late") {
+          // Fade in only, starting after the card has fully landed. Leaves with
+          // the card so nothing is left hanging on an empty frame.
+          var lead = RISE + 0.55, span = 0.5;
+          var a = 0;
+          if (lt >= lead) {
+            var into = lt - lead;
+            a = into < span ? easeOutCubic(into / span) : 1;
+          }
+          mSub = { alpha: Math.min(a, mValue.alpha), dx: 0 };
+        } else {
+          mSub = elementAt(lt, STAGGER * 2, RISE, HOLD, FALL, DIST, OVERSHOOT);
+        }
+
+        // ---- paint -----------------------------------------------------
+        elScrim.style.opacity = mLabel.alpha;
+
+        var subRow = cfg.subRow;
+        elLabel.textContent = label;
+        elLabel.style.left = "40px";
+        elLabel.style.bottom = (40 + subRow) + "px";
+        elLabel.style.opacity = mLabel.alpha;
+        elLabel.style.transform = "translateX(" + mLabel.dx + "px)";
+
+        var inlineWhy = (cfg.mode === "inline" && isNow && hasWhy)
+          ? ' <span class="sn-inline">' + cfg.lead + " " + c.why + "</span>"
+          : "";
+        var markup = value.replace(/&/g, "&amp;").replace(/</g, "&lt;") + inlineWhy;
+        // Only touch the DOM when the string actually changes — this runs at
+        // 60fps and innerHTML is the expensive call in the loop.
+        if (elValue.getAttribute("data-drawn") !== markup) {
+          elValue.innerHTML = markup;
+          elValue.setAttribute("data-drawn", markup);
+        }
+        elValue.style.left = "116px";
+        elValue.style.bottom = (40 + subRow) + "px";
+        elValue.style.opacity = mValue.alpha;
+        elValue.style.transform = "translateX(" + mValue.dx + "px)";
+
+        var whyText = (cfg.lead && cfg.mode === "row") ? cfg.lead + " " + c.why : c.why;
+        elSub.textContent = whyText;
+        elSub.style.left = (cfg.x === "label" ? 40 : 116) + "px";
+        elSub.style.bottom = "40px";
+        elSub.style.fontSize = cfg.size + "px";
+        elSub.style.fontStyle = cfg.italic ? "italic" : "normal";
+        elSub.style.color = cfg.tint === "warm"
+          ? "rgba(255, 226, 186, " + cfg.alpha + ")"
+          : "rgba(255, 255, 255, " + cfg.alpha + ")";
+        elSub.style.opacity = mSub.alpha;
+        elSub.style.transform = "translateX(" + mSub.dx + "px)";
+      });
+      requestAnimationFrame(tick);
+    }
+
+    // The rail re-emits every live axis right after each mount, so a variant
+    // switch and the replay button both land here — no MutationObserver, which
+    // would see this loop's own DOM writes and reset the clock every frame.
+    addEventListener("at:axis", function (e) {
+      if (!(e.detail.axis in state)) return;
+      state[e.detail.axis] = e.detail.value;
+      if (e.detail.axis === "why") t0 = performance.now();  // restart so the card replays
+    });
+
+    requestAnimationFrame(tick);
+  })();
+</script>

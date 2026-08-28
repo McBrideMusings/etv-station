@@ -2009,6 +2009,74 @@ mod regen_floor_tests {
         );
     }
 
+    /// A forced refresh fires once. The marker is the whole protocol between
+    /// `--refresh-channel` and the daemon, so a marker that survived its own
+    /// consumption would refresh the channel on every tick forever.
+    #[tokio::test]
+    async fn a_refresh_request_is_consumed_exactly_once() {
+        let dir = tempdir().unwrap();
+        assert!(
+            !take_refresh_request(dir.path()).await.unwrap(),
+            "no marker, no refresh"
+        );
+        tokio::fs::write(refresh_request_path(dir.path()), b"")
+            .await
+            .unwrap();
+        assert!(take_refresh_request(dir.path()).await.unwrap());
+        assert!(
+            !take_refresh_request(dir.path()).await.unwrap(),
+            "the marker must not survive being acted on"
+        );
+    }
+
+    /// A refresh cuts at the next item boundary, never inside the item on
+    /// screen.
+    ///
+    /// This is the difference between applying a config edit and cutting the
+    /// stream mid-programme. `regen_floor` reads past the chunk filename to the
+    /// currently-airing item's real finish, so the film playing at `now`
+    /// survives whole and the wipe starts after it.
+    #[tokio::test]
+    async fn a_refresh_leaves_the_item_on_screen_intact() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        // Two films back to back; `now` lands inside the first.
+        let anchor = OffsetDateTime::now_utc() - time::Duration::minutes(30);
+        let items = vec![film("airing-now", 3600), film("later", 3600)];
+        let durations = vec![Duration::from_secs(3600), Duration::from_secs(3600)];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        let floor = regen_floor(&channel, now).await.unwrap();
+        assert!(
+            floor >= anchor + time::Duration::hours(1),
+            "the cut must land at or after the finish of the item now playing, got {floor}",
+        );
+        wipe_playout_from(&channel, floor).await.unwrap();
+
+        // The film on screen still covers `now` after the wipe.
+        let files = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        let covered = scan::highest_finish(&files).await.unwrap();
+        assert!(
+            covered >= now,
+            "the wipe took the item that is on screen: coverage ends {covered}, now is {now}",
+        );
+    }
+
     /// Nothing survived the wipe, so the wipe point is the honest cut — there
     /// is no coverage past it to describe.
     #[tokio::test]
@@ -2059,60 +2127,28 @@ mod regen_floor_tests {
     }
 }
 
-/// Hash a channel's would-be regeneration inputs (#182): its resolved
-/// candidate entry-id list (the pool/query half of resolution, no scorer
-/// `pick()`), and its config and overlay config bytes. The result is stored
-/// on the [`crate::resume::Checkpoint`] the generation it describes belongs
-/// to.
+/// Hash the channel's *configuration*: its config bytes and its resolved
+/// overlay, and nothing else. Stored as [`crate::resume::ResumeMap::config_id`],
+/// and compared against on every start and reload to decide whether the written
+/// future still reflects what the channel is configured to do.
 ///
-/// `resume_in` is deliberately not part of this hash. Generation is a pure
-/// function of `(catalog, config, resume_in)` (`docs/architecture.md`), but
-/// the checkpoint this value is stamped onto already carries `resume_in`
-/// structurally — it *is* the pool state and list position entering that
-/// generation — so hashing it too would just be comparing a value against
-/// itself. Hashing it was also the previous attempt's bug: the earliest
-/// unaired checkpoint changes on almost every roll tick, so a stored hash
-/// that included it went stale within one tick of being written (#182).
+/// The whole resolved cascade, not one file's bytes: an edit anywhere the
+/// overlay reads from — the station's declaration, the channel's, a block's, or
+/// a spec file any of them references — changes this. A channel with no overlay
+/// serializes to a fixed empty shape, so adding or removing one moves the hash
+/// rather than contributing nothing either way.
 ///
-/// Synchronous deliberately: `resolve_channel_fingerprint_ids` borrows
-/// `&Catalog`, and `Catalog` is not `Sync` (it wraps a `RefCell` connection).
-/// Held across an `.await` it would make the `tokio::spawn`ed channel-loop
-/// future non-`Send`; with no `.await` in this function, that borrow never
-/// has to survive one.
+/// **The catalog is deliberately absent.** An earlier version hashed the
+/// resolved candidate entry-id list alongside the config, which meant every
+/// Plex ingest that added or dropped a title read as "this channel changed" —
+/// and on a taste-scored channel that would rewrite the whole unaired schedule
+/// for a reason nobody configured. A new title reaches the screen as the window
+/// extends forward, which is soon enough. Dropping the catalog also makes this
+/// cheap and infallible: there is no query to run and no `&Catalog` to borrow.
 ///
-/// Returns `None` (and logs a warning naming the cause) on any failure to
-/// resolve or read — a channel this can't fingerprint always regenerates
-/// rather than skipping on a guess.
-fn channel_input_fingerprint(
-    channel: &LoadedChannel,
-    ctx: StationContext<'_>,
-    catalog: Option<&Catalog>,
-) -> Option<String> {
-    let ids = match crate::resolve::resolve_channel_fingerprint_ids(
-        &channel.config,
-        &channel.config_path,
-        ctx.identity_roots,
-        ctx.catalog.map(|info| &info.path_index),
-        catalog,
-    ) {
-        Ok(ids) => ids,
-        Err(error) => {
-            tracing::warn!(
-                event = "resume.fingerprint_error",
-                channel = %channel.name,
-                %error,
-                "could not resolve candidate entry ids for a generation fingerprint; regenerating as usual",
-            );
-            return None;
-        }
-    };
-
-    // The whole resolved cascade, not one file's bytes: an edit anywhere it
-    // reads from — the station's declaration, the channel's, a block's, or a
-    // spec file any of them references — changes this and forces a regeneration
-    // (#182). A channel with no overlay at all serializes to a fixed empty
-    // shape, so adding or removing one still moves the fingerprint rather than
-    // contributing nothing either way.
+/// Returns `None` only if the config or overlay cannot be serialized, which
+/// regenerates rather than skipping on a guess.
+fn channel_config_fingerprint(channel: &LoadedChannel) -> Option<String> {
     let overlay_bytes = match serde_json::to_vec(&channel.overlays) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2120,12 +2156,11 @@ fn channel_input_fingerprint(
                 event = "resume.fingerprint_error",
                 channel = %channel.name,
                 %error,
-                "could not serialize the resolved overlay for a generation fingerprint; regenerating as usual",
+                "could not serialize the resolved overlay; regenerating as usual",
             );
             return None;
         }
     };
-
     let config_bytes = match serde_json::to_vec(&channel.config) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2133,23 +2168,84 @@ fn channel_input_fingerprint(
                 event = "resume.fingerprint_error",
                 channel = %channel.name,
                 %error,
-                "could not serialize channel config for a generation fingerprint; regenerating as usual",
+                "could not serialize the channel config; regenerating as usual",
             );
             return None;
         }
     };
 
     let mut hasher = Sha256::new();
-    hasher.update((ids.len() as u64).to_le_bytes());
-    for id in &ids {
-        hasher.update(id.as_bytes());
-        hasher.update([0u8]);
-    }
     hasher.update((config_bytes.len() as u64).to_le_bytes());
     hasher.update(&config_bytes);
     hasher.update((overlay_bytes.len() as u64).to_le_bytes());
     hasher.update(&overlay_bytes);
     Some(format!("{:x}", hasher.finalize()))
+}
+
+/// The marker a forced refresh leaves for the daemon, consumed on the next
+/// pass. Written by `etv-station --refresh-channel`, which cannot do the
+/// refresh itself: the running daemon owns this channel's playout, and a second
+/// process rewriting it underneath would race the generation loop.
+fn refresh_request_path(output: &Path) -> PathBuf {
+    output.join(".refresh-request")
+}
+
+/// Whether a forced refresh was requested, removing the marker so it fires
+/// once. A marker that cannot be removed is reported as absent rather than
+/// refreshing on every tick forever.
+async fn take_refresh_request(output: &Path) -> Result<bool, StationError> {
+    let path = refresh_request_path(output);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            tracing::warn!(
+                event = "refresh.marker_stuck",
+                path = %path.display(),
+                %error,
+                "could not remove a refresh marker; ignoring it rather than refreshing every tick",
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Throw the schedule away from the next item boundary forward and let the
+/// generation loop rebuild it.
+///
+/// `regen_floor` is what makes this safe to run against a live channel: it
+/// advances past the item currently on screen to its real finish, so the wipe
+/// starts at the next programme rather than in the middle of this one.
+/// Everything before that — the whole aired past, and the item playing now — is
+/// left exactly as it is.
+async fn refresh_forward(
+    channel: &LoadedChannel,
+    ctx: StationContext<'_>,
+    resume: &mut crate::resume::ResumeMap,
+    now: OffsetDateTime,
+    reason: &'static str,
+) -> Result<(), StationError> {
+    let output = &channel.output_folder;
+    let regen_from = regen_floor(channel, now).await?;
+    let removed = wipe_playout_from(channel, regen_from).await?;
+    // Best-effort pool alignment: rewind to the checkpoint covering the cut if
+    // one survives, else leave the pools where they are and accept a seam
+    // glitch. Either way the stale schedule is gone.
+    resume.rewind_to(regen_from);
+    let cut = ledger_cut_after_wipe(output, regen_from).await?;
+    ctx.history_db.truncate_from(&channel.name, cut)?;
+    crate::resume::save(output, resume).await?;
+    tracing::info!(
+        event = "resume.refresh",
+        channel = %channel.name,
+        reason = reason,
+        from = %regen_from,
+        truncated_from = %cut,
+        removed = removed,
+        airings = ctx.history_db.count(&channel.name)?,
+        "regenerating the schedule from the next item boundary under the current config",
+    );
+    Ok(())
 }
 
 /// The emission loop for every channel: **materialize forward**.
@@ -2234,85 +2330,37 @@ async fn forward_channel_loop(
         "play history store ready",
     );
 
-    // Startup: throw away the future this channel had already written and
-    // generate it again from the config as it stands now.
+    // A config edit reaches the screen here: if the channel's configuration is
+    // not the one its written future was generated under, that future is thrown
+    // away from the next item boundary forward and regenerated under the new
+    // rules. What has aired, and what is on screen right now, is never touched —
+    // rewriting the currently-airing item would cut the stream mid-programme.
     //
-    // A wholesale wipe is not available: the output depends on where the pools
-    // had advanced to, and that state is gone once consumed.
-    // The checkpoint trail is what makes the same thing possible here — rewind
-    // the pools to the start of the earliest unaired generation, drop exactly
-    // the files from that instant on, and regenerate. What has already aired,
-    // or is airing now, is untouched. Without this, a config or overlay edit
-    // wouldn't reach a pattern channel until its entire written window had
-    // played out (#53).
+    // Bounded by the clock, not by the checkpoint trail. `prune_elapsed` drops
+    // checkpoints as they air, so a channel commonly holds one or none, and
+    // rewinding only as far as the earliest surviving checkpoint left up to a
+    // day of stale schedule in front of the viewer with no way to reach it. The
+    // pool state for a span with no checkpoint is gone, so the pools continue
+    // from where they now stand rather than from that generation's recorded
+    // position — a possible seam glitch, never black, and the same bargain
+    // `rewind_to` already documents.
     let now = OffsetDateTime::now_utc();
-    // #182: a checkpoint is only worth fingerprinting against if something is
-    // actually unaired — a fresh channel with no checkpoints, or one where
-    // every generation has already started airing, has nothing to skip and
-    // no fingerprint worth computing. This mirrors the check
-    // `rewind_to_unaired` makes internally, done here first so the (still
-    // real) resolve work below is skipped entirely on those channels.
-    let has_unaired = resume.checkpoints.iter().any(|c| c.start > now);
-    if has_unaired {
-        // Resolved synchronously, before any `.await`, so the `&Catalog`
-        // borrow it takes never has to be part of an async fn's captured
-        // state (see `channel_input_fingerprint`'s doc comment). The pool
-        // query this runs is real work — it is only the scorer's `pick()`
-        // that a match skips.
-        let inputs = channel_input_fingerprint(channel, ctx, catalog.as_ref());
-        let matched = inputs
-            .as_deref()
-            .is_some_and(|fp| resume.unaired_inputs_match(now, fp));
-        if matched {
-            tracing::info!(
-                event = "resume.skip",
-                channel = %channel.name,
-                "catalog, config, and overlay config unchanged since the unaired window was \
-                 written; keeping it as-is",
-            );
-        } else {
-            // Startup: throw away the future this channel had already
-            // written and generate it again from the config as it stands
-            // now.
-            //
-            // A wholesale wipe is not available: the output depends on
-            // where the pools had advanced to, and that state is gone once
-            // consumed. The checkpoint trail is what makes the same thing
-            // possible here — rewind the pools to the start of the earliest
-            // unaired generation, drop exactly the files from that instant
-            // on, and regenerate. What has already aired, or is airing now,
-            // is untouched. Without this, a config or overlay edit wouldn't
-            // reach a pattern channel until its entire written window had
-            // played out (#53).
-            let regen_from = resume
-                .rewind_to_unaired(now)
-                .expect("has_unaired just found a checkpoint at the same `now`");
-            let regen_from = regen_floor(channel, regen_from).await?;
-            let removed = wipe_playout_from(channel, regen_from).await?;
-            // Those airings are no longer scheduled, so they are no longer
-            // history. Because the resume position is a projection of the
-            // store, dropping them is also what rewinds each series — the
-            // two cannot disagree.
-            //
-            // Truncate from where regeneration will actually resume, for the
-            // same reason the coverage heal does: `wipe_playout_from` spares
-            // the chunk file containing `regen_from`, so coverage — and the
-            // airings describing it — survive past that instant, and the
-            // generation loop below picks up at the surviving frontier rather
-            // than at `regen_from`. Truncating from `regen_from` deleted the
-            // rows in between and nothing rewrote them.
-            let resume_at = ledger_cut_after_wipe(&channel.output_folder, regen_from).await?;
-            ctx.history_db.truncate_from(&channel.name, resume_at)?;
-            tracing::info!(
-                event = "resume.rewind",
-                channel = %channel.name,
-                from = %regen_from,
-                truncated_from = %resume_at,
-                removed = removed,
-                airings = ctx.history_db.count(&channel.name)?,
-                "rewound to the earliest unaired generation; regenerating it from the current config",
-            );
-        }
+    let config_id = channel_config_fingerprint(channel);
+    let forced = take_refresh_request(&channel.output_folder).await?;
+    let changed = config_id.is_some() && resume.config_id.as_deref() != config_id.as_deref();
+    if forced || (changed && resume.config_id.is_some()) {
+        refresh_forward(
+            channel,
+            ctx,
+            &mut resume,
+            now,
+            if forced { "forced" } else { "config" },
+        )
+        .await?;
+    }
+    if resume.config_id.as_deref() != config_id.as_deref() {
+        resume.config_id = config_id;
+        crate::resume::save(&channel.output_folder, &resume).await?;
     }
 
     resume = pattern_catch_up(channel, ctx, &mut catalog, resume, "startup").await?;
@@ -2328,6 +2376,32 @@ async fn forward_channel_loop(
                 return Ok(());
             }
             _ = interval.tick() => {
+                // `etv-station --refresh-channel` leaves a marker rather than
+                // rewriting playout itself, because this loop owns these files.
+                // Consumed here so a forced refresh lands on the next tick
+                // instead of waiting for a restart.
+                match take_refresh_request(&channel.output_folder).await {
+                    Ok(true) => {
+                        let now = OffsetDateTime::now_utc();
+                        if let Err(err) =
+                            refresh_forward(channel, ctx, &mut resume, now, "forced").await
+                        {
+                            tracing::error!(
+                                event = "refresh.error",
+                                channel = %channel.name,
+                                error = %err,
+                                "forced refresh failed; the schedule is unchanged",
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(err) => tracing::warn!(
+                        event = "refresh.error",
+                        channel = %channel.name,
+                        error = %err,
+                        "could not read the refresh marker",
+                    ),
+                }
                 let tick = async {
                     match pattern_catch_up(channel, ctx, &mut catalog, resume.clone(), "roll").await {
                         Ok(next) => resume = next,
@@ -2544,7 +2618,6 @@ async fn pattern_catch_up(
     // (outer) means "not computed yet"; `Some(None)` means "computed, and it
     // failed" — both are distinct from re-running the resolve on every
     // generation in a multi-generation catch-up.
-    let mut memoized_inputs: Option<Option<String>> = None;
 
     let mut generations = 0;
     while from < target {
@@ -2563,16 +2636,8 @@ async fn pattern_catch_up(
 
         // Record the state entering this generation before anything consumes
         // it, so the span it is about to write stays regenerable while it is
-        // still in the future. Stamped with the fingerprint of the inputs
-        // that produce it, so a later restart can tell whether this exact
-        // generation is still current without re-running the scorer (#182).
-        let inputs = memoized_inputs
-            .get_or_insert_with(|| {
-                let reader = catalog.as_ref();
-                channel_input_fingerprint(channel, ctx, reader)
-            })
-            .clone();
-        resume.checkpoint(from, inputs);
+        // still in the future.
+        resume.checkpoint(from);
 
         // Where each series left off comes from the play-history store, not
         // from a cursor of the sidecar's own (#70): one table, projected on
@@ -2851,56 +2916,6 @@ mod resume_fingerprint_survives_generation_tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// window_days=1 (24h) against three ~3h entries (9h/generation) chains
-    /// 2-3 generations per `pattern_catch_up` call — enough to exercise the
-    /// `resume = resume_out` swap more than once, without the ~240 tiny
-    /// generations a 30s entry list would produce for the same window.
-    fn ch(dir: &tempfile::TempDir) -> LoadedChannel {
-        let config: ChannelConfig = toml::from_str(
-            r#"
-window_days = 1
-chunk_hours = 6
-roll_interval = "1h"
-
-[[rule.blocks]]
-mode = "all"
-order = "manual"
-
-[[rule.blocks.entries]]
-kind = "item"
-in_point = "0s"
-out_point = "3h"
-[rule.blocks.entries.source]
-kind = "lavfi"
-params = "color=c=blue [out0]"
-
-[[rule.blocks.entries]]
-kind = "item"
-in_point = "0s"
-out_point = "3h"
-[rule.blocks.entries.source]
-kind = "lavfi"
-params = "color=c=red [out0]"
-
-[[rule.blocks.entries]]
-kind = "item"
-in_point = "0s"
-out_point = "3h"
-[rule.blocks.entries.source]
-kind = "lavfi"
-params = "color=c=green [out0]"
-"#,
-        )
-        .expect("fixture channel config parses");
-        LoadedChannel {
-            overlays: Default::default(),
-            name: "testch".into(),
-            config_path: PathBuf::from("testch.toml"),
-            output_folder: dir.path().to_path_buf(),
-            config,
-        }
-    }
-
     fn ctx<'a>(
         history: &'a SharedHistory,
         history_db: &'a HistoryDb,
@@ -3077,125 +3092,6 @@ order = "manual"
              history past what it actually wiped.",
             orphaned.len(),
             orphaned.first(),
-        );
-    }
-
-    /// Assertion 2 below (`unaired_inputs_match`) is the actual startup
-    /// decision at the top of `forward_channel_loop` (`event =
-    /// "resume.skip"` vs `event = "resume.rewind"`) — not a proxy for it.
-    /// Under the pre-2058edd design, `resume = resume_out` replaces the
-    /// whole map with `resolve_channel_with_resume`'s fresh `ResumeMap::new()`
-    /// (which carries only `pools`/`position`) on the very first generation,
-    /// so this returns `false` there where it must return `true` here.
-    #[tokio::test]
-    async fn a_generation_pass_leaves_every_unaired_checkpoint_fingerprinted() {
-        let dir = tempdir().unwrap();
-        let channel = ch(&dir);
-        let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
-        let mut catalog: Option<Catalog> = None;
-
-        let resume = pattern_catch_up(
-            &channel,
-            ctx(&history, &history_db, tz),
-            &mut catalog,
-            crate::resume::ResumeMap::new(),
-            "startup",
-        )
-        .await
-        .expect("a hermetic lavfi channel resolves cleanly");
-
-        let now = OffsetDateTime::now_utc();
-        let fp = channel_input_fingerprint(&channel, ctx(&history, &history_db, tz), None)
-            .expect("a manual entries block always fingerprints");
-
-        let unaired: Vec<_> = resume
-            .checkpoints
-            .iter()
-            .filter(|c| c.start > now)
-            .collect();
-        assert!(
-            !unaired.is_empty(),
-            "the fixture must chain more than one generation, or this test \
-             passes vacuously against a reverted fix",
-        );
-        assert!(
-            unaired
-                .iter()
-                .all(|c| c.inputs.as_deref() == Some(fp.as_str())),
-            "every unaired checkpoint must still carry the fingerprint after \
-             `resume = resume_out` ran on each generation",
-        );
-
-        // The literal decision a restart makes: true means it logs
-        // event="resume.skip", false means event="resume.rewind".
-        assert!(
-            resume.unaired_inputs_match(now, &fp),
-            "a restart right after this pass must see the fingerprint intact \
-             and skip rather than rewind",
-        );
-    }
-
-    /// Encodes the issue title literally: a roll tick fired after startup
-    /// must not wipe the fingerprints the startup pass just stamped, even
-    /// when the roll tick itself generates nothing new (the window is
-    /// already covered, so it hits `chunk.skip` and returns its input
-    /// map essentially unchanged) — the trail from startup must still read
-    /// intact afterwards.
-    #[tokio::test]
-    async fn a_roll_tick_after_the_window_is_covered_keeps_the_fingerprints() {
-        let dir = tempdir().unwrap();
-        let channel = ch(&dir);
-        let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
-        let mut catalog: Option<Catalog> = None;
-
-        let after_startup = pattern_catch_up(
-            &channel,
-            ctx(&history, &history_db, tz),
-            &mut catalog,
-            crate::resume::ResumeMap::new(),
-            "startup",
-        )
-        .await
-        .expect("startup pass resolves cleanly");
-
-        let after_roll = pattern_catch_up(
-            &channel,
-            ctx(&history, &history_db, tz),
-            &mut catalog,
-            after_startup,
-            "roll",
-        )
-        .await
-        .expect("roll pass resolves cleanly");
-
-        let now = OffsetDateTime::now_utc();
-        let fp = channel_input_fingerprint(&channel, ctx(&history, &history_db, tz), None)
-            .expect("a manual entries block always fingerprints");
-
-        let unaired: Vec<_> = after_roll
-            .checkpoints
-            .iter()
-            .filter(|c| c.start > now)
-            .collect();
-        assert!(
-            !unaired.is_empty(),
-            "a roll tick must not drop the trail entirely"
-        );
-        assert!(
-            unaired
-                .iter()
-                .all(|c| c.inputs.as_deref() == Some(fp.as_str())),
-            "a roll tick after the window is covered must not wipe the \
-             fingerprints the startup pass stamped",
-        );
-        assert!(
-            after_roll.unaired_inputs_match(now, &fp),
-            "a restart issued after this roll tick must still see \
-             event=\"resume.skip\", not event=\"resume.rewind\"",
         );
     }
 }

@@ -1,0 +1,455 @@
+<style>
+  /* etv-station overlay tokens, copied from deploy/appdata/shared/pierce-overlay.yaml
+     and now-next-snipe.rhai — not imported. The renderer draws Helvetica at
+     rgba(255,255,255,235) over live video; everything below matches that. */
+  :root {
+    --ov-font: Helvetica, "Helvetica Neue", Arial, sans-serif;
+    --ov-ink: rgba(255, 255, 255, 0.92);
+    --ov-ink-dim: rgba(255, 255, 255, 0.55);
+    --frame-w: 1280;
+    --frame-h: 720;
+    --bug-h: 56;      /* channel.yaml: height: 56 */
+    --bug-margin: 24; /* channel.yaml: margin: 24 */
+  }
+
+  /* A mark for live video is judged against a dark surround, never against a
+     document page — so the prototype brings its own ground rather than
+     borrowing the artifact's. */
+  .mk-page {
+    font-family: var(--ov-font);
+    color: var(--ov-ink);
+    background: #0a0c11;
+    padding: 30px 34px 48px;
+    max-width: 1180px;
+    margin: 0 auto;
+    min-height: 100%;
+  }
+
+  .mk-h {
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ov-ink-dim);
+    margin: 34px 0 12px;
+    font-weight: 700;
+  }
+  .mk-h:first-child { margin-top: 0; }
+
+  /* ---- the 1280x720 broadcast frame ------------------------------------ */
+  .frame {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1280 / 720;
+    overflow: hidden;
+    border-radius: 4px;
+    background: #05070c;
+  }
+  .frame[data-bd="night"] {
+    background:
+      radial-gradient(90% 120% at 78% 88%, #6b4a22 0%, #2a1c10 34%, rgba(0,0,0,0) 66%),
+      radial-gradient(60% 80% at 22% 18%, #16283f 0%, rgba(0,0,0,0) 70%),
+      linear-gradient(#070a10, #03050a);
+  }
+  .frame[data-bd="bright"] {
+    background:
+      radial-gradient(70% 90% at 72% 80%, #ffffff 0%, #f2f4f7 40%, #dfe6ee 100%),
+      linear-gradient(#eef3f8, #dbe4ee);
+  }
+  .frame[data-bd="busy"] {
+    background:
+      repeating-linear-gradient(122deg, rgba(255,255,255,0.20) 0 7px, rgba(0,0,0,0.34) 7px 15px),
+      repeating-linear-gradient(28deg, rgba(190,60,40,0.55) 0 23px, rgba(20,60,120,0.55) 23px 47px),
+      #4a4a52;
+  }
+
+  /* The bug, positioned exactly as the renderer does: bottom_right, margin 24,
+     height 56, in a 720-tall frame. Expressed as a share of frame height so it
+     stays true at any display scale. */
+  .bug {
+    position: absolute;
+    right: calc(var(--bug-margin) / var(--frame-h) * 100%);
+    bottom: calc(var(--bug-margin) / var(--frame-h) * 100%);
+    height: calc(var(--bug-h) / var(--frame-h) * 100%);
+    display: block;
+    color: #fff;
+  }
+  .bug svg { height: 100%; width: auto; display: block; }
+
+  [data-shadow="soft"] .bug svg,
+  [data-shadow="soft"] .mk-swatch svg {
+    filter: drop-shadow(0 1px 2px rgba(0,0,0,0.55)) drop-shadow(0 0 7px rgba(0,0,0,0.40));
+  }
+
+  /* ---- family strip: all three channels at once ------------------------ */
+  .family {
+    display: flex;
+    gap: 0;
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .family > div {
+    flex: 1;
+    padding: 22px 16px 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    background: #0b0e14;
+    border-right: 1px solid rgba(255,255,255,0.10);
+  }
+  .family > div:last-child { border-right: 0; }
+  .family svg { height: 56px; width: auto; color: #fff; display: block; }
+  .family b {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ov-ink-dim);
+  }
+
+  /* ---- size ladder: true pixels, no scaling --------------------------- */
+  .ladder { display: flex; gap: 0; border-radius: 4px; overflow: hidden; border: 1px solid rgba(255,255,255,0.14); }
+  .ladder > div { flex: 1; padding: 20px 14px; display: flex; align-items: flex-end; justify-content: center; gap: 26px; }
+  .ladder .on-dark { background: #06080d; }
+  .ladder .on-light { background: #eef2f7; }
+  .mk-swatch { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .mk-swatch svg { width: auto; display: block; }
+  .mk-swatch span { font-size: 10px; letter-spacing: 0.08em; }
+  .on-dark .mk-swatch svg { color: #fff; }
+  .on-dark .mk-swatch span { color: rgba(255,255,255,0.42); }
+  .on-light .mk-swatch svg { color: #fff; }
+  .on-light .mk-swatch span { color: rgba(0,0,0,0.45); }
+  .s24 { height: 24px; } .s56 { height: 56px; } .s128 { height: 128px; }
+
+  .mk-note {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--ov-ink-dim);
+    margin: 12px 0 0;
+    max-width: 76ch;
+  }
+  .mk-note b { color: var(--ov-ink); font-weight: 600; }
+</style>
+
+<nav data-axis="channel" data-label="Channel">
+  <button data-value="c1">001 For You<em>the whole house</em></button>
+  <button data-value="c2">002 For Pierce<em>single_user</em></button>
+  <button data-value="c3">003 For Madi<em>single_user</em></button>
+</nav>
+
+<nav data-axis="bd" data-label="Backdrop">
+  <button data-value="night">Night interior<em>warm key light under the bug</em></button>
+  <button data-value="bright">Bright exterior<em>white-on-white, the failure case</em></button>
+  <button data-value="busy">Busy<em>high-frequency detail</em></button>
+</nav>
+
+<nav data-axis="shadow" data-label="Bug shadow">
+  <button data-value="none">None<em>as the renderer draws it today</em></button>
+  <button data-value="soft">Soft drop shadow</button>
+</nav>
+
+<aside data-rail-note><b>Scope.</b> The mark only. Bug is drawn at the real spec — <code>corner: bottom_right</code>, <code>margin: 24</code>, <code>height: 56</code> in a 1280&times;720 frame. Every mark is one white shape with knockouts, so it exports to an alpha PNG unchanged.</aside>
+
+<!-- =================================================================== -->
+<template data-variant="Badge" data-caption="Contained squircle, monogram knocked out — maximum legibility at 56px">
+  <div class="mk-page">
+    <div class="mk-h">On air</div>
+    <div class="frame" data-bd-target>
+      <div class="bug">
+        <svg data-channel="c1" viewBox="0 0 100 100" aria-label="For You badge mark">
+          <mask id="bg-m1"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+            <g fill="black"><rect x="45.5" y="27" width="9" height="46" rx="4.5"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(60 50 50)"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(120 50 50)"/></g>
+          </mask>
+          <rect width="100" height="100" fill="currentColor" mask="url(#bg-m1)"/>
+        </svg>
+        <svg data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce badge mark">
+          <mask id="bg-m2"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+            <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="800" text-anchor="middle" dominant-baseline="central">P</text>
+          </mask>
+          <rect width="100" height="100" fill="currentColor" mask="url(#bg-m2)"/>
+        </svg>
+        <svg data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi badge mark">
+          <mask id="bg-m3"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+            <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="52" font-weight="800" text-anchor="middle" dominant-baseline="central">M</text>
+          </mask>
+          <rect width="100" height="100" fill="currentColor" mask="url(#bg-m3)"/>
+        </svg>
+      </div>
+    </div>
+
+    <div class="mk-h">The family</div>
+    <div class="family">
+      <div><svg data-fam="c1" viewBox="0 0 100 100"><use href="#x-badge-1"/></svg><b>001 For You</b></div>
+      <div><svg data-fam="c2" viewBox="0 0 100 100"><use href="#x-badge-2"/></svg><b>002 For Pierce</b></div>
+      <div><svg data-fam="c3" viewBox="0 0 100 100"><use href="#x-badge-3"/></svg><b>003 For Madi</b></div>
+    </div>
+
+    <div class="mk-h">Legibility ladder — true pixels</div>
+    <div class="ladder">
+      <div class="on-dark">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px — on air</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+      <div class="on-light">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+    </div>
+
+    <p class="mk-note"><b>Axis: contained + monogram.</b> A solid field means the mark never has to compete with the picture behind it — the knockout carries the detail, and detail on a solid ground survives any backdrop. 001 takes a six-point spark rather than a letter, so the family head reads as the set and the two people read as members of it. <b>Cost:</b> a filled 84&times;84 block is the loudest possible bug — it holds more screen weight than the ♫ it replaces, every second of every programme.</p>
+  </div>
+</template>
+
+<!-- =================================================================== -->
+<template data-variant="Beacon" data-caption="Open linear signal — arcs over a monogram core">
+  <div class="mk-page">
+    <div class="mk-h">On air</div>
+    <div class="frame" data-bd-target>
+      <div class="bug">
+        <svg data-channel="c1" viewBox="0 0 100 100" aria-label="For You beacon mark"><use href="#x-beacon-1"/></svg>
+        <svg data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce beacon mark"><use href="#x-beacon-2"/></svg>
+        <svg data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi beacon mark"><use href="#x-beacon-3"/></svg>
+      </div>
+    </div>
+
+    <div class="mk-h">The family</div>
+    <div class="family">
+      <div><svg data-fam="c1" viewBox="0 0 100 100"><use href="#x-beacon-1"/></svg><b>001 For You</b></div>
+      <div><svg data-fam="c2" viewBox="0 0 100 100"><use href="#x-beacon-2"/></svg><b>002 For Pierce</b></div>
+      <div><svg data-fam="c3" viewBox="0 0 100 100"><use href="#x-beacon-3"/></svg><b>003 For Madi</b></div>
+    </div>
+
+    <div class="mk-h">Legibility ladder — true pixels</div>
+    <div class="ladder">
+      <div class="on-dark">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px — on air</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+      <div class="on-light">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+    </div>
+
+    <p class="mk-note"><b>Axis: open form + monogram.</b> Same answer to "who" as Badge, opposite answer to "what shape". Arcs sit either side of the core rather than stacked over it, so the mark lands on the radio callsign convention — <em>((P))</em>, a station transmitting <em>at</em> you, which is this channel's whole premise. 001 keeps a solid core, so the family head is the transmitter and the two people are what it is tuned to. Ink coverage is roughly a third of Badge's, so it sits quieter over a picture. <b>Cost:</b> five separate strokes in one small mark, and thin arcs are the first thing to go over the bright exterior backdrop. The 24px rung is where you find out whether they survive a downscale (see #296).</p>
+  </div>
+</template>
+
+<!-- =================================================================== -->
+<template data-variant="Trace" data-caption="A taste reading — peak shape carries the channel, no letters">
+  <div class="mk-page">
+    <div class="mk-h">On air</div>
+    <div class="frame" data-bd-target>
+      <div class="bug">
+        <svg data-channel="c1" viewBox="0 0 100 100" aria-label="For You trace mark"><use href="#x-trace-1"/></svg>
+        <svg data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce trace mark"><use href="#x-trace-2"/></svg>
+        <svg data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi trace mark"><use href="#x-trace-3"/></svg>
+      </div>
+    </div>
+
+    <div class="mk-h">The family</div>
+    <div class="family">
+      <div><svg data-fam="c1" viewBox="0 0 100 100"><use href="#x-trace-1"/></svg><b>001 For You</b></div>
+      <div><svg data-fam="c2" viewBox="0 0 100 100"><use href="#x-trace-2"/></svg><b>002 For Pierce</b></div>
+      <div><svg data-fam="c3" viewBox="0 0 100 100"><use href="#x-trace-3"/></svg><b>003 For Madi</b></div>
+    </div>
+
+    <div class="mk-h">Legibility ladder — true pixels</div>
+    <div class="ladder">
+      <div class="on-dark">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px — on air</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+      <div class="on-light">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+    </div>
+
+    <p class="mk-note"><b>Axis: gestural, letter-free.</b> A signal trace — the channel is literally reading a taste vector, and the mark draws what it reads. 001 is three peaks (a house, plural — two peaks drew the letterform <em>M</em>, which is the one shape it must not be mistaken for here); 002 is one sharp spike; 003 is one broad plateau. Nothing here is a letter, so the family scales past three channels without running out of distinct initials, and it never looks like a monogrammed towel. <b>Cost:</b> "sharp versus broad" is a real distinction on the 128px rung and a coin flip on the 24px one. If 002 and 003 are indistinguishable at 56px, this direction has failed at the exact job it was built for.</p>
+  </div>
+</template>
+
+<!-- =================================================================== -->
+<template data-variant="Aperture" data-caption="Segmented ring — the channel is which segment is weighted">
+  <div class="mk-page">
+    <div class="mk-h">On air</div>
+    <div class="frame" data-bd-target>
+      <div class="bug">
+        <svg data-channel="c1" viewBox="0 0 100 100" aria-label="For You aperture mark"><use href="#x-ap-1"/></svg>
+        <svg data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce aperture mark"><use href="#x-ap-2"/></svg>
+        <svg data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi aperture mark"><use href="#x-ap-3"/></svg>
+      </div>
+    </div>
+
+    <div class="mk-h">The family</div>
+    <div class="family">
+      <div><svg data-fam="c1" viewBox="0 0 100 100"><use href="#x-ap-1"/></svg><b>001 For You</b></div>
+      <div><svg data-fam="c2" viewBox="0 0 100 100"><use href="#x-ap-2"/></svg><b>002 For Pierce</b></div>
+      <div><svg data-fam="c3" viewBox="0 0 100 100"><use href="#x-ap-3"/></svg><b>003 For Madi</b></div>
+    </div>
+
+    <div class="mk-h">Legibility ladder — true pixels</div>
+    <div class="ladder">
+      <div class="on-dark">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px — on air</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+      <div class="on-light">
+        <div class="mk-swatch"><svg class="s24" viewBox="0 0 100 100" data-lad></svg><span>24px</span></div>
+        <div class="mk-swatch"><svg class="s56" viewBox="0 0 100 100" data-lad></svg><span>56px</span></div>
+        <div class="mk-swatch"><svg class="s128" viewBox="0 0 100 100" data-lad></svg><span>128px</span></div>
+      </div>
+    </div>
+
+    <p class="mk-note"><b>Axis: geometric, positional.</b> Three segments for three viewers around one centre. 001 weights all three evenly — the pooled house vector, drawn. 002 and 003 thicken their own segment and thin the other two, which is exactly what <code>taste_scope: single_user</code> does to the maths. The encoding is the meaning, and a fourth viewer is a fourth segment rather than a fourth letter. <b>Cost:</b> nobody will decode it unaided. It differentiates on stroke weight, which is the first property a bilinear downscale destroys.</p>
+  </div>
+</template>
+
+<!-- shared symbol defs, one copy for the whole file -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+
+  <g id="x-badge-1">
+    <mask id="m-badge-1"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+      <g fill="black"><rect x="45.5" y="27" width="9" height="46" rx="4.5"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(60 50 50)"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(120 50 50)"/></g>
+    </mask>
+    <rect width="100" height="100" fill="currentColor" mask="url(#m-badge-1)"/>
+  </g>
+  <g id="x-badge-2">
+    <mask id="m-badge-2"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="800" text-anchor="middle" dominant-baseline="central">P</text></mask>
+    <rect width="100" height="100" fill="currentColor" mask="url(#m-badge-2)"/>
+  </g>
+  <g id="x-badge-3">
+    <mask id="m-badge-3"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="52" font-weight="800" text-anchor="middle" dominant-baseline="central">M</text></mask>
+    <rect width="100" height="100" fill="currentColor" mask="url(#m-badge-3)"/>
+  </g>
+
+  <!-- Arcs sit either side of the core, not stacked above it: two arcs over a
+       rounded block is the wifi glyph, and a bug that reads as a connectivity
+       icon is a bug that reads as an error state. -->
+  <g id="x-beacon-1">
+    <g fill="none" stroke="currentColor" stroke-width="8.5" stroke-linecap="round">
+      <path d="M 24 65 A 30 30 0 0 1 24 35"/>
+      <path d="M 76 65 A 30 30 0 0 0 76 35"/>
+      <path d="M 11.1 65.7 A 42 42 0 0 1 11.1 34.3"/>
+      <path d="M 88.9 65.7 A 42 42 0 0 0 88.9 34.3"/>
+    </g>
+    <rect x="32" y="32" width="36" height="36" rx="11" fill="currentColor"/>
+  </g>
+  <g id="x-beacon-2">
+    <g fill="none" stroke="currentColor" stroke-width="8.5" stroke-linecap="round">
+      <path d="M 24 65 A 30 30 0 0 1 24 35"/>
+      <path d="M 76 65 A 30 30 0 0 0 76 35"/>
+      <path d="M 11.1 65.7 A 42 42 0 0 1 11.1 34.3"/>
+      <path d="M 88.9 65.7 A 42 42 0 0 0 88.9 34.3"/>
+    </g>
+    <mask id="m-beacon-2"><rect x="32" y="32" width="36" height="36" rx="11" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="27" font-weight="800" text-anchor="middle" dominant-baseline="central">P</text></mask>
+    <rect x="32" y="32" width="36" height="36" rx="11" fill="currentColor" mask="url(#m-beacon-2)"/>
+  </g>
+  <g id="x-beacon-3">
+    <g fill="none" stroke="currentColor" stroke-width="8.5" stroke-linecap="round">
+      <path d="M 24 65 A 30 30 0 0 1 24 35"/>
+      <path d="M 76 65 A 30 30 0 0 0 76 35"/>
+      <path d="M 11.1 65.7 A 42 42 0 0 1 11.1 34.3"/>
+      <path d="M 88.9 65.7 A 42 42 0 0 0 88.9 34.3"/>
+    </g>
+    <mask id="m-beacon-3"><rect x="32" y="32" width="36" height="36" rx="11" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="25" font-weight="800" text-anchor="middle" dominant-baseline="central">M</text></mask>
+    <rect x="32" y="32" width="36" height="36" rx="11" fill="currentColor" mask="url(#m-beacon-3)"/>
+  </g>
+
+  <!-- 001 is three peaks, not two: a two-peak trace draws the letterform M,
+       which is the one shape it must not be confused with on this station. -->
+  <g id="x-trace-1"><path d="M 5 70 L 15 70 L 24 38 L 33 70 L 41 70 L 50 30 L 59 70 L 67 70 L 76 38 L 85 70 L 95 70" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g id="x-trace-2"><path d="M 6 72 L 34 72 L 50 20 L 66 72 L 94 72" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g id="x-trace-3"><path d="M 6 72 L 28 72 L 40 32 L 60 32 L 72 72 L 94 72" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></g>
+
+  <g id="x-ap-1">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" transform="rotate(-90 50 50)">
+      <circle cx="50" cy="50" r="36" stroke-width="9" stroke-dasharray="62.8 163.4" stroke-dashoffset="0"/>
+      <circle cx="50" cy="50" r="36" stroke-width="9" stroke-dasharray="62.8 163.4" stroke-dashoffset="-75.4"/>
+      <circle cx="50" cy="50" r="36" stroke-width="9" stroke-dasharray="62.8 163.4" stroke-dashoffset="-150.8"/>
+    </g>
+    <circle cx="50" cy="50" r="8" fill="currentColor"/>
+  </g>
+  <g id="x-ap-2">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" transform="rotate(-90 50 50)">
+      <circle cx="50" cy="50" r="36" stroke-width="18" stroke-dasharray="62.8 163.4" stroke-dashoffset="0"/>
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="-75.4"/>
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="-150.8"/>
+    </g>
+    <circle cx="50" cy="50" r="8" fill="currentColor"/>
+  </g>
+  <g id="x-ap-3">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" transform="rotate(-90 50 50)">
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="0"/>
+      <circle cx="50" cy="50" r="36" stroke-width="18" stroke-dasharray="62.8 163.4" stroke-dashoffset="-75.4"/>
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="-150.8"/>
+    </g>
+    <circle cx="50" cy="50" r="8" fill="currentColor"/>
+  </g>
+
+</defs></svg>
+
+<script>
+  (function () {
+    var state = { channel: 'c1', bd: 'night', shadow: 'none' };
+    var SETS = { Badge: 'x-badge-', Beacon: 'x-beacon-', Trace: 'x-trace-', Aperture: 'x-ap-' };
+
+    function symbolFor(root) {
+      // Which direction is mounted: read it off whichever family swatch is present.
+      var probe = root.querySelector('.family [data-fam] use');
+      if (!probe) return null;
+      var href = probe.getAttribute('href') || '';
+      var prefix = href.replace(/[0-9]+$/, '').slice(1);
+      return prefix + state.channel.slice(1);
+    }
+
+    // Cache of what each ladder slot currently draws, so a re-apply that
+    // changes nothing does not touch the DOM at all.
+    function apply() {
+      document.querySelectorAll('.mk-page').forEach(function (root) {
+        var frame = root.querySelector('.frame');
+        if (frame) frame.setAttribute('data-bd', state.bd);
+        root.setAttribute('data-shadow', state.shadow);
+
+        // The on-air bug: show only the selected channel's mark.
+        root.querySelectorAll('.bug [data-channel]').forEach(function (el) {
+          el.style.display = el.getAttribute('data-channel') === state.channel ? 'block' : 'none';
+        });
+
+        // The size ladder follows the selected channel too.
+        var sym = symbolFor(root);
+        if (sym) {
+          root.querySelectorAll('svg[data-lad]').forEach(function (svg) {
+            if (svg.getAttribute('data-drawn') === sym) return;
+            svg.innerHTML = '<use href="#' + sym + '"></use>';
+            svg.setAttribute('data-drawn', sym);
+          });
+        }
+      });
+    }
+
+    // The rail re-emits every live axis right after each mount, so this is the
+    // only hook needed — a MutationObserver here would see its own writes and
+    // re-enter forever.
+    addEventListener('at:axis', function (e) {
+      if (!(e.detail.axis in state)) return;
+      state[e.detail.axis] = e.detail.value;
+      apply();
+    });
+
+    apply();
+  })();
+</script>

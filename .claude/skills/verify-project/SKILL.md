@@ -147,6 +147,40 @@ regression test — it punches a hole *inside* a chunk (not by deleting the file
 `regen_from` and the frontier coincide and loses nothing) and asserts no airing on disk ends
 up without a row.
 
+## Verifying a config edit reaches the screen (`resume.refresh`)
+
+Editing a channel's config and redeploying it should change what is *about to*
+play, not just what plays a day from now. On the next start or SIGHUP the daemon
+compares `ResumeMap::config_id` — a hash of the channel's config and resolved
+overlay — against the channel as it now stands, and on a mismatch throws the
+schedule away from the next item boundary forward.
+
+```bash
+admin deploy files && admin reload
+# expect, per edited channel:
+#   event="resume.refresh" reason="config" from=… truncated_from=… removed=…
+# and for every channel you did NOT edit: no refresh event at all
+```
+
+`from` must be at or after the finish of the item currently airing — the cut
+never lands inside what is on screen. Unedited channels must stay silent: the
+hash excludes the catalog precisely so a Plex ingest does not rewrite a
+taste-scored channel's future.
+
+To force one without a config change:
+
+```bash
+admin refresh-channel 2               # by channel number, as the guide shows it
+admin refresh-channel 002-for-pierce  # by directory name
+admin refresh-channel all             # every channel
+# expect: reason="forced" within one roll_interval, not instantly
+```
+
+The CLI writes a `.refresh-request` marker in the channel's playout folder and
+the daemon consumes it on its next tick — it does not rewrite playout itself,
+because the daemon owns those files. A marker that is still there a minute later
+means the daemon is not ticking.
+
 ## Verifying a restart's resume decision (skip vs rewind)
 
 On startup, `daemon.rs:2181`/`:2211` decides, per channel, whether a written-but-unaired

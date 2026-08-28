@@ -82,6 +82,31 @@ pub struct ResumeMap {
     /// which bounds the list to the generations covering one window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
+
+    /// The channel configuration the written future was generated under — a
+    /// hash of the channel's config and its resolved overlay, and nothing else.
+    ///
+    /// This is what decides whether an edit reaches the screen. When it differs
+    /// from the channel as it stands now, the daemon throws away the schedule
+    /// from the next item boundary forward and regenerates it under the new
+    /// rules; when it matches, the written future is left alone.
+    ///
+    /// **Deliberately not the catalog.** The candidate entry-id list moves every
+    /// time Plex gains or loses a title, and rewriting the future on that would
+    /// mean the taste-scored channels reshuffle continuously — for a reason that
+    /// has nothing to do with what anybody configured. A new title reaches the
+    /// screen as the window extends, which is soon enough.
+    ///
+    /// **Nor the watch history or the clock.** Generation is a pure function of
+    /// its inputs, but two of those inputs move on their own: a scorer plugin
+    /// reads `ctx.history` and `ctx.now`. So "nothing changed, therefore
+    /// regenerating is a no-op" holds for a plain query channel and does not
+    /// hold for a taste-scored one, which is exactly why this gate is narrow.
+    ///
+    /// `None` on a channel that has never generated, which regenerates rather
+    /// than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_id: Option<String>,
 }
 
 /// The scheduling state immediately before the generation that starts at
@@ -97,20 +122,6 @@ pub struct Checkpoint {
     /// jumping the cursor past a span it just threw away.
     #[serde(default, skip_serializing_if = "is_start")]
     pub position: usize,
-
-    /// A hash of the inputs that produced the generation beginning at
-    /// `start` — the channel's resolved candidate entry-id list, and its
-    /// config and overlay config bytes (#182). `resume_in` is not part of
-    /// this hash: it is *this checkpoint*, carried structurally rather than
-    /// hashed, which is what lets the fingerprint survive ordinary roll
-    /// ticks instead of chasing a checkpoint that moves every tick.
-    ///
-    /// `None` on a checkpoint recorded before this field existed, or
-    /// whenever it could not be computed; both decode the same as a
-    /// mismatch, so a missing fingerprint always regenerates rather than
-    /// skipping on a guess.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<String>,
 }
 
 /// One pool's resume state.
@@ -139,6 +150,7 @@ impl ResumeMap {
             pools: BTreeMap::new(),
             position: 0,
             checkpoints: Vec::new(),
+            config_id: None,
         }
     }
 
@@ -154,12 +166,11 @@ impl ResumeMap {
     /// with the input fingerprint that produced it (#182) — `None` when it
     /// could not be computed, which always regenerates rather than skipping
     /// on a guess.
-    pub fn checkpoint(&mut self, start: OffsetDateTime, inputs: Option<String>) {
+    pub fn checkpoint(&mut self, start: OffsetDateTime) {
         self.checkpoints.push(Checkpoint {
             start,
             pools: self.pools.clone(),
             position: self.position,
-            inputs,
         });
     }
 
@@ -167,46 +178,6 @@ impl ResumeMap {
     /// content is a record now, not something to regenerate.
     pub fn prune_elapsed(&mut self, now: OffsetDateTime) {
         self.checkpoints.retain(|c| c.start > now);
-    }
-
-    /// Rewind to the earliest generation that has not started airing: returns
-    /// the instant to re-emit from, having restored the pool state as it was
-    /// before that generation ran. `None` when nothing is regenerable, in which
-    /// case the map is untouched.
-    ///
-    /// This is what makes a config or overlay edit take effect on a pattern
-    /// channel: the caller deletes the emitted files at or after the returned
-    /// instant and generates the same span again from the current config.
-    pub fn rewind_to_unaired(&mut self, now: OffsetDateTime) -> Option<OffsetDateTime> {
-        self.prune_elapsed(now);
-        let earliest = self.checkpoints.first()?.clone();
-        self.pools = earliest.pools;
-        self.position = earliest.position;
-        // Everything from here forward is about to be regenerated, so its
-        // checkpoints are re-recorded as it goes.
-        self.checkpoints.clear();
-        Some(earliest.start)
-    }
-
-    /// Whether every not-yet-aired checkpoint was produced by `inputs` (#182)
-    /// — the gate a startup restart uses to decide whether the rewind below
-    /// is worth running at all. `false` when there is no unaired checkpoint
-    /// (nothing to compare), when any unaired checkpoint's `inputs` is
-    /// `None`, or when any of them differ from `inputs` — a partial match is
-    /// not a match, because a later generation produced under different
-    /// inputs than the earliest still needs to be thrown away and redone.
-    ///
-    /// Non-mutating and does not prune: elapsed checkpoints are skipped
-    /// exactly as [`prune_elapsed`] would drop them, but nothing is removed.
-    /// Correct without pruning first because [`checkpoint`] always pushes in
-    /// chronological order, so the future-only slice this walks is the same
-    /// one pruning-then-iterating would find.
-    pub fn unaired_inputs_match(&self, now: OffsetDateTime, inputs: &str) -> bool {
-        let mut unaired = self.checkpoints.iter().filter(|c| c.start > now).peekable();
-        if unaired.peek().is_none() {
-            return false;
-        }
-        unaired.all(|c| c.inputs.as_deref() == Some(inputs))
     }
 
     /// Rewind to the generation that was airing at `instant`: restore the pool
@@ -217,10 +188,9 @@ impl ResumeMap {
     /// regenerate from the current pools instead (a possible seam glitch, never
     /// black).
     ///
-    /// Distinct from [`rewind_to_unaired`], which always rewinds to the *earliest*
-    /// unaired generation to apply a config edit. This targets a specific
-    /// instant — the start of an observed coverage hole — and rewinds only as far
-    /// as that hole, leaving healthy earlier chunks in place.
+    /// Targets a specific instant — the start of an observed coverage hole, or
+    /// the next item boundary a config refresh cuts at — and rewinds only as far
+    /// as that, leaving healthy earlier chunks in place.
     pub fn rewind_to(&mut self, instant: OffsetDateTime) -> Option<OffsetDateTime> {
         let idx = self.checkpoints.iter().rposition(|c| c.start <= instant)?;
         let cp = self.checkpoints[idx].clone();
@@ -394,59 +364,14 @@ mod tests {
     }
 
     #[test]
-    fn rewind_restores_the_state_before_the_earliest_unaired_generation() {
-        let mut map = ResumeMap::new();
-        // Three generations recorded, the first already airing by `now`.
-        map.pools = pools_with("e0");
-        map.checkpoint(at(0), None);
-        map.pools = pools_with("e1");
-        map.checkpoint(at(6), None);
-        map.pools = pools_with("e2");
-        map.checkpoint(at(12), None);
-        map.pools = pools_with("e3");
-
-        // At hour 8, the 06:00 generation has started — the 12:00 one has not.
-        let regen = map.rewind_to_unaired(at(8)).unwrap();
-        assert_eq!(regen, at(12));
-        assert_eq!(
-            map.pools,
-            pools_with("e2"),
-            "pools must be exactly what they were entering the 12:00 generation"
-        );
-        assert!(
-            map.checkpoints.is_empty(),
-            "regenerated spans re-record their own checkpoints"
-        );
-    }
-
-    #[test]
-    fn rewind_is_a_no_op_when_nothing_is_unaired() {
-        let mut map = ResumeMap::new();
-        map.pools = pools_with("e0");
-        map.checkpoint(at(0), None);
-        map.pools = pools_with("e1");
-
-        // Everything already airing: nothing to regenerate, state untouched.
-        assert!(map.rewind_to_unaired(at(9)).is_none());
-        assert_eq!(map.pools, pools_with("e1"));
-    }
-
-    #[test]
-    fn rewind_on_a_fresh_map_does_nothing() {
-        let mut map = ResumeMap::new();
-        assert!(map.rewind_to_unaired(at(1)).is_none());
-        assert!(map.is_empty());
-    }
-
-    #[test]
     fn rewind_to_targets_the_generation_covering_an_instant() {
         let mut map = ResumeMap::new();
         map.pools = pools_with("e0");
-        map.checkpoint(at(0), None);
+        map.checkpoint(at(0));
         map.pools = pools_with("e1");
-        map.checkpoint(at(6), None);
+        map.checkpoint(at(6));
         map.pools = pools_with("e2");
-        map.checkpoint(at(12), None);
+        map.checkpoint(at(12));
         map.pools = pools_with("e3");
 
         // A hole at hour 8 lives inside the 06:00 generation: rewind to it,
@@ -463,7 +388,7 @@ mod tests {
     fn rewind_to_is_none_when_the_instant_predates_every_checkpoint() {
         let mut map = ResumeMap::new();
         map.pools = pools_with("e1");
-        map.checkpoint(at(6), None);
+        map.checkpoint(at(6));
         map.pools = pools_with("e2");
 
         // The covering checkpoint was pruned after airing — its pool state is
@@ -475,9 +400,9 @@ mod tests {
     #[test]
     fn prune_keeps_only_future_checkpoints() {
         let mut map = ResumeMap::new();
-        map.checkpoint(at(0), None);
-        map.checkpoint(at(6), None);
-        map.checkpoint(at(12), None);
+        map.checkpoint(at(0));
+        map.checkpoint(at(6));
+        map.checkpoint(at(12));
         map.prune_elapsed(at(7));
         assert_eq!(map.checkpoints.len(), 1);
         assert_eq!(map.checkpoints[0].start, at(12));
@@ -487,7 +412,7 @@ mod tests {
     async fn checkpoints_survive_the_sidecar_round_trip() {
         let dir = tempdir().unwrap();
         let mut map = sample();
-        map.checkpoint(at(12), None);
+        map.checkpoint(at(12));
         save(dir.path(), &map).await.unwrap();
         let (loaded, _) = load(dir.path()).await.unwrap();
         assert_eq!(loaded, map);
@@ -515,29 +440,13 @@ mod tests {
         assert_eq!(map.position, 0);
     }
 
-    /// A config edit rewinds to the earliest unaired generation and re-emits it.
-    /// The list position has to come back with the pools, or the regenerated
-    /// span would start where the thrown-away one *finished* and skip a day.
-    #[test]
-    fn rewinding_restores_the_list_position_with_the_pools() {
-        let mut map = ResumeMap::new();
-        map.position = 10;
-        map.checkpoint(at(0), None);
-        map.position = 40;
-        map.checkpoint(at(6), None);
-        map.position = 75;
-
-        assert_eq!(map.rewind_to_unaired(at(3)).unwrap(), at(6));
-        assert_eq!(map.position, 40);
-    }
-
     #[test]
     fn rewinding_to_an_instant_restores_the_list_position() {
         let mut map = ResumeMap::new();
         map.position = 10;
-        map.checkpoint(at(0), None);
+        map.checkpoint(at(0));
         map.position = 40;
-        map.checkpoint(at(6), None);
+        map.checkpoint(at(6));
         map.position = 75;
 
         assert_eq!(map.rewind_to(at(8)).unwrap(), at(6));
@@ -546,74 +455,19 @@ mod tests {
 
     // ---- fingerprint (#182) -------------------------------------------------
 
-    #[test]
-    fn unaired_inputs_match_is_true_when_every_unaired_checkpoint_matches() {
-        let mut map = ResumeMap::new();
-        map.checkpoint(at(0), Some("stale".into())); // already airing by `now`
-        map.checkpoint(at(6), Some("fp1".into()));
-        map.checkpoint(at(12), Some("fp1".into()));
-
-        assert!(map.unaired_inputs_match(at(3), "fp1"));
-    }
-
-    #[test]
-    fn unaired_inputs_match_is_false_on_any_differing_checkpoint() {
-        let mut map = ResumeMap::new();
-        map.checkpoint(at(6), Some("fp1".into()));
-        map.checkpoint(at(12), Some("fp2".into()));
-
-        assert!(!map.unaired_inputs_match(at(3), "fp1"));
-    }
-
-    #[test]
-    fn unaired_inputs_match_is_false_when_any_unaired_checkpoint_has_no_fingerprint() {
-        let mut map = ResumeMap::new();
-        map.checkpoint(at(6), Some("fp1".into()));
-        map.checkpoint(at(12), None);
-
-        assert!(!map.unaired_inputs_match(at(3), "fp1"));
-    }
-
-    #[test]
-    fn unaired_inputs_match_is_false_when_nothing_is_unaired() {
-        let mut map = ResumeMap::new();
-        map.checkpoint(at(0), Some("fp1".into()));
-        assert!(!map.unaired_inputs_match(at(9), "fp1"));
-    }
-
-    #[test]
-    fn unaired_inputs_match_is_false_on_a_fresh_map_with_no_checkpoints() {
-        let map = ResumeMap::new();
-        assert!(!map.unaired_inputs_match(at(0), "fp1"));
-    }
-
-    #[test]
-    fn unaired_inputs_match_does_not_mutate_the_map() {
-        let mut map = ResumeMap::new();
-        map.checkpoint(at(6), Some("fp1".into()));
-        let before = map.clone();
-        let _ = map.unaired_inputs_match(at(3), "fp1");
-        assert_eq!(map, before);
-    }
-
+    /// The config identity is what decides whether an edit reaches the screen,
+    /// so it has to survive the sidecar round trip. A channel that has never
+    /// generated has none, and that decodes as "regenerate" rather than as a
+    /// match against nothing.
     #[tokio::test]
-    async fn a_checkpoint_with_no_fingerprint_decodes_as_none() {
+    async fn the_config_id_round_trips_through_disk() {
         let dir = tempdir().unwrap();
         let mut map = sample();
-        map.checkpoint(at(0), None);
+        assert_eq!(map.config_id, None, "a fresh map claims no configuration");
+        map.config_id = Some("deadbeef".into());
         save(dir.path(), &map).await.unwrap();
         let (loaded, _) = load(dir.path()).await.unwrap();
-        assert_eq!(loaded.checkpoints[0].inputs, None);
-    }
-
-    #[tokio::test]
-    async fn the_checkpoint_fingerprint_round_trips_through_disk() {
-        let dir = tempdir().unwrap();
-        let mut map = sample();
-        map.checkpoint(at(0), Some("deadbeef".to_string()));
-        save(dir.path(), &map).await.unwrap();
-        let (loaded, _) = load(dir.path()).await.unwrap();
-        assert_eq!(loaded.checkpoints[0].inputs.as_deref(), Some("deadbeef"));
+        assert_eq!(loaded.config_id.as_deref(), Some("deadbeef"));
     }
 
     #[tokio::test]

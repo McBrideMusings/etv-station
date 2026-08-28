@@ -96,6 +96,27 @@ struct Cli {
     /// nothing.
     #[arg(long, requires = "backfill_history")]
     dry_run: bool,
+
+    /// Force a channel to throw away its schedule from the next item boundary
+    /// forward and regenerate it, then exit. Names a channel the way its
+    /// directory is (`002-for-pierce`), by bare name (`for-pierce`), or by
+    /// channel number (`2`) — the same number ETV-next and the guide use, which
+    /// is the channel's position in the station config. `all` marks every
+    /// channel.
+    ///
+    /// A refresh normally happens on its own when a channel's configuration
+    /// changes. This is the override for when you want one anyway — after
+    /// editing a plugin script, or when the catalog has moved and you would
+    /// rather not wait for the window to roll forward.
+    ///
+    /// What is already airing is never touched: the regeneration starts at the
+    /// finish of the item currently on screen, so nothing cuts mid-programme.
+    ///
+    /// This leaves a marker the running daemon consumes on its next pass rather
+    /// than rewriting playout here — the daemon owns those files, and a second
+    /// process writing them would race its generation loop.
+    #[arg(long, value_name = "CHANNEL")]
+    refresh_channel: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -141,6 +162,10 @@ fn main() -> ExitCode {
 
     if cli.backfill_history {
         return backfill_history(&cli.config, cli.dry_run);
+    }
+
+    if let Some(target) = cli.refresh_channel.as_deref() {
+        return refresh_channel(&cli.config, target);
     }
 
     init_tracing(cli.log_format);
@@ -436,6 +461,99 @@ fn backfill_history(config_path: &Path, dry_run: bool) -> ExitCode {
         report.channels.len(),
         report.on_disk(),
         report.inserted(),
+    );
+    ExitCode::SUCCESS
+}
+
+/// Mark one channel — or every channel — for a forced forward refresh.
+///
+/// Resolution is deliberately forgiving, because the three names for a channel
+/// all show up in different places: the directory name is what the logs and the
+/// playout folder use, the bare name is what a person says, and the number is
+/// what the guide and the TV show. A prefix that matches more than one channel
+/// is refused rather than guessed at.
+fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
+    let station = match config::load(config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("refresh-channel: failed to load configuration: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let matched: Vec<&etv_station::config::LoadedChannel> = if target == "all" {
+        station.channels.iter().collect()
+    } else if let Ok(number) = target.parse::<usize>() {
+        // The channel number is its position in the station config, 1-based —
+        // the same arithmetic `render_etv_next` uses to name channelN.json.
+        match number.checked_sub(1).and_then(|i| station.channels.get(i)) {
+            Some(ch) => vec![ch],
+            None => {
+                eprintln!(
+                    "refresh-channel: no channel number {number}; the station has {}",
+                    station.channels.len(),
+                );
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        let exact: Vec<_> = station
+            .channels
+            .iter()
+            .filter(|c| c.name == target)
+            .collect();
+        if exact.is_empty() {
+            // `for-pierce` should find `002-for-pierce`, since the numeric
+            // prefix is a sort key rather than part of the name anyone says.
+            let loose: Vec<_> = station
+                .channels
+                .iter()
+                .filter(|c| {
+                    let bare = c.name.split_once('-').map(|(_, r)| r).unwrap_or(&c.name);
+                    bare == target || c.name.contains(target)
+                })
+                .collect();
+            if loose.len() > 1 {
+                eprintln!(
+                    "refresh-channel: {target:?} matches {} channels: {}",
+                    loose.len(),
+                    loose
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                return ExitCode::from(1);
+            }
+            loose
+        } else {
+            exact
+        }
+    };
+
+    if matched.is_empty() {
+        eprintln!("refresh-channel: no channel matching {target:?}");
+        return ExitCode::from(1);
+    }
+
+    for ch in &matched {
+        let path = ch.output_folder.join(".refresh-request");
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("refresh-channel: {}: {err}", parent.display());
+            return ExitCode::from(1);
+        }
+        if let Err(err) = std::fs::write(&path, b"") {
+            eprintln!("refresh-channel: {}: {err}", path.display());
+            return ExitCode::from(1);
+        }
+        println!("refresh-channel: marked {}", ch.name);
+    }
+    println!(
+        "refresh-channel: {} channel(s) marked; the daemon regenerates each from the next item \
+         boundary on its following pass",
+        matched.len(),
     );
     ExitCode::SUCCESS
 }

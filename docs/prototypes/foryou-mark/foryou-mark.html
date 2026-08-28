@@ -1,0 +1,4235 @@
+<!DOCTYPE html>
+<html lang="en" data-at-kind="prototype" data-at-rail data-at-devices="fit,desktop">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="artifact/prototype">
+<meta name="artifact-build" content="b750c6339131">
+<meta name="artifact-built" content="2026-08-19 23:40">
+<meta name="artifact-fragment" content="/Users/pierce/Projects/etv-station/tmp/claude/artifacts/foryou-mark-v1.body.html">
+<meta name="artifact-out" content="/Users/pierce/Projects/etv-station/tmp/claude/prototypes/foryou-mark/foryou-mark.html">
+<title>For You Mark</title>
+<style>
+/* _base.css — reset, theme plumbing, layout primitives. Inlined into every kind. */
+
+:root {
+  /* Type scale. The root is 17px, so every rem here is a real rendered size:
+     --f-3xl 47px, --f-2xl 36px, --f-xl 26px, --f-lg 20px, --f-md 17px, --f-sm 15px.
+     --f-3xl is the display step: one per artifact, never for a section heading. */
+  --f-3xl: 2.75rem; --f-2xl: 2.1rem; --f-xl: 1.5rem; --f-lg: 1.16rem; --f-md: 1rem; --f-sm: .875rem;
+  /* Spacing scale. --s-7 is the section step: nothing smaller separates two sections,
+     nothing larger sits inside one. */
+  --s-1: .25rem; --s-2: .5rem; --s-3: .75rem; --s-4: 1rem; --s-5: 1.5rem; --s-6: 2.5rem; --s-7: 4rem;
+  --radius: 10px;
+  /* Prose measure, and the wider one that tables, diagrams and code break out to.
+     Reading width and figure width are two different numbers; one column for both
+     either squeezes the figures or overruns the prose. */
+  --maxw: 68ch;
+  --maxw-wide: 96ch;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* neutral ground — light. Kinds override; components consume tokens only. */
+  --bg: #fbfbfd;
+  --surface: #ffffff;
+  --ink: #1c1d22;
+  --ink-soft: #54565e;
+  --line: #e4e4ea;
+  --c-muted: #6b747c;
+  --c-accent: #067a88;
+}
+
+/* Dark comes from the OS preference... */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131419;
+    --surface: #1b1c22;
+    --ink: #ecedf1;
+    --ink-soft: #a9abb4;
+    --line: #2c2e37;
+    --c-muted: #8b8f9a;
+    --c-accent: #34d3e3;
+  }
+}
+
+/* ...and an explicit toggle beats it, in both directions. */
+:root[data-theme="light"] {
+  --bg: #fbfbfd;
+  --surface: #ffffff;
+  --ink: #1c1d22;
+  --ink-soft: #54565e;
+  --line: #e4e4ea;
+  --c-muted: #6b747c;
+  --c-accent: #067a88;
+}
+:root[data-theme="dark"] {
+  --bg: #131419;
+  --surface: #1b1c22;
+  --ink: #ecedf1;
+  --ink-soft: #a9abb4;
+  --line: #2c2e37;
+  --c-muted: #8b8f9a;
+  --c-accent: #34d3e3;
+}
+
+* { box-sizing: border-box; }
+
+html {
+  scroll-behavior: smooth;
+  /* The scale above is stated in rem, so the root size is what makes it real. */
+  font-size: 17px;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--f-md);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tracking tightens as size grows: at display sizes the default spacing reads loose. */
+h1, h2, h3, h4 { line-height: 1.2; font-weight: 650; text-wrap: balance; letter-spacing: -0.01em; }
+h1 { letter-spacing: -0.022em; }
+p { margin: 0 0 var(--s-4); }
+img, svg, video, canvas { max-width: 100%; }
+code, kbd, samp { font-family: var(--font-mono); font-size: .92em; }
+
+/* The surfaces the browser draws still belong to the design. Left at their defaults
+   they are the clearest tell that a page was assembled rather than built. */
+a {
+  color: var(--c-accent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.16em;
+}
+::selection { background: color-mix(in srgb, var(--c-accent) 26%, transparent); color: var(--ink); }
+input, textarea, [contenteditable] { caret-color: var(--c-accent); }
+* { scrollbar-color: var(--c-muted) transparent; scrollbar-width: thin; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--c-muted) 55%, transparent);
+  border: 3px solid transparent; background-clip: content-box; border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--c-muted); background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+hr { border: 0; border-top: 1px solid var(--line); margin: var(--s-6) 0; }
+
+:where(a, button, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* One reading column, plus a wider track a figure can break out into.
+   Prose stays at --maxw; anything marked .wide — and by default every table, figure,
+   diagram and code block — spans --maxw-wide. A single column for both squeezes the
+   figures to the width of a sentence, which is what a 72ch-everything page looks like.
+   deck, prototype and wireframe want the full viewport and opt out with display:block. */
+main {
+  display: grid;
+  justify-content: center;
+  grid-template-columns:
+    [wide-start] minmax(0, calc((var(--maxw-wide) - var(--maxw)) / 2))
+    [prose-start] minmax(0, var(--maxw)) [prose-end]
+    minmax(0, calc((var(--maxw-wide) - var(--maxw)) / 2)) [wide-end];
+}
+main > * { grid-column: prose; min-width: 0; }
+main > :is(.wide, figure, table, .scroll-x, .code, .compare) { grid-column: wide; }
+
+/* A wrapper that passes the measure grid through to its own children, so a table inside
+   a section still reaches the wide track. `page`'s two structural wrappers are named
+   here rather than re-declaring the same three lines in page.css: one definition of the
+   pass-through is worth this file knowing two class names. */
+:is(.subgrid, .page-section, .page-hero) {
+  grid-column: wide; display: grid; grid-template-columns: subgrid;
+}
+:is(.subgrid, .page-section, .page-hero) > * { grid-column: prose; min-width: 0; }
+:is(.subgrid, .page-section, .page-hero) > :is(.wide, figure, table, .scroll-x, .code, .compare) {
+  grid-column: wide;
+}
+
+/* Tables. One rule under the header, one under the last row, zebra between — a border on
+   every row is a ladder and stops the header reading as a header. Here rather than in
+   each kind: page and explainer had identical copies, which is the shape a rule takes
+   just before the two drift apart. */
+table { width: 100%; border-collapse: collapse; margin: var(--s-5) 0; font-size: var(--f-sm); }
+th, td { text-align: left; padding: var(--s-2) var(--s-3); border: 0; }
+thead th {
+  color: var(--ink-soft); font-weight: 650; font-size: .8em;
+  text-transform: uppercase; letter-spacing: .06em;
+  border-bottom: 1px solid var(--ink-soft); padding-bottom: var(--s-2);
+}
+tbody tr:nth-child(even) { background: color-mix(in srgb, var(--ink) 3.5%, transparent); }
+tbody tr:last-child td { border-bottom: 1px solid var(--line); }
+td.nums, th.nums { text-align: right; }
+
+/* Wide content scrolls inside itself; the page body never scrolls sideways. */
+.scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+
+.stack { display: flex; flex-direction: column; gap: var(--s-4); }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-3); }
+.nums { font-variant-numeric: tabular-nums; }
+
+.vh {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* Theme toggle — injected by the tool. On an artifact carrying the harness it is one of
+   the docked floating buttons (see harness/chrome.css); these rules are the standalone
+   fallback for a build with no harness chrome at all. */
+.at-theme:not(.at-dock) {
+  position: fixed; top: 12px; right: 12px; z-index: 2147483646;
+  display: grid; place-items: center; width: 30px; height: 30px;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface); color: var(--ink-soft);
+  font: inherit; font-size: 14px; line-height: 1; cursor: pointer;
+  opacity: .55; transition: opacity 150ms ease-out;
+}
+.at-theme:not(.at-dock):hover { opacity: 1; }
+
+@media print {
+  .at-theme { display: none; }
+  body { background: #fff; color: #000; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
+/* prototype.css — stage only. No palette, no type personality, no opinions.
+   Every colour in the output comes from the fragment, which copies the host
+   project's tokens. Anything styled here would compete with the design being judged. */
+
+body { background: var(--bg); }
+
+/* Switch mode: one variant at a time, full size.
+   The stage is a column and the mounted variant stretches to fill it. Without this the
+   stage is 100vh but the variant is only as tall as its content, so the prototype's own
+   background stops partway down and the artifact's page background shows below it — a
+   seam that reads as a rendering bug in every prototype whose content is short. */
+#at-stage {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+/* min-width: 0 because a flex item defaults to min-width: auto, so one over-wide child
+   made the prototype's whole root grow to match it. The root then WAS the wide thing,
+   every sibling inherited that width, and an overflow that should have been visible as
+   overflow just silently became a wider page. */
+#at-stage > * { flex: 1 0 auto; min-width: 0; }
+
+/* list mode: each variant isolated and stacked, one per screenful.
+   Never a grid of thumbnails — small side-by-side distorts spacing and scale. */
+.at-list-item {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--line);
+}
+.at-list-item:last-child { border-bottom: 0; }
+
+.at-list-head {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: baseline; gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  background: rgba(10, 10, 10, .82);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  backdrop-filter: blur(12px) saturate(1.4);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .08) inset;
+  color: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px; line-height: 1;
+}
+.at-list-head .at-list-n {
+  display: grid; place-items: center;
+  width: 20px; height: 20px; border-radius: 999px;
+  background: rgba(255, 255, 255, .14);
+  font-size: 11px; font-weight: 700;
+}
+.at-list-head .at-list-name { font-weight: 600; }
+.at-list-head .at-list-axis { color: rgba(255, 255, 255, .55); font-size: 12px; }
+
+.at-list-body { flex: 1; display: block; }
+/* rail.css — the prototype control rail. This is a FIXED SPEC, not a starting point.
+
+   Supersedes picker.css (the floating bottom pill + corner round ticker). The keyboard
+   and selection behaviour it implements is still the contract ported from
+   emilkowalski/skills prototype/PICKER.md (MIT, © 2026 Emil Kowalski); only the chrome
+   moved. Attribution stays because the behaviour did.
+
+   Why a rail and not a pill: a pill is a horizontal row, so it can hold ONE axis. A
+   prototype has several — which round, which variant, which screen, which state, which
+   device — and they are all the same question ("what am I looking at"), so they belong
+   in one list. A row cannot grow; a column can.
+
+   Its appearance is not a design decision. It stays identical across every project so it
+   always reads as harness chrome, never as part of the design being judged. Deliberately
+   NOT theme-aware: fixed dark, because it must sit beside light and dark prototypes
+   alike. Never restyle it with project tokens.
+
+   Every colour comes from chrome.css, which is the one palette all harness furniture
+   shares. Fixed spec covers the look, not the legibility floor: the group labels, the
+   second lines and the scope note shipped at 2.0–3.9:1 against the rail ground, and the
+   ink tokens now clear 4.5:1 and must keep clearing it. */
+
+:root {
+  --at-rail-w: 272px;
+}
+
+/* Edge to edge, full height, flush against the window. Tried as an inset floating card
+   and it was worse: the card's own margin exposed a band of empty ground down the side
+   of the artifact, and rounded corners on something anchored to the window edge read as
+   a mistake rather than a decision. A sidebar is furniture, not an overlay. */
+.at-rail {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--at-rail-w);
+  z-index: 2147483646;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 20px 16px 24px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--at-c-bg);
+  border-right: 1px solid var(--at-c-line);
+  color: var(--at-c-ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.at-rail::-webkit-scrollbar { width: 0; }
+
+/* --- header --- */
+
+.at-rail-head {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.at-rail-titlebar {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.at-rail-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+  line-height: 1.25;
+}
+
+.at-rail-keys {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--at-c-fainter);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.at-rail-keys:hover { background: var(--at-c-edge); color: var(--at-c-ink); }
+
+/* --- the key list: the shortcuts do not exist until they are discoverable --- */
+
+.at-rail-legend {
+  display: none;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--at-c-line);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.at-rail[data-legend] .at-rail-legend { display: grid; }
+
+.at-rail-legend dt {
+  color: var(--at-c-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.at-rail-legend dd { margin: 0; color: var(--at-c-faint); }
+
+.at-rail-sub {
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+  color: var(--at-c-faint);
+}
+
+/* --- groups --- */
+
+.at-rail-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.at-rail-group[hidden] { display: none; }
+
+.at-rail-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.9px;
+  color: var(--at-c-faint);
+}
+
+.at-rail-label .at-rail-hint {
+  margin-left: auto;
+  font-size: 9.5px;
+  letter-spacing: 0.4px;
+  text-transform: none;
+  color: var(--at-c-fainter);
+  font-variant-numeric: tabular-nums;
+}
+
+.at-rail-replay {
+  margin-left: auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: var(--at-c-surface);
+  color: var(--at-c-dim);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.at-rail-replay:hover { color: var(--at-c-ink); background: var(--at-c-edge); }
+
+/* --- items --- */
+
+.at-rail-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 9px 11px;
+  border: 1px solid var(--at-c-edge);
+  border-radius: 8px;
+  background: var(--at-c-surface);
+  color: var(--at-c-dim);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.25;
+  cursor: pointer;
+  transition: color 120ms ease-out, border-color 120ms ease-out, background-color 120ms ease-out;
+}
+
+.at-rail-item:hover {
+  color: var(--at-c-ink);
+  border-color: var(--at-c-edge-hi);
+}
+
+.at-rail-item:active { transform: scale(0.99); }
+
+/* A control that does nothing must not look like one that does. Rotate on a desktop
+   frame was `disabled` and rendered identically to every live button, down to the
+   pointer cursor. */
+.at-rail-item:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.at-rail-item:disabled:hover {
+  color: var(--at-c-dim);
+  border-color: var(--at-c-edge);
+}
+
+.at-rail-item:focus-visible {
+  outline: 2px solid rgba(122, 162, 247, 0.6);
+  outline-offset: 2px;
+}
+
+.at-rail-item[data-active] {
+  background: var(--at-c-sel);
+  border-color: var(--at-c-sel-edge);
+  color: var(--at-c-sel-ink);
+}
+
+/* Second line: what the option means. Written by the fragment as <em> inside the button. */
+.at-rail-item em {
+  display: block;
+  margin-top: 4px;
+  font-style: normal;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--at-c-faint);
+}
+
+.at-rail-item[data-active] em { color: var(--at-c-sel-dim); }
+
+.at-rail-item[hidden] { display: none; }
+
+/* --- the round stepper ---
+
+   One row whatever the round count. A chip per round wrapped to three lines by v10 and
+   pushed the variants and axes — the controls you actually touch — off the rail. */
+
+.at-rail-stepper {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.at-rail-step {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--at-c-edge);
+  border-radius: 7px;
+  background: var(--at-c-surface);
+  color: var(--at-c-dim);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 120ms ease-out, border-color 120ms ease-out;
+}
+
+.at-rail-step:hover:not(:disabled) { color: var(--at-c-ink); border-color: var(--at-c-edge-hi); }
+.at-rail-step:disabled { opacity: 0.3; cursor: default; }
+.at-rail-step:active:not(:disabled) { transform: scale(0.96); }
+.at-rail-step:focus-visible { outline: 2px solid var(--at-c-sel-edge); outline-offset: 2px; }
+
+.at-rail-round-now {
+  min-width: 34px;
+  text-align: center;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--at-c-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.at-rail-step-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--at-c-fainter);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- inline row groups (orientation and other compact enumerations) --- */
+
+.at-rail-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.at-rail-row .at-rail-item {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 7px 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- footer note: the scope line a prototype pins under the controls --- */
+
+.at-rail-note {
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid var(--at-c-line);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--at-c-faint);
+}
+
+.at-rail-note b { color: var(--at-c-dim); font-weight: 600; }
+
+.at-rail-built--alone { margin-top: auto; padding-top: 16px; border-top: 1px solid var(--at-c-line); }
+
+.at-rail-built {
+  margin-top: 6px;
+  color: var(--at-c-fainter);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- the focused axis ---
+
+   `x` moves this marker; `,` and `.` step whichever group holds it. Shown only when
+   there is more than one axis, because with one axis there is nothing to choose. */
+
+.at-rail-axis[data-focus] .at-rail-label { color: var(--at-c-dim); }
+
+.at-rail-axis[data-focus] .at-rail-label::before {
+  content: "";
+  width: 3px;
+  height: 10px;
+  margin-right: 2px;
+  border-radius: 2px;
+  background: var(--at-c-sel-edge);
+}
+
+/* --- collapsed ---
+
+   The rail is 272px the prototype does not get. Judging a 1440-wide desktop layout in a
+   1280 window means the frame is scaled to 67% before the rail takes its cut. `\` gives
+   the width back; the reopen chevron is the only thing left on screen. */
+
+html[data-at-rail-collapsed] .at-rail { display: none; }
+
+/* The rail toggle is one of the docked floating buttons: everything about how it looks
+   comes from .at-dock in chrome.css. It is always on screen — it used to try to hide
+   itself while the rail was open, but .at-dock's own display won that fight, so it was
+   visible the whole time anyway. Now that is the design rather than the accident: it
+   shows the rail's state instead of only offering a way back.
+
+   `display: none !important` inside a frame stays: the host's copy drives everything. */
+
+html[data-at-embedded] .at-rail-reopen { display: none !important; }
+
+/* A round's top-level markup, hidden by rail.js when its round is not on screen. */
+.at-shell[hidden] { display: none !important; }
+
+/* --- the stage the rail drives ---
+
+   The stage is the prototype's VIEWPORT, not a padded region of the page. It used to be
+   the latter: the rail reserved its width with `body { padding-left }`, which only moves
+   content that is in normal flow. A prototype pinned to the viewport — `position: fixed;
+   inset: 0`, the shape every app shell, menubar panel and mobile screen takes — ignored
+   that padding completely and ran the full 272px underneath the rail, with its left edge
+   unreadable. So did anything sized `100vw`.
+
+   Positioning the stage and giving it a transform fixes both: the transform makes it the
+   containing block for its `position: fixed` descendants, so a prototype's own fixed
+   header pins to the stage rather than to the window, and the stage's own bounds are the
+   only space it can occupy. A `100vw` child now overflows into the stage's own scroller
+   instead of over the chrome. Nothing in a fragment has to know any of this. */
+
+html[data-at-rail]:not([data-at-embedded]) #at-stage {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: var(--at-inset-l);
+  right: var(--at-inset-r);
+  overflow: auto;
+  transform: translateZ(0);
+}
+
+/* An embedded copy has no rail to sit beside, so its stage is the whole frame. */
+html[data-at-embedded] #at-stage { min-height: 100vh; }
+
+/* An embedded copy (inside a viewport frame) renders no rail and reclaims the width. */
+html[data-at-embedded] .at-rail { display: none; }
+/* chrome.css — the one palette every piece of harness chrome consumes.
+
+   The rail, the comment panel, the device bezel and the toasts are all the same thing:
+   fixed-dark furniture that sits beside an artifact whose own theme is none of their
+   business. They used to each carry their own hardcoded greys — the rail on #101114 /
+   #181b20 / #23272d, the panel on rgba(18,18,18,.93) with its own amber — which is how
+   the rail's labels ended up at 2.0-3.9:1 while the panel's were fine, and how a fix to
+   one silently left the other behind.
+
+   Deliberately NOT theme-aware. Chrome stays dark beside a light artifact and beside a
+   dark one, so it always reads as the harness and never as part of the design.
+
+   Every ink value here clears 4.5:1 against --at-c-bg, and must keep clearing it. */
+
+/* --- the space the artifact gets ---
+
+   Both side panels run edge to edge, so the artifact's usable area is the window minus
+   whichever of them is open. One pair of tokens rather than each surface working it out for
+   itself: the stage and the device host both read these, which is what makes a device
+   frame stay centred in the space that is actually free — with the rail open or shut,
+   with the comments panel open or shut. Before this the host only knew about the rail,
+   so opening comments pushed the phone off-centre by half the panel's width. */
+
+:root {
+  --at-gap: 12px;
+  --at-inset-l: 0px;
+  --at-inset-r: 0px;
+}
+
+/* --- the floating buttons ---
+
+   One object with three instances: reopen the rail, comment, switch theme. Partially
+   opaque so they sit over the artifact without competing with it, solid on hover, and
+   draggable to either edge — see dock.js. Positioned entirely from script, so nothing
+   here sets left/right/top. */
+
+.at-dock {
+  position: fixed;
+  z-index: 2147483646;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: var(--at-c-panel);
+  -webkit-backdrop-filter: blur(10px) saturate(1.3);
+  backdrop-filter: blur(10px) saturate(1.3);
+  color: var(--at-c-dim);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: grab;
+  opacity: 0.55;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.at-dock:hover { opacity: 1; color: var(--at-c-ink); }
+.at-dock:focus-visible { opacity: 1; outline: 2px solid var(--at-c-mark); outline-offset: 2px; }
+.at-dock[data-dragging] { opacity: 1; cursor: grabbing; box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45); }
+
+/* Active is the one state that overrides the resting transparency: amber, the same
+   colour the pins and the send button use, so "the review layer is on" is one signal
+   wherever it appears. Blue belongs to the rail, where it means "this is the option
+   currently selected out of several" — a different question from "this mode is engaged",
+   and the floating buttons are never one of several. */
+.at-dock[data-active] {
+  opacity: 1;
+  background: var(--at-c-mark);
+  border-color: var(--at-c-mark);
+  color: var(--at-c-mark-ink);
+}
+
+.at-dock[data-active]:hover { background: var(--at-c-mark-hi); border-color: var(--at-c-mark-hi); }
+
+@media (prefers-reduced-motion: reduce) {
+  .at-dock { transition: none !important; }
+}
+
+html[data-at-rail]:not([data-at-embedded]) {
+  --at-inset-l: var(--at-rail-w, 272px);
+}
+
+/* Written to outweigh the rule above rather than relying on order: that one carries two
+   attribute selectors, so a single-attribute reset silently lost and the stage kept the
+   rail's width reserved after the rail was gone. */
+html[data-at-rail][data-at-rail-collapsed]:not([data-at-embedded]) { --at-inset-l: 0px; }
+
+:root[data-at-annotate]:not([data-at-embedded]) {
+  --at-inset-r: var(--at-panel-w, 300px);
+}
+
+:root {
+  --at-c-bg: #101114;          /* the rail's ground */
+  --at-c-panel: rgba(18, 18, 18, 0.93);  /* floating surfaces, over an artifact */
+  --at-c-surface: #181b20;     /* a control at rest */
+  --at-c-surface-hi: #23272d;  /* a control under the pointer */
+  --at-c-line: #22262c;        /* divider */
+  --at-c-edge: #23272d;        /* control border */
+  --at-c-edge-hi: #333a43;     /* control border, hover */
+
+  --at-c-ink: #e8eaed;         /* primary text — 14.9:1 */
+  --at-c-dim: #979ea8;         /* secondary text — 7.4:1 */
+  --at-c-faint: #8a919c;       /* labels and second lines — 5.9:1 */
+  --at-c-fainter: #767d88;     /* hints — 4.6:1, the floor */
+
+  --at-c-sel: #1b2740;         /* selected control ground */
+  --at-c-sel-edge: #3f6ac2;    /* selected control border, and the focus marker */
+  --at-c-sel-ink: #cfe0ff;     /* selected control text */
+  --at-c-sel-dim: #8296b8;     /* selected control second line */
+
+  --at-c-mark: #f5a524;        /* the annotate layer's pin colour */
+  --at-c-mark-hi: #ffb733;     /* pin colour, hover */
+  --at-c-mark-ink: #1a1204;    /* text on --at-c-mark */
+  --at-c-stale: #9a9a9a;       /* a pin whose element is gone */
+  --at-c-ok: #3fb950;          /* a completed action */
+  --at-c-ok-ink: #06210c;      /* text on --at-c-ok */
+}
+/* annotate.css — the comment layer. Chrome, not design.
+
+   Same rule as rail.css: deliberately NOT theme-aware, never restyled with project
+   tokens. Dark glass reads as harness on top of any page, light or dark.
+
+   Dormant by default — nothing here renders until annotate.js sets data-at-annotate on
+   :root, which only happens when the user presses `a`. An artifact handed to someone
+   else shows no annotation chrome at all. */
+
+.at-notes-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483640;
+  pointer-events: none;
+  display: none;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+:root[data-at-annotate] .at-notes-layer { display: block; }
+
+/* --- the element being aimed at ------------------------------------------- */
+
+:root[data-at-annotate] .at-aim {
+  outline: 2px solid var(--at-c-mark) !important;
+  outline-offset: 1px;
+  cursor: crosshair !important;
+}
+
+:root[data-at-annotate] * { cursor: crosshair !important; }
+
+/* The harness keeps its own cursors: the picker, the device switcher and the panel stay
+   clickable while you annotate, so they must not look like annotation targets. */
+:root[data-at-annotate] .at-panel,
+:root[data-at-annotate] .at-panel *,
+:root[data-at-annotate] .at-composer,
+:root[data-at-annotate] .at-composer * { cursor: auto !important; }
+:root[data-at-annotate] .at-panel button,
+:root[data-at-annotate] .at-composer button,
+:root[data-at-annotate] .at-theme,
+:root[data-at-annotate] .at-annotate-toggle,
+:root[data-at-annotate] .at-rail-reopen,
+:root[data-at-annotate] .at-rail button,
+:root[data-at-annotate] .at-vp button { cursor: pointer !important; }
+
+/* --- a pinned comment ------------------------------------------------------ */
+
+.at-ring {
+  position: absolute;
+  border: 1.5px solid color-mix(in srgb, var(--at-c-mark) 85%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--at-c-mark) 7%, transparent);
+}
+
+.at-ring[data-state="stale"] {
+  border-style: dashed;
+  border-color: rgba(160, 160, 160, 0.8);
+  background: transparent;
+}
+
+.at-badge {
+  position: absolute;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 0;
+  background: var(--at-c-mark);
+  color: var(--at-c-mark-ink);
+  font: 600 12px/20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  text-align: center;
+  pointer-events: auto;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.at-badge[data-state="stale"] { background: var(--at-c-stale); color: #fff; }
+.at-badge[data-selected] { outline: 2px solid #fff; outline-offset: 1px; }
+
+/* --- the composer ---------------------------------------------------------- */
+
+.at-composer {
+  position: absolute;
+  width: 300px;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--at-c-panel);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  backdrop-filter: blur(12px) saturate(1.4);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.1) inset,
+    0 12px 32px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+}
+
+.at-composer-target {
+  margin: 0 0 6px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.at-composer textarea {
+  display: block;
+  width: 100%;
+  min-height: 66px;
+  padding: 7px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  resize: vertical;
+}
+
+.at-composer textarea:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--at-c-mark) 80%, transparent);
+}
+
+.at-composer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.at-composer-hint {
+  flex: 1;
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 11px;
+}
+
+/* --- the way in ------------------------------------------------------------
+
+   Dormant chrome still needs one visible affordance, or it is chrome nobody knows is
+   there. Geometry, opacity and dragging come from .at-dock in chrome.css; the only thing
+   particular to this button is which glyph it carries. Never inside a device frame: the
+   host's button drives the whole thing. */
+
+html[data-at-embedded] .at-annotate-toggle { display: none; }
+
+/* --- the panel ------------------------------------------------------------- */
+
+:root { --at-panel-w: 300px; }
+
+/* The panel is a review surface for the artifact, so it must not cover the artifact.
+   While annotate mode is on the page reflows beside it — the same move the prototype
+   rail makes with padding-left — instead of parking a 300px pane over the right third
+   of the content the reviewer is trying to comment on. The theme toggle lives in that
+   same corner and moves with it. */
+:root[data-at-annotate]:not([data-at-rail]) body { padding-right: calc(var(--at-panel-w) + 32px); }
+
+/* Edge to edge and full height, the mirror of the rail on the other side. */
+.at-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: var(--at-panel-w);
+  z-index: 2147483641;
+  display: none;
+  flex-direction: column;
+  background: var(--at-c-bg);
+  border-left: 1px solid var(--at-c-line);
+  color: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+:root[data-at-annotate] .at-panel { display: flex; }
+
+.at-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.at-panel-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.at-panel-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+/* The empty state is the first and often only thing anyone reads in this panel, so it
+   holds the 4.5:1 floor like any other text. At 0.42 alpha it sat at 3.96:1 and the key
+   chips at 3.34:1 — found the first time the contrast check was pointed at chrome. */
+.at-empty {
+  padding: 14px 10px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.at-empty kbd {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.at-note {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.at-note:hover { background: rgba(255, 255, 255, 0.06); }
+
+.at-note-n {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--at-c-mark);
+  color: var(--at-c-mark-ink);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+.at-note[data-state="stale"] .at-note-n { background: var(--at-c-stale); color: #fff; }
+
+.at-note-body { flex: 1; min-width: 0; }
+
+.at-note-text {
+  margin: 0 0 3px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.at-note-src {
+  color: rgba(255, 255, 255, 0.42);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.at-note-flag {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.13);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.at-note-del {
+  flex: none;
+  align-self: flex-start;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.at-note-del:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+
+.at-panel-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.at-panel-actions { display: flex; gap: 6px; }
+.at-panel-actions .at-copy { flex: 1; gap: 7px; }
+.at-panel-actions .at-copy svg { flex: 0 0 auto; }
+
+/* An icon button: square, no label, the glyph carries it. Clear and Done sit in the
+   header, where a word would crowd the title. */
+.at-btn--icon {
+  width: 28px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+.at-btn:disabled { opacity: 0.35; cursor: default; }
+.at-btn:disabled:hover { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.88); }
+
+.at-btn--primary { display: flex; align-items: center; justify-content: center; }
+
+.at-btn {
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(255, 255, 255, 0.88);
+  font: 500 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+
+.at-btn:hover { background: rgba(255, 255, 255, 0.13); color: #fff; }
+.at-btn:active { transform: scale(0.97); }
+.at-btn:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.45); outline-offset: 2px; }
+
+.at-btn--primary {
+  flex: 1;
+  border-color: transparent;
+  background: var(--at-c-mark);
+  color: var(--at-c-mark-ink);
+  font-weight: 600;
+}
+
+.at-btn--primary:hover { background: var(--at-c-mark-hi); color: var(--at-c-mark-ink); }
+
+.at-btn[data-done] { background: var(--at-c-ok); border-color: transparent; color: var(--at-c-ok-ink); }
+
+/* --- the toast ------------------------------------------------------------- */
+
+
+@media print {
+  .at-notes-layer, .at-panel, .at-annotate-toggle { display: none !important; }
+}
+/* contrast.css — the text-contrast check. Chrome, not design.
+
+   The overlay is the detail view: dormant until `c`, or until the rail's Contrast row is
+   clicked. The standing verdict itself lives in checks.js, which owns every row. */
+
+.at-cx-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483639;
+  pointer-events: none;
+  display: none;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+:root[data-at-contrast] .at-cx-layer { display: block; }
+
+.at-cx-ring {
+  position: absolute;
+  border: 1.5px dashed rgba(240, 60, 70, 0.9);
+  border-radius: 3px;
+}
+
+.at-cx-badge {
+  position: absolute;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #f03c46;
+  color: #fff;
+  font: 600 10px/15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+.at-cx-badge[data-level="warn"] { background: #d98b12; }
+
+@media print {
+  .at-cx-layer { display: none !important; }
+}
+/* checks.css — the standing verdicts in the rail. Chrome, not design.
+
+   A row is a statement, not a control, so it is quieter than the buttons above it: no
+   filled ground, a hairline only, and colour reserved for the mark. Failures are the
+   only thing that raises its voice — amber mark, amber note — because a passing check
+   should cost you no attention at all. */
+
+.at-check {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--at-c-dim);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out;
+}
+
+.at-check:hover { background: var(--at-c-surface); border-color: var(--at-c-edge); }
+.at-check[data-open] { background: var(--at-c-surface); border-color: var(--at-c-edge-hi); }
+.at-check:focus-visible { outline: 2px solid var(--at-c-sel-edge); outline-offset: 2px; }
+
+.at-check-mark {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.at-check[data-state="pass"] .at-check-mark {
+  background: color-mix(in srgb, var(--at-c-ok) 18%, transparent);
+  color: var(--at-c-ok);
+}
+
+.at-check[data-state="fail"] .at-check-mark {
+  background: color-mix(in srgb, var(--at-c-mark) 20%, transparent);
+  color: var(--at-c-mark);
+}
+
+.at-check[data-state="skip"] .at-check-mark {
+  background: var(--at-c-surface);
+  color: var(--at-c-fainter);
+}
+
+.at-check-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.at-check-name { color: var(--at-c-ink); font-weight: 600; font-size: 12px; }
+.at-check-note { font-size: 10.5px; color: var(--at-c-faint); }
+.at-check[data-state="fail"] .at-check-note { color: var(--at-c-mark); }
+.at-check[data-state="skip"] .at-check-name { color: var(--at-c-dim); }
+
+/* What the row found, revealed in place rather than in a tooltip you cannot read at
+   your own pace. */
+.at-check-detail {
+  margin-top: 2px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: var(--at-c-bg);
+  border: 1px solid var(--at-c-edge);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--at-c-faint);
+}
+
+.at-check-detail-head {
+  margin-bottom: 5px;
+  color: var(--at-c-ink);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.at-check-detail-row {
+  padding: 2px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-word;
+}
+/* viewport.css — the device stage: bezel, outside-the-viewport chrome, and the
+   floating size bar used when there is no rail to put the controls in.
+
+   Fixed spec, same rule as rail.css: this is harness chrome, never restyled with project
+   tokens, never theme-aware. It has to read as "the thing holding the design" against a
+   light prototype and a dark one alike. */
+
+/* --- the stage --- */
+
+/* .at-rail-reopen is exempt for a reason: it is the ONLY way back once the rail is
+   collapsed, and this rule's !important was beating its display, so collapsing the rail
+   while a device frame was up left no control on screen at all and no way to restore one
+   short of editing the URL. */
+html[data-at-vp] body > *:not(.at-vp-host):not(.at-vp):not(.at-rail):not(.at-rail-reopen):not(.at-notes-layer):not(.at-panel):not(.at-toast) {
+  display: none !important;
+}
+
+/* Centred in the space that is actually free, not in the window: both side panels float
+   and either can be open, so the host reads the shared insets rather than knowing about
+   the rail alone. Opening comments used to leave the frame centred on the old bounds,
+   sitting half a panel's width off to the right. */
+.at-vp-host {
+  position: fixed;
+  top: 0;
+  right: var(--at-inset-r, 0px);
+  bottom: 0;
+  left: var(--at-inset-l, 0px);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  overflow: auto;
+  background:
+    radial-gradient(120% 100% at 50% 0%, #16181d 0%, #0a0b0d 70%);
+}
+
+/* The insets already collapse to 0 without a rail, or with it hidden. */
+
+/* 1:1 — the frame keeps its real pixel size and the host scrolls to the rest of it.
+   Centring a frame that is wider than the host would cut off its left edge with no way
+   back, so alignment flips to the start in whichever axis has overflowed. */
+.at-vp-host[data-actual] {
+  align-items: safe center;
+  justify-content: safe center;
+}
+
+/* --- the shell: bezel + whatever chrome sits OUTSIDE the viewport --- */
+
+.at-vp-shell {
+  position: relative;
+  flex: 0 0 auto;
+  transform-origin: top left;
+  overflow: hidden;
+  background: #000;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.09),
+    0 24px 70px rgba(0, 0, 0, 0.62);
+}
+
+/* A phone/tablet gets a real bezel; a window does not — its edge IS the window edge. */
+.at-vp-shell[data-chrome="ios"] {
+  padding: 9px;
+  background: #1b1d21;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.13),
+    0 0 0 9px #0e0f11,
+    0 28px 80px rgba(0, 0, 0, 0.7);
+}
+
+.at-vp-frame {
+  display: block;
+  border: 0;
+  background: #fff;
+  border-radius: inherit;
+}
+
+.at-vp-shell[data-chrome="ios"] .at-vp-frame {
+  border-radius: 38px;
+}
+
+.at-vp-shell[data-chrome="ios"][style*="border-radius: 20px"] .at-vp-frame {
+  border-radius: 14px;
+}
+
+/* The notch is bezel furniture, not page content: it sits over the frame's top edge. */
+.at-vp-notch {
+  position: absolute;
+  top: 9px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 122px;
+  height: 34px;
+  background: #000;
+  border-radius: 0 0 20px 20px;
+  z-index: 3;
+}
+
+/* --- macOS window title bar (OUTSIDE the viewport) --- */
+
+.at-oc {
+  display: flex;
+  align-items: center;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.at-oc-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: 0 0 12px;
+}
+
+.at-oc-macos {
+  height: 38px;
+  gap: 8px;
+  padding: 0 14px;
+  background: linear-gradient(#3a3f46, #2e3238);
+  border-bottom: 1px solid #22252a;
+}
+
+/* A title bar built without traffic lights still balances its centred title. */
+.at-oc-macos .at-oc-nolights { width: 52px; flex: 0 0 52px; }
+
+.at-oc-macos .at-oc-title {
+  flex: 1;
+  text-align: center;
+  margin-right: 52px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #cdd2d9;
+}
+
+/* --- browser chrome (OUTSIDE the viewport) --- */
+
+.at-oc-browser {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  background: #2e3238;
+  border-bottom: 1px solid #22252a;
+}
+
+.at-oc-browser .at-oc-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 14px;
+}
+
+.at-oc-browser .at-oc-tab {
+  margin-left: 10px;
+  width: 190px;
+  height: 26px;
+  border-radius: 8px 8px 0 0;
+  background: #3f444c;
+}
+
+.at-oc-browser .at-oc-url {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 14px 8px;
+}
+
+.at-oc-browser .at-oc-lock {
+  font-size: 9px;
+  color: #7f8792;
+}
+
+.at-oc-browser .at-oc-addr {
+  flex: 1;
+  height: 28px;
+  border-radius: 999px;
+  background: #22252a;
+}
+
+/* --- size readout, and the two controls that change it ---
+
+   Rotate and 1:1 belong here rather than among the device chips: the chips answer "which
+   frame", these two answer "how is it shown". Wearing the same chip treatment they read
+   as two more frames in the list, which is the one thing they are not. Ghost buttons on
+   the readout line — attached to the numbers they change, subordinate to the chips. */
+
+.at-vp-readout {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 2px;
+  padding-left: 2px;
+}
+
+.at-vp-size {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--at-c-fainter);
+  font-variant-numeric: tabular-nums;
+}
+
+.at-vp-mod {
+  flex: 0 0 auto;
+  height: 22px;
+  min-width: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--at-c-faint);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 120ms ease-out, background-color 120ms ease-out;
+}
+
+.at-vp-mod:hover { background: var(--at-c-edge); color: var(--at-c-ink); }
+.at-vp-mod[data-active] { background: var(--at-c-sel); color: var(--at-c-sel-ink); }
+.at-vp-mod:disabled { opacity: 0.3; cursor: default; }
+.at-vp-mod:disabled:hover { background: transparent; color: var(--at-c-faint); }
+.at-vp-mod:focus-visible { outline: 2px solid var(--at-c-sel-edge); outline-offset: 1px; }
+
+/* --- the floating bar, used only when no rail exists (non-prototype kinds) --- */
+
+.at-vp {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 2147483646;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(10, 10, 10, 0.82);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  backdrop-filter: blur(12px) saturate(1.4);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.08) inset,
+    0 8px 24px rgba(0, 0, 0, 0.24);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 12px;
+  line-height: 1;
+  user-select: none;
+}
+
+.at-vp .at-vp-size { padding: 0 8px 0 4px; }
+
+.at-vp-item {
+  display: flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  font: inherit;
+  cursor: pointer;
+}
+
+.at-vp-item:hover { color: #fff; background: rgba(255, 255, 255, 0.1); }
+.at-vp-item[data-active] { color: #fff; background: rgba(255, 255, 255, 0.14); }
+.at-vp-item[disabled] { opacity: 0.3; cursor: default; }
+
+.at-vp-divider {
+  width: 1px;
+  height: 14px;
+  margin: 0 4px;
+  background: rgba(255, 255, 255, 0.12);
+}
+</style>
+</head>
+<body>
+<nav class="at-rail" aria-label="Prototype controls">
+  <div class="at-rail-head">
+    <div class="at-rail-titlebar">
+      <div class="at-rail-title">For You Mark</div>
+      <button class="at-rail-keys" type="button" aria-label="Keyboard shortcuts (?)">?</button>
+    </div>
+    <div class="at-rail-sub">One family silhouette, three channel variants — which direction?</div>
+  </div>
+  <dl class="at-rail-legend"><dt>[ ]</dt><dd>round</dd><dt>1–9 &#8592; &#8594;</dt><dd>variant</dd><dt>x</dt><dd>focus next axis</dd><dt>, .</dt><dd>step that axis</dd><dt>d D</dt><dd>device</dd><dt>r</dt><dd>replay</dd><dt>\</dt><dd>hide the rail</dd><dt>a</dt><dd>comment mode</dd><dt>c</dt><dd>contrast check</dd></dl>
+  <div class="at-rail-group">
+    <div class="at-rail-label">Variant<span class="at-rail-hint">1–4</span></div>
+    <button class="at-rail-item at-rail-variant" data-round="1" data-active aria-current="true">Badge</button>
+    <button class="at-rail-item at-rail-variant" data-round="1">Beacon</button>
+    <button class="at-rail-item at-rail-variant" data-round="1">Trace</button>
+    <button class="at-rail-item at-rail-variant" data-round="1">Aperture</button>
+  </div>
+<div class="at-rail-group at-rail-axis" data-axis="channel" data-round="1">
+  <div class="at-rail-label">Channel<span class="at-rail-hint">, .</span></div>
+  <button class="at-rail-item at-rail-opt" data-value="c1" data-active>001 For You<em data-src="foryou-mark-v1.body.html:136">the whole house</em></button>
+  <button class="at-rail-item at-rail-opt" data-value="c2">002 For Pierce<em data-src="foryou-mark-v1.body.html:137">single_user</em></button>
+  <button class="at-rail-item at-rail-opt" data-value="c3">003 For Madi<em data-src="foryou-mark-v1.body.html:138">single_user</em></button>
+</div>
+<!--/at:axis-->
+<div class="at-rail-group at-rail-axis" data-axis="bd" data-round="1">
+  <div class="at-rail-label">Backdrop<span class="at-rail-hint">, .</span></div>
+  <button class="at-rail-item at-rail-opt" data-value="night" data-active>Night interior<em data-src="foryou-mark-v1.body.html:142">warm key light under the bug</em></button>
+  <button class="at-rail-item at-rail-opt" data-value="bright">Bright exterior<em data-src="foryou-mark-v1.body.html:143">white-on-white, the failure case</em></button>
+  <button class="at-rail-item at-rail-opt" data-value="busy">Busy<em data-src="foryou-mark-v1.body.html:144">high-frequency detail</em></button>
+</div>
+<!--/at:axis-->
+<div class="at-rail-group at-rail-axis" data-axis="shadow" data-round="1">
+  <div class="at-rail-label">Bug shadow<span class="at-rail-hint">, .</span></div>
+  <button class="at-rail-item at-rail-opt" data-value="none" data-active>None<em data-src="foryou-mark-v1.body.html:148">as the renderer draws it today</em></button>
+  <button class="at-rail-item at-rail-opt" data-value="soft">Soft drop shadow</button>
+</div>
+<!--/at:axis-->
+  <div class="at-rail-note"><b data-src="foryou-mark-v1.body.html:152">Scope.</b> The mark only. Bug is drawn at the real spec — <code data-src="foryou-mark-v1.body.html:152">corner: bottom_right</code>, <code data-src="foryou-mark-v1.body.html:152">margin: 24</code>, <code data-src="foryou-mark-v1.body.html:152">height: 56</code> in a 1280&times;720 frame. Every mark is one white shape with knockouts, so it exports to an alpha PNG unchanged.</div>
+</nav>
+<!--at:round 1-->
+<div class="at-shell" data-round="1">
+<style>
+  /* etv-station overlay tokens, copied from deploy/appdata/shared/pierce-overlay.yaml
+     and now-next-snipe.rhai — not imported. The renderer draws Helvetica at
+     rgba(255,255,255,235) over live video; everything below matches that. */
+  :root {
+    --ov-font: Helvetica, "Helvetica Neue", Arial, sans-serif;
+    --ov-ink: rgba(255, 255, 255, 0.92);
+    --ov-ink-dim: rgba(255, 255, 255, 0.55);
+    --frame-w: 1280;
+    --frame-h: 720;
+    --bug-h: 56;      /* channel.yaml: height: 56 */
+    --bug-margin: 24; /* channel.yaml: margin: 24 */
+  }
+
+  /* A mark for live video is judged against a dark surround, never against a
+     document page — so the prototype brings its own ground rather than
+     borrowing the artifact's. */
+  .mk-page {
+    font-family: var(--ov-font);
+    color: var(--ov-ink);
+    background: #0a0c11;
+    padding: 30px 34px 48px;
+    max-width: 1180px;
+    margin: 0 auto;
+    min-height: 100%;
+  }
+
+  .mk-h {
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ov-ink-dim);
+    margin: 34px 0 12px;
+    font-weight: 700;
+  }
+  .mk-h:first-child { margin-top: 0; }
+
+  /* ---- the 1280x720 broadcast frame ------------------------------------ */
+  .frame {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1280 / 720;
+    overflow: hidden;
+    border-radius: 4px;
+    background: #05070c;
+  }
+  .frame[data-bd="night"] {
+    background:
+      radial-gradient(90% 120% at 78% 88%, #6b4a22 0%, #2a1c10 34%, rgba(0,0,0,0) 66%),
+      radial-gradient(60% 80% at 22% 18%, #16283f 0%, rgba(0,0,0,0) 70%),
+      linear-gradient(#070a10, #03050a);
+  }
+  .frame[data-bd="bright"] {
+    background:
+      radial-gradient(70% 90% at 72% 80%, #ffffff 0%, #f2f4f7 40%, #dfe6ee 100%),
+      linear-gradient(#eef3f8, #dbe4ee);
+  }
+  .frame[data-bd="busy"] {
+    background:
+      repeating-linear-gradient(122deg, rgba(255,255,255,0.20) 0 7px, rgba(0,0,0,0.34) 7px 15px),
+      repeating-linear-gradient(28deg, rgba(190,60,40,0.55) 0 23px, rgba(20,60,120,0.55) 23px 47px),
+      #4a4a52;
+  }
+
+  /* The bug, positioned exactly as the renderer does: bottom_right, margin 24,
+     height 56, in a 720-tall frame. Expressed as a share of frame height so it
+     stays true at any display scale. */
+  .bug {
+    position: absolute;
+    right: calc(var(--bug-margin) / var(--frame-h) * 100%);
+    bottom: calc(var(--bug-margin) / var(--frame-h) * 100%);
+    height: calc(var(--bug-h) / var(--frame-h) * 100%);
+    display: block;
+    color: #fff;
+  }
+  .bug svg { height: 100%; width: auto; display: block; }
+
+  [data-shadow="soft"] .bug svg,
+  [data-shadow="soft"] .mk-swatch svg {
+    filter: drop-shadow(0 1px 2px rgba(0,0,0,0.55)) drop-shadow(0 0 7px rgba(0,0,0,0.40));
+  }
+
+  /* ---- family strip: all three channels at once ------------------------ */
+  .family {
+    display: flex;
+    gap: 0;
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .family > div {
+    flex: 1;
+    padding: 22px 16px 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    background: #0b0e14;
+    border-right: 1px solid rgba(255,255,255,0.10);
+  }
+  .family > div:last-child { border-right: 0; }
+  .family svg { height: 56px; width: auto; color: #fff; display: block; }
+  .family b {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ov-ink-dim);
+  }
+
+  /* ---- size ladder: true pixels, no scaling --------------------------- */
+  .ladder { display: flex; gap: 0; border-radius: 4px; overflow: hidden; border: 1px solid rgba(255,255,255,0.14); }
+  .ladder > div { flex: 1; padding: 20px 14px; display: flex; align-items: flex-end; justify-content: center; gap: 26px; }
+  .ladder .on-dark { background: #06080d; }
+  .ladder .on-light { background: #eef2f7; }
+  .mk-swatch { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .mk-swatch svg { width: auto; display: block; }
+  .mk-swatch span { font-size: 10px; letter-spacing: 0.08em; }
+  .on-dark .mk-swatch svg { color: #fff; }
+  .on-dark .mk-swatch span { color: rgba(255,255,255,0.42); }
+  .on-light .mk-swatch svg { color: #fff; }
+  .on-light .mk-swatch span { color: rgba(0,0,0,0.45); }
+  .s24 { height: 24px; } .s56 { height: 56px; } .s128 { height: 128px; }
+
+  .mk-note {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--ov-ink-dim);
+    margin: 12px 0 0;
+    max-width: 76ch;
+  }
+  .mk-note b { color: var(--ov-ink); font-weight: 600; }
+</style>
+
+
+
+
+
+
+
+
+
+<!-- =================================================================== -->
+
+
+<!-- =================================================================== -->
+
+
+<!-- =================================================================== -->
+
+
+<!-- =================================================================== -->
+
+
+<!-- shared symbol defs, one copy for the whole file -->
+<svg data-src="foryou-mark-v1.body.html:318" width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+
+  <g id="x-badge-1">
+    <mask id="m-badge-1"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+      <g fill="black"><rect x="45.5" y="27" width="9" height="46" rx="4.5"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(60 50 50)"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(120 50 50)"/></g>
+    </mask>
+    <rect width="100" height="100" fill="currentColor" mask="url(#m-badge-1)"/>
+  </g>
+  <g id="x-badge-2">
+    <mask id="m-badge-2"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="800" text-anchor="middle" dominant-baseline="central">P</text></mask>
+    <rect width="100" height="100" fill="currentColor" mask="url(#m-badge-2)"/>
+  </g>
+  <g id="x-badge-3">
+    <mask id="m-badge-3"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="52" font-weight="800" text-anchor="middle" dominant-baseline="central">M</text></mask>
+    <rect width="100" height="100" fill="currentColor" mask="url(#m-badge-3)"/>
+  </g>
+
+  <!-- Arcs sit either side of the core, not stacked above it: two arcs over a
+       rounded block is the wifi glyph, and a bug that reads as a connectivity
+       icon is a bug that reads as an error state. -->
+  <g id="x-beacon-1">
+    <g fill="none" stroke="currentColor" stroke-width="8.5" stroke-linecap="round">
+      <path d="M 24 65 A 30 30 0 0 1 24 35"/>
+      <path d="M 76 65 A 30 30 0 0 0 76 35"/>
+      <path d="M 11.1 65.7 A 42 42 0 0 1 11.1 34.3"/>
+      <path d="M 88.9 65.7 A 42 42 0 0 0 88.9 34.3"/>
+    </g>
+    <rect x="32" y="32" width="36" height="36" rx="11" fill="currentColor"/>
+  </g>
+  <g id="x-beacon-2">
+    <g fill="none" stroke="currentColor" stroke-width="8.5" stroke-linecap="round">
+      <path d="M 24 65 A 30 30 0 0 1 24 35"/>
+      <path d="M 76 65 A 30 30 0 0 0 76 35"/>
+      <path d="M 11.1 65.7 A 42 42 0 0 1 11.1 34.3"/>
+      <path d="M 88.9 65.7 A 42 42 0 0 0 88.9 34.3"/>
+    </g>
+    <mask id="m-beacon-2"><rect x="32" y="32" width="36" height="36" rx="11" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="27" font-weight="800" text-anchor="middle" dominant-baseline="central">P</text></mask>
+    <rect x="32" y="32" width="36" height="36" rx="11" fill="currentColor" mask="url(#m-beacon-2)"/>
+  </g>
+  <g id="x-beacon-3">
+    <g fill="none" stroke="currentColor" stroke-width="8.5" stroke-linecap="round">
+      <path d="M 24 65 A 30 30 0 0 1 24 35"/>
+      <path d="M 76 65 A 30 30 0 0 0 76 35"/>
+      <path d="M 11.1 65.7 A 42 42 0 0 1 11.1 34.3"/>
+      <path d="M 88.9 65.7 A 42 42 0 0 0 88.9 34.3"/>
+    </g>
+    <mask id="m-beacon-3"><rect x="32" y="32" width="36" height="36" rx="11" fill="white"/>
+      <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="25" font-weight="800" text-anchor="middle" dominant-baseline="central">M</text></mask>
+    <rect x="32" y="32" width="36" height="36" rx="11" fill="currentColor" mask="url(#m-beacon-3)"/>
+  </g>
+
+  <!-- 001 is three peaks, not two: a two-peak trace draws the letterform M,
+       which is the one shape it must not be confused with on this station. -->
+  <g id="x-trace-1"><path d="M 5 70 L 15 70 L 24 38 L 33 70 L 41 70 L 50 30 L 59 70 L 67 70 L 76 38 L 85 70 L 95 70" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g id="x-trace-2"><path d="M 6 72 L 34 72 L 50 20 L 66 72 L 94 72" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g id="x-trace-3"><path d="M 6 72 L 28 72 L 40 32 L 60 32 L 72 72 L 94 72" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></g>
+
+  <g id="x-ap-1">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" transform="rotate(-90 50 50)">
+      <circle cx="50" cy="50" r="36" stroke-width="9" stroke-dasharray="62.8 163.4" stroke-dashoffset="0"/>
+      <circle cx="50" cy="50" r="36" stroke-width="9" stroke-dasharray="62.8 163.4" stroke-dashoffset="-75.4"/>
+      <circle cx="50" cy="50" r="36" stroke-width="9" stroke-dasharray="62.8 163.4" stroke-dashoffset="-150.8"/>
+    </g>
+    <circle cx="50" cy="50" r="8" fill="currentColor"/>
+  </g>
+  <g id="x-ap-2">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" transform="rotate(-90 50 50)">
+      <circle cx="50" cy="50" r="36" stroke-width="18" stroke-dasharray="62.8 163.4" stroke-dashoffset="0"/>
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="-75.4"/>
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="-150.8"/>
+    </g>
+    <circle cx="50" cy="50" r="8" fill="currentColor"/>
+  </g>
+  <g id="x-ap-3">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" transform="rotate(-90 50 50)">
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="0"/>
+      <circle cx="50" cy="50" r="36" stroke-width="18" stroke-dasharray="62.8 163.4" stroke-dashoffset="-75.4"/>
+      <circle cx="50" cy="50" r="36" stroke-width="5" stroke-dasharray="62.8 163.4" stroke-dashoffset="-150.8"/>
+    </g>
+    <circle cx="50" cy="50" r="8" fill="currentColor"/>
+  </g>
+
+</defs></svg>
+
+<script>
+  (function () {
+    var state = { channel: 'c1', bd: 'night', shadow: 'none' };
+    var SETS = { Badge: 'x-badge-', Beacon: 'x-beacon-', Trace: 'x-trace-', Aperture: 'x-ap-' };
+
+    function symbolFor(root) {
+      // Which direction is mounted: read it off whichever family swatch is present.
+      var probe = root.querySelector('.family [data-fam] use');
+      if (!probe) return null;
+      var href = probe.getAttribute('href') || '';
+      var prefix = href.replace(/[0-9]+$/, '').slice(1);
+      return prefix + state.channel.slice(1);
+    }
+
+    // Cache of what each ladder slot currently draws, so a re-apply that
+    // changes nothing does not touch the DOM at all.
+    function apply() {
+      document.querySelectorAll('.mk-page').forEach(function (root) {
+        var frame = root.querySelector('.frame');
+        if (frame) frame.setAttribute('data-bd', state.bd);
+        root.setAttribute('data-shadow', state.shadow);
+
+        // The on-air bug: show only the selected channel's mark.
+        root.querySelectorAll('.bug [data-channel]').forEach(function (el) {
+          el.style.display = el.getAttribute('data-channel') === state.channel ? 'block' : 'none';
+        });
+
+        // The size ladder follows the selected channel too.
+        var sym = symbolFor(root);
+        if (sym) {
+          root.querySelectorAll('svg[data-lad]').forEach(function (svg) {
+            if (svg.getAttribute('data-drawn') === sym) return;
+            svg.innerHTML = '<use href="#' + sym + '"></use>';
+            svg.setAttribute('data-drawn', sym);
+          });
+        }
+      });
+    }
+
+    // The rail re-emits every live axis right after each mount, so this is the
+    // only hook needed — a MutationObserver here would see its own writes and
+    // re-enter forever.
+    addEventListener('at:axis', function (e) {
+      if (!(e.detail.axis in state)) return;
+      state[e.detail.axis] = e.detail.value;
+      apply();
+    });
+
+    apply();
+  })();
+</script>
+</div>
+<!--/at:round 1-->
+<main id="at-stage"></main>
+<template data-round="1" data-variant="Badge" data-caption="Contained squircle, monogram knocked out — maximum legibility at 56px">
+  <div data-src="foryou-mark-v1.body.html:156" class="mk-page">
+    <div data-src="foryou-mark-v1.body.html:157" class="mk-h">On air</div>
+    <div data-src="foryou-mark-v1.body.html:158" class="frame" data-bd-target>
+      <div data-src="foryou-mark-v1.body.html:159" class="bug">
+        <svg data-src="foryou-mark-v1.body.html:160" data-channel="c1" viewBox="0 0 100 100" aria-label="For You badge mark">
+          <mask id="bg-m1"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+            <g fill="black"><rect x="45.5" y="27" width="9" height="46" rx="4.5"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(60 50 50)"/><rect x="45.5" y="27" width="9" height="46" rx="4.5" transform="rotate(120 50 50)"/></g>
+          </mask>
+          <rect width="100" height="100" fill="currentColor" mask="url(#bg-m1)"/>
+        </svg>
+        <svg data-src="foryou-mark-v1.body.html:166" data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce badge mark">
+          <mask id="bg-m2"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+            <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="800" text-anchor="middle" dominant-baseline="central">P</text>
+          </mask>
+          <rect width="100" height="100" fill="currentColor" mask="url(#bg-m2)"/>
+        </svg>
+        <svg data-src="foryou-mark-v1.body.html:172" data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi badge mark">
+          <mask id="bg-m3"><rect width="100" height="100" fill="black"/><rect x="8" y="8" width="84" height="84" rx="24" fill="white"/>
+            <text x="50" y="51" fill="black" font-family="Helvetica, Arial, sans-serif" font-size="52" font-weight="800" text-anchor="middle" dominant-baseline="central">M</text>
+          </mask>
+          <rect width="100" height="100" fill="currentColor" mask="url(#bg-m3)"/>
+        </svg>
+      </div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:181" class="mk-h">The family</div>
+    <div data-src="foryou-mark-v1.body.html:182" class="family">
+      <div data-src="foryou-mark-v1.body.html:183"><svg data-src="foryou-mark-v1.body.html:183" data-fam="c1" viewBox="0 0 100 100"><use href="#x-badge-1"/></svg><b data-src="foryou-mark-v1.body.html:183">001 For You</b></div>
+      <div data-src="foryou-mark-v1.body.html:184"><svg data-src="foryou-mark-v1.body.html:184" data-fam="c2" viewBox="0 0 100 100"><use href="#x-badge-2"/></svg><b data-src="foryou-mark-v1.body.html:184">002 For Pierce</b></div>
+      <div data-src="foryou-mark-v1.body.html:185"><svg data-src="foryou-mark-v1.body.html:185" data-fam="c3" viewBox="0 0 100 100"><use href="#x-badge-3"/></svg><b data-src="foryou-mark-v1.body.html:185">003 For Madi</b></div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:188" class="mk-h">Legibility ladder — true pixels</div>
+    <div data-src="foryou-mark-v1.body.html:189" class="ladder">
+      <div data-src="foryou-mark-v1.body.html:190" class="on-dark">
+        <div data-src="foryou-mark-v1.body.html:191" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:191" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:191">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:192" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:192" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:192">56px — on air</span></div>
+        <div data-src="foryou-mark-v1.body.html:193" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:193" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:193">128px</span></div>
+      </div>
+      <div data-src="foryou-mark-v1.body.html:195" class="on-light">
+        <div data-src="foryou-mark-v1.body.html:196" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:196" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:196">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:197" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:197" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:197">56px</span></div>
+        <div data-src="foryou-mark-v1.body.html:198" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:198" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:198">128px</span></div>
+      </div>
+    </div>
+
+    <p data-src="foryou-mark-v1.body.html:202" class="mk-note"><b data-src="foryou-mark-v1.body.html:202">Axis: contained + monogram.</b> A solid field means the mark never has to compete with the picture behind it — the knockout carries the detail, and detail on a solid ground survives any backdrop. 001 takes a six-point spark rather than a letter, so the family head reads as the set and the two people read as members of it. <b data-src="foryou-mark-v1.body.html:202">Cost:</b> a filled 84&times;84 block is the loudest possible bug — it holds more screen weight than the ♫ it replaces, every second of every programme.</p>
+  </div>
+</template>
+<template data-round="1" data-variant="Beacon" data-caption="Open linear signal — arcs over a monogram core">
+  <div data-src="foryou-mark-v1.body.html:208" class="mk-page">
+    <div data-src="foryou-mark-v1.body.html:209" class="mk-h">On air</div>
+    <div data-src="foryou-mark-v1.body.html:210" class="frame" data-bd-target>
+      <div data-src="foryou-mark-v1.body.html:211" class="bug">
+        <svg data-src="foryou-mark-v1.body.html:212" data-channel="c1" viewBox="0 0 100 100" aria-label="For You beacon mark"><use href="#x-beacon-1"/></svg>
+        <svg data-src="foryou-mark-v1.body.html:213" data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce beacon mark"><use href="#x-beacon-2"/></svg>
+        <svg data-src="foryou-mark-v1.body.html:214" data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi beacon mark"><use href="#x-beacon-3"/></svg>
+      </div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:218" class="mk-h">The family</div>
+    <div data-src="foryou-mark-v1.body.html:219" class="family">
+      <div data-src="foryou-mark-v1.body.html:220"><svg data-src="foryou-mark-v1.body.html:220" data-fam="c1" viewBox="0 0 100 100"><use href="#x-beacon-1"/></svg><b data-src="foryou-mark-v1.body.html:220">001 For You</b></div>
+      <div data-src="foryou-mark-v1.body.html:221"><svg data-src="foryou-mark-v1.body.html:221" data-fam="c2" viewBox="0 0 100 100"><use href="#x-beacon-2"/></svg><b data-src="foryou-mark-v1.body.html:221">002 For Pierce</b></div>
+      <div data-src="foryou-mark-v1.body.html:222"><svg data-src="foryou-mark-v1.body.html:222" data-fam="c3" viewBox="0 0 100 100"><use href="#x-beacon-3"/></svg><b data-src="foryou-mark-v1.body.html:222">003 For Madi</b></div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:225" class="mk-h">Legibility ladder — true pixels</div>
+    <div data-src="foryou-mark-v1.body.html:226" class="ladder">
+      <div data-src="foryou-mark-v1.body.html:227" class="on-dark">
+        <div data-src="foryou-mark-v1.body.html:228" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:228" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:228">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:229" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:229" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:229">56px — on air</span></div>
+        <div data-src="foryou-mark-v1.body.html:230" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:230" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:230">128px</span></div>
+      </div>
+      <div data-src="foryou-mark-v1.body.html:232" class="on-light">
+        <div data-src="foryou-mark-v1.body.html:233" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:233" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:233">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:234" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:234" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:234">56px</span></div>
+        <div data-src="foryou-mark-v1.body.html:235" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:235" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:235">128px</span></div>
+      </div>
+    </div>
+
+    <p data-src="foryou-mark-v1.body.html:239" class="mk-note"><b data-src="foryou-mark-v1.body.html:239">Axis: open form + monogram.</b> Same answer to "who" as Badge, opposite answer to "what shape". Arcs sit either side of the core rather than stacked over it, so the mark lands on the radio callsign convention — <em data-src="foryou-mark-v1.body.html:239">((P))</em>, a station transmitting <em data-src="foryou-mark-v1.body.html:239">at</em> you, which is this channel's whole premise. 001 keeps a solid core, so the family head is the transmitter and the two people are what it is tuned to. Ink coverage is roughly a third of Badge's, so it sits quieter over a picture. <b data-src="foryou-mark-v1.body.html:239">Cost:</b> five separate strokes in one small mark, and thin arcs are the first thing to go over the bright exterior backdrop. The 24px rung is where you find out whether they survive a downscale (see #296).</p>
+  </div>
+</template>
+<template data-round="1" data-variant="Trace" data-caption="A taste reading — peak shape carries the channel, no letters">
+  <div data-src="foryou-mark-v1.body.html:245" class="mk-page">
+    <div data-src="foryou-mark-v1.body.html:246" class="mk-h">On air</div>
+    <div data-src="foryou-mark-v1.body.html:247" class="frame" data-bd-target>
+      <div data-src="foryou-mark-v1.body.html:248" class="bug">
+        <svg data-src="foryou-mark-v1.body.html:249" data-channel="c1" viewBox="0 0 100 100" aria-label="For You trace mark"><use href="#x-trace-1"/></svg>
+        <svg data-src="foryou-mark-v1.body.html:250" data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce trace mark"><use href="#x-trace-2"/></svg>
+        <svg data-src="foryou-mark-v1.body.html:251" data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi trace mark"><use href="#x-trace-3"/></svg>
+      </div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:255" class="mk-h">The family</div>
+    <div data-src="foryou-mark-v1.body.html:256" class="family">
+      <div data-src="foryou-mark-v1.body.html:257"><svg data-src="foryou-mark-v1.body.html:257" data-fam="c1" viewBox="0 0 100 100"><use href="#x-trace-1"/></svg><b data-src="foryou-mark-v1.body.html:257">001 For You</b></div>
+      <div data-src="foryou-mark-v1.body.html:258"><svg data-src="foryou-mark-v1.body.html:258" data-fam="c2" viewBox="0 0 100 100"><use href="#x-trace-2"/></svg><b data-src="foryou-mark-v1.body.html:258">002 For Pierce</b></div>
+      <div data-src="foryou-mark-v1.body.html:259"><svg data-src="foryou-mark-v1.body.html:259" data-fam="c3" viewBox="0 0 100 100"><use href="#x-trace-3"/></svg><b data-src="foryou-mark-v1.body.html:259">003 For Madi</b></div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:262" class="mk-h">Legibility ladder — true pixels</div>
+    <div data-src="foryou-mark-v1.body.html:263" class="ladder">
+      <div data-src="foryou-mark-v1.body.html:264" class="on-dark">
+        <div data-src="foryou-mark-v1.body.html:265" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:265" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:265">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:266" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:266" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:266">56px — on air</span></div>
+        <div data-src="foryou-mark-v1.body.html:267" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:267" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:267">128px</span></div>
+      </div>
+      <div data-src="foryou-mark-v1.body.html:269" class="on-light">
+        <div data-src="foryou-mark-v1.body.html:270" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:270" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:270">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:271" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:271" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:271">56px</span></div>
+        <div data-src="foryou-mark-v1.body.html:272" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:272" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:272">128px</span></div>
+      </div>
+    </div>
+
+    <p data-src="foryou-mark-v1.body.html:276" class="mk-note"><b data-src="foryou-mark-v1.body.html:276">Axis: gestural, letter-free.</b> A signal trace — the channel is literally reading a taste vector, and the mark draws what it reads. 001 is three peaks (a house, plural — two peaks drew the letterform <em data-src="foryou-mark-v1.body.html:276">M</em>, which is the one shape it must not be mistaken for here); 002 is one sharp spike; 003 is one broad plateau. Nothing here is a letter, so the family scales past three channels without running out of distinct initials, and it never looks like a monogrammed towel. <b data-src="foryou-mark-v1.body.html:276">Cost:</b> "sharp versus broad" is a real distinction on the 128px rung and a coin flip on the 24px one. If 002 and 003 are indistinguishable at 56px, this direction has failed at the exact job it was built for.</p>
+  </div>
+</template>
+<template data-round="1" data-variant="Aperture" data-caption="Segmented ring — the channel is which segment is weighted">
+  <div data-src="foryou-mark-v1.body.html:282" class="mk-page">
+    <div data-src="foryou-mark-v1.body.html:283" class="mk-h">On air</div>
+    <div data-src="foryou-mark-v1.body.html:284" class="frame" data-bd-target>
+      <div data-src="foryou-mark-v1.body.html:285" class="bug">
+        <svg data-src="foryou-mark-v1.body.html:286" data-channel="c1" viewBox="0 0 100 100" aria-label="For You aperture mark"><use href="#x-ap-1"/></svg>
+        <svg data-src="foryou-mark-v1.body.html:287" data-channel="c2" viewBox="0 0 100 100" aria-label="For Pierce aperture mark"><use href="#x-ap-2"/></svg>
+        <svg data-src="foryou-mark-v1.body.html:288" data-channel="c3" viewBox="0 0 100 100" aria-label="For Madi aperture mark"><use href="#x-ap-3"/></svg>
+      </div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:292" class="mk-h">The family</div>
+    <div data-src="foryou-mark-v1.body.html:293" class="family">
+      <div data-src="foryou-mark-v1.body.html:294"><svg data-src="foryou-mark-v1.body.html:294" data-fam="c1" viewBox="0 0 100 100"><use href="#x-ap-1"/></svg><b data-src="foryou-mark-v1.body.html:294">001 For You</b></div>
+      <div data-src="foryou-mark-v1.body.html:295"><svg data-src="foryou-mark-v1.body.html:295" data-fam="c2" viewBox="0 0 100 100"><use href="#x-ap-2"/></svg><b data-src="foryou-mark-v1.body.html:295">002 For Pierce</b></div>
+      <div data-src="foryou-mark-v1.body.html:296"><svg data-src="foryou-mark-v1.body.html:296" data-fam="c3" viewBox="0 0 100 100"><use href="#x-ap-3"/></svg><b data-src="foryou-mark-v1.body.html:296">003 For Madi</b></div>
+    </div>
+
+    <div data-src="foryou-mark-v1.body.html:299" class="mk-h">Legibility ladder — true pixels</div>
+    <div data-src="foryou-mark-v1.body.html:300" class="ladder">
+      <div data-src="foryou-mark-v1.body.html:301" class="on-dark">
+        <div data-src="foryou-mark-v1.body.html:302" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:302" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:302">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:303" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:303" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:303">56px — on air</span></div>
+        <div data-src="foryou-mark-v1.body.html:304" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:304" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:304">128px</span></div>
+      </div>
+      <div data-src="foryou-mark-v1.body.html:306" class="on-light">
+        <div data-src="foryou-mark-v1.body.html:307" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:307" class="s24" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:307">24px</span></div>
+        <div data-src="foryou-mark-v1.body.html:308" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:308" class="s56" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:308">56px</span></div>
+        <div data-src="foryou-mark-v1.body.html:309" class="mk-swatch"><svg data-src="foryou-mark-v1.body.html:309" class="s128" viewBox="0 0 100 100" data-lad></svg><span data-src="foryou-mark-v1.body.html:309">128px</span></div>
+      </div>
+    </div>
+
+    <p data-src="foryou-mark-v1.body.html:313" class="mk-note"><b data-src="foryou-mark-v1.body.html:313">Axis: geometric, positional.</b> Three segments for three viewers around one centre. 001 weights all three evenly — the pooled house vector, drawn. 002 and 003 thicken their own segment and thin the other two, which is exactly what <code data-src="foryou-mark-v1.body.html:313">taste_scope: single_user</code> does to the maths. The encoding is the meaning, and a fourth viewer is a fourth segment rather than a fourth letter. <b data-src="foryou-mark-v1.body.html:313">Cost:</b> nobody will decode it unaided. It differentiates on stroke weight, which is the first property a bilinear downscale destroys.</p>
+  </div>
+</template>
+<script>
+/* rail.js — the prototype control rail: rounds, variants, state axes, devices.
+
+   Supersedes picker.js. The selection/keyboard behaviour is the same contract, ported
+   from emilkowalski/skills prototype/PICKER.md (MIT, © 2026 Emil Kowalski) and extended
+   with the round axis and with arbitrary fragment-declared state axes.
+
+   Three kinds of control, and they are NOT the same question:
+
+   - ROUND (`?r=`) — which version of the design. Changed once a session.
+   - VARIANT (`?v=`) — which direction within this round. Changed constantly.
+   - AXIS (`?<key>=`) — which state of the thing being shown: which screen, which
+     connection state, which error. Orthogonal to both of the above: flipping variant
+     must not reset which screen you were looking at, because the whole point is
+     comparing the same screen across two directions.
+
+   Keyboard, coarse to fine, matching the order of the rail itself:
+
+     [ ]        step round
+     1-N ← →    switch variant
+     x          focus the next axis group     , .   step the focused axis
+     d D        step device (viewport.js)
+     r          replay the entrance animation
+     \          collapse the rail
+     ?          show this list in the rail
+     Escape     blur
+
+   Ignored while focus is in a field or a modifier is held — a prototype's own inputs are
+   real and typing in them must work. Axes and devices get keys because they are the
+   controls that move most: a variant is chosen a few times, a state is flipped all
+   session.
+
+   AXES ARE EVENT-DRIVEN. The rail owns no opinion about what an axis means: clicking an
+   option dispatches
+
+       window.dispatchEvent(new CustomEvent('at:axis', {
+         detail: { axis: 'screen', value: 'chat', index: 1, label: 'Agent chat' }
+       }))
+
+   and the fragment's own top-level <script> decides what that does. The rail re-emits
+   EVERY axis immediately after each mount, so a fragment listener never has to
+   re-apply state itself after a variant switch — it just handles the event again.
+
+   A fragment's listener must be a TOP-LEVEL <script> in the fragment, never inside a
+   <template data-variant>: a script cloned out of a template does not execute. */
+
+(function () {
+  var root = document.documentElement;
+  var rail = document.querySelector('.at-rail');
+  var stage = document.getElementById('at-stage');
+  var all = [].slice.call(document.querySelectorAll('template[data-variant]'));
+  if (!rail || !stage || !all.length) return;
+
+  var variantBtns = [].slice.call(rail.querySelectorAll('.at-rail-variant'));
+  var stepBtns = [].slice.call(rail.querySelectorAll('.at-rail-step'));
+  var roundNow = rail.querySelector('.at-rail-round-now');
+  var roundCount = rail.querySelector('.at-rail-step-count');
+  var axisGroups = [].slice.call(rail.querySelectorAll('.at-rail-axis'));
+  var replay = rail.querySelector('.at-rail-replay');
+
+  function roundOf(el) { return el.getAttribute('data-round') || '1'; }
+
+  var rounds = [];
+  all.forEach(function (t) {
+    var r = roundOf(t);
+    if (rounds.indexOf(r) < 0) rounds.push(r);
+  });
+
+  var round = rounds[rounds.length - 1];   // newest round is what opening the file shows
+  var current = 0;                          // variant index WITHIN the round
+  var axisState = {};                       // axis key -> chosen value, survives everything
+
+  function inRound(r) {
+    return all.filter(function (t) { return roundOf(t) === r; });
+  }
+  function btnsIn(r) {
+    return variantBtns.filter(function (el) { return roundOf(el) === r; });
+  }
+
+  /* ---------------- axes ---------------- */
+
+  function axisOptions(g) {
+    return [].slice.call(g.querySelectorAll('.at-rail-opt'));
+  }
+
+  function emitAxis(g) {
+    var key = g.getAttribute('data-axis');
+    var opts = axisOptions(g);
+    var i = 0;
+    for (var j = 0; j < opts.length; j++) {
+      if (opts[j].getAttribute('data-value') === axisState[key]) { i = j; break; }
+    }
+    var el = opts[i];
+    if (!el) return;
+    window.dispatchEvent(new CustomEvent('at:axis', {
+      detail: {
+        axis: key,
+        value: el.getAttribute('data-value'),
+        index: i,
+        label: (el.textContent || '').trim()
+      }
+    }));
+  }
+
+  function paintAxis(g) {
+    var key = g.getAttribute('data-axis');
+    axisOptions(g).forEach(function (el) {
+      el.toggleAttribute('data-active', el.getAttribute('data-value') === axisState[key]);
+    });
+  }
+
+  function setAxis(g, value) {
+    var key = g.getAttribute('data-axis');
+    axisState[key] = value;
+    paintAxis(g);
+    writeUrl();
+    // data-at-axis-state is what a device frame is told to catch up to, and what any
+    // outside reader polls. It was written only on variant/round changes, so an axis
+    // flip left it describing the state before the flip.
+    root.setAttribute('data-at-axis-state', JSON.stringify(axisState));
+    emitAxis(g);
+  }
+
+  /* Axes can differ between rounds; only the current round's are shown, and only those
+     are emitted. An axis absent from this round keeps its value for when you step back. */
+  function activeAxes() {
+    return axisGroups.filter(function (g) {
+      var r = g.getAttribute('data-round');
+      return !r || r === round;
+    });
+  }
+
+  axisGroups.forEach(function (g) {
+    var key = g.getAttribute('data-axis');
+    var opts = axisOptions(g);
+    if (!opts.length) return;
+    if (!(key in axisState)) axisState[key] = opts[0].getAttribute('data-value');
+    opts.forEach(function (el) {
+      el.addEventListener('click', function () { setAxis(g, el.getAttribute('data-value')); });
+    });
+  });
+
+  /* ---------------- url ---------------- */
+
+  function writeUrl() {
+    // A srcdoc page (a viewport frame) has no query string to persist into, so this is
+    // best-effort; the data-at-* attributes are the real signal.
+    try {
+      var url = new URL(location);
+      url.searchParams.set('r', round);
+      url.searchParams.set('v', current + 1);
+      Object.keys(axisState).forEach(function (k) {
+        url.searchParams.set(k, axisState[k]);
+      });
+      history.replaceState(null, '', url);
+    } catch (e) {}
+  }
+
+  /* ---------------- mounting ---------------- */
+
+  function mount() {
+    var t = inRound(round)[current];
+    if (!t) return;
+    stage.innerHTML = '';
+    // Clear first, render next frame, so entrance animations re-run.
+    requestAnimationFrame(function () {
+      stage.appendChild(t.content.cloneNode(true));
+      // Re-emit every live axis so the freshly mounted markup gets its state applied
+      // without every fragment writing its own re-apply-on-mount code.
+      activeAxes().forEach(emitAxis);
+      // The stage now has content. Anything that measures the artifact — the contrast
+      // verdict — would otherwise be guessing at a delay, and measuring an empty
+      // document whenever it guessed short.
+      window.dispatchEvent(new CustomEvent('at:mounted'));
+      if (root.hasAttribute('data-at-embedded')) {
+        try { parent.postMessage({ at: 'mounted' }, '*'); } catch (e) {}
+      }
+    });
+  }
+
+  function setActive(r, i) {
+    if (rounds.indexOf(r) < 0) return;
+    var n = inRound(r).length;
+    if (i < 0 || i >= n) return;
+    round = r;
+    current = i;
+
+    variantBtns.forEach(function (el) {
+      var on = roundOf(el) === round;
+      el.toggleAttribute('hidden', !on);
+      var active = on && btnsIn(round).indexOf(el) === current;
+      el.toggleAttribute('data-active', active);
+      if (active) el.setAttribute('aria-current', 'true');
+      else el.removeAttribute('aria-current');
+    });
+    if (roundNow) roundNow.textContent = 'v' + round;
+    if (roundCount) {
+      roundCount.textContent = (rounds.indexOf(round) + 1) + ' of ' + rounds.length;
+    }
+    stepBtns.forEach(function (el) {
+      var delta = parseInt(el.getAttribute('data-step'), 10) || 1;
+      var i = rounds.indexOf(round) + delta;
+      el.disabled = i < 0 || i >= rounds.length;
+    });
+    axisGroups.forEach(function (g) {
+      var gr = g.getAttribute('data-round');
+      g.toggleAttribute('hidden', !!gr && gr !== round);
+      paintAxis(g);
+    });
+    axisFocus = 0;
+    paintAxisFocus();
+    // A round's top-level markup lives in the document permanently, so it has to be
+    // hidden when its round is not the one on screen — otherwise round 1's shared
+    // screens stack under round 2's.
+    [].slice.call(document.querySelectorAll('.at-shell')).forEach(function (s) {
+      s.toggleAttribute('hidden', s.getAttribute('data-round') !== round);
+    });
+
+    writeUrl();
+
+    var t = inRound(round)[current];
+    root.setAttribute('data-at-round', round);
+    root.setAttribute('data-at-variant', t.getAttribute('data-variant') || '');
+    root.setAttribute('data-at-variant-index', String(current + 1));
+    root.setAttribute('data-at-axis-state', JSON.stringify(axisState));
+    window.dispatchEvent(new CustomEvent('at:variant', {
+      detail: { index: current, round: round }
+    }));
+    mount();
+  }
+
+  variantBtns.forEach(function (el) {
+    el.addEventListener('click', function () {
+      var r = roundOf(el);
+      setActive(r, btnsIn(r).indexOf(el));
+    });
+  });
+
+  // Stepping a round keeps the variant slot when the destination round has one, so
+  // stepping compares the same direction across versions instead of resetting to 1.
+  stepBtns.forEach(function (el) {
+    el.addEventListener('click', function () {
+      stepRound(parseInt(el.getAttribute('data-step'), 10) || 1);
+    });
+  });
+
+  if (replay) replay.addEventListener('click', mount);
+
+  /* Clamped, not wrapped. Rounds are a history: v4 is not "next to" v1, and stepping off
+     the end of one into the other is a jump, not a step. The buttons disable at the ends
+     so the wall is visible before you hit it. */
+  function stepRound(delta) {
+    var i = rounds.indexOf(round) + delta;
+    if (i < 0 || i >= rounds.length) return;
+    var r = rounds[i];
+    setActive(r, Math.min(current, inRound(r).length - 1));
+  }
+
+  /* ---------------- focused axis ----------------
+
+     One key cannot address "which axis" and "which option" at once, and digits already
+     belong to variants. So `x` moves a focus marker down the axis groups and `,` / `.`
+     step whichever group holds it. Three keys cover any number of axes and collide with
+     nothing. */
+
+  var axisFocus = 0;
+
+  function paintAxisFocus() {
+    var live = activeAxes();
+    live.forEach(function (g, i) {
+      g.toggleAttribute('data-focus', live.length > 1 && i === axisFocus);
+    });
+  }
+
+  function focusNextAxis() {
+    var live = activeAxes();
+    if (!live.length) return;
+    axisFocus = (axisFocus + 1) % live.length;
+    paintAxisFocus();
+  }
+
+  function stepAxis(delta) {
+    var live = activeAxes();
+    if (!live.length) return;
+    var g = live[Math.min(axisFocus, live.length - 1)];
+    var opts = axisOptions(g);
+    if (!opts.length) return;
+    var key = g.getAttribute('data-axis');
+    var i = 0;
+    for (var j = 0; j < opts.length; j++) {
+      if (opts[j].getAttribute('data-value') === axisState[key]) { i = j; break; }
+    }
+    setAxis(g, opts[(i + delta + opts.length) % opts.length].getAttribute('data-value'));
+    paintAxisFocus();
+  }
+
+  /* ---------------- collapse ----------------
+
+     The rail costs 272px of the window for as long as it is open, which is width the
+     design under judgement does not get — and the reason a desktop frame has to be
+     scaled down hardest. Collapsing is one key, and it persists like every other bit of
+     rail state. */
+
+  function setCollapsed(on) {
+    root.toggleAttribute('data-at-rail-collapsed', on);
+    paintToggle();
+    try {
+      var url = new URL(location);
+      if (on) url.searchParams.set('rail', '0');
+      else url.searchParams.delete('rail');
+      history.replaceState(null, '', url);
+    } catch (e) {}
+    window.dispatchEvent(new Event('at:relayout'));
+  }
+
+  /* A toggle, not an opener. It is on screen whether the rail is open or shut, and it
+     says which — amber when the rail is showing, dark when it is not, exactly like the
+     comment button and its panel. Same object, same states, same CSS. */
+  var reopen = document.createElement('button');
+  reopen.className = 'at-rail-reopen';
+  reopen.type = 'button';
+  reopen.addEventListener('click', function () {
+    setCollapsed(!root.hasAttribute('data-at-rail-collapsed'));
+  });
+  document.body.appendChild(reopen);
+
+  function paintToggle() {
+    var open = !root.hasAttribute('data-at-rail-collapsed');
+    reopen.toggleAttribute('data-active', open);
+    reopen.setAttribute('aria-pressed', open ? 'true' : 'false');
+    reopen.setAttribute('aria-label', open ? 'Hide the controls' : 'Show the controls');
+    reopen.setAttribute('title', (open ? 'Hide the controls' : 'Show the controls') + '  (\\)');
+    reopen.textContent = open ? '‹' : '›';
+  }
+  // rail.js is inlined before the widget scripts, so the dock helper does not exist yet.
+  // A timeout runs after every inline script has executed.
+  setTimeout(function () {
+    if (window.__atDock) window.__atDock(reopen, 'rail-reopen', 'left', 0);
+  }, 0);
+
+  /* When a file was built. Several confusing sessions came down to looking at an
+     artifact from before a fix and reasoning about behaviour that no longer existed;
+     the answer was in a meta tag nothing displayed. */
+  (function () {
+    var m = document.querySelector('meta[name="artifact-built"]');
+    if (!m || !m.content) return;
+    var el = document.createElement('div');
+    el.className = 'at-rail-built';
+    el.textContent = 'built ' + m.content;
+    var note = rail.querySelector('.at-rail-note');
+    if (note) { note.appendChild(el); return; }
+    // With no scope note there is nothing pinning the bottom of the rail, so the stamp
+    // takes that job itself rather than floating under the last control group.
+    el.classList.add('at-rail-built--alone');
+    rail.appendChild(el);
+  })();
+
+  function toggleLegend() {
+    rail.toggleAttribute('data-legend');
+  }
+  var legendBtn = rail.querySelector('.at-rail-keys');
+  if (legendBtn) legendBtn.addEventListener('click', toggleLegend);
+
+  document.addEventListener('keydown', function (e) {
+    // An embedded copy is driven by its host: acting locally as well would apply the
+    // same keypress twice and leave the frame describing a state the rail does not show.
+    if (root.hasAttribute('data-at-embedded')) return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    if (e.key === 'Escape') { if (document.activeElement) document.activeElement.blur(); return; }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    var n = inRound(round).length;
+    var num = parseInt(e.key, 10);
+    if (num >= 1 && num <= n) setActive(round, num - 1);
+    else if (e.key === 'ArrowRight') setActive(round, (current + 1) % n);
+    else if (e.key === 'ArrowLeft') setActive(round, (current - 1 + n) % n);
+    else if (e.key === ']') stepRound(1);
+    else if (e.key === '[') stepRound(-1);
+    else if (e.key === 'x' || e.key === 'X') focusNextAxis();
+    else if (e.key === ',' || e.key === '<') stepAxis(-1);
+    else if (e.key === '.' || e.key === '>') stepAxis(1);
+    else if (e.key === '\\') setCollapsed(!root.hasAttribute('data-at-rail-collapsed'));
+    else if (e.key === '?') toggleLegend();
+    else if (e.key === 'r' || e.key === 'R') mount();
+  });
+
+  /* ---------------- driven from outside ----------------
+
+     A device frame is a clone of this document, so it runs this same script. Rather than
+     being rebuilt every time the host's state changes — which throws away the frame's
+     scroll position, its typed input and any state the prototype itself holds — it is
+     told what changed and applies it in place. */
+
+  window.addEventListener('message', function (e) {
+    var m = e.data;
+    if (!m || m.at !== 'sync') return;
+    if (m.round && m.variantIndex) {
+      var i = Math.min(parseInt(m.variantIndex, 10), inRound(m.round).length) - 1;
+      if (m.round !== round || i !== current) setActive(m.round, i);
+    }
+    if (m.axes) {
+      axisGroups.forEach(function (g) {
+        var key = g.getAttribute('data-axis');
+        if (!(key in m.axes) || axisState[key] === m.axes[key]) return;
+        setAxis(g, m.axes[key]);
+      });
+    }
+  });
+
+  /* ---------------- a slot other harness widgets add controls to ----------------
+
+     viewport.js puts its device group here rather than floating its own bar, so every
+     "what am I looking at" control lives in one column. Groups are inserted above the
+     scope note when there is one. */
+
+  window.__atRail = {
+    group: function (label, hint) {
+      var g = document.createElement('div');
+      g.className = 'at-rail-group';
+      var l = document.createElement('div');
+      l.className = 'at-rail-label';
+      l.textContent = label;
+      if (hint) {
+        var h = document.createElement('span');
+        h.className = 'at-rail-hint';
+        h.textContent = hint;
+        l.appendChild(h);
+      }
+      g.appendChild(l);
+      var note = rail.querySelector('.at-rail-note');
+      if (note) rail.insertBefore(g, note);
+      else rail.appendChild(g);
+      return g;
+    },
+    row: function (group) {
+      var r = document.createElement('div');
+      r.className = 'at-rail-row';
+      group.appendChild(r);
+      return r;
+    },
+    item: function (parent, text, onClick) {
+      var b = document.createElement('button');
+      b.className = 'at-rail-item';
+      b.type = 'button';
+      b.textContent = text;
+      b.addEventListener('click', function () { onClick(b); });
+      parent.appendChild(b);
+      return b;
+    }
+  };
+
+  /* ---------------- boot ----------------
+
+     data-at-*-init wins over the query string: it is how a viewport.js device frame is
+     told what the host was showing, and a srcdoc document has no query string. */
+
+  var q = new URLSearchParams(location.search);
+
+  var initAxes = root.getAttribute('data-at-axis-init');
+  if (initAxes) {
+    try {
+      var parsed = JSON.parse(initAxes);
+      Object.keys(parsed).forEach(function (k) { axisState[k] = parsed[k]; });
+    } catch (e) {}
+  } else {
+    axisGroups.forEach(function (g) {
+      var key = g.getAttribute('data-axis');
+      var want = q.get(key);
+      if (!want) return;
+      var ok = axisOptions(g).some(function (el) {
+        return el.getAttribute('data-value') === want;
+      });
+      if (ok) axisState[key] = want;
+    });
+  }
+
+  if (q.get('rail') === '0') root.setAttribute('data-at-rail-collapsed', '');
+  paintToggle();
+
+  var r0 = root.getAttribute('data-at-round-init') || q.get('r') || round;
+  if (rounds.indexOf(r0) < 0) r0 = round;
+  var v0 = parseInt(root.getAttribute('data-at-variant-init'), 10) ||
+    parseInt(q.get('v'), 10) || 1;
+  setActive(r0, Math.min(v0, inRound(r0).length) - 1);
+})();
+/* dock.js — the floating harness buttons: one style, draggable, snapping to an edge.
+
+   The reopen chevron, the comment toggle and the theme toggle are all the same object:
+   a small round control parked over the artifact. They used to be positioned by three
+   separate CSS rules that each knew about the others — a `:has()` offset here, a
+   `calc(--at-panel-w …)` there — which is the shape a layout takes right before one of
+   them lands on top of another.
+
+   They are now one thing. Same size, same partial opacity, same hover. Drag one and it
+   follows the pointer; let go and it slides to whichever vertical edge it is nearest,
+   because the reason to move it is that it is covering the one element you are trying to
+   look at, and the fix for that is "put it on the other side" rather than "put it 40px
+   left". Where each one sits is remembered per artifact.
+
+   A docked button never has to be told about the comments panel: it stores a SIDE, not
+   an x, so the panel opening simply changes where the right-hand edge is. */
+
+(function () {
+  var root = document.documentElement;
+  if (root.hasAttribute('data-at-embedded')) return;
+
+  var GAP = 12;
+  var SLOT = 38;            // vertical pitch when several share an edge
+  var DRAG_SLOP = 4;        // movement below this is a click, not a drag
+  var KEY = 'at:dock:' + (root.getAttribute('data-at-key') || location.pathname);
+
+  var docks = [];
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
+
+  function save() {
+    var out = {};
+    docks.forEach(function (d) { out[d.id] = { side: d.side, top: d.top }; });
+    try { localStorage.setItem(KEY, JSON.stringify(out)); } catch (e) {}
+  }
+
+  /* The free edges, from the same two tokens the stage and the device host read, rather
+     than from the rail's and the panel's own rects — one description of the layout
+     instead of three.
+
+     Through a probe rather than getPropertyValue, because a custom property whose value
+     is itself a var() comes back from getComputedStyle UNRESOLVED: --at-inset-l reads as
+     the literal string "var(--at-rail-w, 272px)", parseFloat gives NaN, and every edge
+     silently collapses to the window's. Laying out a zero-height element with those
+     insets makes the browser resolve them, and its rect is the answer. */
+  var probe = document.createElement('div');
+  probe.setAttribute('aria-hidden', 'true');
+  probe.style.cssText = 'position:fixed;top:0;height:0;pointer-events:none;visibility:hidden;' +
+    'left:var(--at-inset-l,0px);right:var(--at-inset-r,0px)';
+  document.body.appendChild(probe);
+
+  function free() {
+    var r = probe.getBoundingClientRect();
+    return { left: r.left, right: r.right };
+  }
+
+  function leftEdge() {
+    var l = free().left;
+    return l + (l ? GAP : GAP);
+  }
+
+  function rightEdge(w) {
+    var r = free().right;
+    return r - GAP - w;
+  }
+
+  function place(d, animate) {
+    var r = d.el.getBoundingClientRect();
+    var w = r.width || 30;
+    var h = r.height || 30;
+    d.el.style.transition = animate
+      ? 'left 240ms cubic-bezier(.22,1,.36,1), top 240ms cubic-bezier(.22,1,.36,1), opacity 150ms ease-out'
+      : 'none';
+    d.el.style.left = (d.side === 'left' ? leftEdge() : rightEdge(w)) + 'px';
+    d.el.style.top = Math.max(GAP, Math.min(d.top, window.innerHeight - h - GAP)) + 'px';
+    d.el.style.right = 'auto';
+  }
+
+  function placeAll(animate) {
+    docks.forEach(function (d) { place(d, animate); });
+  }
+
+  function drag(d) {
+    d.el.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) return;
+      var r = d.el.getBoundingClientRect();
+      var offX = e.clientX - r.left;
+      var offY = e.clientY - r.top;
+      var moved = false;
+      d.el.setPointerCapture(e.pointerId);
+
+      function move(ev) {
+        if (!moved && Math.abs(ev.clientX - e.clientX) + Math.abs(ev.clientY - e.clientY) < DRAG_SLOP) {
+          return;
+        }
+        moved = true;
+        d.el.setAttribute('data-dragging', '');
+        d.el.style.transition = 'none';
+        d.el.style.left = (ev.clientX - offX) + 'px';
+        d.el.style.top = (ev.clientY - offY) + 'px';
+        d.el.style.right = 'auto';
+      }
+
+      function up() {
+        d.el.removeEventListener('pointermove', move);
+        d.el.removeEventListener('pointerup', up);
+        d.el.removeEventListener('pointercancel', up);
+        d.el.removeAttribute('data-dragging');
+        if (!moved) return;                       // a plain click: let it through
+        // Snap to whichever edge the button's own centre is nearer.
+        var rect = d.el.getBoundingClientRect();
+        d.side = (rect.left + rect.width / 2) < window.innerWidth / 2 ? 'left' : 'right';
+        d.top = rect.top;
+        place(d, true);
+        save();
+        // Swallow the click that a pointerup would otherwise fire on the button.
+        d.el.addEventListener('click', function stop(c) {
+          c.stopPropagation(); c.preventDefault();
+          d.el.removeEventListener('click', stop, true);
+        }, true);
+      }
+
+      d.el.addEventListener('pointermove', move);
+      d.el.addEventListener('pointerup', up);
+      d.el.addEventListener('pointercancel', up);
+    });
+  }
+
+  /* Registration. `side` and `slot` are only defaults: a stored position wins, and the
+     slot keeps two buttons on the same edge from landing on each other. */
+  window.__atDock = function (el, id, side, slot) {
+    var d = {
+      el: el,
+      id: id,
+      side: (saved[id] && saved[id].side) || side || 'right',
+      top: (saved[id] && typeof saved[id].top === 'number')
+        ? saved[id].top : GAP + (slot || 0) * SLOT
+    };
+    el.classList.add('at-dock');
+    docks.push(d);
+    drag(d);
+    requestAnimationFrame(function () { place(d, false); });
+    return d;
+  };
+
+  window.addEventListener('resize', function () { placeAll(false); });
+  // The panels move the edges, so a docked button follows them.
+  window.addEventListener('at:relayout', function () { placeAll(true); });
+  new MutationObserver(function () { placeAll(true); })
+    .observe(root, { attributes: true, attributeFilter: ['data-at-annotate', 'data-at-rail-collapsed'] });
+})();
+/* annotate.js — mark up the artifact and hand the marks back to Claude.
+
+   Dormant until the user presses `a`. Nothing renders, nothing is bound to a visible
+   control, and an artifact sent to somebody else looks exactly as it did before this
+   file existed. That is why annotate is registered for every kind rather than gated
+   per-kind: invisible chrome costs the reader nothing.
+
+   How a comment finds its way back to source:
+
+     - `artifact build` stamps every annotatable element with data-src="<fragment>:<line>",
+       so a pin carries the line of the body fragment that produced the element, not a
+       CSS path nobody can act on.
+     - A pin also stores the element's visible text. On rebuild, an exact data-src match
+       reattaches silently, a text match at a different line reattaches and is flagged
+       MOVED, and neither leaves the pin alive but flagged STALE. Pins are never dropped
+       because the file was rebuilt.
+
+   Storage is localStorage (verified to work on file:// in Chrome), keyed by the
+   artifact's own path so two artifacts never share pins. A page embedded by viewport.js
+   inherits the host's key through data-at-key on :root, so pins made inside a device
+   frame are the same pins.
+
+   Output is one markdown blob on the clipboard, and that is the only channel. It used
+   to also write a file into ~/Downloads for an agent to watch; a download is a worse
+   handoff than a copy in every respect that matters here — it needs a directory nobody
+   asked about, it collides with itself on the second send, and it leaves litter.
+
+   The clipboard is still a real channel back to a waiting agent, with no server and no
+   file: the markdown opens with an HTML comment naming the artifact, so an agent can
+   poll `pbpaste`, recognise that marker, and pick the comments up the moment you press
+   the button. See CONTRACT.md. */
+
+(function () {
+  var root = document.documentElement;
+  var KEY = 'at:notes:' + (root.getAttribute('data-at-key') || location.pathname);
+
+  function meta(name) {
+    var m = document.querySelector('meta[name="' + name + '"]');
+    return m ? m.getAttribute('content') || '' : '';
+  }
+
+  var BUILD = meta('artifact-build');
+  var OUT = meta('artifact-out');
+  var FRAGMENT = meta('artifact-fragment');
+  var SLUG = (OUT.split('/').pop() || 'artifact').replace(/\.html?$/i, '') || 'artifact';
+  /* The marker a watching agent greps the clipboard for. */
+  var MARK = '<!-- artifact-feedback: ' + SLUG + ' -->';
+
+  var notes = load();
+  var seq = notes.reduce(function (n, p) { return Math.max(n, p.n || 0); }, 0);
+  var open = false;
+  var aimed = null;
+  var composing = null;
+  var selected = null;
+  var placements = [];
+
+  // --- storage --------------------------------------------------------------
+
+  function load() {
+    try { return JSON.parse(localStorage.getItem(KEY) || '[]'); }
+    catch (e) { return []; }
+  }
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(notes)); } catch (e) {}
+  }
+
+  // --- the elements a pin can point at --------------------------------------
+
+  /* Harness chrome. Annotate mode swallows page clicks so a prototype's own buttons
+     don't fire while you are commenting — but the picker, the device switcher and the
+     theme toggle are the harness, and flipping variants or sizes mid-review has to keep
+     working. */
+  var CHROME = '.at-panel, .at-composer, .at-notes-layer, ' +
+    '.at-rail, .at-rail-reopen, .at-vp, .at-vp-host, .at-theme, .at-cx-layer, ' +
+    '.at-annotate-toggle';
+
+  function snippetOf(el) {
+    return (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+  }
+
+  function candidates() {
+    return [].slice.call(document.querySelectorAll('[data-src]')).filter(function (el) {
+      return !el.closest(CHROME);
+    });
+  }
+
+  function variant() {
+    return root.getAttribute('data-at-variant') || '';
+  }
+
+  /* Reattach one pin to this build: exact line, then text, then give up but keep it. */
+  function locate(pin, pool) {
+    var i, el;
+    for (i = 0; i < pool.length; i++) {
+      el = pool[i];
+      if (el.getAttribute('data-src') === pin.src && snippetOf(el) === pin.snippet) {
+        return { el: el, state: 'ok' };
+      }
+    }
+    for (i = 0; i < pool.length; i++) {
+      el = pool[i];
+      if (el.getAttribute('data-src') === pin.src) return { el: el, state: 'ok' };
+    }
+    if (pin.snippet) {
+      for (i = 0; i < pool.length; i++) {
+        el = pool[i];
+        if (snippetOf(el) === pin.snippet) return { el: el, state: 'moved' };
+      }
+    }
+    return { el: null, state: 'stale' };
+  }
+
+  // --- chrome ---------------------------------------------------------------
+
+
+  var ICON = {
+    copy: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+      '<rect x="5.5" y="5.5" width="8" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/>' +
+      '<path d="M10.5 3.5H3.9c-.8 0-1.4.6-1.4 1.4v6.6" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>',
+    clear: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+      '<path d="M3 4.5h10M6.5 4.5V3.2c0-.4.3-.7.7-.7h1.6c.4 0 .7.3.7.7v1.3M4.4 4.5l.6 8.2c0 .5.4.8.9.8h4.2c.5 0 .9-.3.9-.8l.6-8.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+    done: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+      '<path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
+  };
+
+  var layer = document.createElement('div');
+  layer.className = 'at-notes-layer';
+
+  var panel = document.createElement('aside');
+  panel.className = 'at-panel';
+  panel.innerHTML =
+    '<header class="at-panel-head">' +
+    '<span class="at-panel-title">Comments</span>' +
+    '<button class="at-btn at-btn--icon at-clear" type="button" ' +
+    'title="Delete every comment" aria-label="Delete every comment">' + ICON.clear + '</button>' +
+    '<button class="at-btn at-btn--icon at-close" type="button" ' +
+    'title="Leave comment mode  (a)" aria-label="Leave comment mode">' + ICON.done + '</button>' +
+    '</header>' +
+    '<div class="at-panel-list"></div>' +
+    '<footer class="at-panel-foot">' +
+    '<div class="at-panel-actions">' +
+    '<button class="at-btn at-btn--primary at-copy" type="button">' +
+    ICON.copy + '<span>Copy comments</span></button>' +
+    '</div></footer>';
+
+  document.body.appendChild(layer);
+  document.body.appendChild(panel);
+
+  var list = panel.querySelector('.at-panel-list');
+
+  // --- rendering ------------------------------------------------------------
+
+  function mine() {
+    var v = variant();
+    return notes.filter(function (p) { return (p.variant || '') === v; });
+  }
+
+  function render() {
+    if (!open) return;
+    var pool = candidates();
+    var rows = mine();
+
+    var dirty = false;
+    placements = rows.map(function (pin) {
+      var hit = locate(pin, pool);
+      if (hit.state === 'moved' && hit.el) {
+        pin.src = hit.el.getAttribute('data-src');
+        pin.moved = true;
+        dirty = true;
+      }
+      var stale = !hit.el;
+      if (!!pin.stale !== stale) { pin.stale = stale; dirty = true; }
+      return { pin: pin, el: hit.el, state: stale ? 'stale' : (pin.moved ? 'moved' : 'ok') };
+    });
+    if (dirty) save();
+
+    layer.innerHTML = '';
+    placements.forEach(function (p) {
+      if (!p.el) return;
+      var r = p.el.getBoundingClientRect();
+      // A device frame hides the host's own copy of the page (viewport.js), so its
+      // elements measure 0×0. Drawing there would strand every badge in the corner —
+      // the pins stay in the panel, and the framed copy draws its own.
+      if (!r.width && !r.height) return;
+      var ring = document.createElement('div');
+      ring.className = 'at-ring';
+      ring.setAttribute('data-state', p.state);
+      ring.style.cssText = 'left:' + r.left + 'px;top:' + r.top + 'px;width:' +
+        r.width + 'px;height:' + r.height + 'px';
+      var badge = document.createElement('button');
+      badge.className = 'at-badge';
+      badge.type = 'button';
+      badge.textContent = p.pin.n;
+      badge.setAttribute('data-state', p.state);
+      if (selected === p.pin.id) badge.setAttribute('data-selected', '');
+      badge.style.cssText = 'left:' + Math.max(2, r.left - 9) + 'px;top:' +
+        Math.max(2, r.top - 9) + 'px';
+      badge.addEventListener('click', function (e) {
+        e.stopPropagation();
+        selected = selected === p.pin.id ? null : p.pin.id;
+        render();
+      });
+      layer.appendChild(ring);
+      layer.appendChild(badge);
+      p.ring = ring;
+      p.badge = badge;
+    });
+
+    renderList(placements);
+    paintActions();
+  }
+
+  /* A control that would do nothing says so by being disabled, which is why neither of
+     these needs a message explaining that there is nothing to send. */
+  function paintActions() {
+    var any = notes.length > 0;
+    panel.querySelector('.at-copy').disabled = !any;
+    panel.querySelector('.at-clear').disabled = !any;
+  }
+
+  function renderList(rows) {
+    if (!rows.length) {
+      list.innerHTML = '<p class="at-empty">Click anything on the page to comment on it. ' +
+        '<kbd>a</kbd> leaves annotate mode, <kbd>c</kbd> checks contrast.</p>';
+      return;
+    }
+    list.innerHTML = '';
+    rows.forEach(function (p) {
+      var row = document.createElement('div');
+      row.className = 'at-note';
+      row.setAttribute('data-state', p.state);
+      var flag = p.state === 'stale'
+        ? '<span class="at-note-flag">stale</span>'
+        : (p.state === 'moved' ? '<span class="at-note-flag">moved</span>' : '');
+      row.innerHTML =
+        '<span class="at-note-n">' + p.pin.n + '</span>' +
+        '<div class="at-note-body">' +
+        '<p class="at-note-text"></p>' +
+        '<span class="at-note-src"></span>' + flag +
+        '</div>' +
+        '<button class="at-note-del" type="button" aria-label="Delete comment">&times;</button>';
+      row.querySelector('.at-note-text').textContent = p.pin.comment;
+      row.querySelector('.at-note-src').textContent = p.pin.src;
+      row.addEventListener('click', function () {
+        selected = p.pin.id;
+        if (p.el) p.el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        render();
+      });
+      row.querySelector('.at-note-del').addEventListener('click', function (e) {
+        e.stopPropagation();
+        notes = notes.filter(function (x) { return x.id !== p.pin.id; });
+        renumber();
+        save();
+        render();
+      });
+      list.appendChild(row);
+    });
+  }
+
+  function renumber() {
+    var v = variant();
+    var n = 0;
+    notes.forEach(function (p) { if ((p.variant || '') === v) p.n = ++n; });
+    seq = notes.reduce(function (m, p) { return Math.max(m, p.n || 0); }, 0);
+  }
+
+  // --- composing ------------------------------------------------------------
+
+  function closeComposer() {
+    if (composing && composing.node.parentNode) composing.node.remove();
+    composing = null;
+  }
+
+  function compose(el) {
+    closeComposer();
+    var r = el.getBoundingClientRect();
+    var box = document.createElement('div');
+    box.className = 'at-composer';
+    box.innerHTML =
+      '<p class="at-composer-target"></p>' +
+      '<textarea rows="3" placeholder="What is wrong with this, in your words"></textarea>' +
+      '<div class="at-composer-row">' +
+      '<span class="at-composer-hint">Enter saves &middot; Esc cancels</span>' +
+      '<button class="at-btn at-composer-save" type="button">Save</button>' +
+      '</div>';
+    var label = el.tagName.toLowerCase() + ' · ' + (el.getAttribute('data-src') || '?');
+    var snip = snippetOf(el);
+    box.querySelector('.at-composer-target').textContent =
+      snip ? label + ' — "' + snip.slice(0, 48) + '"' : label;
+
+    var top = Math.min(window.innerHeight - 170, Math.max(8, r.bottom + 8));
+    var left = Math.min(window.innerWidth - 320, Math.max(8, r.left));
+    box.style.cssText = 'left:' + left + 'px;top:' + top + 'px';
+    layer.appendChild(box);
+
+    var ta = box.querySelector('textarea');
+    ta.focus();
+    composing = { node: box, el: el };
+
+    function commit() {
+      var text = ta.value.trim();
+      if (!text) { closeComposer(); return; }
+      notes.push({
+        id: 'p' + (++seq) + '-' + notes.length,
+        n: 0,
+        variant: variant(),
+        src: el.getAttribute('data-src') || '',
+        tag: el.tagName.toLowerCase(),
+        snippet: snip,
+        comment: text,
+        build: BUILD
+      });
+      renumber();
+      save();
+      closeComposer();
+      render();
+    }
+
+    ta.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); closeComposer(); }
+    });
+    box.querySelector('.at-composer-save').addEventListener('click', commit);
+  }
+
+  // --- markdown -------------------------------------------------------------
+
+  function markdown() {
+    var byVariant = {};
+    notes.forEach(function (p) {
+      var v = p.variant || '';
+      (byVariant[v] = byVariant[v] || []).push(p);
+    });
+    var out = [MARK, '', '# Artifact feedback', ''];
+    if (OUT) out.push('Artifact: ' + OUT);
+    if (FRAGMENT) out.push('Fragment: ' + FRAGMENT + '  <- edit this, not the artifact');
+    if (BUILD) out.push('Build: ' + BUILD);
+    out.push('');
+    Object.keys(byVariant).forEach(function (v) {
+      out.push('## ' + (v || 'Page'));
+      out.push('');
+      byVariant[v].forEach(function (p) {
+        var head = p.n + '. `' + p.src + '` <' + p.tag + '>';
+        if (p.snippet) head += ' "' + p.snippet.slice(0, 60) + '"';
+        if (p.stale) head += '  [STALE - element not in the current build]';
+        else if (p.moved) head += '  [MOVED - matched by text, line differs]';
+        out.push(head);
+        p.comment.split('\n').forEach(function (line) { out.push('   ' + line); });
+        out.push('');
+      });
+    });
+    return out.join('\n');
+  }
+
+  /* The confirmation is the button itself: its label becomes what just happened. An
+     icon-only button has no label to swap, so for those the state is the whole signal. */
+  function flash(btn, word) {
+    var label = btn.querySelector('span');
+    var was = label ? label.textContent : null;
+    if (label) label.textContent = word;
+    btn.setAttribute('data-done', '');
+    setTimeout(function () {
+      if (label) label.textContent = was;
+      btn.removeAttribute('data-done');
+    }, 1600);
+  }
+
+  panel.querySelector('.at-copy').addEventListener('click', function () {
+    var btn = this;
+    var text = markdown();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { flash(btn, 'Copied'); },
+        function () { fallbackCopy(text, btn); });
+    } else {
+      fallbackCopy(text, btn);
+    }
+  });
+
+  function fallbackCopy(text, btn) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); flash(btn, 'Copied'); } catch (e) {}
+    ta.remove();
+  }
+
+  panel.querySelector('.at-clear').addEventListener('click', function () {
+    if (!notes.length) return;
+    if (!window.confirm('Delete all ' + notes.length + ' comments on this artifact?')) return;
+    notes = [];
+    save();
+    render();
+  });
+
+  panel.querySelector('.at-close').addEventListener('click', function () { setMode(false); });
+
+  // --- mode -----------------------------------------------------------------
+
+  /* A visible way in. `a` is fine once you know it, but a key is not an affordance:
+     nothing on the page said the comment layer existed, so it was found by accident and
+     — since the same key leaves — left by accident too. The button says what it is,
+     shows whether it is on, and carries the shortcut in its tooltip. It sits beside the
+     theme toggle rather than in the rail because every kind has annotate and only
+     prototypes have a rail. */
+  var toggleBtn = document.createElement('button');
+  toggleBtn.className = 'at-annotate-toggle';
+  toggleBtn.type = 'button';
+  toggleBtn.title = 'Comment on anything  (a)';
+  toggleBtn.setAttribute('aria-label', 'Comment mode');
+  toggleBtn.setAttribute('aria-pressed', 'false');
+  toggleBtn.innerHTML =
+    '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">' +
+    '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" ' +
+    'd="M2 3.6h12v7.2H7.2L4.2 13.4v-2.6H2z"/></svg>';
+  toggleBtn.addEventListener('click', function () { setMode(!open); });
+  document.body.appendChild(toggleBtn);
+  if (window.__atDock) window.__atDock(toggleBtn, 'annotate', 'right', 0);
+
+  function setMode(on) {
+    open = on;
+    closeComposer();
+    paintActions();
+    toggleBtn.toggleAttribute('data-active', on);
+    toggleBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (on) {
+      root.setAttribute('data-at-annotate', '');
+      render();
+    } else {
+      root.removeAttribute('data-at-annotate');
+      if (aimed) { aimed.classList.remove('at-aim'); aimed = null; }
+      layer.innerHTML = '';
+    }
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'a' || e.key === 'A') { e.preventDefault(); setMode(!open); }
+    else if (e.key === 'Escape' && open) {
+      if (composing) closeComposer();
+      else setMode(false);
+    }
+  });
+
+  document.addEventListener('mousemove', function (e) {
+    if (!open) return;
+    var el = e.target.closest && e.target.closest('[data-src]');
+    if (e.target.closest && e.target.closest(CHROME)) el = null;
+    if (el === aimed) return;
+    if (aimed) aimed.classList.remove('at-aim');
+    aimed = el;
+    if (aimed) aimed.classList.add('at-aim');
+  }, true);
+
+  /* Capture phase: in annotate mode the page's own buttons must not fire. */
+  document.addEventListener('click', function (e) {
+    if (!open) return;
+    if (e.target.closest(CHROME)) return;
+    var el = e.target.closest('[data-src]');
+    e.preventDefault();
+    e.stopPropagation();
+    if (el) compose(el);
+  }, true);
+
+  // --- keeping the overlay on top of a moving page --------------------------
+
+  /* Programmatic surface. The panel is the human control; this is how a test — or an
+     agent checking its own artifact — drives the same thing without a mouse. */
+  window.atAnnotate = {
+    mode: function (on) { setMode(on === undefined ? !open : !!on); return open; },
+    add: function (selector, comment) {
+      var el = typeof selector === 'string' ? document.querySelector(selector) : selector;
+      if (!el || !el.getAttribute('data-src')) return null;
+      var pin = {
+        id: 'p' + (++seq) + '-' + notes.length,
+        n: 0,
+        variant: variant(),
+        src: el.getAttribute('data-src'),
+        tag: el.tagName.toLowerCase(),
+        snippet: snippetOf(el),
+        comment: String(comment),
+        build: BUILD
+      };
+      notes.push(pin);
+      renumber();
+      save();
+      render();
+      return pin;
+    },
+    notes: function () { return notes.slice(); },
+    markdown: markdown,
+    clear: function () { notes = []; save(); render(); }
+  };
+
+  var pending = false;
+  function reflow() {
+    if (!open || pending) return;
+    pending = true;
+    requestAnimationFrame(function () { pending = false; render(); });
+  }
+
+  window.addEventListener('scroll', reflow, true);
+  window.addEventListener('resize', reflow);
+  window.addEventListener('at:variant', function () { selected = null; reflow(); });
+
+  /* A comment made inside a viewport device frame is written by that document, not this
+     one. The storage event fires in every *other* document sharing the origin, which is
+     exactly how the host panel learns about it. */
+  window.addEventListener('storage', function (e) {
+    if (e.key && e.key !== KEY) return;
+    notes = load();
+    renumber();
+    reflow();
+  });
+
+  /* render() writes into .at-notes-layer, so an unfiltered observer would re-enter
+     itself every frame. Only the page's own DOM counts as a change worth reflowing for. */
+  new MutationObserver(function (records) {
+    for (var i = 0; i < records.length; i++) {
+      var t = records[i].target;
+      var el = t.nodeType === 1 ? t : t.parentElement;
+      if (el && el.closest('.at-notes-layer, .at-panel')) continue;
+      reflow();
+      return;
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+})();
+/* contrast.js — press `c` to flag text that fails WCAG AA against what is behind it.
+
+   This widget exists because it is the one judgement your eye cannot make. Dim secondary
+   text on a good display at night looks deliberate; the same text is unreadable on a
+   laptop in a bright room. The ratio is arithmetic, so the harness can just do it.
+
+   Thresholds: 4.5:1 for body text, 3:1 for large text (>=24px, or >=18.66px bold), per
+   WCAG 2.1 SC 1.4.3. Elements whose text sits on an image or a gradient are skipped
+   rather than guessed at — a wrong number is worse than no number.
+
+   Dormant by default: no chrome renders until the key is pressed. */
+
+(function () {
+  var root = document.documentElement;
+  var on = false;
+
+  var layer = document.createElement('div');
+  layer.className = 'at-cx-layer';
+  document.body.appendChild(layer);
+
+  function parseColor(s) {
+    var m = /^rgba?\(([^)]+)\)$/.exec(s || '');
+    if (!m) return null;
+    var p = m[1].split(/[\s,\/]+/).filter(Boolean).map(parseFloat);
+    if (p.length < 3 || p.some(isNaN)) return null;
+    return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+  }
+
+  function over(fg, bg) {
+    var a = fg.a + bg.a * (1 - fg.a);
+    if (!a) return { r: 0, g: 0, b: 0, a: 0 };
+    return {
+      r: (fg.r * fg.a + bg.r * bg.a * (1 - fg.a)) / a,
+      g: (fg.g * fg.a + bg.g * bg.a * (1 - fg.a)) / a,
+      b: (fg.b * fg.a + bg.b * bg.a * (1 - fg.a)) / a,
+      a: a
+    };
+  }
+
+  function lum(c) {
+    var v = [c.r, c.g, c.b].map(function (x) {
+      x /= 255;
+      return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+  }
+
+  function ratio(a, b) {
+    var l1 = lum(a), l2 = lum(b);
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  }
+
+  /* Walk up compositing backgrounds until opaque. Returns null when something in the
+     stack paints an image or gradient — those are not a flat colour to measure against. */
+  function backdrop(el) {
+    var acc = { r: 0, g: 0, b: 0, a: 0 };
+    var node = el;
+    while (node && node.nodeType === 1) {
+      var cs = getComputedStyle(node);
+      if (cs.backgroundImage && cs.backgroundImage !== 'none') return null;
+      var c = parseColor(cs.backgroundColor);
+      if (c && c.a) {
+        acc = over(acc, c);
+        if (acc.a >= 0.999) return acc;
+      }
+      node = node.parentElement;
+    }
+    var page = parseColor(getComputedStyle(document.body).backgroundColor);
+    var base = page && page.a >= 0.999 ? page : { r: 255, g: 255, b: 255, a: 1 };
+    return over(acc, base);
+  }
+
+  function hasOwnText(el) {
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var n = el.childNodes[i];
+      if (n.nodeType === 3 && n.nodeValue.trim()) return true;
+    }
+    return false;
+  }
+
+  /* `c` checks the artifact. The harness's own chrome is excluded — it is not the design
+     under review — but excluded means unchecked, and the rail shipped text at 2.0-3.9:1
+     with nothing to say so. window.atContrast.check(true) audits the chrome; it has no
+     key because its result is for whoever maintains the harness, not for whoever is
+     judging a prototype. */
+  var CHROME = '.at-panel, .at-notes-layer, .at-vp, .at-rail, .at-rail-reopen, ' +
+    '.at-composer, .at-theme, .at-oc, .at-vp-size';
+
+  function check(chromeOnly) {
+    layer.innerHTML = '';
+    var all = document.querySelectorAll('body *');
+    var tested = 0, failed = 0, skipped = 0, items = [];
+
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el.closest('.at-cx-layer')) continue;
+      var inChrome = !!el.closest(CHROME);
+      if (chromeOnly ? !inChrome : inChrome) continue;
+      if (!hasOwnText(el)) continue;
+
+      var cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) continue;
+      var r = el.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+
+      var fg = parseColor(cs.color);
+      var bg = backdrop(el);
+      if (!fg) continue;
+      if (!bg) { skipped++; continue; }
+      if (fg.a < 1) fg = over(fg, bg);
+
+      var px = parseFloat(cs.fontSize);
+      var bold = (parseInt(cs.fontWeight, 10) || 400) >= 700;
+      var large = px >= 24 || (bold && px >= 18.66);
+      var need = large ? 3 : 4.5;
+      var got = ratio(fg, bg);
+      tested++;
+      items.push({
+        src: el.getAttribute('data-src') || '',
+        tag: el.tagName.toLowerCase(),
+        text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+        ratio: Math.round(got * 100) / 100,
+        need: need,
+        pass: got >= need
+      });
+      if (got >= need) continue;
+      failed++;
+
+      var ring = document.createElement('div');
+      ring.className = 'at-cx-ring';
+      ring.style.cssText = 'left:' + r.left + 'px;top:' + r.top + 'px;width:' +
+        r.width + 'px;height:' + r.height + 'px';
+      var badge = document.createElement('span');
+      badge.className = 'at-cx-badge';
+      if (got >= need - 1) badge.setAttribute('data-level', 'warn');
+      badge.textContent = got.toFixed(1) + ':1 need ' + need;
+      badge.style.cssText = 'left:' + Math.max(2, r.left) + 'px;top:' +
+        Math.max(2, r.top - 16) + 'px';
+      layer.appendChild(ring);
+      layer.appendChild(badge);
+    }
+
+    return { tested: tested, failed: failed, skipped: skipped, items: items };
+  }
+
+  function setMode(next, chromeOnly) {
+    on = next;
+    if (!on) {
+      root.removeAttribute('data-at-contrast');
+      layer.innerHTML = '';
+      return;
+    }
+    root.setAttribute('data-at-contrast', '');
+    check(chromeOnly);
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'c' || e.key === 'C') { e.preventDefault(); setMode(!on, false); }
+    else if (e.key === 'Escape' && on) setMode(false);
+  });
+
+  /* Programmatic surface — same reason as annotate's: the check must be runnable
+     without a keypress, by a test or by an agent auditing its own artifact. */
+  window.atContrast = {
+    mode: function (next) { setMode(next === undefined ? !on : !!next); return on; },
+    check: function (chromeOnly) {
+      var was = on;
+      if (!was) root.setAttribute('data-at-contrast', '');
+      var r = check(!!chromeOnly);
+      if (!was) { root.removeAttribute('data-at-contrast'); layer.innerHTML = ''; }
+      return r;
+    }
+  };
+
+  var pending = false;
+  function refresh() {
+    if (!on || pending) return;
+    pending = true;
+    requestAnimationFrame(function () { pending = false; check(); });
+  }
+  window.addEventListener('scroll', refresh, true);
+  window.addEventListener('resize', refresh);
+  window.addEventListener('at:variant', refresh);
+})();
+/* checks.js — the standing verdicts in the rail.
+
+   Everything here is arithmetic on the DOM: no judgement, no guessing, no advice. A
+   check earns its row only if it can be wrong in a way you can verify by looking, which
+   is why colour-only signalling, focus quality and motion appropriateness are absent —
+   each needs a human, and a check that guesses is worse than no check at all.
+
+   They run against whatever document currently holds the artifact: the page itself, or
+   the device frame when one is up. Each returns { state, note, detail }, where detail is
+   the list the row reveals when you click it.
+
+   The thresholds and where they come from:
+
+   - Contrast 4.5:1 / 3:1 large — WCAG 2.1 SC 1.4.3, delegated to contrast.js.
+   - Tap target 24x24 — WCAG 2.2 SC 2.5.8 (AA). Apple's HIG asks 44x44; 24 is the
+     standards floor, so that is what is enforced and 44 is what the note mentions.
+   - Text size 12px — NOT a WCAG rule. WCAG sets no minimum size, only that text must
+     survive being resized. 12px is a house floor for a prototype being judged on a
+     laptop, and the row says so rather than implying a standard exists.
+   - Everything else is a defect with no threshold to argue about: the page scrolls
+     sideways or it does not; an id is duplicated or it is not. */
+
+(function () {
+  var root = document.documentElement;
+  if (root.hasAttribute('data-at-embedded')) return;   // the host owns the verdicts
+  if (!window.__atRail) return;                        // no rail, nowhere to put them
+
+  var INTERACTIVE = 'a[href], button, input, select, textarea, [role="button"], ' +
+    '[role="link"], [role="tab"], [role="switch"], [role="checkbox"], [tabindex]';
+
+  /* The harness is not the artifact. Every check has to exclude it or it reports on the
+     rail's own step buttons and the comment panel's chrome — which is how the first run
+     of the tap-target check confidently failed a prototype for the size of MY buttons. */
+  var CHROME = '.at-rail, .at-rail-reopen, .at-panel, .at-composer, .at-notes-layer, ' +
+    '.at-cx-layer, .at-vp, .at-vp-host, .at-theme, .at-annotate-toggle';
+
+  function mine(el) { return !el.closest(CHROME); }
+
+  function pick(doc, selector) {
+    return [].slice.call(doc.querySelectorAll(selector)).filter(mine);
+  }
+
+  var MIN_TAP = 24;      // WCAG 2.2 SC 2.5.8, AA
+  var COMFY_TAP = 44;    // Apple HIG, quoted in the note but not enforced
+  var MIN_TEXT = 12;     // house floor; WCAG has no minimum size
+
+  function visible(el, win) {
+    var cs = win.getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) {
+      return false;
+    }
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  /* WCAG 2.2 SC 2.5.8 exempts a target "in a sentence or otherwise constrained by the
+     line-height of non-target text". Without this the check fails every prototype that
+     has a link in a paragraph, which is every prototype — and a check that always cries
+     wolf gets ignored along with the ones that mean it. */
+  function inlineInText(el, win) {
+    // Links only. A <button> is a discrete control whatever text surrounds it, and
+    // exempting buttons here made a 16x16 icon button in a paragraph — the exact case
+    // this check exists for — report as fine.
+    if (!/^a$/i.test(el.tagName)) return false;
+    if (!/^inline/.test(win.getComputedStyle(el).display)) return false;
+    var p = el.parentElement;
+    if (!p) return false;
+    var own = (p.textContent || '').replace(/\s+/g, ' ').trim();
+    var mine_ = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return own.length > mine_.length;   // there is other text around it
+  }
+
+  function label(el) {
+    var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (t) return t.slice(0, 40);
+    return '<' + el.tagName.toLowerCase() +
+      (el.className && typeof el.className === 'string'
+        ? '.' + el.className.split(/\s+/)[0] : '') + '>';
+  }
+
+  /* --- the checks ---------------------------------------------------------- */
+
+  var CHECKS = [
+    {
+      key: 'contrast',
+      name: 'Contrast',
+      why: 'Body text 4.5:1, large text 3:1 (WCAG 2.1 SC 1.4.3)',
+      run: function (_doc, win) {
+        if (!win.atContrast) return null;
+        var r = win.atContrast.check(false);
+        return {
+          state: r.failed ? 'fail' : 'pass',
+          note: r.failed ? r.failed + ' of ' + r.tested + ' fail AA'
+                         : 'all ' + r.tested + ' pass AA',
+          reveal: function () { win.atContrast.mode(true); }
+        };
+      }
+    },
+    {
+      key: 'overflow',
+      name: 'Overflow',
+      why: 'Nothing pushes the page sideways',
+      run: function (doc, win) {
+        // The stage is the scrolling box outside a device frame — it is the element with
+        // overflow:auto, so the document never scrolls and reading documentElement said
+        // "no sideways scroll" while 1800px of content hung off the side of the stage.
+        var box = doc.getElementById('at-stage') || doc.scrollingElement || doc.documentElement;
+        var over = box.scrollWidth - box.clientWidth;
+        if (over <= 1) return { state: 'pass', note: 'no sideways scroll' };
+        /* The limit is the box's right EDGE in viewport coordinates, not its width.
+           Comparing a rect's .right against clientWidth counted the stage's own left
+           offset as overflow, so every paragraph on an indented stage looked too wide. */
+        var boxLeft = box.getBoundingClientRect ? box.getBoundingClientRect().left : 0;
+        var limit = boxLeft + box.clientWidth + 1;
+        var over_ = pick(doc, 'body *').filter(function (el) {
+          if (!visible(el, win)) return false;
+          return el.getBoundingClientRect().right > limit;
+        });
+        /* Report the element that is actually too wide, not its ancestors. A flex item
+           refuses to shrink below max-content, so one 1800px child makes every wrapper
+           above it 1800px too and the list fills with the page's own paragraphs. */
+        var culprits = over_.filter(function (el) {
+          return !over_.some(function (other) { return other !== el && el.contains(other); });
+        }).map(label);
+        return {
+          state: 'fail',
+          note: over + 'px of sideways scroll',
+          detail: culprits.slice(0, 8)
+        };
+      }
+    },
+    {
+      key: 'tap',
+      name: 'Tap targets',
+      why: 'Interactive elements at least ' + MIN_TAP + '×' + MIN_TAP +
+           ' (WCAG 2.2 SC 2.5.8). ' + COMFY_TAP + '×' + COMFY_TAP + ' is Apple\'s comfort size.',
+      run: function (doc, win) {
+        var els = pick(doc, INTERACTIVE)
+          .filter(function (el) { return visible(el, win); });
+        var small = els.filter(function (el) {
+          if (inlineInText(el, win)) return false;
+          var r = el.getBoundingClientRect();
+          return r.width < MIN_TAP || r.height < MIN_TAP;
+        });
+        if (!els.length) return { state: 'skip', note: 'no controls on screen' };
+        if (!small.length) {
+          var tight = els.filter(function (el) {
+            if (inlineInText(el, win)) return false;
+            var r = el.getBoundingClientRect();
+            return r.width < COMFY_TAP || r.height < COMFY_TAP;
+          });
+          return {
+            state: 'pass',
+            note: tight.length ? els.length + ' pass, ' + tight.length + ' under 44px'
+                               : 'all ' + els.length + ' at least 44px'
+          };
+        }
+        return {
+          state: 'fail',
+          note: small.length + ' of ' + els.length + ' under ' + MIN_TAP + 'px',
+          detail: small.slice(0, 8).map(function (el) {
+            var r = el.getBoundingClientRect();
+            return label(el) + ' — ' + Math.round(r.width) + '×' + Math.round(r.height);
+          })
+        };
+      }
+    },
+    {
+      key: 'textsize',
+      name: 'Text size',
+      why: 'House floor of ' + MIN_TEXT + 'px. WCAG sets no minimum size, only that ' +
+           'text must survive being resized — this is a legibility call, not a standard.',
+      run: function (doc, win) {
+        var small = [];
+        var all = doc.querySelectorAll('body *');
+        for (var i = 0; i < all.length; i++) {
+          var el = all[i];
+          if (!mine(el)) continue;
+          var own = false;
+          for (var j = 0; j < el.childNodes.length; j++) {
+            if (el.childNodes[j].nodeType === 3 && el.childNodes[j].textContent.trim()) {
+              own = true; break;
+            }
+          }
+          if (!own || !visible(el, win)) continue;
+          var px = parseFloat(win.getComputedStyle(el).fontSize);
+          if (px < MIN_TEXT) small.push(label(el) + ' — ' + px.toFixed(1) + 'px');
+        }
+        return small.length
+          ? { state: 'fail', note: small.length + ' under ' + MIN_TEXT + 'px',
+              detail: small.slice(0, 8) }
+          : { state: 'pass', note: 'nothing under ' + MIN_TEXT + 'px' };
+      }
+    },
+    {
+      key: 'deadlinks',
+      name: 'Dead links',
+      why: 'Links that go nowhere. Only the detectable kind: href="#", href="", or no ' +
+           'href at all. A button whose handler does nothing cannot be seen from here.',
+      run: function (doc) {
+        var dead = pick(doc, 'a').filter(function (a) {
+          var h = a.getAttribute('href');
+          return h === null || h === '' || h === '#';
+        });
+        return dead.length
+          ? { state: 'fail', note: dead.length + ' link' + (dead.length > 1 ? 's' : '') +
+              ' go nowhere', detail: dead.slice(0, 8).map(label) }
+          : { state: 'pass', note: 'no placeholder links' };
+      }
+    },
+    {
+      key: 'alt',
+      name: 'Image alt',
+      why: 'Every <img> carries alt text, or alt="" if it is decorative',
+      run: function (doc) {
+        var imgs = pick(doc, 'img');
+        if (!imgs.length) return { state: 'skip', note: 'no images' };
+        var missing = imgs.filter(function (i) { return i.getAttribute('alt') === null; });
+        return missing.length
+          ? { state: 'fail', note: missing.length + ' of ' + imgs.length + ' missing alt',
+              detail: missing.slice(0, 8).map(function (i) {
+                return (i.getAttribute('src') || '(no src)').slice(0, 40);
+              }) }
+          : { state: 'pass', note: 'all ' + imgs.length + ' have alt' };
+      }
+    },
+    {
+      key: 'ids',
+      name: 'Duplicate ids',
+      why: 'A repeated id breaks <label for>, aria-labelledby and every other reference',
+      run: function (doc) {
+        var seen = {}, dupes = {};
+        var all = pick(doc, '[id]');
+        for (var i = 0; i < all.length; i++) {
+          var id = all[i].id;
+          if (!id) continue;
+          if (seen[id]) dupes[id] = (dupes[id] || 1) + 1;
+          seen[id] = true;
+        }
+        var keys = Object.keys(dupes);
+        return keys.length
+          ? { state: 'fail', note: keys.length + ' id' + (keys.length > 1 ? 's' : '') +
+              ' used more than once',
+              detail: keys.slice(0, 8).map(function (k) { return '#' + k + ' ×' + dupes[k]; }) }
+          : { state: 'pass', note: 'every id unique' };
+      }
+    },
+    {
+      key: 'hermetic',
+      name: 'Hermetic',
+      why: 'No network request of any kind. An artifact has to render identically ' +
+           'offline and in five years.',
+      run: function (doc) {
+        var bad = [];
+        pick(doc, 'link[href], script[src], img[src], ' +
+          'source[src], video[src], audio[src], iframe[src]').forEach(function (el) {
+          var url = el.getAttribute('href') || el.getAttribute('src') || '';
+          if (/^(https?:)?\/\//i.test(url)) bad.push(el.tagName.toLowerCase() + ' → ' + url.slice(0, 46));
+        });
+        pick(doc, 'style').forEach(function (s) {
+          var m = (s.textContent || '').match(/@import\s+url\(([^)]*)\)/i);
+          if (m && /^["']?(https?:)?\/\//i.test(m[1])) bad.push('@import → ' + m[1].slice(0, 46));
+        });
+        return bad.length
+          ? { state: 'fail', note: bad.length + ' remote reference' +
+              (bad.length > 1 ? 's' : ''), detail: bad.slice(0, 8) }
+          : { state: 'pass', note: 'no network requests' };
+      }
+    }
+  ];
+
+  /* --- where the artifact currently lives ---------------------------------- */
+
+  function target() {
+    if (root.hasAttribute('data-at-vp')) {
+      var f = document.querySelector('.at-vp-frame');
+      try {
+        if (f && f.contentWindow && f.contentDocument) {
+          return { doc: f.contentDocument, win: f.contentWindow };
+        }
+      } catch (e) {}
+    }
+    return { doc: document, win: window };
+  }
+
+  /* --- the rail group ------------------------------------------------------ */
+
+  var rows = {};
+  var group = null;
+
+  // Deferred so the device group, added by viewport.js, lands above this one: the rail
+  // runs coarse to fine down the column, and a verdict is not a control.
+  setTimeout(function () {
+    group = window.__atRail.group('Checks');
+    CHECKS.forEach(function (c) {
+      var row = document.createElement('button');
+      row.className = 'at-check';
+      row.type = 'button';
+      row.title = c.why;
+      row.innerHTML =
+        '<span class="at-check-mark"></span>' +
+        '<span class="at-check-body"><span class="at-check-name">' + c.name + '</span>' +
+        '<span class="at-check-note">checking…</span></span>';
+      group.appendChild(row);
+      rows[c.key] = row;
+    });
+    var detail = document.createElement('div');
+    detail.className = 'at-check-detail';
+    detail.hidden = true;
+    group.appendChild(detail);
+    rows.__detail = detail;
+    runAll();
+  }, 0);
+
+  var openKey = null;
+
+  function showDetail(c, result) {
+    var box = rows.__detail;
+    if (openKey === c.key) { openKey = null; box.hidden = true; paint(); return; }
+    openKey = c.key;
+    if (c.key === 'contrast' && result.reveal) { result.reveal(); }
+    box.hidden = false;
+    box.innerHTML = '<div class="at-check-detail-head">' + c.name + '</div>' +
+      (result.detail && result.detail.length
+        ? result.detail.map(function () {
+            return '<div class="at-check-detail-row"></div>';
+          }).join('')
+        : '<div class="at-check-detail-row"></div>');
+    var slots = box.querySelectorAll('.at-check-detail-row');
+    var lines = (result.detail && result.detail.length) ? result.detail : [c.why];
+    for (var i = 0; i < slots.length; i++) slots[i].textContent = lines[i];
+    paint();
+  }
+
+  var last = {};
+
+  function paint() {
+    CHECKS.forEach(function (c) {
+      var row = rows[c.key];
+      var r = last[c.key];
+      if (!row || !r) return;
+      row.setAttribute('data-state', r.state);
+      row.toggleAttribute('data-open', openKey === c.key);
+      row.querySelector('.at-check-mark').textContent =
+        r.state === 'fail' ? '!' : (r.state === 'skip' ? '–' : '✓');
+      row.querySelector('.at-check-note').textContent = r.note;
+    });
+  }
+
+  function runAll() {
+    var t = target();
+    CHECKS.forEach(function (c) {
+      var r;
+      try { r = c.run(t.doc, t.win); } catch (e) { r = null; }
+      last[c.key] = r || { state: 'skip', note: 'not available' };
+      var row = rows[c.key];
+      if (row && !row.__wired) {
+        row.__wired = true;
+        row.addEventListener('click', function () { showDetail(c, last[c.key]); });
+      }
+    });
+    if (openKey && rows.__detail && !rows.__detail.hidden) {
+      var cur = CHECKS.filter(function (c) { return c.key === openKey; })[0];
+      if (cur) { openKey = null; showDetail(cur, last[cur.key]); }
+    }
+    paint();
+  }
+
+  /* Run when there is something to measure — never on a timer. at:variant and at:device
+     both fire before the stage has been filled, so timing them measured an empty
+     document and reported everything green. */
+  window.addEventListener('at:mounted', runAll);
+  window.addEventListener('message', function (e) {
+    if (e.data && e.data.at === 'mounted') runAll();
+  });
+  window.addEventListener('at:axis', function () { requestAnimationFrame(runAll); });
+  window.addEventListener('resize', function () {
+    clearTimeout(runAll.t);
+    runAll.t = setTimeout(runAll, 200);
+  });
+
+  window.atChecks = {
+    run: function () { runAll(); return last; },
+    results: function () { return last; }
+  };
+})();
+/* viewport.js — see the artifact at real device sizes, in real device chrome.
+
+   Why an iframe and not a width-constrained div: CSS media queries answer to the
+   *viewport*, not to the box an element sits in. A 390px-wide <div> shows a squeezed
+   desktop layout and reports itself as a phone — which is exactly the wrong answer for
+   the one thing a device switcher exists to check. An iframe has its own viewport, so
+   `@media (max-width: 640px)` fires inside it for real.
+
+   The frame's document is a clone of this page, serialized into srcdoc. That keeps the
+   artifact hermetic (no second file, no fetch, no server) and means every harness widget
+   — annotate included — is already present inside the frame. The clone is marked
+   data-at-embedded so it renders no nested chrome, and carries data-at-key so comments
+   made inside the frame land in the same storage bucket as comments made outside it.
+
+   CHROME SITS ON WHICHEVER SIDE OF THE VIEWPORT IT REALLY SITS ON. This is the whole
+   reason chrome is the harness's job and not the fragment's:
+
+   - A phone/tablet status bar and home indicator are INSIDE the viewport. Content
+     scrolls under them and they overlap the app's own top bar. They are injected into
+     the clone, and the space they occupy is published as --at-safe-top /
+     --at-safe-bottom so a layout can reserve it.
+   - A desktop window's title bar and a browser's tab+URL bar are OUTSIDE the viewport.
+     A web page cannot see them and must never lay itself out around them. They are drawn
+     in the host document, around the iframe.
+
+   Which devices appear is declared per-artifact by `artifact build --devices`, read here
+   off data-at-devices. There is no sensible default: whether a prototype has anything to
+   say at phone width is a property of that prototype. */
+
+(function () {
+  var root = document.documentElement;
+
+  /* Inside a frame: no nested frames, but the keyboard has to be given back.
+     Clicking a device frame moves focus into the iframe, and from then on every keypress
+     belongs to that document — so the rail's keys, and `a` and `c`, all silently stop
+     working the moment you interact with the thing you are reviewing. The frame is
+     same-origin, so it forwards what it is not going to use itself up to the host, which
+     re-dispatches it as if the host had focus. A key typed into one of the prototype's
+     own fields is left alone. */
+  if (root.hasAttribute('data-at-embedded')) {
+    document.addEventListener('keydown', function (e) {
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // Only the keys the HOST owns. `a` and `c` stay in the frame: annotating and the
+      // contrast check are about the framed document, and comments made inside it land
+      // in the same bucket anyway.
+      if (!/^([0-9]|[xXrRdD]|\[|\]|,|\.|<|>|\\|\?)$/.test(e.key) &&
+          e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      try { parent.postMessage({ at: 'key', key: e.key }, '*'); } catch (err) {}
+    });
+    return;
+  }
+
+  window.addEventListener('message', function (e) {
+    if (!e.data || e.data.at !== 'key') return;
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: e.data.key, bubbles: true }));
+  });
+
+  var CATALOG = {
+    fit:     { label: 'Fit',     w: 0,    h: 0,    chrome: null,      rotates: false },
+    phone:   { label: 'Phone',   w: 390,  h: 844,  chrome: 'ios',     rotates: true, notch: true, radius: 46 },
+    tablet:  { label: 'Tablet',  w: 834,  h: 1194, chrome: 'ios',     rotates: true, notch: false, radius: 20 },
+    desktop: { label: 'Desktop', w: 1440, h: 900,  chrome: 'macos',   rotates: false, radius: 10 },
+    web:     { label: 'Web',     w: 1440, h: 900,  chrome: 'browser', rotates: false, radius: 10 }
+  };
+
+  /* Which parts of the macOS window the desktop frame draws. Build-time, from --window,
+     because whether the design owns its own title area is a property of the thing being
+     prototyped rather than something to flip while looking at it. Default is neither:
+     a full-size-content-view app draws its own top area, and a generic title bar stapled
+     over it is chrome nobody designed. */
+  var win = (root.getAttribute('data-at-window') || '')
+    .split(',').map(function (s) { return s.trim(); });
+  var WIN_BAR = win.indexOf('bar') >= 0;
+  var WIN_LIGHTS = win.indexOf('lights') >= 0;
+
+  // Declared here because both the title bar (outside the viewport) and the
+  // full-size-content-view overlay (inside it) build markup from it.
+  var LIGHTS =
+    '<span class="at-oc-dot" style="background:#ff5f57"></span>' +
+    '<span class="at-oc-dot" style="background:#febc2e"></span>' +
+    '<span class="at-oc-dot" style="background:#28c840"></span>';
+
+  var names = (root.getAttribute('data-at-devices') || 'fit,phone,tablet,desktop')
+    .split(',').map(function (s) { return s.trim(); }).filter(function (s) { return CATALOG[s]; });
+  if (names.indexOf('fit') < 0) names.unshift('fit');
+  if (names.length < 2) return;
+
+  var current = 0;
+  var landscape = false;
+  var actual = false;          // 1:1 — show the frame at its real size and scroll to it
+  var host = null;
+  var frame = null;
+  var shell = null;
+  var deviceBtns = [];
+  var rotateBtn = null;
+  var actualBtn = null;
+  var sizeLabel = null;
+
+  /* Every bit of frame state belongs in the URL, so a phone-landscape view of variant 2
+     is a link. Rotate used to call apply() directly and skipped this, which meant the
+     one control whose result you would most want to send someone was the one that did
+     not survive being sent. */
+  function writeDeviceUrl() {
+    try {
+      var url = new URL(location);
+      url.searchParams.set('d', names[current] + (landscape ? '-landscape' : ''));
+      if (actual) url.searchParams.set('zoom', '1');
+      else url.searchParams.delete('zoom');
+      history.replaceState(null, '', url);
+    } catch (e) {}
+  }
+
+  function toggleRotate() {
+    if (!CATALOG[names[current]].rotates) return;
+    landscape = !landscape;
+    paintControls();
+    writeDeviceUrl();
+    apply();
+  }
+
+  function toggleActual() {
+    actual = !actual;
+    paintControls();
+    writeDeviceUrl();
+    fit();
+  }
+
+  /* ---------------- controls: into the rail when there is one ---------------- */
+
+  var rail = window.__atRail;
+  if (rail) {
+    var g = rail.group('Device');
+    var row = rail.row(g);
+    names.forEach(function (n, i) {
+      deviceBtns.push(rail.item(row, CATALOG[n].label, function () { select(i); }));
+    });
+    /* Rotate and 1:1 are not devices — they change how the chosen frame is shown, not
+       which frame it is. Given the same chip treatment they read as two more frames in
+       the list. They sit on the readout line instead, with the numbers they change. */
+    var readout = document.createElement('div');
+    readout.className = 'at-vp-readout';
+    sizeLabel = document.createElement('span');
+    sizeLabel.className = 'at-vp-size';
+    readout.appendChild(sizeLabel);
+
+    rotateBtn = document.createElement('button');
+    rotateBtn.className = 'at-vp-mod';
+    rotateBtn.type = 'button';
+    rotateBtn.title = 'Rotate';
+    rotateBtn.setAttribute('aria-label', 'Rotate');
+    rotateBtn.innerHTML = '&#8635;';
+    rotateBtn.addEventListener('click', toggleRotate);
+
+    actualBtn = document.createElement('button');
+    actualBtn.className = 'at-vp-mod';
+    actualBtn.type = 'button';
+    actualBtn.title = 'Show at actual size';
+    actualBtn.textContent = '1:1';
+    actualBtn.addEventListener('click', toggleActual);
+
+    readout.appendChild(rotateBtn);
+    readout.appendChild(actualBtn);
+    g.appendChild(readout);
+  } else {
+    var bar = document.createElement('nav');
+    bar.className = 'at-vp';
+    bar.setAttribute('aria-label', 'Viewport size');
+    names.forEach(function (n, i) {
+      var b = document.createElement('button');
+      b.className = 'at-vp-item';
+      b.type = 'button';
+      b.textContent = CATALOG[n].label;
+      b.addEventListener('click', function () { select(i); });
+      bar.appendChild(b);
+      deviceBtns.push(b);
+    });
+    var divider = document.createElement('span');
+    divider.className = 'at-vp-divider';
+    divider.setAttribute('aria-hidden', 'true');
+    rotateBtn = document.createElement('button');
+    rotateBtn.className = 'at-vp-item at-vp-rotate';
+    rotateBtn.type = 'button';
+    rotateBtn.setAttribute('aria-label', 'Rotate');
+    rotateBtn.innerHTML = '&#8635;';
+    rotateBtn.addEventListener('click', toggleRotate);
+    actualBtn = document.createElement('button');
+    actualBtn.className = 'at-vp-item';
+    actualBtn.type = 'button';
+    actualBtn.textContent = '1:1';
+    actualBtn.addEventListener('click', toggleActual);
+    bar.appendChild(actualBtn);
+    sizeLabel = document.createElement('span');
+    sizeLabel.className = 'at-vp-size';
+    bar.appendChild(divider);
+    bar.appendChild(rotateBtn);
+    bar.appendChild(sizeLabel);
+    document.body.appendChild(bar);
+  }
+
+  function paintControls() {
+    deviceBtns.forEach(function (b, j) { b.toggleAttribute('data-active', j === current); });
+    var d = CATALOG[names[current]];
+    if (rotateBtn) {
+      rotateBtn.toggleAttribute('disabled', !d.rotates);
+      rotateBtn.toggleAttribute('data-active', d.rotates && landscape);
+    }
+    if (actualBtn) {
+      actualBtn.toggleAttribute('disabled', !d.w);
+      actualBtn.toggleAttribute('data-active', !!d.w && actual);
+    }
+  }
+
+  function select(i) {
+    current = i;
+    if (!CATALOG[names[i]].rotates) landscape = false;
+    paintControls();
+    writeDeviceUrl();
+    apply();
+  }
+
+  function stepDevice(delta) {
+    select((current + delta + names.length) % names.length);
+  }
+
+  /* ---------------- inside-the-viewport chrome ---------------- */
+
+  var IOS_BAR =
+    '<div class="at-dc at-dc-ios" aria-hidden="true">' +
+    '<span class="at-dc-time">9:41</span>' +
+    '<span class="at-dc-icons">' +
+    '<svg width="17" height="11" viewBox="0 0 17 11"><path fill="currentColor" d="M1 7h2v4H1zM5 5h2v6H5zM9 3h2v8H9zM13 0h2v11h-2z"/></svg>' +
+    '<svg width="16" height="11" viewBox="0 0 16 11"><path fill="currentColor" d="M8 2.2c2 0 3.8.8 5.1 2l1.3-1.4A9.3 9.3 0 0 0 8 .2 9.3 9.3 0 0 0 1.6 2.8L2.9 4.2A7.3 7.3 0 0 1 8 2.2zm0 3.4c1.1 0 2.1.4 2.9 1.2l1.3-1.4A6.1 6.1 0 0 0 8 3.6c-1.6 0-3.1.6-4.2 1.8l1.3 1.4A4.1 4.1 0 0 1 8 5.6zM8 8l1.8 2H6.2z"/></svg>' +
+    '<svg width="25" height="11" viewBox="0 0 25 11"><rect x="0.5" y="0.5" width="20" height="10" rx="3" stroke="currentColor" fill="none" opacity=".5"/>' +
+    '<rect x="2" y="2" width="17" height="7" rx="1.5" fill="currentColor"/>' +
+    '<path d="M22.5 4v3a2 2 0 0 0 0-3z" fill="currentColor" opacity=".5"/></svg>' +
+    '</span></div>';
+
+  var HOME_BAR = '<div class="at-dc at-dc-home" aria-hidden="true"><span></span></div>';
+
+  /* Traffic lights with no title bar are the full-size-content-view shape: the window has
+     no chrome of its own and the lights float over the app's own top area. They are
+     therefore INSIDE the viewport, like an iOS status bar and unlike a title bar. The
+     frame publishes their footprint and reserves nothing — drawing under them is the
+     whole point of that window style; a layout that wants to keep clear of them uses
+     --at-lights-w / --at-lights-h itself. */
+  var LIGHTS_OVERLAY =
+    '<div class="at-dc at-dc-lights" aria-hidden="true">' + LIGHTS + '</div>';
+
+  function insideChrome(d, land) {
+    // Keyed on the device itself, not just its chrome family: traffic lights belong to
+    // the desktop window and nothing else, so a phone can never inherit them however
+    // this is called.
+    if (names[current] === 'desktop' && d.chrome === 'macos') {
+      if (!WIN_LIGHTS || WIN_BAR) return { markup: '', top: 0, bottom: 0 };
+      return { markup: LIGHTS_OVERLAY, top: 0, bottom: 0, lights: true };
+    }
+    if (d.chrome === 'macos') return { markup: '', top: 0, bottom: 0 };
+    if (d.chrome !== 'ios') return { markup: '', top: 0, bottom: 0 };
+    // Landscape phones shrink the bar; tablets keep a slim one either way.
+    var top = d.notch ? (land ? 24 : 54) : 24;
+    var bottom = 22;
+    return { markup: IOS_BAR + HOME_BAR, top: top, bottom: bottom };
+  }
+
+  /* A copy of this document, with the live harness DOM stripped so the frame starts
+     clean and the rail inside it mounts its own variant. */
+  function srcdoc(d, land) {
+    var clone = root.cloneNode(true);
+    // The rail STAYS in the clone. rail.js needs it to exist to mount a variant at all —
+    // removing it makes the frame render an empty stage. rail.css hides it under
+    // html[data-at-embedded], which is the right mechanism: present, not visible.
+    // .at-dc is device chrome injected into a PREVIOUS frame's document. It should never
+    // be on the host, but stripping it here means no frame can inherit another frame's
+    // furniture even if it somehow is.
+    [].slice.call(clone.querySelectorAll(
+      '.at-vp, .at-vp-host, .at-notes-layer, .at-panel, .at-rail-reopen, .at-dc'
+    )).forEach(function (n) { n.remove(); });
+    var stage = clone.querySelector('#at-stage');
+    if (stage) stage.innerHTML = '';
+    clone.setAttribute('data-at-embedded', '');
+    clone.setAttribute('data-at-key', root.getAttribute('data-at-key') || location.pathname);
+    var v = root.getAttribute('data-at-variant-index');
+    if (v) clone.setAttribute('data-at-variant-init', v);
+    var r = root.getAttribute('data-at-round');
+    if (r) clone.setAttribute('data-at-round-init', r);
+    var ax = root.getAttribute('data-at-axis-state');
+    if (ax) clone.setAttribute('data-at-axis-init', ax);
+    clone.removeAttribute('data-at-vp');
+    clone.removeAttribute('data-at-annotate');
+
+    var ch = insideChrome(d, land);
+    if (ch.markup && ch.lights) {
+      // Lights only: publish the footprint, reserve nothing, pad nothing.
+      var lstyle = clone.ownerDocument.createElement('style');
+      lstyle.textContent =
+        ':root{--at-lights-w:78px;--at-lights-h:28px}' +
+        '.at-dc-lights{position:fixed;top:0;left:0;z-index:2147483000;pointer-events:none;' +
+        'display:flex;align-items:center;gap:8px;height:var(--at-lights-h);padding:0 14px}' +
+        '.at-dc-lights .at-oc-dot{width:12px;height:12px;border-radius:50%;flex:0 0 12px}';
+      clone.querySelector('head').appendChild(lstyle);
+      var lholder = clone.ownerDocument.createElement('div');
+      lholder.innerHTML = ch.markup;
+      var lbody = clone.querySelector('body');
+      while (lholder.firstChild) lbody.appendChild(lholder.firstChild);
+    } else if (ch.markup) {
+      var reserve = clone.getAttribute('data-at-safe') !== 'none';
+      var style = clone.ownerDocument.createElement('style');
+      style.textContent =
+        ':root{--at-safe-top:' + ch.top + 'px;--at-safe-bottom:' + ch.bottom + 'px}' +
+        (reserve ? 'body{padding-top:var(--at-safe-top);padding-bottom:var(--at-safe-bottom)}' : '') +
+        '.at-dc{position:fixed;left:0;right:0;z-index:2147483000;pointer-events:none;' +
+        'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;' +
+        'color:currentColor}' +
+        '.at-dc-ios{top:0;height:var(--at-safe-top);display:flex;align-items:center;' +
+        'justify-content:space-between;padding:0 26px;font-size:14px;font-weight:600;' +
+        'letter-spacing:.2px}' +
+        '.at-dc-ios .at-dc-icons{display:flex;align-items:center;gap:5px}' +
+        '.at-dc-home{bottom:0;height:var(--at-safe-bottom);display:flex;align-items:center;' +
+        'justify-content:center}' +
+        '.at-dc-home span{width:140px;height:5px;border-radius:3px;background:currentColor;' +
+        'opacity:.35}';
+      clone.querySelector('head').appendChild(style);
+      var holder = clone.ownerDocument.createElement('div');
+      holder.innerHTML = ch.markup;
+      var body = clone.querySelector('body');
+      while (holder.firstChild) body.appendChild(holder.firstChild);
+    }
+    return '<!DOCTYPE html>\n' + clone.outerHTML;
+  }
+
+  /* ---------------- outside-the-viewport chrome ---------------- */
+
+  var MACOS_BAR =
+    '<div class="at-oc at-oc-macos" aria-hidden="true">' +
+    (WIN_LIGHTS ? LIGHTS : '<span class="at-oc-nolights"></span>') +
+    '<span class="at-oc-title"></span></div>';
+
+  var BROWSER_BAR =
+    '<div class="at-oc at-oc-browser" aria-hidden="true">' +
+    '<div class="at-oc-tabs">' +
+    '<span class="at-oc-dot" style="background:#ff5f57"></span>' +
+    '<span class="at-oc-dot" style="background:#febc2e"></span>' +
+    '<span class="at-oc-dot" style="background:#28c840"></span>' +
+    '<span class="at-oc-tab"></span></div>' +
+    '<div class="at-oc-url"><span class="at-oc-lock">●</span><span class="at-oc-addr"></span></div>' +
+    '</div>';
+
+  function outsideChrome(d) {
+    // A bare desktop frame is a window with no chrome at all — the default.
+    if (d.chrome === 'macos') return WIN_BAR ? MACOS_BAR : '';
+    if (d.chrome === 'browser') return BROWSER_BAR;
+    return '';
+  }
+
+  /* ---------------- apply ---------------- */
+
+  function apply() {
+    var d = CATALOG[names[current]];
+    if (!d.w) {
+      root.removeAttribute('data-at-vp');
+      if (host) { host.remove(); host = null; frame = null; shell = null; }
+      sizeLabel.textContent = '';
+      paintControls();
+      window.dispatchEvent(new CustomEvent('at:device', { detail: { device: 'fit' } }));
+      return;
+    }
+    var land = d.rotates && landscape;
+    var w = land ? d.h : d.w;
+    var h = land ? d.w : d.h;
+
+    if (!host) {
+      host = document.createElement('div');
+      host.className = 'at-vp-host';
+      document.body.appendChild(host);
+    }
+    // The shell is rebuilt per device: its chrome and corner radius differ.
+    host.innerHTML = '';
+    shell = document.createElement('div');
+    shell.className = 'at-vp-shell';
+    shell.setAttribute('data-chrome', d.chrome || 'none');
+    shell.style.borderRadius = (d.radius || 0) + 'px';
+    shell.innerHTML = outsideChrome(d);
+
+    if (d.notch && !land) {
+      var notch = document.createElement('div');
+      notch.className = 'at-vp-notch';
+      notch.setAttribute('aria-hidden', 'true');
+      shell.appendChild(notch);
+    }
+
+    frame = document.createElement('iframe');
+    frame.className = 'at-vp-frame';
+    frame.setAttribute('title', 'Artifact at device size');
+    frame.style.width = w + 'px';
+    frame.style.height = h + 'px';
+    shell.appendChild(frame);
+    host.appendChild(shell);
+
+    root.setAttribute('data-at-vp', '');
+    // A change landing between here and the frame's first paint would arrive before
+    // there is anything to receive it, so the fresh frame is synced once on load.
+    frame.addEventListener('load', function () {
+      syncFrame();
+      // Whatever watches the artifact — the contrast verdict, for one — is now looking
+      // at a different document and has to be told.
+      window.dispatchEvent(new CustomEvent('at:device', { detail: { device: names[current] } }));
+    });
+    frame.srcdoc = srcdoc(d, land);
+    fit();
+  }
+
+  /* Scale down (never up) when the framed device is bigger than the window — and say so.
+     A 1440 desktop in a 1280 window renders at 67%, which is not a size anyone can judge
+     type or spacing at. The label used to print the CSS size either way, so the number on
+     screen described a frame you were not actually looking at. 1:1 turns scaling off and
+     lets the host scroll to the rest. */
+  function fit() {
+    if (!shell || !host) return;
+    shell.style.transform = '';
+    shell.style.marginBottom = '';
+    shell.style.marginRight = '';
+    host.toggleAttribute('data-actual', actual);
+
+    var d = CATALOG[names[current]];
+    var land = d.rotates && landscape;
+    var vw = land ? d.h : d.w;
+    var vh = land ? d.w : d.h;
+    var w = shell.offsetWidth;
+    var h = shell.offsetHeight;
+    var k = actual ? 1 : Math.min(1, (host.clientWidth - 40) / w, (host.clientHeight - 40) / h);
+
+    if (k < 1) {
+      shell.style.transform = 'scale(' + k.toFixed(4) + ')';
+      shell.style.marginBottom = -(h * (1 - k)) + 'px';
+      shell.style.marginRight = -(w * (1 - k)) + 'px';
+    }
+    sizeLabel.textContent = vw + ' × ' + vh +
+      (k < 1 ? '  ·  ' + Math.round(k * 100) + '%' : '  ·  1:1');
+  }
+
+  window.addEventListener('resize', fit);
+  window.addEventListener('at:relayout', fit);
+
+  /* The host's state changed. Tell the frame; do NOT rebuild it.
+     Rebuilding from srcdoc re-parses the whole document, which throws away the frame's
+     scroll position, anything typed into it, and any state the prototype itself holds —
+     on an action that happens a hundred times a session. The frame is same-origin, runs
+     this same rail.js, and knows how to apply a round, a variant and an axis in place. */
+  function syncFrame() {
+    if (!frame || !frame.contentWindow) return;
+    var axes = {};
+    try { axes = JSON.parse(root.getAttribute('data-at-axis-state') || '{}'); } catch (e) {}
+    frame.contentWindow.postMessage({
+      at: 'sync',
+      round: root.getAttribute('data-at-round'),
+      variantIndex: root.getAttribute('data-at-variant-index'),
+      axes: axes
+    }, '*');
+  }
+  window.addEventListener('at:variant', syncFrame);
+  window.addEventListener('at:axis', syncFrame);
+
+  /* `d` steps the frame, `D` steps back. Same guard as the rail's own keys: a prototype's
+     inputs are real, so typing in one never moves the device. */
+  document.addEventListener('keydown', function (e) {
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'd') stepDevice(1);
+    else if (e.key === 'D') stepDevice(-1);
+  });
+
+  var params = new URLSearchParams(location.search);
+  actual = params.get('zoom') === '1';
+  var want = params.get('d') || '';
+  var wantLandscape = /-landscape$/.test(want);
+  var wantName = want.replace(/-landscape$/, '');
+  var wantIndex = names.indexOf(wantName);
+  if (wantIndex > 0) {
+    landscape = wantLandscape && CATALOG[wantName].rotates;
+    select(wantIndex);
+  } else {
+    paintControls();
+  }
+})();
+</script>
+</body>
+</html>
