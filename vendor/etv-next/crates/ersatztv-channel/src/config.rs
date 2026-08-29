@@ -39,6 +39,9 @@ pub struct ChannelConfig {
 
     #[serde(skip)]
     number: String,
+
+    #[serde(skip)]
+    name: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -521,6 +524,7 @@ impl ChannelConfig {
         sources: &[PathBuf],
         output_folder: &PathBuf,
         number: &str,
+        name: &str,
     ) -> Result<ChannelConfig, ChannelError> {
         let stdin_count = sources
             .iter()
@@ -569,12 +573,17 @@ impl ChannelConfig {
         let mut channel_config: ChannelConfig = serde_json::from_value(config_value)
             .map_err(|e| ChannelError::ChannelConfigFailure(e.to_string()))?;
 
-        channel_config.finalize(output_folder, number)?;
+        channel_config.finalize(output_folder, number, name)?;
 
         Ok(channel_config)
     }
 
-    fn finalize(&mut self, output_folder: &PathBuf, number: &str) -> Result<(), ChannelError> {
+    fn finalize(
+        &mut self,
+        output_folder: &PathBuf,
+        number: &str,
+        name: &str,
+    ) -> Result<(), ChannelError> {
         if self.normalization.video.format.is_some() && self.normalization.video.bit_depth.is_none()
         {
             return Err(ChannelError::ChannelConfigFailure(String::from(
@@ -589,6 +598,7 @@ impl ChannelConfig {
             expand_tilde(output_folder).ok_or(ChannelError::ChannelConfigExpandOutputFolder)?;
 
         self.number = number.to_owned();
+        self.name = name.to_owned();
 
         Ok(())
     }
@@ -603,6 +613,10 @@ impl ChannelConfig {
 
     pub fn number(&self) -> &str {
         &self.number
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 

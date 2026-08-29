@@ -784,6 +784,7 @@ dependencies = [
  "env_logger",
  "ersatztv-core",
  "ersatztv-playout",
+ "etv-overlay",
  "ffpipeline",
  "futures-core",
  "libc",

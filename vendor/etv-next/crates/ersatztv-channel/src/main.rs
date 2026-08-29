@@ -36,6 +36,9 @@ enum Commands {
         output_folder: PathBuf,
         #[arg(short, long)]
         number: String,
+        /// Display name shown on the error card when an item fails
+        #[arg(long, default_value = "")]
+        name: String,
         #[arg(short, long)]
         troubleshoot: bool,
     },
@@ -79,10 +82,11 @@ async fn run() -> Result<(), ChannelError> {
             config_paths,
             output_folder,
             number,
+            name,
             troubleshoot,
         } => {
             let channel_config =
-                ChannelConfig::from_sources(&config_paths, &output_folder, &number).await?;
+                ChannelConfig::from_sources(&config_paths, &output_folder, &number, &name).await?;
 
             // start channel session
             let mut channel_session = ChannelSession::new(channel_config).await?;
@@ -90,7 +94,8 @@ async fn run() -> Result<(), ChannelError> {
         }
         Commands::Debug { config_paths } => {
             let channel_config =
-                ChannelConfig::from_sources(&config_paths, &std::env::temp_dir(), "debug").await?;
+                ChannelConfig::from_sources(&config_paths, &std::env::temp_dir(), "debug", "debug")
+                    .await?;
 
             log::debug!("{:?}", channel_config);
 

@@ -47,6 +47,8 @@ impl ChannelSession {
             .arg(channel.output_folder())
             .arg("--number")
             .arg(channel.number())
+            .arg("--name")
+            .arg(channel.name())
             .arg(channel.config_path())
             .args(channel.overlay_paths())
             .spawn()

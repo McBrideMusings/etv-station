@@ -512,8 +512,15 @@ impl ChannelSession {
             }
             Err(e) if troubleshoot => return Err(e),
             Err(e) => {
-                log::error!("item failed, replacing with black/silence: {e}");
-                let fake_item = self.fake_playout_item(Some(current_item.finish));
+                let item_title = current_item
+                    .program
+                    .as_ref()
+                    .and_then(|p| p.title.as_deref())
+                    .unwrap_or("(untitled)");
+                log::error!("item '{item_title}' failed, replacing with an error card: {e}");
+                let fake_item = self
+                    .error_card_playout_item(Some(current_item.finish), item_title, &e.to_string())
+                    .await;
                 self.transcode_item(&fake_item, initial_burst, troubleshoot, pts_duration)
                     .await?
             }
@@ -1245,6 +1252,80 @@ impl ChannelSession {
         }
     }
 
+    /// Build the fallback item shown in place of `current_item` when it
+    /// failed: a rendered card naming the channel, the item, and the ffmpeg
+    /// error, instead of silent black/silence (#386). Rendering runs on a
+    /// blocking thread since it waits on a GPU readback; any failure there —
+    /// including the zero-frame rawvideo defect tracked separately as
+    /// #384, which this does not fix — falls back to the plain
+    /// [`fake_playout_item`](Self::fake_playout_item) so a broken card
+    /// renderer never takes the whole channel down with it.
+    async fn error_card_playout_item(
+        &self,
+        next_start: Option<OffsetDateTime>,
+        item_title: &str,
+        error_text: &str,
+    ) -> PlayoutItem {
+        let width = self
+            .channel_config
+            .normalization
+            .video
+            .width
+            .unwrap_or(1920);
+
+        let height = self
+            .channel_config
+            .normalization
+            .video
+            .height
+            .unwrap_or(1080);
+
+        let channel_label = self.channel_config.name().to_owned();
+        let item_title_owned = item_title.to_owned();
+        let error_text_owned = error_text.to_owned();
+
+        let render_result = tokio::task::spawn_blocking(move || {
+            etv_overlay::render_error_card_png(
+                width,
+                height,
+                &channel_label,
+                &item_title_owned,
+                &error_text_owned,
+            )
+        })
+        .await;
+
+        let png_bytes = match render_result {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                log::warn!("failed to render error card, falling back to black/silence: {e}");
+                return self.fake_playout_item(next_start);
+            }
+            Err(e) => {
+                log::warn!("error card render task panicked, falling back to black/silence: {e}");
+                return self.fake_playout_item(next_start);
+            }
+        };
+
+        let card_path = self
+            .channel_config
+            .expanded_output_folder()
+            .join(".error-card.png");
+
+        if let Err(e) = tokio::fs::write(&card_path, &png_bytes).await {
+            log::warn!("failed to write error card, falling back to black/silence: {e}");
+            return self.fake_playout_item(next_start);
+        }
+
+        build_error_card_item(
+            self.transcoded_until,
+            next_start.unwrap_or(self.transcoded_until + Duration::from_mins(1)),
+            width,
+            height,
+            &card_path,
+        )
+    }
+
     async fn resolve_dynamic_item(
         &self,
         start: &OffsetDateTime,
@@ -1790,6 +1871,71 @@ fn playout_timing_to_pipeline(
     })
 }
 
+/// The `PlayoutItem` [`ChannelSession::error_card_playout_item`] hands to
+/// `transcode_item` once the error card at `card_path` is rendered and
+/// written: a still-image video track pointing at that PNG, paired with the
+/// same silent-audio Lavfi track the black/silence fallback used. Split out
+/// so the item shape is testable without spinning up a `ChannelSession`.
+fn build_error_card_item(
+    start: OffsetDateTime,
+    finish: OffsetDateTime,
+    width: u32,
+    height: u32,
+    card_path: &Path,
+) -> PlayoutItem {
+    let duration = finish - start;
+
+    PlayoutItem {
+        id: uuid::Uuid::new_v4().to_string(),
+        start,
+        finish,
+        source: None,
+        tracks: Some(PlayoutItemTracks {
+            audio: Some(TrackSelection {
+                source: Some(PlayoutItemSource::Lavfi {
+                    params: String::from("anullsrc=channel_layout=stereo:sample_rate=48000"),
+                    probe_hint: Some(ProbeHint {
+                        video: Vec::new(),
+                        audio: vec![AudioHint {
+                            stream_index: 0,
+                            codec: String::from("pcm_s16le"),
+                            channels: 2,
+                        }],
+                        subtitle: Vec::new(),
+                        format_name: Some(String::from("mpegts")),
+                        duration_ms: Some(duration.whole_milliseconds() as u64),
+                    }),
+                }),
+                stream_index: None,
+            }),
+            video: Some(TrackSelection {
+                source: Some(PlayoutItemSource::Local {
+                    path: card_path.to_string_lossy().into_owned(),
+                    in_point_ms: None,
+                    out_point_ms: None,
+                    probe_hint: Some(ProbeHint {
+                        video: vec![VideoHint::new(
+                            String::from("png"),
+                            width,
+                            height,
+                            String::from("yuv420p"),
+                        )],
+                        audio: Vec::new(),
+                        subtitle: Vec::new(),
+                        format_name: Some(String::from("mpegts")),
+                        duration_ms: Some(duration.whole_milliseconds() as u64),
+                    }),
+                }),
+                stream_index: None,
+            }),
+            subtitle: None,
+        }),
+        watermark: None,
+        program: None,
+        metadata: None,
+    }
+}
+
 fn source_is_live(source: &PlayoutItemSource) -> bool {
     matches!(
         source,
@@ -2102,6 +2248,80 @@ mod source_tests {
         assert_eq!(
             path_of(ChannelSession::resolve_source(&bare, |t| t.video.as_ref())).as_deref(),
             Some(MOVIE)
+        );
+    }
+}
+
+/// #386: a failed item must be replaced with a rendered card naming the
+/// failure, not the old `color=c=black` + `anullsrc` fallback that looked
+/// identical to dead air.
+#[cfg(test)]
+mod error_card_tests {
+    use super::*;
+
+    /// `build_error_card_item` is what `transcode_item` actually plays once
+    /// an item fails — asserting its shape is asserting what the viewer sees.
+    /// It must point at the rendered card file, never back at the plain
+    /// black/silence Lavfi source this replaces.
+    #[test]
+    fn a_failed_item_plays_the_rendered_card_not_black() {
+        let start = OffsetDateTime::parse(
+            "2026-08-28T17:10:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let finish = start + time::Duration::minutes(1);
+        let card_path = Path::new("/tmp/etv-test/.error-card.png");
+
+        let item = build_error_card_item(start, finish, 1920, 1080, card_path);
+
+        let video_source = item
+            .tracks
+            .as_ref()
+            .and_then(|t| t.video.as_ref())
+            .and_then(|v| v.source.as_ref())
+            .expect("video track must have a source");
+
+        match video_source {
+            PlayoutItemSource::Local {
+                path, probe_hint, ..
+            } => {
+                assert_eq!(path, "/tmp/etv-test/.error-card.png");
+                let hint = probe_hint.as_ref().expect("must carry a probe hint");
+                assert_eq!(hint.video.len(), 1);
+                assert_eq!(hint.video[0].codec, "png");
+                assert_eq!(hint.video[0].width, 1920);
+                assert_eq!(hint.video[0].height, 1080);
+            }
+            other => panic!("expected a Local card source, got {other:?}"),
+        }
+    }
+
+    /// The rendered PNG itself must actually show something — the old
+    /// fallback's failure mode was a frame indistinguishable from dead air,
+    /// so a card that came out uniformly black (or any single flat color)
+    /// would reproduce the exact bug this closes.
+    #[test]
+    fn the_rendered_card_is_not_a_flat_frame() {
+        let png_bytes = etv_overlay::render_error_card_png(
+            640,
+            360,
+            "011-madison",
+            "Kung Fu Hustle (2004)",
+            "stream failed: ffmpeg exited exit status: 234",
+        )
+        .expect("card should render");
+
+        let mut decoder = png::Decoder::new(png_bytes.as_slice());
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = decoder.read_info().expect("valid png");
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).expect("decode frame");
+        buf.truncate(info.buffer_size());
+
+        assert!(
+            buf.chunks_exact(3).any(|p| p != &buf[0..3]),
+            "card must contain more than one flat color — the whole point is that it isn't black"
         );
     }
 }
