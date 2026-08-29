@@ -1,4 +1,5 @@
 pub mod config_carrier;
+pub mod error_card;
 pub mod fifo_writer;
 pub mod overlay_spec;
 pub mod overlay_timeline;
@@ -7,6 +8,7 @@ pub mod program_context;
 pub mod rhai_engine;
 pub mod vello_renderer;
 
+pub use error_card::render_error_card_png;
 pub use overlay_spec::{Geometry, OverlayKind, OverlaySpec, PixelFormat};
 pub use overlay_timeline::{
     OVERLAY_TIMELINE_FILE_NAME, OverlaySpan, OverlayTimeline, OverlayTimelineSource,

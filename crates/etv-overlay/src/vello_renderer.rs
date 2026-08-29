@@ -44,6 +44,7 @@ fn build_text_layout(
     font_family: &str,
     font_size: f32,
     letter_spacing: f32,
+    max_width: Option<f32>,
 ) -> Layout<()> {
     let stack = font_stack(font_family);
     let mut builder = layout_context.ranged_builder(font_context, content, 1.0, true);
@@ -51,7 +52,7 @@ fn build_text_layout(
     builder.push_default(StyleProperty::FontSize(font_size));
     builder.push_default(StyleProperty::LetterSpacing(letter_spacing));
     let mut layout = builder.build(content);
-    layout.break_all_lines(None);
+    layout.break_all_lines(max_width);
     layout.align(Alignment::Start, AlignmentOptions::default());
     layout
 }
@@ -182,12 +183,192 @@ impl VelloRenderer {
         if state.visible {
             self.build_scene(&mut scene, state)?;
         }
+        self.finish_render(&scene)
+    }
 
+    /// Render a full-frame diagnostic card naming a playout item that failed
+    /// to transcode — channel, item title, and the ffmpeg error text — in
+    /// place of the black/silence fallback (etv-station-next#386). Unlike
+    /// [`render_frame`](Self::render_frame), which composites a transparent
+    /// overlay meant to sit on top of program video, this fills the entire
+    /// canvas: it stands in for the program itself.
+    pub fn render_error_card(
+        &mut self,
+        channel_label: &str,
+        item_title: &str,
+        error_text: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut scene = Scene::new();
+
+        let bg = Color::from_rgba8(18, 18, 21, 255);
+        let full = Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
+        scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &full);
+
+        // Sized off height so the same layout reads correctly at 720p and
+        // 1080p rather than clipping or floating in a corner.
+        let unit = self.height as f64 / 1080.0;
+        let margin = 80.0 * unit;
+        let content_width = (self.width as f64 - margin * 2.0) as f32;
+        let mut y = margin;
+
+        let channel_label = if channel_label.is_empty() {
+            String::from("CHANNEL")
+        } else {
+            format!("CHANNEL {}", channel_label.to_uppercase())
+        };
+        y += self.draw_left_text(
+            &mut scene,
+            &channel_label,
+            (26.0 * unit) as f32,
+            3.0,
+            [255, 140, 105, 255],
+            margin,
+            y,
+            None,
+            None,
+        );
+        y += 30.0 * unit;
+
+        let title = if item_title.trim().is_empty() {
+            "(untitled)"
+        } else {
+            item_title
+        };
+        y += self.draw_left_text(
+            &mut scene,
+            title,
+            (52.0 * unit) as f32,
+            0.0,
+            [240, 240, 242, 255],
+            margin,
+            y,
+            Some(content_width),
+            Some(2),
+        );
+        y += 44.0 * unit;
+
+        let rule_height = (2.0 * unit).max(1.0);
+        let rule = Rect::new(margin, y, self.width as f64 - margin, y + rule_height);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(80, 48, 46, 255),
+            None,
+            &rule,
+        );
+        y += rule_height + 36.0 * unit;
+
+        y += self.draw_left_text(
+            &mut scene,
+            "PLAYBACK ERROR",
+            (22.0 * unit) as f32,
+            3.0,
+            [255, 99, 71, 255],
+            margin,
+            y,
+            None,
+            None,
+        );
+        y += 18.0 * unit;
+
+        // Bounds the render cost of a single failed item: at ~6 chars per
+        // rendered pixel of width, this comfortably covers the max_lines below
+        // for any channel resolution this project supports, so truncation
+        // almost never visibly bites before the line-count clamp does.
+        const ERROR_CHAR_BUDGET: usize = 600;
+        let error_text = if error_text.chars().count() > ERROR_CHAR_BUDGET {
+            let mut truncated: String = error_text.chars().take(ERROR_CHAR_BUDGET).collect();
+            truncated.push('…');
+            truncated
+        } else {
+            error_text.to_string()
+        };
+        self.draw_left_text(
+            &mut scene,
+            &error_text,
+            (28.0 * unit) as f32,
+            0.0,
+            [190, 190, 196, 255],
+            margin,
+            y,
+            Some(content_width),
+            Some(6),
+        );
+
+        self.finish_render(&scene)
+    }
+
+    /// Left-aligned text at an explicit origin, optionally wrapped to
+    /// `max_width` and clamped to `max_lines` — dropping any further lines
+    /// rather than letting them run off the card. Returns the height actually
+    /// drawn so callers can stack blocks with a running cursor.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_left_text(
+        &mut self,
+        scene: &mut Scene,
+        content: &str,
+        font_size: f32,
+        letter_spacing: f32,
+        color: [u8; 4],
+        x0: f64,
+        y0: f64,
+        max_width: Option<f32>,
+        max_lines: Option<usize>,
+    ) -> f64 {
+        if content.is_empty() {
+            return 0.0;
+        }
+        let layout = build_text_layout(
+            &mut self.font_context,
+            &mut self.layout_context,
+            content,
+            FALLBACK_FONT_FAMILY,
+            font_size,
+            letter_spacing,
+            max_width,
+        );
+
+        let brush = Color::from_rgba8(color[0], color[1], color[2], color[3]);
+        let lines: Vec<_> = layout.lines().collect();
+        let take_n = max_lines.unwrap_or(lines.len());
+        let mut drawn_height = 0.0f64;
+        for line in lines.iter().take(take_n) {
+            drawn_height += line.metrics().line_height as f64;
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let run = glyph_run.run();
+                let run_font_size = run.font_size();
+                let glyphs: Vec<Glyph> = glyph_run
+                    .positioned_glyphs()
+                    .map(|g| Glyph {
+                        id: g.id,
+                        x: g.x,
+                        y: g.y,
+                    })
+                    .collect();
+                if glyphs.is_empty() {
+                    continue;
+                }
+                scene
+                    .draw_glyphs(run.font())
+                    .font_size(run_font_size)
+                    .brush(brush)
+                    .transform(Affine::translate((x0, y0)))
+                    .draw(Fill::NonZero, glyphs.into_iter());
+            }
+        }
+
+        drawn_height
+    }
+
+    fn finish_render(&mut self, scene: &Scene) -> anyhow::Result<Vec<u8>> {
         self.renderer
             .render_to_texture(
                 &self.device,
                 &self.queue,
-                &scene,
+                scene,
                 &self.target_view,
                 &RenderParams {
                     base_color: Color::TRANSPARENT,
@@ -369,6 +550,7 @@ impl VelloRenderer {
             font_family,
             font_size,
             letter_spacing,
+            None,
         );
 
         let text_w = layout.width() as f64;
@@ -679,6 +861,7 @@ mod tests {
             "NoSuchFontFamilyExists12345",
             32.0,
             0.0,
+            None,
         );
 
         let mut total_glyphs = 0usize;
