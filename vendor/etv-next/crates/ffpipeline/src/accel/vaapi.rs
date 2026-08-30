@@ -105,6 +105,17 @@ impl HwAccel for Vaapi {
             VideoFilter::ToneMap(ToneMapFilter {
                 output_format: format,
                 ..
+            }) if ffmpeg_info.has_video_filter(&KnownVideoFilter::LibPlacebo) => {
+                TonemapLibplacebo {
+                    algorithm: filter_options.libplacebo.tonemapping.clone(),
+                    output_format: self.output_format(format),
+                }
+                .into()
+            }
+
+            VideoFilter::ToneMap(ToneMapFilter {
+                output_format: format,
+                ..
             }) => {
                 let tonemap_output_format = self.output_format(format);
                 let can_vaapi_tonemap = match (&current_state.pixel_format, tonemap_output_format) {
@@ -468,6 +479,59 @@ impl VideoFilterOp for TonemapVaapi {
     }
 }
 
+/// HDR -> SDR tone map on the VAAPI path, run by libplacebo.
+///
+/// `tonemap_vaapi` returns -22 at filter init on any HDR10 source whose stream
+/// carries no mastering-display side data ("No mastering display data from
+/// input"), which kills the channel before a single frame. That is a property
+/// of the file, not of the hardware, so no capability probe can predict it —
+/// which is why libplacebo is taken whenever the build has it rather than kept
+/// as a fallback. libplacebo also has the better curve.
+///
+/// It runs on system frames, not on a VAAPI surface. Zero-copy VAAPI -> Vulkan
+/// is not available on Intel: ANV cannot import a multi-plane dmabuf as a
+/// Vulkan image with a DRM format modifier, so `hwmap=derive_device=vulkan`
+/// hands libplacebo an image it fails to wrap (`VK_ERROR_OUT_OF_DEVICE_MEMORY`
+/// out of `pl_map_avframe`) on the first frame. Measured on an Intel UHD 770,
+/// 60s of 1280x536 output with the overlay compositing: 0.049 CPU-seconds per
+/// output second with no tone map at all, 0.133 with this filter. libplacebo
+/// itself still runs as a Vulkan compute shader on the iGPU — what is paid is
+/// the download out of the VAAPI surface.
+///
+/// That download is why [`ToneMapFilter`] is sequenced after [`ScaleFilter`]
+/// (see `Pipeline::new`): it then carries an output-sized frame instead of a
+/// 4K one. Putting it back in front costs 0.461 CPU-seconds per output second
+/// on the same clip — 3.5x this filter — for nine times the pixels.
+#[derive(Debug, Clone)]
+pub struct TonemapLibplacebo {
+    pub(crate) algorithm: Option<String>,
+    pub(crate) output_format: HwPixelFormat,
+}
+
+impl VideoFilterOp for TonemapLibplacebo {
+    fn evaluate(&self, _state: &FrameState, _ffmpeg_info: &FfmpegInfo) -> Option<VideoFilter> {
+        None
+    }
+
+    fn apply_to(&self, state: &mut FrameState) {
+        state.is_hdr = false;
+        state.pixel_format = self.output_format.into();
+        state.surface = FrameSurface::System;
+    }
+
+    fn required_surface(&self) -> Option<FrameSurface> {
+        Some(FrameSurface::System)
+    }
+
+    fn as_arg(&self) -> Option<String> {
+        Some(format!(
+            "libplacebo=tonemapping={}:colorspace=bt709:color_primaries=bt709:color_trc=bt709:format={}",
+            self.algorithm.as_deref().unwrap_or("bt.2390"),
+            self.output_format.as_arg(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VaapiOverlay;
 
@@ -637,6 +701,79 @@ mod tests {
             pixel_format: PixelFormat::Nv12,
             is_hdr: false,
         }
+    }
+
+    /// `tonemap_vaapi` returns -22 at filter init on an HDR10 source carrying no
+    /// mastering-display side data, which takes the channel down for the length
+    /// of the item. Nothing the capability probe can see predicts that — it is a
+    /// property of the file — so libplacebo wins outright wherever the build has
+    /// it, rather than sitting behind a VAAPI attempt that may not fail until a
+    /// viewer is already watching.
+    #[test]
+    fn hdr_tonemap_prefers_libplacebo_over_tonemap_vaapi() {
+        let vaapi = make_vaapi();
+        let ffmpeg_info =
+            make_ffmpeg_info(&[KnownVideoFilter::LibPlacebo, KnownVideoFilter::TonemapVaapi]);
+        let state = FrameState {
+            pixel_format: PixelFormat::P010le,
+            is_hdr: true,
+            ..make_frame_state()
+        };
+
+        let result = vaapi.best_filter(
+            &ToneMapFilter {
+                algorithm: None,
+                output_format: PixelFormat::Yuv420p,
+            }
+            .into(),
+            &ffmpeg_info,
+            &state,
+            &VideoFilterOptions::default(),
+        );
+
+        let arg = result.as_arg().expect("tone map filter should emit an arg");
+        assert!(
+            arg.starts_with("libplacebo="),
+            "expected libplacebo, got {arg}"
+        );
+        assert!(
+            arg.contains("format=nv12"),
+            "tone map output should be 8-bit nv12 for an 8-bit encode; got {arg}"
+        );
+    }
+
+    /// With no libplacebo in the build there is nothing better to take, so the
+    /// VAAPI tone mapper stays reachable.
+    #[test]
+    fn hdr_tonemap_falls_back_to_tonemap_vaapi_without_libplacebo() {
+        let mut vaapi = make_vaapi();
+        vaapi
+            .capabilities
+            .can_hdr_to_sdr_tonemap
+            .insert(libva_sys::VA_FOURCC_P010);
+        let ffmpeg_info = make_ffmpeg_info(&[KnownVideoFilter::TonemapVaapi]);
+        let state = FrameState {
+            pixel_format: PixelFormat::P010le,
+            is_hdr: true,
+            ..make_frame_state()
+        };
+
+        let result = vaapi.best_filter(
+            &ToneMapFilter {
+                algorithm: None,
+                output_format: PixelFormat::Yuv420p,
+            }
+            .into(),
+            &ffmpeg_info,
+            &state,
+            &VideoFilterOptions::default(),
+        );
+
+        assert!(
+            matches!(result, VideoFilter::TonemapVaapi(_)),
+            "expected TonemapVaapi, got {:?}",
+            result.as_arg()
+        );
     }
 
     #[test]
