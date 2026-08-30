@@ -160,10 +160,17 @@ COPY --chmod=755 tools/ffmpeg-probe.sh /usr/local/bin/ffmpeg-probe.sh
 
 # Config lives on a bind mount; the playout folders and the HLS working set are
 # written under /data so a restart resumes from what the daemon already emitted.
-RUN mkdir -p /config /data \
-    && chown etv:etv /config /data
+# /data/cache is the Vulkan and libplacebo shader cache. HDR items tone map
+# through libplacebo, which compiles its shaders on first use and caches them
+# under $XDG_CACHE_HOME; unset, that resolves to the home directory of whichever
+# uid the container was told to run as, which on this deploy is not writable
+# ("Failed to create /root/.cache for shader cache"). Every ffmpeg spawn then
+# recompiles. It is on /data so it survives a container recreate.
+RUN mkdir -p /config /data /data/cache \
+    && chown etv:etv /config /data /data/cache
 
-ENV ETV_STATION_CONFIG=/config/station.yaml \
+ENV XDG_CACHE_HOME=/data/cache \
+    ETV_STATION_CONFIG=/config/station.yaml \
     ETV_NEXT_DIR=/config/etv-next \
     ETV_STATION_OUTPUT_BASE=/data/playout \
     ETV_STATION_CATALOG=/data/catalog.db \
