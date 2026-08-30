@@ -21,6 +21,17 @@ FROM rust:1.93-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 
+# Native build dependencies for the graphics stack pulled in transitively by
+# etv-overlay (vello + wgpu + parley). Shared by the `builder` stage, which
+# compiles etv-station (a dependent of etv-overlay for overlay-spec
+# validation), and the `etv-builder` stage below, which compiles
+# ersatztv-channel (a dependent of etv-overlay for its diagnostic card).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        pkg-config \
+        libfontconfig1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # ---- planner ----
 # Reads the whole workspace (including the ersatztv-playout path dep under
 # vendor/etv-next) and writes recipe.json — the dependency graph, no sources.
@@ -30,17 +41,6 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ---- builder ----
 FROM chef AS builder
-
-# Native build dependencies for the graphics stack pulled in transitively by
-# etv-overlay (vello + wgpu + parley) — etv-station depends on the etv-overlay
-# crate for overlay-spec validation, so this toolchain is required even though
-# the daemon itself renders nothing. Needed by the cook step below, which
-# compiles those dependencies.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake \
-        pkg-config \
-        libfontconfig1-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 # Cook only the dependencies from the recipe. This layer is cached across source
 # changes — only a Cargo.toml/Cargo.lock change busts it, so iterating on the
@@ -70,13 +70,34 @@ RUN cargo build --release --locked -p etv-station -p etv-overlay
 
 # ---- etv-builder ----
 # ErsatzTV-next is its own cargo workspace under vendor/, so it builds on its own
-# here rather than as part of the station workspace above. The layer is keyed on
-# the vendored tree, so it only recompiles when that tree moves.
-# `ersatztv-channel` is built alongside the server because the server looks for
-# it as a sibling executable when it spawns a channel session.
+# here rather than as part of the station workspace above. `ersatztv-channel` is
+# built alongside the server because the server looks for it as a sibling
+# executable when it spawns a channel session.
+#
+# vendor/etv-next/Cargo.toml declares etv-overlay as a path dependency
+# (`../../crates/etv-overlay`, for the diagnostic card ersatztv-channel renders
+# in place of black/silence) — relative to vendor/etv-next/, so it must land at
+# the SAME nesting depth it has in the real repo, two directories up from
+# vendor/etv-next itself. Copying vendor/etv-next straight to /build/etv-next
+# (one level shallower) resolves that path to a location that does not exist.
+#
+# etv-overlay's own Cargo.toml uses `{ workspace = true }` dependencies, which
+# cargo resolves against the nearest ancestor [workspace] — the *root*
+# Cargo.toml, since crates/etv-overlay is a member of that workspace, not of
+# vendor/etv-next's. So the root manifest has to be present too. Cargo does not
+# require the root workspace's other members (crates/etv-station,
+# crates/etv-query-test, vendor/plexdb-reader) to exist for this — only the
+# path actually walked, crates/etv-overlay.
+#
+# This layer is keyed on vendor/etv-next AND crates/etv-overlay: either one is
+# a real build input now (etv-overlay is a dependency of ersatztv-channel), so
+# both are what should bust the cache — ordinary station-side changes outside
+# those two trees still don't.
 FROM chef AS etv-builder
-COPY vendor/etv-next /build/etv-next
-WORKDIR /build/etv-next
+COPY Cargo.toml Cargo.toml
+COPY crates/etv-overlay crates/etv-overlay
+COPY vendor/etv-next vendor/etv-next
+WORKDIR /build/vendor/etv-next
 RUN cargo build --release --locked --bin ersatztv --bin ersatztv-channel
 
 # ---- runtime ----
@@ -143,8 +164,8 @@ RUN groupadd --system --gid 1000 etv \
 # ersatztv-channel next to its own, so all four sit in one directory.
 COPY --from=builder /build/target/release/etv-station /usr/local/bin/etv-station
 COPY --from=builder /build/target/release/etv-overlay /usr/local/bin/etv-overlay
-COPY --from=etv-builder /build/etv-next/target/release/ersatztv /usr/local/bin/ersatztv
-COPY --from=etv-builder /build/etv-next/target/release/ersatztv-channel /usr/local/bin/ersatztv-channel
+COPY --from=etv-builder /build/vendor/etv-next/target/release/ersatztv /usr/local/bin/ersatztv
+COPY --from=etv-builder /build/vendor/etv-next/target/release/ersatztv-channel /usr/local/bin/ersatztv-channel
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py /usr/local/bin/
 COPY --chmod=755 tools/probe-checks.sh tools/soak-probe.sh /usr/local/bin/
