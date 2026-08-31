@@ -914,6 +914,21 @@ station reads none of these keys — it still only enforces the shared
 non-finite-float refusal — so a script adding another key to `detail` needs
 no station change to have it appear.
 
+`detail` also carries a bounded `near_misses` array (#393): the candidates
+that placed above or near a pick and did not air, each `#{ id, score |
+distance, reason }`. The bound is a number the script itself states — a
+tunable with a default, overridable per pool via `config:`, the same
+mechanism `exploration_fraction` and `drift` already use — not a station
+limit, so `near_misses` can never grow a chunk file without bound on a large
+library. The `reason` strings are the script's own vocabulary
+(`taste-cosine.rhai`: "already placed by an earlier slot in this
+generation" or "passed over: this slot drew the seeded exploration coin
+flip"; `endless-distance.rhai`: "inside the band but lost the seeded
+tie-break" or "outside this step's distance band") — the station neither
+supplies nor validates them, the same opaque treatment as the rest of
+`detail`. Naming every rejected candidate remains out of scope; a full
+candidate dump stays `taste-debug`'s job.
+
 #### `hooks()` — what a script says it can do
 
 A plugin declares its hooks and the station wires only the declared ones

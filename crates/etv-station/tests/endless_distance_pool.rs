@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use etv_station::catalog::{Catalog, Entry, Source};
 use etv_station::config::DatastoreGrant;
-use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs, pick};
+use etv_station::score::{pick, GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 
 const PLUGIN: &str = "../../examples/plugins/endless-distance.rhai";
 
@@ -383,4 +383,78 @@ fn a_picks_audit_record_carries_the_distance_it_was_walked_by() {
             p.id
         );
     }
+}
+
+/// #393's acceptance criteria: a step's runners-up get named in the pick's
+/// audit trail, each with a distance and a script-authored reason, bounded
+/// by the script's own `near_miss_limit` tunable, and the winner never names
+/// itself.
+#[test]
+fn a_picks_near_misses_name_the_steps_runners_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("taste.db");
+    write_fixture(
+        &db,
+        &[
+            ("anchor", &["k1", "k2"]),
+            // Three in-band ties (dist 0.5 from anchor) — one wins the
+            // seeded tie-break, the other two must be named as runners-up.
+            ("in-1", &["k1", "k3"]),
+            ("in-2", &["k1", "k4"]),
+            ("in-3", &["k1", "k5"]),
+            // Out-of-band: shares only k1, closer than the 0.3 floor.
+            ("close", &["k1"]),
+        ],
+    );
+    let cat = catalog(&["anchor", "in-1", "in-2", "in-3", "close"], None);
+
+    let config = serde_json::json!({
+        "min_distance": 0.3,
+        "max_distance": 0.7,
+        "drift": 0.0,
+    });
+    let picked = run_full(&cat, &db, vec!["anchor".to_string()], 1, 0, Some(config));
+    assert!(!picked.is_empty());
+
+    let mut saw_non_empty = false;
+    for p in &picked {
+        let meta = p.metadata.as_ref().unwrap();
+        let near_misses = meta["audit"][0]["detail"]["near_misses"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: near_misses must be an array", p.id));
+        assert!(
+            near_misses.len() <= 3,
+            "{}: near_misses exceeded the script's default bound of 3, got {}",
+            p.id,
+            near_misses.len()
+        );
+        for nm in near_misses {
+            assert_ne!(
+                nm["id"].as_str(),
+                Some(p.id.as_str()),
+                "{}: a pick must never name itself as its own near miss",
+                p.id
+            );
+            assert!(
+                nm["distance"].as_f64().is_some(),
+                "{}: near_miss distance must be numeric",
+                p.id
+            );
+            let reason = nm["reason"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{}: near_miss reason must be a string", p.id));
+            assert!(
+                !reason.is_empty(),
+                "{}: near_miss reason must not be empty",
+                p.id
+            );
+        }
+        if !near_misses.is_empty() {
+            saw_non_empty = true;
+        }
+    }
+    assert!(
+        saw_non_empty,
+        "expected at least one pick to name a runner-up: {picked:?}"
+    );
 }

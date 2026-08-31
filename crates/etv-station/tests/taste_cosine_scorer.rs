@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
 use etv_station::config::DatastoreGrant;
 use etv_station::score::{
-    Capability, GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs, declared_capabilities,
-    declared_hooks, pick,
+    declared_capabilities, declared_hooks, pick, Capability, GrantedCapabilities, PickedItem,
+    ScoreCache, ScoreInputs,
 };
 
 fn plugin_path() -> PathBuf {
@@ -597,6 +597,145 @@ fn a_picks_audit_record_carries_score_rank_candidate_count_and_draw_kind() {
         saw_exploration,
         "expected at least one exploration pick in the run"
     );
+}
+
+/// #393's acceptance criteria: a pick's audit `detail.near_misses` names the
+/// candidates that ranked immediately above it, each with a score and a
+/// script-authored reason, bounded regardless of how large the candidate set
+/// is.
+#[test]
+fn a_picks_near_misses_name_the_candidates_ranked_above_it() {
+    let scorer = large_scorer(400, 100);
+    let picked = scorer.pick("movies", 42, 490, Some(0.2));
+
+    for p in &picked {
+        let detail = detail_of(p);
+        let rank = detail["rank"].as_i64().unwrap();
+        let own_score = detail["score"].as_f64().unwrap();
+        let near_misses = detail["near_misses"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: near_misses must be an array", p.id));
+
+        let expected = std::cmp::min(3, (rank - 1) as usize);
+        assert!(
+            near_misses.len() <= 3,
+            "{}: near_misses exceeded the script's stated bound of 3, got {}",
+            p.id,
+            near_misses.len()
+        );
+        assert_eq!(
+            near_misses.len(),
+            expected,
+            "{}: expected {expected} near misses at rank {rank} (500-candidate set), got {}",
+            p.id,
+            near_misses.len()
+        );
+
+        for nm in near_misses {
+            let nm_score = nm["score"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{}: near_miss score must be numeric", p.id));
+            assert!(
+                nm_score >= own_score,
+                "{}: a named near miss must have ranked at or above this pick: {nm_score} < {own_score}",
+                p.id
+            );
+            let reason = nm["reason"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{}: near_miss reason must be a string", p.id));
+            assert!(
+                !reason.is_empty(),
+                "{}: near_miss reason must not be empty",
+                p.id
+            );
+            assert!(
+                nm["id"].as_str().is_some(),
+                "{}: near_miss must carry an id",
+                p.id
+            );
+        }
+    }
+}
+
+/// #393's acceptance criterion: the near-miss list must not blow the
+/// audit-trail byte budget the design was costed against (ADR 0011) — the
+/// budget is 400-800 bytes on an item measuring ~2.7KB before this work, so
+/// growth here must also stay under a third of that. Measured directly on
+/// one item's `metadata`, with and without the `near_misses` key, and both
+/// numbers are printed so the number actually reached is on record.
+#[test]
+fn near_misses_stay_inside_the_audit_byte_budget() {
+    let scorer = large_scorer(400, 100);
+    let picked = scorer.pick("movies", 42, 490, Some(0.2));
+
+    // The worst case for byte growth is a pick with the full 3-entry list —
+    // any rank comfortably above 3 has one, by the previous test.
+    let p = picked
+        .iter()
+        .find(|p| detail_of(p)["near_misses"].as_array().unwrap().len() == 3)
+        .expect("expected at least one pick with a full 3-entry near-miss list");
+
+    let with_near_misses = serde_json::to_string(p.metadata.as_ref().unwrap()).unwrap();
+
+    let mut stripped = p.metadata.as_ref().unwrap().clone();
+    stripped["audit"][0]["detail"]
+        .as_object_mut()
+        .unwrap()
+        .remove("near_misses");
+    let without_near_misses = serde_json::to_string(&stripped).unwrap();
+
+    let grown = with_near_misses.len() - without_near_misses.len();
+    println!(
+        "taste-cosine near_misses byte growth: {grown} bytes ({} -> {} bytes for one item's metadata)",
+        without_near_misses.len(),
+        with_near_misses.len()
+    );
+    assert!(
+        grown > 0,
+        "near_misses must add some bytes to the record, got {grown}"
+    );
+    assert!(
+        grown <= 800,
+        "near_misses grew the record by {grown} bytes, exceeding ADR 0011's 800-byte audit budget"
+    );
+    assert!(
+        grown < 2700 / 3,
+        "near_misses grew the record by {grown} bytes, exceeding a third of a ~2.7KB item"
+    );
+}
+
+/// The near-miss bound is the script's own tunable (#393), not a fixed
+/// station constant — overriding it via the pool's `config:` changes how many
+/// candidates get named, the same way `exploration_fraction` already does.
+#[test]
+fn near_miss_limit_is_overridable_via_pool_config() {
+    let scorer = large_scorer(400, 100);
+    let inputs = ScoreInputs {
+        target_count: 490,
+        ..Default::default()
+    };
+    let config = serde_json::json!({ "exploration_fraction": 0.0, "near_miss_limit": 1 });
+    let picked = pick(
+        &scorer.cache,
+        &scorer.script,
+        None,
+        &inputs,
+        42,
+        "movies",
+        Some(&config),
+        grant(&scorer.db),
+    )
+    .unwrap();
+
+    for p in &picked {
+        let near_misses = detail_of(p)["near_misses"].as_array().unwrap();
+        assert!(
+            near_misses.len() <= 1,
+            "{}: near_miss_limit: 1 must cap the list at 1, got {}",
+            p.id,
+            near_misses.len()
+        );
+    }
 }
 
 /// A store for #294's regression case: one played title ("seed") defines

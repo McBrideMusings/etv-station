@@ -61,6 +61,13 @@ fn tunable(ctx, key, fallback) {
 // so it reproduces, which lands ~1 slot in 5 off-profile at the default.
 fn exploration_fraction(ctx) { tunable(ctx, "exploration_fraction", 0.2).to_float() }
 
+// How many candidates ranked immediately above a pick get named in that
+// pick's audit trail as near misses (#393). Bounded by the script, not the
+// station — overridable per pool via `config:` like every other tunable
+// here. A full candidate dump stays taste-debug's job; this is just enough
+// to answer "what did this beat" without growing the chunk file per item.
+fn near_miss_limit(ctx) { tunable(ctx, "near_miss_limit", 3).to_int() }
+
 // The datastore grant name this script reaches for (#181). A channel names
 // its own grant under the pool's `datastores:`; this is this script's half
 // of that contract.
@@ -318,6 +325,28 @@ fn pick(ctx) {
             break;
         }
         used[row.id] = true;
+        // The candidates ranked immediately above this pick, captured right
+        // now — while `used` reflects exactly what has aired so far in this
+        // generation, and before anything copies or truncates `scored`
+        // (#392's carried hazard). Capturing this later, e.g. by re-walking
+        // `scored` inside audit(), would read `used` as it looks at the END
+        // of the generation and mislabel a candidate that airs in a later
+        // slot as "already placed" here. Bounded by construction: the walk
+        // stops at near_miss_limit(ctx) entries, so nothing library-sized is
+        // ever built and then thrown away (#393).
+        let near_misses = [];
+        let nm_idx = row.rank - 2;
+        let nm_limit = near_miss_limit(ctx);
+        while nm_idx >= 0 && near_misses.len < nm_limit {
+            let cand = scored[nm_idx];
+            let reason = if used[cand.id] != () {
+                "already placed by an earlier slot in this generation"
+            } else {
+                "passed over: this slot drew the seeded exploration coin flip"
+            };
+            near_misses.push(#{ id: cand.id, score: cand.score, reason: reason });
+            nm_idx -= 1;
+        }
         // The score, the specific on-profile keywords behind it, and
         // whether this slot came from the ranking or the seeded surprise
         // draw travel along as `metadata` (#166) so a pick can be explained
@@ -332,11 +361,13 @@ fn pick(ctx) {
         // its position in the full ranked candidate set, and whether this
         // slot drew it by rank or by the seeded exploration draw. Keyed by
         // entry_id so audit() — handed the raw picks array, not this row —
-        // can look each one up.
+        // can look each one up. `near_misses` is #393: the bounded list
+        // captured above.
         ws_rows[row.id] = #{
             score: row.score,
             rank: row.rank,
             draw: if source == "explore" { "exploration" } else { "ranked" },
+            near_misses: near_misses,
         };
     }
 
@@ -349,8 +380,9 @@ fn pick(ctx) {
 // rank, candidate-set size, and draw kind pick() already computed for each
 // pick — an exploration draw is a deliberate product state this channel is
 // FOR, not a fallback, so it gets its own verdict rather than reading like a
-// low-ranked accident. Naming a rejected candidate is #393, out of scope
-// here.
+// low-ranked accident. Also reports the bounded near-miss list pick()
+// captured for each pick (#393) — the candidates ranked immediately above it
+// and the script's own reason each one did not air.
 fn audit(ctx, picks, workspace) {
     let out = #{};
     for p in picks {
@@ -361,6 +393,7 @@ fn audit(ctx, picks, workspace) {
                 rank: r.rank,
                 candidate_count: workspace.candidate_count,
                 draw: r.draw,
+                near_misses: r.near_misses,
             }
         } else {
             #{}

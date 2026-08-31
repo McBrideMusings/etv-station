@@ -60,6 +60,12 @@ fn max_distance(ctx) { tunable(ctx, "max_distance", 0.70) }
 // jumps instead of getting stuck pinned to the ceiling.
 fn drift(ctx) { tunable(ctx, "drift", 0.02) }
 
+// How many of a step's runners-up get named in that step's pick's audit
+// trail as near misses (#393). Bounded by the script, not the station —
+// overridable per pool via `config:` like every other tunable here. A full
+// candidate dump stays taste-debug's job.
+fn near_miss_limit(ctx) { tunable(ctx, "near_miss_limit", 3).to_int() }
+
 // Which datastore grant this script reaches for — see
 // docs/schema.md "Pool `capabilities` / `datastores`". A fixed name, not a
 // tunable: the channel author names the *location* under `datastores:`, not
@@ -150,6 +156,7 @@ fn pick(ctx) {
     let used = #{};
     used[anchor] = true;
     let ws_rows = #{};
+    let nm_limit = near_miss_limit(ctx);
 
     // Ask for a little more than the generation needs, so a pattern that draws
     // unevenly across pools does not run short.
@@ -197,6 +204,13 @@ fn pick(ctx) {
         let fb_delta = ();
         let fb_dist = 0.0;
 
+        // This step's runners-up (#393), kept ordered by closeness to the
+        // band (smallest delta first) and capped at nm_limit + 1 while the
+        // scan runs — one spare slot, because the eventual winner is
+        // scanned right alongside everything else here and only known once
+        // the loop below finishes; it is dropped once `chosen` is set.
+        let near_misses = [];
+
         for cid in pool_ids {
             let kw = keywords[cid];
             let n = kw.len;
@@ -206,7 +220,8 @@ fn pick(ctx) {
             let cos = if denom <= 0.0 { 0.0 } else { inter.to_float() / denom };
             let dist = 1.0 - cos;
 
-            if dist >= band_min && dist <= band_max {
+            let in_band = dist >= band_min && dist <= band_max;
+            if in_band {
                 // A deterministic, reproducible tie-break among every
                 // in-band match: mixes this generation's seed, the step,
                 // and the candidate's stable position in `candidates` —
@@ -219,6 +234,25 @@ fn pick(ctx) {
                 if fb_id == () || delta < fb_delta {
                     fb_id = cid; fb_delta = delta; fb_dist = dist;
                 }
+            }
+
+            // Record this candidate as a runner-up, regardless of whether
+            // it ends up chosen below — the winner is dropped from the list
+            // once known. In-band candidates sort first (delta 0); the
+            // reason names which branch above this candidate took.
+            let nm_delta = if in_band { 0.0 } else if dist > band_max { dist - band_max } else { band_min - dist };
+            let nm_reason = if in_band {
+                "inside the band but lost the seeded tie-break"
+            } else {
+                "outside this step's distance band"
+            };
+            let ins = near_misses.len;
+            while ins > 0 && near_misses[ins - 1].delta > nm_delta {
+                ins -= 1;
+            }
+            near_misses.insert(ins, #{ id: cid, distance: dist, reason: nm_reason, delta: nm_delta });
+            if near_misses.len > nm_limit + 1 {
+                near_misses.pop();
             }
         }
 
@@ -260,17 +294,32 @@ fn pick(ctx) {
 
         if chosen == () { break; } // every candidate has been used
 
+        // Drop the winner's own id from the runner-up list — it was scanned
+        // like every other candidate above, before the winner was known —
+        // then trim the delta field and the spare slot (#393). The
+        // seeded_jump path never populated `near_misses` at all (nothing was
+        // scanned), so this stays an empty array there — a uniform key
+        // shape rather than a missing one.
+        let chosen_near_misses = [];
+        for nm in near_misses {
+            if nm.id != chosen && chosen_near_misses.len < nm_limit {
+                chosen_near_misses.push(#{ id: nm.id, distance: nm.distance, reason: nm.reason });
+            }
+        }
+
         out.push(#{ entry_id: chosen, metadata: #{ distance: chosen_dist } });
         // What audit() will report for this pick (#392): the distance
         // walked, the band it was walked against, and which of the three
         // selection paths chose it — set here, next to the assignment, not
-        // re-derived afterwards.
+        // re-derived afterwards. `near_misses` is #393: the step's bounded
+        // runner-up list captured above.
         ws_rows[chosen] = #{
             distance: chosen_dist,
             step: step,
             band_min: band_min,
             band_max: band_max,
             draw: chosen_draw,
+            near_misses: chosen_near_misses,
         };
         used[chosen] = true;
         cur = chosen;
@@ -289,7 +338,8 @@ fn pick(ctx) {
 // called once per generation, immediately after pick(), handed back the list
 // pick() returned plus the workspace pick() built above — the distance
 // walked to reach each pick, and the band and selection path behind it.
-// Naming a rejected candidate is #393, out of scope here.
+// Also reports the bounded runner-up list pick() captured for that step
+// (#393) — the candidates that were scanned and did not win it.
 fn audit(ctx, picks, workspace) {
     let out = #{};
     for p in picks {
@@ -301,6 +351,7 @@ fn audit(ctx, picks, workspace) {
                 band_min: r.band_min,
                 band_max: r.band_max,
                 draw: r.draw,
+                near_misses: r.near_misses,
             }
         } else {
             #{}
