@@ -13,9 +13,14 @@
 # in this committed file (deploy/appdata/ itself is gitignored).
 #
 #   ./tools/taste-debug.sh                          # list available channels
+#   ./tools/taste-debug.sh --list                    # same list, one `name<TAB>path` per line
 #   ./tools/taste-debug.sh for-pierce                # explain 002-for-pierce/channel.yaml
 #   ./tools/taste-debug.sh endless --top 10 --extended-target-count 500
 #   ./tools/taste-debug.sh --channel path/to/other.yaml ...   # raw passthrough
+#
+# `--list` is the machine-readable form `admin taste-debug`'s picker reads, so
+# the `plugin:` discovery below stays the only place that decides which channels
+# this tool works on.
 #
 # Neither database exists on a dev Mac; both live on the Unraid host at
 # /mnt/user/appdata/etv-station/data/{catalog.db,plexdb.snapshot.db}. This
@@ -41,25 +46,29 @@ DEFAULT_PLEXDB="$CACHE_DIR/plexdb.snapshot.db"
 # plugin-backed channel. Discovered by grepping for `plugin:` rather than
 # hand-listed, so 001-for-you/ becomes `for-you`, 045-endless/ becomes
 # `endless`, and a future plugin channel needs no edit here.
-plugin_channel_path() {
-  local name="$1" f stem
-  for f in "$CHANNELS_DIR"/*/channel.yaml; do
-    [ -f "$f" ] || continue
-    grep -q "plugin:" "$f" || continue
-    stem="$(basename "$(dirname "$f")" | sed -E 's/^[0-9]+-//')"
-    [ "$stem" = "$name" ] && { echo "$f"; return 0; }
-  done
-  return 1
-}
-
-list_plugin_channels() {
+plugin_channels_tsv() {
   local f stem
   for f in "$CHANNELS_DIR"/*/channel.yaml; do
     [ -f "$f" ] || continue
     grep -q "plugin:" "$f" || continue
     stem="$(basename "$(dirname "$f")" | sed -E 's/^[0-9]+-//')"
-    echo "  $stem  ($f)"
+    printf '%s\t%s\n' "$stem" "$f"
   done
+}
+
+plugin_channel_path() {
+  local name="$1" stem path
+  while IFS=$'\t' read -r stem path; do
+    [ "$stem" = "$name" ] && { echo "$path"; return 0; }
+  done < <(plugin_channels_tsv)
+  return 1
+}
+
+list_plugin_channels() {
+  local stem path
+  while IFS=$'\t' read -r stem path; do
+    echo "  $stem  ($path)"
+  done < <(plugin_channels_tsv)
 }
 
 has_flag() {
@@ -74,6 +83,11 @@ has_flag() {
 # No argument is the list mode, not a usage error: it answers "which channels
 # can I explain?". It exits 0 so `admin taste-debug` doesn't report the answer
 # as a failed step.
+if [ "${1:-}" = "--list" ]; then
+  plugin_channels_tsv
+  exit 0
+fi
+
 if [ "$#" -eq 0 ]; then
   echo "Usage: admin taste-debug <channel> [-- taste-debug flags]"
   echo "       admin taste-debug --channel <path> [flags]   (raw passthrough)"
