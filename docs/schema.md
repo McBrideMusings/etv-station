@@ -863,6 +863,11 @@ above; `workspace` is a value the station holds for the length of one
 generation and hands back, unread, as `audit()`'s third argument. A script
 with nothing to say puts `()` there.
 
+A scorer plugin may carry its working set from `pick()` to `audit()` this
+way, and that value lives for exactly one generation — nothing carries over
+to the next, and `--check-determinism` diffs the resulting audit trail
+alongside the schedule.
+
 #### `audit(ctx, picks, workspace)` — a plugin explains its picks (#389, ADR 0011)
 
 Every scheduled item carries an `audit` array in its `metadata` — one record

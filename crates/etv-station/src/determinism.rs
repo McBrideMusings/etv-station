@@ -1,6 +1,6 @@
 //! Determinism check (#168) — generate a channel twice from identical inputs
-//! and diff the two schedules, so a plugin that breaks reproducible
-//! generation is caught instead of shipping.
+//! and diff the two schedules and their audit trails (#391), so a plugin
+//! that breaks reproducible generation is caught instead of shipping.
 //!
 //! Reproducible generation is a stated property of the system: pin a seed and
 //! the same catalog, config, and resume state produce the same schedule. That
@@ -35,7 +35,8 @@ use crate::score::ScoreInputs;
 /// for an ordinary pool, and it is only a hint a script may ignore.
 const TARGET_COUNT_HINT: usize = 500;
 
-/// Where two generations of the same channel first disagree.
+/// Where two generations of the same channel first disagree — on entry id,
+/// on the audit trail attached to that position, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Difference {
     /// The airing position, zero-indexed, where the two schedules diverge.
@@ -46,6 +47,12 @@ pub struct Difference {
     /// The entry id pass B resolved at `position`, or `None` if pass B's
     /// schedule ended before reaching it.
     pub entry_b: Option<String>,
+    /// Pass A's `metadata.audit` at `position`, canonically serialized, or
+    /// `None` when that item carried no audit trail.
+    pub audit_a: Option<String>,
+    /// Pass B's `metadata.audit` at `position`, canonically serialized, or
+    /// `None` when that item carried no audit trail.
+    pub audit_b: Option<String>,
 }
 
 /// The result of generating one channel twice from identical inputs.
@@ -100,6 +107,18 @@ impl DeterminismReport {
 /// with the same `window_start`, so both inherit the same fixed plugin clock
 /// by construction, same as two real generations at the same `window_start`
 /// would.
+///
+/// The comparison covers each item's audit trail (`metadata.audit`, #389) as
+/// well as its entry id — a plugin can pass on schedule while still
+/// disagreeing on *why* it picked what it picked, and that divergence would
+/// otherwise be silent. `pick()`'s `workspace` (ADR 0013) is exactly the
+/// kind of thing that could leak such a disagreement: it is a value the
+/// station threads from `pick()` to `audit()` inside one generation and
+/// nothing more — there is no storage behind it, unlike
+/// `score::PLUGIN_CLOCK`'s per-generation thread-local — but a script that
+/// built it from something outside the pinned inputs above would still make
+/// the two passes' audit trails disagree, and comparing schedules alone
+/// would miss it.
 ///
 /// # Hook coverage
 ///
@@ -172,10 +191,11 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
     Ok(diff_report(channel_name, &a, &b))
 }
 
-/// One pass: resolve the channel and reduce it to the bare `entry_id`
-/// sequence a diff needs. Takes everything by shared reference so the same
-/// catalog handle, state, and scoring snapshot can be reused for both passes
-/// with no clone and no risk of one pass's call mutating what the other sees.
+/// One pass: resolve the channel and reduce it to the `entry_id` sequence
+/// plus each item's canonically-serialized audit trail — everything a diff
+/// needs. Takes everything by shared reference so the same catalog handle,
+/// state, and scoring snapshot can be reused for both passes with no clone
+/// and no risk of one pass's call mutating what the other sees.
 fn generate_once(
     channel: &LoadedChannel,
     identity_roots: &[String],
@@ -184,7 +204,7 @@ fn generate_once(
     scoring: &ScoreInputs,
     fill: Option<std::time::Duration>,
     window_start: OffsetDateTime,
-) -> Result<Vec<String>, StationError> {
+) -> Result<Vec<(String, Option<String>)>, StationError> {
     let (items, _resume_out) = resolve_channel_with_resume(
         &channel.config,
         &channel.config_path,
@@ -196,23 +216,43 @@ fn generate_once(
         fill,
         window_start,
     )?;
-    Ok(items.into_iter().map(|item| item.id).collect())
+    Ok(items
+        .into_iter()
+        .map(|item| (item.id, audit_trail_json(item.metadata.as_ref())))
+        .collect())
 }
 
-/// The first position (if any) where `a` and `b` disagree — including a
-/// length mismatch, read as one side running out.
-fn diff_report(channel: &str, a: &[String], b: &[String]) -> DeterminismReport {
+/// Pull `metadata.audit` (#389) out of one item's metadata blob, if present,
+/// and serialize it canonically so two passes' trails can be compared as
+/// plain strings. `serde_json::Map` in this tree is a `BTreeMap` (no
+/// `preserve_order` feature), so key order inside each record is already
+/// stable — this only needs to fix the value into one comparable form.
+fn audit_trail_json(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let audit = metadata?.get("audit")?;
+    Some(serde_json::to_string(audit).expect("serde_json::Value always serializes"))
+}
+
+/// The first position (if any) where `a` and `b` disagree — on entry id, on
+/// audit trail, or both — including a length mismatch, read as one side
+/// running out.
+fn diff_report(
+    channel: &str,
+    a: &[(String, Option<String>)],
+    b: &[(String, Option<String>)],
+) -> DeterminismReport {
     let max = a.len().max(b.len());
     let difference = (0..max).find_map(|i| {
-        let entry_a = a.get(i).cloned();
-        let entry_b = b.get(i).cloned();
-        if entry_a == entry_b {
+        let (entry_a, audit_a) = a.get(i).cloned().unzip();
+        let (entry_b, audit_b) = b.get(i).cloned().unzip();
+        if entry_a == entry_b && audit_a == audit_b {
             None
         } else {
             Some(Difference {
                 position: i,
                 entry_a,
                 entry_b,
+                audit_a: audit_a.flatten(),
+                audit_b: audit_b.flatten(),
             })
         }
     });
@@ -666,5 +706,188 @@ fn audit(ctx, picks, workspace) {
             report.is_identical(),
             "a plugin picking from ctx.seed must reproduce across two passes: {report:?}"
         );
+    }
+
+    // ---- a plugin carrying workspace from pick() to audit() (#391, ADR 0013) --
+
+    fn workspace_audit_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-audit.rhai")
+    }
+
+    /// One generation of the workspace-audit fixture, built fresh each call —
+    /// its own `GenerationState`, `ScoreInputs`, and `window_start` — the same
+    /// shape [`check`] gives each of its two passes, so calling this
+    /// repeatedly simulates independent generations rather than one long-lived
+    /// resolve.
+    fn generate_workspace_fixture_once(
+        station: &Station,
+        catalog: Option<&Catalog>,
+    ) -> Vec<(String, Option<String>)> {
+        let channel = &station.channels[0];
+        let fill = Some(window_duration(channel.config.window_days).unsigned_abs());
+        let state = GenerationState::empty();
+        let scoring = ScoreInputs {
+            target_count: TARGET_COUNT_HINT,
+            history: Arc::from(Vec::new()),
+            recent: Vec::new(),
+            now: OffsetDateTime::now_utc().unix_timestamp(),
+            tz: Some(crate::tz::parse(&station.station.tz).unwrap()),
+            account_id: None,
+        };
+        let window_start = OffsetDateTime::now_utc();
+        generate_once(
+            channel,
+            &station.station.identity_roots,
+            catalog,
+            &state,
+            &scoring,
+            fill,
+            window_start,
+        )
+        .unwrap()
+    }
+
+    /// A plugin whose `pick()` builds a real scoring table — not a scalar —
+    /// stashes it in `workspace`, and whose `audit()` derives its records
+    /// purely from that workspace reproduces across two passes exactly like
+    /// any other `pool_provider` (#391, ADR 0013): `workspace` is only ever an
+    /// argument the station threads inside one generation, so it carries no
+    /// extra non-determinism of its own.
+    #[test]
+    fn a_plugin_carrying_a_workspace_to_audit_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["m0", "m1", "m2", "m3", "m4", "m5"];
+        let catalog_path = dir.path().join("catalog.db");
+        catalog_with_movies(&catalog_path, &ids);
+
+        let cfg = base_channel(
+            RuleConfig {
+                blocks: vec![pattern_block(&workspace_audit_fixture(), ids.len())],
+            },
+            None,
+        );
+        let mut station = station_with(
+            "workspace",
+            cfg,
+            Some(catalog_path.to_string_lossy().into_owned()),
+        );
+        let report = check(&mut station, "workspace").unwrap();
+        assert!(
+            report.is_identical(),
+            "a plugin carrying a workspace to audit() must reproduce across two passes: {report:?}"
+        );
+    }
+
+    /// The audit trail the fixture attaches is not a stub: it carries a rank,
+    /// a score, the fixed candidate count, and the list of ids that pick
+    /// outranked — all read back out of `workspace` in `audit()`, never
+    /// re-derived from `ctx`.
+    #[test]
+    fn the_workspace_derived_audit_trail_is_non_trivial() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["m0", "m1", "m2", "m3", "m4", "m5"];
+        let catalog_path = dir.path().join("catalog.db");
+        catalog_with_movies(&catalog_path, &ids);
+
+        let cfg = base_channel(
+            RuleConfig {
+                blocks: vec![pattern_block(&workspace_audit_fixture(), ids.len())],
+            },
+            None,
+        );
+        let station = station_with(
+            "workspace-detail",
+            cfg,
+            Some(catalog_path.to_string_lossy().into_owned()),
+        );
+        let catalog = open_catalog(station.station.catalog_path.as_deref()).unwrap();
+        let items = generate_workspace_fixture_once(&station, catalog.as_ref());
+        assert_eq!(items.len(), ids.len());
+
+        for (_, audit_json) in &items {
+            let audit_json = audit_json
+                .as_ref()
+                .expect("the workspace-audit fixture must attach an audit trail to every item");
+            let audit: serde_json::Value = serde_json::from_str(audit_json).unwrap();
+            let detail = &audit[0]["detail"];
+            assert_eq!(
+                detail["candidates"],
+                serde_json::json!(ids.len()),
+                "workspace.candidates must equal the fixed catalog size: {audit}"
+            );
+            let rank = detail["rank"]
+                .as_u64()
+                .expect("detail.rank must be a number") as usize;
+            let beat = detail["beat"]
+                .as_array()
+                .expect("detail.beat must be an array");
+            assert_eq!(
+                rank + beat.len(),
+                ids.len(),
+                "rank plus the ids this pick outranked must account for the whole table: {audit}"
+            );
+        }
+    }
+
+    /// Four generations in sequence (two `check()` calls, each internally
+    /// running two passes) never let a later generation see an earlier one's
+    /// workspace — there is no storage behind `workspace` for it to leak
+    /// through, unlike `score::PLUGIN_CLOCK`'s per-generation thread-local.
+    /// An accumulating implementation would show up here as a growing
+    /// `candidates`/`beat` or a diverging trail; this fixture's table stays
+    /// pinned to the catalog's fixed size and byte-identical every time.
+    #[test]
+    fn a_second_generation_does_not_observe_the_first_generations_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["m0", "m1", "m2", "m3", "m4", "m5"];
+        let catalog_path = dir.path().join("catalog.db");
+        catalog_with_movies(&catalog_path, &ids);
+
+        let mut cfg = base_channel(
+            RuleConfig {
+                blocks: vec![pattern_block(&workspace_audit_fixture(), ids.len())],
+            },
+            None,
+        );
+        // Pinned so all four generations below share one seed — an unpinned
+        // one would still be workspace-leak-free, but a differing seed would
+        // also (correctly) change the ranking, which would be a second,
+        // unrelated source of divergence muddying what this test checks.
+        cfg.seed = Some(4242);
+        let mut station = station_with(
+            "workspace-leak",
+            cfg,
+            Some(catalog_path.to_string_lossy().into_owned()),
+        );
+        let catalog = open_catalog(station.station.catalog_path.as_deref()).unwrap();
+
+        let mut previous: Option<Vec<(String, Option<String>)>> = None;
+        for _ in 0..2 {
+            let report = check(&mut station, "workspace-leak").unwrap();
+            assert!(
+                report.is_identical(),
+                "a leaked workspace would show up as a schedule or audit divergence within \
+                 one check(): {report:?}"
+            );
+
+            let items = generate_workspace_fixture_once(&station, catalog.as_ref());
+            for (_, audit_json) in &items {
+                let audit_json = audit_json.as_ref().expect("fixture always attaches audit");
+                let audit: serde_json::Value = serde_json::from_str(audit_json).unwrap();
+                assert_eq!(
+                    audit[0]["detail"]["candidates"],
+                    serde_json::json!(ids.len()),
+                    "a workspace accumulating across generations would grow this count: {audit}"
+                );
+            }
+            if let Some(prev) = &previous {
+                assert_eq!(
+                    prev, &items,
+                    "independent generations of the same pinned inputs must produce \
+                     byte-identical audit trails, not merely identical schedules"
+                );
+            }
+            previous = Some(items);
+        }
     }
 }

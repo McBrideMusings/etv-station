@@ -589,6 +589,16 @@ fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
                 report.pass_a_len,
                 report.pass_b_len,
             );
+            if diff.audit_a != diff.audit_b {
+                println!(
+                    "check-determinism: {} — audit trail at position {} also differs: \
+                     pass A = {}, pass B = {}",
+                    report.channel,
+                    diff.position,
+                    diff.audit_a.as_deref().unwrap_or("<no audit trail>"),
+                    diff.audit_b.as_deref().unwrap_or("<no audit trail>"),
+                );
+            }
             ExitCode::from(1)
         }
         Err(err) => {
