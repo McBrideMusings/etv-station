@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use etv_station::catalog::{Catalog, Entry, Source};
 use etv_station::config::DatastoreGrant;
-use etv_station::score::{GrantedCapabilities, ScoreCache, ScoreInputs, pick};
+use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs, pick};
 
 const PLUGIN: &str = "../../examples/plugins/endless-distance.rhai";
 
@@ -88,17 +88,19 @@ fn catalog(movies: &[&str], episode: Option<&str>) -> Catalog {
     cat
 }
 
-/// Runs the plugin once and returns `(entry_id, distance-from-previous)` in
-/// the order `pick()` chose them. `config` is the pool's `config:` bag —
-/// `None` takes the script's own defaults.
-fn run(
+/// Runs the plugin once and returns the full `PickedItem` list, in the order
+/// `pick()` chose them. `config` is the pool's `config:` bag — `None` takes
+/// the script's own defaults. The shared entry point every test below (and
+/// `run` below it) goes through, so none of them can drift apart on how a
+/// generation is set up.
+fn run_full(
     cat: &Catalog,
     db: &Path,
     recent: Vec<String>,
     target_count: usize,
     seed: u64,
     config: Option<serde_json::Value>,
-) -> Vec<(String, f64)> {
+) -> Vec<PickedItem> {
     let script = plugin_path();
     let mut cache = ScoreCache::default();
     cache.prepare(cat, &script, None).unwrap();
@@ -116,7 +118,7 @@ fn run(
         ..Default::default()
     };
 
-    let picked = pick(
+    pick(
         &cache,
         &script,
         None,
@@ -126,9 +128,21 @@ fn run(
         config.as_ref(),
         granted,
     )
-    .expect("pick() must succeed against a fixture with at least one keyworded candidate");
+    .expect("pick() must succeed against a fixture with at least one keyworded candidate")
+}
 
-    picked
+/// Runs the plugin once and returns `(entry_id, distance-from-previous)` in
+/// the order `pick()` chose them — the shape every determinism/walk test
+/// below needs.
+fn run(
+    cat: &Catalog,
+    db: &Path,
+    recent: Vec<String>,
+    target_count: usize,
+    seed: u64,
+    config: Option<serde_json::Value>,
+) -> Vec<(String, f64)> {
+    run_full(cat, db, recent, target_count, seed, config)
         .into_iter()
         .map(|p| {
             let dist = p
@@ -336,4 +350,37 @@ fn episodes_are_never_candidates() {
         "an episode must never be picked, even when it happens to carry \
          keywords: {out:?}"
     );
+}
+
+/// #392's acceptance criterion: each pick's audit record carries the
+/// distance it was walked by, and it must agree with the `distance` the walk
+/// already attaches under `metadata` — the two must never disagree.
+#[test]
+fn a_picks_audit_record_carries_the_distance_it_was_walked_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("taste.db");
+    write_fixture(
+        &db,
+        &[
+            ("m1", &["a", "b", "c"]),
+            ("m2", &["a", "d"]),
+            ("m3", &["b", "e"]),
+            ("m4", &["c", "f"]),
+            ("m5", &["d", "e", "f"]),
+        ],
+    );
+    let cat = catalog(&["m1", "m2", "m3", "m4", "m5"], None);
+
+    let picked = run_full(&cat, &db, Vec::new(), 4, 42, None);
+    assert!(!picked.is_empty());
+    for p in &picked {
+        let meta = p.metadata.as_ref().unwrap();
+        let meta_distance = meta["distance"].as_f64().unwrap();
+        let detail_distance = meta["audit"][0]["detail"]["distance"].as_f64().unwrap();
+        assert_eq!(
+            detail_distance, meta_distance,
+            "{}: audit detail.distance must agree with metadata.distance",
+            p.id
+        );
+    }
 }

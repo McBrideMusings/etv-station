@@ -149,6 +149,7 @@ fn pick(ctx) {
 
     let used = #{};
     used[anchor] = true;
+    let ws_rows = #{};
 
     // Ask for a little more than the generation needs, so a pattern that draws
     // unevenly across pools does not run short.
@@ -223,15 +224,18 @@ fn pick(ctx) {
 
         let chosen = ();
         let chosen_dist = 0.0;
+        let chosen_draw = "";
         if best_id != () {
             chosen = best_id;
             chosen_dist = best_dist;
+            chosen_draw = "in_band";
         } else if fb_id != () {
             // Nothing in this step's band, but something shares a keyword
             // with `cur` — take whichever candidate sits closest to the
             // band rather than stall the walk on a strict miss.
             chosen = fb_id;
             chosen_dist = fb_dist;
+            chosen_draw = "nearest_band_miss";
         } else {
             // `cur` shares no keyword with anything left at all: the local
             // neighbourhood is exhausted. Jump to a fresh, seeded candidate
@@ -247,6 +251,7 @@ fn pick(ctx) {
                 if probe != cur && used[probe] != true {
                     chosen = probe;
                     chosen_dist = 1.0;
+                    chosen_draw = "seeded_jump";
                     break;
                 }
                 i += 1;
@@ -256,6 +261,17 @@ fn pick(ctx) {
         if chosen == () { break; } // every candidate has been used
 
         out.push(#{ entry_id: chosen, metadata: #{ distance: chosen_dist } });
+        // What audit() will report for this pick (#392): the distance
+        // walked, the band it was walked against, and which of the three
+        // selection paths chose it — set here, next to the assignment, not
+        // re-derived afterwards.
+        ws_rows[chosen] = #{
+            distance: chosen_dist,
+            step: step,
+            band_min: band_min,
+            band_max: band_max,
+            draw: chosen_draw,
+        };
         used[chosen] = true;
         cur = chosen;
         cur_kw = keywords[cur];
@@ -266,21 +282,43 @@ fn pick(ctx) {
     if out.len == 0 {
         throw "endless-distance: could not find a candidate within reach of the starting point";
     }
-    #{ picks: out, workspace: () }
+    #{ picks: out, workspace: ws_rows }
 }
 
 // The fifth pool_provider contract function (#389, ADR 0011, ADR 0013):
 // called once per generation, immediately after pick(), handed back the list
-// pick() returned. This is the minimum contract — stage/by/verdict only, no
-// detail — filling detail with the distance is #392, naming a rejection is
-// #393.
+// pick() returned plus the workspace pick() built above — the distance
+// walked to reach each pick, and the band and selection path behind it.
+// Naming a rejected candidate is #393, out of scope here.
 fn audit(ctx, picks, workspace) {
     let out = #{};
     for p in picks {
+        let r = workspace[p.entry_id];
+        let detail = if r != () {
+            #{
+                distance: r.distance,
+                step: r.step,
+                band_min: r.band_min,
+                band_max: r.band_max,
+                draw: r.draw,
+            }
+        } else {
+            #{}
+        };
+        let verdict = if r == () {
+            "walked to the nearest in-band keyword neighbour"
+        } else if r.draw == "in_band" {
+            "walked to a candidate inside the distance band"
+        } else if r.draw == "nearest_band_miss" {
+            "walked to the closest candidate outside the distance band"
+        } else {
+            "jumped to a fresh, seeded candidate after exhausting the local neighbourhood"
+        };
         out[p.entry_id] = #{
             stage: "pool",
             by: "plugin:endless-distance",
-            verdict: "walked to the nearest in-band keyword neighbour",
+            verdict: verdict,
+            detail: detail,
         };
     }
     out

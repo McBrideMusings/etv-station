@@ -244,6 +244,16 @@ fn pick(ctx) {
         else { 0 }
     });
 
+    // Stamp each row's ranked position before anything copies the list —
+    // `explorable` below is built by `.filter()`, which copies rows, so an
+    // exploration draw only knows its own rank if it is already stamped on
+    // when that copy is taken. One inline pass over `scored`, not a second
+    // id -> rank map (#172's rule: no per-candidate helper taking a
+    // library-sized collection by value).
+    for i in 0..scored.len {
+        scored[i].rank = i + 1;
+    }
+
     // The candidates an exploration slot may draw from — only ones the
     // store has at least one `tmdb_keywords` fact for (#254). A title with
     // none is not "on-profile with weight zero"; it is a title this scorer
@@ -266,6 +276,7 @@ fn pick(ctx) {
     let out_len = ctx.target_count + 10;
 
     let out = [];
+    let ws_rows = #{};
     let used = #{};
     let rank_cursor = 0;
     let explore_cursor = 0;
@@ -317,23 +328,53 @@ fn pick(ctx) {
             entry_id: row.id,
             metadata: #{ score: row.score, on_profile_keywords: row.on_profile, source: source },
         });
+        // The numbers audit() will report for this pick (#392): its score,
+        // its position in the full ranked candidate set, and whether this
+        // slot drew it by rank or by the seeded exploration draw. Keyed by
+        // entry_id so audit() — handed the raw picks array, not this row —
+        // can look each one up.
+        ws_rows[row.id] = #{
+            score: row.score,
+            rank: row.rank,
+            draw: if source == "explore" { "exploration" } else { "ranked" },
+        };
     }
 
-    #{ picks: out, workspace: () }
+    #{ picks: out, workspace: #{ rows: ws_rows, candidate_count: scored.len } }
 }
 
 // The fifth pool_provider contract function (#389, ADR 0011, ADR 0013):
 // called once per generation, immediately after pick(), handed back the list
-// pick() returned. This is the minimum contract — stage/by/verdict only, no
-// detail — filling detail with the score and rejected candidates is #392,
-// naming a rejection is #393.
+// pick() returned plus the workspace pick() built above. Reports the score,
+// rank, candidate-set size, and draw kind pick() already computed for each
+// pick — an exploration draw is a deliberate product state this channel is
+// FOR, not a fallback, so it gets its own verdict rather than reading like a
+// low-ranked accident. Naming a rejected candidate is #393, out of scope
+// here.
 fn audit(ctx, picks, workspace) {
     let out = #{};
     for p in picks {
+        let r = workspace.rows[p.entry_id];
+        let detail = if r != () {
+            #{
+                score: r.score,
+                rank: r.rank,
+                candidate_count: workspace.candidate_count,
+                draw: r.draw,
+            }
+        } else {
+            #{}
+        };
+        let verdict = if r != () && r.draw == "exploration" {
+            "drawn off-profile by the exploration slot"
+        } else {
+            "ranked by keyword cosine against pooled taste"
+        };
         out[p.entry_id] = #{
             stage: "pool",
             by: "plugin:taste-cosine",
-            verdict: "ranked by keyword cosine against pooled taste",
+            verdict: verdict,
+            detail: detail,
         };
     }
     out

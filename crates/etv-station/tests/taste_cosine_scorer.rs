@@ -271,6 +271,10 @@ fn large_scorer(n_eligible: usize, n_ineligible: usize) -> Scorer {
     })
 }
 
+fn detail_of(p: &PickedItem) -> &serde_json::Value {
+    &p.metadata.as_ref().unwrap()["audit"][0]["detail"]
+}
+
 fn source_of(p: &PickedItem) -> Option<&str> {
     p.metadata.as_ref()?.get("source")?.as_str()
 }
@@ -541,6 +545,57 @@ fn exploration_fraction_lands_roughly_one_in_five() {
         ratio > 0.10 && ratio < 0.30,
         "expected roughly 1 in 5 slots to come from the explore draw, got {ratio} \
          ({explore_count}/{total})"
+    );
+}
+
+/// #392's acceptance criterion: a pick's audit record carries its score,
+/// rank, the candidate-set size, and its draw kind — and an exploration draw
+/// reads as distinguishable from a ranked one rather than as a low-ranked
+/// accident. A high `exploration_fraction` (the same knob
+/// `exploration_fraction_lands_roughly_one_in_five` uses) guarantees at
+/// least one of each kind lands in the picked set.
+#[test]
+fn a_picks_audit_record_carries_score_rank_candidate_count_and_draw_kind() {
+    let scorer = large_scorer(400, 100);
+    let picked = scorer.pick("movies", 42, 490, Some(0.2));
+
+    let mut saw_ranked = false;
+    let mut saw_exploration = false;
+    for p in &picked {
+        let detail = detail_of(p);
+        let detail_score = detail["score"].as_f64().unwrap();
+        let meta_score = p.metadata.as_ref().unwrap()["score"].as_f64().unwrap();
+        assert_eq!(
+            detail_score, meta_score,
+            "{}: detail.score must agree with metadata.score",
+            p.id
+        );
+        assert!(
+            detail["rank"].as_i64().unwrap() >= 1,
+            "{}: rank must be 1-based",
+            p.id
+        );
+        assert_eq!(
+            detail["candidate_count"].as_i64().unwrap(),
+            500,
+            "{}: candidate_count must cover every candidate scored, eligible or not",
+            p.id
+        );
+        let draw = detail["draw"].as_str().unwrap();
+        match (source_of(p), draw) {
+            (Some("explore"), "exploration") => saw_exploration = true,
+            (Some("explore"), other) => panic!(
+                "{}: exploration pick's draw was {other:?}, not \"exploration\"",
+                p.id
+            ),
+            (_, "ranked") => saw_ranked = true,
+            (_, other) => panic!("{}: ranked pick's draw was {other:?}, not \"ranked\"", p.id),
+        }
+    }
+    assert!(saw_ranked, "expected at least one ranked pick in the run");
+    assert!(
+        saw_exploration,
+        "expected at least one exploration pick in the run"
     );
 }
 
