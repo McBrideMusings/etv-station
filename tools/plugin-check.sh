@@ -100,7 +100,10 @@ trap 'rm -rf "$staged"' EXIT
 
 echo
 echo "==> fetching $target:$appdata/plugins"
-if ! ssh -o BatchMode=yes "$target" "tar -C '$appdata' -cf - plugins" 2>/dev/null | tar -xf - -C "$staged"; then
+# ssh's stderr is left alone on purpose: an unreachable host, a refused key and a
+# missing plugins/ directory all land here, and the message it prints is the only
+# thing that separates them.
+if ! ssh -o BatchMode=yes "$target" "tar -C '$appdata' -cf - plugins" | tar -xf - -C "$staged"; then
   echo "fatal: could not read $target:$appdata/plugins over ssh" >&2
   exit 2
 fi
