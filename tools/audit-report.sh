@@ -41,17 +41,30 @@ user=${UNRAID_USER:-root}
 config=${ETV_STATION_CONFIG:-/config/station.yaml}
 target="$user@$UNRAID_HOST"
 
-# No channel named: list what exists and stop. The station writes one directory
-# per channel under `output_base` (/data/playout in the container, which is
-# $ETV_STATION_DATA/playout on the host), so the directory listing IS the
-# channel list — no need to start the binary to ask.
-if [[ $# -eq 0 ]]; then
-  channels=$(ssh "$target" "ls -1 '$ETV_STATION_DATA/playout' 2>/dev/null") || {
+# No channel named: list what has actually written playout and stop.
+#
+# DIRECTORIES ONLY, and that is not a tidiness preference. The station writes
+# one directory per channel under `output_base` (/data/playout in the
+# container, $ETV_STATION_DATA/playout on the host) — but it also keeps
+# history.db there, with its -wal and -shm siblings beside it. A plain `ls`
+# listed all three as if they were channels you could audit.
+#
+# `--list` is the machine form: one `name<TAB>label` line per channel, which is
+# what admin.toml's picker parses. Bare is the human form.
+if [[ $# -eq 0 || ${1:-} == "--list" ]]; then
+  channels=$(ssh "$target" "find '$ETV_STATION_DATA/playout' -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort") || {
     echo "audit: cannot read $ETV_STATION_DATA/playout on $target" >&2
     exit 2
   }
   if [[ -z $channels ]]; then
-    echo "No channels have written playout yet."
+    [[ ${1:-} == "--list" ]] || echo "No channels have written playout yet."
+    exit 0
+  fi
+  # The picker's second column is the chunk count, not a constant string: it is
+  # the one cheap fact that tells a channel with a full window apart from one
+  # holding a single file, and it costs no extra round trip.
+  if [[ ${1:-} == "--list" ]]; then
+    ssh "$target" "find '$ETV_STATION_DATA/playout' -mindepth 1 -maxdepth 1 -type d -exec sh -c 'printf \"%s\t%s chunk(s)\n\" \"\$(basename \"\$1\")\" \"\$(ls -1 \"\$1\"/*.json 2>/dev/null | wc -l | tr -d \" \")\"' _ {} \; 2>/dev/null | sort"
     exit 0
   fi
   echo "Channels with a schedule to audit:"
