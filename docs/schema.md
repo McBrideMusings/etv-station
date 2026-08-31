@@ -905,9 +905,14 @@ An `entry_id` `audit()` names that `pick()` never returned is refused, the
 same "cheaper to reject than explain" posture as a duplicate pick. Each
 record lands under that item's `metadata.audit`, as the first element of an
 ordered array — sibling to a viewer-facing `reason_set` key, never merged
-with it (ADR 0012). Both shipped scripts (`taste-cosine.rhai`,
-`endless-distance.rhai`) implement the minimum: `stage`/`by`/`verdict` only,
-no `detail`, and a trivial `workspace`.
+with it (ADR 0012). Both shipped scripts now fill `detail` in their own
+vocabulary (#392): `taste-cosine.rhai` stashes each pick's score, rank,
+candidate-set size and draw kind (`"ranked"` or `"exploration"`) in
+`workspace` inside `pick()` and reports them back in `audit()`;
+`endless-distance.rhai` does the same with the distance it walked by. The
+station reads none of these keys — it still only enforces the shared
+non-finite-float refusal — so a script adding another key to `detail` needs
+no station change to have it appear.
 
 #### `hooks()` — what a script says it can do
 
