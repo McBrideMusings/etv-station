@@ -57,6 +57,8 @@ export default defineConfig({
           { text: '0007 — The overlay cascade hot-reloads, never respawns', link: '/adr/0007-overlay-cascade-hot-reloads-never-respawns' },
           { text: '0009 — A Plex rating key\'s entry_id is pinned for life', link: '/adr/0009-a-plex-rating-keys-entry-id-is-pinned' },
           { text: '0010 — A published slot moves only for an author', link: '/adr/0010-a-published-slot-moves-only-for-an-author' },
+          { text: '0011 — An audit trail is a stage list', link: '/adr/0011-an-audit-trail-is-a-stage-list-and-a-plugin-explains-itself-in-a-function' },
+          { text: '0012 — The reason set and the audit trail are separate fields', link: '/adr/0012-the-reason-set-and-the-audit-trail-are-separate-fields' },
         ],
       },
     ],

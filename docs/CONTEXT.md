@@ -86,6 +86,14 @@ One recorded justification for a pick, and the atom a [[why line]] is built from
 
 Every [[reason]] a pick cleared the share threshold with, ranked, plus which of them the scorer chose to say out loud. Both halves are recorded at pick time and carried untouched to the playout JSON: the choice is seeded, so re-running a generation shows a viewer the same sentence it showed them before, and the unchosen reasons survive as the evidence for why a line read the way it did. Selection cannot happen at render time — the overlay script runs per frame and holds no seed and no memory.
 
+## Audit trail
+
+The ordered record of every [[selection stage]] that acted on one scheduled item, recorded as the item is laid down and carried in the playout JSON beside it. Ordered because several mechanisms act on the same item in sequence and each has something different to say — a pool ranked it, a draw took it, a constraint kept or moved it, the pattern placed it — so no single field can hold "why this item is here". Distinct from a [[reason set]], which justifies a pick to a *viewer* in one sentence on screen; an audit trail justifies it to whoever is diagnosing the channel, and nothing in it is ever rendered.
+
+## Selection stage
+
+One mechanism that can act on an item on its way into a schedule, and the unit an [[audit trail]] is a list of. The set is closed and the station owns it, so a report can be filtered across every channel regardless of how that channel picks things. What each stage says about its own decision stays opaque to the station, the same way a [[scorer plugin]]'s metadata already is.
+
 ## Broadcast graphics vocabulary
 
 Borrowed industry terms for the things an overlay draws. None of these are schema keys or code identifiers — they exist here so an overlay author can name what they are building and search for real reference material instead of inventing a word for it. Everything below is one of the [[overlay cascade]]'s layers.
