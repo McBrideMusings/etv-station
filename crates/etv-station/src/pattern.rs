@@ -882,25 +882,37 @@ pub fn build(
                     guide_out.insert(id.clone(), guide.clone());
                 }
             }
-            // Every drawn id gets a `pool` stage, including one a plugin pool
-            // produced — the plugin's own `audit()` says how it *ranked*, this
-            // says which pool the slot drew from and how. Before this, the 60
-            // channels with no `plugin:` pool wrote no trail at all and every
-            // item in their report read "unexplained", which is the wrong way
-            // round: a channel selecting by a plain expression is the one a
-            // reader has least other insight into.
+            // Every drawn id gets a `select` stage — the draw, which is a
+            // different fact from the ranking a plugin's own `audit()` records
+            // as `pool`. ADR 0011 names them separately for exactly this
+            // reason: "a pool ranked it, a draw took it, a constraint kept or
+            // moved it, the pattern's `take` placed it".
+            //
+            // Emitting it as a second `pool` stage was the first shape and was
+            // wrong twice over: an item from a plugin pool then carried two
+            // records both claiming `by: plugin:<name>`, which reads as a
+            // duplicate rather than as two facts, and it left `select` an
+            // unexercised guess (#404) while the thing it names was already
+            // happening.
+            //
+            // The 60 channels with no `plugin:` pool have no ranking stage at
+            // all, so this is their whole trail — which is why the pool's
+            // source lands in `detail` here rather than being assumed known
+            // from a `pool` record that never gets written for them.
             if !drawn.is_empty() {
                 let cfg = &runtimes[idx].cfg;
-                let (by, verdict) = pool_provenance(cfg);
+                let by = format!("pool:{}", cfg.name);
+                let verdict = format!("drawn from pool {:?}", cfg.name);
                 let mut detail = serde_json::Map::new();
                 detail.insert("pool".into(), serde_json::Value::String(cfg.name.clone()));
+                detail.insert("source".into(), serde_json::Value::String(pool_source(cfg)));
                 detail.insert(
                     "take".into(),
-                    serde_json::Value::String(format!("{:?}", step.take)),
+                    serde_json::Value::String(describe_take(step.take)),
                 );
                 detail.insert(
                     "from".into(),
-                    serde_json::Value::String(format!("{:?}", step.from)),
+                    serde_json::Value::String(describe_take_from(step.from)),
                 );
                 if let Some(expr) = &cfg.expr {
                     detail.insert("expr".into(), serde_json::Value::String(expr.clone()));
@@ -909,7 +921,7 @@ pub fn build(
                     let entry = audit_out.entry(id.clone()).or_insert(None);
                     crate::audit::push_stage(
                         entry,
-                        "pool",
+                        "select",
                         by.clone(),
                         verdict.clone(),
                         Some(serde_json::Value::Object(detail.clone())),
@@ -987,36 +999,46 @@ fn merge_audit_into(existing: &mut serde_json::Value, staged: serde_json::Value)
         .extend(incoming.iter().cloned());
 }
 
-/// How a pool identifies itself in an audit record, and what it says it did.
+/// Where a pool's candidates came from, for the `select` stage's `detail`.
 ///
-/// `by` names the mechanism the way the plugin path already does
-/// (`plugin:taste-cosine`), so a report can be filtered across 64 channels on
-/// one axis regardless of how each one picks.
-fn pool_provenance(cfg: &Pool) -> (String, String) {
+/// The pool's *identity* is its name, carried in `by`; this is the second
+/// question a reader asks — a pool named `movies` says nothing about whether a
+/// script ranked it or an expression matched it.
+fn pool_source(cfg: &Pool) -> String {
     if let Some(plugin) = &cfg.plugin {
         let name = plugin
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| plugin.to_string_lossy().into_owned());
-        (
-            format!("plugin:{name}"),
-            format!("drawn from plugin pool {:?}", cfg.name),
-        )
+        format!("plugin {name}")
     } else if cfg.expr.is_some() {
-        (
-            format!("expr:{}", cfg.name),
-            format!("matched pool {:?}'s expression", cfg.name),
-        )
+        "expression".into()
     } else if !cfg.groups.is_empty() {
-        (
-            format!("groups:{}", cfg.name),
-            format!("drawn from pool {:?}'s show groups", cfg.name),
-        )
+        format!("{} show group(s)", cfg.groups.len())
     } else {
-        (
-            format!("pool:{}", cfg.name),
-            format!("drawn from pool {:?}", cfg.name),
-        )
+        "unknown".into()
+    }
+}
+
+/// `take`, in the words the channel author wrote it in.
+///
+/// Not `{:?}`. That printed `Count(2)` and `All` — Rust type names leaking into
+/// a report a human reads, naming a variant nobody outside this crate has any
+/// reason to know.
+fn describe_take(take: Take) -> String {
+    match take {
+        Take::Count(n) => n.to_string(),
+        Take::All => "all".into(),
+    }
+}
+
+/// `from`, likewise — `Start`/`End`/`Random` as the config spells them, plus
+/// what each one means, since the bare word is ambiguous on its own.
+fn describe_take_from(from: TakeFrom) -> String {
+    match from {
+        TakeFrom::Start => "start (where the series left off)".into(),
+        TakeFrom::End => "end (the last items, ignoring the cursor)".into(),
+        TakeFrom::Random => "random (a seeded offset, re-rolled per visit)".into(),
     }
 }
 
@@ -1769,6 +1791,28 @@ mod tests {
     use crate::catalog::{Entry as CatEntry, EntrySource, Source};
     use crate::config::Order;
     use crate::resume::{PoolResume, ResumeMap};
+
+    /// A `select` record's `detail` is read by a person, so no Rust variant
+    /// name may reach it. `{:?}` on these two enums printed `Count(2)` and
+    /// `Start`, which name a type nobody outside this crate has cause to know.
+    #[test]
+    fn the_select_detail_describers_leak_no_type_names() {
+        assert_eq!(describe_take(Take::Count(2)), "2");
+        assert_eq!(describe_take(Take::All), "all");
+        for from in [TakeFrom::Start, TakeFrom::End, TakeFrom::Random] {
+            let rendered = describe_take_from(from);
+            assert!(
+                !rendered.contains("Start")
+                    && !rendered.contains("End")
+                    && !rendered.contains("Random"),
+                "{from:?} rendered as {rendered:?}, which still names the variant",
+            );
+            assert!(
+                rendered.contains('('),
+                "{from:?} rendered as {rendered:?} with no gloss; the bare word is ambiguous",
+            );
+        }
+    }
 
     /// Two shows of deliberately different lengths plus three movies — the
     /// shape #81 (Sample S7) exercises: series that must each progress
