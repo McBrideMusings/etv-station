@@ -4,7 +4,8 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 use etv_station::catalog::Catalog;
 use etv_station::catalog::reconcile_plexdb::{self, ReconcileReport};
-use etv_station::{config, daemon, etv_next};
+use etv_station::{audit_report, config, daemon, etv_next};
+use time::OffsetDateTime;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -117,6 +118,22 @@ struct Cli {
     /// process writing them would race its generation loop.
     #[arg(long, value_name = "CHANNEL")]
     refresh_channel: Option<String>,
+
+    /// Read the named channel's chunk files, take the next `--next` items
+    /// from now forward, and write a plain-text report naming each item and
+    /// its audit trail, then exit. Named the same way `--refresh-channel`
+    /// accepts a channel (exact name, bare name, channel number, or `all`).
+    ///
+    /// Reads only the chunk files already on disk: no generation runs, no
+    /// catalog is opened, and no plugin is evaluated (ADR 0011) — this
+    /// reports what will actually air, not what a re-simulation believes
+    /// would air.
+    #[arg(long, value_name = "CHANNEL")]
+    audit: Option<String>,
+
+    /// With `--audit`, how many upcoming items to report.
+    #[arg(long, value_name = "N", requires = "audit", default_value_t = 10)]
+    next: usize,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -166,6 +183,10 @@ fn main() -> ExitCode {
 
     if let Some(target) = cli.refresh_channel.as_deref() {
         return refresh_channel(&cli.config, target);
+    }
+
+    if let Some(target) = cli.audit.as_deref() {
+        return audit(&cli.config, target, cli.next);
     }
 
     init_tracing(cli.log_format);
@@ -481,53 +502,11 @@ fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
         }
     };
 
-    let matched: Vec<&etv_station::config::LoadedChannel> = if target == "all" {
-        station.channels.iter().collect()
-    } else if let Ok(number) = target.parse::<usize>() {
-        // The channel number is its position in the station config, 1-based —
-        // the same arithmetic `render_etv_next` uses to name channelN.json.
-        match number.checked_sub(1).and_then(|i| station.channels.get(i)) {
-            Some(ch) => vec![ch],
-            None => {
-                eprintln!(
-                    "refresh-channel: no channel number {number}; the station has {}",
-                    station.channels.len(),
-                );
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        let exact: Vec<_> = station
-            .channels
-            .iter()
-            .filter(|c| c.name == target)
-            .collect();
-        if exact.is_empty() {
-            // `for-pierce` should find `002-for-pierce`, since the numeric
-            // prefix is a sort key rather than part of the name anyone says.
-            let loose: Vec<_> = station
-                .channels
-                .iter()
-                .filter(|c| {
-                    let bare = c.name.split_once('-').map(|(_, r)| r).unwrap_or(&c.name);
-                    bare == target || c.name.contains(target)
-                })
-                .collect();
-            if loose.len() > 1 {
-                eprintln!(
-                    "refresh-channel: {target:?} matches {} channels: {}",
-                    loose.len(),
-                    loose
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-                return ExitCode::from(1);
-            }
-            loose
-        } else {
-            exact
+    let matched = match resolve_channels(&station, target) {
+        Ok(m) => m,
+        Err(msg) => {
+            eprintln!("refresh-channel: {msg}");
+            return ExitCode::from(1);
         }
     };
 
@@ -555,6 +534,154 @@ fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
          boundary on its following pass",
         matched.len(),
     );
+    ExitCode::SUCCESS
+}
+
+/// Resolve `target` to the channels it names, the same forgiving way for
+/// every one-shot mode that accepts a channel argument: exact name, bare name
+/// after the numeric directory prefix (`for-pierce` finds `002-for-pierce`),
+/// substring, channel number (1-based, its position in the station config —
+/// the same number the guide and ETV-next show), or `all`.
+///
+/// Messages carry no command prefix — each caller prepends its own, so
+/// `refresh-channel`'s and `audit`'s errors read as their own tool's output.
+fn resolve_channels<'a>(
+    station: &'a config::Station,
+    target: &str,
+) -> Result<Vec<&'a config::LoadedChannel>, String> {
+    if target == "all" {
+        return Ok(station.channels.iter().collect());
+    }
+    if let Ok(number) = target.parse::<usize>() {
+        return match number.checked_sub(1).and_then(|i| station.channels.get(i)) {
+            Some(ch) => Ok(vec![ch]),
+            None => Err(format!(
+                "no channel number {number}; the station has {}",
+                station.channels.len(),
+            )),
+        };
+    }
+
+    let exact: Vec<_> = station
+        .channels
+        .iter()
+        .filter(|c| c.name == target)
+        .collect();
+    if !exact.is_empty() {
+        return Ok(exact);
+    }
+
+    // `for-pierce` should find `002-for-pierce`, since the numeric prefix is
+    // a sort key rather than part of the name anyone says.
+    let loose: Vec<_> = station
+        .channels
+        .iter()
+        .filter(|c| {
+            let bare = c.name.split_once('-').map(|(_, r)| r).unwrap_or(&c.name);
+            bare == target || c.name.contains(target)
+        })
+        .collect();
+    if loose.len() > 1 {
+        return Err(format!(
+            "{target:?} matches {} channels: {}",
+            loose.len(),
+            loose
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if loose.is_empty() {
+        return Err(format!("no channel matching {target:?}"));
+    }
+    Ok(loose)
+}
+
+/// Read `target`'s chunk files, take the next `next` items from now forward,
+/// and write a plain-text audit report to a temp file, then print its path.
+///
+/// Reads only the chunk files already on disk: no catalog is opened and no
+/// plugin runs on this path, which is the whole point (ADR 0011) — the
+/// report describes what will actually air, not what a re-simulation of a
+/// plugin's `pick()` believes would air.
+fn audit(config_path: &Path, target: &str, next: usize) -> ExitCode {
+    let station = match config::load(config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("audit: failed to load configuration: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let matched = match resolve_channels(&station, target) {
+        Ok(m) => m,
+        Err(msg) => {
+            eprintln!("audit: {msg}");
+            eprintln!(
+                "audit: known channels: {}",
+                station
+                    .channels
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let channel = match matched.as_slice() {
+        [ch] => *ch,
+        other => {
+            eprintln!(
+                "audit: {target:?} must name exactly one channel, matched {}: {}",
+                other.len(),
+                other
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            eprintln!(
+                "audit: known channels: {}",
+                station
+                    .channels
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("audit: failed to start tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let now = OffsetDateTime::now_utc();
+    let items = match runtime.block_on(audit_report::upcoming(&channel.output_folder, now, next)) {
+        Ok(items) => items,
+        Err(err) => {
+            eprintln!("audit: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let report = audit_report::render(&channel.name, now, &items);
+    let path = std::env::temp_dir().join(format!("etv-station-audit-{}.txt", channel.name));
+    if let Err(err) = std::fs::write(&path, report) {
+        eprintln!("audit: writing {}: {err}", path.display());
+        return ExitCode::from(1);
+    }
+    println!("{}", path.display());
     ExitCode::SUCCESS
 }
 

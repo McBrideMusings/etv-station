@@ -1,5 +1,6 @@
 pub mod atomic;
 pub mod attribution;
+pub mod audit_report;
 pub mod backfill;
 pub mod catalog;
 pub mod channel_card;
