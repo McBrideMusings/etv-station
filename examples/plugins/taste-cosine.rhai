@@ -1,6 +1,23 @@
 // taste-cosine — ranks a movie pool by how close its subject matter sits to
 // the house's pooled taste, not by whether the house has already watched it
-// (#254).
+// (#254), then damps whatever this channel aired recently (`ctx.recent`).
+//
+// Those two are different axes, and only the second is a repeat guard.
+// #254's rule stands unchanged: a title someone loves and has rewatched five
+// times should still rank at the top, so Plex watch state never lowers a
+// score. What #254 did not cover is that the cosine is a pure function of
+// (catalog, taste vector), and both are near-constant between generations —
+// so the ranking came out identical every run and the head of it aired on a
+// loop. The seeded exploration slot below does not help: its permutation and
+// its coin flips are seeded off `ctx.seed` alone, which is also constant, so
+// it varies picks WITHIN one returned list and never BETWEEN two of them.
+//
+// The recency factor is therefore the only input to this script that moves
+// as the channel plays, and it is what makes a later generation reach
+// further down the ranking instead of replaying the top of it. It damps
+// rather than excludes: a title in the tail can still win if its cosine is
+// far enough ahead, which is the judgement a hard cooldown window cannot
+// express.
 //
 // Five functions make up the contract:
 //   hooks()               -> [hook_name, …]                    which hooks this script implements
@@ -38,6 +55,12 @@
 //                        this script never resolves a username itself; the
 //                        station already did, from watch history it holds
 //                        and this sandbox cannot reach
+//   ctx.recent           the entry_ids this channel aired most recently,
+//                        oldest first and newest LAST, capped at the
+//                        channel's `scoring.recent_depth` (default 200).
+//                        Airings of THIS channel, not Plex watch events —
+//                        `ctx.history` is the other thing and this script
+//                        does not read it. Ambient: no capability gates it.
 //   ctx.datastore(name)  a handle onto the plex-db-ex reader (#181),
 //                        exposing enrichment_for_many / pooled_taste_vector
 //                        among others
@@ -67,6 +90,35 @@ fn exploration_fraction(ctx) { tunable(ctx, "exploration_fraction", 0.2).to_floa
 // here. A full candidate dump stays taste-debug's job; this is just enough
 // to answer "what did this beat" without growing the chunk file per item.
 fn near_miss_limit(ctx) { tunable(ctx, "near_miss_limit", 3).to_int() }
+
+// How many airings back a title's damping is half spent. At the default 25,
+// a channel laying ~16 movies a day has a title back to 89% of its cosine
+// after a week and 96% after two.
+//
+// A half-life rather than a cutoff, and measured in POSITIONS rather than
+// hours, because `ctx.recent` is a bare id list with no timestamps on it —
+// see recency_factor() below. A dark day and a busy day therefore decay
+// identically; widening the station's history tail to carry `start_ns` is
+// what a true time decay would need.
+fn recency_half_life(ctx) { tunable(ctx, "recency_half_life", 25.0).to_float() }
+
+// How much of a candidate's cosine survives, given how recently this channel
+// aired it. `r` is its position in the airing tail counted back from the end
+// — 1 for the last thing that aired — or unit for a title the tail does not
+// hold at all.
+//
+// r / (r + half_life): 1.0 for a title never aired, 0.5 for one exactly
+// half_life airings ago, climbing back toward 1.0 beyond that. Monotonic, so
+// two titles that aired at different times never swap on the factor alone,
+// and bounded in (0, 1], so nothing is ever zeroed out by having aired.
+//
+// Takes two scalars, so calling it per candidate is free — the #172 rule it
+// has to respect is about a helper taking a library-sized collection by
+// value (Rhai passes arguments by value and would clone one per candidate),
+// which this does not.
+fn recency_factor(r, half_life) {
+    if r == () { 1.0 } else { r.to_float() / (r.to_float() + half_life) }
+}
 
 // The datastore grant name this script reaches for (#181). A channel names
 // its own grant under the pool's `datastores:`; this is this script's half
@@ -153,6 +205,27 @@ fn pick(ctx) {
 
     let seed = ctx.seed;
 
+    // Where each recently-aired entry sits in this channel's airing tail,
+    // as a distance back from the newest: 1 is the last thing that aired,
+    // `recent.len` the oldest still remembered. `ctx.recent` is newest-LAST,
+    // so the distance is measured from the end.
+    //
+    // Bounded by `scoring.recent_depth` (200 by default), never by the
+    // library, so this pass is ~200 steps regardless of catalog size. The
+    // tail holds episodes too — this channel's shows pool put them there —
+    // and they simply never match a movie id, which costs one failed map
+    // lookup each and no correctness.
+    let recent = ctx.recent;
+    let recent_n = recent.len;
+    let recency = #{};
+    for i in 0..recent_n {
+        // A title aired more than once inside the tail keeps its most recent
+        // position: later iterations overwrite earlier ones, and later means
+        // newer.
+        recency[recent[i]] = recent_n - i;
+    }
+    let half_life = recency_half_life(ctx);
+
     // Document-frequency pass (#294): how many candidates carry each
     // keyword, and how many candidates carry any `ns` fact at all. Feeds the
     // idf factor below, which is what keeps a title with one keyword shared
@@ -229,9 +302,22 @@ fn pick(ctx) {
             // job of not over-rewarding tag count. See #254's worked table.
             if n > 0 { score = sum / n.to_float().sqrt(); }
         }
+        // The cosine before recency, kept alongside the damped one so the
+        // audit can show both. A title that fell twenty places because it
+        // aired last night only reads as a decision if both halves are
+        // visible; one number alone reads as the scorer changing its mind.
+        let base_score = score;
+        let aired_rank = recency[id];
+        let factor = recency_factor(aired_rank, half_life);
+        score = base_score * factor;
         scored.push(#{
             id: id,
             score: score,
+            base_score: base_score,
+            // Unit for a title this channel's remembered tail does not hold
+            // — which is most of them, and is what `explorable` below tests.
+            aired_rank: aired_rank,
+            recency_factor: factor,
             eligible: eligible,
             on_profile: on_profile,
             // The seeded key this candidate draws if an exploration slot
@@ -266,7 +352,16 @@ fn pick(ctx) {
     // none is not "on-profile with weight zero"; it is a title this scorer
     // cannot say anything about, and handing it to a surprise slot reads as
     // the recommender being broken rather than as a surprise.
-    let explorable = scored.filter(|row| row.eligible);
+    //
+    // Anything in the airing tail is excluded outright here rather than
+    // damped. The exploration slot draws in a fixed seeded order that
+    // ignores score, so damping buys it nothing — and spending the one
+    // off-profile slot in five on a title from three days ago is the exact
+    // failure this whole change is about. The rank cursor is unaffected and
+    // still sees every candidate. If the tail swallows the entire eligible
+    // set on a small channel this list runs empty and every slot falls
+    // through to the ranking, which the loop below already handles.
+    let explorable = scored.filter(|row| row.eligible && row.aired_rank == ());
     // A fixed random permutation of the eligible candidates — the order an
     // exploration slot draws from, one at a time, seeded so it reproduces.
     explorable.sort(|a, b| {
@@ -365,6 +460,9 @@ fn pick(ctx) {
         // captured above.
         ws_rows[row.id] = #{
             score: row.score,
+            base_score: row.base_score,
+            recency_factor: row.recency_factor,
+            aired_rank: row.aired_rank,
             rank: row.rank,
             draw: if source == "explore" { "exploration" } else { "ranked" },
             near_misses: near_misses,
@@ -377,6 +475,7 @@ fn pick(ctx) {
 // The fifth pool_provider contract function (#389, ADR 0011, ADR 0013):
 // called once per generation, immediately after pick(), handed back the list
 // pick() returned plus the workspace pick() built above. Reports the score,
+// the undamped cosine and the recency factor multiplied into it, the
 // rank, candidate-set size, and draw kind pick() already computed for each
 // pick — an exploration draw is a deliberate product state this channel is
 // FOR, not a fallback, so it gets its own verdict rather than reading like a
@@ -390,6 +489,15 @@ fn audit(ctx, picks, workspace) {
         let detail = if r != () {
             #{
                 score: r.score,
+                // The cosine before the recency factor, and the factor
+                // itself, so `admin audit` can show why a pick ranks where
+                // it does rather than only that it does. `aired_rank` is
+                // unit for a title outside the channel's remembered tail,
+                // which is the common case and the one where the factor is
+                // exactly 1.0.
+                base_score: r.base_score,
+                recency_factor: r.recency_factor,
+                aired_rank: r.aired_rank,
                 rank: r.rank,
                 candidate_count: workspace.candidate_count,
                 draw: r.draw,
@@ -398,8 +506,13 @@ fn audit(ctx, picks, workspace) {
         } else {
             #{}
         };
+        // An exploration draw never carries an `aired_rank` — `explorable`
+        // excludes the airing tail outright — so these three branches are
+        // mutually exclusive and the order between them does not matter.
         let verdict = if r != () && r.draw == "exploration" {
             "drawn off-profile by the exploration slot"
+        } else if r != () && r.aired_rank != () {
+            "ranked by keyword cosine, damped for a recent airing on this channel"
         } else {
             "ranked by keyword cosine against pooled taste"
         };

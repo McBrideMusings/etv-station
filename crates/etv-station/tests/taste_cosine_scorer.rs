@@ -192,7 +192,28 @@ impl Scorer {
         target_count: usize,
         exploration_fraction: Option<f64>,
     ) -> Vec<PickedItem> {
-        self.pick_for(pool, seed, target_count, exploration_fraction, None)
+        self.pick_for(pool, seed, target_count, exploration_fraction, None, &[])
+    }
+
+    /// One generation on a channel that has already aired something (#254's
+    /// recency damping). `recent` is the airing tail exactly as the station
+    /// hands it over — oldest first, newest LAST — so a test naming the
+    /// order it wants reads the same way the daemon's own
+    /// `HistoryDb::tail` returns it.
+    fn pick_recent(
+        &self,
+        target_count: usize,
+        exploration_fraction: Option<f64>,
+        recent: &[&str],
+    ) -> Vec<PickedItem> {
+        self.pick_for(
+            "movies",
+            0,
+            target_count,
+            exploration_fraction,
+            None,
+            recent,
+        )
     }
 
     /// One generation for a `single_user`-scoped channel (#278):
@@ -207,7 +228,7 @@ impl Scorer {
         target_count: usize,
         account_id: Option<i64>,
     ) -> Vec<PickedItem> {
-        self.pick_for(pool, 0, target_count, Some(0.0), account_id)
+        self.pick_for(pool, 0, target_count, Some(0.0), account_id, &[])
     }
 
     /// The one call into `score::pick` both of the above make, so the two
@@ -219,11 +240,13 @@ impl Scorer {
         target_count: usize,
         exploration_fraction: Option<f64>,
         account_id: Option<i64>,
+        recent: &[&str],
     ) -> Vec<PickedItem> {
         let config = exploration_fraction.map(|f| serde_json::json!({ "exploration_fraction": f }));
         let inputs = ScoreInputs {
             target_count,
             account_id,
+            recent: recent.iter().map(|s| (*s).to_string()).collect(),
             ..Default::default()
         };
         pick(
@@ -813,6 +836,202 @@ fn a_rare_shared_keyword_outranks_a_common_one_and_no_tie_holds_rank_one() {
         tied_at_top, 1,
         "rank 1 must be held by exactly one title, not a tie: {picked:?}"
     );
+}
+
+/// The order the picks come back in, which with exploration off is the
+/// ranking itself — the one thing the recency tests below are actually
+/// asserting about.
+fn order_of(picked: &[PickedItem]) -> Vec<&str> {
+    picked.iter().map(|p| p.id.as_str()).collect()
+}
+
+fn detail_f64(p: &PickedItem, key: &str) -> f64 {
+    detail_of(p)[key]
+        .as_f64()
+        .unwrap_or_else(|| panic!("detail.{key} missing or not a number: {:?}", detail_of(p)))
+}
+
+/// The acceptance criterion for recency damping. The cosine alone is a pure
+/// function of (catalog, taste vector), and both hold still between
+/// generations — so before this, the ranking came out identical every run
+/// and the head of it aired on a loop. `ctx.recent` is the only input that
+/// moves as the channel plays.
+///
+/// `write_taste_fixture`'s undamped ranking is mov-a (0.9938) > mov-c
+/// (0.7027) > mov-d (0.4969) > mov-b (0.0), pinned by
+/// `the_committed_example_plugin_runs_and_scores_correctly` above. Airing
+/// mov-a puts it at distance 1 in the tail, so it keeps 1/(1+25) = 3.8% of
+/// its cosine and lands third — behind both titles it beat a moment ago,
+/// and still ahead of the one that has no keywords at all.
+#[test]
+fn a_recent_airing_drops_a_title_below_the_ones_it_was_beating() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+
+    assert_eq!(
+        order_of(&scorer.pick_recent(4, Some(0.0), &[])),
+        ["mov-a", "mov-c", "mov-d", "mov-b"],
+        "the undamped ranking, with nothing yet aired"
+    );
+    assert_eq!(
+        order_of(&scorer.pick_recent(4, Some(0.0), &["mov-a"])),
+        ["mov-c", "mov-d", "mov-a", "mov-b"],
+        "mov-a aired last, so it must fall behind mov-c and mov-d"
+    );
+}
+
+/// Damped, not excluded — the judgement a fixed cooldown window cannot
+/// express. Pushed far enough back in the tail (distance 100, so it keeps
+/// 100/(100+25) = 80% of its cosine), mov-a's 0.9938 * 0.8 = 0.795 still
+/// clears mov-c's undamped 0.7027 and it returns to the top on its own.
+#[test]
+fn a_far_enough_back_airing_stops_mattering_and_the_title_returns() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+
+    // mov-a oldest, then 99 ids this catalog does not contain — a real tail
+    // carries this channel's episodes too, and they simply never match a
+    // movie id.
+    let filler: Vec<String> = (0..99).map(|i| format!("ep-{i:03}")).collect();
+    let mut tail = vec!["mov-a"];
+    tail.extend(filler.iter().map(String::as_str));
+
+    let picked = scorer.pick_recent(4, Some(0.0), &tail);
+    assert_eq!(
+        order_of(&picked),
+        ["mov-a", "mov-c", "mov-d", "mov-b"],
+        "100 airings back, mov-a keeps 80% of its cosine and still leads"
+    );
+    assert_close(
+        detail_f64(&picked[0], "recency_factor"),
+        100.0 / 125.0,
+        "mov-a's recency factor at distance 100",
+    );
+}
+
+/// A title the tail does not hold is untouched: factor exactly 1.0 and the
+/// damped score identical to the cosine. This is the common case — the tail
+/// is 200 entries against an 11,543-movie library — so a regression that
+/// damped everything would be invisible in the ordering tests above.
+#[test]
+fn a_title_outside_the_tail_keeps_its_whole_cosine() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let picked = scorer.pick_recent(4, Some(0.0), &["mov-a"]);
+
+    for p in &picked {
+        if p.id == "mov-a" {
+            continue;
+        }
+        assert!(
+            detail_of(p)["aired_rank"].is_null(),
+            "{} is not in the tail, so aired_rank must be null: {:?}",
+            p.id,
+            detail_of(p)
+        );
+        assert_close(
+            detail_f64(p, "recency_factor"),
+            1.0,
+            &format!("{}'s recency factor", p.id),
+        );
+        assert_close(
+            detail_f64(p, "score"),
+            detail_f64(p, "base_score"),
+            &format!("{}'s damped score against its cosine", p.id),
+        );
+    }
+}
+
+/// The audit has to show both halves. A title that fell twenty places
+/// because it aired last night only reads as a decision if the undamped
+/// cosine and the factor are both on the page; one number alone reads as
+/// the scorer having changed its mind about the title.
+#[test]
+fn the_audit_shows_the_undamped_cosine_the_factor_and_the_verdict() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let picked = scorer.pick_recent(4, Some(0.0), &["mov-a"]);
+    let damped = picked.iter().find(|p| p.id == "mov-a").unwrap();
+
+    assert_eq!(detail_of(damped)["aired_rank"].as_i64(), Some(1));
+    assert_close(
+        detail_f64(damped, "recency_factor"),
+        1.0 / 26.0,
+        "mov-a's recency factor at distance 1",
+    );
+    assert_close(
+        detail_f64(damped, "score"),
+        detail_f64(damped, "base_score") / 26.0,
+        "the reported score against cosine times factor",
+    );
+    assert_eq!(
+        damped.metadata.as_ref().unwrap()["audit"][0]["verdict"].as_str(),
+        Some("ranked by keyword cosine, damped for a recent airing on this channel"),
+        "a damped pick must say so rather than reading like a plain low rank"
+    );
+}
+
+/// The exploration slot excludes the airing tail outright rather than
+/// damping it: it draws in a fixed seeded order that ignores score, so
+/// damping would buy it nothing, and spending the one off-profile slot in
+/// five on a title from three days ago is the failure this whole change is
+/// about.
+#[test]
+fn no_exploration_slot_ever_draws_a_title_from_the_airing_tail() {
+    let scorer = large_scorer(40, 0);
+    let aired: Vec<String> = (0..30).map(|i| format!("el-{i:04}")).collect();
+    let tail: Vec<&str> = aired.iter().map(String::as_str).collect();
+    let recent: HashSet<&str> = tail.iter().copied().collect();
+
+    let picked = scorer.pick_recent(20, None, &tail);
+    let explored: Vec<&str> = picked
+        .iter()
+        .filter(|p| source_of(p) == Some("explore"))
+        .map(|p| p.id.as_str())
+        .collect();
+
+    assert!(
+        !explored.is_empty(),
+        "the default exploration fraction must have fired at least once in 30 slots"
+    );
+    for id in &explored {
+        assert!(
+            !recent.contains(id),
+            "{id} aired inside the tail and must not be an exploration draw: {explored:?}"
+        );
+    }
+}
+
+/// What `admin audit` actually prints. The two halves this change touches
+/// are written by `pick()` and rendered by `audit_report::render`, and the
+/// tests above only check the first half — so this feeds real plugin output
+/// straight into the real renderer and asserts the damping is legible on the
+/// page rather than merely present in the JSON.
+#[test]
+fn admin_audit_prints_the_damping_for_a_recently_aired_pick() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let picked = scorer.pick_recent(4, Some(0.0), &["mov-a"]);
+
+    let start = time::OffsetDateTime::UNIX_EPOCH;
+    let items: Vec<etv_station::audit_report::ReportItem> = picked
+        .iter()
+        .map(|p| etv_station::audit_report::ReportItem {
+            id: p.id.clone(),
+            start,
+            finish: start + time::Duration::hours(2),
+            title: Some(p.id.clone()),
+            metadata: p.metadata.clone(),
+        })
+        .collect();
+    let report = etv_station::audit_report::render("for-pierce", start, &items);
+    println!("{report}");
+
+    assert!(
+        report.contains("ranked by keyword cosine, damped for a recent airing on this channel"),
+        "the verdict must name the damping:\n{report}"
+    );
+    for line in ["base_score", "recency_factor", "aired_rank"] {
+        assert!(
+            report.contains(line),
+            "the report must show {line}:\n{report}"
+        );
+    }
 }
 
 /// `taste-engine.rhai` is gone (#254) — this is the negative half of "the

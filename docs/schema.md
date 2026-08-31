@@ -908,7 +908,14 @@ ordered array — sibling to a viewer-facing `reason_set` key, never merged
 with it (ADR 0012). Both shipped scripts now fill `detail` in their own
 vocabulary (#392): `taste-cosine.rhai` stashes each pick's score, rank,
 candidate-set size and draw kind (`"ranked"` or `"exploration"`) in
-`workspace` inside `pick()` and reports them back in `audit()`;
+`workspace` inside `pick()` and reports them back in `audit()`. It reports
+the score twice over — `base_score` is the raw keyword cosine and
+`recency_factor` the multiplier it damped that by, alongside `aired_rank`,
+the pick's distance back in `ctx.recent` or null for a title outside the
+tail. Both halves are there because a title that fell twenty places for
+having aired last night only reads as a decision when the cosine and the
+factor are visible apart; one number alone reads as the scorer changing its
+mind. Meanwhile,
 `endless-distance.rhai` does the same with the distance it walked by. The
 station reads none of these keys — it still only enforces the shared
 non-finite-float refusal — so a script adding another key to `detail` needs
@@ -1305,7 +1312,7 @@ Four knobs sit on the channel, under `scoring:`, all optional:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. |
+| `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. `taste-cosine.rhai` damps a candidate against its position in this tail, so raising it lengthens how long an aired title stays suppressed and lowering it shortens that. |
 | `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
 | `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
 | `user` | — | The account `single_user` follows: a Tautulli username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
