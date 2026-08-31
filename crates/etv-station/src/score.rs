@@ -390,25 +390,140 @@ pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
 /// 0011 explicitly defers ("What this does not decide").
 pub const KNOWN_STAGES: &[&str] = &["pool", "select", "constraint", "pattern"];
 
-/// Whether a plugin script declares `audit(ctx, picks, workspace)` — the
-/// fifth `pool_provider` contract function (#389, ADR 0011, ADR 0013).
+/// One function a plugin script must implement because of a hook it declares.
+///
+/// `signature` is what the refusal prints, so it reads as the thing the author
+/// has to go write; `why` is the clause after the dash that says what the
+/// station loses without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredFn {
+    /// The hook in [`KNOWN_HOOKS`] that makes this function mandatory.
+    pub hook: &'static str,
+    /// The bare function name, as it appears in the script's `fn` line.
+    pub name: &'static str,
+    /// Name plus parameter list, for the error message.
+    pub signature: &'static str,
+    /// Why the station refuses to load without it.
+    pub why: &'static str,
+}
+
+/// Every function a declared hook makes mandatory (#389, ADR 0011, ADR 0013).
+///
+/// **Adding an entry here is a breaking change for plugin scripts that live
+/// outside this checkout, and it takes the whole station off the air when it
+/// lands unnoticed.** The station refuses to load a config whose pool names a
+/// script missing one of these, and the container entrypoint renders that
+/// config before ETV-next starts — so an old script plus a new binary is a
+/// crash loop with every channel dark, not a degraded channel. That is #396:
+/// #389 added `audit` here, updated `examples/plugins/`, and left the scripts
+/// the host actually loads untouched; 64 channels were off air for 27 minutes.
+///
+/// A new entry therefore has to reach three sets of scripts, not one:
+///
+/// - `examples/plugins/*.rhai` — what the repo's own tests load.
+/// - `deploy/appdata/plugins/*.rhai` — gitignored, and what a deploy ships.
+/// - Whatever else is already on the host, including scripts with no copy
+///   here at all. `admin plugin-check` walks that directory and is the only
+///   thing that can see them; run it before deploying a change to this list.
+///
+/// See `docs/schema.md` § "Changing the plugin contract".
+pub const REQUIRED_HOOK_FNS: &[RequiredFn] = &[RequiredFn {
+    hook: "pool_provider",
+    name: "audit",
+    signature: "audit(ctx, picks, workspace)",
+    why: "every pool_provider must explain its picks",
+}];
+
+/// Which of [`REQUIRED_HOOK_FNS`] the script at `script_path` owes for the
+/// hooks it declares, and does not implement.
 ///
 /// Compile-and-inspect only, mirroring [`declared_capabilities`]'s presence
 /// probe: never runs `sources()` or `pick()`, so a load-time refusal needs no
 /// catalog handle or full generation.
 ///
-/// Every failure names the script: an unreadable or uncompilable file. A
-/// missing `audit` is not a failure here — it is reported as `Ok(false)`, and
-/// it is the caller's job (config-load validation, and [`pick`] itself) to
-/// turn that into a refusal naming the pool or the plugin.
-pub fn declares_audit(script_path: &Path) -> Result<bool, String> {
+/// The only failure is an unreadable or uncompilable file, and it names the
+/// script. A missing function is not a failure here — it comes back in the
+/// returned slice, and it is the caller's job (config-load validation,
+/// `--check-plugins`, and [`pick`] itself) to turn that into a refusal naming
+/// the pool or the plugin.
+pub fn missing_required_fns(
+    script_path: &Path,
+    hooks: &[String],
+) -> Result<Vec<&'static RequiredFn>, String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
     let engine = engine();
     let ast = engine
         .compile(&source)
         .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
-    Ok(ast.iter_functions().any(|f| f.name == "audit"))
+    let defined: Vec<&str> = ast.iter_functions().map(|f| f.name).collect();
+    Ok(REQUIRED_HOOK_FNS
+        .iter()
+        .filter(|req| hooks.iter().any(|h| h == req.hook))
+        .filter(|req| !defined.contains(&req.name))
+        .collect())
+}
+
+/// What walking one plugin script found: the hooks it declares, or the reason
+/// it could not be read at all.
+#[derive(Debug)]
+pub struct PluginCheck {
+    /// The script, as it was found on disk.
+    pub path: PathBuf,
+    /// `Ok` carries the declared hooks and the required functions the script
+    /// owes and does not implement. `Err` is an unreadable, uncompilable, or
+    /// hookless script — every one of which the station would also refuse.
+    pub result: Result<(Vec<String>, Vec<&'static RequiredFn>), String>,
+}
+
+impl PluginCheck {
+    /// Whether this script would load. A read/compile failure and a missing
+    /// required function are both refusals; nothing else is.
+    pub fn is_ok(&self) -> bool {
+        matches!(&self.result, Ok((_, missing)) if missing.is_empty())
+    }
+}
+
+/// Check every `*.rhai` in `dir` against the hook contract, without a station
+/// config and without a catalog.
+///
+/// This is the only check that can see a script no config references. Contract
+/// enforcement otherwise runs at config load, so it reaches exactly the
+/// scripts some pool names — which left the host carrying a `pool_provider`
+/// with no `audit()` for weeks, armed and invisible, because its one reference
+/// sat inside a YAML comment (#396). A directory is the unit here for that
+/// reason: an orphan with no counterpart in this checkout is the case that
+/// bites, and no parity check against local files can express it.
+///
+/// Not recursive, and it sorts by path so two runs of `--check-plugins` on the
+/// same directory print the same lines in the same order.
+///
+/// `Err` is a directory that cannot be listed. A directory holding no scripts
+/// at all is `Ok(vec![])` — the caller decides whether that is a problem.
+pub fn check_plugin_dir(dir: &Path) -> Result<Vec<PluginCheck>, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read plugin dir {}: {e}", dir.display()))?;
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read plugin dir {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rhai") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let result = declared_hooks(&path).and_then(|hooks| {
+                let missing = missing_required_fns(&path, &hooks)?;
+                Ok((hooks, missing))
+            });
+            PluginCheck { path, result }
+        })
+        .collect())
 }
 
 /// A host capability a plugin script can declare via `capabilities()` (#167).
@@ -1211,17 +1326,24 @@ pub fn pick(
         ));
     }
 
-    // The fifth `pool_provider` contract function (#389, ADR 0011, ADR 0013):
-    // required, same probe `declared_capabilities` uses to test for presence
-    // without running the script. Checked here too, not only at config load
-    // (`crate::config::validate`), because a unit fixture driving `pick`
+    // The `pool_provider` contract functions (#389, ADR 0011, ADR 0013): read
+    // from `REQUIRED_HOOK_FNS` so this and config-load validation can never
+    // disagree about what is required. Checked here too, not only at config
+    // load (`crate::config::validate`), because a unit fixture driving `pick`
     // directly bypasses load-time validation entirely.
-    if !ast.iter_functions().any(|f| f.name == "audit") {
-        return Err(format!(
-            "scorer plugin {} declares pool_provider but implements no \
-             audit(ctx, picks, workspace) — every pool_provider must explain its picks",
-            script_path.display()
-        ));
+    for req in REQUIRED_HOOK_FNS
+        .iter()
+        .filter(|r| r.hook == "pool_provider")
+    {
+        if !ast.iter_functions().any(|f| f.name == req.name) {
+            return Err(format!(
+                "scorer plugin {} declares pool_provider but implements no \
+                 {} — {}",
+                script_path.display(),
+                req.signature,
+                req.why
+            ));
+        }
     }
 
     let mut audit_scope = Scope::new();
@@ -2322,25 +2444,46 @@ fn pick(ctx) { throw "pick must not run"; }
 
     // ---- audit() declaration (#389, ADR 0011, ADR 0013) --------------------
 
+    fn pool_provider() -> Vec<String> {
+        vec!["pool_provider".to_string()]
+    }
+
     #[test]
-    fn declares_audit_reads_presence() {
+    fn missing_required_fns_is_empty_when_audit_is_present() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn audit(ctx, picks, workspace) { #{} }");
-        assert!(declares_audit(&p).unwrap());
+        assert!(
+            missing_required_fns(&p, &pool_provider())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
-    fn declares_audit_reports_absence_rather_than_erroring() {
+    fn missing_required_fns_reports_absence_rather_than_erroring() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, r#"fn hooks() { ["pool_provider"] }"#);
-        assert!(!declares_audit(&p).unwrap());
+        let missing = missing_required_fns(&p, &pool_provider()).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].name, "audit");
     }
 
-    /// `declares_audit` never runs `sources()` or `pick()`, exactly like
+    /// A hook the script never declared owes nothing. `sequencer` alone means
+    /// no `audit()` is required, which is what keeps a required function
+    /// scoped to the hook that introduced it.
+    #[test]
+    fn a_hook_that_is_not_declared_requires_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn hooks() { ["sequencer"] }"#);
+        let hooks = vec!["sequencer".to_string()];
+        assert!(missing_required_fns(&p, &hooks).unwrap().is_empty());
+    }
+
+    /// `missing_required_fns` never runs `sources()` or `pick()`, exactly like
     /// `declared_hooks`/`declared_capabilities` — a load-time check must not
     /// need a catalog.
     #[test]
-    fn declares_audit_never_runs_sources_or_pick() {
+    fn missing_required_fns_never_runs_sources_or_pick() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(
             &dir,
@@ -2351,7 +2494,87 @@ fn pick(ctx) { throw "pick must not run"; }
 fn audit(ctx, picks, workspace) { throw "audit must not run"; }
 "#,
         );
-        assert!(declares_audit(&p).unwrap());
+        assert!(
+            missing_required_fns(&p, &pool_provider())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ---- the plugin-directory walk (#396) ----------------------------------
+
+    /// The case #396 exists for: a script with no counterpart anywhere in this
+    /// checkout, referenced by no config, declaring `pool_provider` without
+    /// `audit()`. This is the shape of the host's `taste-engine.rhai`, and it
+    /// is caught here because the unit of the check is a directory, not a
+    /// config's reference graph.
+    #[test]
+    fn an_orphan_pool_provider_missing_audit_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("taste-engine.rhai"),
+            "fn hooks() { [\"pool_provider\"] }\nfn sources() { [] }\nfn pick(ctx) { [] }\n",
+        )
+        .unwrap();
+
+        let checks = check_plugin_dir(dir.path()).unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].is_ok());
+        let (_, missing) = checks[0].result.as_ref().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].name, "audit");
+    }
+
+    #[test]
+    fn a_compliant_directory_passes_and_reports_each_script_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("b-scorer.rhai"),
+            "fn hooks() { [\"pool_provider\"] }\nfn audit(ctx, picks, workspace) { #{} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a-seq.rhai"),
+            "fn hooks() { [\"sequencer\"] }\n",
+        )
+        .unwrap();
+
+        let checks = check_plugin_dir(dir.path()).unwrap();
+        // Sorted by path, so the output is stable across runs.
+        assert_eq!(checks.len(), 2);
+        assert!(checks.iter().all(|c| c.is_ok()));
+        assert!(checks[0].path.ends_with("a-seq.rhai"));
+        assert_eq!(checks[0].result.as_ref().unwrap().0, vec!["sequencer"]);
+    }
+
+    /// A file that will not compile is a refusal, not a silent skip — the
+    /// station would refuse to load it too.
+    #[test]
+    fn an_uncompilable_script_is_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.rhai"), "fn hooks() { [\n").unwrap();
+
+        let checks = check_plugin_dir(dir.path()).unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].is_ok());
+        assert!(checks[0].result.is_err());
+    }
+
+    /// Only `*.rhai`. A README, an editor backup or a `.rhai.bak` left beside
+    /// the scripts is not a plugin and must not fail the check.
+    #[test]
+    fn non_rhai_files_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "not a plugin").unwrap();
+        std::fs::write(dir.path().join("old.rhai.bak"), "fn hooks() { [\n").unwrap();
+
+        assert!(check_plugin_dir(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_missing_directory_is_an_error_naming_the_path() {
+        let err = check_plugin_dir(Path::new("/nonexistent/plugins")).unwrap_err();
+        assert!(err.contains("/nonexistent/plugins"), "err = {err}");
     }
 
     // ---- runtime capability gate (#167) ------------------------------------

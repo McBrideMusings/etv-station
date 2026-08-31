@@ -15,8 +15,11 @@ use tracing_subscriber::EnvFilter;
 )]
 struct Cli {
     /// Path to the top-level station config (TOML or YAML, by extension).
+    ///
+    /// Required by every mode except `--check-plugins`, which reads a
+    /// directory of scripts and nothing else.
     #[arg(short, long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     /// Log output format.
     #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
@@ -134,6 +137,22 @@ struct Cli {
     /// With `--audit`, how many upcoming items to report.
     #[arg(long, value_name = "N", requires = "audit", default_value_t = 10)]
     next: usize,
+
+    /// Check every `*.rhai` in this directory against the plugin hook
+    /// contract, print one line per script, and exit. Non-zero if any script
+    /// fails to compile, declares no hooks, or declares a hook whose required
+    /// functions it does not implement.
+    ///
+    /// Takes no `--config` and opens no catalog, deliberately: this is the
+    /// only check that sees a script no channel references. Contract
+    /// enforcement otherwise happens at config load, so it reaches exactly the
+    /// scripts some pool names — and the host spent weeks carrying a
+    /// `pool_provider` with no `audit()` whose sole reference was inside a
+    /// YAML comment (#396). Point it at the plugin directory a host actually
+    /// loads, before shipping a binary that requires a new contract function:
+    /// `admin plugin-check` does exactly that, over ssh, in this image.
+    #[arg(long, value_name = "DIR")]
+    check_plugins: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -145,16 +164,32 @@ enum LogFormat {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // First, and before `--config` is even resolved: this is the one mode that
+    // has no station config to resolve. It reads a directory of scripts, which
+    // is what lets it run against a host's plugin folder on a machine that
+    // holds no channel configs at all.
+    if let Some(dir) = cli.check_plugins.as_deref() {
+        return check_plugins(dir);
+    }
+
+    let config: &Path = match cli.config.as_deref() {
+        Some(path) => path,
+        None => {
+            eprintln!("--config is required (only --check-plugins runs without one)");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Query mode: print resolved folders and exit before any tracing/runtime
     // setup, so stdout carries only the folder list for a caller to capture.
     if cli.list_folders {
-        return list_folders(&cli.config);
+        return list_folders(config);
     }
 
     // Same reasoning as `--list-folders`: stdout carries only the YAML, so a
     // caller can redirect it straight into a spec file.
     if let Some(channel) = cli.dump_overlay.as_deref() {
-        return dump_overlay(&cli.config, channel);
+        return dump_overlay(config, channel);
     }
 
     // Tracing comes up before this one, unlike `--list-folders` above: the
@@ -166,27 +201,27 @@ fn main() -> ExitCode {
     // reading its stdout.
     if let Some(dir) = cli.render_etv_next.as_deref() {
         init_tracing(cli.log_format);
-        return render_etv_next(&cli.config, dir);
+        return render_etv_next(config, dir);
     }
 
     if let Some(channel) = cli.check_determinism.as_deref() {
-        return check_determinism(&cli.config, channel);
+        return check_determinism(config, channel);
     }
 
     if let Some(plexdb_path) = cli.reconcile_plexdb.as_deref() {
-        return reconcile_plexdb_cmd(&cli.config, plexdb_path);
+        return reconcile_plexdb_cmd(config, plexdb_path);
     }
 
     if cli.backfill_history {
-        return backfill_history(&cli.config, cli.dry_run);
+        return backfill_history(config, cli.dry_run);
     }
 
     if let Some(target) = cli.refresh_channel.as_deref() {
-        return refresh_channel(&cli.config, target);
+        return refresh_channel(config, target);
     }
 
     if let Some(target) = cli.audit.as_deref() {
-        return audit(&cli.config, target, cli.next);
+        return audit(config, target, cli.next);
     }
 
     init_tracing(cli.log_format);
@@ -203,7 +238,7 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
-        let station = match config::load(&cli.config) {
+        let station = match config::load(config) {
             Ok(s) => s,
             Err(err) => {
                 tracing::error!(event = "config.error", error = %err, "failed to load configuration");
@@ -258,6 +293,76 @@ fn list_folders(config_path: &Path) -> ExitCode {
             eprintln!("failed to load configuration: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Walk a directory of plugin scripts, print one line per script, and exit
+/// non-zero if any of them would refuse to load.
+///
+/// The output is one `OK`/`FAIL` line per script plus a count, on stdout, with
+/// no tracing subscriber in the way — this runs over ssh inside the container
+/// image (`admin plugin-check`), where the whole answer needs to survive being
+/// piped through two shells.
+///
+/// An empty directory is a pass with a count of zero, not an error: a station
+/// with no plugin scripts is a legitimate configuration, and inventing a
+/// failure there would make the check something people learn to skip.
+fn check_plugins(dir: &Path) -> ExitCode {
+    let checks = match etv_station::score::check_plugin_dir(dir) {
+        Ok(checks) => checks,
+        Err(err) => {
+            eprintln!("check-plugins: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut failed = 0usize;
+    for check in &checks {
+        let name = check
+            .path
+            .file_name()
+            .unwrap_or(check.path.as_os_str())
+            .to_string_lossy();
+        match &check.result {
+            Ok((hooks, missing)) if missing.is_empty() => {
+                println!("OK   {name}  hooks=[{}]", hooks.join(", "));
+            }
+            Ok((hooks, missing)) => {
+                failed += 1;
+                for req in missing {
+                    println!(
+                        "FAIL {name}  hooks=[{}]  missing {} — {}",
+                        hooks.join(", "),
+                        req.signature,
+                        req.why
+                    );
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                println!("FAIL {name}  {err}");
+            }
+        }
+    }
+
+    if failed == 0 {
+        println!(
+            "check-plugins: {} script(s) in {} satisfy the hook contract",
+            checks.len(),
+            dir.display()
+        );
+        ExitCode::SUCCESS
+    } else {
+        // Named as the failure it is on the host: these scripts load at
+        // startup, so shipping a binary against them is a crash loop with
+        // every channel dark, not one bad channel (#396).
+        eprintln!(
+            "check-plugins: {failed} of {} script(s) in {} would refuse to load — \
+             a station running this binary against them fails to start",
+            checks.len(),
+            dir.display()
+        );
+        ExitCode::from(1)
     }
 }
 

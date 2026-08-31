@@ -956,6 +956,46 @@ config load rather than mid-generation:
 - A script declaring an empty array is refused: `declares no hooks — a plugin
   must declare at least one of: pool_provider, sequencer`
 
+#### Changing the plugin contract is a breaking change for deployed scripts
+
+Every function a hook makes mandatory is declared once, in
+`score::REQUIRED_HOOK_FNS` (`crates/etv-station/src/score.rs`). Today the list
+holds one entry: a `pool_provider` must implement
+`audit(ctx, picks, workspace)`.
+
+**Adding an entry to that list reaches outside this checkout, and it takes the
+whole station off the air when it lands unnoticed.** A pool naming a script
+that lacks a required function fails config load; the container entrypoint
+renders that config before ETV-next starts; so an old script plus a new binary
+is a crash loop with every channel dark, not one degraded channel. That is what
+happened on 2026-08-31: `audit()` became required, `examples/plugins/` was
+updated, and the gitignored `deploy/appdata/plugins/` copy the host actually
+loads was not. All 64 channels were off air for 27 minutes, 13:48–14:15 UTC
+(9:48–10:15am ET), across 35 restarts. Every test passed the whole time,
+because the test suite only ever sees `examples/`.
+
+A change to the list therefore has to reach three sets of scripts:
+
+| Where | How it is checked |
+|---|---|
+| `examples/plugins/*.rhai` | `cargo test` — `crates/etv-station/tests/plugin_dirs_satisfy_contract.rs` |
+| `deploy/appdata/plugins/*.rhai` | the same test, which skips when the directory is absent (it is gitignored, so a worktree and a fresh clone have no copy) |
+| whatever else is already on the host | `admin plugin-check` — nothing else can see these |
+
+That third row is the one that matters. A host carries scripts with no
+counterpart here at all, and `admin deploy files` never removes them
+(`delete = false` is correct: the same directory holds `catalog.db`,
+`history.db` and the HLS working set). The station's plugin directory held
+`taste-engine.rhai` — a `pool_provider` with no `audit()`, existing nowhere in
+this repo, and harmless only because its single reference sat inside a YAML
+comment. No check that compares local files to their counterparts can express
+that case, so `admin plugin-check` copies the host's whole plugin directory
+down and walks it with `etv-station --check-plugins`, using the binary on your
+branch rather than the one already deployed.
+
+Run `admin plugin-check` before `admin deploy image` whenever the contract
+changed — a new required function, a renamed hook, a new required capability.
+
 #### `capabilities()` — which host inputs a script needs (#167)
 
 Nothing is available to a script ambiently beyond `ctx.pool`, `ctx.config`,

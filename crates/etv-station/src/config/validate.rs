@@ -800,19 +800,24 @@ fn validate_plugin_declares_pool_provider(
         )));
     }
     // Checked after the hook check, not before — a script declaring only
-    // `sequencer` (or nothing) should still be told about that first. `audit`
-    // is the fifth `pool_provider` contract function (ADR 0011/0013): a
-    // script that ranks but cannot explain itself fails to load, the same as
-    // one that never declared `pick()`.
-    let declares_audit = crate::score::declares_audit(&script_path)
+    // `sequencer` (or nothing) should still be told about that first. The
+    // functions a declared hook makes mandatory are
+    // [`crate::score::REQUIRED_HOOK_FNS`]: a script that ranks but cannot
+    // explain itself fails to load, the same as one that never declared
+    // `pick()`. Adding to that list is a breaking change for every plugin
+    // script on a deployed host, including ones with no copy in this
+    // checkout — read its doc comment before you do.
+    let missing = crate::score::missing_required_fns(&script_path, &hooks)
         .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
-    if !declares_audit {
+    if let Some(req) = missing.first() {
         return Err(bad(format!(
             "pool {:?} names plugin {} via `plugin:`, which declares the \
-             `pool_provider` hook but implements no `audit(ctx, picks, workspace)` — \
-             every pool_provider must explain its picks",
+             `{}` hook but implements no `{}` — {}",
             pool.name,
-            script_path.display()
+            script_path.display(),
+            req.hook,
+            req.signature,
+            req.why
         )));
     }
     Ok(())
