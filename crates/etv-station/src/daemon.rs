@@ -1813,7 +1813,88 @@ async fn wipe_playout_from(
             }
         }
     }
+    // The file that *contains* `from` is truncated, not spared. Sparing it whole
+    // was the older behaviour and it silently moved the real cut forward to the
+    // next chunk boundary — with `chunk_hours: 6`, up to twelve hours past the
+    // instant the caller asked for, so a forced refresh left most of a day of
+    // stale schedule in place and looked like it had done nothing.
+    for f in files.iter().filter(|f| f.start < from && f.finish > from) {
+        removed += truncate_playout_at(f, from).await?;
+    }
     Ok(removed)
+}
+
+/// Rewrite one chunk file so it holds only items finishing at or before `cut`,
+/// renaming it so its span stops claiming what it no longer covers.
+///
+/// The rename is the load-bearing half. A playout file's name is a claim about
+/// what is inside it, and ErsatzTV-next picks a file by that name before looking
+/// at any item — so a truncated file left under its old name is an over-claiming
+/// file, gets chosen for a time it no longer covers, and plays black (ADR 0003).
+///
+/// Returns 1 when nothing survived and the file was removed, so the caller's
+/// count stays a count of files gone.
+async fn truncate_playout_at(
+    f: &scan::DiscoveredFile,
+    cut: OffsetDateTime,
+) -> Result<usize, StationError> {
+    let bytes = tokio::fs::read(&f.path)
+        .await
+        .map_err(|source| StationError::Io {
+            path: f.path.clone(),
+            source,
+        })?;
+    let playout: Playout =
+        serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
+            path: f.path.clone(),
+            source,
+        })?;
+
+    // Consumed by value: `PlayoutItem` is a vendored upstream type and does not
+    // implement `Clone`, so filtering a borrow is not available here.
+    let total = playout.items.len();
+    let kept: Vec<_> = playout
+        .items
+        .into_iter()
+        .filter(|i| i.finish <= cut)
+        .collect();
+    if kept.len() == total {
+        return Ok(0);
+    }
+    if kept.is_empty() {
+        match tokio::fs::remove_file(&f.path).await {
+            Ok(()) => return Ok(1),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(StationError::Io {
+                    path: f.path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+
+    // Keep the file's own start — it is the chunk-grid boundary emit named it
+    // for, not the first item's start — and take the finish from what survived.
+    let finish = kept
+        .iter()
+        .map(|i| i.finish)
+        .max()
+        .expect("kept is non-empty, checked above");
+    let path = f
+        .path
+        .with_file_name(crate::emit::chunk_filename(f.start, finish)?);
+    crate::atomic::atomic_write_json(&path, &Playout::new(kept)).await?;
+    if path != f.path
+        && let Err(source) = tokio::fs::remove_file(&f.path).await
+        && source.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(StationError::Io {
+            path: f.path.clone(),
+            source,
+        });
+    }
+    Ok(0)
 }
 
 /// The instant the ledger may be truncated from after a wipe: where the
@@ -1925,6 +2006,70 @@ mod regen_floor_tests {
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
         }
+    }
+
+    /// A forced refresh cuts at the airing item's finish, not at the end of the
+    /// chunk that contains it.
+    ///
+    /// Six one-hour films fill a 6-hour chunk from 00:00. At 00:30 the first is
+    /// on screen, so the cut belongs at 01:00 and films 2-6 must be gone. The
+    /// old path returned `regen_floor(now)`, which read the *last* item of the
+    /// surrounding chunk and answered 06:00 — every remaining film survived and
+    /// a refresh looked like it had done nothing. Observed in prod on
+    /// 2026-08-31: a refresh at 14:19 left the schedule untouched until 23:00.
+    #[tokio::test]
+    async fn a_refresh_cuts_at_the_airing_items_finish_not_the_chunks() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let anchor = datetime!(2026-01-01 00:00 UTC);
+        let items: Vec<_> = (0..6).map(|i| film(&format!("f{i}"), 3600)).collect();
+        let durations = vec![Duration::from_secs(3600); 6];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        let now = anchor + time::Duration::minutes(30);
+        let cut = airing_item_finish(&channel, now).await.unwrap();
+        assert_eq!(
+            cut,
+            anchor + time::Duration::hours(1),
+            "the cut must be the airing item's finish, not the chunk's last item",
+        );
+
+        wipe_playout_from(&channel, cut).await.unwrap();
+
+        // Everything past the cut is gone, and what remains stops claiming it.
+        let files = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        let highest = scan::highest_finish(&files).await;
+        assert_eq!(
+            highest,
+            Some(cut),
+            "a surviving file may not claim a span past the cut (ADR 0003)",
+        );
+
+        let mut surviving = Vec::new();
+        for f in &files {
+            let bytes = tokio::fs::read(&f.path).await.unwrap();
+            let playout: Playout = serde_json::from_slice(&bytes).unwrap();
+            surviving.extend(playout.items.into_iter().map(|i| i.finish));
+        }
+        assert!(
+            surviving.iter().all(|finish| *finish <= cut),
+            "no item may survive past the cut, found {surviving:?}",
+        );
+        assert_eq!(surviving.len(), 1, "only the airing film should remain");
     }
 
     /// The exact #153 shape: an 8-hour film starting an hour before a 6-hour
@@ -2210,14 +2355,56 @@ async fn take_refresh_request(output: &Path) -> Result<bool, StationError> {
     }
 }
 
+/// The instant a forced refresh cuts at: the finish of the item airing at
+/// `now`, so the wipe starts at the next programme rather than mid-item.
+///
+/// **Distinct from [`regen_floor`], which answers a different question.** That
+/// one is handed a chunk boundary by the coverage-heal path and advances past
+/// whatever item straddles it. Handed `now` instead, it returns the finish of
+/// the *last item in the whole surrounding chunk* — which is why a forced
+/// refresh used to cut hours later than the caller asked for.
+///
+/// Returns `now` unchanged when nothing is airing: a gap in coverage, or a
+/// channel whose schedule has not reached `now`. There is no item to protect,
+/// so there is nothing to advance past.
+async fn airing_item_finish(
+    channel: &LoadedChannel,
+    now: OffsetDateTime,
+) -> Result<OffsetDateTime, StationError> {
+    let files = scan::scan_output_folder(&channel.output_folder).await?;
+    let mut cut = now;
+    // Every file that could hold the airing item, not just one: `emit_window`
+    // writes a boundary-straddling item whole into both neighbouring chunks, so
+    // the item on screen at a seam is in two of them.
+    for f in files.iter().filter(|f| f.start <= now && f.finish >= now) {
+        let bytes = tokio::fs::read(&f.path)
+            .await
+            .map_err(|source| StationError::Io {
+                path: f.path.clone(),
+                source,
+            })?;
+        let playout: Playout =
+            serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
+                path: f.path.clone(),
+                source,
+            })?;
+        for item in &playout.items {
+            if item.start <= now && item.finish > now {
+                cut = cut.max(item.finish);
+            }
+        }
+    }
+    Ok(cut)
+}
+
 /// Throw the schedule away from the next item boundary forward and let the
 /// generation loop rebuild it.
 ///
-/// `regen_floor` is what makes this safe to run against a live channel: it
-/// advances past the item currently on screen to its real finish, so the wipe
-/// starts at the next programme rather than in the middle of this one.
-/// Everything before that — the whole aired past, and the item playing now — is
-/// left exactly as it is.
+/// [`airing_item_finish`] is what makes this safe to run against a live
+/// channel: it advances past the item currently on screen to its real finish,
+/// so the wipe starts at the next programme rather than in the middle of this
+/// one. Everything before that — the whole aired past, and the item playing
+/// now — is left exactly as it is.
 async fn refresh_forward(
     channel: &LoadedChannel,
     ctx: StationContext<'_>,
@@ -2226,7 +2413,7 @@ async fn refresh_forward(
     reason: &'static str,
 ) -> Result<(), StationError> {
     let output = &channel.output_folder;
-    let regen_from = regen_floor(channel, now).await?;
+    let regen_from = airing_item_finish(channel, now).await?;
     let removed = wipe_playout_from(channel, regen_from).await?;
     // Best-effort pool alignment: rewind to the checkpoint covering the cut if
     // one survives, else leave the pools where they are and accept a seam
