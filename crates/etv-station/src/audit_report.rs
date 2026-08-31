@@ -213,22 +213,33 @@ fn render_detail(out: &mut String, detail: &serde_json::Map<String, serde_json::
     }
 }
 
-/// An item's start, to the second and without the trailing offset noise.
+/// An item's start, to the second and without the sub-second noise.
 ///
 /// The raw `OffsetDateTime` renders as `2026-08-31 17:47:18.442285 +00:00:00`.
-/// Sub-second precision on a programme start is noise a reader has to look
-/// past on every line, and the offset is always UTC here because that is what
-/// the playout files store.
+/// Microseconds on a programme start are something a reader has to look past on
+/// every line, so they go.
+///
+/// The offset does not. Playout files store UTC today, and this printed a bare
+/// `Z` on that assumption — but a `Z` stamped on a timestamp that is not UTC is
+/// not tidier, it is wrong, and it would be wrong silently in a report whose
+/// entire job is to be trusted about when something airs. A non-UTC offset
+/// prints itself instead.
 fn clock(t: OffsetDateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+    let stamp = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         t.year(),
         u8::from(t.month()),
         t.day(),
         t.hour(),
         t.minute(),
         t.second(),
-    )
+    );
+    let offset = t.offset();
+    if offset.is_utc() {
+        return format!("{stamp}Z");
+    }
+    let (h, m, _) = offset.as_hms();
+    format!("{stamp} {:+03}:{:02}", h, m.abs())
 }
 
 /// Lifted from `taste-debug`'s printer (ADR 0002: metadata is opaque to the
