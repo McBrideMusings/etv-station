@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
 use etv_station::config::DatastoreGrant;
 use etv_station::score::{
-    declared_capabilities, declared_hooks, pick, Capability, GrantedCapabilities, PickedItem,
-    ScoreCache, ScoreInputs,
+    Capability, GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs, declared_capabilities,
+    declared_hooks, pick,
 };
 
 fn plugin_path() -> PathBuf {

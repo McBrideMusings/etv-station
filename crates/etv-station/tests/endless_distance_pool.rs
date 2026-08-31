@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use etv_station::catalog::{Catalog, Entry, Source};
 use etv_station::config::DatastoreGrant;
-use etv_station::score::{pick, GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
+use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs, pick};
 
 const PLUGIN: &str = "../../examples/plugins/endless-distance.rhai";
 
