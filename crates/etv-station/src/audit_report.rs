@@ -113,7 +113,7 @@ pub fn render(channel: &str, generated_at: OffsetDateTime, items: &[ReportItem])
     for item in items {
         out.push('\n');
         let title = item.title.as_deref().unwrap_or(item.id.as_str());
-        out.push_str(&format!("{} — {title}\n", item.start));
+        out.push_str(&format!("{} — {title}\n", clock(item.start)));
         render_audit_trail(&mut out, item.metadata.as_ref());
     }
     out
@@ -142,20 +142,93 @@ fn render_audit_trail(out: &mut String, metadata: Option<&serde_json::Value>) {
         let stage = map.get("stage").map(format_value).unwrap_or_default();
         let by = map.get("by").map(format_value).unwrap_or_default();
         let verdict = map.get("verdict").map(format_value).unwrap_or_default();
-        out.push_str(&format!("    [{stage}] {by}: {verdict}"));
+        out.push_str(&format!("    [{stage}] {by}: {verdict}\n"));
 
         if let Some(detail) = map.get("detail").and_then(|d| d.as_object()) {
-            let fields = detail
-                .iter()
-                .map(|(k, v)| format!("{k}={}", format_value(v)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !fields.is_empty() {
-                out.push_str(&format!(" ({fields})"));
+            render_detail(out, detail);
+        }
+    }
+}
+
+/// Render a stage's `detail` map as an aligned block, one key per line.
+///
+/// It used to be one inline `(a=1 b=2 …)` parenthetical, which held up for the
+/// three scalars #392 put there and collapsed the moment #393 added a list of
+/// near-miss candidates: the whole list serialized as raw JSON on one line,
+/// several hundred characters wide, and the numbers a reader actually wanted
+/// were buried in it.
+///
+/// Still entirely key-agnostic (ADR 0002) — no key name appears in this
+/// function, so a script adding one needs no change here. The only thing it
+/// branches on is a value's JSON *shape*.
+fn render_detail(out: &mut String, detail: &serde_json::Map<String, serde_json::Value>) {
+    let width = detail.keys().map(|k| k.len()).max().unwrap_or(0);
+    for (key, value) in detail {
+        match value {
+            // A list of records — near-miss candidates, and anything else
+            // shaped like them — gets one line each rather than one long line.
+            serde_json::Value::Array(items)
+                if items.iter().any(|i| i.is_object()) && !items.is_empty() =>
+            {
+                out.push_str(&format!("        {key}:\n"));
+                for entry in items {
+                    match entry.as_object() {
+                        Some(fields) => {
+                            let rendered = fields
+                                .iter()
+                                .map(|(k, v)| format!("{k}={}", format_value(v)))
+                                .collect::<Vec<_>>()
+                                .join("  ");
+                            out.push_str(&format!("          - {rendered}\n"));
+                        }
+                        None => out.push_str(&format!("          - {}\n", format_value(entry))),
+                    }
+                }
+            }
+            // An empty list is worth saying out loud: for a near-miss list it
+            // means the pick beat nothing that placed near it, which is a real
+            // finding and not the same as the key being absent.
+            serde_json::Value::Array(items) if items.is_empty() => {
+                out.push_str(&format!("        {key:<width$}  (none)\n"));
+            }
+            serde_json::Value::Object(fields) => {
+                out.push_str(&format!("        {key}:\n"));
+                let inner = fields.keys().map(|k| k.len()).max().unwrap_or(0);
+                for (k, v) in fields {
+                    out.push_str(&format!(
+                        "          {k:<inner$}  {}\n",
+                        format_value(v),
+                        inner = inner
+                    ));
+                }
+            }
+            other => {
+                out.push_str(&format!(
+                    "        {key:<width$}  {}\n",
+                    format_value(other),
+                    width = width
+                ));
             }
         }
-        out.push('\n');
     }
+}
+
+/// An item's start, to the second and without the trailing offset noise.
+///
+/// The raw `OffsetDateTime` renders as `2026-08-31 17:47:18.442285 +00:00:00`.
+/// Sub-second precision on a programme start is noise a reader has to look
+/// past on every line, and the offset is always UTC here because that is what
+/// the playout files store.
+fn clock(t: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+    )
 }
 
 /// Lifted from `taste-debug`'s printer (ADR 0002: metadata is opaque to the
@@ -171,8 +244,17 @@ fn format_value(v: &serde_json::Value) -> String {
                 .join(", ")
         ),
         serde_json::Value::String(s) => s.clone(),
+        // A whole number prints whole. Rhai has one numeric type, so a count
+        // and a rank arrive as floats and rendered at a fixed 4dp they read as
+        // `candidate_count=11543.0000` and `rank=9.0000` — precision that is
+        // not merely noise but actively misleading about what the value is.
+        // A genuine fraction keeps 4dp, trailing zeros trimmed.
         serde_json::Value::Number(n) => match n.as_f64() {
-            Some(f) => format!("{f:.4}"),
+            Some(f) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", f as i64),
+            Some(f) => {
+                let s = format!("{f:.4}");
+                s.trim_end_matches('0').trim_end_matches('.').to_string()
+            }
             None => n.to_string(),
         },
         other => other.to_string(),
@@ -307,7 +389,49 @@ mod tests {
 
         let items = upcoming(dir.path(), start, 10).await.unwrap();
         let report = render("ch", start, &items);
-        assert!(report.contains("a_key_this_test_made_up=42.0000"));
+        // The key appears with no code here naming it, and its whole-number
+        // value renders whole — `42`, not the `42.0000` a fixed 4dp produced.
+        assert!(
+            report.contains("a_key_this_test_made_up  42\n"),
+            "expected the invented key rendered whole, got:\n{report}",
+        );
+    }
+
+    /// A list of records renders one entry per line, not as raw JSON.
+    ///
+    /// #393's near-miss list was the case that broke the old inline
+    /// parenthetical: several hundred characters of serialized JSON on one
+    /// line, with the score and rank a reader wanted buried inside it. Still
+    /// key-agnostic — this test invents its own field names and none of them
+    /// appears in `render_detail`.
+    #[test]
+    fn a_list_of_records_renders_one_per_line() {
+        let mut out = String::new();
+        let detail = serde_json::json!({
+            "candidate_count": 11543.0,
+            "rank": 9.0,
+            "score": 7.718826072245981,
+            "beaten_by": [
+                { "who": "imdb:tt1235827", "by_how_much": 0.5 },
+                { "who": "imdb:tt11736638", "by_how_much": 1.25 },
+            ],
+            "nothing_here": [],
+        });
+        render_detail(&mut out, detail.as_object().unwrap());
+
+        assert!(out.contains("candidate_count  11543\n"), "got:\n{out}");
+        assert!(out.contains("rank             9\n"), "got:\n{out}");
+        assert!(out.contains("score            7.7188\n"), "got:\n{out}");
+        assert!(out.contains("beaten_by:\n"), "got:\n{out}");
+        assert!(
+            out.contains("          - by_how_much=0.5  who=imdb:tt1235827\n"),
+            "got:\n{out}",
+        );
+        assert!(out.contains("(none)"), "an empty list says so; got:\n{out}");
+        assert!(
+            !out.contains('{') && !out.contains('"'),
+            "no raw JSON should survive into the report; got:\n{out}",
+        );
     }
 
     fn plain_item(id: &str, start: OffsetDateTime, finish: OffsetDateTime) -> PlayoutItem {

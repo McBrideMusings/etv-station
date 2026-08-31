@@ -817,6 +817,10 @@ pub fn build(
     // `Pool::constraints` already documents as "blind across pools" — pools
     // that must stay apart have to be disjoint by construction.
     let mut guide_out: HashMap<String, GuideConfig> = HashMap::new();
+    // Per-id audit blobs the walk builds as it draws, folded into the metadata
+    // map at the end. `Option<Value>` rather than `Value` so it plugs straight
+    // into `audit::push_stage`, which owns creating the blob.
+    let mut audit_out: HashMap<String, Option<serde_json::Value>> = HashMap::new();
     let mut laid = Duration::ZERO;
     for cycle in 0..cycles {
         // Checked between cycles, never inside one: a cycle is the unit the
@@ -878,6 +882,40 @@ pub fn build(
                     guide_out.insert(id.clone(), guide.clone());
                 }
             }
+            // Every drawn id gets a `pool` stage, including one a plugin pool
+            // produced — the plugin's own `audit()` says how it *ranked*, this
+            // says which pool the slot drew from and how. Before this, the 60
+            // channels with no `plugin:` pool wrote no trail at all and every
+            // item in their report read "unexplained", which is the wrong way
+            // round: a channel selecting by a plain expression is the one a
+            // reader has least other insight into.
+            if !drawn.is_empty() {
+                let cfg = &runtimes[idx].cfg;
+                let (by, verdict) = pool_provenance(cfg);
+                let mut detail = serde_json::Map::new();
+                detail.insert("pool".into(), serde_json::Value::String(cfg.name.clone()));
+                detail.insert(
+                    "take".into(),
+                    serde_json::Value::String(format!("{:?}", step.take)),
+                );
+                detail.insert(
+                    "from".into(),
+                    serde_json::Value::String(format!("{:?}", step.from)),
+                );
+                if let Some(expr) = &cfg.expr {
+                    detail.insert("expr".into(), serde_json::Value::String(expr.clone()));
+                }
+                for id in &drawn {
+                    let entry = audit_out.entry(id.clone()).or_insert(None);
+                    crate::audit::push_stage(
+                        entry,
+                        "pool",
+                        by.clone(),
+                        verdict.clone(),
+                        Some(serde_json::Value::Object(detail.clone())),
+                    );
+                }
+            }
             out.extend(drawn);
         }
     }
@@ -906,13 +944,80 @@ pub fn build(
     // the take-override half, which stays behind on each `PoolRuntime` for
     // #173 to read. See [`flatten_picked_extras`] (#203) for why the pool
     // half of the key is dropped here.
-    let metadata_out = flatten_picked_extras(score_cache.picked_extras);
+    let mut metadata_out = flatten_picked_extras(score_cache.picked_extras);
+    // Fold each id's `pool` stage into the same blob a plugin pick's metadata
+    // lands in, so one item carries one `audit` array whatever produced it.
+    // A plugin pool's ranking record was written first, in `score`, so
+    // appending here keeps the array in the order the stages actually acted.
+    for (id, staged) in audit_out {
+        let Some(staged) = staged else { continue };
+        match metadata_out.get_mut(&id) {
+            Some(existing) => merge_audit_into(existing, staged),
+            None => {
+                metadata_out.insert(id, staged);
+            }
+        }
+    }
     Ok(BlockBuild {
         ids: out,
         resume: resume_out,
         metadata: metadata_out,
         guides: guide_out,
     })
+}
+
+/// Append `staged`'s `audit` records onto `existing`'s, leaving every other
+/// key of both blobs alone.
+///
+/// Needed because a plugin pool writes its ranking record into
+/// `picked_extras` during `score`, and the `pool` stage above is written
+/// later against the same id — two producers, one array, and a plain insert
+/// would drop whichever wrote first.
+fn merge_audit_into(existing: &mut serde_json::Value, staged: serde_json::Value) {
+    let Some(incoming) = staged.get("audit").and_then(|a| a.as_array()) else {
+        return;
+    };
+    let Some(obj) = existing.as_object_mut() else {
+        return;
+    };
+    obj.entry("audit")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("`audit` is always inserted as an array")
+        .extend(incoming.iter().cloned());
+}
+
+/// How a pool identifies itself in an audit record, and what it says it did.
+///
+/// `by` names the mechanism the way the plugin path already does
+/// (`plugin:taste-cosine`), so a report can be filtered across 64 channels on
+/// one axis regardless of how each one picks.
+fn pool_provenance(cfg: &Pool) -> (String, String) {
+    if let Some(plugin) = &cfg.plugin {
+        let name = plugin
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| plugin.to_string_lossy().into_owned());
+        (
+            format!("plugin:{name}"),
+            format!("drawn from plugin pool {:?}", cfg.name),
+        )
+    } else if cfg.expr.is_some() {
+        (
+            format!("expr:{}", cfg.name),
+            format!("matched pool {:?}'s expression", cfg.name),
+        )
+    } else if !cfg.groups.is_empty() {
+        (
+            format!("groups:{}", cfg.name),
+            format!("drawn from pool {:?}'s show groups", cfg.name),
+        )
+    } else {
+        (
+            format!("pool:{}", cfg.name),
+            format!("drawn from pool {:?}", cfg.name),
+        )
+    }
 }
 
 /// Flatten `ScoreCache::picked_extras`'s metadata half down to a plain
