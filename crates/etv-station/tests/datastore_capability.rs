@@ -101,8 +101,9 @@ fn pick(ctx) {
         throw "pooled_taste_vector: does not equal taste_vector_for(42) for the sole account";
     }
 
-    ["ok"]
+    #{ picks: ["ok"], workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#;
 
 /// The acceptance criterion: a plugin in a channel with the grant can call

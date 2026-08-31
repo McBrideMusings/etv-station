@@ -572,6 +572,14 @@ fn pick(ctx) {
 
     let out = [];
     for s in scored { out.push(s.id); }
+    #{ picks: out, workspace: () }
+}
+// A shipped script's `audit()` must derive purely from `picks`/`workspace`
+// (#389, ADR 0011) — `--check-determinism` runs pick() and audit() twice, and
+// anything unpinned here would newly fail that check.
+fn audit(ctx, picks, workspace) {
+    let out = #{};
+    for id in picks { out[id] = #{ stage: "pool", by: "test:ctx-seed", verdict: "shuffled by ctx.seed" }; }
     out
 }
 "#;

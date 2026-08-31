@@ -12,11 +12,12 @@
 // inside a plugin today — the catalog's `show_id` is derived from the show's
 // *title*, not a GUID, and no reader accessor maps an item to its show.
 //
-// Four functions make up the contract (see docs/schema.md "Pool `plugin`"):
-//   hooks()         -> ["pool_provider"]
-//   capabilities()  -> ["catalog_read", #{ datastore: "taste_db" }]
-//   sources()       -> #{ movies: cel_expression }
-//   pick(ctx)       -> [#{ entry_id, metadata }, …]
+// Five functions make up the contract (see docs/schema.md "Pool `plugin`"):
+//   hooks()               -> ["pool_provider"]
+//   capabilities()        -> ["catalog_read", #{ datastore: "taste_db" }]
+//   sources()             -> #{ movies: cel_expression }
+//   pick(ctx)             -> #{ picks: [#{ entry_id, metadata }, …], workspace }
+//   audit(ctx, picks, ws) -> #{ entry_id: stage_record }
 //
 // ctx carries (docs/schema.md § capabilities()):
 //   ctx.sets.movies   every movie the sources() query matched
@@ -264,6 +265,23 @@ fn pick(ctx) {
 
     if out.len == 0 {
         throw "endless-distance: could not find a candidate within reach of the starting point";
+    }
+    #{ picks: out, workspace: () }
+}
+
+// The fifth pool_provider contract function (#389, ADR 0011, ADR 0013):
+// called once per generation, immediately after pick(), handed back the list
+// pick() returned. This is the minimum contract — stage/by/verdict only, no
+// detail — filling detail with the distance is #392, naming a rejection is
+// #393.
+fn audit(ctx, picks, workspace) {
+    let out = #{};
+    for p in picks {
+        out[p.entry_id] = #{
+            stage: "pool",
+            by: "plugin:endless-distance",
+            verdict: "walked to the nearest in-band keyword neighbour",
+        };
     }
     out
 }

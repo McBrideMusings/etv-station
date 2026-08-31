@@ -643,8 +643,9 @@ fn pick(ctx) {
     rows.sort(|a, b| if a.year < b.year { -1 } else if a.year > b.year { 1 } else { 0 });
     let out = [];
     for r in rows { out.push(r.entry_id); }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
     )
     .unwrap();

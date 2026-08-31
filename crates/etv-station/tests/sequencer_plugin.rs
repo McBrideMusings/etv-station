@@ -345,10 +345,21 @@ fn arrange(ctx) {
 const MIXED_SHAPES: &str = r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
 fn pick(ctx) {
-    [
-        #{ entry_id: "mov-a", metadata: #{ reason: "won an Oscar" } },
-        "mov-b",
-    ]
+    #{
+        picks: [
+            #{ entry_id: "mov-a", metadata: #{ reason: "won an Oscar" } },
+            "mov-b",
+        ],
+        workspace: (),
+    }
+}
+fn audit(ctx, picks, workspace) {
+    let out = #{};
+    for p in picks {
+        let id = if type_of(p) == "map" { p.entry_id } else { p };
+        out[id] = #{ stage: "pool", by: "test", verdict: "picked" };
+    }
+    out
 }
 "#;
 
@@ -379,15 +390,18 @@ fn a_records_metadata_reaches_the_resolved_item_on_a_sequencer_block() {
     .unwrap();
 
     let a = items.iter().find(|i| i.id == "mov-a").expect("mov-a airs");
-    assert_eq!(
-        a.metadata,
-        Some(serde_json::json!({ "reason": "won an Oscar" })),
-        "the record's metadata must reach the resolved item on a sequencer block"
-    );
+    let a_meta = a.metadata.as_ref().expect("mov-a carries metadata");
+    assert_eq!(a_meta["reason"], serde_json::json!("won an Oscar"));
+    assert_eq!(a_meta["audit"][0]["by"], serde_json::json!("test"));
+
+    // Every plugin pick now carries an `audit` array (#389, ADR 0011), so a
+    // bare id attaches no *plugin-authored* key beyond it — not "no metadata
+    // at all", which held before this existed.
     let b = items.iter().find(|i| i.id == "mov-b").expect("mov-b airs");
-    assert!(
-        b.metadata.is_none(),
-        "a bare id must attach no metadata — the widening is additive"
+    let b_meta = b.metadata.as_ref().expect("mov-b carries its audit trail");
+    assert_eq!(
+        b_meta.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["audit"]
     );
 }
 
@@ -435,21 +449,27 @@ async fn a_records_metadata_is_readable_in_the_emitted_playout_json_for_a_sequen
         .iter()
         .find(|i| i.id == "mov-a")
         .expect("mov-a's airing is in the emitted file");
-    assert_eq!(
-        a.metadata,
-        Some(serde_json::json!({ "reason": "won an Oscar" })),
-        "the record's metadata must be readable in the emitted playout JSON for a sequencer block"
-    );
+    let a_meta = a
+        .metadata
+        .as_ref()
+        .expect("mov-a's airing carries metadata");
+    assert_eq!(a_meta["reason"], serde_json::json!("won an Oscar"));
+    assert_eq!(a_meta["audit"][0]["by"], serde_json::json!("test"));
     let b = playout
         .items
         .iter()
         .find(|i| i.id == "mov-b")
         .expect("mov-b's airing is in the emitted file");
-    assert!(
-        b.metadata.is_none(),
-        "a bare id's airing must carry no metadata key at all"
+    let b_meta = b
+        .metadata
+        .as_ref()
+        .expect("mov-b's airing carries its audit trail");
+    assert_eq!(
+        b_meta.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["audit"],
+        "a bare id's airing carries no plugin-authored key beyond the audit trail"
     );
 
     let raw = String::from_utf8(bytes).unwrap();
-    assert_eq!(raw.matches("\"metadata\"").count(), 1, "raw JSON: {raw}");
+    assert_eq!(raw.matches("\"metadata\"").count(), 2, "raw JSON: {raw}");
 }

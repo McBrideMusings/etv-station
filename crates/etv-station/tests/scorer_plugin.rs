@@ -224,8 +224,9 @@ fn pick(ctx) {
     rows.sort(|a, b| if a.year > b.year { -1 } else if a.year < b.year { 1 } else { 0 });
     let out = [];
     for r in rows { out.push(r.entry_id); }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
     );
     let got = resolve_with(
@@ -253,8 +254,9 @@ fn pick(ctx) {
     rows.sort(|a, b| if a.year > b.year { -1 } else if a.year < b.year { 1 } else { 0 });
     let out = [];
     for r in rows { out.push(r.entry_id); }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
     );
     let scifi = write_plugin(
@@ -267,8 +269,9 @@ fn pick(ctx) {
     for item in ctx.sets.movies {
         if item.genres.contains("Sci-Fi") { out.push(item.entry_id); }
     }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
     );
 
@@ -299,8 +302,9 @@ fn pick(ctx) {
             out.push(item.entry_id);
         }
     }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
     );
     let inputs = ScoreInputs {
@@ -344,8 +348,9 @@ fn sources() { #{ all: `item.year > 0` } }
 fn pick(ctx) {
     let out = [];
     for item in ctx.sets.all { out.push(item.entry_id); }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
     );
     // take = 2 with the default rotate = "visit": one visit draws two items
@@ -376,7 +381,8 @@ fn a_relative_plugin_path_resolves_against_the_channel_config() {
         plugins.join("pick-one.rhai"),
         r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { ["mov-a"] }
+fn pick(ctx) { #{ picks: ["mov-a"], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
     )
     .unwrap();
@@ -414,7 +420,7 @@ fn a_plugin_that_picks_nothing_is_an_error() {
     let p = write_plugin(
         &dir,
         "empty.rhai",
-        "fn sources() { #{} }\nfn pick(ctx) { [] }\n",
+        "fn sources() { #{} }\nfn pick(ctx) { #{ picks: [], workspace: () } }\n",
     );
     let state = GenerationState::default();
     let err = resolve_channel_with_resume(
@@ -439,36 +445,49 @@ fn a_plugin_that_picks_nothing_is_an_error() {
 const MIXED_SHAPES: &str = r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
 fn pick(ctx) {
-    [
-        #{ entry_id: "mov-a", metadata: #{ reason: "won an Oscar" } },
-        "mov-b",
-    ]
+    #{
+        picks: [
+            #{ entry_id: "mov-a", metadata: #{ reason: "won an Oscar" } },
+            "mov-b",
+        ],
+        workspace: (),
+    }
+}
+fn audit(ctx, picks, workspace) {
+    let out = #{};
+    for p in picks {
+        let id = if type_of(p) == "map" { p.entry_id } else { p };
+        out[id] = #{ stage: "pool", by: "test", verdict: "picked" };
+    }
+    out
 }
 "#;
 
 /// The whole point of the widening: a plugin can mix bare ids with records
 /// naming a `metadata` blob, and only the records' airings carry one all the
 /// way to `ResolvedItem::metadata` — the field `crate::rule::build_playout_item`
-/// copies onto `PlayoutItem::metadata` for the emitted playout JSON. An id
-/// with no record attaches nothing, which is what keeps a plugin that only
-/// ever returns bare ids producing byte-identical output to before this
-/// existed.
+/// copies onto `PlayoutItem::metadata` for the emitted playout JSON. Every
+/// plugin pick now carries an `audit` array too (#389, ADR 0011) — a bare id
+/// attaches no *plugin-authored* metadata key, but `audit()` still runs and
+/// records against it, so "no metadata at all" is no longer the invariant;
+/// "nothing but the audit trail" is.
 #[test]
-fn a_records_metadata_reaches_the_resolved_item_and_a_bare_id_carries_none() {
+fn a_records_metadata_reaches_the_resolved_item_and_a_bare_id_carries_only_its_audit_trail() {
     let dir = tempfile::tempdir().unwrap();
     let p = write_plugin(&dir, "metadata.rhai", MIXED_SHAPES);
     let items = resolve_items(&plugin_channel(&p, 2, 1), &catalog(), &Default::default()).unwrap();
 
     let a = items.iter().find(|i| i.id == "mov-a").expect("mov-a airs");
-    assert_eq!(
-        a.metadata,
-        Some(serde_json::json!({ "reason": "won an Oscar" })),
-        "the record's metadata must reach the resolved item"
-    );
+    let a_meta = a.metadata.as_ref().expect("mov-a carries metadata");
+    assert_eq!(a_meta["reason"], serde_json::json!("won an Oscar"));
+    assert_eq!(a_meta["audit"][0]["by"], serde_json::json!("test"));
+
     let b = items.iter().find(|i| i.id == "mov-b").expect("mov-b airs");
-    assert!(
-        b.metadata.is_none(),
-        "a bare id must attach no metadata — the widening is additive"
+    let b_meta = b.metadata.as_ref().expect("mov-b carries its audit trail");
+    assert_eq!(
+        b_meta.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["audit"],
+        "a bare id attaches no plugin-authored key beyond the audit trail"
     );
 }
 
@@ -484,7 +503,7 @@ fn a_non_finite_float_in_metadata_fails_channel_resolution_and_names_the_key() {
         "bad_metadata.rhai",
         r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { [#{ entry_id: "mov-a", metadata: #{ weight: 1.0 / 0.0 } }] }
+fn pick(ctx) { #{ picks: [#{ entry_id: "mov-a", metadata: #{ weight: 1.0 / 0.0 } }], workspace: () } }
 "#,
     );
     let err = resolve_items(&plugin_channel(&p, 1, 1), &catalog(), &Default::default())
@@ -500,9 +519,11 @@ fn pick(ctx) { [#{ entry_id: "mov-a", metadata: #{ weight: 1.0 / 0.0 } }] }
 /// lay the result with the real `Sequential` rule (`crate::rule::build_playout_item`
 /// is what copies `ResolvedItem::metadata` onto `PlayoutItem::metadata`), and
 /// write it with the real `emit::emit_window` — then read the actual bytes
-/// back off disk. `mov-a`'s airing carries the blob; `mov-b`'s carries no
-/// `metadata` key at all, which is what keeps a plugin that only ever
-/// returns bare ids producing byte-identical playout JSON to before #166.
+/// back off disk. `mov-a`'s airing carries the blob plus its audit trail;
+/// `mov-b`'s carries only its audit trail (#389, ADR 0011) — every plugin
+/// pick now carries a `metadata` key, so "no metadata key at all" is no
+/// longer what a bare id proves; "nothing plugin-authored beyond the audit
+/// trail" is.
 #[tokio::test]
 async fn a_records_metadata_is_readable_in_the_emitted_playout_json() {
     let dir = tempfile::tempdir().unwrap();
@@ -525,26 +546,31 @@ async fn a_records_metadata_is_readable_in_the_emitted_playout_json() {
         .iter()
         .find(|i| i.id == "mov-a")
         .expect("mov-a's airing is in the emitted file");
-    assert_eq!(
-        a.metadata,
-        Some(serde_json::json!({ "reason": "won an Oscar" })),
-        "the record's metadata must be readable in the emitted playout JSON"
-    );
+    let a_meta = a
+        .metadata
+        .as_ref()
+        .expect("mov-a's airing carries metadata");
+    assert_eq!(a_meta["reason"], serde_json::json!("won an Oscar"));
+    assert_eq!(a_meta["audit"][0]["by"], serde_json::json!("test"));
     let b = playout
         .items
         .iter()
         .find(|i| i.id == "mov-b")
         .expect("mov-b's airing is in the emitted file");
-    assert!(
-        b.metadata.is_none(),
-        "a bare id's airing must carry no metadata key at all"
+    let b_meta = b
+        .metadata
+        .as_ref()
+        .expect("mov-b's airing carries its audit trail");
+    assert_eq!(
+        b_meta.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["audit"],
+        "a bare id's airing carries no plugin-authored key beyond the audit trail"
     );
 
-    // The raw bytes make the same point the struct assertion does, in the
-    // words of the acceptance criterion: the key is present once, for the
-    // one airing that earned it.
+    // The raw bytes make the same point the struct assertions do: `metadata`
+    // is present for both airings now, not just the one that named a record.
     let raw = String::from_utf8(bytes).unwrap();
-    assert_eq!(raw.matches("\"metadata\"").count(), 1, "raw JSON: {raw}");
+    assert_eq!(raw.matches("\"metadata\"").count(), 2, "raw JSON: {raw}");
 }
 
 // ---- per-entry take override reaches the draw (#173) -----------------------
@@ -553,7 +579,8 @@ async fn a_records_metadata_is_readable_in_the_emitted_playout_json() {
 /// `take` down to 1, so `ep-2` never airs.
 const TAKE_OVERRIDE: &str = r#"
 fn sources() { #{} }
-fn pick(ctx) { [#{ entry_id: "ep-1", take: 1 }, "ep-2"] }
+fn pick(ctx) { #{ picks: [#{ entry_id: "ep-1", take: 1 }, "ep-2"], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#;
 
 /// The acceptance criterion, driven through the real resolve path: a

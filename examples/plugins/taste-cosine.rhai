@@ -2,11 +2,15 @@
 // the house's pooled taste, not by whether the house has already watched it
 // (#254).
 //
-// Four functions make up the contract:
-//   hooks()         -> [hook_name, …]                 which hooks this script implements
-//   capabilities()  -> [capability_name, …]           which host capabilities this script needs
-//   sources()       -> #{ name: cel_expression }      run once, up front
-//   pick(ctx)       -> [#{ entry_id, metadata }, …]   most-wanted first (#166's widened shape)
+// Five functions make up the contract:
+//   hooks()               -> [hook_name, …]                    which hooks this script implements
+//   capabilities()        -> [capability_name, …]              which host capabilities this script needs
+//   sources()             -> #{ name: cel_expression }         run once, up front
+//   pick(ctx)             -> #{ picks: [...], workspace }      picks, most-wanted first (#166's
+//                                                               widened shape), plus an opaque
+//                                                               working set for audit() (#389,
+//                                                               ADR 0013)
+//   audit(ctx, picks, ws) -> #{ entry_id: stage_record }       explains each pick (#389, ADR 0011)
 //
 // **Movies only.** TMDB keywords sit on movies and on shows, never on an
 // episode directly, and a plugin cannot currently resolve an episode to its
@@ -315,5 +319,22 @@ fn pick(ctx) {
         });
     }
 
+    #{ picks: out, workspace: () }
+}
+
+// The fifth pool_provider contract function (#389, ADR 0011, ADR 0013):
+// called once per generation, immediately after pick(), handed back the list
+// pick() returned. This is the minimum contract — stage/by/verdict only, no
+// detail — filling detail with the score and rejected candidates is #392,
+// naming a rejection is #393.
+fn audit(ctx, picks, workspace) {
+    let out = #{};
+    for p in picks {
+        out[p.entry_id] = #{
+            stage: "pool",
+            by: "plugin:taste-cosine",
+            verdict: "ranked by keyword cosine against pooled taste",
+        };
+    }
     out
 }

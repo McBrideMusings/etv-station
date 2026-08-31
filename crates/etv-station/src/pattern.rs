@@ -3412,8 +3412,9 @@ fn pick(ctx) {
         if !ctx.recent.contains(item.entry_id) { out.push(item.entry_id); }
     }
     out.truncate(ctx.target_count);
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         )
         .unwrap();
@@ -3464,7 +3465,8 @@ fn pick(ctx) {
             &script,
             r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { ["mov-1", "mov-2"] }
+fn pick(ctx) { #{ picks: ["mov-1", "mov-2"], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         )
         .unwrap();
@@ -3641,7 +3643,8 @@ fn pick(ctx) { ["mov-1", "mov-2"] }
             &script,
             r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { [#{ entry_id: "mov-1", take: 3 }, "mov-2"] }
+fn pick(ctx) { #{ picks: [#{ entry_id: "mov-1", take: 3 }, "mov-2"], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         )
         .unwrap();
@@ -3689,7 +3692,8 @@ fn pick(ctx) { [#{ entry_id: "mov-1", take: 3 }, "mov-2"] }
             &script_a,
             r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { [#{ entry_id: "mov-1", take: 3 }] }
+fn pick(ctx) { #{ picks: [#{ entry_id: "mov-1", take: 3 }], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         )
         .unwrap();
@@ -3698,7 +3702,8 @@ fn pick(ctx) { [#{ entry_id: "mov-1", take: 3 }] }
             &script_b,
             r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { [#{ entry_id: "mov-1", take: 7 }] }
+fn pick(ctx) { #{ picks: [#{ entry_id: "mov-1", take: 7 }], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         )
         .unwrap();
@@ -3744,7 +3749,11 @@ fn pick(ctx) { [#{ entry_id: "mov-1", take: 7 }] }
         let script = dir.join("foryou.rhai");
         std::fs::write(
             &script,
-            format!("fn sources() {{ #{{}} }}\nfn pick(ctx) {{ [{picks}] }}\n"),
+            format!(
+                "fn sources() {{ #{{}} }}\n\
+                 fn pick(ctx) {{ #{{ picks: [{picks}], workspace: () }} }}\n\
+                 fn audit(ctx, picks, workspace) {{ #{{}} }}\n"
+            ),
         )
         .unwrap();
         let mut pool = plugin_pool(&script);

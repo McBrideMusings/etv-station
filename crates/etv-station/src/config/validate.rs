@@ -799,6 +799,22 @@ fn validate_plugin_declares_pool_provider(
             hooks.join(", ")
         )));
     }
+    // Checked after the hook check, not before — a script declaring only
+    // `sequencer` (or nothing) should still be told about that first. `audit`
+    // is the fifth `pool_provider` contract function (ADR 0011/0013): a
+    // script that ranks but cannot explain itself fails to load, the same as
+    // one that never declared `pick()`.
+    let declares_audit = crate::score::declares_audit(&script_path)
+        .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
+    if !declares_audit {
+        return Err(bad(format!(
+            "pool {:?} names plugin {} via `plugin:`, which declares the \
+             `pool_provider` hook but implements no `audit(ctx, picks, workspace)` — \
+             every pool_provider must explain its picks",
+            pool.name,
+            script_path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1809,7 +1825,11 @@ mod tests {
 
     #[test]
     fn a_plugin_declaring_pool_provider_validates() {
-        validate_plugin_script(r#"fn hooks() { ["pool_provider"] }"#).unwrap();
+        validate_plugin_script(
+            r#"fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }"#,
+        )
+        .unwrap();
     }
 
     /// A relative `plugin:` path is checked against the channel config's own
@@ -1821,7 +1841,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("plugins")).unwrap();
         std::fs::write(
             dir.path().join("plugins/scorer.rhai"),
-            r#"fn hooks() { ["pool_provider"] }"#,
+            r#"fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }"#,
         )
         .unwrap();
         let channel = plugin_channel(PathBuf::from("plugins/scorer.rhai"));
@@ -1869,11 +1890,24 @@ mod tests {
         validate_plugin_script(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn sources() { throw "sources must not run at load time"; }
 fn pick(ctx) { throw "pick must not run at load time"; }
 "#,
         )
         .unwrap();
+    }
+
+    /// A `pool_provider` that declares the hook but implements no
+    /// `audit(ctx, picks, workspace)` fails to load, naming the missing
+    /// function (ADR 0011/0013) — checked after the hook check, which is why
+    /// this fixture's `hooks()` alone still needs to declare `pool_provider`.
+    #[test]
+    fn a_pool_provider_missing_audit_is_rejected_and_names_the_function() {
+        let err = validate_plugin_script(r#"fn hooks() { ["pool_provider"] }"#).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("audit"), "msg = {msg}");
+        assert!(msg.contains("scorer.rhai"), "msg = {msg}");
     }
 
     // ---- plugin capability declaration (#167) ------------------------------
@@ -1903,7 +1937,8 @@ fn pick(ctx) { throw "pick must not run at load time"; }
     #[test]
     fn a_plugin_declaring_no_capabilities_needs_no_grant() {
         validate_plugin_script_with_capabilities(
-            r#"fn hooks() { ["pool_provider"] }"#,
+            r#"fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }"#,
             vec![],
             vec![],
         )
@@ -1915,6 +1950,7 @@ fn pick(ctx) { throw "pick must not run at load time"; }
         validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { ["catalog_read", "watch_history"] }
 "#,
             vec!["catalog_read", "watch_history"],
@@ -1930,6 +1966,7 @@ fn capabilities() { ["catalog_read", "watch_history"] }
         let err = validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { ["catalog_read", "watch_history"] }
 "#,
             vec!["catalog_read"],
@@ -1948,6 +1985,7 @@ fn capabilities() { ["catalog_read", "watch_history"] }
         let err = validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { ["catalog_read"] }
 "#,
             vec!["catalog_read", "watch_history"],
@@ -1964,6 +2002,7 @@ fn capabilities() { ["catalog_read"] }
         let err = validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { [] }
 "#,
             vec!["telepathy"],
@@ -1998,6 +2037,7 @@ fn capabilities() { [] }
         validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { [#{ datastore: "taste_db" }] }
 "#,
             vec![],
@@ -2013,6 +2053,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         let err = validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { [#{ datastore: "taste_db" }] }
 "#,
             vec![],
@@ -2038,6 +2079,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         let err = validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { [#{ datastore: "taste_db" }] }
 "#,
             vec![],
@@ -2146,6 +2188,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
             validate_plugin_script_with_capabilities(
                 r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { [#{ datastore: "taste_db" }] }
 "#,
                 vec![],
@@ -2180,6 +2223,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
             validate_plugin_script_with_capabilities(
                 r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { [#{ datastore: "taste_db" }] }
 "#,
                 vec![],
@@ -2215,6 +2259,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { [#{ datastore: "taste_db" }] }
 "#,
             vec![],
@@ -2230,7 +2275,8 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
     fn a_station_granting_no_datastore_reads_no_mtime_and_logs_nothing_about_a_snapshot() {
         let (result, events) = capture_datastore_age_events(|| {
             validate_plugin_script_with_capabilities(
-                r#"fn hooks() { ["pool_provider"] }"#,
+                r#"fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }"#,
                 vec![],
                 vec![],
             )

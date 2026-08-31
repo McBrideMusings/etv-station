@@ -52,9 +52,12 @@
 //!     }
 //! }
 //!
-//! // Returns entry_ids, most-wanted first — or, per entry, a record
-//! // widening what a bare id can say (#166). Both shapes may appear in the
-//! // same returned array.
+//! // Returns an envelope (#389, ADR 0013), not a bare array — a script that
+//! // returns one fails to load, naming the expected shape. `picks` holds
+//! // entry_ids, most-wanted first — or, per entry, a record widening what a
+//! // bare id can say (#166); both shapes may appear in the same array.
+//! // `workspace` is opaque and travels unread to `audit()` below, for the
+//! // length of this one generation only.
 //! fn pick(ctx) {
 //!     // ctx.sets.movies   — array of item maps, one per match
 //!     // ctx.pool          — the name of the pool asking
@@ -75,6 +78,23 @@
 //!     // series to take. `entry_id` is required; `metadata` and `take` are
 //!     // each optional and independent of one another.
 //!     // #{ entry_id: "ghost", metadata: #{ reason: "won an Oscar" }, take: 3 }
+//!
+//!     #{ picks: ["ghost"], workspace: #{} }
+//! }
+//!
+//! // Called once per generation, immediately after pick() — handed back the
+//! // list pick() returned plus the workspace it produced (#389, ADR 0011,
+//! // ADR 0013). Required of every pool_provider: a script that ranks but
+//! // cannot explain itself fails to load. Returns one stage record per
+//! // entry_id it wants to explain — an id pick() never returned is refused,
+//! // naming the entry.
+//! fn audit(ctx, picks, workspace) {
+//!     // stage    — one of KNOWN_STAGES, a closed set the station owns
+//!     // by       — which instance acted, e.g. "plugin:taste-cosine"
+//!     // verdict  — one line in the producer's own words; never read by the
+//!     //            station
+//!     // detail   — opaque, same treatment as `metadata` above; optional
+//!     #{ "ghost": #{ stage: "pool", by: "plugin:example", verdict: "ranked highest" } }
 //! }
 //! ```
 //!
@@ -86,6 +106,10 @@
 //! rule. `take` overrides the pattern step's own `take` for that entry's
 //! series; carrying it through pool resolution is this slice's job, honouring
 //! it in the pattern walk is #173's.
+//!
+//! `audit()`'s records land under `metadata.audit`, an ordered array whose
+//! first element is this plugin's own stage record — sibling to a future
+//! `reason_set` key, never merged with it (ADR 0012).
 //!
 //! `ctx.config` is the one input the station does not construct: it is whatever
 //! the channel author wrote under that pool, converted and handed over with
@@ -356,6 +380,35 @@ pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
         hooks.push(name);
     }
     Ok(hooks)
+}
+
+/// The station-owned set of selection stages an `audit()` record may name
+/// (ADR 0011; `docs/CONTEXT.md`'s "Selection stage"): a pool ranked an item, a
+/// draw took it, a constraint kept or moved it, the pattern placed it. This
+/// slice's one producer — a `pool_provider` plugin's `audit()` — only ever
+/// emits `"pool"`; the other three are reserved for built-in machinery ADR
+/// 0011 explicitly defers ("What this does not decide").
+pub const KNOWN_STAGES: &[&str] = &["pool", "select", "constraint", "pattern"];
+
+/// Whether a plugin script declares `audit(ctx, picks, workspace)` — the
+/// fifth `pool_provider` contract function (#389, ADR 0011, ADR 0013).
+///
+/// Compile-and-inspect only, mirroring [`declared_capabilities`]'s presence
+/// probe: never runs `sources()` or `pick()`, so a load-time refusal needs no
+/// catalog handle or full generation.
+///
+/// Every failure names the script: an unreadable or uncompilable file. A
+/// missing `audit` is not a failure here — it is reported as `Ok(false)`, and
+/// it is the caller's job (config-load validation, and [`pick`] itself) to
+/// turn that into a refusal naming the pool or the plugin.
+pub fn declares_audit(script_path: &Path) -> Result<bool, String> {
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
+    let engine = engine();
+    let ast = engine
+        .compile(&source)
+        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
+    Ok(ast.iter_functions().any(|f| f.name == "audit"))
 }
 
 /// A host capability a plugin script can declare via `capabilities()` (#167).
@@ -1124,13 +1177,19 @@ pub fn pick(
         account_id: inputs.account_id,
     };
 
-    let picked: Array = engine
+    // `audit()` needs its own `ctx`, built from the same inputs `pick()` gets
+    // — cloned before the move below, since `ScoreCtx` is consumed by
+    // `Dynamic::from` (ADR 0011, ADR 0013).
+    let ctx_for_audit = ctx.clone();
+
+    let envelope: Dynamic = engine
         .call_fn(&mut scope, ast, "pick", (Dynamic::from(ctx),))
         .map_err(|e| format!("scorer plugin {}: pick(): {e}", script_path.display()))?;
+    let (picks_dyn, workspace) = parse_pick_envelope(script_path, envelope)?;
 
-    let mut out = Vec::with_capacity(picked.len());
+    let mut out = Vec::with_capacity(picks_dyn.len());
     let mut seen = std::collections::HashSet::new();
-    for (i, value) in picked.into_iter().enumerate() {
+    for (i, value) in picks_dyn.iter().cloned().enumerate() {
         let item = parse_picked_item(script_path, i, value)?;
         // A duplicate would give one item two positions in the same pool and
         // two cursors under one series key. Cheaper to reject than to explain.
@@ -1151,7 +1210,207 @@ pub fn pick(
             script_path.display()
         ));
     }
+
+    // The fifth `pool_provider` contract function (#389, ADR 0011, ADR 0013):
+    // required, same probe `declared_capabilities` uses to test for presence
+    // without running the script. Checked here too, not only at config load
+    // (`crate::config::validate`), because a unit fixture driving `pick`
+    // directly bypasses load-time validation entirely.
+    if !ast.iter_functions().any(|f| f.name == "audit") {
+        return Err(format!(
+            "scorer plugin {} declares pool_provider but implements no \
+             audit(ctx, picks, workspace) — every pool_provider must explain its picks",
+            script_path.display()
+        ));
+    }
+
+    let mut audit_scope = Scope::new();
+    let records: Map = engine
+        .call_fn(
+            &mut audit_scope,
+            ast,
+            "audit",
+            (
+                Dynamic::from(ctx_for_audit),
+                Dynamic::from_array(picks_dyn),
+                workspace,
+            ),
+        )
+        .map_err(|e| format!("scorer plugin {}: audit(): {e}", script_path.display()))?;
+    merge_audit_into_metadata(script_path, &mut out, records)?;
+
     Ok(out)
+}
+
+/// Parse `pick()`'s returned envelope `#{ picks: [...], workspace: <opaque> }`
+/// (#389, ADR 0013). There is no compatibility path — a bare array, the shape
+/// before this existed, fails naming the shape `pick()` must return instead.
+fn parse_pick_envelope(script_path: &Path, value: Dynamic) -> Result<(Array, Dynamic), String> {
+    if !value.is_map() {
+        return Err(format!(
+            "scorer plugin {}: pick() must return #{{ picks: [...], workspace: <opaque> }}, \
+             got {}",
+            script_path.display(),
+            value.type_name()
+        ));
+    }
+    let mut map = value.cast::<Map>();
+    let picks = map.remove("picks").ok_or_else(|| {
+        format!(
+            "scorer plugin {}: pick() must return #{{ picks: [...], workspace: <opaque> }} — \
+             no `picks` key",
+            script_path.display()
+        )
+    })?;
+    let picks: Array = picks.into_array().map_err(|actual| {
+        format!(
+            "scorer plugin {}: pick()'s `picks` must be an array, got {actual}",
+            script_path.display()
+        )
+    })?;
+    // Opaque and unread by the station (ADR 0002, ADR 0013) — a script that
+    // puts nothing there gets `()` back, the same as omitting the key.
+    let workspace = map.remove("workspace").unwrap_or(Dynamic::UNIT);
+    Ok((picks, workspace))
+}
+
+/// Merge each stage record `audit()` returned into the matching item's
+/// `metadata`, as the first element of an `audit` array (#389, ADR 0011) —
+/// sibling to, and never merged with, a future `reason_set` key (ADR 0012).
+///
+/// Refuses a `stage` outside [`KNOWN_STAGES`] and an `entry_id` `audit()`
+/// named that `pick()` never returned, each naming the entry — the same
+/// "cheaper to reject than explain" posture as the duplicate-id refusal in
+/// [`pick`] above. `verdict` and `detail` are never inspected, only carried:
+/// `detail` reuses the same non-finite-float refusal `metadata` already
+/// makes, the opaque treatment ADR 0002 gives both.
+fn merge_audit_into_metadata(
+    script_path: &Path,
+    items: &mut [PickedItem],
+    records: Map,
+) -> Result<(), String> {
+    for (raw_entry_id, record) in records {
+        let entry_id = raw_entry_id.to_string();
+        let item = items.iter_mut().find(|i| i.id == entry_id).ok_or_else(|| {
+            format!(
+                "scorer plugin {}: audit() named {entry_id:?}, which pick() never returned",
+                script_path.display()
+            )
+        })?;
+
+        if !record.is_map() {
+            return Err(format!(
+                "scorer plugin {}: audit() record for {entry_id:?} must be a map, got {}",
+                script_path.display(),
+                record.type_name()
+            ));
+        }
+        let map = record.cast::<Map>();
+
+        let stage = map
+            .get("stage")
+            .ok_or_else(|| {
+                format!(
+                    "scorer plugin {}: audit() record for {entry_id:?} names no `stage`",
+                    script_path.display()
+                )
+            })?
+            .clone()
+            .into_string()
+            .map_err(|actual| {
+                format!(
+                    "scorer plugin {}: audit() record for {entry_id:?}'s `stage` must be a \
+                     string, got {actual}",
+                    script_path.display()
+                )
+            })?;
+        if !KNOWN_STAGES.contains(&stage.as_str()) {
+            return Err(format!(
+                "scorer plugin {}: audit() record for {entry_id:?} names unknown stage \
+                 {stage:?} — known stages are: {}",
+                script_path.display(),
+                KNOWN_STAGES.join(", ")
+            ));
+        }
+
+        let by = map
+            .get("by")
+            .ok_or_else(|| {
+                format!(
+                    "scorer plugin {}: audit() record for {entry_id:?} names no `by`",
+                    script_path.display()
+                )
+            })?
+            .clone()
+            .into_string()
+            .map_err(|actual| {
+                format!(
+                    "scorer plugin {}: audit() record for {entry_id:?}'s `by` must be a \
+                     string, got {actual}",
+                    script_path.display()
+                )
+            })?;
+
+        let verdict = map
+            .get("verdict")
+            .ok_or_else(|| {
+                format!(
+                    "scorer plugin {}: audit() record for {entry_id:?} names no `verdict`",
+                    script_path.display()
+                )
+            })?
+            .clone()
+            .into_string()
+            .map_err(|actual| {
+                format!(
+                    "scorer plugin {}: audit() record for {entry_id:?}'s `verdict` must be a \
+                     string, got {actual}",
+                    script_path.display()
+                )
+            })?;
+
+        // Opaque, the same treatment `metadata` gets (ADR 0002) — reuses the
+        // exact non-finite-float refusal `parse_picked_item`'s own `metadata`
+        // makes, rather than a second implementation of that rule.
+        let detail = match map.get("detail") {
+            Some(v) => {
+                config_carrier::deserialize_config(DynamicDeserializer::new(v)).map_err(|e| {
+                    format!(
+                        "scorer plugin {}: audit() record for {entry_id:?} detail: {e}",
+                        script_path.display()
+                    )
+                })?
+            }
+            None => None,
+        };
+
+        let mut record_json = serde_json::Map::new();
+        record_json.insert("stage".into(), serde_json::Value::String(stage));
+        record_json.insert("by".into(), serde_json::Value::String(by));
+        record_json.insert("verdict".into(), serde_json::Value::String(verdict));
+        if let Some(detail) = detail {
+            record_json.insert("detail".into(), detail);
+        }
+
+        let metadata = item
+            .metadata
+            .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let obj = metadata.as_object_mut().ok_or_else(|| {
+            format!(
+                "scorer plugin {}: item {entry_id:?}'s metadata is not an object, cannot \
+                 attach an audit trail",
+                script_path.display()
+            )
+        })?;
+        let audit_array = obj
+            .entry("audit")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        audit_array
+            .as_array_mut()
+            .expect("`audit` is always inserted as an array")
+            .push(serde_json::Value::Object(record_json));
+    }
+    Ok(())
 }
 
 /// Parse one array element `pick()` returned into the widened record shape
@@ -1556,8 +1815,9 @@ fn pick(ctx) {
     if deep[3] != "four" { throw "string did not survive: " + deep[3]; }
     if c.weights.affinity != 3.0 { throw "nested float wrong"; }
     if c.name != "taste" { throw "top-level string wrong"; }
-    [c.first, c.second]
+    #{ picks: [c.first, c.second], workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let cfg = yaml(
@@ -1608,8 +1868,9 @@ fn pick(ctx) {
     for item in ctx.sets.movies {
         if item.entry_id == "m2" && item.library != () { throw "expected unit"; }
     }
-    ids
+    #{ picks: ids, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let got = run(
@@ -1636,8 +1897,9 @@ fn pick(ctx) {
     // erroring, so a script never has to guard before looking.
     if ctx.config.anything != () { throw "expected unit"; }
     if ctx.config.len() != 0 { throw "expected an empty map"; }
-    ["m1"]
+    #{ picks: ["m1"], workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let got = run(
@@ -1659,7 +1921,8 @@ fn pick(ctx) {
             &dir,
             r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { ["m1"] }
+fn pick(ctx) { #{ picks: ["m1"], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         // Nothing in the station knows what any of these mean, and a script that
@@ -1684,7 +1947,8 @@ fn pick(ctx) { ["m1"] }
             &dir,
             r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
-fn pick(ctx) { [ctx.config.want] }
+fn pick(ctx) { #{ picks: [ctx.config.want], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let mut cache = ScoreCache::default();
@@ -1731,8 +1995,9 @@ fn pick(ctx) {
     let ids = [];
     for item in ctx.sets.movies { ids.push(item.entry_id); }
     ids.reverse();
-    ids
+    #{ picks: ids, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let got = run(
@@ -1761,8 +2026,9 @@ fn pick(ctx) {
             out.push(item.entry_id);
         }
     }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         assert_eq!(
@@ -1792,8 +2058,9 @@ fn pick(ctx) {
         if !ctx.recent.contains(item.entry_id) { out.push(item.entry_id); }
     }
     out.truncate(ctx.target_count);
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let inputs = ScoreInputs {
@@ -1837,7 +2104,10 @@ fn pick(ctx) {
     #[test]
     fn an_empty_pick_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [] }\n");
+        let p = write(
+            &dir,
+            "fn sources() { #{} }\nfn pick(ctx) { #{ picks: [], workspace: () } }\n",
+        );
         let e = run(
             &catalog(),
             &p,
@@ -1855,7 +2125,7 @@ fn pick(ctx) {
         let dir = tempfile::tempdir().unwrap();
         let p = write(
             &dir,
-            "fn sources() { #{} }\nfn pick(ctx) { [\"m1\", \"m1\"] }\n",
+            "fn sources() { #{} }\nfn pick(ctx) { #{ picks: [\"m1\", \"m1\"], workspace: () } }\n",
         );
         let e = run(
             &catalog(),
@@ -2050,6 +2320,40 @@ fn pick(ctx) { throw "pick must not run"; }
         );
     }
 
+    // ---- audit() declaration (#389, ADR 0011, ADR 0013) --------------------
+
+    #[test]
+    fn declares_audit_reads_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "fn audit(ctx, picks, workspace) { #{} }");
+        assert!(declares_audit(&p).unwrap());
+    }
+
+    #[test]
+    fn declares_audit_reports_absence_rather_than_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, r#"fn hooks() { ["pool_provider"] }"#);
+        assert!(!declares_audit(&p).unwrap());
+    }
+
+    /// `declares_audit` never runs `sources()` or `pick()`, exactly like
+    /// `declared_hooks`/`declared_capabilities` — a load-time check must not
+    /// need a catalog.
+    #[test]
+    fn declares_audit_never_runs_sources_or_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn hooks() { ["pool_provider"] }
+fn sources() { throw "sources must not run"; }
+fn pick(ctx) { throw "pick must not run"; }
+fn audit(ctx, picks, workspace) { throw "audit must not run"; }
+"#,
+        );
+        assert!(declares_audit(&p).unwrap());
+    }
+
     // ---- runtime capability gate (#167) ------------------------------------
 
     /// A script that reaches for `ctx.history` without being granted
@@ -2133,8 +2437,9 @@ fn pick(ctx) {
     if ctx.now != 42 { throw "now wrong"; }
     if ctx.recent.len != 1 { throw "recent wrong"; }
     if ctx.config.want != "m1" { throw "config wrong"; }
-    [ctx.config.want]
+    #{ picks: [ctx.config.want], workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let mut cache = ScoreCache::default();
@@ -2174,7 +2479,9 @@ fn pick(ctx) {
         let dir = tempfile::tempdir().unwrap();
         let p = write(
             &dir,
-            "fn sources() { #{} }\nfn pick(ctx) { [ctx.seed.to_string()] }\n",
+            "fn sources() { #{} }\n\
+             fn pick(ctx) { #{ picks: [ctx.seed.to_string()], workspace: () } }\n\
+             fn audit(ctx, picks, workspace) { #{} }\n",
         );
         let mut cache = ScoreCache::default();
         cache.prepare(&catalog(), &p, None).unwrap();
@@ -2240,7 +2547,8 @@ fn pick(ctx) {
         let p = write(
             &dir,
             "fn sources() { #{} }\n\
-             fn pick(ctx) { [if ctx.account_id == () { \"none\" } else { ctx.account_id.to_string() }] }\n",
+             fn pick(ctx) { #{ picks: [if ctx.account_id == () { \"none\" } else { ctx.account_id.to_string() }], workspace: () } }\n\
+             fn audit(ctx, picks, workspace) { #{} }\n",
         );
         let mut cache = ScoreCache::default();
         cache.prepare(&catalog(), &p, None).unwrap();
@@ -2285,7 +2593,14 @@ fn pick(ctx) {
     #[test]
     fn a_bare_id_carries_no_metadata_or_take_override() {
         let dir = tempfile::tempdir().unwrap();
-        let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [\"m1\"] }\n");
+        let p = write(
+            &dir,
+            "fn sources() { #{} }\n\
+             fn pick(ctx) { #{ picks: [\"m1\"], workspace: () } }\n\
+             fn audit(ctx, picks, workspace) { \
+                 #{ \"m1\": #{ stage: \"pool\", by: \"test\", verdict: \"only one\" } } \
+             }\n",
+        );
         let mut cache = ScoreCache::default();
         cache.prepare(&catalog(), &p, None).unwrap();
         let got = pick(
@@ -2301,7 +2616,14 @@ fn pick(ctx) {
         .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "m1");
-        assert!(got[0].metadata.is_none());
+        // A bare id attaches no *plugin-authored* keys — `audit()` still runs
+        // and adds its own `metadata.audit` entry (#389), so "no metadata at
+        // all" is no longer the invariant; "nothing but the audit trail" is.
+        let meta = got[0].metadata.as_ref().unwrap();
+        assert_eq!(
+            meta.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["audit"]
+        );
         assert!(got[0].take_override.is_none());
     }
 
@@ -2316,8 +2638,12 @@ fn pick(ctx) {
             r#"
 fn sources() { #{} }
 fn pick(ctx) {
-    [#{ entry_id: "m1", metadata: #{ reason: "won an Oscar", score: 3.5, tags: ["a", "b"] } }]
+    #{
+        picks: [#{ entry_id: "m1", metadata: #{ reason: "won an Oscar", score: 3.5, tags: ["a", "b"] } }],
+        workspace: ()
+    }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let mut cache = ScoreCache::default();
@@ -2348,7 +2674,8 @@ fn pick(ctx) {
             &dir,
             r#"
 fn sources() { #{} }
-fn pick(ctx) { [#{ entry_id: "m1", take: 3 }, "m2"] }
+fn pick(ctx) { #{ picks: [#{ entry_id: "m1", take: 3 }, "m2"], workspace: () } }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let mut cache = ScoreCache::default();
@@ -2381,7 +2708,7 @@ fn pick(ctx) { [#{ entry_id: "m1", take: 3 }, "m2"] }
             &dir,
             r#"
 fn sources() { #{} }
-fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
+fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }], workspace: () } }
 "#,
         );
         let mut cache = ScoreCache::default();
@@ -2411,7 +2738,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
             let p = write(
                 &dir,
                 &format!(
-                    "fn sources() {{ #{{}} }}\nfn pick(ctx) {{ [#{{ entry_id: \"m1\", take: {take} }}] }}\n"
+                    "fn sources() {{ #{{}} }}\nfn pick(ctx) {{ #{{ picks: [#{{ entry_id: \"m1\", take: {take} }}], workspace: () }} }}\n"
                 ),
             );
             let mut cache = ScoreCache::default();
@@ -2441,7 +2768,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
         let p = write(
             &dir,
             &format!(
-                "fn sources() {{ #{{}} }}\nfn pick(ctx) {{ [#{{ entry_id: \"m1\", take: {} }}] }}\n",
+                "fn sources() {{ #{{}} }}\nfn pick(ctx) {{ #{{ picks: [#{{ entry_id: \"m1\", take: {} }}], workspace: () }} }}\n",
                 MAX_TAKE + 1
             ),
         );
@@ -2468,7 +2795,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
         let dir = tempfile::tempdir().unwrap();
         let p = write(
             &dir,
-            "fn sources() { #{} }\nfn pick(ctx) { [#{ metadata: #{ x: 1 } }] }\n",
+            "fn sources() { #{} }\nfn pick(ctx) { #{ picks: [#{ metadata: #{ x: 1 } }], workspace: () } }\n",
         );
         let mut cache = ScoreCache::default();
         cache.prepare(&catalog(), &p, None).unwrap();
@@ -2496,7 +2823,7 @@ fn pick(ctx) { [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }] }
         let p = write(
             &dir,
             r#"fn sources() { #{} }
-fn pick(ctx) { ["m1", #{ entry_id: "m1" }] }
+fn pick(ctx) { #{ picks: ["m1", #{ entry_id: "m1" }], workspace: () } }
 "#,
         );
         let mut cache = ScoreCache::default();
@@ -2513,6 +2840,203 @@ fn pick(ctx) { ["m1", #{ entry_id: "m1" }] }
         )
         .unwrap_err();
         assert!(err.contains("more than once"), "got {err}");
+    }
+
+    // ---- pick() envelope and audit() (#389, ADR 0011, ADR 0012, ADR 0013) --
+
+    /// `pick()` returning a bare array — the shape before #389 — fails to
+    /// load, naming the envelope it must return instead. There is no
+    /// compatibility path.
+    #[test]
+    fn a_bare_array_pick_return_names_the_expected_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [\"m1\"] }\n");
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("picks"), "got {err}");
+        assert!(err.contains("workspace"), "got {err}");
+    }
+
+    /// A `pool_provider` that ranks but implements no `audit()` fails at
+    /// `pick()` naming the missing function — the runtime half of the
+    /// load-time refusal `config::validate` also makes; unit fixtures that
+    /// drive `pick` directly bypass validation entirely, so this is the
+    /// backstop.
+    #[test]
+    fn pick_without_audit_names_the_missing_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            "fn sources() { #{} }\nfn pick(ctx) { #{ picks: [\"m1\"], workspace: () } }\n",
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("audit"), "got {err}");
+    }
+
+    /// `workspace` round-trips from `pick()` to `audit()` unread — a
+    /// non-trivial value (nested map, not just `()`) survives the trip
+    /// intact, which is the property `audit()` needing `pick()`'s working
+    /// set depends on (ADR 0013).
+    #[test]
+    fn workspace_reaches_audit_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) {
+    #{ picks: ["m1"], workspace: #{ candidates: ["m1", "m2"], round: 3 } }
+}
+fn audit(ctx, picks, workspace) {
+    if workspace.round != 3 { throw "workspace.round did not survive: " + workspace.round; }
+    if workspace.candidates.len != 2 { throw "workspace.candidates did not survive"; }
+    #{ "m1": #{ stage: "pool", by: "test", verdict: "workspace round-tripped" } }
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let got = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        let audit = &got[0].metadata.as_ref().unwrap()["audit"];
+        assert_eq!(
+            audit[0]["verdict"],
+            serde_json::json!("workspace round-tripped")
+        );
+    }
+
+    /// The audit trail lands under `metadata.audit`, as the first element of
+    /// an ordered array, carrying `stage`/`by`/`verdict`/`detail` exactly as
+    /// `audit()` wrote them.
+    #[test]
+    fn audit_records_land_under_metadata_audit_as_the_first_element() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { #{ picks: ["m1"], workspace: () } }
+fn audit(ctx, picks, workspace) {
+    #{ "m1": #{ stage: "pool", by: "plugin:example", verdict: "ranked highest", detail: #{ score: 0.9 } } }
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let got = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        let meta = got[0].metadata.as_ref().unwrap();
+        let audit = meta["audit"].as_array().unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0]["stage"], serde_json::json!("pool"));
+        assert_eq!(audit[0]["by"], serde_json::json!("plugin:example"));
+        assert_eq!(audit[0]["verdict"], serde_json::json!("ranked highest"));
+        assert_eq!(audit[0]["detail"]["score"], serde_json::json!(0.9));
+    }
+
+    /// An `audit()` record naming a `stage` outside the closed set is refused
+    /// at pick time, naming the entry — the same posture as every other
+    /// audit-record refusal.
+    #[test]
+    fn an_unknown_stage_is_refused_and_names_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { #{ picks: ["m1"], workspace: () } }
+fn audit(ctx, picks, workspace) {
+    #{ "m1": #{ stage: "vibes", by: "test", verdict: "felt right" } }
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("m1"), "got {err}");
+        assert!(err.contains("vibes"), "got {err}");
+    }
+
+    /// An `audit()` record naming an `entry_id` `pick()` never returned is
+    /// refused, naming the entry.
+    #[test]
+    fn an_audit_record_for_an_id_pick_never_returned_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { #{ picks: ["m1"], workspace: () } }
+fn audit(ctx, picks, workspace) {
+    #{ "ghost": #{ stage: "pool", by: "test", verdict: "never picked" } }
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("ghost"), "got {err}");
     }
 
     /// Four movies across three Plex libraries — the shape that made #210 a
@@ -2543,8 +3067,9 @@ fn sources() { #{ movies: `item.type == "movie"` } }
 fn pick(ctx) {
     let out = [];
     for item in ctx.sets.movies { out.push(item.entry_id); }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#;
 
     fn sources(pairs: &[(&str, &str)]) -> PoolSources {
@@ -2609,8 +3134,9 @@ fn pick(ctx) {
 fn pick(ctx) {
     let out = [];
     for item in ctx.sets.features { out.push(item.entry_id); }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let cat = library_catalog();

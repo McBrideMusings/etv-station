@@ -732,7 +732,7 @@ largest pool once per window, so a no-repeat rule here would just force the
 whole movie library into one window. `examples/samples/kungfu.yaml` is the
 sample that exercises the field, on CEL pools.
 
-The script defines four functions:
+The script defines five functions:
 
 ```rhai
 // Which hooks this script implements. Read at config load time, before the
@@ -749,9 +749,25 @@ fn sources() {
     #{ movies: `item.type == "movie"` }
 }
 
-// Returns entry_ids, most-wanted first — or, per entry, a record widening
-// what a bare id can say (#166): `#{ entry_id: "…", metadata: #{…}, take: 3 }`.
-fn pick(ctx) { … }
+// Returns an envelope: `picks`, most-wanted first — a bare entry_id string
+// or, per entry, a record widening what a bare id can say (#166):
+// `#{ entry_id: "…", metadata: #{…}, take: 3 }` — plus `workspace`, an
+// opaque value the station carries unread to audit() below, for the length
+// of this one generation (#389, ADR 0013). A script with nothing to hand
+// forward still returns the key, e.g. `workspace: ()`.
+fn pick(ctx) {
+    #{ picks: […], workspace: … }
+}
+
+// Called once per generation, immediately after pick(), handed back the
+// list pick() returned plus the workspace it produced (#389, ADR 0011).
+// Required of every pool_provider — a script that ranks but cannot explain
+// itself fails to load. Returns one stage record per entry_id it wants to
+// explain, keyed by that id; an id audit() names that pick() never
+// returned is refused, naming the entry.
+fn audit(ctx, picks, workspace) {
+    #{ "ghost": #{ stage: "pool", by: "plugin:example", verdict: "ranked highest" } }
+}
 ```
 
 #### Pool `sources` — the channel says which items the script may rank (#210)
@@ -809,8 +825,8 @@ the file the expression is actually written in.
 
 #### The record shape — `metadata` and a per-entry `take` (#166)
 
-Each element `pick()` returns may be a bare `entry_id` string — unchanged
-since #74 — or a record naming one plus two optional extras:
+Each element `pick()`'s `picks` array holds may be a bare `entry_id` string —
+unchanged since #74 — or a record naming one plus two optional extras:
 
 ```rhai
 #{ entry_id: "ghost", metadata: #{ reason: "won an Oscar" }, take: 3 }
@@ -837,6 +853,56 @@ place (each slot is always one item), so there is nothing for an override
 to replace there. Zero or negative fails the generation, naming the entry.
 
 The widening is additive: a script returning only bare ids needs no edit. A `sequencer:` block's plugin pool record shape parses the same way as a `pattern:` block's, and its `metadata` reaches the emitted JSON identically (#201). The per-entry `take` override remains out of scope for a sequencer block: `arrange()` already decides its own order, so what a `take` override would even mean there is a separate design question, not a plumbing gap (#201).
+
+#### `pick()`'s envelope and `workspace` (#389, ADR 0013)
+
+`pick()` returns `#{ picks: [...], workspace: <opaque> }`, not a bare array —
+there is no compatibility path, and a script returning one fails to load
+naming the shape it must return instead. `picks` is the array documented
+above; `workspace` is a value the station holds for the length of one
+generation and hands back, unread, as `audit()`'s third argument. A script
+with nothing to say puts `()` there.
+
+#### `audit(ctx, picks, workspace)` — a plugin explains its picks (#389, ADR 0011)
+
+Every scheduled item carries an `audit` array in its `metadata` — one record
+per *selection stage* (`docs/CONTEXT.md`) that acted on it, in the order they
+acted. A `pool_provider` plugin produces its own record from this
+fifth contract function, called once per generation, immediately after
+`pick()`, and handed back the list `pick()` returned plus the `workspace` it
+produced. Required of every `pool_provider`: a script declaring the hook but
+implementing no `audit()` fails to load, naming the missing function — the
+same load-time refusal `hooks()` itself gets.
+
+`audit()` returns a map keyed by `entry_id`, one stage record per id it wants
+to explain:
+
+```rhai
+#{ "ghost": #{ stage: "pool", by: "plugin:example", verdict: "ranked highest", detail: #{ score: 0.82 } } }
+```
+
+- `stage` — one of a closed, station-owned set: `pool`, `select`,
+  `constraint`, `pattern`. A `pool_provider`'s own `audit()` only ever emits
+  `"pool"` today; the other three name built-in machinery not yet
+  instrumented against this trail. An unknown value is refused at pick time,
+  naming the entry.
+- `by` — which instance acted, e.g. `"plugin:taste-cosine"`. A plain string,
+  never inspected.
+- `verdict` — one line in the producer's own words. Never read by station
+  code — a script that returns `"picked"` satisfies the contract just as
+  well as one that explains itself in detail; the station cannot tell a
+  lazy record from a thorough one.
+- `detail` — opaque, the same treatment `metadata` gets: converted and
+  carried untouched, refusing a non-finite float anywhere inside and naming
+  the key. Optional.
+
+An `entry_id` `audit()` names that `pick()` never returned is refused, the
+same "cheaper to reject than explain" posture as a duplicate pick. Each
+record lands under that item's `metadata.audit`, as the first element of an
+ordered array — sibling to a viewer-facing `reason_set` key, never merged
+with it (ADR 0012). Both shipped scripts (`taste-cosine.rhai`,
+`endless-distance.rhai`) implement the minimum: `stage`/`by`/`verdict` only,
+no `detail`, and a trivial `workspace`.
 
 #### `hooks()` — what a script says it can do
 

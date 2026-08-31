@@ -86,8 +86,9 @@ fn pick(ctx) {
 
     let out = [];
     for s in scored { out.push(s.id); }
-    out
+    #{ picks: out, workspace: () }
 }
+fn audit(ctx, picks, workspace) { #{} }
 "#;
 
 fn plugin_channel(plugin: &Path) -> ChannelConfig {
