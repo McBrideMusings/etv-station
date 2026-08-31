@@ -55,6 +55,7 @@ export default defineConfig({
           { text: '0005 — A plugin gets the channel seed', link: '/adr/0005-a-plugin-gets-the-channel-seed' },
           { text: '0006 — A catalog entry is marked missing, never deleted', link: '/adr/0006-catalog-entries-are-soft-deleted' },
           { text: '0007 — The overlay cascade hot-reloads, never respawns', link: '/adr/0007-overlay-cascade-hot-reloads-never-respawns' },
+          { text: '0008 — A cascade level can append layers', link: '/adr/0008-a-cascade-level-can-append-layers' },
           { text: '0009 — A Plex rating key\'s entry_id is pinned for life', link: '/adr/0009-a-plex-rating-keys-entry-id-is-pinned' },
           { text: '0010 — A published slot moves only for an author', link: '/adr/0010-a-published-slot-moves-only-for-an-author' },
           { text: '0011 — An audit trail is a stage list', link: '/adr/0011-an-audit-trail-is-a-stage-list-and-a-plugin-explains-itself-in-a-function' },
