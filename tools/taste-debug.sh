@@ -80,14 +80,24 @@ has_flag() {
   return 1
 }
 
-# No argument is the list mode, not a usage error: it answers "which channels
-# can I explain?". It exits 0 so `admin taste-debug` doesn't report the answer
-# as a failed step.
+flag_value() {
+  local needle="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    [ "$1" = "$needle" ] && { echo "${2:-}"; return 0; }
+    shift
+  done
+  return 1
+}
+
 if [ "${1:-}" = "--list" ]; then
   plugin_channels_tsv
   exit 0
 fi
 
+# No argument is the list mode, not a usage error: it answers "which channels
+# can I explain?". It exits 0 so `admin taste-debug` doesn't report the answer
+# as a failed step.
 if [ "$#" -eq 0 ]; then
   echo "Usage: admin taste-debug <channel> [-- taste-debug flags]"
   echo "       admin taste-debug --channel <path> [flags]   (raw passthrough)"
@@ -109,6 +119,15 @@ if [[ "$1" != --* ]]; then
   args+=(--channel "$channel_path")
 fi
 args+=("$@")
+
+# Name the resolved channel on stdout before anything else runs. `admin
+# taste-debug`'s picker erases its own menu on selection (pick_target calls
+# _home() before returning), so without this line neither the terminal nor
+# tmp/taste-debug.*.log records which channel was chosen — including on the
+# missing-database exit below, which is the most common way this ends.
+if resolved_channel="$(flag_value --channel "${args[@]}")"; then
+  echo "taste-debug: channel $resolved_channel"
+fi
 
 missing=()
 if ! has_flag --catalog "${args[@]}"; then
