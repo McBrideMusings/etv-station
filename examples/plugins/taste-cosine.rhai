@@ -29,11 +29,18 @@
 //                                                               ADR 0013)
 //   audit(ctx, picks, ws) -> #{ entry_id: stage_record }       explains each pick (#389, ADR 0011)
 //
-// **Movies only.** TMDB keywords sit on movies and on shows, never on an
-// episode directly, and a plugin cannot currently resolve an episode to its
-// show's keywords — that gap is #274 and is not a prerequisite here.
-// `sources()` below offers only `movies`, so this script never sees an
-// episode regardless of what a channel grants it.
+// **Movies or shows, one pool's `unit:` picks which.** TMDB keywords sit on
+// movies and on shows, never on an episode directly. #274 made the catalog's
+// `show_id` GUID-derived instead of title-derived, which is what lets this
+// script resolve an episode to its show and score the show's keywords — that
+// was the gap that made #254 ship movies-only, and it is closed. Verified
+// against the live snapshot: all 1,633 distinct catalog `show_id`s match a
+// `type='show'` row in the plex-db-ex store, 1,550 of them carrying
+// tmdb_keywords.
+//
+// A shows pool therefore ranks SERIES, not episodes: an episode has no
+// keywords to score, and ordering episodes by anything but season/episode
+// would air a season shuffled.
 //
 // capabilities() declares catalog_read (for ctx.sets, built from sources()
 // below), watch_history, and a named datastore grant (#181). The channel
@@ -120,6 +127,18 @@ fn recency_factor(r, half_life) {
     if r == () { 1.0 } else { r.to_float() / (r.to_float() + half_life) }
 }
 
+// How many shows a `unit = "show"` pool hands back. Not `target_count`: a
+// show expands to every episode it has, so asking for one show per scheduled
+// item would return tens of thousands of ids. This is how many series the
+// station's rotation gets to walk before it wraps — the ranking's whole
+// effect on a shows pool, since the rotation follows the order units come
+// back in.
+//
+// 12 is deliberately more than a day's rotation and far less than the
+// library: enough that a channel does not cycle the same three shows, few
+// enough that the 13th-ranked show has to earn its way up.
+fn show_count(ctx) { tunable(ctx, "show_count", 12).to_int() }
+
 // The datastore grant name this script reaches for (#181). A channel names
 // its own grant under the pool's `datastores:`; this is this script's half
 // of that contract.
@@ -135,9 +154,14 @@ fn hooks() { ["pool_provider"] }
 
 fn capabilities() { ["catalog_read", "watch_history", #{ datastore: datastore_name() }] }
 
+// Both sets this script can rank. A pool picks one with `unit:` in its
+// `config:` and SHOULD narrow `sources:` to match — a pool that overrides
+// neither resolves both sets, which on a shows pool means loading 11,543
+// movies it will never look at.
 fn sources() {
     #{
         movies: `item.type == "movie"`,
+        shows: `item.type == "episode"`,
     }
 }
 
@@ -173,15 +197,107 @@ fn unit_at(seed, nonce) {
 }
 
 fn pick(ctx) {
-    let items = ctx.sets.movies;
     let ds = ctx.datastore(datastore_name());
     let ns = enrichment_namespace();
 
-    // Every candidate's id, gathered once so enrichment can be fetched in a
+    // WHAT ONE ROW OF THE RANKING IS, and which catalog entries air when that
+    // row is picked.
+    //
+    //   unit = "movie"  a unit is one film; airing it airs that one entry.
+    //   unit = "show"   a unit is a SERIES, scored on the show's own
+    //                   keywords, and airing it makes every episode of that
+    //                   show available in season/episode order.
+    //
+    // Everything between here and the emit loop operates on units and knows
+    // nothing about which kind it has: one document-frequency pass, one
+    // cosine, one recency damping, one exploration draw. Only this block and
+    // the emit loop differ, which is why shows did not need a second script.
+    //
+    // Read from `config:` rather than inferred from which set came back: a
+    // pool that does not override `sources:` receives BOTH sets, so
+    // inference would have to guess, and guessing wrong silently ranks the
+    // wrong library. A channel says which it wants.
+    let unit_kind = tunable(ctx, "unit", "movie");
+    let units = [];
+    let members = #{};
+
+    // The airing tail, as a distance back from the newest: 1 is the last
+    // thing that aired, `recent.len` the oldest still remembered.
+    // `ctx.recent` is newest-LAST, so the distance is measured from the end.
+    // Bounded by `scoring.recent_depth` (200 by default), never by the
+    // library.
+    let recent = ctx.recent;
+    let recent_n = recent.len;
+    let aired = #{};
+    for i in 0..recent_n {
+        // A title aired more than once inside the tail keeps its most recent
+        // position: later iterations overwrite earlier ones, and later means
+        // newer.
+        aired[recent[i]] = recent_n - i;
+    }
+    // The same distance, per UNIT. For a show that means its most recently
+    // aired episode: damping keys on the series, not the episode, because a
+    // specific episode almost never repeats — damping the episode id would
+    // do nothing at all, while damping the series is exactly "Columbo has
+    // been on a lot lately".
+    let unit_recency = #{};
+
+    if unit_kind == "show" {
+        // Episodes carry `show_id` (registered on every item in score.rs),
+        // and since #274 it is GUID-derived — the same id space plex-db-ex
+        // keys its `items` rows on, which is what makes this join possible
+        // at all. Verified against the live snapshot: all 1,633 distinct
+        // show_ids in the catalog match a `type='show'` row there, 1,550 of
+        // them carrying tmdb_keywords.
+        //
+        // One pass over the episodes, grouping each under its show. An
+        // episode with no `show_id` is dropped rather than aired as a series
+        // of one — a shows pool exists to air series.
+        //
+        // Members are pushed in place (`members[sid].push(...)`) rather than
+        // read-modify-written: on a 74,815-episode catalog the latter clones
+        // a growing array per episode, which is #172's cost all over again.
+        // Each member is a compact `[season, episode, entry_id]` triple, not
+        // the whole item map, for the same reason.
+        for ep in ctx.sets.shows {
+            let sid = ep.show_id;
+            if sid == () { continue; }
+            if members[sid] == () {
+                units.push(sid);
+                members[sid] = [];
+            }
+            members[sid].push([
+                if ep.season == () { -1 } else { ep.season },
+                if ep.episode == () { -1 } else { ep.episode },
+                ep.entry_id,
+            ]);
+            // Roll this episode's airing distance up to its show, keeping the
+            // most recent. Checked inside the pass that already touches every
+            // episode, so no second walk of the library is needed to find
+            // which shows the 200-entry tail belongs to.
+            let d = aired[ep.entry_id];
+            if d != () {
+                let cur = unit_recency[sid];
+                if cur == () || d < cur { unit_recency[sid] = d; }
+            }
+        }
+    } else {
+        for item in ctx.sets.movies {
+            let id = item.entry_id;
+            units.push(id);
+            members[id] = [[-1, -1, id]];
+            let d = aired[id];
+            if d != () { unit_recency[id] = d; }
+        }
+    }
+
+    // Every unit's id, gathered once so enrichment can be fetched in a
     // single bulk call before the loop below (plex-db-ex#40) — #172 measured
     // the per-candidate alternative at 101 million steps and 6m34s on an
-    // 84,722-item library.
-    let enrichment = ds.enrichment_for_many(items.map(|item| item.entry_id), ns);
+    // 84,722-item library. On a shows pool this asks for 1,633 show ids
+    // rather than 74,815 episode ids, since an episode carries no keywords
+    // of its own.
+    let enrichment = ds.enrichment_for_many(units, ns);
 
     // One account's taste vector when the channel is `single_user`-scoped
     // (#278) and the station resolved that account's id; the house's pooled
@@ -205,25 +321,6 @@ fn pick(ctx) {
 
     let seed = ctx.seed;
 
-    // Where each recently-aired entry sits in this channel's airing tail,
-    // as a distance back from the newest: 1 is the last thing that aired,
-    // `recent.len` the oldest still remembered. `ctx.recent` is newest-LAST,
-    // so the distance is measured from the end.
-    //
-    // Bounded by `scoring.recent_depth` (200 by default), never by the
-    // library, so this pass is ~200 steps regardless of catalog size. The
-    // tail holds episodes too — this channel's shows pool put them there —
-    // and they simply never match a movie id, which costs one failed map
-    // lookup each and no correctness.
-    let recent = ctx.recent;
-    let recent_n = recent.len;
-    let recency = #{};
-    for i in 0..recent_n {
-        // A title aired more than once inside the tail keeps its most recent
-        // position: later iterations overwrite earlier ones, and later means
-        // newer.
-        recency[recent[i]] = recent_n - i;
-    }
     let half_life = recency_half_life(ctx);
 
     // Document-frequency pass (#294): how many candidates carry each
@@ -244,8 +341,8 @@ fn pick(ctx) {
     // collection.
     let df = #{};
     let doc_count = 0;
-    for item in items {
-        let facts = enrichment[item.entry_id];
+    for unit in units {
+        let facts = enrichment[unit];
         if facts != () {
             doc_count += 1;
             for f in facts {
@@ -259,8 +356,7 @@ fn pick(ctx) {
     }
 
     let scored = [];
-    for item in items {
-        let id = item.entry_id;
+    for id in units {
         let facts = enrichment[id];
         let score = 0.0;
         let eligible = false;
@@ -307,7 +403,7 @@ fn pick(ctx) {
         // aired last night only reads as a decision if both halves are
         // visible; one number alone reads as the scorer changing its mind.
         let base_score = score;
-        let aired_rank = recency[id];
+        let aired_rank = unit_recency[id];
         let factor = recency_factor(aired_rank, half_life);
         score = base_score * factor;
         scored.push(#{
@@ -373,20 +469,28 @@ fn pick(ctx) {
     });
 
     let fraction = exploration_fraction(ctx);
-    // Ask for a little more than the generation needs, so a pattern that
-    // draws unevenly across pools does not run short.
-    let out_len = ctx.target_count + 10;
+    // How many UNITS to hand back. For movies a unit is one film, so this is
+    // the generation's item count plus slack, so a pattern that draws
+    // unevenly across pools does not run short. For shows a unit expands to
+    // a whole series, so what matters instead is how many series the
+    // rotation gets to walk — see show_count() above.
+    let want = if unit_kind == "show" {
+        show_count(ctx)
+    } else {
+        ctx.target_count + 10
+    };
 
     let out = [];
     let ws_rows = #{};
     let used = #{};
     let rank_cursor = 0;
     let explore_cursor = 0;
-    while out.len < out_len {
-        // Which slot this is — one row lands per pass, so the count already
-        // written is the slot's own index, and it is the nonce that makes
+    let picked = 0;
+    while picked < want {
+        // Which slot this is — one UNIT lands per pass, so the count already
+        // picked is the slot's own index, and it is the nonce that makes
         // each slot's coin flip independent of its neighbours'.
-        let slot = out.len;
+        let slot = picked;
         // One slot in five, at the default fraction — decided by a seeded
         // coin flip for this slot, not a fixed stride through the ranking
         // (see exploration_fraction() above for why).
@@ -420,6 +524,7 @@ fn pick(ctx) {
             break;
         }
         used[row.id] = true;
+        picked += 1;
         // The candidates ranked immediately above this pick, captured right
         // now — while `used` reflects exactly what has aired so far in this
         // generation, and before anything copies or truncates `scored`
@@ -448,25 +553,67 @@ fn pick(ctx) {
         // rather than just trusted — never read back by etv-station itself
         // (ADR 0002: the score stays internal to the plugin), only carried
         // through untouched to the emitted playout JSON.
-        out.push(#{
-            entry_id: row.id,
-            metadata: #{ score: row.score, on_profile_keywords: row.on_profile, source: source },
-        });
-        // The numbers audit() will report for this pick (#392): its score,
-        // its position in the full ranked candidate set, and whether this
-        // slot drew it by rank or by the seeded exploration draw. Keyed by
-        // entry_id so audit() — handed the raw picks array, not this row —
-        // can look each one up. `near_misses` is #393: the bounded list
-        // captured above.
-        ws_rows[row.id] = #{
+        //
+        // The numbers audit() will report (#392): the unit's score, its
+        // position in the full ranked set, and whether this slot drew it by
+        // rank or by the seeded exploration draw. `near_misses` is #393: the
+        // bounded list captured above. One record per unit, attached below to
+        // every entry that unit emits.
+        let stage = #{
             score: row.score,
             base_score: row.base_score,
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
+            // Which series was ranked, on a shows pool — unit on a movies
+            // pool, where the entry and the unit are the same thing. Without
+            // it an audit line reads as though the episode itself scored 7.7,
+            // when what scored is the show it belongs to.
+            unit: if unit_kind == "show" { row.id } else { () },
             draw: if source == "explore" { "exploration" } else { "ranked" },
             near_misses: near_misses,
         };
+        // Emit the unit's members. A movie is its own single member; a show
+        // hands back every episode it has, in season/episode order.
+        //
+        // That order IS broadcast order. The station will not re-sort what a
+        // plugin returns, and it groups the returned list into series by
+        // first appearance (pattern.rs) — so the order units were ranked in
+        // becomes the series rotation, and the order inside a unit becomes
+        // the order its episodes play.
+        //
+        // A show hands back ALL of its episodes rather than a slice because
+        // `advance: resume` finds the last-aired episode in this list and
+        // continues past it: a list holding only the first few would never
+        // contain the episode the ledger resumes from, and the show would
+        // restart from episode one forever. Sorting happens here, for the
+        // handful of shows actually picked, not for all 1,633 of them.
+        let member_rows = members[row.id];
+        if unit_kind == "show" {
+            member_rows.sort(|a, b| {
+                if a[0] < b[0] { -1 } else if a[0] > b[0] { 1 }
+                else if a[1] < b[1] { -1 } else if a[1] > b[1] { 1 }
+                else if a[2] < b[2] { -1 } else if a[2] > b[2] { 1 }
+                else { 0 }
+            });
+        }
+        for m in member_rows {
+            let mid = m[2];
+            // The score, the specific on-profile keywords behind it, and
+            // whether this slot came from the ranking or the seeded surprise
+            // draw travel along as `metadata` (#166) so a pick can be
+            // explained rather than just trusted — never read back by
+            // etv-station itself (ADR 0002: the score stays internal to the
+            // plugin), only carried through untouched to the playout JSON.
+            out.push(#{
+                entry_id: mid,
+                metadata: #{ score: row.score, on_profile_keywords: row.on_profile, source: source },
+            });
+            // Keyed by the EMITTED entry_id, since audit() is handed the
+            // picks array and looks each one up by that — an episode, not the
+            // show it was ranked as.
+            ws_rows[mid] = stage;
+        }
     }
 
     #{ picks: out, workspace: #{ rows: ws_rows, candidate_count: scored.len } }
@@ -498,6 +645,9 @@ fn audit(ctx, picks, workspace) {
                 base_score: r.base_score,
                 recency_factor: r.recency_factor,
                 aired_rank: r.aired_rank,
+                // The series this entry was ranked as, on a shows pool.
+                // Unit on a movies pool, where the entry IS the unit.
+                unit: r.unit,
                 rank: r.rank,
                 candidate_count: workspace.candidate_count,
                 draw: r.draw,

@@ -808,9 +808,23 @@ every query.
 
 The set **names** belong to the script, not to the schema: nothing checks that a
 name means anything to it, and one it does not recognise simply arrives as
-another entry in `ctx.sets`. `taste-cosine.rhai` looks for one set only,
-`movies` (#254 — movies only, since an episode cannot yet be resolved to its
-show's keywords), so an override written for it keeps that one name.
+another entry in `ctx.sets`. `taste-cosine.rhai` offers two, `movies` and
+`shows`, and a pool picks which one it ranks with `unit: "movie"` (the
+default) or `unit: "show"` in its `config:` — so an override written for it
+keeps whichever of those two names that pool uses.
+
+A `unit: "show"` pool ranks the **series**, not the episode. An episode
+carries no `tmdb_keywords` of its own, so the script resolves each one to its
+show through the catalog's GUID-derived `show_id` (#274 — the change that
+made this possible; before it, `show_id` came from the show's title and
+joined to nothing) and scores the show, then hands back the top `show_count`
+shows with every episode in season/episode order. Because the station groups
+a returned list into series by first appearance, that order becomes the
+rotation order: such a pool wants `select: round_robin` and `group_by: show`,
+where `random` would discard the ranking at the last step and `season` would
+cut a show into per-season series. Narrow `sources:` to the one set the pool
+uses, or it resolves both — 74,815 episodes loaded for a movies pool that
+never looks at them.
 
 Two pools naming the same script with different `sources` each resolve their own
 set, so narrowing one pool never narrows its sibling. Two that wrote the same

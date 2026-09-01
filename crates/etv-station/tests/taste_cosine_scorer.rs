@@ -460,15 +460,17 @@ fn the_script_declares_pool_provider_and_all_three_capabilities() {
     );
 }
 
-/// Acceptance criterion: no episode is ever handed to the scorer. Movies
-/// only, at the source — `sources()` declares nothing but `movies`, so
-/// `ctx.sets` can never carry an episode. Proven the way a misconfiguration
-/// would find out: a catalog holding both, resolved for a pool named
-/// "shows" (as if a channel had mistakenly pointed its episode pool at this
-/// script) still returns only movies, because there is no `episodes` set for
-/// any pool name to draw from.
+/// `unit:` decides what gets ranked — never the pool's name, and never what
+/// happens to be in the catalog. Now that `sources()` offers both sets, a
+/// pool that omits `unit:` must still rank movies, so a channel that points
+/// its episode pool at this script and forgets the key gets an obviously
+/// wrong schedule rather than a silent mixture of films and episodes.
+///
+/// Proven the way the misconfiguration would find out: a catalog holding
+/// both, resolved for a pool actually named "shows", still returns only
+/// movies.
 #[test]
-fn only_movies_ever_reach_the_scorer_regardless_of_which_pool_asks() {
+fn a_pool_that_omits_the_unit_key_ranks_movies_whatever_it_is_called() {
     let cat = small_catalog();
     add(&cat, "ep-1", "episode");
     let scorer = Scorer::new(&cat, write_taste_fixture);
@@ -476,8 +478,38 @@ fn only_movies_ever_reach_the_scorer_regardless_of_which_pool_asks() {
     let picked = scorer.pick("shows", 0, 3, None);
     assert!(
         picked.iter().all(|p| p.id != "ep-1"),
-        "an episode must never be returned, even for a pool named \"shows\": {:?}",
+        "no episode may come back without unit = \"show\", even for a pool named \"shows\": {:?}",
         picked.iter().map(|p| &p.id).collect::<Vec<_>>()
+    );
+}
+
+/// An episode with no `show_id` is dropped rather than aired as a series of
+/// one. A shows pool exists to air series, and #274's own note is that a
+/// catalog with no `show_id` still emits television — it just draws a
+/// different show every slot and nothing that groups episodes can work.
+/// Silently mixing those in would reintroduce exactly that.
+#[test]
+fn an_episode_with_no_show_id_never_reaches_a_shows_pool() {
+    let cat = shows_catalog();
+    // An orphan: an episode the ingester never resolved a show for.
+    let orphan = Entry::new("orphan-ep", "episode", "orphan-ep", Source::Plex);
+    cat.upsert_entry(&orphan).unwrap();
+    cat.add_source(&EntrySource {
+        source: Source::LocalFs,
+        source_id: "fs-orphan".into(),
+        entry_id: "orphan-ep".into(),
+        playback_path: "/media/orphan.mkv".into(),
+        last_seen: None,
+        missing_since: None,
+    })
+    .unwrap();
+
+    let scorer = Scorer::new(&cat, write_shows_fixture);
+    let picked = scorer.pick_shows(8, &[]);
+    assert!(
+        picked.iter().all(|p| p.id != "orphan-ep"),
+        "an episode with no show_id must be dropped: {:?}",
+        order_of(&picked)
     );
 }
 
@@ -1032,6 +1064,200 @@ fn admin_audit_prints_the_damping_for_a_recently_aired_pick() {
             "the report must show {line}:\n{report}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shows: the scorer ranks SERIES, not episodes.
+//
+// #274 made the catalog's `show_id` GUID-derived, which is what lets a script
+// resolve an episode to its show and score the show's own keywords — the gap
+// that made #254 ship movies-only. An episode carries no keywords, and
+// ordering episodes by anything but season/episode would air a season
+// shuffled, so a shows pool ranks the show and hands back its episodes in
+// broadcast order.
+// ---------------------------------------------------------------------------
+
+/// Three shows whose ids are also the `item_id`s the plexdb fixture carries
+/// keywords for, plus episodes pointing at them via `show_id` — the join
+/// #274 unlocked, in miniature.
+///
+/// `sh-a` is watched, so it defines the pooled weights (contact + time, 0.5
+/// each). `sh-b` carries `contact` only; `sh-c` carries `time` plus the
+/// off-profile `desert`; `sh-d` carries nothing and is ineligible. Those are
+/// exactly `write_taste_fixture`'s four movies with show ids, so the same
+/// hand-computed cosines apply: sh-a 0.9938 > sh-b 0.7027 > sh-c 0.4969 >
+/// sh-d 0.0.
+fn write_shows_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('sh-a', 'show'), ('sh-b', 'show'), ('sh-c', 'show'), ('sh-d', 'show');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('sh-a', 'tmdb_keywords', 'keyword', 'contact', 't'),
+                 ('sh-a', 'tmdb_keywords', 'keyword', 'time', 't'),
+                 ('sh-b', 'tmdb_keywords', 'keyword', 'contact', 't'),
+                 ('sh-c', 'tmdb_keywords', 'keyword', 'time', 't'),
+                 ('sh-c', 'tmdb_keywords', 'keyword', 'desert', 't');
+             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+                 ('h1', 'sh-a', 42, 1700000000);",
+        )
+        .unwrap();
+}
+
+/// One episode, wired to its show the way the Plex ingester wires one.
+fn add_episode(cat: &Catalog, show_id: &str, season: i64, episode: i64) {
+    let id = format!("{show_id}-s{season}e{episode:02}");
+    let mut e = Entry::new(&id, "episode", &id, Source::Plex);
+    e.show = Some(show_id.to_string());
+    e.show_id = Some(show_id.to_string());
+    e.season = Some(season);
+    e.episode = Some(episode);
+    cat.upsert_entry(&e).unwrap();
+    cat.add_source(&EntrySource {
+        source: Source::LocalFs,
+        source_id: format!("fs-{id}"),
+        entry_id: id.clone(),
+        playback_path: format!("/media/{id}.mkv"),
+        last_seen: None,
+        missing_since: None,
+    })
+    .unwrap();
+}
+
+/// Four shows, two seasons of two episodes each. Deliberately inserted in a
+/// scrambled order so a test asserting broadcast order is asserting the
+/// script's sort, not the catalog's insertion sequence.
+fn shows_catalog() -> Catalog {
+    let cat = Catalog::open_in_memory().unwrap();
+    for show in ["sh-a", "sh-b", "sh-c", "sh-d"] {
+        for (season, episode) in [(2, 2), (1, 1), (2, 1), (1, 2)] {
+            add_episode(&cat, show, season, episode);
+        }
+    }
+    cat
+}
+
+impl Scorer {
+    /// One generation on a `unit = "show"` pool, with exploration off so the
+    /// order under test is the ranking itself.
+    fn pick_shows(&self, target_count: usize, recent: &[&str]) -> Vec<PickedItem> {
+        let config = serde_json::json!({ "unit": "show", "exploration_fraction": 0.0 });
+        let inputs = ScoreInputs {
+            target_count,
+            recent: recent.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        };
+        pick(
+            &self.cache,
+            &self.script,
+            None,
+            &inputs,
+            0,
+            "shows",
+            Some(&config),
+            grant(&self.db),
+        )
+        .unwrap()
+    }
+}
+
+/// The acceptance criterion. A shows pool ranks the series by the show's own
+/// keyword cosine — the thing that was impossible before #274 — and hands
+/// back each show's episodes in season/episode order, all of them, best show
+/// first.
+///
+/// Both halves matter. The station will not re-sort what a plugin returns and
+/// groups the list into series by first appearance (`pattern.rs:14`), so the
+/// order shows come back in becomes the rotation order, and the order inside
+/// a show becomes the order its episodes play.
+#[test]
+fn a_shows_pool_ranks_series_and_returns_episodes_in_broadcast_order() {
+    let scorer = Scorer::new(&shows_catalog(), write_shows_fixture);
+    let picked = scorer.pick_shows(8, &[]);
+
+    // Shows in ranked order — the same cosines as the movie fixture, since
+    // the keywords are the same.
+    let show_order: Vec<&str> = picked
+        .iter()
+        .map(|p| &p.id[..4])
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[0] != w[1])
+        .map(|w| w[0])
+        .chain(picked.last().map(|p| &p.id[..4]))
+        .collect();
+    assert_eq!(
+        show_order,
+        ["sh-a", "sh-b", "sh-c", "sh-d"],
+        "series must come back in cosine order: {:?}",
+        order_of(&picked)
+    );
+
+    // Every episode of every show, each show's block in broadcast order.
+    assert_eq!(
+        order_of(&picked),
+        [
+            "sh-a-s1e01", "sh-a-s1e02", "sh-a-s2e01", "sh-a-s2e02", //
+            "sh-b-s1e01", "sh-b-s1e02", "sh-b-s2e01", "sh-b-s2e02", //
+            "sh-c-s1e01", "sh-c-s1e02", "sh-c-s2e01", "sh-c-s2e02", //
+            "sh-d-s1e01", "sh-d-s1e02", "sh-d-s2e01", "sh-d-s2e02",
+        ],
+        "episodes must be season-then-episode inside each show"
+    );
+}
+
+/// A show hands back ALL of its episodes, not a slice. `advance: resume`
+/// finds the last-aired episode in the returned list and continues past it,
+/// so a list holding only the first few would never contain the episode the
+/// ledger resumes from and the show would restart from episode one forever.
+#[test]
+fn every_episode_of_a_picked_show_comes_back_not_just_the_next_few() {
+    let scorer = Scorer::new(&shows_catalog(), write_shows_fixture);
+    // A target_count far smaller than one show's episode count: the unit
+    // budget counts SHOWS, so this must not truncate a show mid-run.
+    let picked = scorer.pick_shows(1, &[]);
+    for show in ["sh-a", "sh-b", "sh-c", "sh-d"] {
+        let n = picked.iter().filter(|p| p.id.starts_with(show)).count();
+        assert_eq!(n, 4, "{show} must hand back all 4 of its episodes");
+    }
+}
+
+/// Recency damps the SERIES, keyed on `show_id`, not the episode. A specific
+/// episode almost never repeats, so damping the episode id would do nothing;
+/// damping the series is what "Columbo has been on a lot lately" means.
+///
+/// `sh-a` leads on cosine (0.9938 against sh-b's 0.7027). Airing one of its
+/// episodes puts the whole show at distance 1, so it keeps 1/(1+25) of its
+/// score and drops to third — behind two shows whose episodes never aired.
+#[test]
+fn airing_one_episode_damps_the_whole_series() {
+    let scorer = Scorer::new(&shows_catalog(), write_shows_fixture);
+
+    let before = scorer.pick_shows(8, &[]);
+    assert!(before[0].id.starts_with("sh-a"), "sh-a leads undamped");
+
+    let after = scorer.pick_shows(8, &["sh-a-s1e01"]);
+    let first_show = &after[0].id[..4];
+    assert_eq!(first_show, "sh-b", "one sh-a episode must sink the series");
+
+    let damped = after.iter().find(|p| p.id.starts_with("sh-a")).unwrap();
+    assert_eq!(
+        detail_of(damped)["aired_rank"].as_i64(),
+        Some(1),
+        "the series carries its most recently aired episode's distance"
+    );
+    assert_close(
+        detail_f64(damped, "recency_factor"),
+        1.0 / 26.0,
+        "sh-a's recency factor at distance 1",
+    );
+    // The show that was ranked, named on every one of its episodes — without
+    // it the audit reads as though the episode itself scored.
+    assert_eq!(
+        detail_of(damped)["unit"].as_str(),
+        Some("sh-a"),
+        "a shows pick must name the series it was ranked as"
+    );
 }
 
 /// `taste-engine.rhai` is gone (#254) — this is the negative half of "the

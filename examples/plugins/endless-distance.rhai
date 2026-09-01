@@ -8,9 +8,12 @@
 // in the issue.
 //
 // Movies only (#176's scoping note): keywords sit on movies and shows, never
-// on episodes, and an episode cannot be resolved to its show's keywords from
-// inside a plugin today — the catalog's `show_id` is derived from the show's
-// *title*, not a GUID, and no reader accessor maps an item to its show.
+// on episodes. That is now a choice rather than a wall — #274 made the
+// catalog's `show_id` GUID-derived, and taste-cosine.rhai uses it to score an
+// episode's show. This script has no equivalent yet because its walk is a
+// chain of single titles: the unit it steps between would have to become a
+// series, and what "distance from the last thing played" means across a
+// season is an open question, not a port of the same code.
 //
 // Five functions make up the contract (see docs/schema.md "Pool `plugin`"):
 //   hooks()               -> ["pool_provider"]
