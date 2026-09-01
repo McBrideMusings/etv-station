@@ -112,7 +112,11 @@ async def check(width: int, height: int) -> bool:
     epgb.fetch_lineup = lambda host: fixture()
     app = epgb.build_app("http://127.0.0.1:8409")
     ok = True
-    async with app.run_test(size=(width, height)):
+    async with app.run_test(size=(width, height)) as pilot:
+        # The lineup fetch now runs on a thread worker (#422) — drain it
+        # before asserting, or these checks race the fixture landing.
+        await app.workers.wait_for_complete()
+        await pilot.pause()
         wide = app.query_one("#layout").has_class("wide")
         print(f"=== {width}x{height} — detail {'right column' if wide else 'bottom row'} ===")
         panes = ("#layout", "#channels", "#programmes", "#detail")
