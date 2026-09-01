@@ -203,10 +203,18 @@ fn pick(ctx) {
     // WHAT ONE ROW OF THE RANKING IS, and which catalog entries air when that
     // row is picked.
     //
-    //   unit = "movie"  a unit is one film; airing it airs that one entry.
-    //   unit = "show"   a unit is a SERIES, scored on the show's own
-    //                   keywords, and airing it makes every episode of that
-    //                   show available in season/episode order.
+    //   unit = "movie"   a unit is one film; airing it airs that one entry.
+    //   unit = "show"    a unit is a SERIES, scored on the show's own
+    //                    keywords, and airing it makes every episode of that
+    //                    show available in season/episode order.
+    //   unit = "season"  ranks series exactly as "show" does, but lays the
+    //                    output out season-major: every picked show's season
+    //                    1 in ranked order, then every show's season 2, and
+    //                    so on. For a pattern whose visit is a whole season
+    //                    (`take: all`, `group_by: season`) — where "show"
+    //                    ordering would air every season of the top show
+    //                    before reaching the second show at all, turning a
+    //                    recommendation channel into a marathon channel.
     //
     // Everything between here and the emit loop operates on units and knows
     // nothing about which kind it has: one document-frequency pass, one
@@ -242,7 +250,7 @@ fn pick(ctx) {
     // been on a lot lately".
     let unit_recency = #{};
 
-    if unit_kind == "show" {
+    if unit_kind != "movie" {
         // Episodes carry `show_id` (registered on every item in score.rs),
         // and since #274 it is GUID-derived — the same id space plex-db-ex
         // keys its `items` rows on, which is what makes this join possible
@@ -474,7 +482,7 @@ fn pick(ctx) {
     // unevenly across pools does not run short. For shows a unit expands to
     // a whole series, so what matters instead is how many series the
     // rotation gets to walk — see show_count() above.
-    let want = if unit_kind == "show" {
+    let want = if unit_kind != "movie" {
         show_count(ctx)
     } else {
         ctx.target_count + 10
@@ -482,6 +490,12 @@ fn pick(ctx) {
 
     let out = [];
     let ws_rows = #{};
+    // Units in the order they were selected, and the audit record each one
+    // carries. Selection and layout are two passes, not one: `unit = season`
+    // has to see every picked show before it can interleave their seasons,
+    // and a single pass that emitted as it picked could not.
+    let selected = [];
+    let stages = #{};
     let used = #{};
     let rank_cursor = 0;
     let explore_cursor = 0;
@@ -557,9 +571,9 @@ fn pick(ctx) {
         // The numbers audit() will report (#392): the unit's score, its
         // position in the full ranked set, and whether this slot drew it by
         // rank or by the seeded exploration draw. `near_misses` is #393: the
-        // bounded list captured above. One record per unit, attached below to
-        // every entry that unit emits.
-        let stage = #{
+        // bounded list captured above. One record per unit, attached in the
+        // layout pass to every entry that unit emits.
+        stages[row.id] = #{
             score: row.score,
             base_score: row.base_score,
             recency_factor: row.recency_factor,
@@ -569,36 +583,75 @@ fn pick(ctx) {
             // pool, where the entry and the unit are the same thing. Without
             // it an audit line reads as though the episode itself scored 7.7,
             // when what scored is the show it belongs to.
-            unit: if unit_kind == "show" { row.id } else { () },
+            unit: if unit_kind == "movie" { () } else { row.id },
             draw: if source == "explore" { "exploration" } else { "ranked" },
             near_misses: near_misses,
+            on_profile: row.on_profile,
+            source: source,
         };
-        // Emit the unit's members. A movie is its own single member; a show
-        // hands back every episode it has, in season/episode order.
-        //
-        // That order IS broadcast order. The station will not re-sort what a
-        // plugin returns, and it groups the returned list into series by
-        // first appearance (pattern.rs) — so the order units were ranked in
-        // becomes the series rotation, and the order inside a unit becomes
-        // the order its episodes play.
-        //
-        // A show hands back ALL of its episodes rather than a slice because
-        // `advance: resume` finds the last-aired episode in this list and
-        // continues past it: a list holding only the first few would never
-        // contain the episode the ledger resumes from, and the show would
-        // restart from episode one forever. Sorting happens here, for the
-        // handful of shows actually picked, not for all 1,633 of them.
-        let member_rows = members[row.id];
-        if unit_kind == "show" {
-            member_rows.sort(|a, b| {
-                if a[0] < b[0] { -1 } else if a[0] > b[0] { 1 }
-                else if a[1] < b[1] { -1 } else if a[1] > b[1] { 1 }
-                else if a[2] < b[2] { -1 } else if a[2] > b[2] { 1 }
-                else { 0 }
-            });
+        selected.push(row.id);
+    }
+
+    // LAYOUT. The station will not re-sort what a plugin returns, and it
+    // groups the returned list into series by first appearance (pattern.rs),
+    // so the order below is broadcast order AND rotation order at once.
+    //
+    // A show hands back ALL of its episodes rather than a slice because
+    // `advance: resume` locates the last-aired episode in this list and
+    // continues past it: a list holding only the first few would never
+    // contain the episode the ledger resumes from, and the show would restart
+    // from episode one forever.
+    let blocks = [];
+    for i in 0..selected.len {
+        let uid = selected[i];
+        let rows = members[uid];
+        if unit_kind == "movie" {
+            blocks.push(#{ season: 0, order: i, uid: uid, ids: [uid] });
+            continue;
         }
-        for m in member_rows {
-            let mid = m[2];
+        // Season, then episode, then id — the order a series is broadcast in.
+        // Sorted here, for the handful of shows actually picked, never for
+        // all 1,633 of them.
+        rows.sort(|a, b| {
+            if a[0] < b[0] { -1 } else if a[0] > b[0] { 1 }
+            else if a[1] < b[1] { -1 } else if a[1] > b[1] { 1 }
+            else if a[2] < b[2] { -1 } else if a[2] > b[2] { 1 }
+            else { 0 }
+        });
+        // Cut the show into one block per season. `unit = "show"` will
+        // re-join them untouched; `unit = "season"` interleaves them.
+        let cur = ();
+        let block = [];
+        for m in rows {
+            if cur == () { cur = m[0]; }
+            if m[0] != cur {
+                blocks.push(#{ season: cur, order: i, uid: uid, ids: block });
+                block = [];
+                cur = m[0];
+            }
+            block.push(m[2]);
+        }
+        if block.len > 0 {
+            blocks.push(#{ season: cur, order: i, uid: uid, ids: block });
+        }
+    }
+
+    if unit_kind == "season" {
+        // Season-major: every picked show's season 1 in ranked order, then
+        // every show's season 2, and so on. Under `group_by: season` the
+        // station makes one series per season, so this is the rotation
+        // visiting a different SHOW each time rather than working through one
+        // show's seasons back to back.
+        blocks.sort(|a, b| {
+            if a.season < b.season { -1 } else if a.season > b.season { 1 }
+            else if a.order < b.order { -1 } else if a.order > b.order { 1 }
+            else { 0 }
+        });
+    }
+
+    for b in blocks {
+        let stage = stages[b.uid];
+        for id in b.ids {
             // The score, the specific on-profile keywords behind it, and
             // whether this slot came from the ranking or the seeded surprise
             // draw travel along as `metadata` (#166) so a pick can be
@@ -606,13 +659,17 @@ fn pick(ctx) {
             // etv-station itself (ADR 0002: the score stays internal to the
             // plugin), only carried through untouched to the playout JSON.
             out.push(#{
-                entry_id: mid,
-                metadata: #{ score: row.score, on_profile_keywords: row.on_profile, source: source },
+                entry_id: id,
+                metadata: #{
+                    score: stage.score,
+                    on_profile_keywords: stage.on_profile,
+                    source: stage.source,
+                },
             });
             // Keyed by the EMITTED entry_id, since audit() is handed the
             // picks array and looks each one up by that — an episode, not the
             // show it was ranked as.
-            ws_rows[mid] = stage;
+            ws_rows[id] = stage;
         }
     }
 

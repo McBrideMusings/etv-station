@@ -813,6 +813,15 @@ another entry in `ctx.sets`. `taste-cosine.rhai` offers two, `movies` and
 default) or `unit: "show"` in its `config:` — so an override written for it
 keeps whichever of those two names that pool uses.
 
+There is a third value, `unit: "season"`. It ranks series exactly as
+`"show"` does and returns exactly the same episodes — it differs only in the
+order the blocks are laid down: every picked show's season 1 in ranked order,
+then every show's season 2, and so on. Pick it when a visit is a whole season
+(`take: all` with `group_by: season`), where show-major ordering would work
+through every season of the top-ranked show before the rotation reached the
+second show at all. `001-for-you` uses it; `002`/`003` use `"show"`, which
+suits their `take: 3`.
+
 A `unit: "show"` pool ranks the **series**, not the episode. An episode
 carries no `tmdb_keywords` of its own, so the script resolves each one to its
 show through the catalog's GUID-derived `show_id` (#274 — the change that

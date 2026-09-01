@@ -1,7 +1,13 @@
-//! Acceptance test for the keyword-cosine taste scorer (#254): a movies-only
-//! plugin that ranks by how close a candidate's TMDB keywords sit to the
-//! house's pooled taste vector, read from a granted plex-db-ex datastore,
-//! with a seeded exploration slot layered on top of the ranking.
+//! Acceptance test for the keyword-cosine taste scorer (#254): a plugin that
+//! ranks by how close a candidate's TMDB keywords sit to the house's pooled
+//! taste vector, read from a granted plex-db-ex datastore, with a seeded
+//! exploration slot layered on top of the ranking and a recency damping
+//! under it.
+//!
+//! It ranks films or series, chosen by a pool's `unit:` — `"movie"`,
+//! `"show"`, or `"season"`. Series became possible when #274 made the
+//! catalog's `show_id` GUID-derived, so an episode (which carries no
+//! keywords of its own) can be resolved to the show that does.
 //!
 //! Runs `score::pick` directly against `examples/plugins/taste-cosine.rhai`
 //! (the committed script, proving it still compiles and runs) and a
@@ -1197,10 +1203,22 @@ fn a_shows_pool_ranks_series_and_returns_episodes_in_broadcast_order() {
     assert_eq!(
         order_of(&picked),
         [
-            "sh-a-s1e01", "sh-a-s1e02", "sh-a-s2e01", "sh-a-s2e02", //
-            "sh-b-s1e01", "sh-b-s1e02", "sh-b-s2e01", "sh-b-s2e02", //
-            "sh-c-s1e01", "sh-c-s1e02", "sh-c-s2e01", "sh-c-s2e02", //
-            "sh-d-s1e01", "sh-d-s1e02", "sh-d-s2e01", "sh-d-s2e02",
+            "sh-a-s1e01",
+            "sh-a-s1e02",
+            "sh-a-s2e01",
+            "sh-a-s2e02", //
+            "sh-b-s1e01",
+            "sh-b-s1e02",
+            "sh-b-s2e01",
+            "sh-b-s2e02", //
+            "sh-c-s1e01",
+            "sh-c-s1e02",
+            "sh-c-s2e01",
+            "sh-c-s2e02", //
+            "sh-d-s1e01",
+            "sh-d-s1e02",
+            "sh-d-s2e01",
+            "sh-d-s2e02",
         ],
         "episodes must be season-then-episode inside each show"
     );
@@ -1257,6 +1275,90 @@ fn airing_one_episode_damps_the_whole_series() {
         detail_of(damped)["unit"].as_str(),
         Some("sh-a"),
         "a shows pick must name the series it was ranked as"
+    );
+}
+
+impl Scorer {
+    /// One generation on a `unit = "season"` pool — 001-for-you's shape,
+    /// where a visit is a whole season rather than three episodes.
+    fn pick_seasons(&self, target_count: usize) -> Vec<PickedItem> {
+        let config = serde_json::json!({ "unit": "season", "exploration_fraction": 0.0 });
+        let inputs = ScoreInputs {
+            target_count,
+            ..Default::default()
+        };
+        pick(
+            &self.cache,
+            &self.script,
+            None,
+            &inputs,
+            0,
+            "shows",
+            Some(&config),
+            grant(&self.db),
+        )
+        .unwrap()
+    }
+}
+
+/// `unit = "season"` lays the same ranking out season-major: every picked
+/// show's season 1 in ranked order, then every show's season 2.
+///
+/// This is what 001-for-you needs and `unit = "show"` cannot give it. That
+/// channel's pattern draws `take: all`, so a visit is a whole season. Under
+/// show-major ordering the station's rotation — which follows first
+/// appearance — would work through every season of the top-ranked show
+/// before ever reaching the second show, turning a recommendation channel
+/// into a marathon channel. Season-major makes each visit land on a
+/// different series.
+#[test]
+fn season_units_interleave_shows_instead_of_marathoning_one() {
+    let scorer = Scorer::new(&shows_catalog(), write_shows_fixture);
+
+    assert_eq!(
+        order_of(&scorer.pick_seasons(8)),
+        [
+            // Every show's season 1, in cosine order …
+            "sh-a-s1e01",
+            "sh-a-s1e02", //
+            "sh-b-s1e01",
+            "sh-b-s1e02", //
+            "sh-c-s1e01",
+            "sh-c-s1e02", //
+            "sh-d-s1e01",
+            "sh-d-s1e02", //
+            // … then every show's season 2, same order.
+            "sh-a-s2e01",
+            "sh-a-s2e02", //
+            "sh-b-s2e01",
+            "sh-b-s2e02", //
+            "sh-c-s2e01",
+            "sh-c-s2e02", //
+            "sh-d-s2e01",
+            "sh-d-s2e02",
+        ],
+        "seasons must interleave across shows, not run one show to its end"
+    );
+}
+
+/// The two layouts hold the same episodes and the same ranking — they differ
+/// only in the order the blocks are laid down. A regression that dropped or
+/// duplicated an episode in one layout would otherwise hide behind the
+/// order assertions above.
+#[test]
+fn show_major_and_season_major_carry_the_same_episodes() {
+    let scorer = Scorer::new(&shows_catalog(), write_shows_fixture);
+
+    let shows = scorer.pick_shows(8, &[]);
+    let seasons = scorer.pick_seasons(8);
+    let mut by_show = order_of(&shows);
+    let mut by_season = order_of(&seasons);
+    assert_ne!(by_show, by_season, "the two layouts must differ in order");
+    by_show.sort_unstable();
+    by_season.sort_unstable();
+    assert_eq!(
+        by_show, by_season,
+        "and must hold exactly the same episodes"
     );
 }
 
