@@ -33,10 +33,16 @@ WIDE_HEIGHT = 45
 DETAIL_MIN = 52  # the full stream URL — the widest single line in the app.
 # Measured against #detail's CONTENT box, so its border and padding are already
 # excluded and the number is comparable to a character count.
-PREFIX_W = 17  # marker+space, `chNNN `, the 2-column ┌/│/└ gutter, `HH:MM`,
-# then two spaces — everything on a programme row before the title starts.
-TITLE_MIN = 29  # title-elision budget a row must keep at MIN_WIDTH: the
-# 46-wide stacked programmes pane minus PREFIX_W.
+PREFIX_W = 21  # marker+space, `chNNN `, the 2-column ┌/│/└ gutter, the
+# weekday-qualified `Wed HH:MM` stamp (#419: every block clock in a window
+# is padded to the widest stamp the window can render, so a forward-mode
+# window that crosses midnight uses this 9-char form throughout, not the
+# bare 5-char `HH:MM` today's rows alone would need), then two spaces —
+# everything on a programme row before the title starts.
+TITLE_MIN = 25  # title-elision budget a row must keep at MIN_WIDTH: the
+# 46-wide stacked programmes pane minus PREFIX_W. This is forward mode's
+# worst case (the mode the fixture drives); history mode's 11-char stamp
+# is 2 wider still, giving it a budget of 23, not asserted here.
 
 SRC = Path(__file__).resolve().parent / "epg-browser.py"
 spec = importlib.util.spec_from_file_location("epg_browser", SRC)
