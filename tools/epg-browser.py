@@ -365,25 +365,47 @@ def build_app(host: str):
     test driver and assert the layout still fits a narrow terminal."""
     from rich.markup import escape
     from textual.app import App, ComposeResult
-    from textual.containers import Horizontal, Vertical, VerticalScroll
+    from textual.containers import Container, VerticalScroll
     from textual.widgets import Footer, Header, ListItem, ListView, Label, Static
 
     class EpgBrowserApp(App):
         ENABLE_COMMAND_PALETTE = False
-        # Two rows, not three columns. Three side-by-side panes needed 128
-        # columns before anything clipped (34+1 channels, 40+1 programmes, 52
-        # for the widest detail line — the full stream URL), which is wider
-        # than a laptop terminal or a split pane. Stacking detail underneath
-        # drops the minimum to 76 and hands the detail pane the full terminal
-        # width, which is the pane that actually wanted it: URLs, a `desc`
-        # paragraph, a comma-joined category list. Vertical space is the cheap
-        # axis — the programme list never fills a terminal's height.
+        # One grid, two regimes, picked from the terminal's width by
+        # _apply_layout. Three side-by-side panes need WIDE_COLUMNS before
+        # anything clips (34+1 channels, 40+1 programmes, 52 for the widest
+        # detail line — the full stream URL), which is wider than a laptop
+        # terminal or a split pane. Narrower than that, detail stacks
+        # underneath and gets the full terminal width, which is the pane that
+        # actually wanted it: URLs, a `desc` paragraph, a comma-joined category
+        # list. Vertical space is the cheap axis — the programme list never
+        # fills a terminal's height — so stacking is the default and the right
+        # column is what a wide terminal buys.
         CSS = """
-        #top { height: 2fr; }
-        #channels { width: 34; border-right: solid $accent; }
-        #programmes { width: 1fr; min-width: 40; }
-        #detail { height: 1fr; border-top: solid $accent; padding: 0 1; }
+        #layout {
+            layout: grid;
+            grid-size: 2 2;
+            grid-columns: 34 1fr;
+            grid-rows: 2fr 1fr;
+        }
+        #layout.wide {
+            grid-size: 3 1;
+            grid-columns: 34 1fr 55;
+            grid-rows: 1fr;
+        }
+        #channels { border-right: solid $accent; }
+        #programmes { min-width: 40; }
+        #detail { column-span: 2; border-top: solid $accent; padding: 0 1; }
+        #layout.wide #detail {
+            column-span: 1;
+            border-top: none;
+            border-left: solid $accent;
+        }
         """
+        # Terminal columns at or above which #detail becomes a right-hand
+        # column instead of a bottom row. Derived from the panes themselves,
+        # not taste: 34 channels + 40 minimum programmes + 55 detail (52 chars
+        # of stream URL, 1 column of padding either side, 1 for its left border).
+        WIDE_COLUMNS = 129
         BINDINGS = [
             ("r", "refresh", "Refresh"),
             ("h", "toggle_history", "History ↕"),
@@ -426,15 +448,24 @@ def build_app(host: str):
 
         def compose(self) -> ComposeResult:
             yield Header()
-            with Vertical():
-                with Horizontal(id="top"):
-                    yield ListView(id="channels")
-                    yield ListView(id="programmes")
+            with Container(id="layout"):
+                yield ListView(id="channels")
+                yield ListView(id="programmes")
                 with VerticalScroll(id="detail"):
                     yield Static("Loading…", id="detail-body", markup=True)
             yield Footer()
 
+        def _apply_layout(self, width: int) -> None:
+            """Right-hand detail column on a wide terminal, bottom row
+            otherwise. Only the class changes — the widgets never move, so
+            selection, scroll position and focus survive a resize."""
+            self.query_one("#layout").set_class(width >= self.WIDE_COLUMNS, "wide")
+
+        def on_resize(self, event) -> None:
+            self._apply_layout(event.size.width)
+
         def on_mount(self) -> None:
+            self._apply_layout(self.size.width)
             self.title = f"epg-browser — {self.host}"
             self._sync_mode_subtitle()
             self.action_refresh()

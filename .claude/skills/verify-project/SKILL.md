@@ -47,10 +47,14 @@ it; if it is the only failure, the tree is green.
 `tools/epg-browser.py` is Python, so `verify-all.sh` never touches it. `admin
 test` runs `tools/epg-layout-check.py` alongside the cargo trees: it drives the
 real TUI under Textual's headless driver against fixture data (no network, no
-station) at 80x24 and fails if any pane spills past the terminal edge. Run it
-directly at another size with `uv run tools/epg-layout-check.py 128 40`. The
-three-column layout it replaced needed 128 columns before titles clipped, which
-is wider than a split pane.
+station) and fails if any pane spills past the terminal edge, or if the detail
+pane is too narrow for the widest line in the app (the full stream URL). With no
+arguments it checks both layouts — 80x24, where the detail pane is a bottom row,
+and 160x45, where it is a right-hand column. Run it at another size with `uv run
+tools/epg-layout-check.py 128 40`. The switch is at
+`EpgBrowserApp.WIDE_COLUMNS = 129`: three side-by-side panes need 34 channels +
+40 minimum programmes + 55 detail before nothing clips, so anything narrower
+stacks.
 
 `admin epg`'s action must stay `kind = "shell-passthrough"` with `interactive =
 true`. That is the only action kind that hands the child this terminal's stdin

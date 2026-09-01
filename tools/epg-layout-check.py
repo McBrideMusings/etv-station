@@ -2,12 +2,17 @@
 # requires-python = ">=3.11"
 # dependencies = ["textual>=0.60", "httpx>=0.27"]
 # ///
-"""Assert the epg-browser TUI still fits a narrow terminal.
+"""Assert the epg-browser TUI fits both of its layouts.
 
-The three-column layout it started with needed 128 columns before anything
-clipped, which is wider than a laptop terminal or a split pane. This drives the
-real app under Textual's headless test driver against fixture data — no network,
-no station — and fails if any pane spills past the terminal edge at 80 columns.
+It has two regimes, picked from the terminal width by EpgBrowserApp.WIDE_COLUMNS:
+below it, #detail is a bottom row spanning the full width; at or above it,
+#detail is a right-hand column. Three side-by-side panes clip under 128 columns,
+which is why the stacked layout is the default. This drives the real app under
+Textual's headless test driver against fixture data — no network, no station —
+and fails if any pane spills past the terminal edge, or if #detail is too narrow
+to hold the widest line in the app (the full stream URL).
+
+With no arguments it checks both regimes. Given a size, it checks just that one.
 
 Run with: uv run tools/epg-layout-check.py [width] [height]
 """
@@ -23,6 +28,11 @@ from pathlib import Path
 
 MIN_WIDTH = 80  # the width the two-row layout is required to survive
 MIN_HEIGHT = 24
+WIDE_WIDTH = 160  # a terminal wide enough to earn the right-hand detail column
+WIDE_HEIGHT = 45
+DETAIL_MIN = 52  # the full stream URL — the widest single line in the app.
+# Measured against #detail's CONTENT box, so its border and padding are already
+# excluded and the number is comparable to a character count.
 
 SRC = Path(__file__).resolve().parent / "epg-browser.py"
 spec = importlib.util.spec_from_file_location("epg_browser", SRC)
@@ -88,25 +98,28 @@ async def check(width: int, height: int) -> bool:
     app = epgb.build_app("http://127.0.0.1:8409")
     ok = True
     async with app.run_test(size=(width, height)):
-        print(f"=== {width}x{height} ===")
-        for sel in ("#top", "#channels", "#programmes", "#detail"):
+        wide = app.query_one("#layout").has_class("wide")
+        print(f"=== {width}x{height} — detail {'right column' if wide else 'bottom row'} ===")
+        panes = ("#layout", "#channels", "#programmes", "#detail")
+        for sel in panes:
             r = app.query_one(sel).region
             print(f"  {sel:12} x={r.x:<4} y={r.y:<4} w={r.width:<4} h={r.height}")
 
-        right = max(app.query_one(s).region.right for s in ("#channels", "#programmes", "#detail"))
-        bottom = max(app.query_one(s).region.bottom for s in ("#top", "#detail"))
+        right = max(app.query_one(s).region.right for s in panes)
+        bottom = max(app.query_one(s).region.bottom for s in panes)
         for what, got, limit in (("right edge", right, width), ("bottom edge", bottom, height)):
             good = got <= limit
             ok &= good
             print(f"  {what:12} {got} <= {limit}  {'OK' if good else 'OVERFLOW'}")
 
         # The detail pane holds the widest single line in the app — the full
-        # stream URL. If it no longer spans the terminal, the two-row layout
-        # has been undone.
-        detail_w = app.query_one("#detail").region.width
-        good = detail_w >= width - 2
+        # stream URL. Stacked, it must span the terminal; as a column, it must
+        # still be wide enough for that line plus its 1-column padding.
+        detail_w = app.query_one("#detail").content_size.width
+        floor = DETAIL_MIN if wide else width - 2
+        good = detail_w >= floor
         ok &= good
-        print(f"  {'detail width':12} {detail_w} (terminal {width})  {'OK' if good else 'TOO NARROW'}")
+        print(f"  {'detail width':12} {detail_w} >= {floor} (terminal {width})  {'OK' if good else 'TOO NARROW'}")
 
         # Report-only: a changeover row can still clip at 80 columns. The full
         # text is always in the detail pane, so this is not a failure.
@@ -118,9 +131,11 @@ async def check(width: int, height: int) -> bool:
 
 
 def main() -> None:
-    width = int(sys.argv[1]) if len(sys.argv) > 1 else MIN_WIDTH
-    height = int(sys.argv[2]) if len(sys.argv) > 2 else MIN_HEIGHT
-    ok = asyncio.run(check(width, height))
+    if len(sys.argv) > 1:
+        sizes = [(int(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else MIN_HEIGHT)]
+    else:
+        sizes = [(MIN_WIDTH, MIN_HEIGHT), (WIDE_WIDTH, WIDE_HEIGHT)]
+    ok = all([asyncio.run(check(w, h)) for w, h in sizes])
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
