@@ -33,6 +33,10 @@ WIDE_HEIGHT = 45
 DETAIL_MIN = 52  # the full stream URL — the widest single line in the app.
 # Measured against #detail's CONTENT box, so its border and padding are already
 # excluded and the number is comparable to a character count.
+PREFIX_W = 17  # marker+space, `chNNN `, the 2-column ┌/│/└ gutter, `HH:MM`,
+# then two spaces — everything on a programme row before the title starts.
+TITLE_MIN = 29  # title-elision budget a row must keep at MIN_WIDTH: the
+# 46-wide stacked programmes pane minus PREFIX_W.
 
 SRC = Path(__file__).resolve().parent / "epg-browser.py"
 spec = importlib.util.spec_from_file_location("epg_browser", SRC)
@@ -45,12 +49,13 @@ def fixture() -> tuple[dict, list]:
     """Two channels and a back-to-back run of long-titled shows, so the
     programme rows include a worst-case changeover: the second and third
     shows start at unrounded `now + i hours`, mid-block relative to the
-    15-minute grid, so their rows open with the indented `›` continuation
-    line rather than the block-clock line the first show's row gets (as the
-    window's first segment, its row is always clock-form — see
-    epg-browser.py's `_load_programmes`). `number` is set because every row
-    is prefixed with the channel number, and a fixture without one measures a
-    row six characters narrower than prod draws."""
+    15-minute grid, so their rows open on their own real unrounded start time
+    rather than the block-clock time the first show's row gets (as the
+    window's first segment, its row always opens on a block boundary — see
+    epg-browser.py's `_load_programmes`). Each row's title is stated once, on
+    its first line, with a ┌/│/└ gutter rule marking the rest. `number` is
+    set because every row is prefixed with the channel number, and a fixture
+    without one measures a row six characters narrower than prod draws."""
     now = datetime.now(timezone.utc)
     channels = {
         f"ersatztv.{n}": epgb.Channel(
@@ -128,15 +133,24 @@ async def check(width: int, height: int) -> bool:
         # Report-only: a changeover row can still clip at 80 columns. The full
         # text is always in the detail pane, so this is not a failure. A row
         # is one item now and can be several lines tall (one per 15-minute
-        # boundary it crosses) with the widest line anywhere in it — not
-        # necessarily the first, which is often the narrower indented `›`
-        # continuation line — so this measures every line of every row.
+        # boundary it crosses), with the title only on its first line and a
+        # bare clock plus gutter rule on every line after it — so this
+        # measures every line of every row, not just the first.
         pane = app.query_one("#programmes").region.width
         rows = [
             len(line) for i in app.query("#programmes ListItem") for line in _label_text(i.query_one("Label")).split("\n")
         ]
         widest = max(rows, default=0)
         print(f"  {'widest row':12} {widest} chars, pane {pane}  {'fits' if widest <= pane else 'clips (detail pane has it)'}")
+
+        # The gutter's real cost: the title-elision budget a row keeps once
+        # PREFIX_W is subtracted from the programmes pane. Asserted, not just
+        # reported, so a prefix that grows again fails the suite instead of
+        # silently eating into TITLE_MIN.
+        budget = pane - PREFIX_W
+        good = budget >= TITLE_MIN
+        ok &= good
+        print(f"  {'title budget':12} {budget} >= {TITLE_MIN} (pane {pane} - prefix {PREFIX_W})  {'OK' if good else 'TOO NARROW'}")
 
         # One ListItem per media item, not per 15-minute block (#415) — the
         # fixture channel (ersatztv.1, selected by default) has 3
