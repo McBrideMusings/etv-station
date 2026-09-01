@@ -43,10 +43,14 @@ spec.loader.exec_module(epgb)
 
 def fixture() -> tuple[dict, list]:
     """Two channels and a back-to-back run of long-titled shows, so the
-    programme rows include a worst-case changeover block — one that renders as
-    a block line plus a hanging line for the incoming show. `number` is set
-    because every row is prefixed with the channel number, and a fixture
-    without one measures a row six characters narrower than prod draws."""
+    programme rows include a worst-case changeover: the second and third
+    shows start at unrounded `now + i hours`, mid-block relative to the
+    15-minute grid, so their rows open with the indented `›` continuation
+    line rather than the block-clock line the first show's row gets (as the
+    window's first segment, its row is always clock-form — see
+    epg-browser.py's `_load_programmes`). `number` is set because every row
+    is prefixed with the channel number, and a fixture without one measures a
+    row six characters narrower than prod draws."""
     now = datetime.now(timezone.utc)
     channels = {
         f"ersatztv.{n}": epgb.Channel(
@@ -122,11 +126,29 @@ async def check(width: int, height: int) -> bool:
         print(f"  {'detail width':12} {detail_w} >= {floor} (terminal {width})  {'OK' if good else 'TOO NARROW'}")
 
         # Report-only: a changeover row can still clip at 80 columns. The full
-        # text is always in the detail pane, so this is not a failure.
+        # text is always in the detail pane, so this is not a failure. A row
+        # is one item now and can be several lines tall (one per 15-minute
+        # boundary it crosses) with the widest line anywhere in it — not
+        # necessarily the first, which is often the narrower indented `›`
+        # continuation line — so this measures every line of every row.
         pane = app.query_one("#programmes").region.width
-        rows = [len(_label_text(i.query_one("Label")).split("\n")[0]) for i in app.query("#programmes ListItem")]
+        rows = [
+            len(line) for i in app.query("#programmes ListItem") for line in _label_text(i.query_one("Label")).split("\n")
+        ]
         widest = max(rows, default=0)
         print(f"  {'widest row':12} {widest} chars, pane {pane}  {'fits' if widest <= pane else 'clips (detail pane has it)'}")
+
+        # One ListItem per media item, not per 15-minute block (#415) — the
+        # fixture channel (ersatztv.1, selected by default) has 3
+        # back-to-back hour-long programmes from `now`, so its rows should be
+        # exactly those 3 items plus the "Last EPG data" bound row, not the
+        # ~13 block rows a hard-coded block-per-row sidebar would produce.
+        assert app.selected_channel == "ersatztv.1", f"fixture default selection changed: {app.selected_channel}"
+        row_count = len(app.query("#programmes ListItem"))
+        expected = 4
+        good = row_count == expected
+        ok &= good
+        print(f"  {'item rows':12} {row_count} == {expected} (3 programmes + end-of-EPG bound row)  {'OK' if good else 'WRONG COUNT'}")
     return ok
 
 

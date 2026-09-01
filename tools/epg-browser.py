@@ -419,10 +419,11 @@ def build_app(host: str):
         ]
 
         REFRESH_SECS = 60  # re-fetch lineup from the station this often
-        TICK_SECS = 15  # rebuild the block list (cheap, no fetch) this often —
-        # this is what makes the top block roll from e.g. 15:45 to 16:00 live
-        BLOCK_MINUTES = 15  # width of one row in the shows sidebar
-        BLOCK_SAFETY_CAP = 2000  # ~20 days of blocks — a runaway-loop backstop, not a UX truncation
+        TICK_SECS = 15  # rebuild the item list (cheap, no fetch) this often —
+        # this is what makes the top row's clock roll from e.g. 15:45 to 16:00 live
+        BLOCK_MINUTES = 15  # the grid a row's height snaps to — one line per
+        # boundary it crosses, not the width of a row (a row is one item now)
+        BLOCK_SAFETY_CAP = 2000  # ~20 days of blocks walked — a runaway-loop backstop, not a UX truncation
         # How far back history mode reaches, when the guide still holds that
         # much. The station's default `retention_days` is 7, so in practice the
         # retained data runs out first and this never truncates — it is here so
@@ -440,7 +441,7 @@ def build_app(host: str):
             # at the BOTTOM, reading back. See _load_programmes.
             self.history = False
             # Parallel to #programmes items. Each entry is either:
-            #   ("block", block_start, segments)  — segments: list[(Programme|None, start, stop)]
+            #   ("item", seg_start, (Programme|None, start, stop))  — one media item (or one gap span)
             #   ("end", end_bound, None)          — "Last EPG data: ..."; forward mode, last row
             #   ("start", win_start, None)        — "Start of retained history"; history mode, FIRST row
             #   ("empty", None, last_known_programme_or_None)  — nothing to show in this direction
@@ -507,10 +508,11 @@ def build_app(host: str):
             return dt.replace(minute=floored_minute, second=0, microsecond=0)
 
         def _load_programmes(self, keep_selection: bool = False) -> None:
-            """(Re)populate the #programmes sidebar as fixed BLOCK_MINUTES-wide
-            rows, clock-aligned. Every block is rendered, on-air or off-air;
-            nothing is summarized or capped, so a scheduling gap is exactly as
-            long on screen as it is in reality.
+            """(Re)populate the #programmes sidebar with one row per media
+            item, each row's height snapped to the BLOCK_MINUTES grid (one
+            line per boundary it crosses). Every item is rendered, on-air or
+            off-air; nothing is summarized or capped, so a scheduling gap is
+            exactly as long on screen as it is in reality.
 
             Two directions, toggled with `h`:
 
@@ -528,14 +530,18 @@ def build_app(host: str):
 
             Both directions put the block containing `now` under the ▶ marker
             and select it on a fresh channel switch; it is simply at opposite
-            ends of the list. On a periodic rebuild, whatever block the user had
-            highlighted stays highlighted (by its real start time, not row
-            index, since the list shifts every time a block rolls over)."""
+            ends of the list. On a periodic rebuild, whatever item the user had
+            highlighted stays highlighted (by its title and real start time,
+            not row index, since the list shifts every time a block rolls
+            over or an item's row is regrouped)."""
             lv = self.query_one("#programmes", ListView)
             keep_kind = None
-            keep_block_start = None
+            keep_key = None
             if keep_selection and lv.index is not None and self.programme_rows and lv.index < len(self.programme_rows):
-                keep_kind, keep_block_start, _ = self.programme_rows[lv.index]
+                keep_kind, keep_row_ts, keep_payload = self.programme_rows[lv.index]
+                if keep_kind == "item":
+                    keep_title = keep_payload[0].title if keep_payload[0] is not None else None
+                    keep_key = (keep_title, keep_row_ts)
             lv.clear()
             self.programme_rows = []
             if self.selected_channel is None:
@@ -664,6 +670,43 @@ def build_app(host: str):
             cur = self._floor_block(win_start, self.BLOCK_MINUTES)
             step = timedelta(minutes=self.BLOCK_MINUTES)
             row_count = 0
+
+            # A row is one media item (or one gap span), not one block — but
+            # the loop below still walks blocks, because that's what already
+            # produces the right lines in the right order (block-clock line
+            # for whichever segment opens a block, indented `›` continuation
+            # line for every segment after it). This just groups those lines
+            # into per-segment row buffers instead of emitting one ListItem
+            # per block. `open_ident` tracks row ownership by the identity
+            # (`is`) of the segments[] tuple the open row belongs to — two
+            # adjacent gap segments can compare equal by value, so identity
+            # is what keeps them from merging into one row.
+            row_open = False
+            open_ident: object = None
+            open_payload: tuple[Programme | None, datetime, datetime] | None = None
+            open_lines: list[str] = []
+            open_row_ts: datetime | None = None
+            open_is_now = False
+
+            def flush() -> None:
+                nonlocal row_open, open_ident, open_payload, open_lines, open_row_ts, open_is_now, select_idx
+                if not row_open:
+                    return
+                lv.append(ListItem(Label("\n".join(open_lines)), name="item"))
+                row_idx = len(self.programme_rows)
+                self.programme_rows.append(("item", open_row_ts, open_payload))
+                title = open_payload[0].title if open_payload is not None and open_payload[0] is not None else None
+                if keep_kind == "item" and (title, open_row_ts) == keep_key:
+                    select_idx = row_idx
+                elif keep_kind not in ("item", "end", "start") and open_is_now:
+                    select_idx = row_idx
+                row_open = False
+                open_ident = None
+                open_payload = None
+                open_lines = []
+                open_row_ts = None
+                open_is_now = False
+
             while cur < end_bound and row_count < self.BLOCK_SAFETY_CAP:
                 block_end = cur + step
                 overlapping = []
@@ -679,33 +722,53 @@ def build_app(host: str):
                 is_now = cur <= now < block_end
                 marker = "▶" if is_now else " "
                 time_str = _fmt_dt(cur, today=now.date(), with_date=self.history)
-                # One line per programme in the block. The block's own clock
-                # anchors the first line; every segment after it gets its real
-                # unrounded start time, so a mid-block changeover reads as the
-                # minute it actually happens rather than being implied by an
-                # arrow. A block one show fully occupies is still a single row.
-                # Three-way changeovers just add a third line instead of
-                # truncating, and each line keeps the full title column, which
-                # the old inline "A → B" spent on the second title.
+                # One line per programme this block touches. The segment that
+                # opens the block gets the block-clock form; every segment
+                # after it in the same block gets its real unrounded start
+                # time on an indented `›` line. Which row a line joins is
+                # decided below: a block-clock line continues the still-open
+                # row when it's the same segment crossing a new boundary, and
+                # starts a fresh row otherwise.
                 prefix_w = 2 + chan_tag_w + len(time_str) + 2
                 if not overlapping:
-                    lines_out = [f"{marker} {chan_tag}{time_str}  [red]— off-air —[/red]"]
+                    # No segment covers this block at all — a window-edge
+                    # artifact (`cur` floors to before win_start on the first
+                    # block), not a real gap; `segments` already carries real
+                    # gaps as None-programme entries. One line, its own row,
+                    # never merged with a neighbour.
+                    flush()
+                    row_open = True
+                    open_ident = object()
+                    open_payload = (None, cur, block_end)
+                    open_lines = [f"{marker} {chan_tag}{time_str}  [red]— off-air —[/red]"]
+                    open_row_ts = cur
+                    open_is_now = is_now
+                    flush()
                 else:
-                    lines_out = [f"{marker} {chan_tag}{time_str}  {_seg_text(overlapping[0], prefix_w)}"]
                     hang = " " * (2 + chan_tag_w)
-                    for seg in overlapping[1:]:
-                        stamp = _fmt_dt(seg[1], today=now.date(), with_date=self.history).rjust(len(time_str))
-                        lines_out.append(f"{hang}[dim]{stamp}[/dim]› {_seg_text(seg, prefix_w)}")
-                label = "\n".join(lines_out)
-                lv.append(ListItem(Label(label), name="block"))
-                row_idx = len(self.programme_rows)
-                self.programme_rows.append(("block", cur, overlapping))
-                if keep_kind == "block" and cur == keep_block_start:
-                    select_idx = row_idx
-                elif keep_kind not in ("block", "end", "start") and is_now:
-                    select_idx = row_idx
+                    for j, seg in enumerate(overlapping):
+                        if j == 0:
+                            line = f"{marker} {chan_tag}{time_str}  {_seg_text(seg, prefix_w)}"
+                        else:
+                            stamp = _fmt_dt(seg[1], today=now.date(), with_date=self.history).rjust(len(time_str))
+                            line = f"{hang}[dim]{stamp}[/dim]› {_seg_text(seg, prefix_w)}"
+                        if j == 0 and row_open and open_ident is seg:
+                            # Same item as the still-open row, crossing into a
+                            # new boundary mid-item — add a line, not a row.
+                            open_lines.append(line)
+                            if is_now:
+                                open_is_now = True
+                        else:
+                            flush()
+                            row_open = True
+                            open_ident = seg
+                            open_payload = seg
+                            open_lines = [line]
+                            open_row_ts = seg[1]
+                            open_is_now = is_now
                 cur = block_end
                 row_count += 1
+            flush()
 
             # Forward mode's bound row closes the list. History mode already
             # opened with its own bound row and ends at `now`, which is not an
@@ -835,7 +898,7 @@ def build_app(host: str):
 
             row = self._selected_row()
             if row is None:
-                lines.append("[dim]No block selected.[/dim]")
+                lines.append("[dim]No programme selected.[/dim]")
             else:
                 # The bound rows carry their timestamp in the middle slot and
                 # nothing in the payload — reading `payload` here crashed on
@@ -857,21 +920,19 @@ def build_app(host: str):
                         f"[dim]The guide holds nothing older. History mode reaches back at most "
                         f"{self.HISTORY_DAYS} days; the retention sweep may have cut it shorter.[/dim]"
                     )
-                else:  # "block"
-                    segments: list[tuple[Programme | None, datetime, datetime]] = payload
-                    if len(segments) == 1 and segments[0][0] is None:
-                        lines.append("[b]status: off-air[/b] — no programme scheduled in this block")
+                else:  # "item"
+                    p, s, e = payload
+                    if p is None:
+                        lines.append("[b]status: off-air[/b]")
+                        lines.append(f"[dim]— off-air {_fmt_dt_sec(s)} … {_fmt_dt_sec(e)} —[/dim]")
                     else:
-                        for i, (p, s, e) in enumerate(segments):
-                            if p is None:
-                                lines.append(f"[dim]— off-air {_fmt_dt_sec(s)} … {_fmt_dt_sec(e)} —[/dim]")
-                                lines.append("")
-                                continue
-                            heading = "Selected show" if len(segments) == 1 else ("Ends this block" if i == 0 else "Begins this block")
-                            lines.append(f"[b]{heading}[/b]  ({_fmt_dt_sec(s)} → {_fmt_dt_sec(e)})")
-                            lines.append(f"  [b]{self._programme_headline(p)}[/b]")
-                            lines.extend(self._programme_fields(p))
-                            lines.append("")
+                        # The row addresses the whole programme, not the
+                        # window-clamped segment — a row whose first line was
+                        # clamped to `now` must still show the film's real
+                        # start, not the moment the guide started rendering.
+                        lines.append(f"[b]Selected show[/b]  ({_fmt_dt_sec(p.start)} → {_fmt_dt_sec(p.stop)})")
+                        lines.append(f"  [b]{self._programme_headline(p)}[/b]")
+                        lines.extend(self._programme_fields(p))
             body.update("\n".join(lines))
 
         def action_open_vlc(self) -> None:
@@ -885,11 +946,10 @@ def build_app(host: str):
             row = self._selected_row()
             if row is not None:
                 kind, _, payload = row
-                if kind == "block":
-                    for p, _, _ in payload:
-                        if p is not None and p.icon:
-                            url = p.icon
-                            break
+                if kind == "item":
+                    p = payload[0]
+                    if p is not None and p.icon:
+                        url = p.icon
                 elif kind == "empty" and payload is not None and payload.icon:
                     url = payload.icon
             if url is None and self.selected_channel is not None:
