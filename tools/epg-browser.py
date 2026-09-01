@@ -496,15 +496,20 @@ def build_app(host: str):
 
         @work(exclusive=True, thread=True, group="lineup")
         def _fetch_lineup_worker(self) -> None:
-            try:
-                channels, programmes = fetch_lineup(self.host)
-            except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not crashed on
-                self.call_from_thread(self._lineup_failed, str(exc))
-                return
             # exclusive=True cancels the previous worker but a thread worker
             # keeps running to completion — this is what stops a slow fetch
             # a newer refresh superseded from clobbering the newer one.
-            if get_current_worker().is_cancelled:
+            # A superseded worker should report nothing at all — neither its
+            # result nor its error.
+            worker = get_current_worker()
+            try:
+                channels, programmes = fetch_lineup(self.host)
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not crashed on
+                if worker.is_cancelled:
+                    return
+                self.call_from_thread(self._lineup_failed, str(exc))
+                return
+            if worker.is_cancelled:
                 return
             self.call_from_thread(self._apply_lineup, channels, programmes)
 
