@@ -177,6 +177,47 @@ fn influence_weight(ctx) { tunable(ctx, "influence_weight", 0.0).to_float() }
 // keywords it shares with it — the same terms as every other candidate.
 fn influence_set_name() { "influence" }
 
+// Which half of the library this pool may rank, by whether the account has
+// ever played it (#397). Three values:
+//
+//   "any"      every candidate — the default, and what every pool did before
+//   "only"     only units the account has played: comfort viewing
+//   "exclude"  only units it has not: discovery
+//
+// This partitions CANDIDATES; it does not score them. #254's rule — Plex
+// watch state never lowers a score — is about ranking, and is untouched: a
+// title inside the half a pool may draw from is ranked exactly as before.
+//
+// **The partition is what makes two movie pools legal in one block.** Pools
+// are blind to each other (schema.md § Pool `constraints`), so two pools that
+// can resolve the same entry_id may both air it in one day and neither one's
+// no-repeat rule will notice. "only" and "exclude" cannot overlap, so a
+// comfort pool and a discovery pool are disjoint by construction.
+//
+// The source is the datastore's lifetime play set, not `ctx.history` — that
+// is the newest 1000 Tautulli rows, so a film watched three years ago would
+// read as unseen and land in the discovery half.
+fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
+
+// How much a candidate is discounted for sitting close to what the WHOLE
+// HOUSE watches (#397) — the "unusual choice" knob. The score is divided by
+// `1 + unusual_weight * house cosine`, so a positive value pushes toward
+// titles nobody here has a habit of watching.
+//
+// The three terms together read as a sentence: rank by what this account
+// likes, tilt toward the influence set, and discount the house's well-worn
+// middle. Unlike `influence_weight` this one is scale-free — it is a ratio
+// against 1.0, not against the house vector's magnitude — so 1.0 means "halve
+// the score of a title whose house cosine is 1.0" whatever the library.
+// See the score assembly in pick() for why it divides rather than subtracts.
+//
+// Meaningful only on a `taste_scope: single_user` channel. On a pooled
+// channel the taste vector IS the house vector, so this subtracts a scaled
+// copy of the first term and only flattens the ranking.
+//
+// Zero by default.
+fn unusual_weight(ctx) { tunable(ctx, "unusual_weight", 0.0).to_float() }
+
 // How many shows a `unit = "show"` pool hands back. Not `target_count`: a
 // show expands to every episode it has, so asking for one show per scheduled
 // item would return tens of thousands of ids. This is how many series the
@@ -285,6 +326,24 @@ fn pick(ctx) {
     let units = [];
     let members = #{};
 
+    // The lifetime play set, as a lookup, when this pool takes only one half
+    // of it (#397). Fetched before the unit pass below so the filter is one
+    // map probe per candidate rather than a query per candidate.
+    //
+    // Scoped to this channel's account when it has one, and to the house when
+    // it does not — a pooled channel has no single "have I seen this", and
+    // the house's set is the closest true answer rather than a guess.
+    let mode = seen_mode(ctx);
+    let watched = #{};
+    if mode != "any" {
+        let ids = if ctx.account_id != () {
+            ds.watched_units_for(ctx.account_id)
+        } else {
+            ds.watched_units()
+        };
+        for id in ids { watched[id] = true; }
+    }
+
     // The airing tail, as a distance back from the newest: 1 is the last
     // thing that aired, `recent.len` the oldest still remembered.
     // `ctx.recent` is newest-LAST, so the distance is measured from the end.
@@ -326,6 +385,14 @@ fn pick(ctx) {
         for ep in ctx.sets.shows {
             let sid = ep.show_id;
             if sid == () { continue; }
+            // The partition keys on the SERIES, matching the unit being
+            // ranked: "have I watched Columbo", not "have I watched this
+            // episode of it".
+            if mode != "any" {
+                let was_seen = watched[sid] != ();
+                if mode == "only" && !was_seen { continue; }
+                if mode == "exclude" && was_seen { continue; }
+            }
             if members[sid] == () {
                 units.push(sid);
                 members[sid] = [];
@@ -348,6 +415,11 @@ fn pick(ctx) {
     } else {
         for item in ctx.sets.movies {
             let id = item.entry_id;
+            if mode != "any" {
+                let was_seen = watched[id] != ();
+                if mode == "only" && !was_seen { continue; }
+                if mode == "exclude" && was_seen { continue; }
+            }
             units.push(id);
             members[id] = [[-1, -1, id]];
             let d = aired[id];
@@ -422,6 +494,20 @@ fn pick(ctx) {
         }
     }
 
+    // The house's own profile, for the "unusual choice" term (#397). Fetched
+    // only when a pool asks for it, and skipped outright on a pooled channel,
+    // where it would be the same vector `weights` already holds.
+    let gamma = unusual_weight(ctx);
+    let house_weights = #{};
+    if gamma != 0.0 && ctx.account_id != () {
+        let house = ds.pooled_taste_vector();
+        for attr in house.attributes {
+            if attr.namespace == ns {
+                house_weights[attr.key + "\x01" + attr.value] = attr.weight;
+            }
+        }
+    }
+
     let seed = ctx.seed;
 
     let half_life = recency_half_life(ctx);
@@ -463,6 +549,7 @@ fn pick(ctx) {
         let facts = enrichment[id];
         let taste_score = 0.0;
         let influence_score = 0.0;
+        let house_score = 0.0;
         let eligible = false;
         // The specific keywords this candidate shares with the pooled
         // profile — not needed for ranking, only so a ranking can be
@@ -477,17 +564,20 @@ fn pick(ctx) {
             let n = 0;
             let sum = 0.0;
             let infl_sum = 0.0;
+            let house_sum = 0.0;
             for f in facts {
                 if f.namespace == ns {
                     n += 1;
                     let k = f.key + "\x01" + f.value;
                     let w = weights[k];
                     let iw = infl_weights[k];
+                    let hw = house_weights[k];
                     // The idf is computed once for the keyword and shared by
-                    // both profiles, and only when at least one of them has
-                    // something to say about it — a keyword neither carries
-                    // must not pay for an ln() call on every candidate (#172).
-                    if w != () || iw != () {
+                    // all three profiles, and only when at least one of them
+                    // has something to say about it — a keyword none of them
+                    // carries must not pay for an ln() call on every
+                    // candidate (#172).
+                    if w != () || iw != () || hw != () {
                         // idf: a keyword every candidate carries scales by
                         // exactly 1.0 (doc_count / df == 1, ln == 0); a
                         // keyword only a few candidates carry scales up —
@@ -503,6 +593,11 @@ fn pick(ctx) {
                             infl_sum += iw * idf;
                             on_influence.push(f.value);
                         }
+                        // No keyword list for the house term: it is a
+                        // penalty, and naming the keywords a title was
+                        // penalised for would be the longest list in the
+                        // audit and the least useful.
+                        if hw != () { house_sum += hw * idf; }
                     }
                 }
             }
@@ -525,6 +620,7 @@ fn pick(ctx) {
                 let divisor = n.to_float().sqrt();
                 taste_score = sum / divisor;
                 influence_score = infl_sum / divisor;
+                house_score = house_sum / divisor;
             }
         }
         // The cosine before recency, kept alongside the damped one so the
@@ -532,9 +628,29 @@ fn pick(ctx) {
         // aired last night only reads as a decision if both halves are
         // visible; one number alone reads as the scorer changing its mind.
         //
-        // With no influence set this is exactly the taste cosine, unchanged
-        // from #254: `beta` is 0.0 and `influence_score` is 0.0.
-        let base_score = taste_score + beta * influence_score;
+        // Three terms: what this account likes, tilted toward the influence
+        // set, discounted by how close it sits to the house's well-worn
+        // middle (#396, #397). With neither weight set this is exactly the
+        // taste cosine, unchanged from #254 — `beta` and `gamma` are 0.0, so
+        // the divisor is 1.0.
+        //
+        // **The house term divides where the influence term adds**, and the
+        // asymmetry is deliberate. Subtracting it drives scores negative,
+        // which breaks two things at once: a negative score sorts below a
+        // title carrying no keywords at all — ranking "too mainstream" under
+        // "we know nothing about this" — and the recency factor below is a
+        // multiply by a number in (0, 1], so damping a negative score raises
+        // it, turning "this aired last night" into a promotion. Clamping the
+        // subtraction at zero fixes neither: it collapses every penalised
+        // title into one indistinguishable bucket, which is exactly where the
+        // term is meant to be discriminating hardest.
+        //
+        // `house_score` is a sum of non-negative weights, so the divisor is
+        // always >= 1.0: never zero, never negative, and the result keeps the
+        // sign and the ordering that the rest of this script assumes.
+        // `gamma` is scale-free for the same reason — it is a ratio against
+        // 1.0 rather than against the house vector's magnitude.
+        let base_score = (taste_score + beta * influence_score) / (1.0 + gamma * house_score);
         let aired_rank = unit_recency[id];
         let factor = recency_factor(aired_rank, half_life);
         let score = base_score * factor;
@@ -544,6 +660,7 @@ fn pick(ctx) {
             base_score: base_score,
             taste_score: taste_score,
             influence_score: influence_score,
+            house_score: house_score,
             // Unit for a title this channel's remembered tail does not hold
             // — which is most of them, and is what `explorable` below tests.
             aired_rank: aired_rank,
@@ -712,6 +829,12 @@ fn pick(ctx) {
             influence_score: row.influence_score,
             influence_weight: beta,
             on_influence: row.on_influence,
+            // The house term and the half of the library this pool drew from
+            // (#397), so an audit line says which of the two movie pools a
+            // pick came out of without the reader knowing the config.
+            house_score: row.house_score,
+            unusual_weight: gamma,
+            seen: mode,
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
@@ -850,6 +973,9 @@ fn audit(ctx, picks, workspace) {
                 influence_score: r.influence_score,
                 influence_weight: r.influence_weight,
                 on_influence: r.on_influence,
+                house_score: r.house_score,
+                unusual_weight: r.unusual_weight,
+                seen: r.seen,
                 recency_factor: r.recency_factor,
                 aired_rank: r.aired_rank,
                 // The series this entry was ranked as, on a shows pool.
@@ -881,6 +1007,18 @@ fn audit(ctx, picks, workspace) {
         // every one of them.
         if r != () && r.influence_weight > 0.0 && r.influence_score > 0.0 {
             verdict = verdict + ", tilted toward the influence set";
+        }
+        // Which half of the library the pool drew from, named on every pick
+        // that came from a partitioned pool. Not conditional on the pick
+        // itself the way the tilt clause is: the partition applied to this
+        // pick by definition, since it is why the candidate was there at all.
+        if r != () && r.seen == "only" {
+            verdict = verdict + ", from titles this account has already played";
+        } else if r != () && r.seen == "exclude" {
+            verdict = verdict + ", from titles this account has never played";
+        }
+        if r != () && r.unusual_weight > 0.0 && r.house_score > 0.0 {
+            verdict = verdict + ", pushed away from what the house watches";
         }
         out[p.entry_id] = #{
             stage: "pool",

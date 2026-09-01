@@ -1,5 +1,5 @@
 # Vendored from plex-db-ex (McBrideMusings/plex-db-ex), crates/plexdb-reader,
-# at commit 0da6e8b. Files under src/ are unmodified copies of that crate;
+# at commit d809635. Files under src/ are unmodified copies of that crate;
 # only this manifest is adapted to plug into etv-station's own workspace
 # instead of plex-db-ex's. See docs/architecture.md's "Why plexdb-reader is
 # vendored, not a git dependency" for why, and how to refresh this copy.

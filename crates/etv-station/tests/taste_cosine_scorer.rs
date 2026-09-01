@@ -1593,3 +1593,207 @@ fn a_pool_with_no_influence_set_is_untouched_by_the_feature() {
         "base_score must be the taste cosine alone when nothing tilts it",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #397 — `seen` partitions the candidates and `unusual_weight` pushes away
+// from the house.
+//
+// The fixture is the influence one plus a second account, so "this account's
+// taste" and "the house's taste" are genuinely different vectors rather than
+// the same numbers twice. Account 42 played mov-a only; account 99 played
+// mov-c twice, which puts `contact` heavily into the pooled vector and not at
+// all into 42's own past `mov-a`'s share of it.
+//
+// The partition is the claim that matters: "only" and "exclude" cannot both
+// return the same title, which is what makes a comfort pool and a discovery
+// pool safe to run in one block.
+// ---------------------------------------------------------------------------
+
+fn write_seen_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('mov-a', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie'),
+                 ('gp-1', 'movie'), ('gp-2', 'movie');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('mov-a', 'tmdb_keywords', 'keyword', 'contact', 't'),
+                 ('mov-a', 'tmdb_keywords', 'keyword', 'time', 't'),
+                 ('mov-c', 'tmdb_keywords', 'keyword', 'contact', 't'),
+                 ('mov-d', 'tmdb_keywords', 'keyword', 'time', 't'),
+                 ('mov-d', 'tmdb_keywords', 'keyword', 'desert', 't'),
+                 ('gp-1', 'tmdb_keywords', 'keyword', 'desert', 't'),
+                 ('gp-2', 'tmdb_keywords', 'keyword', 'desert', 't');
+             -- Account 42 has played mov-a and nothing else. Account 99's two
+             -- plays of mov-c exist only to make the pooled vector differ
+             -- from 42's; they must never make mov-c look watched to 42.
+             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+                 ('h1', 'mov-a', 42, 1700000000),
+                 ('h2', 'mov-c', 99, 1700000100),
+                 ('h3', 'mov-c', 99, 1700000200);",
+        )
+        .unwrap();
+}
+
+impl Scorer {
+    /// One generation on a pool that partitions on watch state and/or leans
+    /// away from the house — the two halves of #397. `account_id` is required
+    /// for either to mean anything, exactly as on a live `single_user`
+    /// channel.
+    fn pick_split(
+        &self,
+        seen: &str,
+        unusual_weight: f64,
+        account_id: i64,
+        target_count: usize,
+    ) -> Vec<PickedItem> {
+        let config = serde_json::json!({
+            "exploration_fraction": 0.0,
+            "seen": seen,
+            "unusual_weight": unusual_weight,
+        });
+        self.pick_for(
+            "movies",
+            0,
+            target_count,
+            Some(config),
+            Some(account_id),
+            &[],
+        )
+    }
+}
+
+fn seen_scorer() -> Scorer {
+    let cat = catalog_of(["mov-a", "mov-c", "mov-d", "gp-1", "gp-2"]);
+    Scorer::new_sourced(&cat, write_seen_fixture, Some(influence_sources()))
+}
+
+/// The acceptance criterion, and the property two movie pools in one block
+/// depend on: the two halves are disjoint and together they are the whole.
+#[test]
+fn seen_only_and_seen_exclude_partition_the_candidates() {
+    let scorer = seen_scorer();
+
+    let comfort = scorer.pick_split("only", 0.0, 42, 10);
+    let discovery = scorer.pick_split("exclude", 0.0, 42, 10);
+
+    let seen: Vec<&str> = order_of(&comfort);
+    let unseen: Vec<&str> = order_of(&discovery);
+
+    assert_eq!(
+        seen,
+        vec!["mov-a"],
+        "account 42 has played exactly one of the candidates"
+    );
+    assert!(
+        !unseen.contains(&"mov-a"),
+        "the discovery half must not repeat the comfort half: {unseen:?}"
+    );
+    assert!(
+        unseen.contains(&"mov-c"),
+        "account 99's plays of mov-c must not make it look watched to 42"
+    );
+
+    let mut whole: Vec<&str> = seen.iter().chain(unseen.iter()).copied().collect();
+    whole.sort_unstable();
+    assert_eq!(
+        whole,
+        vec!["mov-a", "mov-c", "mov-d"],
+        "the two halves together must be every candidate, each exactly once"
+    );
+}
+
+/// `seen: any` — the default — is every candidate, so a pool that never sets
+/// the key behaves as it always did.
+#[test]
+fn seen_defaults_to_the_whole_library() {
+    let scorer = seen_scorer();
+    let picked = scorer.pick_split("any", 0.0, 42, 10);
+    let mut all = order_of(&picked);
+    all.sort_unstable();
+    assert_eq!(all, vec!["mov-a", "mov-c", "mov-d"]);
+}
+
+/// The unusual term subtracts the house's own cosine, so a title the house
+/// has a habit of watching falls behind one it does not. `mov-c` carries
+/// `contact`, which account 99's two plays put heavily into the pooled vector
+/// — so raising `unusual_weight` must push `mov-c` down.
+#[test]
+fn the_unusual_term_pushes_away_from_what_the_house_watches() {
+    let scorer = seen_scorer();
+
+    let flat = scorer.pick_split("exclude", 0.0, 42, 10);
+    let pushed = scorer.pick_split("exclude", 1.0, 42, 10);
+
+    let before = order_of(&flat)
+        .iter()
+        .position(|id| *id == "mov-c")
+        .unwrap();
+    let after = order_of(&pushed)
+        .iter()
+        .position(|id| *id == "mov-c")
+        .unwrap();
+    assert!(
+        after > before,
+        "mov-c carries the house's heaviest keyword and must fall, was {before} now {after}"
+    );
+
+    let c = pushed.iter().find(|p| p.id == "mov-c").unwrap();
+    assert!(
+        detail_f64(c, "house_score") > 0.0,
+        "the audit must report the house cosine it was penalised by"
+    );
+    assert_close(detail_f64(c, "unusual_weight"), 1.0, "the weight");
+    assert_close(
+        detail_f64(c, "base_score"),
+        detail_f64(c, "taste_score") / (1.0 + detail_f64(c, "house_score")),
+        "base_score against taste / (1 + weight * house)",
+    );
+}
+
+/// The house term divides rather than subtracts, so no weight — however
+/// extreme — can drive a score to or below zero. A negative score would sort
+/// under a title carrying no keywords at all, and would invert the recency
+/// damping, which is a multiply by a number in (0, 1].
+#[test]
+fn the_house_term_never_drives_a_score_to_zero_or_below() {
+    let picked = seen_scorer().pick_split("any", 5000.0, 42, 10);
+    let scored: Vec<&PickedItem> = picked
+        .iter()
+        .filter(|p| detail_f64(p, "taste_score") > 0.0)
+        .collect();
+    assert!(!scored.is_empty(), "the fixture must produce scored titles");
+    for p in scored {
+        assert!(
+            detail_f64(p, "base_score") > 0.0,
+            "{} scored {} at unusual_weight 5000",
+            p.id,
+            detail_f64(p, "base_score")
+        );
+    }
+}
+
+/// The verdict names the half and the push, so an audit line says which of
+/// two sibling pools a pick came out of without the reader holding the config.
+#[test]
+fn the_verdict_names_the_half_of_the_library_a_pick_came_from() {
+    let comfort = seen_scorer().pick_split("only", 0.0, 42, 10);
+    let a = comfort.iter().find(|p| p.id == "mov-a").unwrap();
+    assert_eq!(
+        a.metadata.as_ref().unwrap()["audit"][0]["verdict"]
+            .as_str()
+            .unwrap(),
+        "ranked by keyword cosine against pooled taste, \
+         from titles this account has already played",
+    );
+
+    let discovery = seen_scorer().pick_split("exclude", 1.0, 42, 10);
+    let c = discovery.iter().find(|p| p.id == "mov-c").unwrap();
+    let v = c.metadata.as_ref().unwrap()["audit"][0]["verdict"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        v.contains("never played") && v.contains("what the house watches"),
+        "a discovery pick must name both, got: {v}"
+    );
+}

@@ -297,6 +297,54 @@ impl Reader {
         self.rollup(units)
     }
 
+    /// Every unit one Plex account has ever played, as ids — the lifetime
+    /// answer to "has this been watched", which no fixed-length history tail
+    /// can give (issue #62).
+    ///
+    /// A unit is what [`Self::taste_vector_for`] weighs: a film is its own
+    /// unit, an episode rolls up to its show. So a caller ranking films gets
+    /// film ids back, and one ranking series gets show ids, with no second
+    /// join on either side.
+    ///
+    /// **One play is the bar.** This answers "has this been played", not "was
+    /// it finished" — `seconds_watched` is deliberately not read, because a
+    /// caller asking whether to recommend something has no use for a rule
+    /// that calls a film unwatched after two hours of it. ADR-0011's `r = 0.5`
+    /// abandonment floor belongs to the taste rollup, where a weak signal must
+    /// not move a weight; it is the wrong rule for a membership test.
+    ///
+    /// Sorted, so the result is deterministic. Empty, not an error, for an
+    /// account with no plays.
+    pub fn watched_units_for(&self, plex_account_id: i64) -> Result<Vec<String>, ReaderError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT COALESCE(i.show_item_id, p.item_id) AS unit \
+             FROM plays p \
+             JOIN items i ON i.item_id = p.item_id \
+             WHERE p.plex_account_id = ?1 \
+             ORDER BY unit",
+        )?;
+        let units = stmt
+            .query_map([plex_account_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(units)
+    }
+
+    /// The same, pooled across every account — what the *house* has seen,
+    /// rather than one person. Same unit rollup and the same one-play bar as
+    /// [`Self::watched_units_for`].
+    pub fn watched_units(&self) -> Result<Vec<String>, ReaderError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT COALESCE(i.show_item_id, p.item_id) AS unit \
+             FROM plays p \
+             JOIN items i ON i.item_id = p.item_id \
+             ORDER BY unit",
+        )?;
+        let units = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(units)
+    }
+
     /// The Layer 2 rollup pooled across every account, weighted per
     /// ADR-0011 exactly as [`Self::taste_vector_for`] weighs one account.
     ///

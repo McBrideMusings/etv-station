@@ -35,10 +35,10 @@
 //! // as `#{ datastore: "name" }` instead of a bare string; see
 //! // `config::Pool::datastores`. A granted datastore is reached as
 //! // `ctx.datastore("name")` (#181), which returns a handle exposing the
-//! // plex-db-ex reader crate's six accessors — `enrichment_for`,
+//! // plex-db-ex reader crate's eight accessors — `enrichment_for`,
 //! // `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`,
-//! // `pooled_taste_vector` — or fails the pick() call naming the
-//! // datastore if it was never granted.
+//! // `pooled_taste_vector`, `watched_units_for`, `watched_units` — or fails
+//! // the pick() call naming the datastore if it was never granted.
 //! fn capabilities() { ["catalog_read", "watch_history"] }
 //!
 //! // Every catalog query this plugin will read, named. Run once, up front —
@@ -888,6 +888,27 @@ impl Datastore {
         Ok(taste_vector_to_dynamic(vector))
     }
 
+    /// Every unit one account has ever played, as an array of id strings
+    /// (plex-db-ex#62). The lifetime answer, unlike `ctx.history`, which is
+    /// the newest 1000 Tautulli rows and therefore reports a film watched
+    /// three years ago as unseen.
+    fn watched_units_for(&mut self, plex_account_id: i64) -> Result<Array, Box<EvalAltResult>> {
+        let units = self
+            .lock()
+            .watched_units_for(plex_account_id)
+            .map_err(|e| format!("datastore: watched_units_for({plex_account_id}): {e}"))?;
+        Ok(units.into_iter().map(Dynamic::from).collect())
+    }
+
+    /// The same, pooled across every account — what the house has seen.
+    fn watched_units(&mut self) -> Result<Array, Box<EvalAltResult>> {
+        let units = self
+            .lock()
+            .watched_units()
+            .map_err(|e| format!("datastore: watched_units(): {e}"))?;
+        Ok(units.into_iter().map(Dynamic::from).collect())
+    }
+
     /// The server-wide taste vector — see
     /// [`plexdb_reader::Reader::pooled_taste_vector`] for what "pooled" means
     /// (plex-db-ex#39).
@@ -1092,7 +1113,9 @@ pub(crate) fn engine() -> Engine {
         .register_fn("edges_from", Datastore::edges_from)
         .register_fn("edges_to", Datastore::edges_to)
         .register_fn("taste_vector_for", Datastore::taste_vector_for)
-        .register_fn("pooled_taste_vector", Datastore::pooled_taste_vector);
+        .register_fn("pooled_taste_vector", Datastore::pooled_taste_vector)
+        .register_fn("watched_units_for", Datastore::watched_units_for)
+        .register_fn("watched_units", Datastore::watched_units);
     engine
         .register_fn("timestamp", clock_read)
         .register_fn("elapsed", |t0: f64| clock_read() - t0);

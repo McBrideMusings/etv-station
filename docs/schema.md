@@ -901,6 +901,56 @@ An influence set is scored against **units**, so it belongs on a `unit: movie`
 pool. A film collection's keywords cannot join to a `unit: show` pool, whose
 units are series ids.
 
+#### `seen` and `unusual_weight` — two pools, two pitches (#397)
+
+`taste-cosine.rhai` takes two more `config` keys, both aimed at one channel
+running a *comfort* movie pool and a *discovery* movie pool side by side:
+
+```yaml
+- name: comfort
+  config: { seen: only,    influence_weight: 3.0 }
+- name: discovery
+  config: { seen: exclude, influence_weight: 3.0, unusual_weight: 0.1 }
+```
+
+**`seen`** partitions the candidates on whether the channel's account has ever
+played the unit — `only`, `exclude`, or `any` (the default). It partitions;
+it does not score, so #254's rule that Plex watch state never lowers a score
+is untouched.
+
+This is what makes two movie pools legal in one block. [Pools are blind to
+each other](#pool-constraints-spacing-counted-in-a-pools-own-draw-order), so
+two that can resolve the same `entry_id` may both air it in one day and
+neither one's `no_repeat_within` will notice. `only` and `exclude` cannot
+overlap, so the two are disjoint by construction.
+
+Watch state comes from the granted datastore's whole `plays` table
+(`watched_units_for`, plex-db-ex#62), not from `ctx.history`, which is the
+newest 1000 Tautulli rows and would call a film watched two years ago unseen.
+A pool with no `ctx.account_id` — a pooled channel — partitions on what the
+*house* has played, which is the closest true answer available to it. On a
+`unit: show` pool the partition keys on the series, matching the unit ranked.
+
+**`unusual_weight`** divides the score by `1 + unusual_weight × house cosine`,
+discounting a title the whole house has a habit of watching. It divides rather
+than subtracts: a subtraction drives scores negative, and a negative score
+both sorts below a title carrying no keywords at all and inverts the recency
+damping, which is a multiply by a number in (0, 1]. Clamping at zero is worse
+still — it collapses every penalised title into one bucket.
+
+Unlike `influence_weight` it is scale-free, a ratio against 1.0 rather than
+against the house vector's magnitude, so useful values are small. Measured on
+`002-for-pierce`, watching for the failure mode where titles the account's own
+taste says nothing about float up purely because the house dislikes them:
+`0.05`–`0.25` are clean, `0.5` puts 8 such titles in 42 picks, `1.0` puts 22
+in 43. It means nothing on a pooled channel, where the taste vector already is
+the house vector.
+
+Every pick's audit detail carries `house_score`, `unusual_weight` and `seen`,
+and the verdict names the half the pick came from — so `admin audit` says
+which of two sibling pools aired something without the reader holding the
+config.
+
 #### The record shape — `metadata` and a per-entry `take` (#166)
 
 Each element `pick()`'s `picks` array holds may be a bare `entry_id` string —
@@ -1092,7 +1142,7 @@ are gated behind a declaration, and a third is opened only by name:
 |---|---|---|
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
-| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, and `pooled_taste_vector` accessors (#181, #271); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
+| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #397); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
 
 Unlike `hooks()`, `capabilities()` is optional — a script with no such function
 declares nothing, which is the right answer for a plugin that only reads the
