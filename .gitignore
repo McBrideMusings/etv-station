@@ -62,3 +62,9 @@ tmp-*.log
 # port, so it is machine config, not project config. Synced to the host on every
 # `deploy image`; recreate it from admin.toml and the host env file.
 deploy/unraid-template.xml
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

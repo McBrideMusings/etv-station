@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "etv_station",
+  "project_id": "59d1eec0-4726-4a33-b32b-defbea30a00e"
+}
