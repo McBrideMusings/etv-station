@@ -175,6 +175,14 @@ fn influence_weight(ctx) { tunable(ctx, "influence_weight", 0.0).to_float() }
 // It is a PROFILE, not a candidate list: nothing here restricts what the pool
 // may pick. A film in the set gets no bonus for being in it, only for the
 // keywords it shares with it — the same terms as every other candidate.
+//
+// **The join is keyword-to-keyword, never id-to-id**, so the set and the
+// candidates do not have to be the same kind of thing. The members' keywords
+// are aggregated into a weight map below; a candidate is scored on its OWN
+// keywords against that map. A film collection therefore tilts a `unit: show`
+// pool exactly as well as a movie pool — measured on 003-for-madi, 5 of the 12
+// series that pool returns draw a nonzero influence score from a collection of
+// 24 films. An earlier version of this comment claimed the opposite.
 fn influence_set_name() { "influence" }
 
 // Which half of the library this pool may rank, by whether the account has

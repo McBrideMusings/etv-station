@@ -901,9 +901,14 @@ actually contributed), and a tilted pick's verdict gains `, tilted toward the
 influence set` — so `admin audit <channel>` is how the weight gets tuned
 against real numbers rather than guessed.
 
-An influence set is scored against **units**, so it belongs on a `unit: movie`
-pool. A film collection's keywords cannot join to a `unit: show` pool, whose
-units are series ids.
+**The join is keyword-to-keyword, not id-to-id**, so an influence set works on
+a `unit: show` pool as readily as on a `unit: movie` one — the set's members
+and the pool's candidates never have to be the same kind of thing. The set's
+`tmdb_keywords` are aggregated into a weight map; a candidate is scored on its
+own keywords against that map. A show carries `tmdb_keywords` the same way a
+film does, so a collection of 24 films tilts a series ranking perfectly well:
+on `003-for-madi`, 5 of the 12 series its shows pool returns draw a nonzero
+`influence_score` from a film-only collection.
 
 #### `seen` and `unusual_weight` — two pools, two pitches (#411)
 
