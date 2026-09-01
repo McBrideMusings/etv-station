@@ -216,6 +216,40 @@ async def check_resize_debounce() -> bool:
     return ok
 
 
+async def check_resize_teardown() -> bool:
+    """A resize armed within RESIZE_DEBOUNCE_SECS of quitting must not fire
+    its callback against a torn-down screen (etv-station-7v6b): arm a resize,
+    then exit the app immediately — the quit-inside-100ms shape — and confirm
+    on_unmount cancelled the pending timer instead of leaving it to fire
+    _flush_resize -> _apply_layout -> query_one("#layout") against a dead
+    widget tree."""
+    epgb.fetch_lineup = lambda host: fixture()
+    app = epgb.build_app("http://127.0.0.1:8409")
+    ok = True
+    try:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.resize_terminal(150, 24)
+            armed = app._resize_timer is not None
+            ok &= armed
+            print(f"  {'timer armed':12} {armed}  {'OK' if armed else 'FAIL (nothing pending to test teardown against)'}")
+            # No pause here — exit the context immediately, before
+            # RESIZE_DEBOUNCE_SECS elapses, so the timer is still pending
+            # at teardown.
+
+        # Give a surviving timer the chance it would need to fire and crash.
+        await asyncio.sleep(app.RESIZE_DEBOUNCE_SECS + 0.05)
+        cleared = app._resize_timer is None
+        ok &= cleared
+        print(f"  {'timer cleared':12} {cleared}  {'OK' if cleared else 'FAIL (timer survived unmount)'}")
+    except Exception as exc:
+        ok = False
+        print(f"  {'exception':12} {exc!r}  FAIL")
+    return ok
+
+
 def main() -> None:
     if len(sys.argv) > 1:
         sizes = [(int(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else MIN_HEIGHT)]
@@ -225,6 +259,8 @@ def main() -> None:
         results = [asyncio.run(check(w, h)) for w, h in sizes]
         print("=== resize debounce ===")
         results.append(asyncio.run(check_resize_debounce()))
+        print("=== resize teardown ===")
+        results.append(asyncio.run(check_resize_teardown()))
         ok = all(results)
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

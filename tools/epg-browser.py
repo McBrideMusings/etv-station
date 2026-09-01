@@ -502,6 +502,19 @@ def build_app(host: str):
             if self._pending_width is not None:
                 self._apply_layout(self._pending_width)
 
+        async def _shutdown(self) -> None:
+            # Cancel here, not in on_unmount: App._shutdown() closes every
+            # screen (removing #layout's children) BEFORE it dispatches the
+            # Unmount event, so a timer still pending at that point already
+            # has time to fire mid-teardown and crash _apply_layout's
+            # query_one("#layout") against a screen with no children left.
+            # Cancelling at the top of _shutdown, before any of that runs,
+            # is the only point that is actually before the race.
+            if self._resize_timer is not None:
+                self._resize_timer.stop()
+                self._resize_timer = None
+            await super()._shutdown()
+
         def on_mount(self) -> None:
             self._apply_layout(self.size.width)
             self.title = f"epg-browser — {self.host}"
