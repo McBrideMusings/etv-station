@@ -21,6 +21,7 @@ fn path() -> &'static Path {
 
 fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> ChannelConfig {
     ChannelConfig {
+        number: 1,
         name: None,
         display_name: None,
         guide,

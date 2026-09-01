@@ -6,8 +6,10 @@
 //! config loader resolves each channel's output folder, and we emit ETV-next
 //! config that reads exactly those folders.
 //!
-//! What the station owns (derived here): the channel roster, channel numbers
-//! (station order), and each `playout.folder`. It also now owns the
+//! What the station owns (derived here): the channel roster and each
+//! `playout.folder`. Each channel's number (#263) is not derived at all — it
+//! is the config's own declared `number:`, carried through verbatim. It also
+//! now owns the
 //! `normalization` / `ffmpeg` playback block ETV-next runs with — typed fields
 //! on the station config (`StationConfig::ffmpeg`, `StationConfig::normalization`),
 //! deserialized through ETV-next's own `ersatztv_channel::config` types so an
@@ -208,6 +210,10 @@ pub enum RenderError {
 /// are indexed together — the length assert that guarded two of them was the
 /// seam, and a third and fourth array would only widen it.
 pub struct ChannelRender {
+    /// The channel's declared dial number (#263) — no longer derived from
+    /// this channel's position in `channels`. Need not be contiguous with any
+    /// other channel's number.
+    pub number: i64,
     /// Playout folder the station writes and ETV-next reads.
     pub folder: PathBuf,
     /// The channel's own `display_name` (#158) — never a second file. `None`
@@ -230,6 +236,7 @@ pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, Rend
         .channels
         .iter()
         .map(|ch| ChannelRender {
+            number: ch.config.number,
             folder: ch.output_folder.clone(),
             display_name: ch.config.display_name.clone(),
             overlay: crate::daemon::load_overlay_playout_spec(ch),
@@ -351,8 +358,8 @@ pub fn render_channels(
     remove_stale_channel_files(&opts.out_dir)?;
 
     let mut lineup_channels = Vec::with_capacity(channels.len());
-    for (index, channel_render) in channels.iter().enumerate() {
-        let number = index + 1;
+    for channel_render in channels {
+        let number = channel_render.number;
         let folder = &channel_render.folder;
         let identity = folder
             .file_name()
@@ -623,7 +630,9 @@ mod tests {
     fn chans(folders: &[PathBuf]) -> Vec<ChannelRender> {
         folders
             .iter()
-            .map(|folder| ChannelRender {
+            .enumerate()
+            .map(|(i, folder)| ChannelRender {
+                number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name: None,
                 overlay: None,
@@ -636,7 +645,9 @@ mod tests {
         folders
             .iter()
             .zip(names)
-            .map(|(folder, display_name)| ChannelRender {
+            .enumerate()
+            .map(|(i, (folder, display_name))| ChannelRender {
+                number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name,
                 overlay: None,
@@ -911,6 +922,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let channels = vec![
             ChannelRender {
+                number: 1,
                 folder: PathBuf::from("out/hbo"),
                 display_name: None,
                 overlay: Some(PlayoutOverlaySpec {
@@ -924,6 +936,7 @@ mod tests {
                 }),
             },
             ChannelRender {
+                number: 2,
                 folder: PathBuf::from("out/plain"),
                 display_name: None,
                 overlay: None,

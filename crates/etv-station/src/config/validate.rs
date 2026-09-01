@@ -1133,6 +1133,7 @@ mod tests {
 
     fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            number: 1,
             scoring: None,
             name: None,
             display_name: None,

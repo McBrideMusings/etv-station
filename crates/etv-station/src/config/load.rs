@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::block::BlockFile;
@@ -91,36 +91,27 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
 
     let channel_paths = expand_channel_patterns(station_path, &base, &station.channels)?;
 
+    // One bad channel config costs one channel, not the station (#263, #156):
+    // a failure here is logged at ERROR and the channel is dropped from the
+    // lineup, rather than propagated with `?` and aborting every other
+    // channel's load.
     let mut channels = Vec::with_capacity(channel_paths.len());
     for channel_path in channel_paths {
-        let mut config: ChannelConfig = read_config_file(&channel_path)?;
-        resolve_blocks(&mut config, &channel_path, env)?;
-        validate::validate_channel(&channel_path, &config)?;
-        let name = resolve_identity(station_path, &channel_path, &config)?;
-        apply_station_seed(&mut config, station.seed, &name);
-        // After `resolve_blocks`, so a block-file body's own `overlay:` has
-        // already been spliced onto the include and takes part in the cascade.
-        let channel_dir = channel_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let overlays =
-            overlay::resolve_channel(station.overlay.as_ref(), &base, &config, &channel_dir)
-                .map_err(|message| ConfigError::Validation {
-                    path: channel_path.clone(),
-                    message,
-                })?;
-        // Verbatim relative to CWD (matching how the daemon writes), NOT joined
-        // to the station config's directory — see `validate_output_folders`.
-        let output_folder = station.output_base.join(&name);
-        channels.push(LoadedChannel {
-            name,
-            config_path: channel_path,
-            output_folder,
-            config,
-            overlays,
-        });
+        match load_one_channel(station_path, &station, &base, &channel_path, env) {
+            Ok(channel) => channels.push(channel),
+            Err(e) => {
+                tracing::error!(
+                    event = "channel.load_failed",
+                    path = %channel_path.display(),
+                    error = %e,
+                    "channel config failed to load and will not appear in the lineup; \
+                     every other channel still serves"
+                );
+            }
+        }
     }
+
+    reject_number_collisions(&mut channels);
 
     // Cross-channel: two channels sharing an output_folder collide on the
     // `.anchor` and `.durations.json` sidecars. Two channels with the same
@@ -136,6 +127,92 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
         station,
         channels,
     })
+}
+
+/// Load and resolve one channel config to a [`LoadedChannel`], or the single
+/// [`ConfigError`] that channel failed on. Split out of [`load_with_env`] so
+/// that loop can catch the error per channel instead of propagating it with
+/// `?` and aborting every other channel's load (#263, #156).
+fn load_one_channel(
+    station_path: &Path,
+    station: &StationConfig,
+    base: &Path,
+    channel_path: &Path,
+    env: EnvLookup<'_>,
+) -> Result<LoadedChannel, ConfigError> {
+    let mut config: ChannelConfig = read_config_file(channel_path)?;
+    resolve_blocks(&mut config, channel_path, env)?;
+    validate::validate_channel(channel_path, &config)?;
+    let name = resolve_identity(station_path, channel_path, &config)?;
+    apply_station_seed(&mut config, station.seed, &name);
+    // After `resolve_blocks`, so a block-file body's own `overlay:` has
+    // already been spliced onto the include and takes part in the cascade.
+    let channel_dir = channel_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let overlays = overlay::resolve_channel(station.overlay.as_ref(), base, &config, &channel_dir)
+        .map_err(|message| ConfigError::Validation {
+            path: channel_path.to_path_buf(),
+            message,
+        })?;
+    // Verbatim relative to CWD (matching how the daemon writes), NOT joined
+    // to the station config's directory — see `validate_output_folders`.
+    let output_folder = station.output_base.join(&name);
+    Ok(LoadedChannel {
+        name,
+        config_path: channel_path.to_path_buf(),
+        output_folder,
+        config,
+        overlays,
+    })
+}
+
+/// Drop every channel whose declared `number` (#263) collides with another
+/// channel's. Two channels declaring the same number both drop out, logged at
+/// ERROR naming both config files and the number — neither is silently
+/// preferred, and every channel with a unique number still serves.
+///
+/// Runs after every individual channel has already loaded successfully,
+/// because a collision is a property of the whole roster, not of any one
+/// channel's own file.
+fn reject_number_collisions(channels: &mut Vec<LoadedChannel>) {
+    let mut by_number: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (idx, channel) in channels.iter().enumerate() {
+        by_number
+            .entry(channel.config.number)
+            .or_default()
+            .push(idx);
+    }
+
+    let mut drop: HashSet<usize> = HashSet::new();
+    for (number, indices) in &by_number {
+        if indices.len() < 2 {
+            continue;
+        }
+        let paths: Vec<String> = indices
+            .iter()
+            .map(|&i| channels[i].config_path.display().to_string())
+            .collect();
+        tracing::error!(
+            event = "channel.number_collision",
+            number = number,
+            paths = %paths.join(", "),
+            "channels declare the same number and were all dropped from the lineup; \
+             every other channel still serves"
+        );
+        drop.extend(indices.iter().copied());
+    }
+
+    if drop.is_empty() {
+        return;
+    }
+    let mut idx = 0;
+    channels.retain(|_| {
+        let keep = !drop.contains(&idx);
+        idx += 1;
+        keep
+    });
 }
 
 /// Apply runtime overrides to the station config — the Docker-friendly knobs
@@ -822,7 +899,7 @@ mod tests {
         let channel_path = dir.path().join("channel.toml");
         std::fs::write(
             &channel_path,
-            "[[rule.blocks]]\nblock = \"blocks/b.toml\"\nmode = \"all\"\norder = \"manual\"\n",
+            "number = 1\n[[rule.blocks]]\nblock = \"blocks/b.toml\"\nmode = \"all\"\norder = \"manual\"\n",
         )
         .unwrap();
 
@@ -849,7 +926,7 @@ mod tests {
         let channel_path = dir.path().join("channel.toml");
         std::fs::write(
             &channel_path,
-            "[[rule.blocks]]\nblock = \"blocks/b.yaml\"\nmode = \"all\"\norder = \"manual\"\n",
+            "number = 1\n[[rule.blocks]]\nblock = \"blocks/b.yaml\"\nmode = \"all\"\norder = \"manual\"\n",
         )
         .unwrap();
 
@@ -870,7 +947,7 @@ mod tests {
         let channel_path = dir.path().join("channel.yaml");
         std::fs::write(
             &channel_path,
-            "roll_interval: 60s\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
+            "number: 1\nroll_interval: 60s\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
         )
         .unwrap();
 
@@ -891,7 +968,7 @@ mod tests {
         let channel_path = dir.path().join("channel.yaml");
         std::fs::write(
             &channel_path,
-            "rule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          expr: 'kind == \"episode\"'\n      pattern:\n        - pool: \"shows\"\n          take: 1\n",
+            "number: 1\nrule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          expr: 'kind == \"episode\"'\n      pattern:\n        - pool: \"shows\"\n          take: 1\n",
         )
         .unwrap();
 
@@ -912,7 +989,7 @@ mod tests {
         let channel_path = dir.path().join("channel.yaml");
         std::fs::write(
             &channel_path,
-            "rule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          plugin: \"scorer.rhai\"\n          datastores:\n            - name: \"taste_db\"\n              path: \"${TASTE_DB_PATH}\"\n      pattern:\n        - pool: \"shows\"\n          take: 1\n",
+            "number: 1\nrule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          plugin: \"scorer.rhai\"\n          datastores:\n            - name: \"taste_db\"\n              path: \"${TASTE_DB_PATH}\"\n      pattern:\n        - pool: \"shows\"\n          take: 1\n",
         )
         .unwrap();
 
@@ -1024,7 +1101,7 @@ mod tests {
         serde_norway::from_str(yaml).unwrap()
     }
 
-    const MINIMAL_RULE: &str = "rule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n";
+    const MINIMAL_RULE: &str = "number: 1\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n";
 
     #[test]
     fn identity_defaults_to_file_stem() {
@@ -1477,7 +1554,7 @@ mod tests {
         let channel_path = dir.path().join("channel.yaml");
         std::fs::write(
             &channel_path,
-            "rule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        \
+            "number: 1\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        \
              - kind: item\n          id: \"die-hard-1988\"\n          source:\n            \
              kind: local\n            path: \"/data/media/Die.Hard.mkv\"\n",
         )
@@ -1498,7 +1575,7 @@ mod tests {
         let channel_path = dir.path().join("channel.yaml");
         std::fs::write(
             &channel_path,
-            "rule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        \
+            "number: 1\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        \
              - kind: item\n          source:\n            kind: local\n            \
              path: \"/data/media/Die.Hard.mkv\"\n",
         )
@@ -1517,7 +1594,7 @@ mod tests {
         let channel_path = dir.path().join("channel.yaml");
         std::fs::write(
             &channel_path,
-            "rule:\n  blocks:\n    - mode: all\n      entries:\n        \
+            "number: 1\nrule:\n  blocks:\n    - mode: all\n      entries:\n        \
              - kind: query\n          query: 'kind == \"movie\"'\n          typo_field: true\n",
         )
         .unwrap();
@@ -1530,5 +1607,104 @@ mod tests {
                 .any(|keys| keys.contains("entries.0.typo_field")),
             "events = {events:?}"
         );
+    }
+
+    // --- #263: declared channel numbers -------------------------------------
+
+    /// A minimal station with a `channels/*.yaml` glob and one channel file
+    /// per `(filename, body)` pair.
+    fn write_min_station(dir: &Path, channels: &[(&str, &str)]) -> PathBuf {
+        std::fs::create_dir_all(dir.join("channels")).unwrap();
+        for (name, body) in channels {
+            std::fs::write(dir.join("channels").join(name), *body).unwrap();
+        }
+        let station_path = dir.join("station.yaml");
+        std::fs::write(
+            &station_path,
+            "tz: \"UTC\"\n\
+             output_base: out\n\
+             channels:\n\
+             \x20 - channels/*.yaml\n\
+             normalization:\n\
+             \x20 audio: {}\n\
+             \x20 video: {}\n",
+        )
+        .unwrap();
+        station_path
+    }
+
+    /// A channel body identical to `MINIMAL_RULE` but with no `number:` line
+    /// at all — the shape the missing-field acceptance criterion exercises.
+    const RULE_WITH_NO_NUMBER: &str = "rule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n";
+
+    /// #263 rule 1: a channel config with no `number:` fails to load and does
+    /// not appear in the lineup, but every other channel still serves.
+    #[test]
+    fn a_channel_with_no_number_is_dropped_but_others_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_path = write_min_station(
+            dir.path(),
+            &[("a.yaml", RULE_WITH_NO_NUMBER), ("b.yaml", MINIMAL_RULE)],
+        );
+
+        let station = load_with_env(&station_path, &no_env).expect("station still loads");
+        assert_eq!(station.channels.len(), 1, "only b.yaml should load");
+        assert_eq!(station.channels[0].name, "b");
+    }
+
+    /// #263 rule 2: two channels declaring the same number both drop out;
+    /// every channel with a unique number still serves.
+    #[test]
+    fn two_channels_sharing_a_number_both_drop_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_path = write_min_station(
+            dir.path(),
+            &[
+                ("a.yaml", MINIMAL_RULE), // number: 1
+                ("b.yaml", MINIMAL_RULE), // number: 1, same as a.yaml
+                (
+                    "c.yaml",
+                    "number: 2\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
+                ),
+            ],
+        );
+
+        let station = load_with_env(&station_path, &no_env).expect("station still loads");
+        assert_eq!(station.channels.len(), 1, "only c.yaml should survive");
+        assert_eq!(station.channels[0].name, "c");
+        assert_eq!(station.channels[0].config.number, 2);
+    }
+
+    /// #263 rule 3: numbers need not be contiguous — a lineup with gaps loads
+    /// without warning and serves every declared number.
+    #[test]
+    fn a_lineup_with_gaps_loads_every_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_path = write_min_station(
+            dir.path(),
+            &[
+                (
+                    "a.yaml",
+                    "number: 1\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
+                ),
+                (
+                    "b.yaml",
+                    "number: 2\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
+                ),
+                (
+                    "c.yaml",
+                    "number: 5\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
+                ),
+                (
+                    "d.yaml",
+                    "number: 100\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n",
+                ),
+            ],
+        );
+
+        let station = load_with_env(&station_path, &no_env).expect("station still loads");
+        let mut numbers: Vec<i64> = station.channels.iter().map(|c| c.config.number).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, vec![1, 2, 5, 100]);
     }
 }

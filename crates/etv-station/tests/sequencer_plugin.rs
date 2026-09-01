@@ -293,6 +293,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
 /// logic.
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
+        number: 1,
         name: None,
         display_name: None,
         guide: None,

@@ -44,12 +44,12 @@ fn write_station(dir: &Path, station_seed: Option<&str>, beta_seed: Option<&str>
     let station_path = dir.join("station.yaml");
     fs::write(&station_path, station).unwrap();
 
-    for (folder, own_seed) in [("001-for-you", None), ("002-for-pierce", beta_seed)] {
+    for (number, folder, own_seed) in [(1, "001-for-you", None), (2, "002-for-pierce", beta_seed)] {
         let folder_dir = dir.join("channels").join(folder);
         fs::create_dir_all(&folder_dir).unwrap();
         let body = match own_seed {
-            Some(seed) => format!("seed: {seed}\n{RULE}"),
-            None => RULE.to_string(),
+            Some(seed) => format!("number: {number}\nseed: {seed}\n{RULE}"),
+            None => format!("number: {number}\n{RULE}"),
         };
         fs::write(folder_dir.join("channel.yaml"), body).unwrap();
     }

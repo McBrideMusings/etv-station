@@ -1599,7 +1599,7 @@ mod supervisor_tests {
 
     fn fixture(dir: &TempDir) -> LoadedChannel {
         let config: ChannelConfig = toml::from_str(
-            "window_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n\
+            "number = 1\nwindow_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n\
              [rule]\nblocks = []\n",
         )
         .expect("fixture channel config parses");
@@ -1978,7 +1978,7 @@ mod regen_floor_tests {
 
     fn ch(dir: &tempfile::TempDir) -> LoadedChannel {
         let config: ChannelConfig = toml::from_str(
-            "window_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n[rule]\nblocks = []\n",
+            "number = 1\nwindow_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n[rule]\nblocks = []\n",
         )
         .expect("fixture channel config parses");
         LoadedChannel {
@@ -3172,6 +3172,7 @@ params = "color=c={color} [out0]"
         };
         let config: ChannelConfig = toml::from_str(&format!(
             r#"
+number = 1
 window_days = 1
 chunk_hours = 6
 roll_interval = "1h"
@@ -4507,7 +4508,7 @@ mod history_catalog_tests {
     /// `plugin: <path>` or `expr: <cel>`.
     fn channel(name: &str, source: &str) -> LoadedChannel {
         let yaml = format!(
-            "rule:\n  blocks:\n    - pools:\n        - name: p\n          {source}\n      pattern:\n        - pool: p\n          take: 1\n"
+            "number: 1\nrule:\n  blocks:\n    - pools:\n        - name: p\n          {source}\n      pattern:\n        - pool: p\n          take: 1\n"
         );
         LoadedChannel {
             overlays: Default::default(),
@@ -4559,6 +4560,7 @@ mod tests {
     use super::*;
 
     const CHANNEL_BODY: &str = r#"
+number = 1
 window_days = 1
 chunk_hours = 6
 roll_interval = "60s"

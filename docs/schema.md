@@ -535,6 +535,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 
 | Field | Required | Type / default |
 |---|---|---|
+| `number` | **yes** | int — the channel's dial number. See [Channel numbers](#channel-numbers). |
 | `name` | no — default: config file stem | string — channel identity override; drives the log label, overlay handshake, and output folder leaf. Must not contain path separators. |
 | `window_days` | no — default `1` | int — how far ahead the schedule is written, and the span one generation is allowed to cover |
 | `chunk_hours` | no — default `6` | int — playout file size only; it does not bound a generation |
@@ -543,6 +544,26 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `seed` | no — inherited from the station `seed` when unset | int — seeds `random` order and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's folder name, then to a fresh wall-clock seed — see [Seed cascade](#seed-cascade). |
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
+
+### Channel numbers
+
+`number:` is the channel's dial number (#263). It is required, and it is
+**never derived** from a channel's position in the sorted folder list — that
+derivation was the bug: adding, renaming, or removing any channel renumbered
+every channel after it, silently invalidating every saved favourite,
+remembered number, and Plex's own cached lineup. Numbers need not be
+contiguous — `1, 2, 5, 100` is a valid lineup, and gaps are not warned about.
+
+Two failure behaviors, both scoped to the offending channel(s) rather than the
+whole station — one bad channel config costs one channel, not the station
+(#156):
+
+- **A channel config with no `number:` fails to load.** An ERROR is logged
+  naming the config file and the missing field; the channel does not appear
+  in the lineup, and every other channel still serves.
+- **Two channels declaring the same `number:` are both refused.** An ERROR is
+  logged naming both config files and the number; neither is silently
+  preferred, and every channel with a unique number still serves.
 
 ### Composing blocks — `rule.blocks`
 
@@ -557,6 +578,7 @@ fields are ignored and warned about; see [Unknown keys](#unknown-keys).
 # channels/starwars.yaml — no output_folder; identity is the file stem "starwars",
 # so it writes to {output_base}/starwars
 
+number: 24
 rule:
   blocks:
     - block: "../blocks/starwars-timeline.yaml"
@@ -569,6 +591,7 @@ rule:
 ```yaml
 # channels/lotr.yaml — identity "lotr" from the file stem
 
+number: 26
 rule:
   blocks:
     - mode: "all"

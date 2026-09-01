@@ -8,6 +8,7 @@
 # dev-run serves it live. Being a query channel it resolves to nothing
 # unless the station's `catalog_path` points at a populated catalog. Its
 # resolution is also proven by the `lotr_sample` acceptance test.
+number: 11
 display_name: "The Lord of the Rings"
 window_days: 1
 roll_interval: "60s"

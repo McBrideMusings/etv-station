@@ -10,6 +10,19 @@ use crate::tautulli::HistoryScope;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChannelConfig {
+    /// This channel's dial number (#263) — required, and no longer derived
+    /// from the channel's position in the sorted folder list. That derivation
+    /// was the bug: adding, renaming, or removing any channel renumbered
+    /// every channel after it, silently invalidating every saved favourite,
+    /// remembered number, and Plex's own cached lineup.
+    ///
+    /// A channel whose config omits this fails to load; two channels
+    /// declaring the same number both fail to load. Neither check can live on
+    /// this type alone (a collision is a cross-channel property) — see
+    /// `config::load`. Numbers need not be contiguous: gaps are legal and not
+    /// warned about.
+    pub number: i64,
+
     /// Optional channel identity override. When unset, the channel's identity
     /// is its config file's stem (e.g. `diehard.yaml` -> `diehard`) — or, for
     /// a file literally named `channel.yaml` (the per-channel-directory

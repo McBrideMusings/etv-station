@@ -1,3 +1,4 @@
+number: 1
 name: test
 # Exercises #158 on every dev-run: a display name distinct from the identity
 # above, and a channel-level `guide:` template that overrides the description

@@ -300,6 +300,7 @@ mod tests {
 
     fn base_channel(rule: RuleConfig, scoring: Option<ScoringConfig>) -> ChannelConfig {
         ChannelConfig {
+            number: 1,
             scoring,
             name: None,
             display_name: None,

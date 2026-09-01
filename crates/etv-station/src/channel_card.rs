@@ -182,7 +182,7 @@ mod tests {
 
     fn channel(dir: &Path) -> LoadedChannel {
         let config: ChannelConfig = toml::from_str(
-            "window_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n\
+            "number = 1\nwindow_days = 1\nchunk_hours = 6\nroll_interval = \"1h\"\n\
              [rule]\nblocks = []\n",
         )
         .expect("fixture channel config parses");
