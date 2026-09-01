@@ -424,6 +424,8 @@ def build_app(host: str):
         BLOCK_MINUTES = 15  # the grid a row's height snaps to — one line per
         # boundary it crosses, not the width of a row (a row is one item now)
         BLOCK_SAFETY_CAP = 2000  # ~20 days of blocks walked — a runaway-loop backstop, not a UX truncation
+        GUTTER_W = 2  # the ┌/│/└ rule column between the channel tag and the
+        # clock, plus its trailing space
         # How far back history mode reaches, when the guide still holds that
         # much. The station's default `retention_days` is 7, so in practice the
         # retained data runs out first and this never truncates — it is here so
@@ -562,9 +564,9 @@ def build_app(host: str):
             selected = self.channels.get(self.selected_channel)
             chan_num = selected.number if selected else None
             chan_tag = f"[dim]ch{chan_num:<3}[/dim] " if chan_num is not None else ""
-            # Rendered width of chan_tag, markup stripped — continuation lines
-            # hang off this, so it has to be what the terminal draws, not the
-            # length of the markup string.
+            # Rendered width of chan_tag, markup stripped — the title-elision
+            # budget in _seg_text is sized off this, so it has to be what the
+            # terminal draws, not the length of the markup string.
             chan_tag_w = len(f"ch{chan_num:<3} ") if chan_num is not None else 0
 
             if not progs_win:
@@ -673,14 +675,20 @@ def build_app(host: str):
 
             # A row is one media item (or one gap span), not one block — but
             # the loop below still walks blocks, because that's what already
-            # produces the right lines in the right order (block-clock line
-            # for whichever segment opens a block, indented `›` continuation
-            # line for every segment after it). This just groups those lines
-            # into per-segment row buffers instead of emitting one ListItem
-            # per block. `open_ident` tracks row ownership by the identity
-            # (`is`) of the segments[] tuple the open row belongs to — two
-            # adjacent gap segments can compare equal by value, so identity
-            # is what keeps them from merging into one row.
+            # produces the right lines in the right order (a title line for
+            # whichever segment opens the row, a bare-clock line for every
+            # block boundary after it). This just groups those lines into
+            # per-segment row buffers instead of emitting one ListItem per
+            # block. `open_ident` tracks row ownership by the identity (`is`)
+            # of the segments[] tuple the open row belongs to — two adjacent
+            # gap segments can compare equal by value, so identity is what
+            # keeps them from merging into one row.
+            #
+            # Each line is built with a `\x00` sentinel where its gutter
+            # glyph goes — which glyph (┌ first, │ middle, └ last, or a blank
+            # gutter for a one-line row) depends on the row's total line
+            # count, which isn't known until the row closes. flush() resolves
+            # every sentinel in one pass right before the row is rendered.
             row_open = False
             open_ident: object = None
             open_payload: tuple[Programme | None, datetime, datetime] | None = None
@@ -692,7 +700,18 @@ def build_app(host: str):
                 nonlocal row_open, open_ident, open_payload, open_lines, open_row_ts, open_is_now, select_idx
                 if not row_open:
                     return
-                lv.append(ListItem(Label("\n".join(open_lines)), name="item"))
+                n = len(open_lines)
+                if n == 1:
+                    # A lone ┌ with nothing under it reads as broken — a
+                    # one-line row gets a blank gutter instead, keeping the
+                    # clock column aligned with every other row.
+                    resolved = [open_lines[0].replace("\x00", " ", 1)]
+                else:
+                    resolved = []
+                    for idx, line in enumerate(open_lines):
+                        glyph = "┌" if idx == 0 else ("└" if idx == n - 1 else "│")
+                        resolved.append(line.replace("\x00", glyph, 1))
+                lv.append(ListItem(Label("\n".join(resolved)), name="item"))
                 row_idx = len(self.programme_rows)
                 self.programme_rows.append(("item", open_row_ts, open_payload))
                 title = open_payload[0].title if open_payload is not None and open_payload[0] is not None else None
@@ -722,14 +741,16 @@ def build_app(host: str):
                 is_now = cur <= now < block_end
                 marker = "▶" if is_now else " "
                 time_str = _fmt_dt(cur, today=now.date(), with_date=self.history)
-                # One line per programme this block touches. The segment that
-                # opens the block gets the block-clock form; every segment
-                # after it in the same block gets its real unrounded start
-                # time on an indented `›` line. Which row a line joins is
-                # decided below: a block-clock line continues the still-open
-                # row when it's the same segment crossing a new boundary, and
-                # starts a fresh row otherwise.
-                prefix_w = 2 + chan_tag_w + len(time_str) + 2
+                # One line per programme this block touches, gutter glyph
+                # left as a `\x00` sentinel for flush() to resolve. The title
+                # is stated once, on a row's first line only; every line
+                # after it in the same row carries just the block clock.
+                # Which row a line joins is decided below: a block-clock line
+                # continues the still-open row when it's the same segment
+                # crossing a new boundary, and starts a fresh row otherwise
+                # — and a fresh row is always that row's first line, so it
+                # always carries the title.
+                prefix_w = 2 + chan_tag_w + self.GUTTER_W + len(time_str) + 2
                 if not overlapping:
                     # No segment covers this block at all — a window-edge
                     # artifact (`cur` floors to before win_start on the first
@@ -740,21 +761,22 @@ def build_app(host: str):
                     row_open = True
                     open_ident = object()
                     open_payload = (None, cur, block_end)
-                    open_lines = [f"{marker} {chan_tag}{time_str}  [red]— off-air —[/red]"]
+                    open_lines = [f"{marker} {chan_tag}\x00 {time_str}  [red]— off-air —[/red]"]
                     open_row_ts = cur
                     open_is_now = is_now
                     flush()
                 else:
-                    hang = " " * (2 + chan_tag_w)
                     for j, seg in enumerate(overlapping):
+                        continuation = j == 0 and row_open and open_ident is seg
                         if j == 0:
-                            line = f"{marker} {chan_tag}{time_str}  {_seg_text(seg, prefix_w)}"
+                            clock = time_str
                         else:
-                            stamp = _fmt_dt(seg[1], today=now.date(), with_date=self.history).rjust(len(time_str))
-                            line = f"{hang}[dim]{stamp}[/dim]› {_seg_text(seg, prefix_w)}"
-                        if j == 0 and row_open and open_ident is seg:
+                            clock = _fmt_dt(seg[1], today=now.date(), with_date=self.history).rjust(len(time_str))
+                        if continuation:
                             # Same item as the still-open row, crossing into a
-                            # new boundary mid-item — add a line, not a row.
+                            # new boundary mid-item — add a bare-clock line,
+                            # not a new row, so the title isn't restated.
+                            line = f"{marker} {chan_tag}\x00 {clock}"
                             open_lines.append(line)
                             if is_now:
                                 open_is_now = True
@@ -763,7 +785,7 @@ def build_app(host: str):
                             row_open = True
                             open_ident = seg
                             open_payload = seg
-                            open_lines = [line]
+                            open_lines = [f"{marker} {chan_tag}\x00 {clock}  {_seg_text(seg, prefix_w)}"]
                             open_row_ts = seg[1]
                             open_is_now = is_now
                 cur = block_end
