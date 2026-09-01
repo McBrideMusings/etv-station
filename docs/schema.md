@@ -846,6 +846,61 @@ resolve fails the channel's generation naming the pool and the set, and says
 `channel-authored source` rather than naming the script, so the error points at
 the file the expression is actually written in.
 
+#### An `influence` set — a curated list guides a taste pool without gating it
+(#396)
+
+`taste-cosine.rhai` reads one set name it does not declare in `sources()`:
+`influence`. A pool that authors one, and gives `config.influence_weight` a
+non-zero value, gets its ranking tilted toward that set's subject matter:
+
+```yaml
+- name: movies
+  plugin: "../plugins/taste-cosine.rhai"
+  sources:
+    movies:    'item.type == "movie"'
+    influence: 'item.collections.contains("Pierce''s Guilty Pleasures")'
+  config:
+    influence_weight: 3.0
+```
+
+The set's `tmdb_keywords` are aggregated into a second weight map — each
+keyword weighted by the **share of the set carrying it**, so a 69-film set and
+a 690-film set produce comparable numbers — and a candidate's cosine against
+that map is added to its cosine against the account's taste vector, scaled by
+`influence_weight`.
+
+**`influence_weight` is not a fraction.** The two cosines share their idf
+scaling and their `sqrt(keyword count)` divisor, but not their magnitude: a
+taste vector built from thousands of plays runs about 20x an influence profile
+whose weights are shares bounded by 1.0. Sweep the value against the real
+snapshot with `tools/taste-debug.sh` instead of reasoning about it. On
+`002-for-pierce`, over one 56-slot generation, `0.25` moved nothing, `3.0` made
+the tilt a quarter of the taste score and changed 8 slots, and `25.0` let the
+collection drive rather than guide.
+
+**It is a profile, not a candidate list.** Nothing in the set is added to the
+pool, nothing outside it is removed, and a film inside it gets no bonus for
+membership — only for the keywords it shares, on the same terms as every other
+candidate. That is the distinction from a `kind: query` entry naming the same
+collection: the query channel can play those films and nothing else, while a
+tilted pool plays the whole library in an order the collection nudged.
+
+`sources` replaces the script's own table wholesale, so a pool adding
+`influence` must also write the set it ranks (`movies` or `shows`) — see
+[Pool `sources`](#pool-sources-the-channel-says-which-items-the-script-may-rank-210).
+Any CEL expression works; a collection is just the common case.
+
+The default weight is `0.0`, so a pool that authors no influence set scores
+exactly what it scored before. Every pick's audit detail carries `taste_score`,
+`influence_score`, `influence_weight` and `on_influence` (the keywords the set
+actually contributed), and a tilted pick's verdict gains `, tilted toward the
+influence set` — so `admin audit <channel>` is how the weight gets tuned
+against real numbers rather than guessed.
+
+An influence set is scored against **units**, so it belongs on a `unit: movie`
+pool. A film collection's keywords cannot join to a `unit: show` pool, whose
+units are series ids.
+
 #### The record shape — `metadata` and a per-entry `take` (#166)
 
 Each element `pick()`'s `picks` array holds may be a bare `entry_id` string —

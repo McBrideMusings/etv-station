@@ -42,6 +42,14 @@
 // keywords to score, and ordering episodes by anything but season/episode
 // would air a season shuffled.
 //
+// **A pool can tilt the ranking toward a curated set** (#396) by authoring an
+// `influence` source and an `influence_weight`. The set's keywords become a
+// second profile, its cosine is added to the taste cosine, and nothing is
+// gated: a title outside the set competes on the keywords it happens to
+// share, and a title inside it gets no bonus for membership alone. That is
+// what lets a collection channel become a flavour on an existing channel
+// rather than a channel of its own. See influence_weight() below.
+//
 // capabilities() declares catalog_read (for ctx.sets, built from sources()
 // below), watch_history, and a named datastore grant (#181). The channel
 // pool that names this script must grant all three under that pool's
@@ -50,6 +58,9 @@
 //
 // ctx carries (see docs/schema.md § Pool `capabilities` / `datastores`):
 //   ctx.sets.movies      the movie candidates sources() matched
+//   ctx.sets.influence   a channel-authored set whose keywords tilt the
+//                        ranking (#396), or unit when the pool authored none —
+//                        a profile, never a candidate list
 //   ctx.pool             the name of the pool asking
 //   ctx.target_count     how many items this generation needs
 //   ctx.config           this pool's `config:` block, or an empty map
@@ -127,6 +138,45 @@ fn recency_factor(r, half_life) {
     if r == () { 1.0 } else { r.to_float() / (r.to_float() + half_life) }
 }
 
+// How much a candidate's closeness to an INFLUENCE set counts, added to its
+// closeness to the account's own taste (#396).
+//
+// **The two cosines are not on the same scale, so this is not a fraction.**
+// Both are computed the same way over the same namespace, but the taste
+// weights come from thousands of plays while the influence weights are
+// per-keyword shares of one curated set, bounded by 1.0. Measured against the
+// live snapshot for `002-for-pierce`, the taste cosine runs about 20x the
+// influence cosine, so useful values here are single digits, not fractions —
+// 3.0 makes the tilt a quarter of the taste score and moves roughly one slot
+// in seven. Sweep it with `tools/taste-debug.sh` rather than reasoning about
+// it; that channel's config records the table.
+//
+// Additive rather than blended into the taste vector: a title that is pure
+// guilty pleasure and off the account's ordinary profile can still rise on
+// its own, which is the thing a dedicated collection channel was doing. A
+// blend would dilute 69 films' keywords against thousands of watch events and
+// leave the audit unable to say which half a pick came from.
+//
+// Zero by default, so a pool that authors no influence set — every pool that
+// exists today — scores exactly what it scored before.
+fn influence_weight(ctx) { tunable(ctx, "influence_weight", 0.0).to_float() }
+
+// The set name the influence profile is built from. A pool authors it under
+// `sources:` beside the set it ranks:
+//
+//   sources:
+//     movies:    'item.type == "movie"'
+//     influence: 'item.collections.contains("Pierce''s Guilty Pleasures")'
+//
+// The membership question is the config's half (ADR 0002) — which is why this
+// is a CEL source rather than a collection name in `config:`. Any expression
+// works, not just a collection.
+//
+// It is a PROFILE, not a candidate list: nothing here restricts what the pool
+// may pick. A film in the set gets no bonus for being in it, only for the
+// keywords it shares with it — the same terms as every other candidate.
+fn influence_set_name() { "influence" }
+
 // How many shows a `unit = "show"` pool hands back. Not `target_count`: a
 // show expands to every episode it has, so asking for one show per scheduled
 // item would return tens of thousands of ids. This is how many series the
@@ -158,6 +208,12 @@ fn capabilities() { ["catalog_read", "watch_history", #{ datastore: datastore_na
 // `config:` and SHOULD narrow `sources:` to match — a pool that overrides
 // neither resolves both sets, which on a shows pool means loading 11,543
 // movies it will never look at.
+//
+// A third name, `influence`, is read if a pool authors one but is deliberately
+// NOT declared here: there is no library-wide default for "what should tilt
+// this channel", and a set nobody asked for would cost a full resolution on
+// every pool. See influence_set_name() above. A pool that wants it overrides
+// `sources:` wholesale, so it writes the set it ranks AND the influence set.
 fn sources() {
     #{
         movies: `item.type == "movie"`,
@@ -327,6 +383,45 @@ fn pick(ctx) {
         }
     }
 
+    // The influence profile (#396): a second keyword weight map in the same
+    // shape as `weights` above, built from a channel-authored candidate set
+    // instead of from watch history. Skipped entirely — no resolution, no
+    // enrichment fetch, no map — when the pool set no weight or authored no
+    // set, which is every pool that predates this.
+    //
+    // Each keyword's weight is the SHARE of the set carrying it, so a profile
+    // built from 69 films and one built from 690 produce comparable numbers
+    // and `beta` means the same thing against both. Accumulated as `1/n` per
+    // occurrence rather than counted and divided afterwards, so nothing walks
+    // the map a second time.
+    let beta = influence_weight(ctx);
+    let infl_weights = #{};
+    let infl_size = 0;
+    let infl_set = ctx.sets[influence_set_name()];
+    if beta != 0.0 && infl_set != () {
+        let infl_ids = [];
+        for item in infl_set { infl_ids.push(item.entry_id); }
+        infl_size = infl_ids.len;
+        if infl_size > 0 {
+            let inc = 1.0 / infl_size.to_float();
+            // One bulk call for the whole set, the same #172 rule the
+            // candidate fetch above follows — this one asks for tens of ids,
+            // not tens of thousands.
+            let infl_enrichment = ds.enrichment_for_many(infl_ids, ns);
+            for id in infl_ids {
+                let facts = infl_enrichment[id];
+                if facts == () { continue; }
+                for f in facts {
+                    if f.namespace == ns {
+                        let k = f.key + "\x01" + f.value;
+                        let c = infl_weights[k];
+                        infl_weights[k] = if c == () { inc } else { c + inc };
+                    }
+                }
+            }
+        }
+    }
+
     let seed = ctx.seed;
 
     let half_life = recency_half_life(ctx);
@@ -366,30 +461,48 @@ fn pick(ctx) {
     let scored = [];
     for id in units {
         let facts = enrichment[id];
-        let score = 0.0;
+        let taste_score = 0.0;
+        let influence_score = 0.0;
         let eligible = false;
         // The specific keywords this candidate shares with the pooled
         // profile — not needed for ranking, only so a ranking can be
         // explained: see the `metadata` attached below.
         let on_profile = [];
+        // The same, for the influence profile. Empty on every pool that
+        // authored no influence set, which is what makes a guilty pick
+        // distinguishable from an ordinary one in the audit.
+        let on_influence = [];
         if facts != () {
             eligible = true;
             let n = 0;
             let sum = 0.0;
+            let infl_sum = 0.0;
             for f in facts {
                 if f.namespace == ns {
                     n += 1;
                     let k = f.key + "\x01" + f.value;
                     let w = weights[k];
-                    if w != () {
+                    let iw = infl_weights[k];
+                    // The idf is computed once for the keyword and shared by
+                    // both profiles, and only when at least one of them has
+                    // something to say about it — a keyword neither carries
+                    // must not pay for an ln() call on every candidate (#172).
+                    if w != () || iw != () {
                         // idf: a keyword every candidate carries scales by
                         // exactly 1.0 (doc_count / df == 1, ln == 0); a
                         // keyword only a few candidates carry scales up —
                         // ln(doc_count / df) grows as df shrinks. df[k] is
                         // always >= 1 here, since this very candidate
                         // contributed to it above, so no divide-by-zero.
-                        sum += w * (1.0 + (doc_count.to_float() / df[k].to_float()).ln());
-                        on_profile.push(f.value);
+                        let idf = 1.0 + (doc_count.to_float() / df[k].to_float()).ln();
+                        if w != () {
+                            sum += w * idf;
+                            on_profile.push(f.value);
+                        }
+                        if iw != () {
+                            infl_sum += iw * idf;
+                            on_influence.push(f.value);
+                        }
                     }
                 }
             }
@@ -404,26 +517,40 @@ fn pick(ctx) {
             // tying a title with several keywords few candidates share
             // (#294) — the sqrt divisor is unchanged and still does its own
             // job of not over-rewarding tag count. See #254's worked table.
-            if n > 0 { score = sum / n.to_float().sqrt(); }
+            //
+            // The influence cosine uses the same divisor, so the two are on
+            // one scale and `beta` is a ratio between them rather than an
+            // arbitrary constant (#396).
+            if n > 0 {
+                let divisor = n.to_float().sqrt();
+                taste_score = sum / divisor;
+                influence_score = infl_sum / divisor;
+            }
         }
         // The cosine before recency, kept alongside the damped one so the
         // audit can show both. A title that fell twenty places because it
         // aired last night only reads as a decision if both halves are
         // visible; one number alone reads as the scorer changing its mind.
-        let base_score = score;
+        //
+        // With no influence set this is exactly the taste cosine, unchanged
+        // from #254: `beta` is 0.0 and `influence_score` is 0.0.
+        let base_score = taste_score + beta * influence_score;
         let aired_rank = unit_recency[id];
         let factor = recency_factor(aired_rank, half_life);
-        score = base_score * factor;
+        let score = base_score * factor;
         scored.push(#{
             id: id,
             score: score,
             base_score: base_score,
+            taste_score: taste_score,
+            influence_score: influence_score,
             // Unit for a title this channel's remembered tail does not hold
             // — which is most of them, and is what `explorable` below tests.
             aired_rank: aired_rank,
             recency_factor: factor,
             eligible: eligible,
             on_profile: on_profile,
+            on_influence: on_influence,
             // The seeded key this candidate draws if an exploration slot
             // reaches it — computed once here, not per slot, since a
             // candidate's own id and the seed are all it depends on.
@@ -576,6 +703,15 @@ fn pick(ctx) {
         stages[row.id] = #{
             score: row.score,
             base_score: row.base_score,
+            // The two halves `base_score` is the sum of, and the weight that
+            // combined them (#396). Without all three, a pick that only aired
+            // because the influence set liked it is indistinguishable from one
+            // the account's own history chose — which is the whole question a
+            // tilted channel raises.
+            taste_score: row.taste_score,
+            influence_score: row.influence_score,
+            influence_weight: beta,
+            on_influence: row.on_influence,
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
@@ -663,6 +799,12 @@ fn pick(ctx) {
                 metadata: #{
                     score: stage.score,
                     on_profile_keywords: stage.on_profile,
+                    // One float, not a second keyword list: the keywords the
+                    // influence set contributed are in the audit detail, where
+                    // bytes are budgeted for explanation. This is here so a
+                    // reader of the playout JSON alone can still see that a
+                    // tilt was applied and how much of the score it was.
+                    influence_score: stage.influence_score,
                     source: stage.source,
                 },
             });
@@ -700,6 +842,14 @@ fn audit(ctx, picks, workspace) {
                 // which is the common case and the one where the factor is
                 // exactly 1.0.
                 base_score: r.base_score,
+                // The two terms `base_score` adds together and the weight
+                // between them (#396). `influence_weight` is 0.0 and
+                // `influence_score` 0.0 on a pool with no influence set, where
+                // `base_score` is the taste cosine alone.
+                taste_score: r.taste_score,
+                influence_score: r.influence_score,
+                influence_weight: r.influence_weight,
+                on_influence: r.on_influence,
                 recency_factor: r.recency_factor,
                 aired_rank: r.aired_rank,
                 // The series this entry was ranked as, on a shows pool.
@@ -723,6 +873,15 @@ fn audit(ctx, picks, workspace) {
         } else {
             "ranked by keyword cosine against pooled taste"
         };
+        // The tilt is a clause on whichever of the three above applies, not a
+        // fourth verdict: a pick can be damped AND tilted, and a reader needs
+        // both facts. Only added when this candidate actually shared a keyword
+        // with the influence set — a tilted pool still airs titles the tilt
+        // had no opinion about, and saying otherwise would be a lie about
+        // every one of them.
+        if r != () && r.influence_weight > 0.0 && r.influence_score > 0.0 {
+            verdict = verdict + ", tilted toward the influence set";
+        }
         out[p.entry_id] = #{
             stage: "pool",
             by: "plugin:taste-cosine",

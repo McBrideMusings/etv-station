@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
 use etv_station::config::DatastoreGrant;
 use etv_station::score::{
-    Capability, GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs, declared_capabilities,
-    declared_hooks, pick,
+    Capability, GrantedCapabilities, PickedItem, PoolSources, ScoreCache, ScoreInputs,
+    declared_capabilities, declared_hooks, pick,
 };
 
 fn plugin_path() -> PathBuf {
@@ -158,6 +158,13 @@ fn small_catalog() -> Catalog {
     catalog_of(["mov-a", "mov-b", "mov-c", "mov-d"])
 }
 
+/// A pool `config:` block holding just `exploration_fraction`, or no block at
+/// all — which is what most tests here want, and what leaves the script's own
+/// default in place rather than overriding it with the same number.
+fn tunables(exploration_fraction: Option<f64>) -> Option<serde_json::Value> {
+    exploration_fraction.map(|f| serde_json::json!({ "exploration_fraction": f }))
+}
+
 /// The committed script prepared against a catalog, plus the fixture store its
 /// `taste` grant opens — every test here needs all three together, and the
 /// `TempDir` has to outlive the store's path.
@@ -166,12 +173,28 @@ struct Scorer {
     db: PathBuf,
     script: PathBuf,
     cache: ScoreCache,
+    /// The pool's own `sources:` table (#210), or `None` to let the script's
+    /// `sources()` stand. It is half the cache key, so the same value has to
+    /// reach `prepare` and `pick` — holding it here is what stops those two
+    /// from drifting apart.
+    sources: Option<PoolSources>,
 }
 
 impl Scorer {
     /// `write_store` fills the plexdb fixture the script reads; `cat` is the
     /// library it gets to rank.
     fn new(cat: &Catalog, write_store: impl FnOnce(&Path)) -> Self {
+        Self::new_sourced(cat, write_store, None)
+    }
+
+    /// The same, for a pool that writes its own candidate queries — the shape
+    /// an influence-tilted pool needs (#396), since the `influence` set is
+    /// channel-authored and the script declares no default for it.
+    fn new_sourced(
+        cat: &Catalog,
+        write_store: impl FnOnce(&Path),
+        sources: Option<PoolSources>,
+    ) -> Self {
         let script = plugin_path();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
@@ -179,12 +202,13 @@ impl Scorer {
         // The two halves, in the order the daemon runs them: `prepare` reads
         // the catalog, `pick` below ranks what it found.
         let mut cache = ScoreCache::default();
-        cache.prepare(cat, &script, None).unwrap();
+        cache.prepare(cat, &script, sources.as_ref()).unwrap();
         Self {
             _dir: dir,
             db,
             script,
             cache,
+            sources,
         }
     }
 
@@ -198,7 +222,26 @@ impl Scorer {
         target_count: usize,
         exploration_fraction: Option<f64>,
     ) -> Vec<PickedItem> {
-        self.pick_for(pool, seed, target_count, exploration_fraction, None, &[])
+        self.pick_for(
+            pool,
+            seed,
+            target_count,
+            tunables(exploration_fraction),
+            None,
+            &[],
+        )
+    }
+
+    /// One generation on a pool tilted toward an influence set (#396).
+    /// `influence_weight` is the pool's `config:` value; the set itself came
+    /// from the `sources:` table this scorer was built with. Exploration is
+    /// off, so the order under test is the tilted ranking itself.
+    fn pick_tilted(&self, target_count: usize, influence_weight: f64) -> Vec<PickedItem> {
+        let config = serde_json::json!({
+            "exploration_fraction": 0.0,
+            "influence_weight": influence_weight,
+        });
+        self.pick_for("movies", 0, target_count, Some(config), None, &[])
     }
 
     /// One generation on a channel that has already aired something (#254's
@@ -216,7 +259,7 @@ impl Scorer {
             "movies",
             0,
             target_count,
-            exploration_fraction,
+            tunables(exploration_fraction),
             None,
             recent,
         )
@@ -234,21 +277,22 @@ impl Scorer {
         target_count: usize,
         account_id: Option<i64>,
     ) -> Vec<PickedItem> {
-        self.pick_for(pool, 0, target_count, Some(0.0), account_id, &[])
+        self.pick_for(pool, 0, target_count, tunables(Some(0.0)), account_id, &[])
     }
 
-    /// The one call into `score::pick` both of the above make, so the two
-    /// cannot drift apart on how a generation is set up.
+    /// The one call into `score::pick` all of the above make, so they cannot
+    /// drift apart on how a generation is set up. `config` is the pool's
+    /// `config:` block verbatim; `None` hands the script an absent block,
+    /// which reaches `tunable()` differently from an empty one.
     fn pick_for(
         &self,
         pool: &str,
         seed: u64,
         target_count: usize,
-        exploration_fraction: Option<f64>,
+        config: Option<serde_json::Value>,
         account_id: Option<i64>,
         recent: &[&str],
     ) -> Vec<PickedItem> {
-        let config = exploration_fraction.map(|f| serde_json::json!({ "exploration_fraction": f }));
         let inputs = ScoreInputs {
             target_count,
             account_id,
@@ -258,7 +302,7 @@ impl Scorer {
         pick(
             &self.cache,
             &self.script,
-            None,
+            self.sources.as_ref(),
             &inputs,
             seed,
             pool,
@@ -1371,5 +1415,181 @@ fn the_deleted_scorer_is_gone() {
     assert!(
         !path.exists(),
         "taste-engine.rhai must be deleted, not left beside its replacement"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #396 — a channel-authored INFLUENCE set tilts the ranking without gating it.
+//
+// The fixture is `write_taste_fixture`'s arithmetic with two extra films that
+// are not candidates. Pooled taste comes from the one played movie: `mov-a`
+// carries `contact` and `time`, so both weigh 0.5. The candidate set is the
+// three `mov-*` titles, so doc_count = 3 and the document frequencies are
+// contact = 2 (a, c), time = 2 (a, d), desert = 1 (d) — idf factors
+// 1 + ln(3/2) for the first two and 1 + ln(3) for `desert`.
+//
+// The influence set is `gp-1` and `gp-2`, both carrying `desert` and nothing
+// else, so the influence profile is exactly `desert -> 1.0` (both members of
+// two carry it). `desert` is the keyword the account's own history has no
+// opinion about at all, which is what makes the tilt visible rather than
+// merely additive to an existing preference:
+//
+//   mov-a  taste (0.5·idfC + 0.5·idfT)/√2 = 0.993813   influence 0
+//   mov-c  taste  0.5·idfC                = 0.702733   influence 0
+//   mov-d  taste  0.5·idfT/√2             = 0.496905   influence idfD/√2 = 1.483946
+//
+// So `mov-d` is last untilted and first at influence_weight 0.5 — and `mov-c`,
+// which shares nothing with the influence set, still airs. That is the whole
+// claim: a guide, not a gate.
+// ---------------------------------------------------------------------------
+
+fn write_influence_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('mov-a', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie'),
+                 ('gp-1', 'movie'), ('gp-2', 'movie');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('mov-a', 'tmdb_keywords', 'keyword', 'contact', 't'),
+                 ('mov-a', 'tmdb_keywords', 'keyword', 'time', 't'),
+                 ('mov-c', 'tmdb_keywords', 'keyword', 'contact', 't'),
+                 ('mov-d', 'tmdb_keywords', 'keyword', 'time', 't'),
+                 ('mov-d', 'tmdb_keywords', 'keyword', 'desert', 't'),
+                 ('gp-1', 'tmdb_keywords', 'keyword', 'desert', 't'),
+                 ('gp-2', 'tmdb_keywords', 'keyword', 'desert', 't');
+             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+                 ('h1', 'mov-a', 42, 1700000000);",
+        )
+        .unwrap();
+}
+
+/// The candidates and the influence set as a pool would author them: two CEL
+/// expressions over one catalog, disjoint here only so the arithmetic above
+/// stays hand-checkable — nothing requires them to be.
+fn influence_sources() -> PoolSources {
+    [
+        (
+            "movies".to_string(),
+            r#"item.title.startsWith("mov-")"#.to_string(),
+        ),
+        (
+            "influence".to_string(),
+            r#"item.title.startsWith("gp-")"#.to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn influence_scorer() -> Scorer {
+    let cat = catalog_of(["mov-a", "mov-c", "mov-d", "gp-1", "gp-2"]);
+    Scorer::new_sourced(&cat, write_influence_fixture, Some(influence_sources()))
+}
+
+/// The acceptance criterion. The same catalog and the same taste vector
+/// produce a different order once the influence set is weighted, and the
+/// title that moves is the one sharing the influence set's keyword.
+#[test]
+fn an_influence_set_reorders_the_ranking_it_shares_keywords_with() {
+    let scorer = influence_scorer();
+
+    let plain = scorer.pick_tilted(3, 0.0);
+    assert_eq!(
+        order_of(&plain),
+        vec!["mov-a", "mov-c", "mov-d"],
+        "at weight 0 the ranking must be the plain taste cosine"
+    );
+
+    let tilted = scorer.pick_tilted(3, 0.5);
+    assert_eq!(
+        order_of(&tilted),
+        vec!["mov-d", "mov-a", "mov-c"],
+        "at weight 0.5 the title carrying the influence set's keyword must lead"
+    );
+}
+
+/// The tilt is a guide, not a gate: every candidate is still returned, and one
+/// sharing nothing at all with the influence set still airs.
+#[test]
+fn a_tilted_pool_still_returns_candidates_the_influence_set_says_nothing_about() {
+    let picked = influence_scorer().pick_tilted(3, 4.0);
+    let mut ids = order_of(&picked);
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["mov-a", "mov-c", "mov-d"],
+        "even at weight 4.0 the influence set must not narrow the candidates"
+    );
+}
+
+/// The two halves of the score are hand-checkable and both reported, so a
+/// pick that only aired because of the tilt can be told apart from one the
+/// account's own history chose.
+#[test]
+fn the_audit_reports_both_cosines_and_the_weight_between_them() {
+    let picked = influence_scorer().pick_tilted(3, 0.5);
+    let d = picked.iter().find(|p| p.id == "mov-d").unwrap();
+
+    let idf_time = 1.0 + (3.0f64 / 2.0).ln();
+    let idf_desert = 1.0 + 3.0f64.ln();
+    let taste = 0.5 * idf_time / 2.0f64.sqrt();
+    let influence = idf_desert / 2.0f64.sqrt();
+
+    assert_close(detail_f64(d, "taste_score"), taste, "mov-d's taste cosine");
+    assert_close(
+        detail_f64(d, "influence_score"),
+        influence,
+        "mov-d's influence cosine",
+    );
+    assert_close(detail_f64(d, "influence_weight"), 0.5, "the weight");
+    assert_close(
+        detail_f64(d, "base_score"),
+        taste + 0.5 * influence,
+        "base_score against taste + weight * influence",
+    );
+    assert_eq!(
+        detail_of(d)["on_influence"][0].as_str(),
+        Some("desert"),
+        "the audit must name which keyword the influence set contributed"
+    );
+    assert_eq!(
+        d.metadata.as_ref().unwrap()["audit"][0]["verdict"].as_str(),
+        Some("ranked by keyword cosine against pooled taste, tilted toward the influence set"),
+        "a tilted pick must say so"
+    );
+}
+
+/// A candidate sharing nothing with the influence set gets no tilt clause and
+/// no influence score, on the very same tilted pool — the verdict has to stay
+/// true per pick, not per pool.
+#[test]
+fn a_candidate_the_influence_set_never_touched_reads_as_an_ordinary_pick() {
+    let picked = influence_scorer().pick_tilted(3, 0.5);
+    let c = picked.iter().find(|p| p.id == "mov-c").unwrap();
+
+    assert_close(detail_f64(c, "influence_score"), 0.0, "mov-c's tilt");
+    assert_eq!(
+        c.metadata.as_ref().unwrap()["audit"][0]["verdict"].as_str(),
+        Some("ranked by keyword cosine against pooled taste"),
+        "an untouched candidate must not claim a tilt it never got"
+    );
+}
+
+/// The default is zero, so every pool that predates #396 — and every pool that
+/// authors no influence set — scores exactly what it scored before. Checked
+/// against the untouched `write_taste_fixture` rather than by asserting the
+/// default's value, so it fails if the influence branch ever runs unasked.
+#[test]
+fn a_pool_with_no_influence_set_is_untouched_by_the_feature() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let picked = scorer.pick("movies", 0, 4, Some(0.0));
+    let c = picked.iter().find(|p| p.id == "mov-c").unwrap();
+
+    assert_close(detail_f64(c, "influence_score"), 0.0, "an untilted pool");
+    assert_close(detail_f64(c, "influence_weight"), 0.0, "an untilted pool");
+    assert_close(
+        detail_f64(c, "base_score"),
+        detail_f64(c, "taste_score"),
+        "base_score must be the taste cosine alone when nothing tilts it",
     );
 }
