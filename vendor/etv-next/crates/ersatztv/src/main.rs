@@ -21,6 +21,7 @@ use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_folder};
 use tokio::signal;
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 use crate::channel_model::ChannelModel;
@@ -162,6 +163,12 @@ async fn run() -> Result<(), LineupError> {
                 .route("/discover.json", get(hdhr_discover))
                 .route("/lineup.json", get(hdhr_lineup))
                 .route("/lineup_status.json", get(hdhr_lineup_status))
+                // Text routes only. Router::layer wraps the routes registered
+                // above it, so /session (HLS segments) and /artwork
+                // (JPEG/PNG) below stay uncompressed — both are already-
+                // compressed media and gzipping them spends CPU per segment
+                // per viewer for nothing.
+                .layer(CompressionLayer::new())
                 .nest_service(
                     "/session",
                     ServiceBuilder::new()
