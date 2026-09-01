@@ -176,12 +176,56 @@ async def check(width: int, height: int) -> bool:
     return ok
 
 
+async def check_resize_debounce() -> bool:
+    """A resize drag emits one event per intermediate width (#424) — assert
+    that a burst of them, delivered with no pause in between, produces
+    exactly one _apply_layout call once the debounce settles, and that it
+    lands on the final width's layout rather than an intermediate one."""
+    epgb.fetch_lineup = lambda host: fixture()
+    app = epgb.build_app("http://127.0.0.1:8409")
+    ok = True
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        calls = 0
+        real_apply_layout = app._apply_layout
+
+        def counting_apply_layout(width: int) -> None:
+            nonlocal calls
+            calls += 1
+            real_apply_layout(width)
+
+        app._apply_layout = counting_apply_layout
+
+        # A burst crossing WIDE_COLUMNS back and forth, no pause between
+        # calls — the shape of a real divider drag.
+        for w in (90, 110, 130, 150, 170, 100):
+            await pilot.resize_terminal(w, 24)
+        await pilot.pause()
+        await asyncio.sleep(app.RESIZE_DEBOUNCE_SECS + 0.05)
+
+        wide = app.query_one("#layout").has_class("wide")
+        expected_wide = 100 >= app.WIDE_COLUMNS
+        good = calls == 1
+        ok &= good
+        print(f"  {'relayout calls':12} {calls} == 1 after a 6-event burst  {'OK' if good else 'FAIL'}")
+        good = wide == expected_wide
+        ok &= good
+        print(f"  {'settled class':12} wide={wide} == {expected_wide} (final width 100)  {'OK' if good else 'FAIL'}")
+    return ok
+
+
 def main() -> None:
     if len(sys.argv) > 1:
         sizes = [(int(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else MIN_HEIGHT)]
+        ok = all([asyncio.run(check(w, h)) for w, h in sizes])
     else:
         sizes = [(MIN_WIDTH, MIN_HEIGHT), (WIDE_WIDTH, WIDE_HEIGHT)]
-    ok = all([asyncio.run(check(w, h)) for w, h in sizes])
+        results = [asyncio.run(check(w, h)) for w, h in sizes]
+        print("=== resize debounce ===")
+        results.append(asyncio.run(check_resize_debounce()))
+        ok = all(results)
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
