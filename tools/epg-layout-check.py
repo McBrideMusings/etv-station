@@ -23,6 +23,7 @@ import asyncio
 import importlib.util
 import re
 import sys
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -180,13 +181,40 @@ async def check_resize_debounce() -> bool:
     """A resize drag emits one event per intermediate width (#424) — assert
     that a burst of them, delivered with no pause in between, produces
     exactly one _apply_layout call once the debounce settles, and that it
-    lands on the final width's layout rather than an intermediate one."""
+    lands on the final width's layout rather than an intermediate one.
+
+    etv-station-67xp: the original version raced a real 0.1s set_timer —
+    six awaited pilot.resize_terminal() calls plus a sleep tuned to
+    RESIZE_DEBOUNCE_SECS, both of which let the event loop turn and the
+    timer fire mid-check under load. A tolerance bump was rejected: it only
+    lowers the failure rate, it doesn't remove the race, and the same check
+    goes red again on the next loaded machine. Instead the burst is fed
+    synthetically with no `await` between arming the timer and asserting on
+    it — Textual's Timer only ever fires from its own task, so with no
+    await in between it provably cannot have fired yet, which is what makes
+    these assertions clock-independent rather than merely less likely to
+    flake."""
     epgb.fetch_lineup = lambda host: fixture()
     app = epgb.build_app("http://127.0.0.1:8409")
     ok = True
     async with app.run_test(size=(80, 24)) as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
+
+        # Wiring check, timing-independent: prove Textual's real Resize
+        # event still reaches on_resize. _flush_resize never clears
+        # _pending_width, so this holds whether or not the debounce timer
+        # from this resize has already fired.
+        await pilot.resize_terminal(150, 24)
+        wired = app._pending_width == 150
+        ok &= wired
+        print(f"  {'event wiring':12} _pending_width={app._pending_width} == 150  {'OK' if wired else 'FAIL'}")
+
+        # Quiesce whatever timer that resize armed before starting the
+        # synthetic burst below, so it can't fire partway through it.
+        if app._resize_timer is not None:
+            app._resize_timer.stop()
+            app._resize_timer = None
 
         calls = 0
         real_apply_layout = app._apply_layout
@@ -198,31 +226,68 @@ async def check_resize_debounce() -> bool:
 
         app._apply_layout = counting_apply_layout
 
-        # A burst crossing WIDE_COLUMNS back and forth, no pause between
-        # calls — the shape of a real divider drag.
+        # A burst crossing WIDE_COLUMNS back and forth, delivered as
+        # synthetic events with NO awaits between them — the shape of a
+        # real divider drag, minus the event-loop turns that let the
+        # debounce timer race it. on_resize reads only event.size.width.
         for w in (90, 110, 130, 150, 170, 100):
-            await pilot.resize_terminal(w, 24)
-        await pilot.pause()
-        await asyncio.sleep(app.RESIZE_DEBOUNCE_SECS + 0.05)
+            ev = types.SimpleNamespace(size=types.SimpleNamespace(width=w))
+            app.on_resize(ev)
 
-        wide = app.query_one("#layout").has_class("wide")
-        expected_wide = 100 >= app.WIDE_COLUMNS
-        good = calls == 1
+        # Still no await since the burst: the timer armed by the last
+        # on_resize call cannot have fired yet.
+        good = calls == 0
         ok &= good
-        print(f"  {'relayout calls':12} {calls} == 1 after a 6-event burst  {'OK' if good else 'FAIL'}")
-        good = wide == expected_wide
+        print(f"  {'deferred calls':12} {calls} == 0 during the burst  {'OK' if good else 'FAIL'}")
+        good = app._pending_width == 100
         ok &= good
-        print(f"  {'settled class':12} wide={wide} == {expected_wide} (final width 100)  {'OK' if good else 'FAIL'}")
+        print(f"  {'pending width':12} {app._pending_width} == 100 (latest of the burst)  {'OK' if good else 'FAIL'}")
+        good = app._resize_timer is not None
+        ok &= good
+        print(f"  {'timer armed':12} {app._resize_timer is not None}  {'OK' if good else 'FAIL'}")
+
+        # Settle the debounce by calling _flush_resize directly instead of
+        # waiting on the clock for the timer to fire it itself.
+        timer = app._resize_timer
+        timer.stop()
+        app._flush_resize()
+
+        try:
+            app._apply_layout = real_apply_layout
+
+            wide = app.query_one("#layout").has_class("wide")
+            expected_wide = 100 >= app.WIDE_COLUMNS
+            good = calls == 1
+            ok &= good
+            print(f"  {'relayout calls':12} {calls} == 1 after settling the burst  {'OK' if good else 'FAIL'}")
+            good = wide == expected_wide
+            ok &= good
+            print(f"  {'settled class':12} wide={wide} == {expected_wide} (final width 100)  {'OK' if good else 'FAIL'}")
+        finally:
+            # Restore before the run_test context exits, or App._shutdown's
+            # teardown path runs through the counting wrapper too.
+            if app._apply_layout is not real_apply_layout:
+                app._apply_layout = real_apply_layout
     return ok
 
 
 async def check_resize_teardown() -> bool:
     """A resize armed within RESIZE_DEBOUNCE_SECS of quitting must not fire
-    its callback against a torn-down screen (etv-station-7v6b): arm a resize,
-    then exit the app immediately — the quit-inside-100ms shape — and confirm
-    on_unmount cancelled the pending timer instead of leaving it to fire
-    _flush_resize -> _apply_layout -> query_one("#layout") against a dead
-    widget tree."""
+    its callback against a torn-down screen (etv-station-7v6b): arm a
+    resize, then exit the app immediately — the quit-inside-100ms shape —
+    and confirm _shutdown (App._shutdown() closes every screen before
+    dispatching Unmount, so the cancel lives there, not in on_unmount — see
+    epg-browser.py's own comment on _shutdown) cancelled the pending timer
+    instead of leaving it to fire _flush_resize -> _apply_layout ->
+    query_one("#layout") against a dead widget tree.
+
+    etv-station-67xp: the original version armed the timer with an awaited
+    pilot.resize_terminal() and then slept RESIZE_DEBOUNCE_SECS + 0.05
+    before checking it had cleared — both real elapsed time the timer could
+    beat under load, either arriving already fired ("nothing pending to
+    test teardown against") or racing the assertion itself. Arming
+    synthetically with no await before the state checks removes the race
+    instead of just narrowing its window."""
     epgb.fetch_lineup = lambda host: fixture()
     app = epgb.build_app("http://127.0.0.1:8409")
     ok = True
@@ -231,19 +296,24 @@ async def check_resize_teardown() -> bool:
             await app.workers.wait_for_complete()
             await pilot.pause()
 
-            await pilot.resize_terminal(150, 24)
+            # Synthetic arm, no await after it — nothing can have fired the
+            # timer between arming it and the assertion below.
+            ev = types.SimpleNamespace(size=types.SimpleNamespace(width=150))
+            app.on_resize(ev)
             armed = app._resize_timer is not None
             ok &= armed
             print(f"  {'timer armed':12} {armed}  {'OK' if armed else 'FAIL (nothing pending to test teardown against)'}")
+            timer = app._resize_timer
             # No pause here — exit the context immediately, before
             # RESIZE_DEBOUNCE_SECS elapses, so the timer is still pending
-            # at teardown.
+            # at teardown. Exiting runs App._shutdown, hence the override.
 
-        # Give a surviving timer the chance it would need to fire and crash.
-        await asyncio.sleep(app.RESIZE_DEBOUNCE_SECS + 0.05)
-        cleared = app._resize_timer is None
+        # timer._task is None is Textual's own proof of cancellation
+        # (Timer.stop() clears it — textual/timer.py), not just that
+        # _resize_timer was dereferenced elsewhere.
+        cleared = app._resize_timer is None and timer._task is None
         ok &= cleared
-        print(f"  {'timer cleared':12} {cleared}  {'OK' if cleared else 'FAIL (timer survived unmount)'}")
+        print(f"  {'timer cancelled':12} {cleared}  {'OK' if cleared else 'FAIL (timer survived unmount)'}")
     except Exception as exc:
         ok = False
         print(f"  {'exception':12} {exc!r}  FAIL")
