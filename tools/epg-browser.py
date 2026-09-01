@@ -423,6 +423,16 @@ def build_app(host: str):
         REFRESH_SECS = 60  # re-fetch lineup from the station this often
         TICK_SECS = 15  # rebuild the item list (cheap, no fetch) this often —
         # this is what makes the top row's clock roll from e.g. 15:45 to 16:00 live
+        # A terminal emits a resize event per intermediate width while a pane
+        # divider is dragged — dozens per drag — and each _apply_layout costs
+        # 55ms (Textual's own per-resize floor) plus ~110ms more when the
+        # resize crosses the WIDE_COLUMNS threshold (#424). on_resize defers
+        # to _flush_resize instead of relaying out on every event, so a drag
+        # produces one relayout when the width settles. Cost: a resize that
+        # settles exactly on WIDE_COLUMNS shows the previous layout for this
+        # long. 0.1s is above a terminal's inter-event gap during a drag and
+        # below the perceptual threshold for a settled resize.
+        RESIZE_DEBOUNCE_SECS = 0.1
         BLOCK_MINUTES = 15  # the grid a row's height snaps to — one line per
         # boundary it crosses, not the width of a row (a row is one item now)
         BLOCK_SAFETY_CAP = 2000  # ~20 days of blocks walked — a runaway-loop backstop, not a UX truncation
@@ -455,6 +465,10 @@ def build_app(host: str):
             #   ("start", win_start, None)        — "Start of retained history"; history mode, FIRST row
             #   ("empty", None, last_known_programme_or_None)  — nothing to show in this direction
             self.programme_rows: list[tuple[str, datetime | None, object]] = []
+            # Pending single-shot debounce timer for on_resize/_flush_resize
+            # (see RESIZE_DEBOUNCE_SECS), or None when nothing is pending.
+            self._resize_timer = None
+            self._pending_width: int | None = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -469,10 +483,37 @@ def build_app(host: str):
             """Right-hand detail column on a wide terminal, bottom row
             otherwise. Only the class changes — the widgets never move, so
             selection, scroll position and focus survive a resize."""
-            self.query_one("#layout").set_class(width >= self.WIDE_COLUMNS, "wide")
+            wide = width >= self.WIDE_COLUMNS
+            layout = self.query_one("#layout")
+            if layout.has_class("wide") == wide:
+                return
+            layout.set_class(wide, "wide")
 
         def on_resize(self, event) -> None:
-            self._apply_layout(event.size.width)
+            # Record the latest width and (re)arm a single-shot timer instead
+            # of relaying out immediately — see RESIZE_DEBOUNCE_SECS.
+            self._pending_width = event.size.width
+            if self._resize_timer is not None:
+                self._resize_timer.stop()
+            self._resize_timer = self.set_timer(self.RESIZE_DEBOUNCE_SECS, self._flush_resize)
+
+        def _flush_resize(self) -> None:
+            self._resize_timer = None
+            if self._pending_width is not None:
+                self._apply_layout(self._pending_width)
+
+        async def _shutdown(self) -> None:
+            # Cancel here, not in on_unmount: App._shutdown() closes every
+            # screen (removing #layout's children) BEFORE it dispatches the
+            # Unmount event, so a timer still pending at that point already
+            # has time to fire mid-teardown and crash _apply_layout's
+            # query_one("#layout") against a screen with no children left.
+            # Cancelling at the top of _shutdown, before any of that runs,
+            # is the only point that is actually before the race.
+            if self._resize_timer is not None:
+                self._resize_timer.stop()
+                self._resize_timer = None
+            await super()._shutdown()
 
         def on_mount(self) -> None:
             self._apply_layout(self.size.width)
