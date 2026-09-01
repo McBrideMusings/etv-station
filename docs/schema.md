@@ -1126,13 +1126,18 @@ A change to the list therefore has to reach three sets of scripts:
 | `deploy/appdata/plugins/*.rhai` | the same test, which skips when the directory is absent (it is gitignored, so a worktree and a fresh clone have no copy) |
 | whatever else is already on the host | `admin plugin-check` — nothing else can see these |
 
-That third row is the one that matters. A host carries scripts with no
-counterpart here at all, and `admin deploy files` never removes them
-(`delete = false` is correct: the same directory holds `catalog.db`,
-`history.db` and the HLS working set). The station's plugin directory held
-`taste-engine.rhai` — a `pool_provider` with no `audit()`, existing nowhere in
-this repo, and harmless only because its single reference sat inside a YAML
-comment. No check that compares local files to their counterparts can express
+That third row is the one that matters. A host can carry scripts with no
+counterpart here at all. `admin deploy files` removes them now — `[deploy]`
+declares `owns = ["channels", "plugins", "shared", ...]` with `delete = true`,
+so the sync prunes orphans inside those paths and leaves everything else on the
+volume (`catalog.db`, `history.db`, the HLS working set) untouched. It did not
+always: the station's plugin directory held `taste-engine.rhai` — a
+`pool_provider` with no `audit()`, existing nowhere in this repo, and harmless
+only because its single reference sat inside a YAML comment.
+
+Pruning does not make `admin plugin-check` redundant. A deploy reconciles the
+host to this checkout; the check answers what is on the host *right now*,
+before a deploy, which is the state a running station is actually loading. No check that compares local files to their counterparts can express
 that case, so `admin plugin-check` copies the host's whole plugin directory
 down and walks it with `etv-station --check-plugins`, using the binary on your
 branch rather than the one already deployed.
