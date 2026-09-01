@@ -364,9 +364,11 @@ def build_app(host: str):
     tools/epg-layout-check.py can drive the same app under Textual's headless
     test driver and assert the layout still fits a narrow terminal."""
     from rich.markup import escape
+    from textual import work
     from textual.app import App, ComposeResult
     from textual.containers import Container, VerticalScroll
     from textual.widgets import Footer, Header, ListItem, ListView, Label, Static
+    from textual.worker import get_current_worker
 
     class EpgBrowserApp(App):
         ENABLE_COMMAND_PALETTE = False
@@ -439,6 +441,11 @@ def build_app(host: str):
             self.channels: dict[str, Channel] = {}
             self.programmes: list[Programme] = []
             self.selected_channel: str | None = None
+            # True until the first lineup lands (from the startup fetch or a
+            # later refresh); refresh_detail shows a loading message while
+            # this is set instead of "No channel selected."
+            self.loading = True
+            self.load_error: str | None = None
             # False: now at the top, reading forward. True: history mode — now
             # at the BOTTOM, reading back. See _load_programmes.
             self.history = False
@@ -471,13 +478,49 @@ def build_app(host: str):
             self._apply_layout(self.size.width)
             self.title = f"epg-browser — {self.host}"
             self._sync_mode_subtitle()
-            self.action_refresh()
+            # Paint the shell before the first byte of network data exists —
+            # first paint then costs imports only, not the ~1.2s lineup fetch.
+            lv = self.query_one("#channels", ListView)
+            lv.append(ListItem(Label("Loading channels…")))
+            self.query_one("#detail-body", Static).update(f"Loading lineup from {self.host}…")
             self.query_one("#channels", ListView).focus()
+            self.action_refresh()
             self.set_interval(self.REFRESH_SECS, self.action_refresh)
             self.set_interval(self.TICK_SECS, lambda: self._load_programmes(keep_selection=True))
 
         def action_refresh(self) -> None:
-            self.channels, self.programmes = fetch_lineup(self.host)
+            """Kick off a lineup fetch on a thread worker and return
+            immediately — never block the event loop. `_apply_lineup` (called
+            back via call_from_thread) does the work this used to do inline."""
+            self._fetch_lineup_worker()
+
+        @work(exclusive=True, thread=True, group="lineup")
+        def _fetch_lineup_worker(self) -> None:
+            try:
+                channels, programmes = fetch_lineup(self.host)
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not crashed on
+                self.call_from_thread(self._lineup_failed, str(exc))
+                return
+            # exclusive=True cancels the previous worker but a thread worker
+            # keeps running to completion — this is what stops a slow fetch
+            # a newer refresh superseded from clobbering the newer one.
+            if get_current_worker().is_cancelled:
+                return
+            self.call_from_thread(self._apply_lineup, channels, programmes)
+
+        def _lineup_failed(self, message: str) -> None:
+            self.loading = False
+            self.load_error = message
+            self.notify(f"Failed to fetch lineup: {message}", severity="error")
+            self.refresh_detail()
+
+        def _apply_lineup(self, channels: dict[str, Channel], programmes: list[Programme]) -> None:
+            """Runs on the event loop via call_from_thread, so this whole body
+            is one loop callback — the 15s tick can never observe channels and
+            programmes half-swapped."""
+            self.channels, self.programmes = channels, programmes
+            self.loading = False
+            self.load_error = None
             lv = self.query_one("#channels", ListView)
             keep_index = lv.index
             lv.clear()
@@ -915,6 +958,15 @@ def build_app(host: str):
 
         def refresh_detail(self) -> None:
             body = self.query_one("#detail-body", Static)
+            if self.load_error is not None:
+                body.update(
+                    f"[red]Failed to fetch lineup from {escape(self.host)}[/red]\n"
+                    f"[dim]{escape(self.load_error)}[/dim]\n\npress r to retry"
+                )
+                return
+            if self.loading:
+                body.update(f"Loading lineup from {escape(self.host)}…")
+                return
             if self.selected_channel is None:
                 body.update("No channel selected.")
                 return
