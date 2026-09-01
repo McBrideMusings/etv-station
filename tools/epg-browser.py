@@ -601,6 +601,16 @@ def build_app(host: str):
                 win_start = now
                 end_bound = progs_win[-1].stop  # where known EPG data actually ends
 
+            # The block-clock column is a property of the render window, not
+            # of any one row: derive its width from win_start/end_bound/
+            # self.history alone, once, rather than by formatting every block
+            # and taking a max after the fact. Otherwise a window that crosses
+            # midnight renders a 5-char HH:MM column for today's rows and a
+            # 9-char "Wed HH:MM" column for the rest, breaking the aligned
+            # clock column #418 chose the left-gutter layout for.
+            today = now.date()
+            stamp_w = max(len(_fmt_dt(d, today=today, with_date=self.history)) for d in (win_start, end_bound))
+
             # Sweep progs_win into a flat list of (programme_or_None, start, stop)
             # segments covering [win_start, end_bound) with zero gaps between
             # them and real (unrounded) boundary timestamps — this is what lets
@@ -672,6 +682,9 @@ def build_app(host: str):
             cur = self._floor_block(win_start, self.BLOCK_MINUTES)
             step = timedelta(minutes=self.BLOCK_MINUTES)
             row_count = 0
+            # prefix_w depends only on stamp_w now, not on any one block's
+            # clock text, so it's computed once here rather than per block.
+            prefix_w = 2 + chan_tag_w + self.GUTTER_W + stamp_w + 2
 
             # A row is one media item (or one gap span), not one block — but
             # the loop below still walks blocks, because that's what already
@@ -740,7 +753,7 @@ def build_app(host: str):
                 # `now` rather than row position is what makes that one rule.
                 is_now = cur <= now < block_end
                 marker = "▶" if is_now else " "
-                time_str = _fmt_dt(cur, today=now.date(), with_date=self.history)
+                time_str = _fmt_dt(cur, today=now.date(), with_date=self.history).rjust(stamp_w)
                 # One line per programme this block touches, gutter glyph
                 # left as a `\x00` sentinel for flush() to resolve. The title
                 # is stated once, on a row's first line only; every line
@@ -750,7 +763,6 @@ def build_app(host: str):
                 # crossing a new boundary, and starts a fresh row otherwise
                 # — and a fresh row is always that row's first line, so it
                 # always carries the title.
-                prefix_w = 2 + chan_tag_w + self.GUTTER_W + len(time_str) + 2
                 if not overlapping:
                     # No segment covers this block at all — a window-edge
                     # artifact (`cur` floors to before win_start on the first
@@ -771,7 +783,7 @@ def build_app(host: str):
                         if j == 0:
                             clock = time_str
                         else:
-                            clock = _fmt_dt(seg[1], today=now.date(), with_date=self.history).rjust(len(time_str))
+                            clock = _fmt_dt(seg[1], today=now.date(), with_date=self.history).rjust(stamp_w)
                         if continuation:
                             # Same item as the still-open row, crossing into a
                             # new boundary mid-item — add a bare-clock line,
