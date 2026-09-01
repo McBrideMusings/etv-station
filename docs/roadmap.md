@@ -37,6 +37,26 @@ place; and an entry the library loses is marked missing rather than deleted
 ([ADR 0006](/adr/0006-catalog-entries-are-soft-deleted)), so `entry_id` stays the
 durable join key the ledger and the coming enrichment graph need.
 
+**A curated collection became an influence rather than a channel (2026-09-01).**
+Channel 10 played the Plex collection "Pierce's Guilty Pleasures" and nothing
+else — a whitelist, so it could never surface anything adjacent to what was on
+it. A `taste-cosine.rhai` pool can now name an `influence` source whose keywords
+tilt its ranking without gating it
+([#410](https://github.com/McBrideMusings/etv-station/issues/410)), and channel
+10 is retired into channel 2. The same channel now makes two pitches rather than
+one: a comfort pool restricted to films the account has played and a discovery
+pool restricted to films it has not, the second also discounted by how close a
+title sits to what the whole house watches
+([#411](https://github.com/McBrideMusings/etv-station/issues/411)). The
+partition is not a preference — pools are blind to each other, so two movie
+pools over one library have to be disjoint by construction or they will both air
+the same film in a day. Lifetime watch state came from a new reader accessor
+([plex-db-ex#60](https://github.com/McBrideMusings/plex-db-ex/issues/60)); the
+Tautulli history tail this station already held is capped at 1000 rows and would
+have called a film watched two years ago unseen. Both weights were swept against
+the live snapshot rather than chosen, and every pick's audit now carries the
+three cosines behind it so the next tuning pass has numbers.
+
 ## Next — three sequential phases of v2+ scope expansion
 
 The v2+ direction extends `etv-station` from a hand-authored Loop Forever generator into a composable, catalog-aware playout system with overlay graphics. See [PRD §Scope evolution beyond v1](/PRD#scope-evolution-beyond-v1) for the framing and rationale.

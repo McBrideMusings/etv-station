@@ -188,7 +188,7 @@ impl Scorer {
     }
 
     /// The same, for a pool that writes its own candidate queries — the shape
-    /// an influence-tilted pool needs (#396), since the `influence` set is
+    /// an influence-tilted pool needs (#410), since the `influence` set is
     /// channel-authored and the script declares no default for it.
     fn new_sourced(
         cat: &Catalog,
@@ -232,7 +232,7 @@ impl Scorer {
         )
     }
 
-    /// One generation on a pool tilted toward an influence set (#396).
+    /// One generation on a pool tilted toward an influence set (#410).
     /// `influence_weight` is the pool's `config:` value; the set itself came
     /// from the `sources:` table this scorer was built with. Exploration is
     /// off, so the order under test is the tilted ranking itself.
@@ -1419,7 +1419,7 @@ fn the_deleted_scorer_is_gone() {
 }
 
 // ---------------------------------------------------------------------------
-// #396 — a channel-authored INFLUENCE set tilts the ranking without gating it.
+// #410 — a channel-authored INFLUENCE set tilts the ranking without gating it.
 //
 // The fixture is `write_taste_fixture`'s arithmetic with two extra films that
 // are not candidates. Pooled taste comes from the one played movie: `mov-a`
@@ -1575,7 +1575,7 @@ fn a_candidate_the_influence_set_never_touched_reads_as_an_ordinary_pick() {
     );
 }
 
-/// The default is zero, so every pool that predates #396 — and every pool that
+/// The default is zero, so every pool that predates #410 — and every pool that
 /// authors no influence set — scores exactly what it scored before. Checked
 /// against the untouched `write_taste_fixture` rather than by asserting the
 /// default's value, so it fails if the influence branch ever runs unasked.
@@ -1595,7 +1595,7 @@ fn a_pool_with_no_influence_set_is_untouched_by_the_feature() {
 }
 
 // ---------------------------------------------------------------------------
-// #397 — `seen` partitions the candidates and `unusual_weight` pushes away
+// #411 — `seen` partitions the candidates and `unusual_weight` pushes away
 // from the house.
 //
 // The fixture is the influence one plus a second account, so "this account's
@@ -1636,7 +1636,7 @@ fn write_seen_fixture(path: &Path) {
 
 impl Scorer {
     /// One generation on a pool that partitions on watch state and/or leans
-    /// away from the house — the two halves of #397. `account_id` is required
+    /// away from the house — the two halves of #411. `account_id` is required
     /// for either to mean anything, exactly as on a live `single_user`
     /// channel.
     fn pick_split(

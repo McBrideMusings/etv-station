@@ -151,8 +151,12 @@ it, and `item.edition == ""` selects exactly the no-edition items.
 Each field is either a column on the catalog's `entries` table (scalar —
 compared with `==`, `!=`, `in`, and for text `contains` / `startsWith` /
 `matches`) or a tag namespace (multi-valued — membership only, via `contains`).
-`source`, `collections`, and `fs_dir` are membership over a related table, and
-take `==` only — the one comparison that reads as "has one of".
+`source`, `collections`, and `fs_dir` are membership over a related table. `source`
+and `fs_dir` take `==` only — the one comparison that reads as "has one of".
+`collections` also takes `contains` (exact membership by collection name),
+`startsWith` and `matches` (both against the collection's NAME, not the item's),
+so a curated list split across several similarly-named collections is reachable
+without naming each one — see `catalog/query.rs`'s `method_predicate`.
 
 | Field | Kind | Notes |
 |---|---|---|
@@ -847,7 +851,7 @@ resolve fails the channel's generation naming the pool and the set, and says
 the file the expression is actually written in.
 
 #### An `influence` set — a curated list guides a taste pool without gating it
-(#396)
+(#410)
 
 `taste-cosine.rhai` reads one set name it does not declare in `sources()`:
 `influence`. A pool that authors one, and gives `config.influence_weight` a
@@ -901,7 +905,7 @@ An influence set is scored against **units**, so it belongs on a `unit: movie`
 pool. A film collection's keywords cannot join to a `unit: show` pool, whose
 units are series ids.
 
-#### `seen` and `unusual_weight` — two pools, two pitches (#397)
+#### `seen` and `unusual_weight` — two pools, two pitches (#411)
 
 `taste-cosine.rhai` takes two more `config` keys, both aimed at one channel
 running a *comfort* movie pool and a *discovery* movie pool side by side:
@@ -925,7 +929,7 @@ neither one's `no_repeat_within` will notice. `only` and `exclude` cannot
 overlap, so the two are disjoint by construction.
 
 Watch state comes from the granted datastore's whole `plays` table
-(`watched_units_for`, plex-db-ex#62), not from `ctx.history`, which is the
+(`watched_units_for`, plex-db-ex#60), not from `ctx.history`, which is the
 newest 1000 Tautulli rows and would call a film watched two years ago unseen.
 A pool with no `ctx.account_id` — a pooled channel — partitions on what the
 *house* has played, which is the closest true answer available to it. On a
@@ -1142,7 +1146,7 @@ are gated behind a declaration, and a third is opened only by name:
 |---|---|---|
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
-| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #397); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
+| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
 
 Unlike `hooks()`, `capabilities()` is optional — a script with no such function
 declares nothing, which is the right answer for a plugin that only reads the

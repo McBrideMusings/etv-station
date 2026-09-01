@@ -889,7 +889,7 @@ impl Datastore {
     }
 
     /// Every unit one account has ever played, as an array of id strings
-    /// (plex-db-ex#62). The lifetime answer, unlike `ctx.history`, which is
+    /// (plex-db-ex#60). The lifetime answer, unlike `ctx.history`, which is
     /// the newest 1000 Tautulli rows and therefore reports a film watched
     /// three years ago as unseen.
     fn watched_units_for(&mut self, plex_account_id: i64) -> Result<Array, Box<EvalAltResult>> {

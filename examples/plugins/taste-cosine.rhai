@@ -42,7 +42,7 @@
 // keywords to score, and ordering episodes by anything but season/episode
 // would air a season shuffled.
 //
-// **A pool can tilt the ranking toward a curated set** (#396) by authoring an
+// **A pool can tilt the ranking toward a curated set** (#410) by authoring an
 // `influence` source and an `influence_weight`. The set's keywords become a
 // second profile, its cosine is added to the taste cosine, and nothing is
 // gated: a title outside the set competes on the keywords it happens to
@@ -59,7 +59,7 @@
 // ctx carries (see docs/schema.md § Pool `capabilities` / `datastores`):
 //   ctx.sets.movies      the movie candidates sources() matched
 //   ctx.sets.influence   a channel-authored set whose keywords tilt the
-//                        ranking (#396), or unit when the pool authored none —
+//                        ranking (#410), or unit when the pool authored none —
 //                        a profile, never a candidate list
 //   ctx.pool             the name of the pool asking
 //   ctx.target_count     how many items this generation needs
@@ -139,7 +139,7 @@ fn recency_factor(r, half_life) {
 }
 
 // How much a candidate's closeness to an INFLUENCE set counts, added to its
-// closeness to the account's own taste (#396).
+// closeness to the account's own taste (#410).
 //
 // **The two cosines are not on the same scale, so this is not a fraction.**
 // Both are computed the same way over the same namespace, but the taste
@@ -178,7 +178,7 @@ fn influence_weight(ctx) { tunable(ctx, "influence_weight", 0.0).to_float() }
 fn influence_set_name() { "influence" }
 
 // Which half of the library this pool may rank, by whether the account has
-// ever played it (#397). Three values:
+// ever played it (#411). Three values:
 //
 //   "any"      every candidate — the default, and what every pool did before
 //   "only"     only units the account has played: comfort viewing
@@ -200,7 +200,7 @@ fn influence_set_name() { "influence" }
 fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
 
 // How much a candidate is discounted for sitting close to what the WHOLE
-// HOUSE watches (#397) — the "unusual choice" knob. The score is divided by
+// HOUSE watches (#411) — the "unusual choice" knob. The score is divided by
 // `1 + unusual_weight * house cosine`, so a positive value pushes toward
 // titles nobody here has a habit of watching.
 //
@@ -327,7 +327,7 @@ fn pick(ctx) {
     let members = #{};
 
     // The lifetime play set, as a lookup, when this pool takes only one half
-    // of it (#397). Fetched before the unit pass below so the filter is one
+    // of it (#411). Fetched before the unit pass below so the filter is one
     // map probe per candidate rather than a query per candidate.
     //
     // Scoped to this channel's account when it has one, and to the house when
@@ -455,7 +455,7 @@ fn pick(ctx) {
         }
     }
 
-    // The influence profile (#396): a second keyword weight map in the same
+    // The influence profile (#410): a second keyword weight map in the same
     // shape as `weights` above, built from a channel-authored candidate set
     // instead of from watch history. Skipped entirely — no resolution, no
     // enrichment fetch, no map — when the pool set no weight or authored no
@@ -494,7 +494,7 @@ fn pick(ctx) {
         }
     }
 
-    // The house's own profile, for the "unusual choice" term (#397). Fetched
+    // The house's own profile, for the "unusual choice" term (#411). Fetched
     // only when a pool asks for it, and skipped outright on a pooled channel,
     // where it would be the same vector `weights` already holds.
     let gamma = unusual_weight(ctx);
@@ -615,7 +615,7 @@ fn pick(ctx) {
             //
             // The influence cosine uses the same divisor, so the two are on
             // one scale and `beta` is a ratio between them rather than an
-            // arbitrary constant (#396).
+            // arbitrary constant (#410).
             if n > 0 {
                 let divisor = n.to_float().sqrt();
                 taste_score = sum / divisor;
@@ -630,7 +630,7 @@ fn pick(ctx) {
         //
         // Three terms: what this account likes, tilted toward the influence
         // set, discounted by how close it sits to the house's well-worn
-        // middle (#396, #397). With neither weight set this is exactly the
+        // middle (#410, #411). With neither weight set this is exactly the
         // taste cosine, unchanged from #254 — `beta` and `gamma` are 0.0, so
         // the divisor is 1.0.
         //
@@ -821,7 +821,7 @@ fn pick(ctx) {
             score: row.score,
             base_score: row.base_score,
             // The two halves `base_score` is the sum of, and the weight that
-            // combined them (#396). Without all three, a pick that only aired
+            // combined them (#410). Without all three, a pick that only aired
             // because the influence set liked it is indistinguishable from one
             // the account's own history chose — which is the whole question a
             // tilted channel raises.
@@ -830,7 +830,7 @@ fn pick(ctx) {
             influence_weight: beta,
             on_influence: row.on_influence,
             // The house term and the half of the library this pool drew from
-            // (#397), so an audit line says which of the two movie pools a
+            // (#411), so an audit line says which of the two movie pools a
             // pick came out of without the reader knowing the config.
             house_score: row.house_score,
             unusual_weight: gamma,
@@ -966,7 +966,7 @@ fn audit(ctx, picks, workspace) {
                 // exactly 1.0.
                 base_score: r.base_score,
                 // The two terms `base_score` adds together and the weight
-                // between them (#396). `influence_weight` is 0.0 and
+                // between them (#410). `influence_weight` is 0.0 and
                 // `influence_score` 0.0 on a pool with no influence set, where
                 // `base_score` is the taste cosine alone.
                 taste_score: r.taste_score,
