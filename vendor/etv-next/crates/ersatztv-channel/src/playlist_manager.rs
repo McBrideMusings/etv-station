@@ -199,6 +199,18 @@ impl PlaylistManager {
             .map(|s| s.program_date_time + Duration::from_secs_f64(s.duration))
             .unwrap_or(channel_start_time);
 
+        // `resumed.next_media_sequence` names the sequence the *next new*
+        // segment would take, not `adopted[0]` — that segment was already
+        // published `adopted.len()` numbers earlier by the previous run.
+        // Advertising it again under a higher number tells a still-tuned
+        // client the bytes it already has are new content. `saturating_sub`
+        // rather than `-`: a `.sequence` file that disagrees with the
+        // playlist on disk (hand-edited, truncated, or from an older build)
+        // must not panic a worker at startup — it degrades to 0 instead.
+        let first_media_sequence = resumed
+            .next_media_sequence
+            .saturating_sub(adopted.len() as u64);
+
         PlaylistManager {
             output_folder,
             segment_folder,
@@ -213,8 +225,8 @@ impl PlaylistManager {
 
             segments: adopted,
             discontinuity_before: HashSet::new(),
-            media_sequence: resumed.next_media_sequence,
-            last_served_media_sequence: resumed.next_media_sequence,
+            media_sequence: first_media_sequence,
+            last_served_media_sequence: first_media_sequence,
             discontinuity_sequence: resumed.next_discontinuity_sequence,
             target_duration,
             target_duration_f64: target_duration as f64,
@@ -1193,6 +1205,127 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Write a `live.m3u8` at `dir`'s root naming `count` segments, each with a
+    /// file present in `run`'s folder so [`adopt_segments`] actually adopts it
+    /// (it skips any entry whose `.ts` file is missing on disk). PDTs step by
+    /// the segment duration starting at `first_pdt`, matching the shape
+    /// [`push_segments`] produces.
+    async fn write_prior_playlist_n(
+        dir: &Path,
+        run: &str,
+        count: usize,
+        first_pdt: OffsetDateTime,
+    ) {
+        let run_folder = dir.join(run);
+        tokio::fs::create_dir_all(&run_folder).await.unwrap();
+
+        let mut body = String::from(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n",
+        );
+        for i in 0..count {
+            let path = format!("live{i:06}.ts");
+            tokio::fs::write(run_folder.join(&path), b"segment")
+                .await
+                .unwrap();
+            let pdt = first_pdt + Duration::from_secs_f64(4.0 * i as f64);
+            body.push_str(&format!(
+                "#EXTINF:4.000000,\n#EXT-X-PROGRAM-DATE-TIME:{}\n{run}/{path}\n",
+                pdt.format(PROGRAM_DATE_TIME_FORMAT).unwrap(),
+            ));
+        }
+
+        tokio::fs::write(dir.join("live.m3u8"), body).await.unwrap();
+    }
+
+    /// The defect this guards (`etv-station-262.1`): before this fix,
+    /// `media_sequence` was seeded from `resumed.next_media_sequence` even
+    /// though `segments[0]` is the *oldest* adopted segment — published
+    /// `adopted.len()` numbers earlier by the previous run. Every adopted
+    /// segment was re-advertised too high, so a still-tuned client saw its
+    /// own already-consumed content reappear as new media.
+    #[tokio::test]
+    async fn adopted_segments_keep_the_media_sequence_the_prior_run_already_published() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let prior_run = "r0000000000000-9999";
+        // A few seconds old, well inside the two-minute trim window, so
+        // `update()` neither drops them nor reorders this assertion.
+        let first_pdt = OffsetDateTime::now_utc() - time::Duration::seconds(4);
+        write_prior_playlist_n(dir.path(), prior_run, 10, first_pdt).await;
+
+        tokio::fs::write(
+            dir.path().join(SEQUENCE_FILE_NAME),
+            serde_json::to_string(&SequenceState {
+                next_media_sequence: 150,
+                next_discontinuity_sequence: 0,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        // The oldest adopted segment was published at 150 - 10 = 140 by the
+        // previous run, not 150 — 150 is the number the *next new* segment
+        // gets.
+        assert_eq!(pm.media_sequence, 140);
+        assert_eq!(pm.last_served_media_sequence, 140);
+
+        pm.update().await.unwrap();
+
+        let playlist = tokio::fs::read_to_string(dir.path().join("live.m3u8"))
+            .await
+            .unwrap();
+        assert!(
+            playlist.contains("#EXT-X-MEDIA-SEQUENCE:140\n"),
+            "the published header must still name 140, the number the client was already \
+             given for these bytes: {playlist}"
+        );
+        assert!(
+            playlist
+                .lines()
+                .any(|l| l == format!("{prior_run}/live000000.ts")),
+            "the first adopted segment, at the sequence the previous run actually published \
+             it under, must still be listed: {playlist}"
+        );
+
+        // Round-tripping through `sequence_state()` must not inflate the
+        // counter again: 140 held + 10 still held = 150, exactly what the
+        // previous run persisted, not 160.
+        assert_eq!(pm.sequence_state().next_media_sequence, 150);
+    }
+
+    /// With nothing adopted, the fix must be a no-op: the existing behaviour
+    /// (also pinned by `a_restarted_worker_numbers_above_every_segment_the_last_one_published`)
+    /// stays exactly as it was.
+    #[tokio::test]
+    async fn with_no_adopted_segments_the_seeded_sequence_is_unchanged() {
+        let dir = TempDir::new().unwrap();
+
+        tokio::fs::write(
+            dir.path().join(SEQUENCE_FILE_NAME),
+            serde_json::to_string(&SequenceState {
+                next_media_sequence: 150,
+                next_discontinuity_sequence: 0,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert!(
+            pm.segments.is_empty(),
+            "no live.m3u8 means nothing to adopt"
+        );
+        assert_eq!(pm.media_sequence, 150);
+        assert_eq!(pm.last_served_media_sequence, 150);
     }
 
     /// The direct assertion for the `etv-station-262.1` respawn fix: a new
