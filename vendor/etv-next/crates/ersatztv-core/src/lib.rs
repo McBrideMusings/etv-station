@@ -36,6 +36,88 @@ pub const HEARTBEAT_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 /// that reap removes: the reap clears a session's *media*, not its *identity*.
 pub const SEQUENCE_FILE_NAME: &str = ".sequence";
 
+/// The sequence counters a session carries across worker restarts, persisted
+/// to [`SEQUENCE_FILE_NAME`] in the channel's output folder.
+///
+/// Both counter fields name what the *next* segment must be numbered, not
+/// what the last one was, so seeding a fresh `PlaylistManager` (in
+/// `ersatztv-channel`) is a plain assignment with no off-by-one to get wrong
+/// at the call site.
+///
+/// This struct lives in `ersatztv-core` rather than the `ersatztv-channel`
+/// crate that writes it, because [`reap_unreferenced_run_folders`] — the
+/// periodic sweep, which runs on the server side of the worker/server
+/// boundary — also needs to read `run_folders`: it is the worker's own
+/// record of which run folders its in-memory retention deque currently holds
+/// segments in, and that is the authority the sweep must protect against,
+/// not the ten-segment window the *served* playlist happens to show (see
+/// that function's doc for why the two can disagree).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SequenceState {
+    /// `EXT-X-MEDIA-SEQUENCE` the next segment produced on this session takes.
+    /// Strictly above every sequence number already published, so a client
+    /// that discards anything at or below what it has already consumed still
+    /// accepts the first segment of the new worker.
+    pub next_media_sequence: u64,
+    /// `EXT-X-DISCONTINUITY-SEQUENCE` in force once the segments held now
+    /// have all been trimmed away.
+    pub next_discontinuity_sequence: u64,
+    /// Every run folder the worker's retention deque currently holds a
+    /// segment in, sorted and deduplicated. `#[serde(default)]` so a
+    /// `.sequence` file written by a build that predates this field — or one
+    /// with nothing in it — decodes to an empty list rather than failing to
+    /// parse: [`read_sequence_state`]'s degrade-to-default rule still governs
+    /// the file as a whole, but this covers the narrower case of an
+    /// otherwise-valid file missing only this field.
+    #[serde(default)]
+    pub run_folders: Vec<String>,
+}
+
+/// Read a session's persisted sequence counters, or [`SequenceState::default`]
+/// when there are none to read.
+///
+/// Every failure route lands on the default deliberately. A missing file is
+/// the ordinary first-run case; a truncated or malformed one is a file that
+/// was being written when the process died. Neither is worth refusing to
+/// start a channel, or a sweep, over — the cost of falling back is that one
+/// already-tuned client freezes until it re-tunes, and the cost of
+/// propagating the error is a channel that will not start, or a sweep that
+/// stops running, at all.
+pub async fn read_sequence_state(path: &Path) -> SequenceState {
+    let Ok(contents) = tokio::fs::read_to_string(path).await else {
+        return SequenceState::default();
+    };
+    match serde_json::from_str(&contents) {
+        Ok(state) => state,
+        Err(e) => {
+            log::warn!(
+                "ignoring unreadable sequence file {}: {e}; this session's segment numbering \
+                 restarts from zero and any client already tuned to it will freeze until it \
+                 re-tunes",
+                path.display()
+            );
+            SequenceState::default()
+        }
+    }
+}
+
+/// Every run folder [`SequenceState::run_folders`] names at `channel_folder`,
+/// filtered through [`is_run_folder_name`] so a malformed or hand-edited
+/// `.sequence` cannot smuggle an arbitrary path into the sweep's protected
+/// set. A missing, empty, or unparseable `.sequence` yields an empty set —
+/// see [`read_sequence_state`] — which is safe here specifically because
+/// [`reap_unreferenced_run_folders`] unions this with the served-playlist
+/// set rather than replacing it: an empty result never removes protection a
+/// playlist would otherwise have granted.
+pub async fn run_folders_held_by_session(channel_folder: &Path) -> HashSet<String> {
+    let state = read_sequence_state(&channel_folder.join(SEQUENCE_FILE_NAME)).await;
+    state
+        .run_folders
+        .into_iter()
+        .filter(|name| is_run_folder_name(name))
+        .collect()
+}
+
 /// Touched by the channel worker before it opens a live overlay's rawvideo fifo
 /// for read. Its presence tells the overlay producer (the separate etv-station
 /// daemon) that this channel is now being watched and its overlay process
@@ -335,7 +417,18 @@ pub async fn reap_unreferenced_run_folders(
         folders.pop();
     }
 
-    let referenced = run_folders_named_by_playlists(channel_folder).await;
+    // The served playlist is a ten-segment shop window (`generate_playlist`'s
+    // `Some(10)` cap in `ersatztv-channel`), not the worker's actual
+    // retention deque (~2 minutes). Unioning in what `.sequence` says the
+    // deque still holds closes that gap without weakening today's
+    // playlist-only protection: in the steady state the deque is always a
+    // superset of the served window, so this union equals the `.sequence`
+    // set, and a `.sequence` that is missing or carries no run-folder list
+    // (an old build, or a fresh worker that has not written one yet)
+    // contributes nothing, leaving the playlist set as the sole authority —
+    // see etv-station-262.1.
+    let mut referenced = run_folders_named_by_playlists(channel_folder).await;
+    referenced.extend(run_folders_held_by_session(channel_folder).await);
 
     let mut removed = 0;
     for folder in folders {
@@ -576,9 +669,9 @@ mod empty_folder_tests {
 #[cfg(test)]
 mod run_folder_tests {
     use super::{
-        LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME, is_run_folder_name,
-        list_run_folders, new_run_folder_name, reap_run_folders, reap_unreferenced_run_folders,
-        run_folders_named_by_playlists,
+        LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME, SEQUENCE_FILE_NAME,
+        SequenceState, is_run_folder_name, list_run_folders, new_run_folder_name, reap_run_folders,
+        reap_unreferenced_run_folders, run_folders_named_by_playlists,
     };
 
     /// The direct guarantee two runs on the same channel depend on: neither can
@@ -953,5 +1046,132 @@ mod run_folder_tests {
             .unwrap();
 
         assert_eq!(removed, 0);
+    }
+
+    /// The defect etv-station-262.1 fixes: the served `live.m3u8` is a
+    /// ten-segment shop window, not the worker's ~2-minute retention deque,
+    /// so a folder can drop out of the playlist while the worker still
+    /// holds — and could still serve — its segments. `.sequence`'s
+    /// `run_folders` is the deque's own record and must protect a folder the
+    /// playlist has already stopped naming.
+    #[tokio::test]
+    async fn reap_unreferenced_keeps_every_folder_the_sequence_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let older = root.join("r0000000000001-0000");
+        let newer = root.join("r0000000000002-0000");
+        tokio::fs::create_dir(&older).await.unwrap();
+        tokio::fs::create_dir(&newer).await.unwrap();
+        // The served playlist has already slid off the older folder...
+        tokio::fs::write(
+            root.join(LIVE_PLAYLIST_FILE_NAME),
+            "r0000000000002-0000/live000000.ts\n",
+        )
+        .await
+        .unwrap();
+        // ...but the deque, per .sequence, still holds segments in both.
+        tokio::fs::write(
+            root.join(SEQUENCE_FILE_NAME),
+            serde_json::to_string(&SequenceState {
+                next_media_sequence: 40,
+                next_discontinuity_sequence: 0,
+                run_folders: vec![
+                    "r0000000000001-0000".to_owned(),
+                    "r0000000000002-0000".to_owned(),
+                ],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let removed = reap_unreferenced_run_folders(root, false).await.unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(
+            older.exists(),
+            "the deque still holds this folder's segments per .sequence"
+        );
+        assert!(newer.exists());
+    }
+
+    /// Non-regression control for the test above: once `.sequence` agrees
+    /// with the playlist that the older folder is no longer held, the sweep
+    /// must still collect it. This case already passes without the fix —
+    /// today's playlist-only set is also just the newer folder — so it is
+    /// here to prove the union does not over-protect, not to prove the fix
+    /// exists.
+    #[tokio::test]
+    async fn reap_unreferenced_collects_a_folder_the_sequence_file_no_longer_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let older = root.join("r0000000000001-0000");
+        let newer = root.join("r0000000000002-0000");
+        tokio::fs::create_dir(&older).await.unwrap();
+        tokio::fs::create_dir(&newer).await.unwrap();
+        tokio::fs::write(
+            root.join(LIVE_PLAYLIST_FILE_NAME),
+            "r0000000000002-0000/live000000.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join(SEQUENCE_FILE_NAME),
+            serde_json::to_string(&SequenceState {
+                next_media_sequence: 20,
+                next_discontinuity_sequence: 0,
+                run_folders: vec!["r0000000000002-0000".to_owned()],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let removed = reap_unreferenced_run_folders(root, false).await.unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!older.exists());
+        assert!(newer.exists());
+    }
+
+    /// A missing, empty, or field-less `.sequence` (an older build, or one
+    /// that failed to parse) must degrade to contributing nothing — never
+    /// panic or error the sweep, and never remove a folder the playlist
+    /// still names on its own.
+    #[tokio::test]
+    async fn reap_unreferenced_degrades_when_the_sequence_file_is_absent_or_fieldless() {
+        let cases = [
+            None,
+            Some("{}"),
+            Some(r#"{"next_media_sequence":5,"next_discontinuity_sequence":0}"#),
+        ];
+        for sequence_contents in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+
+            let held = root.join("r0000000000001-0000");
+            tokio::fs::create_dir(&held).await.unwrap();
+            tokio::fs::write(
+                root.join(LIVE_PLAYLIST_FILE_NAME),
+                "r0000000000001-0000/live000000.ts\n",
+            )
+            .await
+            .unwrap();
+            if let Some(contents) = sequence_contents {
+                tokio::fs::write(root.join(SEQUENCE_FILE_NAME), contents)
+                    .await
+                    .unwrap();
+            }
+
+            let removed = reap_unreferenced_run_folders(root, false).await.unwrap();
+
+            assert_eq!(removed, 0, "case {sequence_contents:?}");
+            assert!(
+                held.exists(),
+                "a folder the playlist still names must survive case {sequence_contents:?}"
+            );
+        }
     }
 }

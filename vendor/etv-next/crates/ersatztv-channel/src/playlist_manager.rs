@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use ersatztv_channel::error::ChannelError;
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, SEQUENCE_FILE_NAME, is_run_folder_name,
+    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, SEQUENCE_FILE_NAME, SequenceState,
+    is_run_folder_name, read_sequence_state,
 };
 use ffpipeline::pipeline::PtsOffset;
 use ffpipeline::web_vtt::{Cue, format_vtt_ts};
@@ -117,23 +118,10 @@ pub struct PlaylistManager {
     last_progress: OffsetDateTime,
 }
 
-/// The sequence counters a session carries across worker restarts, persisted to
-/// [`SEQUENCE_FILE_NAME`] in the output folder.
-///
-/// Both fields name what the *next* segment must be numbered, not what the last
-/// one was, so seeding a fresh [`PlaylistManager`] is a plain assignment with no
-/// off-by-one to get wrong at the call site.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct SequenceState {
-    /// `EXT-X-MEDIA-SEQUENCE` the next segment produced on this session takes.
-    /// Strictly above every sequence number already published, so a client that
-    /// discards anything at or below what it has already consumed still accepts
-    /// the first segment of the new worker.
-    next_media_sequence: u64,
-    /// `EXT-X-DISCONTINUITY-SEQUENCE` in force once the segments held now have
-    /// all been trimmed away.
-    next_discontinuity_sequence: u64,
-}
+// [`SequenceState`] and [`read_sequence_state`] now live in `ersatztv-core`
+// — see that crate's doc on `SequenceState` for why: the periodic reap sweep,
+// on the server side of the worker/server boundary, needs to read the same
+// on-disk shape this module writes.
 
 #[derive(Clone)]
 struct Segment {
@@ -510,7 +498,22 @@ impl PlaylistManager {
     /// this session's numbering, and a successor that reused any of those
     /// numbers for different content would be offering a client segments it has
     /// grounds to discard.
+    ///
+    /// `run_folders` names every run folder this deque currently holds a
+    /// segment in — sorted and deduplicated, one entry per distinct folder,
+    /// not one per segment. This is the reap sweep's real retention
+    /// authority (etv-station-262.1): the deque, not the ten-segment window
+    /// `generate_playlist` serves.
     fn sequence_state(&self) -> SequenceState {
+        let mut run_folders: Vec<String> = self
+            .segments
+            .iter()
+            .filter_map(|s| s.path.split('/').next())
+            .map(str::to_owned)
+            .collect();
+        run_folders.sort();
+        run_folders.dedup();
+
         SequenceState {
             next_media_sequence: self.media_sequence + self.segments.len() as u64,
             next_discontinuity_sequence: self.discontinuity_sequence
@@ -519,6 +522,7 @@ impl PlaylistManager {
                     .iter()
                     .filter(|s| self.discontinuity_before.contains(&s.path))
                     .count() as u64,
+            run_folders,
         }
     }
 
@@ -651,34 +655,6 @@ impl PlaylistManager {
         }
 
         Ok(result)
-    }
-}
-
-/// Read a session's persisted sequence counters, or [`SequenceState::default`]
-/// when there are none to read.
-///
-/// Every failure route lands on the default deliberately. A missing file is the
-/// ordinary first-run case; a truncated or malformed one is a file that was
-/// being written when the process died. Neither is worth refusing to start a
-/// channel over — the cost of falling back is that one already-tuned client
-/// freezes until it re-tunes, which is exactly what happened before any of this
-/// was persisted, and the cost of propagating the error is a channel that will
-/// not start at all.
-async fn read_sequence_state(path: &Path) -> SequenceState {
-    let Ok(contents) = tokio::fs::read_to_string(path).await else {
-        return SequenceState::default();
-    };
-    match serde_json::from_str(&contents) {
-        Ok(state) => state,
-        Err(e) => {
-            log::warn!(
-                "ignoring unreadable sequence file {}: {e}; this session's segment numbering \
-                 restarts from zero and any client already tuned to it will freeze until it \
-                 re-tunes",
-                path.display()
-            );
-            SequenceState::default()
-        }
     }
 }
 
@@ -1262,6 +1238,7 @@ mod tests {
             serde_json::to_string(&SequenceState {
                 next_media_sequence: 150,
                 next_discontinuity_sequence: 0,
+                ..Default::default()
             })
             .unwrap(),
         )
@@ -1312,6 +1289,7 @@ mod tests {
             serde_json::to_string(&SequenceState {
                 next_media_sequence: 150,
                 next_discontinuity_sequence: 0,
+                ..Default::default()
             })
             .unwrap(),
         )
@@ -1357,6 +1335,7 @@ mod tests {
             serde_json::to_string(&SequenceState {
                 next_media_sequence: 6,
                 next_discontinuity_sequence: 0,
+                ..Default::default()
             })
             .unwrap(),
         )

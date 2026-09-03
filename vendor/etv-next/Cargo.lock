@@ -693,6 +693,8 @@ dependencies = [
 name = "ersatztv-core"
 version = "0.1.0"
 dependencies = [
+ "log",
+ "serde",
  "serde_json",
  "simple-expand-tilde",
  "tempfile",
