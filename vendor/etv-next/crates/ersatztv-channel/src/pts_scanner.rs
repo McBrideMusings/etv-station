@@ -1,7 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
 use tokio::process::Command;
 
@@ -10,13 +9,19 @@ pub struct PtsTime {
 }
 
 pub struct PtsScanner {
-    output_folder: PathBuf,
+    segment_folder: PathBuf,
 }
 
 impl PtsScanner {
-    pub fn new(channel_config: &ChannelConfig) -> PtsScanner {
+    /// Scans `segment_folder` — a worker run's own segment subfolder, not the
+    /// channel's output folder — for the newest `.ts` file, to continue PTS
+    /// numbering within a run. A fresh run folder is empty on the first
+    /// transcode of a run, which is exactly the state a resumed session needs:
+    /// there is nothing from a previous run to continue from, because that
+    /// previous run's segments live in its own, different folder.
+    pub fn new(segment_folder: &Path) -> PtsScanner {
         PtsScanner {
-            output_folder: channel_config.expanded_output_folder().to_owned(),
+            segment_folder: segment_folder.to_owned(),
         }
     }
 
@@ -25,9 +30,9 @@ impl PtsScanner {
             duration: Duration::ZERO,
         };
 
-        // find last segment file in output folder
+        // find last segment file in this run's segment folder
         let mut entries = Vec::new();
-        let mut dir = tokio::fs::read_dir(&self.output_folder).await?;
+        let mut dir = tokio::fs::read_dir(&self.segment_folder).await?;
         while let Ok(Some(entry)) = dir.next_entry().await {
             if entry
                 .path()

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::HttpBody as _;
 use axum::extract::{ConnectInfo, Path, State};
@@ -143,6 +143,51 @@ async fn run() -> Result<(), LineupError> {
                 health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
                 device_id: lineup_config.server.device_id.clone(),
             });
+
+            // Per-run segment folders (etv-station-262) mean a channel's exit-time
+            // cleanup only ever sees the run that JUST exited — a viewer usually
+            // detaches AFTER that point, so a dead run whose viewer left later has
+            // nothing tied to a spawn or an exit that would ever collect it. This
+            // sweep is that collector: it periodically reaps every channel's run
+            // folders down to the live run plus every run folder the channel's
+            // current live.m3u8/live_sub.m3u8 still names (etv-station-262.1),
+            // catching exactly the run folders the exit-time reap in
+            // `channel_session::spawn` could not see yet. The one-time
+            // `empty_folder` above stays as it is — a cold start with no viewers
+            // has nothing this sweep would improve on.
+            //
+            // Per channel, `channel_session::reap_channel_run_folders` holds
+            // `state.active`'s lock across the whole decide-then-reap step
+            // (etv-station-262.1) — the same lock `session_middleware` and the
+            // ready-wait spawn path hold across `ChannelSession::spawn` — so a
+            // worker spawning for that channel and this sweep reaping it can
+            // never interleave: a run folder can only come into existence
+            // before this sweep reads `active` (where the entry is then
+            // visible, and `keep_newest` is `true`) or after the reap has
+            // returned (there is nothing yet for it to have removed).
+            {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        for channel in &state.channels {
+                            let number = channel.number();
+                            if let Err(err) = crate::channel_session::reap_channel_run_folders(
+                                number,
+                                channel.output_folder(),
+                                &state.active,
+                            )
+                            .await
+                            {
+                                log::warn!(
+                                    "failed to reap run folders for channel {number}: {err}"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
 
             let addr = format!(
                 "{}:{}",

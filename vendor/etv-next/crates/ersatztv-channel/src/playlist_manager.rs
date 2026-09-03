@@ -4,11 +4,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_channel::error::ChannelError;
-use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, SEQUENCE_FILE_NAME};
+use ersatztv_core::{
+    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, SEQUENCE_FILE_NAME, SequenceState,
+    is_run_folder_name, read_sequence_state,
+};
 use ffpipeline::pipeline::PtsOffset;
 use ffpipeline::web_vtt::{Cue, format_vtt_ts};
 use time::OffsetDateTime;
+use time::format_description::FormatItem;
 use time::macros::format_description;
+
+/// The `#EXT-X-PROGRAM-DATE-TIME` timestamp format written by
+/// [`PlaylistManager::generate_playlist`] and parsed back by
+/// [`adopt_segments`] when a new worker's playlist seeds itself from the
+/// previous run's still-published `live.m3u8`. Shared as one `const` so the
+/// writer and the reader can never drift apart.
+const PROGRAM_DATE_TIME_FORMAT: &[FormatItem<'static>] = format_description!(
+    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
+);
 
 // 3 segments is the commonly cited floor for a live HLS playlist (e.g. AWS's
 // Kinesis Video Streams HLS docs state a live media playlist should carry a
@@ -61,7 +74,20 @@ pub struct SubtitleSource {
 
 #[derive(Clone)]
 pub struct PlaylistManager {
+    /// Channel root: where the generated playlists (`live.m3u8`,
+    /// `live_sub.m3u8`), `.heartbeat`, and [`SEQUENCE_FILE_NAME`] live.
+    /// `write_atomically`'s `folder` argument must be the same folder its
+    /// destination lives in, so calls writing one of *those* files pass
+    /// `output_folder` — calls writing into the run folder (the regenerated
+    /// ffmpeg playlist, each segment's `.vtt` sidecar) pass `segment_folder`
+    /// instead.
     output_folder: PathBuf,
+    /// This run's own segment subfolder of `output_folder`, where `.ts`
+    /// segments and their `.vtt` sidecars are scanned for and trimmed.
+    segment_folder: PathBuf,
+    /// `segment_folder`'s own name, prefixed onto every segment path this
+    /// manager emits so a playlist line reads `<run>/live000000.ts`.
+    run_folder_name: String,
     ready_file: PathBuf,
     heartbeat_file: PathBuf,
     sequence_file: PathBuf,
@@ -92,23 +118,10 @@ pub struct PlaylistManager {
     last_progress: OffsetDateTime,
 }
 
-/// The sequence counters a session carries across worker restarts, persisted to
-/// [`SEQUENCE_FILE_NAME`] in the output folder.
-///
-/// Both fields name what the *next* segment must be numbered, not what the last
-/// one was, so seeding a fresh [`PlaylistManager`] is a plain assignment with no
-/// off-by-one to get wrong at the call site.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct SequenceState {
-    /// `EXT-X-MEDIA-SEQUENCE` the next segment produced on this session takes.
-    /// Strictly above every sequence number already published, so a client that
-    /// discards anything at or below what it has already consumed still accepts
-    /// the first segment of the new worker.
-    next_media_sequence: u64,
-    /// `EXT-X-DISCONTINUITY-SEQUENCE` in force once the segments held now have
-    /// all been trimmed away.
-    next_discontinuity_sequence: u64,
-}
+// [`SequenceState`] and [`read_sequence_state`] now live in `ersatztv-core`
+// — see that crate's doc on `SequenceState` for why: the periodic reap sweep,
+// on the server side of the worker/server boundary, needs to read the same
+// on-disk shape this module writes.
 
 #[derive(Clone)]
 struct Segment {
@@ -136,6 +149,8 @@ impl PlaylistManager {
         channel_start_time: OffsetDateTime,
         target_duration: u32,
         output_folder: PathBuf,
+        segment_folder: PathBuf,
+        run_folder_name: String,
         ready_file: PathBuf,
         output_files: PlaylistManagerOutputFiles,
     ) -> PlaylistManager {
@@ -144,8 +159,50 @@ impl PlaylistManager {
 
         let resumed = read_sequence_state(&sequence_file).await;
 
+        // Seed this run's playlist from whatever the previous run's `live.m3u8`
+        // still names — see `adopt_segments`. This is what keeps the playlist a
+        // still-tuned client is polling continuous across the respawn instead
+        // of dropping the segments it was mid-playback on the instant this
+        // worker's own `update()` runs (etv-station-262).
+        let adopted = adopt_segments(
+            Path::new(&output_files.generated_playlist_file),
+            &output_folder,
+        )
+        .await;
+
+        // The playlist must never advertise a shorter target duration than any
+        // segment it actually holds — the same clamp `update` applies to a
+        // freshly-produced segment applies here to an adopted one.
+        let mut target_duration = target_duration;
+        for segment in &adopted {
+            if segment.duration > target_duration as f64 {
+                target_duration = segment.duration.ceil() as u32;
+            }
+        }
+
+        // The wall-clock end of the adopted tail, if there is one — the point
+        // this run's own segments continue from, not the channel start time.
+        let last_segment_end = adopted
+            .back()
+            .map(|s| s.program_date_time + Duration::from_secs_f64(s.duration))
+            .unwrap_or(channel_start_time);
+
+        // `resumed.next_media_sequence` names the sequence the *next new*
+        // segment would take, not `adopted[0]` — that segment was already
+        // published `adopted.len()` numbers earlier by the previous run.
+        // Advertising it again under a higher number tells a still-tuned
+        // client the bytes it already has are new content. `saturating_sub`
+        // rather than `-`: a `.sequence` file that disagrees with the
+        // playlist on disk (hand-edited, truncated, or from an older build)
+        // must not panic a worker at startup — it degrades to 0 instead.
+        let first_media_sequence = resumed
+            .next_media_sequence
+            .saturating_sub(adopted.len() as u64);
+
         PlaylistManager {
             output_folder,
+            segment_folder,
+            run_folder_name,
             ready_file,
             heartbeat_file,
             sequence_file,
@@ -154,10 +211,10 @@ impl PlaylistManager {
             generated_subtitle_playlist_file: output_files.generated_subtitle_playlist_file,
             ready: false,
 
-            segments: VecDeque::new(),
+            segments: adopted,
             discontinuity_before: HashSet::new(),
-            media_sequence: resumed.next_media_sequence,
-            last_served_media_sequence: resumed.next_media_sequence,
+            media_sequence: first_media_sequence,
+            last_served_media_sequence: first_media_sequence,
             discontinuity_sequence: resumed.next_discontinuity_sequence,
             target_duration,
             target_duration_f64: target_duration as f64,
@@ -166,10 +223,12 @@ impl PlaylistManager {
             // new codec parameters — so it needs an EXT-X-DISCONTINUITY ahead of
             // it. Continuing the sequence numbering without that tag would tell
             // the client the two spliced cleanly, which is the one claim a
-            // restart cannot make.
+            // restart cannot make. It now lands exactly between the adopted
+            // segments (if any) and this run's own first one, which really is
+            // a new encoder run.
             pending_discontinuity: resumed != SequenceState::default(),
-            last_segment_end: channel_start_time,
-            current_session_start: channel_start_time,
+            last_segment_end,
+            current_session_start: last_segment_end,
 
             pts_offset: None,
             subtitle_source: None,
@@ -222,11 +281,25 @@ impl PlaylistManager {
 
         self.last_progress = OffsetDateTime::now_utc();
 
-        // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
+        // overwrite ffmpeg's playlist with a generated playlist containing
+        // this run's own segments only — never a segment adopted from a
+        // previous run (own_run_only: true), since both runs number from
+        // live000000.ts and an adopted entry would collide by basename with
+        // this run's own in get_new_segment_durations' map, corrupting
+        // ffmpeg's continuation numbering. ffmpeg.m3u8 lives inside the run
+        // folder alongside the segments themselves (`-hls_flags append_list`
+        // reads it back to continue numbering), and ffmpeg always writes bare
+        // basenames when a segment shares its playlist's directory — so this
+        // must regenerate it in that same bare-basename form, not the
+        // run-prefixed URI the client-facing playlists below carry.
         if Path::new(&self.generated_playlist_file).exists() {
-            let generated_playlist = self.generate_playlist(|s| s.to_owned(), None)?;
+            let generated_playlist = self.generate_playlist(
+                |s| s.rsplit('/').next().unwrap_or(s).to_owned(),
+                None,
+                true,
+            )?;
             write_atomically(
-                &self.output_folder,
+                &self.segment_folder,
                 &self.ffmpeg_playlist_file,
                 generated_playlist,
             )
@@ -237,19 +310,22 @@ impl PlaylistManager {
     }
 
     pub async fn update(&mut self) -> Result<(), ChannelError> {
-        // scan for segments on disk
+        // scan for segments on disk, inside this run's own segment folder
         let mut new_segment_files: VecDeque<String> = VecDeque::new();
-        let mut entries = tokio::fs::read_dir(&self.output_folder).await?;
+        let mut entries = tokio::fs::read_dir(&self.segment_folder).await?;
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Some(file_name) = entry.file_name().to_str()
                 && file_name.ends_with(".ts")
-                && !self.segments.iter().any(|s| s.path == file_name)
             {
-                new_segment_files.push_back(file_name.to_owned());
+                let uri = format!("{}/{file_name}", self.run_folder_name);
+                if !self.segments.iter().any(|s| s.path == uri) {
+                    new_segment_files.push_back(file_name.to_owned());
+                }
             }
         }
 
-        // get all segment durations from extinf tags in ffmpeg playlist
+        // get all segment durations from extinf tags in ffmpeg playlist,
+        // keyed by basename — see get_new_segment_durations for why
         let new_segment_durations: HashMap<String, f64> = self.get_new_segment_durations().await?;
 
         // filter out segments without a known duration
@@ -261,10 +337,13 @@ impl PlaylistManager {
         }
         sorted_new_segments.sort();
 
-        // add new segments
+        // add new segments, as run-relative URIs (`<run>/live000000.ts`) so
+        // the client-facing playlists point into this run's own folder
         for file in sorted_new_segments {
+            let uri = format!("{}/{file}", self.run_folder_name);
+
             if self.pending_discontinuity {
-                self.discontinuity_before.insert(file.to_owned());
+                self.discontinuity_before.insert(uri.clone());
                 self.pending_discontinuity = false;
             }
 
@@ -280,7 +359,7 @@ impl PlaylistManager {
             let program_date_time = self.last_segment_end;
 
             self.segments.push_back(Segment {
-                path: file.clone(),
+                path: uri.clone(),
                 program_date_time,
                 duration,
             });
@@ -288,7 +367,7 @@ impl PlaylistManager {
             self.last_segment_end += Duration::from_secs_f64(duration);
             self.last_progress = OffsetDateTime::now_utc();
 
-            let vtt_path = format!("{}.vtt", file.strip_suffix(".ts").unwrap_or(&file));
+            let vtt_path = format!("{}.vtt", uri.strip_suffix(".ts").unwrap_or(&uri));
             let vtt_full = self.output_folder.join(&vtt_path);
             let mpegts_90khz = (((self.pts_offset.unwrap_or_default().duration.as_secs_f64()
                 + (program_date_time - self.current_session_start).as_seconds_f64())
@@ -310,7 +389,7 @@ impl PlaylistManager {
                     mpegts_90khz
                 ),
             };
-            write_atomically(&self.output_folder, &vtt_full, body).await?;
+            write_atomically(&self.segment_folder, &vtt_full, body).await?;
         }
 
         // trim old segments
@@ -337,7 +416,7 @@ impl PlaylistManager {
         }
 
         // generate and atomically save playlist
-        let generated_playlist = self.generate_playlist(|s| s.to_owned(), Some(10))?;
+        let generated_playlist = self.generate_playlist(|s| s.to_owned(), Some(10), false)?;
         write_atomically(
             &self.output_folder,
             &self.generated_playlist_file,
@@ -350,6 +429,7 @@ impl PlaylistManager {
             let generated_subtitle_playlist = self.generate_playlist(
                 |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
                 Some(10),
+                false,
             )?;
             write_atomically(
                 &self.output_folder,
@@ -418,7 +498,22 @@ impl PlaylistManager {
     /// this session's numbering, and a successor that reused any of those
     /// numbers for different content would be offering a client segments it has
     /// grounds to discard.
+    ///
+    /// `run_folders` names every run folder this deque currently holds a
+    /// segment in — sorted and deduplicated, one entry per distinct folder,
+    /// not one per segment. This is the reap sweep's real retention
+    /// authority (etv-station-262.1): the deque, not the ten-segment window
+    /// `generate_playlist` serves.
     fn sequence_state(&self) -> SequenceState {
+        let mut run_folders: Vec<String> = self
+            .segments
+            .iter()
+            .filter_map(|s| s.path.split('/').next())
+            .map(str::to_owned)
+            .collect();
+        run_folders.sort();
+        run_folders.dedup();
+
         SequenceState {
             next_media_sequence: self.media_sequence + self.segments.len() as u64,
             next_discontinuity_sequence: self.discontinuity_sequence
@@ -427,6 +522,7 @@ impl PlaylistManager {
                     .iter()
                     .filter(|s| self.discontinuity_before.contains(&s.path))
                     .count() as u64,
+            run_folders,
         }
     }
 
@@ -441,7 +537,27 @@ impl PlaylistManager {
         &mut self,
         path_map: fn(&str) -> String,
         max_segments: Option<usize>,
+        own_run_only: bool,
     ) -> Result<String, ChannelError> {
+        // ffmpeg's own playlist (`before_new_pipeline`'s call, `own_run_only:
+        // true`) must never carry a segment adopted from a previous run: both
+        // runs number their segments from `live000000.ts`, and ffmpeg reads
+        // this file back via `-hls_flags append_list` while
+        // `get_new_segment_durations` keys it by bare basename — an adopted
+        // old-run segment sharing a basename with a new one would collide in
+        // that map and corrupt ffmpeg's continuation numbering. The two
+        // client-facing generations in `update` pass `false` and keep listing
+        // every segment held, adopted or not.
+        let run_prefix = format!("{}/", self.run_folder_name);
+        let owned: Vec<&Segment> = if own_run_only {
+            self.segments
+                .iter()
+                .filter(|s| s.path.starts_with(run_prefix.as_str()))
+                .collect()
+        } else {
+            self.segments.iter().collect()
+        };
+
         let mut playlist = String::new();
         playlist.push_str("#EXTM3U\n");
         playlist.push_str("#EXT-X-VERSION:7\n");
@@ -454,7 +570,7 @@ impl PlaylistManager {
                 // cannot select this window — every held segment is newer than
                 // any such cutoff, and the window would pin itself to the
                 // oldest of a growing backlog.
-                let candidate_skip = self.segments.len().saturating_sub(max);
+                let candidate_skip = owned.len().saturating_sub(max);
 
                 // monotonic clamp
                 let candidate_ms = self.media_sequence + candidate_skip as u64;
@@ -462,15 +578,14 @@ impl PlaylistManager {
                 self.last_served_media_sequence = clamped_ms;
 
                 let skip = (clamped_ms - self.media_sequence) as usize;
-                let skip = skip.min(self.segments.len());
+                let skip = skip.min(owned.len());
                 (skip, max)
             }
-            None => (0, self.segments.len()),
+            None => (0, owned.len()),
         };
         let effective_media_sequence = self.media_sequence + skip as u64;
         let effective_discontinuity_sequence = self.discontinuity_sequence
-            + self
-                .segments
+            + owned
                 .iter()
                 .take(skip)
                 .filter(|s| self.discontinuity_before.contains(&s.path))
@@ -488,18 +603,14 @@ impl PlaylistManager {
         }
         playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
-        let format = format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
-        );
-
-        for segment in self.segments.iter().skip(skip).take(limit) {
+        for segment in owned.iter().skip(skip).take(limit) {
             if self.discontinuity_before.contains(&segment.path) {
                 playlist.push_str("#EXT-X-DISCONTINUITY\n");
             }
             playlist.push_str(&format!("#EXTINF:{:.6},\n", segment.duration));
             playlist.push_str(&format!(
                 "#EXT-X-PROGRAM-DATE-TIME:{}\n",
-                segment.program_date_time.format(format)?
+                segment.program_date_time.format(PROGRAM_DATE_TIME_FORMAT)?
             ));
             playlist.push_str(&format!("{}\n", path_map(&segment.path)));
         }
@@ -507,6 +618,17 @@ impl PlaylistManager {
         Ok(playlist)
     }
 
+    /// Duration for each segment named in `ffmpeg.m3u8`, keyed by the segment's
+    /// bare basename.
+    ///
+    /// Keying on the basename — not the raw line — matters because two
+    /// different things write this same file across a session: ffmpeg itself
+    /// appends bare basenames (`live000000.ts`) as it produces segments, since
+    /// the playlist and its segments share the run folder, but
+    /// [`Self::before_new_pipeline`] periodically overwrites it wholesale with
+    /// a generated playlist — which, by design, also carries bare basenames,
+    /// but a mismatch either way would silently drop every segment: `update`
+    /// filters out any segment file whose name is not a key in this map.
     async fn get_new_segment_durations(&self) -> Result<HashMap<String, f64>, ChannelError> {
         let mut result: HashMap<String, f64> = HashMap::new();
 
@@ -520,7 +642,7 @@ impl PlaylistManager {
                     && i + 2 < lines.len()
                     && lines[i + 2].ends_with(".ts")
                 {
-                    let segment_name = lines[i + 2];
+                    let segment_name = lines[i + 2].rsplit('/').next().unwrap_or(lines[i + 2]);
                     let inf_split: Vec<&str> =
                         lines[i].split(':').map(|s| s.trim_matches(',')).collect();
                     if let Ok(duration) = inf_split[1].parse::<f64>() {
@@ -536,32 +658,77 @@ impl PlaylistManager {
     }
 }
 
-/// Read a session's persisted sequence counters, or [`SequenceState::default`]
-/// when there are none to read.
+/// Seed a fresh session's segment deque from the previous run's still-published
+/// `live.m3u8` at `channel_root`, if there is one.
 ///
-/// Every failure route lands on the default deliberately. A missing file is the
-/// ordinary first-run case; a truncated or malformed one is a file that was
-/// being written when the process died. Neither is worth refusing to start a
-/// channel over — the cost of falling back is that one already-tuned client
-/// freezes until it re-tunes, which is exactly what happened before any of this
-/// was persisted, and the cost of propagating the error is a channel that will
-/// not start at all.
-async fn read_sequence_state(path: &Path) -> SequenceState {
-    let Ok(contents) = tokio::fs::read_to_string(path).await else {
-        return SequenceState::default();
+/// This is what keeps a respawn's first playlist naming the segments a
+/// still-tuned client was mid-playback on, instead of the new
+/// [`PlaylistManager`] starting from an empty deque and leaving that client
+/// polling a run folder nothing references any more (etv-station-262). Every
+/// failure route — no file, an empty file, a line that doesn't parse — lands
+/// on an empty deque and never errors, the same rule [`read_sequence_state`]
+/// follows for `.sequence`: a session that cannot be adopted is a genuinely
+/// new one, not a reason to refuse to start.
+///
+/// Walks the exact 3-line block [`PlaylistManager::generate_playlist`] emits
+/// per segment (`#EXTINF`, `#EXT-X-PROGRAM-DATE-TIME`, then the segment URI)
+/// in playlist order. An entry is adopted only when its leading path
+/// component is shaped like a real run folder
+/// ([`is_run_folder_name`]) and its file still exists on disk — a folder the
+/// sweep already collected must never be re-advertised.
+async fn adopt_segments(playlist_path: &Path, channel_root: &Path) -> VecDeque<Segment> {
+    let mut adopted = VecDeque::new();
+
+    let Ok(contents) = tokio::fs::read_to_string(playlist_path).await else {
+        return adopted;
     };
-    match serde_json::from_str(&contents) {
-        Ok(state) => state,
-        Err(e) => {
-            log::warn!(
-                "ignoring unreadable sequence file {}: {e}; this session's segment numbering \
-                 restarts from zero and any client already tuned to it will freeze until it \
-                 re-tunes",
-                path.display()
-            );
-            SequenceState::default()
+
+    let lines: Vec<&str> = contents.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(duration_str) = lines[i].strip_prefix("#EXTINF:") else {
+            i += 1;
+            continue;
+        };
+        if i + 2 >= lines.len() {
+            break;
         }
+        let Some(pdt_str) = lines[i + 1].strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") else {
+            i += 1;
+            continue;
+        };
+        let uri = lines[i + 2].trim();
+        i += 3;
+
+        let Ok(duration) = duration_str.trim().trim_end_matches(',').parse::<f64>() else {
+            continue;
+        };
+        let Ok(program_date_time) = OffsetDateTime::parse(pdt_str.trim(), PROGRAM_DATE_TIME_FORMAT)
+        else {
+            continue;
+        };
+
+        let run = uri.split('/').next().unwrap_or("");
+        if !is_run_folder_name(run) {
+            continue;
+        }
+
+        let exists = tokio::fs::metadata(channel_root.join(uri))
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+
+        adopted.push_back(Segment {
+            path: uri.to_owned(),
+            duration,
+            program_date_time,
+        });
     }
+
+    adopted
 }
 
 /// Write `contents` to `destination` in a single step no reader can catch
@@ -658,18 +825,31 @@ mod tests {
     /// A manager whose newest segment ends at `last_segment_end`. Passing that as
     /// the channel start time is how a session that has never produced a segment
     /// looks too — the field only ever advances when one is added.
+    ///
+    /// `dir` plays the channel root; every manager built here gets the same
+    /// run folder name, which is fine — these tests build at most one manager
+    /// alive at a time per directory, so nothing collides.
     async fn manager(dir: &Path, last_segment_end: OffsetDateTime) -> PlaylistManager {
         let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let run_folder_name = "r0000000000000-0000".to_owned();
+        let segment_folder = dir.join(&run_folder_name);
+        tokio::fs::create_dir_all(&segment_folder).await.unwrap();
+        let ffmpeg_playlist_file = segment_folder
+            .join("ffmpeg.m3u8")
+            .to_string_lossy()
+            .into_owned();
 
         PlaylistManager::new(
             last_segment_end,
             SEGMENT_SECONDS,
             dir.to_path_buf(),
+            segment_folder,
+            run_folder_name,
             dir.join(".ready"),
             PlaylistManagerOutputFiles {
                 generated_playlist_file: file("live.m3u8"),
                 generated_subtitle_playlist_file: Some(file("live_sub.m3u8")),
-                ffmpeg_playlist_file: file("ffmpeg.m3u8"),
+                ffmpeg_playlist_file,
             },
         )
         .await
@@ -772,12 +952,14 @@ mod tests {
     }
 
     /// Give `pm` `count` segments, as `update` would once ffmpeg had written
-    /// them, without needing ffmpeg to have written anything.
+    /// them, without needing ffmpeg to have written anything. Paths come out
+    /// run-relative, exactly as `update` produces them, so a test can assert
+    /// on the real URI shape a client is served.
     fn push_segments(pm: &mut PlaylistManager, count: usize) {
         for i in 0..count {
             let program_date_time = pm.last_segment_end;
             pm.segments.push_back(Segment {
-                path: format!("live{i:06}.ts"),
+                path: format!("{}/live{i:06}.ts", pm.run_folder_name),
                 duration: pm.target_duration_f64,
                 program_date_time,
             });
@@ -797,6 +979,10 @@ mod tests {
             !pm.pending_discontinuity,
             "nothing precedes the first segment of a new session, so there is \
              nothing for it to be discontinuous with"
+        );
+        assert!(
+            pm.segments.is_empty(),
+            "no live.m3u8 at the channel root means nothing to adopt, not an error"
         );
     }
 
@@ -838,7 +1024,7 @@ mod tests {
         first.discontinuity_sequence = 2;
         first
             .discontinuity_before
-            .insert("live000002.ts".to_owned());
+            .insert(format!("{}/live000002.ts", first.run_folder_name));
         first.update().await.unwrap();
 
         // Two already trimmed past, one still held ahead of a live segment.
@@ -923,13 +1109,406 @@ mod tests {
             .parse()
             .unwrap();
 
+        let run = &pm.run_folder_name;
         assert_eq!(listed.len(), 10);
         assert_eq!(
             listed.last().copied(),
-            Some("live000024.ts"),
+            Some(format!("{run}/live000024.ts")).as_deref(),
             "the window must end on the newest segment held, not the tenth"
         );
-        assert_eq!(listed.first().copied(), Some("live000015.ts"));
+        assert_eq!(
+            listed.first().copied(),
+            Some(format!("{run}/live000015.ts")).as_deref()
+        );
         assert_eq!(published, 15);
+    }
+
+    /// The direct assertion for `etv-station-262`: segments a manager scans
+    /// off disk get a run-relative URI, and the playlists naming them still
+    /// land at the channel root — not inside the run folder.
+    #[tokio::test]
+    async fn segments_get_run_relative_uris_and_playlists_land_at_the_channel_root() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        let run = pm.run_folder_name.clone();
+        let segment_folder = dir.path().join(&run);
+
+        tokio::fs::write(segment_folder.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        // Shape matches what get_new_segment_durations expects: an EXTINF
+        // line, a PROGRAM-DATE-TIME line, then the bare segment basename —
+        // the same three-line block generate_playlist emits, and the shape
+        // ffmpeg's own playlist takes too.
+        tokio::fs::write(
+            segment_folder.join("ffmpeg.m3u8"),
+            "#EXTM3U\n#EXTINF:6.000000,\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.000+00:00\nlive000000.ts\n",
+        )
+        .await
+        .unwrap();
+
+        pm.update().await.unwrap();
+
+        assert!(
+            dir.path().join("live.m3u8").exists(),
+            "the generated playlist must be written at the channel root, not the run folder"
+        );
+        let playlist = tokio::fs::read_to_string(dir.path().join("live.m3u8"))
+            .await
+            .unwrap();
+        assert!(
+            playlist
+                .lines()
+                .any(|l| l == format!("{run}/live000000.ts")),
+            "the playlist line must point into the run folder: {playlist}"
+        );
+    }
+
+    /// Write a `live.m3u8` at `dir`'s root naming exactly one segment, in the
+    /// same 3-line-per-segment shape [`PlaylistManager::generate_playlist`]
+    /// emits — what a respawning [`PlaylistManager`] reads back on startup.
+    async fn write_prior_playlist(dir: &Path, run: &str, path: &str, pdt: OffsetDateTime) {
+        tokio::fs::write(
+            dir.join("live.m3u8"),
+            format!(
+                "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n\
+                 #EXT-X-MEDIA-SEQUENCE:5\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+                 #EXTINF:4.000000,\n#EXT-X-PROGRAM-DATE-TIME:{}\n{run}/{path}\n",
+                pdt.format(PROGRAM_DATE_TIME_FORMAT).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Write a `live.m3u8` at `dir`'s root naming `count` segments, each with a
+    /// file present in `run`'s folder so [`adopt_segments`] actually adopts it
+    /// (it skips any entry whose `.ts` file is missing on disk). PDTs step by
+    /// the segment duration starting at `first_pdt`, matching the shape
+    /// [`push_segments`] produces.
+    async fn write_prior_playlist_n(
+        dir: &Path,
+        run: &str,
+        count: usize,
+        first_pdt: OffsetDateTime,
+    ) {
+        let run_folder = dir.join(run);
+        tokio::fs::create_dir_all(&run_folder).await.unwrap();
+
+        let mut body = String::from(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n",
+        );
+        for i in 0..count {
+            let path = format!("live{i:06}.ts");
+            tokio::fs::write(run_folder.join(&path), b"segment")
+                .await
+                .unwrap();
+            let pdt = first_pdt + Duration::from_secs_f64(4.0 * i as f64);
+            body.push_str(&format!(
+                "#EXTINF:4.000000,\n#EXT-X-PROGRAM-DATE-TIME:{}\n{run}/{path}\n",
+                pdt.format(PROGRAM_DATE_TIME_FORMAT).unwrap(),
+            ));
+        }
+
+        tokio::fs::write(dir.join("live.m3u8"), body).await.unwrap();
+    }
+
+    /// The defect this guards (`etv-station-262.1`): before this fix,
+    /// `media_sequence` was seeded from `resumed.next_media_sequence` even
+    /// though `segments[0]` is the *oldest* adopted segment — published
+    /// `adopted.len()` numbers earlier by the previous run. Every adopted
+    /// segment was re-advertised too high, so a still-tuned client saw its
+    /// own already-consumed content reappear as new media.
+    #[tokio::test]
+    async fn adopted_segments_keep_the_media_sequence_the_prior_run_already_published() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let prior_run = "r0000000000000-9999";
+        // A few seconds old, well inside the two-minute trim window, so
+        // `update()` neither drops them nor reorders this assertion.
+        let first_pdt = OffsetDateTime::now_utc() - time::Duration::seconds(4);
+        write_prior_playlist_n(dir.path(), prior_run, 10, first_pdt).await;
+
+        tokio::fs::write(
+            dir.path().join(SEQUENCE_FILE_NAME),
+            serde_json::to_string(&SequenceState {
+                next_media_sequence: 150,
+                next_discontinuity_sequence: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        // The oldest adopted segment was published at 150 - 10 = 140 by the
+        // previous run, not 150 — 150 is the number the *next new* segment
+        // gets.
+        assert_eq!(pm.media_sequence, 140);
+        assert_eq!(pm.last_served_media_sequence, 140);
+
+        pm.update().await.unwrap();
+
+        let playlist = tokio::fs::read_to_string(dir.path().join("live.m3u8"))
+            .await
+            .unwrap();
+        assert!(
+            playlist.contains("#EXT-X-MEDIA-SEQUENCE:140\n"),
+            "the published header must still name 140, the number the client was already \
+             given for these bytes: {playlist}"
+        );
+        assert!(
+            playlist
+                .lines()
+                .any(|l| l == format!("{prior_run}/live000000.ts")),
+            "the first adopted segment, at the sequence the previous run actually published \
+             it under, must still be listed: {playlist}"
+        );
+
+        // Round-tripping through `sequence_state()` must not inflate the
+        // counter again: 140 held + 10 still held = 150, exactly what the
+        // previous run persisted, not 160.
+        assert_eq!(pm.sequence_state().next_media_sequence, 150);
+    }
+
+    /// With nothing adopted, the fix must be a no-op: the existing behaviour
+    /// (also pinned by `a_restarted_worker_numbers_above_every_segment_the_last_one_published`)
+    /// stays exactly as it was.
+    #[tokio::test]
+    async fn with_no_adopted_segments_the_seeded_sequence_is_unchanged() {
+        let dir = TempDir::new().unwrap();
+
+        tokio::fs::write(
+            dir.path().join(SEQUENCE_FILE_NAME),
+            serde_json::to_string(&SequenceState {
+                next_media_sequence: 150,
+                next_discontinuity_sequence: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert!(
+            pm.segments.is_empty(),
+            "no live.m3u8 means nothing to adopt"
+        );
+        assert_eq!(pm.media_sequence, 150);
+        assert_eq!(pm.last_served_media_sequence, 150);
+    }
+
+    /// The direct assertion for the `etv-station-262.1` respawn fix: a new
+    /// [`PlaylistManager`] seeds itself from the previous run's still-published
+    /// `live.m3u8`, so the playlist a still-tuned client polls never drops the
+    /// segments it names — it keeps naming them until the ordinary trim rolls
+    /// past them, with a discontinuity between the adopted run and this one's
+    /// own first segment.
+    #[tokio::test]
+    async fn a_respawn_adopts_the_previous_runs_still_published_segments() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let prior_run = "r0000000000000-9999";
+        let prior_folder = dir.path().join(prior_run);
+        tokio::fs::create_dir_all(&prior_folder).await.unwrap();
+        tokio::fs::write(prior_folder.join("live000005.ts"), b"segment")
+            .await
+            .unwrap();
+
+        let prior_pdt = OffsetDateTime::now_utc() - time::Duration::seconds(4);
+        write_prior_playlist(dir.path(), prior_run, "live000005.ts", prior_pdt).await;
+
+        // `.sequence` present so the resumed session sets `pending_discontinuity`
+        // — the boundary this test asserts sits between the adopted segment
+        // and this run's own first one.
+        tokio::fs::write(
+            dir.path().join(SEQUENCE_FILE_NAME),
+            serde_json::to_string(&SequenceState {
+                next_media_sequence: 6,
+                next_discontinuity_sequence: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert_eq!(pm.segments.len(), 1, "the adopted segment must be seeded");
+        assert_eq!(pm.segments[0].path, format!("{prior_run}/live000005.ts"));
+        let expected_last_segment_end = prior_pdt + Duration::from_secs_f64(4.0);
+        assert!(
+            (pm.last_segment_end - expected_last_segment_end).abs()
+                < time::Duration::milliseconds(2),
+            "last_segment_end must continue from the adopted tail's end, not restart at the \
+             channel start time: got {}, want {}",
+            pm.last_segment_end,
+            expected_last_segment_end
+        );
+
+        // This run's own first segment, produced the way `update` really
+        // produces one — on disk, with a duration ffmpeg's own playlist has
+        // published — so the ordinary scan naturally consumes
+        // `pending_discontinuity`.
+        let own_run = pm.run_folder_name.clone();
+        let own_segment_folder = dir.path().join(&own_run);
+        tokio::fs::write(own_segment_folder.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            own_segment_folder.join("ffmpeg.m3u8"),
+            "#EXTM3U\n#EXTINF:4.000000,\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.000+00:00\nlive000000.ts\n",
+        )
+        .await
+        .unwrap();
+
+        pm.update().await.unwrap();
+
+        let playlist = tokio::fs::read_to_string(dir.path().join("live.m3u8"))
+            .await
+            .unwrap();
+        let prior_idx = playlist
+            .find(&format!("{prior_run}/live000005.ts"))
+            .expect("playlist must still name the adopted segment");
+        let own_idx = playlist
+            .find(&format!("{own_run}/live000000.ts"))
+            .expect("playlist must also name this run's own segment");
+        assert!(
+            prior_idx < own_idx,
+            "adopted segment must come first: {playlist}"
+        );
+
+        let discontinuity_idx = playlist
+            .find("#EXT-X-DISCONTINUITY\n")
+            .expect("a discontinuity marker must separate the two runs");
+        assert!(
+            discontinuity_idx > prior_idx && discontinuity_idx < own_idx,
+            "the discontinuity marker must sit between the adopted segment and this run's \
+             own first one: {playlist}"
+        );
+    }
+
+    /// Adoption only defers the trim, it does not exempt it: an adopted
+    /// segment is dropped by the ordinary two-minute trim the same as any
+    /// other, and its file removed from the old run folder it still lives in.
+    #[tokio::test]
+    async fn adopted_segments_are_trimmed_and_their_files_removed_from_the_old_run_folder() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let prior_run = "r0000000000000-9999";
+        let prior_folder = dir.path().join(prior_run);
+        tokio::fs::create_dir_all(&prior_folder).await.unwrap();
+        tokio::fs::write(prior_folder.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        tokio::fs::write(prior_folder.join("live000000.vtt"), b"WEBVTT\n")
+            .await
+            .unwrap();
+
+        // Well in the past: the ordinary two-minute trim must drop it on the
+        // very first update, exactly as it would any other stale segment.
+        let prior_pdt = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        write_prior_playlist(dir.path(), prior_run, "live000000.ts", prior_pdt).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        assert_eq!(pm.segments.len(), 1, "the adopted segment must be seeded");
+
+        pm.update().await.unwrap();
+
+        assert!(
+            pm.segments.is_empty(),
+            "the adopted segment must have been trimmed"
+        );
+        assert!(
+            !prior_folder.join("live000000.ts").exists(),
+            "its file must be removed from the old run folder"
+        );
+        assert!(
+            !prior_folder.join("live000000.vtt").exists(),
+            "its subtitle sidecar must be removed too"
+        );
+    }
+
+    /// A folder round 3's sweep already collected must never be re-advertised
+    /// just because a stale playlist still names it.
+    #[tokio::test]
+    async fn an_adopted_entry_whose_file_is_missing_on_disk_is_not_adopted() {
+        let dir = TempDir::new().unwrap();
+
+        // No file written for this entry anywhere — only named in the
+        // playlist, as if its run folder had already been reaped.
+        let prior_run = "r0000000000000-9999";
+        let prior_pdt = OffsetDateTime::now_utc();
+        write_prior_playlist(dir.path(), prior_run, "live000000.ts", prior_pdt).await;
+
+        let pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+
+        assert!(
+            pm.segments.is_empty(),
+            "a segment whose file the sweep already collected must never be re-adopted"
+        );
+    }
+
+    /// The interaction the issue does not name but the fix depends on: both
+    /// runs number their own segments from `live000000.ts`, so writing an
+    /// adopted old-run segment into this run's `ffmpeg.m3u8` would collide by
+    /// basename in `get_new_segment_durations`'s map and corrupt ffmpeg's
+    /// `-hls_flags append_list` continuation numbering. `before_new_pipeline`
+    /// must regenerate that file from this run's own segments only.
+    #[tokio::test]
+    async fn before_new_pipeline_writes_only_this_runs_own_segments_to_ffmpeg_playlist() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let prior_run = "r0000000000000-9999";
+        let prior_folder = dir.path().join(prior_run);
+        tokio::fs::create_dir_all(&prior_folder).await.unwrap();
+        tokio::fs::write(prior_folder.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+
+        let prior_pdt = OffsetDateTime::now_utc() - time::Duration::seconds(4);
+        write_prior_playlist(dir.path(), prior_run, "live000000.ts", prior_pdt).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        assert_eq!(pm.segments.len(), 1, "the adopted segment must be seeded");
+
+        // before_new_pipeline only regenerates ffmpeg.m3u8 when the ffmpeg
+        // playlist file already exists, mirroring a real pipeline start.
+        let own_segment_folder = dir.path().join(&pm.run_folder_name);
+        tokio::fs::write(own_segment_folder.join("ffmpeg.m3u8"), b"#EXTM3U\n")
+            .await
+            .unwrap();
+
+        // This run's own segment, sharing a basename with the adopted one —
+        // the collision the filter exists to prevent.
+        push_segments(&mut pm, 1);
+
+        pm.before_new_pipeline(None, None).await.unwrap();
+
+        let ffmpeg_playlist = tokio::fs::read_to_string(own_segment_folder.join("ffmpeg.m3u8"))
+            .await
+            .unwrap();
+        let ts_lines: Vec<&str> = ffmpeg_playlist
+            .lines()
+            .filter(|l| l.ends_with(".ts"))
+            .collect();
+        assert_eq!(
+            ts_lines,
+            vec!["live000000.ts"],
+            "must list this run's own segment exactly once, not the adopted old-run \
+             segment that collides with it on basename: {ffmpeg_playlist}"
+        );
     }
 }
