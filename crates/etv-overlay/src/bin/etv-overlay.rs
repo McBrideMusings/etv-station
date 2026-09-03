@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use etv_overlay::fifo_writer::{FifoWriter, OpenOutcome, default_fifo_path};
-use etv_overlay::overlay_spec::OverlaySpec;
+use etv_overlay::overlay_spec::{OverlayKind, OverlaySpec};
 use etv_overlay::overlay_timeline::OverlayTimelineSource;
 use etv_overlay::phase_watchdog::{self, Phase, PhaseWatch};
 use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
@@ -137,6 +137,39 @@ struct PreviewProgram {
     item_remaining: f64,
 }
 
+/// Program-context flags for `dump-text`. A near-twin of [`PreviewProgram`],
+/// minus `item_elapsed`/`item_remaining` (which `dump-text` derives from
+/// `--duration`/`--samples` instead, one value per sampled instant) and plus
+/// `description` — `PreviewProgram` hardcodes that to empty in
+/// [`program_context_for`] because `render-still`/`watch` never needed it,
+/// but a script can read it (and the `watched_by` line it's parsed from), so
+/// `dump-text` has to be able to set it.
+#[derive(clap::Args, Clone)]
+struct DumpTextProgram {
+    #[arg(long, default_value = "")]
+    title: String,
+    #[arg(long, default_value = "")]
+    sub_title: String,
+    #[arg(long, default_value = "")]
+    description: String,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    season: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    episode: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    year: i64,
+    #[arg(long, default_value = "")]
+    next_title: String,
+    #[arg(long, default_value = "")]
+    next_sub_title: String,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    next_season: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    next_episode: i64,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    next_year: i64,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Render a single overlay frame to a PNG file (no ffmpeg)
@@ -211,6 +244,25 @@ enum Cmd {
         #[arg(long)]
         playout_folder: PathBuf,
     },
+    /// Print the text an overlay's script would draw over a run, without
+    /// opening a GPU surface, loading fonts, or rasterizing anything — for
+    /// reviewing what a block will say without eyeballing rendered frames.
+    DumpText {
+        /// The overlay spec (the same YAML/TOML `OverlaySpec` a station
+        /// channel names for this block).
+        #[arg(long)]
+        spec: PathBuf,
+        #[command(flatten)]
+        program: DumpTextProgram,
+        /// The item's runtime in seconds. Drives `item_elapsed` /
+        /// `item_remaining` at each sampled instant.
+        #[arg(long)]
+        duration: f64,
+        /// How many evenly spaced instants across `[0, duration)` to
+        /// evaluate.
+        #[arg(long, default_value_t = 24)]
+        samples: u32,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -258,6 +310,12 @@ fn main() -> anyhow::Result<()> {
             ready_file,
             playout_folder,
         } => pipe_to_fifo(fifo, create_fifo, ready_file, playout_folder),
+        Cmd::DumpText {
+            spec,
+            program,
+            duration,
+            samples,
+        } => dump_text(spec, program, duration, samples),
     }
 }
 
@@ -915,6 +973,129 @@ fn evaluate_state(
     Ok(engine.evaluate(time, frame_index, program))
 }
 
+fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
+    ProgramContext {
+        title: p.title.clone(),
+        sub_title: p.sub_title.clone(),
+        description: p.description.clone(),
+        season: p.season,
+        episode: p.episode,
+        year: p.year,
+        next_title: p.next_title.clone(),
+        next_sub_title: p.next_sub_title.clone(),
+        next_season: p.next_season,
+        next_episode: p.next_episode,
+        next_year: p.next_year,
+        // Overwritten per-sample in `collect_texts`.
+        item_elapsed: -1.0,
+        item_remaining: -1.0,
+    }
+}
+
+/// One distinct text string an overlay script drew across the sampled run,
+/// and the window of sampled instants it occupied.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct TextSpan {
+    content: String,
+    first_at: f64,
+    last_at: f64,
+    sample_count: u32,
+}
+
+#[derive(serde::Serialize)]
+struct DumpTextOutput {
+    spec: String,
+    samples: u32,
+    texts: Vec<TextSpan>,
+}
+
+fn dump_text(
+    spec_path: PathBuf,
+    program: DumpTextProgram,
+    duration: f64,
+    samples: u32,
+) -> anyhow::Result<()> {
+    let spec = OverlaySpec::from_path(&spec_path)?;
+    let texts = collect_texts(&spec, &program, duration, samples)?;
+    let output = DumpTextOutput {
+        spec: spec_path.display().to_string(),
+        samples,
+        texts,
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+/// Sample `engine`'s script across `samples` evenly spaced instants in
+/// `[0, duration)`, collecting every visible `OverlayKind::Text` layer's
+/// content — one entry per *distinct* string, in first-appearance order, with
+/// the window of sampled instants it occupied. Uses
+/// [`RhaiEngine::try_evaluate`], the exact evaluation path the renderer runs
+/// through [`RhaiEngine::evaluate`], so a text this reports and a text the
+/// renderer draws cannot disagree — the only difference is that a script
+/// error here propagates instead of being warned-and-swallowed, since a wrong
+/// or silently skipped sample is exactly the bug this command exists to
+/// catch.
+fn collect_texts(
+    spec: &OverlaySpec,
+    program: &DumpTextProgram,
+    duration: f64,
+    samples: u32,
+) -> anyhow::Result<Vec<TextSpan>> {
+    let engine = build_engine(spec)?;
+    let base_ctx = program_context_for_dump_text(program);
+    let sample_count = samples.max(1);
+
+    let mut order: Vec<String> = Vec::new();
+    let mut spans: std::collections::HashMap<String, TextSpan> = std::collections::HashMap::new();
+
+    for i in 0..sample_count {
+        let t = duration * (i as f64) / (sample_count as f64);
+        let mut ctx = base_ctx.clone();
+        ctx.item_elapsed = t;
+        ctx.item_remaining = duration - t;
+
+        let state = engine
+            .try_evaluate(t, i as u64, &ctx)
+            .map_err(|e| anyhow::anyhow!("rhai script eval failed at sample {i} (t={t}): {e}"))?;
+
+        if !state.visible {
+            continue;
+        }
+        for layer in &state.layers {
+            if !layer.visible {
+                continue;
+            }
+            let OverlayKind::Text { content, .. } = &layer.kind else {
+                continue;
+            };
+            match spans.get_mut(content) {
+                Some(span) => {
+                    span.last_at = t;
+                    span.sample_count += 1;
+                }
+                None => {
+                    order.push(content.clone());
+                    spans.insert(
+                        content.clone(),
+                        TextSpan {
+                            content: content.clone(),
+                            first_at: t,
+                            last_at: t,
+                            sample_count: 1,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|k| spans.remove(&k).expect("just inserted under this key"))
+        .collect())
+}
+
 fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<()> {
     let file = std::fs::File::create(path)
         .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
@@ -1005,5 +1186,137 @@ mod tests {
             "sanity: the reader really did stall past the idle timeout"
         );
         readers.join().unwrap();
+    }
+
+    fn fixture(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    fn dump_program() -> DumpTextProgram {
+        DumpTextProgram {
+            title: String::new(),
+            sub_title: String::new(),
+            description: String::new(),
+            season: -1,
+            episode: -1,
+            year: -1,
+            next_title: String::new(),
+            next_sub_title: String::new(),
+            next_season: -1,
+            next_episode: -1,
+            next_year: -1,
+        }
+    }
+
+    /// `title_chyron.rhai` (fixtures/title_chyron.yaml) draws the item's
+    /// title while `time` sits inside its slide-in/hold/slide-out window
+    /// (`config`: interval 12s, hold 4s, slide 0.5s each way — visible for
+    /// `t < 5.0`), and stays hidden the rest of the 12s cycle. Sampling the
+    /// whole cycle should report exactly the title text, occupying the first
+    /// part of the window.
+    #[test]
+    fn dump_text_yields_the_title_text() {
+        let spec = OverlaySpec::from_path(&fixture("fixtures/title_chyron.yaml")).unwrap();
+        let mut program = dump_program();
+        program.title = "MOVIE TITLE".to_string();
+
+        let texts = collect_texts(&spec, &program, 12.0, 24).unwrap();
+
+        assert_eq!(texts.len(), 1, "expected exactly one distinct string");
+        assert_eq!(texts[0].content, "MOVIE TITLE");
+        assert_eq!(texts[0].first_at, 0.0);
+        assert!(
+            texts[0].last_at < 5.0,
+            "the title should only occupy the visible window, got last_at={}",
+            texts[0].last_at
+        );
+        assert!(texts[0].sample_count >= 1);
+    }
+
+    /// `now_and_next.rhai` (fixtures/channel_dynamic.yaml) draws "Now
+    /// playing: {title}" for the item's first 10s and "Up next:
+    /// {next_title}" for its last 10s. Over a 30s run that should yield two
+    /// distinct strings, each with a plausible first/last sample window.
+    #[test]
+    fn dump_text_now_and_next_yields_more_than_one_distinct_string() {
+        let spec = OverlaySpec::from_path(&fixture("fixtures/channel_dynamic.yaml")).unwrap();
+        let mut program = dump_program();
+        program.title = "The Office".to_string();
+        program.next_title = "Seinfeld".to_string();
+
+        let texts = collect_texts(&spec, &program, 30.0, 30).unwrap();
+
+        assert_eq!(
+            texts.len(),
+            2,
+            "expected now-playing and up-next both to appear"
+        );
+        assert_eq!(texts[0].content, "Now playing: The Office");
+        assert!(texts[0].first_at < texts[0].last_at || texts[0].sample_count == 1);
+        assert!(
+            texts[0].last_at < 10.0,
+            "now-playing should only occupy the item's first 10s, got {}",
+            texts[0].last_at
+        );
+        assert_eq!(texts[1].content, "Up next: Seinfeld");
+        assert!(
+            texts[1].first_at >= 20.0,
+            "up-next should only occupy the item's last 10s, got {}",
+            texts[1].first_at
+        );
+    }
+
+    /// A spec with no script (and no text layer) draws nothing textual —
+    /// `texts` comes back empty, not an error.
+    #[test]
+    fn dump_text_with_no_text_layer_yields_empty_texts() {
+        let spec = OverlaySpec::from_yaml_str(
+            r#"
+width: 320
+height: 180
+framerate: 30
+pixel_format: rgba8
+layers:
+  - type: watermark
+    corner: top_right
+    margin: 16
+    box_size: 64
+    color: [220, 60, 60, 220]
+"#,
+        )
+        .unwrap();
+
+        let texts = collect_texts(&spec, &dump_program(), 10.0, 8).unwrap();
+        assert!(texts.is_empty());
+    }
+
+    /// A script error at a sampled frame propagates with the frame index and
+    /// the underlying Rhai error, rather than being swallowed like the
+    /// renderer's own `evaluate` swallows it.
+    #[test]
+    fn dump_text_propagates_a_script_error() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        file.write_all(b"throw \"boom\";").unwrap();
+
+        let mut spec = OverlaySpec::from_yaml_str(
+            r#"
+width: 320
+height: 180
+framerate: 30
+pixel_format: rgba8
+layers: []
+"#,
+        )
+        .unwrap();
+        spec.script = Some(file.path().to_path_buf());
+
+        let err = collect_texts(&spec, &dump_program(), 10.0, 4).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sample 0"),
+            "expected frame index in error: {msg}"
+        );
+        assert!(msg.contains("boom"), "expected the rhai error text: {msg}");
     }
 }
