@@ -21,9 +21,11 @@
 # wrapper never copies a database anywhere and never needs one present.
 #
 # Usage:
-#   tools/audit-report.sh                        # list channels, exit 0
-#   tools/audit-report.sh for-pierce             # report for one channel
-#   tools/audit-report.sh for-pierce --next 25   # extra flags reach the binary
+#   tools/audit-report.sh                             # list channels, exit 0
+#   tools/audit-report.sh for-pierce                  # report for one channel
+#   tools/audit-report.sh for-pierce --next 25        # extra flags reach the binary
+#   tools/audit-report.sh for-pierce --format json    # JSON report (per-item
+#                                                      # audit trail + overlay_spec)
 #
 # Env (from .env, gitignored — no fallbacks, these name a specific machine):
 #   UNRAID_HOST, UNRAID_USER, ETV_STATION_DATA

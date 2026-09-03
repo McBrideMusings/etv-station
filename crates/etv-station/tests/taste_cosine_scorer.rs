@@ -1099,6 +1099,7 @@ fn admin_audit_prints_the_damping_for_a_recently_aired_pick() {
             finish: start + time::Duration::hours(2),
             title: Some(p.id.clone()),
             metadata: p.metadata.clone(),
+            overlay_spec: None,
         })
         .collect();
     let report = etv_station::audit_report::render("for-pierce", start, &items);
