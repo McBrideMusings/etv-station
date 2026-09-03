@@ -86,8 +86,18 @@ pub const VERSION: &str = env!("ETV_VERSION_STRING");
 /// `.heartbeat`, `.ready`, `.error-card.png`) without a registry.
 pub const RUN_FOLDER_PREFIX: &str = "r";
 
-/// Process-local counter mixed into [`new_run_folder_name`] so two runs that
-/// start within the same millisecond still sort distinctly and never collide.
+/// Process-local counter mixed into [`new_run_folder_name`] so two calls made
+/// by the *same process* within the same millisecond still sort distinctly.
+/// It disambiguates nothing across processes — each worker run is its own OS
+/// process, so this `AtomicU64` starts back at 0 every time and a second run
+/// starting in the same millisecond as another gets counter value 0 again.
+/// What actually keeps two live runs of one channel from colliding is that
+/// only one worker per channel ever exists at a time — enforced by the
+/// `active` map in the server — combined with the millisecond timestamp
+/// itself: two runs of the *same* channel are never both live, and two
+/// different channels write to different channel folders, so a same-process,
+/// same-millisecond collision is only reachable within a single call site
+/// making several calls in a row, which is exactly the case the tests exercise.
 static RUN_FOLDER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A new, unique name for a worker run's own segment subfolder under a
@@ -98,10 +108,12 @@ static RUN_FOLDER_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// rationale on [`SEQUENCE_FILE_NAME`] and the per-run design in
 /// `etv-station-262`. The name is a fixed-width millisecond timestamp plus a
 /// zero-padded counter, in that order, so plain string comparison already
-/// equals creation order (`sort()` needs no parsing) and two runs starting in
-/// the same millisecond — realistic under test, and not impossible in
-/// production — still produce different names. See [`is_run_folder_name`] for
-/// the inverse check.
+/// equals creation order (`sort()` needs no parsing). The counter only
+/// disambiguates repeated calls within the same process and the same
+/// millisecond — realistic under test — since a fresh process starts it back
+/// at 0; two live runs of one channel are kept apart instead by there only
+/// ever being one worker per channel (the `active` map) and the timestamp
+/// component. See [`is_run_folder_name`] for the inverse check.
 pub fn new_run_folder_name() -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

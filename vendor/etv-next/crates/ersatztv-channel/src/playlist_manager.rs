@@ -62,10 +62,12 @@ pub struct SubtitleSource {
 #[derive(Clone)]
 pub struct PlaylistManager {
     /// Channel root: where the generated playlists (`live.m3u8`,
-    /// `live_sub.m3u8`), `.heartbeat`, and [`SEQUENCE_FILE_NAME`] live, and
-    /// what `write_atomically` uses as its rename-source directory — the same
-    /// filesystem as `segment_folder`, so a rename into the run folder is
-    /// still atomic.
+    /// `live_sub.m3u8`), `.heartbeat`, and [`SEQUENCE_FILE_NAME`] live.
+    /// `write_atomically`'s `folder` argument must be the same folder its
+    /// destination lives in, so calls writing one of *those* files pass
+    /// `output_folder` — calls writing into the run folder (the regenerated
+    /// ffmpeg playlist, each segment's `.vtt` sidecar) pass `segment_folder`
+    /// instead.
     output_folder: PathBuf,
     /// This run's own segment subfolder of `output_folder`, where `.ts`
     /// segments and their `.vtt` sidecars are scanned for and trimmed.
@@ -248,7 +250,7 @@ impl PlaylistManager {
             let generated_playlist =
                 self.generate_playlist(|s| s.rsplit('/').next().unwrap_or(s).to_owned(), None)?;
             write_atomically(
-                &self.output_folder,
+                &self.segment_folder,
                 &self.ffmpeg_playlist_file,
                 generated_playlist,
             )
@@ -338,7 +340,7 @@ impl PlaylistManager {
                     mpegts_90khz
                 ),
             };
-            write_atomically(&self.output_folder, &vtt_full, body).await?;
+            write_atomically(&self.segment_folder, &vtt_full, body).await?;
         }
 
         // trim old segments

@@ -37,6 +37,35 @@ pub(crate) async fn heartbeat_is_fresh(heartbeat_file: &Path) -> bool {
     }
 }
 
+/// Decide and reap one channel's run folders under a single hold of `active`,
+/// so a spawn and the periodic sweep can never interleave.
+///
+/// `session_middleware` and the ready-wait path in `main` both take `active`
+/// *before* calling [`ChannelSession::spawn`] and hold it across the spawn and
+/// the `insert` that follows. Holding the same lock here for the whole
+/// decide-then-reap step makes the two orderings exhaustive: either a spawn
+/// wins the lock first — it lands in `active` before this function ever reads
+/// it, so `has_active_worker` sees the entry and `keep_newest` is `true`, and
+/// the spawn's own brand-new run folder is the newest one anyway, which
+/// `reap_run_folders` never removes — or this function wins the lock first —
+/// the spawn then blocks at `active.lock().await` until the reap below has
+/// returned, so the run folder it would create does not exist yet for the
+/// reap to see or delete. There is no window where a folder is created after
+/// the decision but before the removal runs.
+pub(crate) async fn reap_channel_run_folders(
+    number: &str,
+    output_folder: &Path,
+    active: &Mutex<HashMap<String, ChannelSession>>,
+) -> Result<usize, std::io::Error> {
+    let guard = active.lock().await;
+    let has_active_worker = guard.contains_key(number);
+    let heartbeat_file = output_folder.join(HEARTBEAT_FILE_NAME);
+    let keep_newest = has_active_worker || heartbeat_is_fresh(&heartbeat_file).await;
+    let result = reap_run_folders(output_folder, keep_newest).await;
+    drop(guard);
+    result
+}
+
 pub struct ChannelSession {
     ready_receiver: watch::Receiver<bool>,
 }
@@ -157,13 +186,13 @@ impl ChannelSession {
             }
 
             // Release the slot in `active` so `session_middleware` can spawn a
-            // replacement worker. Per-run segment folders remove the race this
-            // ordering used to guard against: a fresh worker computes its own
-            // new run-folder name and never writes into a path this reap could
-            // have just removed, so releasing the slot before or after the
-            // reap above no longer matters for correctness. Kept after it
-            // anyway, since there is no reason to invite a respawn before this
-            // exit has finished tidying up after itself.
+            // replacement worker. The ordering matters again now that
+            // `reap_channel_run_folders` holds this same lock across its own
+            // decide-then-reap step: while this key is still in `active`, that
+            // sweep sees a live worker and keeps every run folder untouched, so
+            // a respawn racing the sweep can never be starved by it. Removing
+            // the key before the reap above finished would open exactly the
+            // window that helper exists to close.
             active.lock().await.remove(&channel_number);
 
             if ready_file.exists() {
@@ -201,9 +230,16 @@ fn channel_binary_path() -> Result<PathBuf, LineupError> {
 
 #[cfg(test)]
 mod reap_tests {
-    use tempfile::TempDir;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use super::{HEARTBEAT_FILE_NAME, heartbeat_is_fresh, reap_run_folders};
+    use tempfile::TempDir;
+    use tokio::sync::{Mutex, watch};
+
+    use super::{
+        ChannelSession, HEARTBEAT_FILE_NAME, heartbeat_is_fresh, reap_channel_run_folders,
+        reap_run_folders,
+    };
 
     /// Exercises the exact call the exit-time cleanup in `spawn` makes:
     /// `keep_newest` decided by `heartbeat_is_fresh` on a heartbeat sampled
@@ -263,5 +299,73 @@ mod reap_tests {
             "a run a viewer is still attached to must survive the reap"
         );
         assert!(live_run.join("live000000.ts").exists());
+    }
+
+    /// Regression test for the reap-sweep race (etv-station-262.1): without
+    /// `reap_channel_run_folders` holding `active` across the whole
+    /// decide-then-reap step, a spawn landing between the "no active worker"
+    /// read and the reap's own directory listing loses its brand-new run
+    /// folder to that reap — the sweep lists the directory after the folder
+    /// exists but reaps as though nobody was there when it decided.
+    ///
+    /// Looped: the failure depends on the sweep task yielding (at
+    /// `heartbeat_is_fresh`'s metadata read) before the racing spawn task
+    /// runs, which a single current-thread `#[tokio::test]` schedules
+    /// deterministically in practice but is not guaranteed by the language —
+    /// every iteration surviving is the evidence the lock, not luck, is what
+    /// protects the folder.
+    #[tokio::test]
+    async fn a_spawn_racing_the_sweep_never_loses_its_run_folder() {
+        for _ in 0..50 {
+            let dir = TempDir::new().unwrap();
+            let channel_root = dir.path().to_path_buf();
+
+            let dead_run = channel_root.join("r0000000000001-0000");
+            tokio::fs::create_dir(&dead_run).await.unwrap();
+            tokio::fs::write(dead_run.join("live000000.ts"), b"segment")
+                .await
+                .unwrap();
+
+            let active: Arc<Mutex<HashMap<String, ChannelSession>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
+            let root_for_sweep = channel_root.clone();
+            let active_for_sweep = Arc::clone(&active);
+            let sweep = tokio::spawn(async move {
+                reap_channel_run_folders("1", &root_for_sweep, &active_for_sweep)
+                    .await
+                    .unwrap();
+            });
+
+            // Give the sweep a chance to acquire `active` and reach its first
+            // real await (the heartbeat metadata read) before the spawn below
+            // starts racing it for the same lock — the same ordering
+            // `session_middleware` and the ready-wait path produce against
+            // the real sweep in `main`.
+            tokio::task::yield_now().await;
+
+            let root_for_spawn = channel_root.clone();
+            let active_for_spawn = Arc::clone(&active);
+            let spawn = tokio::spawn(async move {
+                let mut guard = active_for_spawn.lock().await;
+                let new_run = root_for_spawn.join("r0000000000002-0000");
+                tokio::fs::create_dir(&new_run).await.unwrap();
+                tokio::fs::write(new_run.join("live000000.ts"), b"segment")
+                    .await
+                    .unwrap();
+                let (_ready_sender, ready_receiver) = watch::channel(false);
+                guard.insert("1".to_owned(), ChannelSession { ready_receiver });
+            });
+
+            sweep.await.unwrap();
+            spawn.await.unwrap();
+
+            let new_run = channel_root.join("r0000000000002-0000");
+            assert!(
+                new_run.exists(),
+                "a run folder created by a spawn racing the sweep must survive it"
+            );
+            assert!(new_run.join("live000000.ts").exists());
+        }
     }
 }
