@@ -115,15 +115,39 @@ impl RhaiEngine {
 
     /// Evaluate the script (if any) against the given frame time and program
     /// context. Returns the resolved per-frame state ready for the renderer.
+    ///
+    /// A script error is warned and swallowed, falling back to the base
+    /// state — an overlay is decoration over a channel already on the air, so
+    /// a bad script must cost the decoration, not the stream. Use
+    /// [`Self::try_evaluate`] where a caller needs to see the error instead.
     pub fn evaluate(
         &self,
         time_seconds: f64,
         frame_index: u64,
         program: &ProgramContext,
     ) -> OverlayState {
+        match self.try_evaluate(time_seconds, frame_index, program) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!("rhai script eval failed: {e}");
+                OverlayState::from_layers(self.base_layers.clone())
+            }
+        }
+    }
+
+    /// As [`Self::evaluate`], but surfaces a script evaluation error instead
+    /// of warning and falling back — same engine, same scope construction, so
+    /// a caller inspecting the script's output (`etv-overlay dump-text`)
+    /// cannot see a result the renderer wouldn't also produce.
+    pub fn try_evaluate(
+        &self,
+        time_seconds: f64,
+        frame_index: u64,
+        program: &ProgramContext,
+    ) -> Result<OverlayState, Box<rhai::EvalAltResult>> {
         let mut state = OverlayState::from_layers(self.base_layers.clone());
         let Some(ast) = self.ast.as_ref() else {
-            return state;
+            return Ok(state);
         };
 
         let mut scope = Scope::new();
@@ -156,17 +180,13 @@ impl RhaiEngine {
         scope.push_constant("item_elapsed", program.item_elapsed);
         scope.push_constant("item_remaining", program.item_remaining);
 
-        match self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, ast) {
-            Ok(value) => {
-                if let Some(map) = value.try_cast::<rhai::Map>() {
-                    apply_script_result(&mut state, &map);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("rhai script eval failed: {e}");
-            }
+        let value = self
+            .engine
+            .eval_ast_with_scope::<Dynamic>(&mut scope, ast)?;
+        if let Some(map) = value.try_cast::<rhai::Map>() {
+            apply_script_result(&mut state, &map);
         }
-        state
+        Ok(state)
     }
 }
 
