@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -356,6 +357,251 @@ def cmd_artwork_check(host: str, channel_id: str | None) -> None:
     print(json.dumps({"checked": len(targets), "broken": broken}, indent=2))
 
 
+# --- Audit screen helpers ----------------------------------------------------
+#
+# Pure functions with no Textual dependency, backing the AuditScreen defined
+# inside build_app below — kept free-standing so they run on a plain thread
+# worker with nothing but subprocess and json, and so a test could call them
+# with no App instance at all.
+
+
+def find_etv_overlay_binary() -> Path | None:
+    """Locate the `etv-overlay` binary via `cargo metadata`'s own
+    `target_directory` — the only way to find it that also honors a swarm
+    worktree's shared `.cargo/config.toml` target-dir override (see
+    CLAUDE.local.md's "Swarm worktrees share one cargo target dir"). Falls
+    back to `<repo>/target` if `cargo metadata` fails. Prefers a release
+    build; returns None if neither profile has been built."""
+    target_dir: Path | None = None
+    try:
+        result = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            target_dir = Path(json.loads(result.stdout)["target_directory"])
+    except Exception:  # noqa: BLE001 - falls back to the default below
+        target_dir = None
+    if target_dir is None:
+        target_dir = REPO_ROOT / "target"
+    for profile in ("release", "debug"):
+        candidate = target_dir / profile / "etv-overlay"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def fetch_channel_number_map() -> dict[int, str]:
+    """Run `tools/audit-report.sh --list --format json` and return
+    {dial number: channel folder name}. Raises RuntimeError, with a message
+    fit to show on screen, on any failure — a non-zero exit, or stdout that
+    isn't the JSON array the binary's `--audit --list --format json` prints."""
+    script = REPO_ROOT / "tools" / "audit-report.sh"
+    result = subprocess.run(
+        [str(script), "--list", "--format", "json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"audit-report.sh --list exited {result.returncode}")
+    try:
+        listing = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"audit-report.sh --list did not print JSON: {exc}") from exc
+    out: dict[int, str] = {}
+    for entry in listing:
+        try:
+            out[int(entry["number"])] = entry["name"]
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def fetch_audit_report(channel_name: str, next_n: int = 100) -> dict:
+    """Run `tools/audit-report.sh <channel_name> --next N --format json` and
+    return the parsed report. Raises RuntimeError, with a message fit to show
+    on screen, on any failure."""
+    script = REPO_ROOT / "tools" / "audit-report.sh"
+    result = subprocess.run(
+        [str(script), channel_name, "--next", str(next_n), "--format", "json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"audit-report.sh {channel_name} exited {result.returncode}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"audit-report.sh {channel_name} did not print JSON: {exc}") from exc
+
+
+def find_matching_audit_item(report: dict, start: datetime) -> dict | None:
+    """The report item whose `start` names the same instant as `start` — the
+    EPG's tz-aware Python datetime and the report's RFC3339 text are two
+    different wire formats for the same clock, so this compares instants
+    (both converted to UTC), never the raw strings."""
+    target = start.astimezone(timezone.utc)
+    for item in report.get("items", []) if isinstance(report, dict) else []:
+        raw = item.get("start") if isinstance(item, dict) else None
+        if not raw:
+            continue
+        try:
+            item_start = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if item_start.astimezone(timezone.utc) == target:
+            return item
+    return None
+
+
+def render_classification(audit: object) -> str:
+    """The `select`-stage record's `detail.pool/source/take/from/expr`,
+    labelling the item by its pool. `audit` is `metadata.audit` verbatim from
+    the station (see split_audit's doc comment in
+    crates/etv-station/src/audit_report.rs) — not guaranteed to be a list."""
+    if not isinstance(audit, list):
+        return f"the audit trail is malformed (not a list): {audit!r}"
+    if not audit:
+        return "unclassified — nothing wrote an audit record for this item"
+    select_record = next(
+        (r for r in audit if isinstance(r, dict) and r.get("stage") == "select"),
+        None,
+    )
+    if select_record is None:
+        return "no 'select' stage record in the audit trail — nothing classified this item"
+    detail = select_record.get("detail")
+    detail = detail if isinstance(detail, dict) else {}
+    lines = [f"pool: {detail.get('pool', '∅')}"]
+    for key in ("source", "take", "from", "expr"):
+        lines.append(f"{key}: {detail.get(key, '∅')}")
+    return "\n".join(lines)
+
+
+def render_audit_trail(audit: object) -> str:
+    """Every record in `audit`, in order — `stage`/`by`/`verdict` then each
+    `detail` key indented, generically: no key name is hard-coded here, so an
+    unknown `detail` key renders exactly like a known one."""
+    if not isinstance(audit, list):
+        return f"the audit trail is malformed (not a list): {audit!r}"
+    if not audit:
+        return "unclassified — nothing wrote an audit record for this item"
+    blocks = []
+    for record in audit:
+        if not isinstance(record, dict):
+            blocks.append(f"(malformed audit record: {record!r})")
+            continue
+        stage = record.get("stage", "∅")
+        by = record.get("by", "∅")
+        verdict = record.get("verdict", "∅")
+        lines = [f"[{stage}] {by}: {verdict}"]
+        detail = record.get("detail")
+        if isinstance(detail, dict):
+            for key, value in detail.items():
+                lines.append(f"    {key}: {value}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def rewrite_script_path(script: str) -> tuple[str, str | None]:
+    """A `script` of `/config/<rest>` names a path inside the station
+    container, mounted from this checkout's `deploy/appdata/`. Rewrite it to
+    that local path and return (local_path, None) when the file is actually
+    there, or (attempted_local_path, error_message) when it is not — the
+    caller shows both paths and skips the invocation rather than failing."""
+    if script.startswith("/config/"):
+        local = REPO_ROOT / "deploy" / "appdata" / script[len("/config/"):]
+    else:
+        local = Path(script)
+    # Absolute, always. The spec this path is written into lands in a scratch
+    # directory, not beside whatever the path was originally relative to, so a
+    # relative path that resolves here resolves to nothing once `etv-overlay`
+    # reads it back from there. A station-written spec is absolute already
+    # (`ChannelOverlays` is loaded "with every path absolute", see
+    # crates/etv-station/src/config/overlay.rs), so this only catches a
+    # hand-written or fixture spec — which is exactly the case that hit it.
+    local = local.resolve()
+    if local.exists():
+        return str(local), None
+    return str(local), f"container path {script!r} does not resolve to a local file"
+
+
+def run_overlay_dump_text(overlay_spec: dict, programme: "Programme", next_title: str | None) -> dict:
+    """Write `overlay_spec` to a scratch file (rewriting a `/config/` script
+    path to this checkout's `deploy/appdata/` first), invoke `etv-overlay
+    dump-text` against it, and return {"ok": bool, "text": str} — this never
+    raises; every failure mode is turned into text for the Overlay section to
+    show, per the item's acceptance bullets."""
+    binary = find_etv_overlay_binary()
+    if binary is None:
+        return {
+            "ok": False,
+            "text": "etv-overlay binary not found — build it first: cargo build -p etv-overlay",
+        }
+
+    spec = dict(overlay_spec)
+    script = spec.get("script")
+    if script:
+        local_path, err = rewrite_script_path(script)
+        if err is not None:
+            return {
+                "ok": False,
+                "text": (
+                    "script does not resolve locally — skipping dump-text\n"
+                    f"  container path: {script}\n"
+                    f"  local path:     {local_path}"
+                ),
+            }
+        spec["script"] = local_path
+
+    out_dir = REPO_ROOT / "tmp" / "claude" / "epg-browser"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=out_dir, prefix="overlay-spec-", suffix=".json")
+    spec_path = Path(tmp_name)
+    with os.fdopen(fd, "w") as f:
+        json.dump(spec, f)
+
+    duration = max(0.0, (programme.stop - programme.start).total_seconds())
+    args = [
+        str(binary),
+        "dump-text",
+        "--spec", str(spec_path),
+        "--title", programme.title or "",
+        "--sub-title", programme.sub_title or "",
+        "--description", programme.desc or "",
+        "--next-title", next_title or "",
+        "--duration", str(duration),
+    ]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the Overlay section, not crashed on
+        return {"ok": False, "text": f"failed to run etv-overlay dump-text: {exc}"}
+    finally:
+        spec_path.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "text": f"etv-overlay dump-text exited {result.returncode}\n{result.stderr.strip()}",
+        }
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "text": f"etv-overlay dump-text printed non-JSON output:\n{result.stdout.strip()}"}
+    texts = parsed.get("texts", [])
+    if not texts:
+        return {"ok": True, "text": "(no text layers drawn over this run)"}
+    lines = [
+        f"[{t.get('first_at', 0):.1f}s–{t.get('last_at', 0):.1f}s] {t.get('content', '')!r}"
+        for t in texts
+    ]
+    return {"ok": True, "text": "\n".join(lines)}
+
+
 # --- Textual TUI -------------------------------------------------------------
 
 
@@ -367,6 +613,7 @@ def build_app(host: str):
     from textual import work
     from textual.app import App, ComposeResult
     from textual.containers import Container, VerticalScroll
+    from textual.screen import Screen
     from textual.widgets import Footer, Header, ListItem, ListView, Label, Static
     from textual.worker import get_current_worker
 
@@ -414,6 +661,7 @@ def build_app(host: str):
             ("v", "open_vlc", "Stream in VLC"),
             ("a", "open_artwork", "Artwork preview"),
             ("s", "open_sublime", "XML in Sublime"),
+            ("d", "open_audit", "Audit"),
             ("left", "focus_channels", "◀ Channels"),
             ("right", "focus_programmes", "Shows ▶"),
             ("q", "quit", "Quit"),
@@ -469,6 +717,12 @@ def build_app(host: str):
             # (see RESIZE_DEBOUNCE_SECS), or None when nothing is pending.
             self._resize_timer = None
             self._pending_width: int | None = None
+            # AuditScreen's session-scoped caches. None until the first
+            # AuditScreen open fetches it; a failed fetch leaves it None so
+            # the next open retries rather than pinning the failure forever.
+            self.channel_name_by_number: dict[int, str] | None = None
+            # channel folder name -> parsed `--audit --format json` report.
+            self.audit_cache: dict[str, dict] = {}
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -1091,6 +1345,34 @@ def build_app(host: str):
                 return
             subprocess.run(["open", url])
 
+        def action_open_audit(self) -> None:
+            row = self._selected_row()
+            if row is None:
+                self.notify("No programme selected.", severity="warning")
+                return
+            kind, _, payload = row
+            programme = payload[0] if kind == "item" else None
+            if kind != "item" or programme is None:
+                self.notify(
+                    "Select an on-air programme to audit — this row has nothing to audit.",
+                    severity="warning",
+                )
+                return
+            if self.selected_channel is None:
+                return
+            chan = self.channels[self.selected_channel]
+            self.push_screen(AuditScreen(chan, programme, self._next_programme_title(programme)))
+
+        def _next_programme_title(self, programme: Programme) -> str | None:
+            """The title of the next real EPG entry after `programme` on the
+            current channel — what `etv-overlay dump-text --next-title`
+            wants, not the next visual row (which may be an off-air gap)."""
+            if self.selected_channel is None:
+                return None
+            chan_progs = programmes_for(self.programmes, self.selected_channel)
+            upcoming = [p for p in chan_progs if p.start > programme.start]
+            return upcoming[0].title if upcoming else None
+
         def action_open_sublime(self) -> None:
             if self.selected_channel is None:
                 return
@@ -1115,6 +1397,167 @@ def build_app(host: str):
             out_path = out_dir / f"{chan.tvg_id}.xml"
             ET.ElementTree(root).write(out_path, encoding="unicode", xml_declaration=True)
             subprocess.run(["subl", str(out_path)])
+
+    class AuditScreen(Screen):
+        """Full-screen audit of one highlighted programme: what it is, why the
+        plugin picked it, and what its overlay draws — pushed by `d` on the
+        programme list, closed by `escape`. `r` here refreshes the audit and
+        overlay sections only; it does not fall through to the app's own `r`
+        (lineup refresh) because a screen binding shadows the app's for the
+        same key while this screen is on top."""
+
+        BINDINGS = [
+            ("escape", "dismiss", "Close"),
+            ("r", "do_refresh", "Refresh audit"),
+        ]
+
+        CSS = """
+        AuditScreen VerticalScroll { padding: 1 2; }
+        AuditScreen .heading { text-style: bold; margin-top: 1; }
+        """
+
+        SECTION_IDS = ("audit-classification", "audit-trail", "audit-overlay")
+
+        def __init__(self, chan: Channel, programme: Programme, next_title: str | None) -> None:
+            super().__init__()
+            self.chan = chan
+            self.programme = programme
+            self.next_title = next_title
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            with VerticalScroll():
+                yield Label("Programme", classes="heading")
+                yield Static(self._programme_text(), id="audit-programme", markup=False)
+                yield Label("Classification", classes="heading")
+                yield Static("Loading…", id="audit-classification", markup=False)
+                yield Label("Audit trail", classes="heading")
+                yield Static("Loading…", id="audit-trail", markup=False)
+                yield Label("Overlay", classes="heading")
+                yield Static("Loading…", id="audit-overlay", markup=False)
+            yield Footer()
+
+        def _programme_text(self) -> str:
+            p = self.programme
+            window = f"{_fmt_dt_sec(p.start, with_date=True)} → {_fmt_dt_sec(p.stop, with_date=True)}"
+            chan_label = f"ch{self.chan.number}  {self.chan.name}" if self.chan.number is not None else self.chan.name
+            return "\n".join(
+                [
+                    f"title: {p.title or '(untitled)'}",
+                    f"sub-title: {p.sub_title or '∅'}",
+                    f"window: {window}",
+                    f"channel: {chan_label}",
+                ]
+            )
+
+        def action_dismiss(self) -> None:
+            self.dismiss()
+
+        def on_mount(self) -> None:
+            self._load()
+
+        def action_do_refresh(self) -> None:
+            app: EpgBrowserApp = self.app  # type: ignore[assignment]
+            name = (
+                app.channel_name_by_number.get(self.chan.number)
+                if app.channel_name_by_number is not None and self.chan.number is not None
+                else None
+            )
+            if name is not None:
+                app.audit_cache.pop(name, None)
+            self._load()
+
+        def _load(self) -> None:
+            for section_id in self.SECTION_IDS:
+                self.query_one(f"#{section_id}", Static).update("Loading…")
+            self._load_worker()
+
+        def _apply_message(self, message: str) -> None:
+            for section_id in self.SECTION_IDS:
+                self.query_one(f"#{section_id}", Static).update(message)
+
+        def _apply_result(self, classification: str, trail: str, overlay: str) -> None:
+            self.query_one("#audit-classification", Static).update(classification)
+            self.query_one("#audit-trail", Static).update(trail)
+            self.query_one("#audit-overlay", Static).update(overlay)
+
+        @work(thread=True, exclusive=True, group="audit-screen")
+        def _load_worker(self) -> None:
+            app: EpgBrowserApp = self.app  # type: ignore[assignment]
+            worker = get_current_worker()
+            number = self.chan.number
+            if number is None:
+                app.call_from_thread(
+                    self._apply_message,
+                    "This channel has no dial number to resolve against the audit tool.",
+                )
+                return
+
+            if app.channel_name_by_number is None:
+                try:
+                    channel_map = fetch_channel_number_map()
+                except RuntimeError as exc:
+                    if worker.is_cancelled:
+                        return
+                    app.call_from_thread(
+                        self._apply_message,
+                        f"Could not fetch the channel number→name map: {exc}",
+                    )
+                    return
+                if worker.is_cancelled:
+                    return
+                app.channel_name_by_number = channel_map
+
+            name = app.channel_name_by_number.get(number)
+            if name is None:
+                app.call_from_thread(
+                    self._apply_message,
+                    f"Channel number {number} has no entry in the audit tool's channel listing "
+                    f"({len(app.channel_name_by_number)} known).",
+                )
+                return
+
+            report = app.audit_cache.get(name)
+            if report is None:
+                try:
+                    report = fetch_audit_report(name)
+                except RuntimeError as exc:
+                    if worker.is_cancelled:
+                        return
+                    app.call_from_thread(
+                        self._apply_message,
+                        f"Could not fetch the audit report for {name!r}: {exc}",
+                    )
+                    return
+                if worker.is_cancelled:
+                    return
+                app.audit_cache[name] = report
+
+            item = find_matching_audit_item(report, self.programme.start)
+            if worker.is_cancelled:
+                return
+            if item is None:
+                app.call_from_thread(
+                    self._apply_message,
+                    "No audit item matches this programme's start time — "
+                    "the schedule moved under the guide.",
+                )
+                return
+
+            raw_audit = item.get("audit", []) if isinstance(item, dict) else []
+            classification_text = render_classification(raw_audit)
+            trail_text = render_audit_trail(raw_audit)
+
+            overlay_spec = item.get("overlay_spec") if isinstance(item, dict) else None
+            if overlay_spec is None:
+                overlay_text = "this channel draws no overlay here"
+            else:
+                overlay_result = run_overlay_dump_text(overlay_spec, self.programme, self.next_title)
+                overlay_text = overlay_result["text"]
+
+            if worker.is_cancelled:
+                return
+            app.call_from_thread(self._apply_result, classification_text, trail_text, overlay_text)
 
     return EpgBrowserApp(host)
 
