@@ -161,10 +161,24 @@ pub fn is_run_folder_name(name: &str) -> bool {
 ///
 /// Ascending order is what lets [`reap_run_folders`] treat "the last one" as
 /// "the live or most-recently-exited run" with no separate bookkeeping.
+///
+/// A `channel_folder` that does not exist yet has no run folders — that is
+/// not an error, it is a channel nobody has ever tuned to, and it is the
+/// normal resting state for most of a lineup. This used to propagate
+/// `read_dir`'s `NotFound` straight out, which the periodic sweep logged as
+/// `failed to reap run folders for channel N` every sixty seconds forever,
+/// for every channel with no worker history — noise that trains a reader to
+/// ignore the one log that distinguishes a stalled encoder from a healthy
+/// one. The folder is deliberately not created here; that side effect
+/// belongs to a worker actually starting, not to a read.
 pub async fn list_run_folders(channel_folder: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut result = Vec::new();
 
-    let mut entries = read_dir(channel_folder).await?;
+    let mut entries = match read_dir(channel_folder).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(err) => return Err(err),
+    };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let Ok(file_type) = entry.file_type().await else {
             continue;
@@ -240,18 +254,33 @@ pub async fn run_folders_named_by_playlists(channel_folder: &Path) -> HashSet<St
     let mut referenced = HashSet::new();
 
     for file_name in [LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME] {
-        let Ok(contents) = tokio::fs::read_to_string(channel_folder.join(file_name)).await else {
+        referenced.extend(run_folders_named_by_playlist(&channel_folder.join(file_name)).await);
+    }
+
+    referenced
+}
+
+/// Every run-folder name referenced by the single playlist at `playlist_path`.
+///
+/// The per-file half of [`run_folders_named_by_playlists`], factored out so
+/// [`reap_unreferenced_run_folders`] can judge `live.m3u8` and
+/// `live_sub.m3u8` on their own contents rather than their union — a
+/// subtitle playlist naming only a reaped run must not save an unrelated,
+/// still-live `live.m3u8` from the same check, or the other way around.
+async fn run_folders_named_by_playlist(playlist_path: &Path) -> HashSet<String> {
+    let mut referenced = HashSet::new();
+
+    let Ok(contents) = tokio::fs::read_to_string(playlist_path).await else {
+        return referenced;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
-        };
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let run_folder_name = line.split('/').next().unwrap_or(line);
-            if is_run_folder_name(run_folder_name) {
-                referenced.insert(run_folder_name.to_owned());
-            }
+        }
+        let run_folder_name = line.split('/').next().unwrap_or(line);
+        if is_run_folder_name(run_folder_name) {
+            referenced.insert(run_folder_name.to_owned());
         }
     }
 
@@ -279,6 +308,24 @@ pub async fn run_folders_named_by_playlists(channel_folder: &Path) -> HashSet<St
 /// close. No count and no age threshold are used to widen the margin further
 /// — both are guesses about how many runs can stack up or how long a grace
 /// period should be, and etv-station-262.1 explicitly rules both out.
+///
+/// After the run folders above are removed, this also removes a root
+/// playlist (`live.m3u8` and/or `live_sub.m3u8`, judged independently) that
+/// no surviving run folder backs. A playlist that names only folders this
+/// sweep just deleted describes nothing that exists any more; serving it as
+/// a 200 hands a client a segment URI that then 404s — the exact signature
+/// that made VLC/3.0.4 stop requesting video permanently on 2026-08-11.
+/// Deleting the playlist instead turns that into a 404 on the playlist
+/// itself, which a client reads as "channel not up" and recovers from by
+/// tuning in again, spawning a fresh worker.
+///
+/// This step only runs when `keep_newest` is `false`. Under `keep_newest`,
+/// every run folder any playlist names is by construction protected, so the
+/// only playlist that could still name nothing is a brand-new worker's
+/// `live.m3u8` — its `PlaylistManager` writes a header with an empty segment
+/// deque before its first segment lands. That playlist is not stale, it is
+/// early, and deleting it would yank a live channel's playlist out from
+/// under a client mid-tune-in.
 pub async fn reap_unreferenced_run_folders(
     channel_folder: &Path,
     keep_newest: bool,
@@ -300,6 +347,36 @@ pub async fn reap_unreferenced_run_folders(
         }
         remove_dir_all(&folder).await?;
         removed += 1;
+    }
+
+    if !keep_newest {
+        for file_name in [LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME] {
+            let playlist_path = channel_folder.join(file_name);
+            if !tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
+                // No playlist to reconsider — same "missing is not an
+                // error" rule run_folders_named_by_playlist follows.
+                continue;
+            }
+
+            let named = run_folders_named_by_playlist(&playlist_path).await;
+            let mut any_survives = false;
+            for name in &named {
+                if tokio::fs::try_exists(channel_folder.join(name))
+                    .await
+                    .unwrap_or(false)
+                {
+                    any_survives = true;
+                    break;
+                }
+            }
+            if !any_survives {
+                match remove_file(&playlist_path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 
     Ok(removed)
@@ -499,8 +576,9 @@ mod empty_folder_tests {
 #[cfg(test)]
 mod run_folder_tests {
     use super::{
-        is_run_folder_name, list_run_folders, new_run_folder_name, reap_run_folders,
-        reap_unreferenced_run_folders, run_folders_named_by_playlists,
+        LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME, is_run_folder_name,
+        list_run_folders, new_run_folder_name, reap_run_folders, reap_unreferenced_run_folders,
+        run_folders_named_by_playlists,
     };
 
     /// The direct guarantee two runs on the same channel depend on: neither can
@@ -697,6 +775,10 @@ mod run_folder_tests {
             "a folder a playlist still names must survive"
         );
         assert!(unreferenced_newer.exists());
+        assert!(
+            root.join("live.m3u8").exists(),
+            "a playlist naming a surviving folder must be left alone"
+        );
     }
 
     #[tokio::test]
@@ -751,5 +833,125 @@ mod run_folder_tests {
             brand_new_run.exists(),
             "keep_newest must protect a worker that has not produced a segment yet"
         );
+    }
+
+    /// The defect this whole change exists for, reproduced at the exact
+    /// shape it was reported in: the channel root holds `.sequence` and a
+    /// `live.m3u8` naming a run folder that is already gone (removed by the
+    /// worker's own exit-time [`reap_run_folders`], which does not consult
+    /// the playlist at all) — no run folders remain for this sweep to
+    /// remove, but the stale playlist must go, or a returning client gets a
+    /// 200 naming a segment that 404s.
+    #[tokio::test]
+    async fn reap_unreferenced_removes_a_playlist_naming_only_reaped_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        tokio::fs::write(
+            root.join(LIVE_PLAYLIST_FILE_NAME),
+            "r0000000000001-0000/live000000.ts\n",
+        )
+        .await
+        .unwrap();
+
+        let removed = reap_unreferenced_run_folders(root, false).await.unwrap();
+
+        assert_eq!(removed, 0, "the named run folder was already gone");
+        assert!(
+            !root.join(LIVE_PLAYLIST_FILE_NAME).exists(),
+            "a playlist naming nothing that survives must be removed"
+        );
+    }
+
+    /// Each playlist is judged on its own contents, not their union: a dead
+    /// subtitle playlist must not be spared by an unrelated, still-live
+    /// `live.m3u8`, and vice versa.
+    #[tokio::test]
+    async fn reap_unreferenced_judges_each_playlist_on_its_own_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let surviving = root.join("r0000000000002-0000");
+        tokio::fs::create_dir(&surviving).await.unwrap();
+        // r0000000000001-0000 is deliberately never created — the run
+        // folder it names is already gone, exactly like the reported repro.
+        tokio::fs::write(
+            root.join(LIVE_PLAYLIST_FILE_NAME),
+            "r0000000000002-0000/live000000.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join(LIVE_SUBTITLE_PLAYLIST_FILE_NAME),
+            "r0000000000001-0000/live000000.vtt\n",
+        )
+        .await
+        .unwrap();
+
+        let removed = reap_unreferenced_run_folders(root, false).await.unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(surviving.exists());
+        assert!(
+            root.join(LIVE_PLAYLIST_FILE_NAME).exists(),
+            "live.m3u8 still names a surviving folder"
+        );
+        assert!(
+            !root.join(LIVE_SUBTITLE_PLAYLIST_FILE_NAME).exists(),
+            "live_sub.m3u8 named only a folder that was already gone"
+        );
+    }
+
+    /// `keep_newest = true` is the live-worker verdict: it must protect a
+    /// brand-new worker's header-only playlist (empty segment deque, no
+    /// media lines yet) from being read as "names nothing, so delete it".
+    #[tokio::test]
+    async fn reap_unreferenced_keep_newest_protects_a_header_only_playlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let brand_new_run = root.join("r0000000000001-0000");
+        tokio::fs::create_dir(&brand_new_run).await.unwrap();
+        tokio::fs::write(
+            root.join(LIVE_PLAYLIST_FILE_NAME),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n",
+        )
+        .await
+        .unwrap();
+
+        let removed = reap_unreferenced_run_folders(root, true).await.unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(brand_new_run.exists());
+        assert!(
+            root.join(LIVE_PLAYLIST_FILE_NAME).exists(),
+            "a header-only playlist under keep_newest must survive — it is early, not stale"
+        );
+    }
+
+    /// A channel that has never run has no output folder yet, and that is
+    /// the normal resting state for most of a lineup, not a fault: both
+    /// helpers must treat a missing channel folder as zero run folders
+    /// rather than propagating read_dir's NotFound.
+    #[tokio::test]
+    async fn list_run_folders_on_a_nonexistent_channel_folder_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let never_ran = dir.path().join("never-ran");
+
+        let found = list_run_folders(&never_ran).await.unwrap();
+
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_unreferenced_on_a_nonexistent_channel_folder_returns_ok_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let never_ran = dir.path().join("never-ran");
+
+        let removed = reap_unreferenced_run_folders(&never_ran, true)
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 0);
     }
 }
