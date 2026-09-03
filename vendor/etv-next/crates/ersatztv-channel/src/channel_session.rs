@@ -8,8 +8,9 @@ use std::time::Duration;
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, OVERLAY_WANTED_FILE_NAME, OVERLAY_WRITER_POLL_INTERVAL,
-    OVERLAY_WRITER_TIMEOUT, READY_FILE_NAME, new_run_folder_name,
+    HEARTBEAT_FILE_NAME, LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME,
+    OVERLAY_WANTED_FILE_NAME, OVERLAY_WRITER_POLL_INTERVAL, OVERLAY_WRITER_TIMEOUT,
+    READY_FILE_NAME, new_run_folder_name,
 };
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
@@ -226,7 +227,7 @@ impl ChannelSession {
 
         let output_folder = channel_config.expanded_output_folder().to_owned();
         let generated_output_file = output_folder
-            .join("live.m3u8")
+            .join(LIVE_PLAYLIST_FILE_NAME)
             .into_os_string()
             .into_string()
             .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
@@ -236,7 +237,7 @@ impl ChannelSession {
         let generated_subtitle_output_file = match channel_config.normalization.subtitle.mode {
             ersatztv_channel::config::SubtitleMode::Convert => Some(
                 output_folder
-                    .join("live_sub.m3u8")
+                    .join(LIVE_SUBTITLE_PLAYLIST_FILE_NAME)
                     .into_os_string()
                     .into_string()
                     .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?,

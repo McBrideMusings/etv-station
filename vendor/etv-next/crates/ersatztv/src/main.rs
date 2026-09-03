@@ -149,10 +149,12 @@ async fn run() -> Result<(), LineupError> {
             // detaches AFTER that point, so a dead run whose viewer left later has
             // nothing tied to a spawn or an exit that would ever collect it. This
             // sweep is that collector: it periodically reaps every channel's run
-            // folders down to the live/attached one, catching exactly the run
-            // folders the exit-time reap in `channel_session::spawn` could not see
-            // yet. The one-time `empty_folder` above stays as it is — a cold start
-            // with no viewers has nothing this sweep would improve on.
+            // folders down to the live run plus every run folder the channel's
+            // current live.m3u8/live_sub.m3u8 still names (etv-station-262.1),
+            // catching exactly the run folders the exit-time reap in
+            // `channel_session::spawn` could not see yet. The one-time
+            // `empty_folder` above stays as it is — a cold start with no viewers
+            // has nothing this sweep would improve on.
             //
             // Per channel, `channel_session::reap_channel_run_folders` holds
             // `state.active`'s lock across the whole decide-then-reap step

@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use ersatztv::error::LineupError;
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, STALL_EXIT_CODE, reap_run_folders,
+    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, STALL_EXIT_CODE,
+    reap_run_folders, reap_unreferenced_run_folders,
 };
 use tokio::sync::{Mutex, watch};
 
@@ -47,7 +48,7 @@ pub(crate) async fn heartbeat_is_fresh(heartbeat_file: &Path) -> bool {
 /// wins the lock first — it lands in `active` before this function ever reads
 /// it, so `has_active_worker` sees the entry and `keep_newest` is `true`, and
 /// the spawn's own brand-new run folder is the newest one anyway, which
-/// `reap_run_folders` never removes — or this function wins the lock first —
+/// `reap_unreferenced_run_folders` never removes — or this function wins the lock first —
 /// the spawn then blocks at `active.lock().await` until the reap below has
 /// returned, so the run folder it would create does not exist yet for the
 /// reap to see or delete. There is no window where a folder is created after
@@ -61,7 +62,7 @@ pub(crate) async fn reap_channel_run_folders(
     let has_active_worker = guard.contains_key(number);
     let heartbeat_file = output_folder.join(HEARTBEAT_FILE_NAME);
     let keep_newest = has_active_worker || heartbeat_is_fresh(&heartbeat_file).await;
-    let result = reap_run_folders(output_folder, keep_newest).await;
+    let result = reap_unreferenced_run_folders(output_folder, keep_newest).await;
     drop(guard);
     result
 }
@@ -367,5 +368,82 @@ mod reap_tests {
             );
             assert!(new_run.join("live000000.ts").exists());
         }
+    }
+
+    /// Regression test for etv-station-262.1's remaining defect: the periodic
+    /// sweep must keep a dead run's folder as long as the served playlist
+    /// still names it, not just because it happens to be the newest one.
+    ///
+    /// Walks the real respawn shape: run folder A (dead, still named by
+    /// `live.m3u8`) and run folder B (the replacement worker, active in
+    /// `active`). The first sweep must leave both standing — this fails on
+    /// the old `reap_run_folders` behavior, which pops the newest (B) and
+    /// deletes A regardless of what the playlist says. Once `live.m3u8` is
+    /// rewritten to name only B, the same sweep must collect A.
+    #[tokio::test]
+    async fn sweep_keeps_a_dead_run_folder_the_live_playlist_still_names() {
+        let dir = TempDir::new().unwrap();
+        let channel_root = dir.path();
+
+        let dead_run = channel_root.join("r0000000000001-0000");
+        let new_run = channel_root.join("r0000000000002-0000");
+        tokio::fs::create_dir(&dead_run).await.unwrap();
+        tokio::fs::create_dir(&new_run).await.unwrap();
+        tokio::fs::write(dead_run.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        tokio::fs::write(new_run.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+
+        // The client's in-hand playlist: still points at the dead run's
+        // segments, which have not scrolled out of the window yet.
+        tokio::fs::write(
+            channel_root.join("live.m3u8"),
+            "r0000000000001-0000/live000000.ts\n",
+        )
+        .await
+        .unwrap();
+
+        let active: Arc<Mutex<HashMap<String, ChannelSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (_ready_sender, ready_receiver) = watch::channel(false);
+        active
+            .lock()
+            .await
+            .insert("1".to_owned(), ChannelSession { ready_receiver });
+
+        reap_channel_run_folders("1", channel_root, &active)
+            .await
+            .unwrap();
+
+        assert!(
+            dead_run.exists(),
+            "a run folder the live playlist still names must survive the sweep"
+        );
+        assert!(new_run.exists(), "the active worker's run folder survives");
+        assert!(
+            channel_root.join("live.m3u8").exists(),
+            "the playlist file itself is never a reap candidate"
+        );
+
+        // Advance the respawn: the current playlist now names only the new
+        // run's segments, so nothing protects the dead one any more.
+        tokio::fs::write(
+            channel_root.join("live.m3u8"),
+            "r0000000000002-0000/live000000.ts\n",
+        )
+        .await
+        .unwrap();
+
+        reap_channel_run_folders("1", channel_root, &active)
+            .await
+            .unwrap();
+
+        assert!(
+            !dead_run.exists(),
+            "once no playlist names it, the dead run is collected"
+        );
+        assert!(new_run.exists());
     }
 }
