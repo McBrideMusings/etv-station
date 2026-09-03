@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::HttpBody as _;
 use axum::extract::{ConnectInfo, Path, State};
@@ -17,7 +17,7 @@ use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use clap::{Parser, Subcommand};
 use ersatztv::error::LineupError;
-use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_folder};
+use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_folder, reap_run_folders};
 use tokio::signal;
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
@@ -143,6 +143,41 @@ async fn run() -> Result<(), LineupError> {
                 health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
                 device_id: lineup_config.server.device_id.clone(),
             });
+
+            // Per-run segment folders (etv-station-262) mean a channel's exit-time
+            // cleanup only ever sees the run that JUST exited — a viewer usually
+            // detaches AFTER that point, so a dead run whose viewer left later has
+            // nothing tied to a spawn or an exit that would ever collect it. This
+            // sweep is that collector: it periodically reaps every channel's run
+            // folders down to the live/attached one, catching exactly the run
+            // folders the exit-time reap in `channel_session::spawn` could not see
+            // yet. The one-time `empty_folder` above stays as it is — a cold start
+            // with no viewers has nothing this sweep would improve on.
+            {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        for channel in &state.channels {
+                            let number = channel.number();
+                            let has_active_worker = state.active.lock().await.contains_key(number);
+                            let heartbeat_file = channel.output_folder().join(HEARTBEAT_FILE_NAME);
+                            let keep_newest = has_active_worker
+                                || crate::channel_session::heartbeat_is_fresh(&heartbeat_file)
+                                    .await;
+
+                            if let Err(err) =
+                                reap_run_folders(channel.output_folder(), keep_newest).await
+                            {
+                                log::warn!(
+                                    "failed to reap run folders for channel {number}: {err}"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
 
             let addr = format!(
                 "{}:{}",

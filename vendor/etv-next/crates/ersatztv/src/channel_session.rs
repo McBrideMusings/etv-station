@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use ersatztv::error::LineupError;
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, STALL_EXIT_CODE, empty_folder,
+    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, STALL_EXIT_CODE, reap_run_folders,
 };
 use tokio::sync::{Mutex, watch};
 
@@ -16,7 +16,13 @@ use crate::channel_model::ChannelModel;
 /// judges it: the heartbeat exists and was touched within the timeout. A missing
 /// or unreadable file means nobody is watching, which is the safe reading — it
 /// counts nothing rather than blaming the channel for an ordinary idle exit.
-async fn heartbeat_is_fresh(heartbeat_file: &Path) -> bool {
+///
+/// `pub(crate)` so `main`'s periodic run-folder reap sweep can use the exact
+/// same freshness rule this module uses at exit time — a channel that goes
+/// idle between viewers must be judged consistently by both call sites, or a
+/// sweep timed just wrong could reap a run folder the exit-time check would
+/// have kept.
+pub(crate) async fn heartbeat_is_fresh(heartbeat_file: &Path) -> bool {
     let Ok(metadata) = tokio::fs::metadata(heartbeat_file).await else {
         return false;
     };
@@ -126,7 +132,7 @@ impl ChannelSession {
                 );
             }
 
-            // Clean up this channel's HLS output — the segments and .vtt
+            // Reap this run's segment folder — the segments and .vtt
             // sidecars PlaylistManager's trim never reached, because it only
             // drops a segment once a *later* one pushes it outside the
             // two-minute playlist window, and no later segment ever arrives
@@ -136,16 +142,28 @@ impl ChannelSession {
             // Done for every exit route: this point is reached whether the
             // worker returned cleanly, hit an error, or was killed out from
             // under it, since `child.wait()` above resolves either way.
-            if let Err(err) = empty_folder(&output_folder).await {
-                log::warn!("failed to clean up output folder for channel {channel_number}: {err}");
+            //
+            // Per-run segment folders (etv-station-262) mean this can target
+            // the run that just exited instead of wiping the whole channel
+            // folder: `viewer_attached` (sampled above, before this cleanup)
+            // decides whether that folder is kept — a client mid-playback
+            // still holds a playlist naming segments in it. A viewer that has
+            // not yet detached at this instant is exactly the case
+            // `keep_newest` protects; one that detaches later is caught by
+            // the periodic reap sweep in `main`, since nothing at exit time
+            // can see a detach that has not happened yet.
+            if let Err(err) = reap_run_folders(&output_folder, viewer_attached).await {
+                log::warn!("failed to reap run folders for channel {channel_number}: {err}");
             }
 
-            // Only now release the slot in `active`: `session_middleware`
-            // respawns a worker as soon as this channel's key is gone from
-            // the map, and a fresh worker would start writing new segments
-            // into `output_folder` immediately. Removing the entry before the
-            // wipe above finished would let that race and delete a live
-            // session's segments out from under it.
+            // Release the slot in `active` so `session_middleware` can spawn a
+            // replacement worker. Per-run segment folders remove the race this
+            // ordering used to guard against: a fresh worker computes its own
+            // new run-folder name and never writes into a path this reap could
+            // have just removed, so releasing the slot before or after the
+            // reap above no longer matters for correctness. Kept after it
+            // anyway, since there is no reason to invite a respawn before this
+            // exit has finished tidying up after itself.
             active.lock().await.remove(&channel_number);
 
             if ready_file.exists() {
@@ -178,5 +196,72 @@ fn channel_binary_path() -> Result<PathBuf, LineupError> {
         Err(LineupError::ChannelBinaryNotFoundAtPath(
             path.to_string_lossy().to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod reap_tests {
+    use tempfile::TempDir;
+
+    use super::{HEARTBEAT_FILE_NAME, heartbeat_is_fresh, reap_run_folders};
+
+    /// Exercises the exact call the exit-time cleanup in `spawn` makes:
+    /// `keep_newest` decided by `heartbeat_is_fresh` on a heartbeat sampled
+    /// before cleanup. No heartbeat at all reads as "nobody watching", so the
+    /// dead run's folder — the one that just exited — is removed.
+    #[tokio::test]
+    async fn a_dead_run_is_reaped_when_no_heartbeat_is_fresh() {
+        let dir = TempDir::new().unwrap();
+        let channel_root = dir.path();
+
+        let dead_run = channel_root.join("r0000000000001-0000");
+        tokio::fs::create_dir(&dead_run).await.unwrap();
+        tokio::fs::write(dead_run.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+
+        let heartbeat_file = channel_root.join(HEARTBEAT_FILE_NAME);
+        let viewer_attached = heartbeat_is_fresh(&heartbeat_file).await;
+        assert!(!viewer_attached, "no heartbeat file exists yet");
+
+        reap_run_folders(channel_root, viewer_attached)
+            .await
+            .unwrap();
+
+        assert!(
+            !dead_run.exists(),
+            "a dead run with nobody watching must be reaped"
+        );
+    }
+
+    /// The retention half of the same call: a fresh heartbeat means a client
+    /// mid-playback still holds a playlist naming segments in the run that
+    /// just exited, so the reap must leave it alone.
+    #[tokio::test]
+    async fn a_run_is_kept_when_its_heartbeat_is_fresh() {
+        let dir = TempDir::new().unwrap();
+        let channel_root = dir.path();
+
+        let live_run = channel_root.join("r0000000000001-0000");
+        tokio::fs::create_dir(&live_run).await.unwrap();
+        tokio::fs::write(live_run.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+
+        let heartbeat_file = channel_root.join(HEARTBEAT_FILE_NAME);
+        tokio::fs::write(&heartbeat_file, b"").await.unwrap();
+
+        let viewer_attached = heartbeat_is_fresh(&heartbeat_file).await;
+        assert!(viewer_attached, "a just-touched heartbeat must read fresh");
+
+        reap_run_folders(channel_root, viewer_attached)
+            .await
+            .unwrap();
+
+        assert!(
+            live_run.exists(),
+            "a run a viewer is still attached to must survive the reap"
+        );
+        assert!(live_run.join("live000000.ts").exists());
     }
 }

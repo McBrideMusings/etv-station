@@ -9,7 +9,7 @@ use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
 use ersatztv_core::{
     HEARTBEAT_FILE_NAME, OVERLAY_WANTED_FILE_NAME, OVERLAY_WRITER_POLL_INTERVAL,
-    OVERLAY_WRITER_TIMEOUT, READY_FILE_NAME, empty_folder,
+    OVERLAY_WRITER_TIMEOUT, READY_FILE_NAME, new_run_folder_name,
 };
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
@@ -156,6 +156,31 @@ struct TimingResult {
     finish: OffsetDateTime,
 }
 
+/// Prepare a fresh run folder for a new worker run, without disturbing
+/// anything else at `channel_root` — its playlists, its sequence state, or
+/// any sibling run folder a previous run left behind. Per-run segment folders
+/// (`etv-station-262`) replace the old wipe-on-respawn behavior, so there is
+/// nothing left for a `troubleshoot` run to skip: every run, troubleshooting
+/// or not, gets its own folder and leaves every other one alone.
+async fn prep_run_folder(
+    channel_root: &Path,
+    run_folder: &Path,
+    ready_file: &Path,
+) -> Result<(), ChannelError> {
+    if ready_file.exists() {
+        tokio::fs::remove_file(ready_file).await?;
+    }
+
+    tokio::fs::create_dir_all(channel_root)
+        .await
+        .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+    tokio::fs::create_dir_all(run_folder)
+        .await
+        .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+
+    Ok(())
+}
+
 pub struct ChannelSession {
     channel_config: ChannelConfig,
     playout_loader: PlayoutLoader,
@@ -170,6 +195,12 @@ pub struct ChannelSession {
 
     transcoded_until: OffsetDateTime,
     ready_file: PathBuf,
+
+    /// This run's own segment subfolder under the channel's HLS output
+    /// folder — see `etv-station-262`. Every worker run gets its own, so a
+    /// respawn never has to delete segments a client's in-hand playlist
+    /// still names.
+    run_folder: PathBuf,
 
     output_file: String,
     output_segment_template: String,
@@ -213,13 +244,22 @@ impl ChannelSession {
             ersatztv_channel::config::SubtitleMode::Burn => None,
         };
 
-        let ffmpeg_output_file = output_folder
+        // Every worker run writes its ffmpeg-facing playlist and segments into
+        // its own subfolder of the channel's output folder, so two runs can
+        // never share a path and a respawn has nothing to delete out from
+        // under a client's in-hand playlist. Only the generated playlists
+        // above (live.m3u8, live_sub.m3u8) stay at the channel root — see
+        // `etv-station-262`.
+        let run_folder_name = new_run_folder_name();
+        let run_folder = output_folder.join(&run_folder_name);
+
+        let ffmpeg_output_file = run_folder
             .join("ffmpeg.m3u8")
             .into_os_string()
             .into_string()
             .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
 
-        let output_segment_template = output_folder
+        let output_segment_template = run_folder
             .join("live%06d.ts")
             .into_os_string()
             .into_string()
@@ -228,11 +268,13 @@ impl ChannelSession {
         let ready_file = output_folder.join(READY_FILE_NAME);
 
         let playout_loader = PlayoutLoader::new(&channel_config);
-        let pts_scanner = PtsScanner::new(&channel_config);
+        let pts_scanner = PtsScanner::new(&run_folder);
         let playlist_manager = PlaylistManager::new(
             now,
             SEGMENT_SECONDS,
             output_folder.to_owned(),
+            run_folder.to_owned(),
+            run_folder_name,
             ready_file.to_owned(),
             PlaylistManagerOutputFiles {
                 generated_playlist_file: generated_output_file,
@@ -276,6 +318,7 @@ impl ChannelSession {
             hw_accel: None,
             transcoded_until: now + start_time_offset,
             ready_file,
+            run_folder,
             output_file: ffmpeg_output_file,
             output_segment_template,
             start_time_offset,
@@ -287,7 +330,7 @@ impl ChannelSession {
     }
 
     pub async fn run(&mut self, troubleshoot: bool) -> Result<(), ChannelError> {
-        self.prep_output_folder(troubleshoot).await?;
+        self.prep_output_folder().await?;
 
         self.ffmpeg_info = FfmpegInfo::load(
             &self.ffmpeg_path,
@@ -370,41 +413,28 @@ impl ChannelSession {
         }
     }
 
-    async fn prep_output_folder(&self, troubleshoot: bool) -> Result<(), ChannelError> {
+    async fn prep_output_folder(&self) -> Result<(), ChannelError> {
         let output_folder = self.channel_config.expanded_output_folder();
 
-        if self.ready_file.exists() {
-            tokio::fs::remove_file(&self.ready_file).await?;
-        }
+        prep_run_folder(output_folder, &self.run_folder, &self.ready_file).await?;
 
-        if output_folder.exists() {
-            if !troubleshoot {
-                empty_folder(output_folder)
-                    .await
-                    .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
-            }
-        } else {
-            tokio::fs::create_dir(output_folder)
-                .await
-                .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
-        }
-
-        // Stamp the heartbeat here, after the wipe above, because both timers
-        // that can end this worker read it and BOTH are inert while it is
-        // absent: PlaylistManager evaluates the idle timeout and the stall
-        // watchdog only inside `if heartbeat_file.exists()`, so with no file it
-        // never times out and never sees a viewer it could be stalled on.
+        // Stamp the heartbeat here, right after the run folder is created,
+        // because both timers that can end this worker read it and BOTH are
+        // inert while it is absent: PlaylistManager evaluates the idle timeout
+        // and the stall watchdog only inside `if heartbeat_file.exists()`, so
+        // with no file it never times out and never sees a viewer it could be
+        // stalled on.
         //
         // Until now only the server's session route wrote it, and a viewer
         // reaches that route only after this channel is ready. A worker that
         // wedged before its first segment therefore never got a heartbeat at
         // all and ran forever, holding its ffmpeg, with nothing able to reap it.
         //
-        // It belongs here rather than in the server before spawn: the wipe above
-        // would delete anything written beforehand. Stamping it is honest, not a
-        // convenient lie — a worker only ever starts because a request arrived,
-        // so at this instant someone is genuinely waiting. If they leave, nobody
-        // refreshes it and the ordinary idle timeout collects this worker.
+        // It belongs here rather than in the server before spawn: stamping it
+        // is honest, not a convenient lie — a worker only ever starts because a
+        // request arrived, so at this instant someone is genuinely waiting. If
+        // they leave, nobody refreshes it and the ordinary idle timeout
+        // collects this worker.
         let heartbeat_file = output_folder.join(HEARTBEAT_FILE_NAME);
         if let Err(err) = tokio::fs::write(&heartbeat_file, b"").await {
             log::warn!("failed to stamp initial heartbeat: {err}");
@@ -2462,5 +2492,61 @@ mod tests {
             accumulate_progress_line("progress = continue", &mut fields),
             Some("speed=1x progress=continue".to_owned())
         );
+    }
+}
+
+#[cfg(test)]
+mod prep_tests {
+    use tempfile::TempDir;
+
+    use super::prep_run_folder;
+
+    /// The direct regression test for the 404: a client's playlist can still
+    /// name segments in the previous run's folder, and a second run's prep
+    /// must not touch it.
+    #[tokio::test]
+    async fn a_second_run_leaves_a_sibling_run_folders_files_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let channel_root = dir.path();
+        let ready_file = channel_root.join(".ready");
+
+        let first_run = channel_root.join("r0000000000001-0000");
+        prep_run_folder(channel_root, &first_run, &ready_file)
+            .await
+            .unwrap();
+        tokio::fs::write(first_run.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        tokio::fs::write(first_run.join("live000000.vtt"), b"cues")
+            .await
+            .unwrap();
+
+        let second_run = channel_root.join("r0000000000002-0000");
+        prep_run_folder(channel_root, &second_run, &ready_file)
+            .await
+            .unwrap();
+
+        assert!(
+            first_run.join("live000000.ts").exists(),
+            "a new run must not delete a sibling run folder's segments"
+        );
+        assert!(first_run.join("live000000.vtt").exists());
+        assert!(second_run.is_dir(), "the new run gets its own folder");
+    }
+
+    #[tokio::test]
+    async fn removes_a_stale_ready_file_before_the_new_run() {
+        let dir = TempDir::new().unwrap();
+        let channel_root = dir.path();
+        let ready_file = channel_root.join(".ready");
+        tokio::fs::write(&ready_file, b"").await.unwrap();
+
+        let run_folder = channel_root.join("r0000000000001-0000");
+        prep_run_folder(channel_root, &run_folder, &ready_file)
+            .await
+            .unwrap();
+
+        assert!(!ready_file.exists());
+        assert!(run_folder.is_dir());
     }
 }

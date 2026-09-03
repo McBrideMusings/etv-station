@@ -1,6 +1,8 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_file};
+use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_dir_all, remove_file};
 
 mod merge;
 mod path_resolve;
@@ -21,15 +23,16 @@ pub const HEARTBEAT_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 /// A client polls one URL — `/session/{channel}/live.m3u8` — for the life of its
 /// tune-in, and RFC 8216 §6.2.1 requires `EXT-X-MEDIA-SEQUENCE` never to
 /// decrease across that URL's lifetime. But the worker is a process that exits
-/// and respawns under a client that never noticed, and each respawn wipes the
-/// output folder ([`empty_folder`]) and builds a fresh
+/// and respawns under a client that never noticed, and each respawn writes into
+/// a fresh per-run segment folder ([`new_run_folder_name`]) and builds a fresh
 /// `PlaylistManager` starting at zero. The in-memory monotonic clamp there only
 /// spans one process, which is the one span where the counter was never going to
 /// go backwards anyway.
 ///
 /// So the counters live here instead, in the session folder, which outlives any
-/// one worker. [`empty_folder`] preserves this file by name for that reason: the
-/// wipe clears the session's *media*, not its *identity*.
+/// one worker run. This file sits at the channel root, a sibling of every run
+/// folder, so it survives [`reap_run_folders`] regardless of which run folders
+/// that reap removes: the reap clears a session's *media*, not its *identity*.
 pub const SEQUENCE_FILE_NAME: &str = ".sequence";
 
 /// Touched by the channel worker before it opens a live overlay's rawvideo fifo
@@ -78,6 +81,110 @@ pub const STALL_EXIT_CODE: i32 = 75;
 
 pub const VERSION: &str = env!("ETV_VERSION_STRING");
 
+/// Prefix every run-folder name carries, so [`is_run_folder_name`] can tell one
+/// from an ordinary file at the channel root (`live.m3u8`, `.sequence`,
+/// `.heartbeat`, `.ready`, `.error-card.png`) without a registry.
+pub const RUN_FOLDER_PREFIX: &str = "r";
+
+/// Process-local counter mixed into [`new_run_folder_name`] so two runs that
+/// start within the same millisecond still sort distinctly and never collide.
+static RUN_FOLDER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A new, unique name for a worker run's own segment subfolder under a
+/// channel's HLS output folder.
+///
+/// Each worker run gets its own subfolder so a respawn never has to delete
+/// segments a client's in-hand playlist still names — see the module-level
+/// rationale on [`SEQUENCE_FILE_NAME`] and the per-run design in
+/// `etv-station-262`. The name is a fixed-width millisecond timestamp plus a
+/// zero-padded counter, in that order, so plain string comparison already
+/// equals creation order (`sort()` needs no parsing) and two runs starting in
+/// the same millisecond — realistic under test, and not impossible in
+/// production — still produce different names. See [`is_run_folder_name`] for
+/// the inverse check.
+pub fn new_run_folder_name() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let counter = RUN_FOLDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{RUN_FOLDER_PREFIX}{millis:013}-{counter:04}")
+}
+
+/// Whether `name` is shaped like a value [`new_run_folder_name`] could have
+/// produced: the prefix, then exactly 13 ASCII digits, a `-`, then exactly 4
+/// ASCII digits.
+///
+/// This is what keeps [`list_run_folders`] and [`reap_run_folders`] from ever
+/// treating `.sequence`, `.ready`, `.heartbeat`, `live.m3u8`, or
+/// `.error-card.png` — every non-run-folder thing that lives at the channel
+/// root — as a candidate to remove.
+pub fn is_run_folder_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(RUN_FOLDER_PREFIX) else {
+        return false;
+    };
+    let Some((millis, counter)) = rest.split_once('-') else {
+        return false;
+    };
+    millis.len() == 13
+        && millis.bytes().all(|b| b.is_ascii_digit())
+        && counter.len() == 4
+        && counter.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Every run folder directly under `channel_folder`, oldest first.
+///
+/// Ascending order is what lets [`reap_run_folders`] treat "the last one" as
+/// "the live or most-recently-exited run" with no separate bookkeeping.
+pub async fn list_run_folders(channel_folder: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut result = Vec::new();
+
+    let mut entries = read_dir(channel_folder).await?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if is_run_folder_name(&name) {
+            result.push(entry.path());
+        }
+    }
+
+    result.sort();
+    Ok(result)
+}
+
+/// Remove dead run folders under `channel_folder`. When `keep_newest` is
+/// `true` the single newest run folder (by [`list_run_folders`]'s ascending
+/// order) is left alone; every other run folder is removed recursively.
+///
+/// Pure mechanics only: this function has no opinion on whether a worker is
+/// live or a viewer is attached — the caller decides `keep_newest` from
+/// whatever it already knows (an `active` map entry, a fresh heartbeat) and
+/// this just acts on that verdict. Returns how many run folders were removed.
+pub async fn reap_run_folders(
+    channel_folder: &Path,
+    keep_newest: bool,
+) -> Result<usize, std::io::Error> {
+    let mut folders = list_run_folders(channel_folder).await?;
+    if keep_newest {
+        folders.pop();
+    }
+
+    let mut removed = 0;
+    for folder in folders {
+        remove_dir_all(&folder).await?;
+        removed += 1;
+    }
+
+    Ok(removed)
+}
+
 /// Empty a session's output folder, keeping the folder itself and
 /// [`SEQUENCE_FILE_NAME`].
 ///
@@ -88,6 +195,11 @@ pub const VERSION: &str = env!("ETV_VERSION_STRING");
 /// player that had already consumed segment 150 — the player then discards every
 /// lower-numbered segment the new worker offers and freezes on its last decoded
 /// frame. See [`SEQUENCE_FILE_NAME`].
+///
+/// A worker respawn no longer calls this — see [`new_run_folder_name`] and
+/// [`reap_run_folders`] for that path. What remains is the server's cold start
+/// (`main` empties the whole output root once, before anything is watching) and
+/// the sequence-file preservation behavior this module's tests pin.
 pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io::Error> {
     if !output_folder.exists() {
         create_dir_all(output_folder).await?;
@@ -261,5 +373,111 @@ mod empty_folder_tests {
         empty_folder(&root).await.unwrap();
 
         assert!(root.is_dir());
+    }
+}
+
+#[cfg(test)]
+mod run_folder_tests {
+    use super::{is_run_folder_name, list_run_folders, new_run_folder_name, reap_run_folders};
+
+    /// The direct guarantee two runs on the same channel depend on: neither can
+    /// ever produce the same segment path, because their run folders never
+    /// collide, and plain string order already matches creation order so a
+    /// caller never has to parse the name back apart to sort it.
+    #[test]
+    fn two_consecutive_run_folder_names_differ_and_sort_in_creation_order() {
+        let a = new_run_folder_name();
+        let b = new_run_folder_name();
+
+        assert_ne!(a, b, "two runs must never share a segment folder");
+
+        let mut sorted = [b.clone(), a.clone()];
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            [a, b],
+            "plain string sort must already equal creation order"
+        );
+    }
+
+    #[test]
+    fn recognizes_only_run_folder_shaped_names() {
+        assert!(is_run_folder_name(&new_run_folder_name()));
+        assert!(is_run_folder_name("r1234567890123-0007"));
+
+        for not_a_run_folder in [
+            ".sequence",
+            ".ready",
+            ".heartbeat",
+            "live.m3u8",
+            "live_sub.m3u8",
+            ".error-card.png",
+            "r123-0000",           // millis too short
+            "r1234567890123",      // no counter
+            "x1234567890123-0000", // wrong prefix
+        ] {
+            assert!(
+                !is_run_folder_name(not_a_run_folder),
+                "{not_a_run_folder:?} must not be recognized as a run folder"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_only_run_folders_in_creation_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        tokio::fs::write(root.join("live.m3u8"), b"").await.unwrap();
+        tokio::fs::write(root.join(".sequence"), b"{}")
+            .await
+            .unwrap();
+
+        let older = root.join("r0000000000001-0000");
+        let newer = root.join("r0000000000002-0000");
+        tokio::fs::create_dir(&newer).await.unwrap();
+        tokio::fs::create_dir(&older).await.unwrap();
+
+        let found = list_run_folders(root).await.unwrap();
+
+        assert_eq!(found, vec![older, newer]);
+    }
+
+    #[tokio::test]
+    async fn keep_newest_removes_every_run_folder_but_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let older = root.join("r0000000000001-0000");
+        let newer = root.join("r0000000000002-0000");
+        tokio::fs::create_dir(&older).await.unwrap();
+        tokio::fs::create_dir(&newer).await.unwrap();
+        tokio::fs::write(newer.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+
+        let removed = reap_run_folders(root, true).await.unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!older.exists(), "the dead run folder must be gone");
+        assert!(newer.exists(), "the newest run folder must survive");
+        assert!(newer.join("live000000.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn not_keeping_newest_removes_every_run_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let older = root.join("r0000000000001-0000");
+        let newer = root.join("r0000000000002-0000");
+        tokio::fs::create_dir(&older).await.unwrap();
+        tokio::fs::create_dir(&newer).await.unwrap();
+
+        let removed = reap_run_folders(root, false).await.unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!older.exists());
+        assert!(!newer.exists());
     }
 }

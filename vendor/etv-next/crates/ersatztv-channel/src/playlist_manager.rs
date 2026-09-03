@@ -61,7 +61,18 @@ pub struct SubtitleSource {
 
 #[derive(Clone)]
 pub struct PlaylistManager {
+    /// Channel root: where the generated playlists (`live.m3u8`,
+    /// `live_sub.m3u8`), `.heartbeat`, and [`SEQUENCE_FILE_NAME`] live, and
+    /// what `write_atomically` uses as its rename-source directory — the same
+    /// filesystem as `segment_folder`, so a rename into the run folder is
+    /// still atomic.
     output_folder: PathBuf,
+    /// This run's own segment subfolder of `output_folder`, where `.ts`
+    /// segments and their `.vtt` sidecars are scanned for and trimmed.
+    segment_folder: PathBuf,
+    /// `segment_folder`'s own name, prefixed onto every segment path this
+    /// manager emits so a playlist line reads `<run>/live000000.ts`.
+    run_folder_name: String,
     ready_file: PathBuf,
     heartbeat_file: PathBuf,
     sequence_file: PathBuf,
@@ -136,6 +147,8 @@ impl PlaylistManager {
         channel_start_time: OffsetDateTime,
         target_duration: u32,
         output_folder: PathBuf,
+        segment_folder: PathBuf,
+        run_folder_name: String,
         ready_file: PathBuf,
         output_files: PlaylistManagerOutputFiles,
     ) -> PlaylistManager {
@@ -146,6 +159,8 @@ impl PlaylistManager {
 
         PlaylistManager {
             output_folder,
+            segment_folder,
+            run_folder_name,
             ready_file,
             heartbeat_file,
             sequence_file,
@@ -222,9 +237,16 @@ impl PlaylistManager {
 
         self.last_progress = OffsetDateTime::now_utc();
 
-        // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
+        // overwrite ffmpeg's playlist with a generated playlist (containing
+        // *all* segments). ffmpeg.m3u8 lives inside the run folder alongside
+        // the segments themselves (`-hls_flags append_list` reads it back to
+        // continue numbering), and ffmpeg always writes bare basenames when a
+        // segment shares its playlist's directory — so this must regenerate it
+        // in that same bare-basename form, not the run-prefixed URI the
+        // client-facing playlists below carry.
         if Path::new(&self.generated_playlist_file).exists() {
-            let generated_playlist = self.generate_playlist(|s| s.to_owned(), None)?;
+            let generated_playlist =
+                self.generate_playlist(|s| s.rsplit('/').next().unwrap_or(s).to_owned(), None)?;
             write_atomically(
                 &self.output_folder,
                 &self.ffmpeg_playlist_file,
@@ -237,19 +259,22 @@ impl PlaylistManager {
     }
 
     pub async fn update(&mut self) -> Result<(), ChannelError> {
-        // scan for segments on disk
+        // scan for segments on disk, inside this run's own segment folder
         let mut new_segment_files: VecDeque<String> = VecDeque::new();
-        let mut entries = tokio::fs::read_dir(&self.output_folder).await?;
+        let mut entries = tokio::fs::read_dir(&self.segment_folder).await?;
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Some(file_name) = entry.file_name().to_str()
                 && file_name.ends_with(".ts")
-                && !self.segments.iter().any(|s| s.path == file_name)
             {
-                new_segment_files.push_back(file_name.to_owned());
+                let uri = format!("{}/{file_name}", self.run_folder_name);
+                if !self.segments.iter().any(|s| s.path == uri) {
+                    new_segment_files.push_back(file_name.to_owned());
+                }
             }
         }
 
-        // get all segment durations from extinf tags in ffmpeg playlist
+        // get all segment durations from extinf tags in ffmpeg playlist,
+        // keyed by basename — see get_new_segment_durations for why
         let new_segment_durations: HashMap<String, f64> = self.get_new_segment_durations().await?;
 
         // filter out segments without a known duration
@@ -261,10 +286,13 @@ impl PlaylistManager {
         }
         sorted_new_segments.sort();
 
-        // add new segments
+        // add new segments, as run-relative URIs (`<run>/live000000.ts`) so
+        // the client-facing playlists point into this run's own folder
         for file in sorted_new_segments {
+            let uri = format!("{}/{file}", self.run_folder_name);
+
             if self.pending_discontinuity {
-                self.discontinuity_before.insert(file.to_owned());
+                self.discontinuity_before.insert(uri.clone());
                 self.pending_discontinuity = false;
             }
 
@@ -280,7 +308,7 @@ impl PlaylistManager {
             let program_date_time = self.last_segment_end;
 
             self.segments.push_back(Segment {
-                path: file.clone(),
+                path: uri.clone(),
                 program_date_time,
                 duration,
             });
@@ -288,7 +316,7 @@ impl PlaylistManager {
             self.last_segment_end += Duration::from_secs_f64(duration);
             self.last_progress = OffsetDateTime::now_utc();
 
-            let vtt_path = format!("{}.vtt", file.strip_suffix(".ts").unwrap_or(&file));
+            let vtt_path = format!("{}.vtt", uri.strip_suffix(".ts").unwrap_or(&uri));
             let vtt_full = self.output_folder.join(&vtt_path);
             let mpegts_90khz = (((self.pts_offset.unwrap_or_default().duration.as_secs_f64()
                 + (program_date_time - self.current_session_start).as_seconds_f64())
@@ -507,6 +535,17 @@ impl PlaylistManager {
         Ok(playlist)
     }
 
+    /// Duration for each segment named in `ffmpeg.m3u8`, keyed by the segment's
+    /// bare basename.
+    ///
+    /// Keying on the basename — not the raw line — matters because two
+    /// different things write this same file across a session: ffmpeg itself
+    /// appends bare basenames (`live000000.ts`) as it produces segments, since
+    /// the playlist and its segments share the run folder, but
+    /// [`Self::before_new_pipeline`] periodically overwrites it wholesale with
+    /// a generated playlist — which, by design, also carries bare basenames,
+    /// but a mismatch either way would silently drop every segment: `update`
+    /// filters out any segment file whose name is not a key in this map.
     async fn get_new_segment_durations(&self) -> Result<HashMap<String, f64>, ChannelError> {
         let mut result: HashMap<String, f64> = HashMap::new();
 
@@ -520,7 +559,7 @@ impl PlaylistManager {
                     && i + 2 < lines.len()
                     && lines[i + 2].ends_with(".ts")
                 {
-                    let segment_name = lines[i + 2];
+                    let segment_name = lines[i + 2].rsplit('/').next().unwrap_or(lines[i + 2]);
                     let inf_split: Vec<&str> =
                         lines[i].split(':').map(|s| s.trim_matches(',')).collect();
                     if let Ok(duration) = inf_split[1].parse::<f64>() {
@@ -658,18 +697,31 @@ mod tests {
     /// A manager whose newest segment ends at `last_segment_end`. Passing that as
     /// the channel start time is how a session that has never produced a segment
     /// looks too — the field only ever advances when one is added.
+    ///
+    /// `dir` plays the channel root; every manager built here gets the same
+    /// run folder name, which is fine — these tests build at most one manager
+    /// alive at a time per directory, so nothing collides.
     async fn manager(dir: &Path, last_segment_end: OffsetDateTime) -> PlaylistManager {
         let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let run_folder_name = "r0000000000000-0000".to_owned();
+        let segment_folder = dir.join(&run_folder_name);
+        tokio::fs::create_dir_all(&segment_folder).await.unwrap();
+        let ffmpeg_playlist_file = segment_folder
+            .join("ffmpeg.m3u8")
+            .to_string_lossy()
+            .into_owned();
 
         PlaylistManager::new(
             last_segment_end,
             SEGMENT_SECONDS,
             dir.to_path_buf(),
+            segment_folder,
+            run_folder_name,
             dir.join(".ready"),
             PlaylistManagerOutputFiles {
                 generated_playlist_file: file("live.m3u8"),
                 generated_subtitle_playlist_file: Some(file("live_sub.m3u8")),
-                ffmpeg_playlist_file: file("ffmpeg.m3u8"),
+                ffmpeg_playlist_file,
             },
         )
         .await
@@ -772,12 +824,14 @@ mod tests {
     }
 
     /// Give `pm` `count` segments, as `update` would once ffmpeg had written
-    /// them, without needing ffmpeg to have written anything.
+    /// them, without needing ffmpeg to have written anything. Paths come out
+    /// run-relative, exactly as `update` produces them, so a test can assert
+    /// on the real URI shape a client is served.
     fn push_segments(pm: &mut PlaylistManager, count: usize) {
         for i in 0..count {
             let program_date_time = pm.last_segment_end;
             pm.segments.push_back(Segment {
-                path: format!("live{i:06}.ts"),
+                path: format!("{}/live{i:06}.ts", pm.run_folder_name),
                 duration: pm.target_duration_f64,
                 program_date_time,
             });
@@ -838,7 +892,7 @@ mod tests {
         first.discontinuity_sequence = 2;
         first
             .discontinuity_before
-            .insert("live000002.ts".to_owned());
+            .insert(format!("{}/live000002.ts", first.run_folder_name));
         first.update().await.unwrap();
 
         // Two already trimmed past, one still held ahead of a live segment.
@@ -923,13 +977,60 @@ mod tests {
             .parse()
             .unwrap();
 
+        let run = &pm.run_folder_name;
         assert_eq!(listed.len(), 10);
         assert_eq!(
             listed.last().copied(),
-            Some("live000024.ts"),
+            Some(format!("{run}/live000024.ts")).as_deref(),
             "the window must end on the newest segment held, not the tenth"
         );
-        assert_eq!(listed.first().copied(), Some("live000015.ts"));
+        assert_eq!(
+            listed.first().copied(),
+            Some(format!("{run}/live000015.ts")).as_deref()
+        );
         assert_eq!(published, 15);
+    }
+
+    /// The direct assertion for `etv-station-262`: segments a manager scans
+    /// off disk get a run-relative URI, and the playlists naming them still
+    /// land at the channel root — not inside the run folder.
+    #[tokio::test]
+    async fn segments_get_run_relative_uris_and_playlists_land_at_the_channel_root() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        let run = pm.run_folder_name.clone();
+        let segment_folder = dir.path().join(&run);
+
+        tokio::fs::write(segment_folder.join("live000000.ts"), b"segment")
+            .await
+            .unwrap();
+        // Shape matches what get_new_segment_durations expects: an EXTINF
+        // line, a PROGRAM-DATE-TIME line, then the bare segment basename —
+        // the same three-line block generate_playlist emits, and the shape
+        // ffmpeg's own playlist takes too.
+        tokio::fs::write(
+            segment_folder.join("ffmpeg.m3u8"),
+            "#EXTM3U\n#EXTINF:6.000000,\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.000+00:00\nlive000000.ts\n",
+        )
+        .await
+        .unwrap();
+
+        pm.update().await.unwrap();
+
+        assert!(
+            dir.path().join("live.m3u8").exists(),
+            "the generated playlist must be written at the channel root, not the run folder"
+        );
+        let playlist = tokio::fs::read_to_string(dir.path().join("live.m3u8"))
+            .await
+            .unwrap();
+        assert!(
+            playlist
+                .lines()
+                .any(|l| l == format!("{run}/live000000.ts")),
+            "the playlist line must point into the run folder: {playlist}"
+        );
     }
 }
