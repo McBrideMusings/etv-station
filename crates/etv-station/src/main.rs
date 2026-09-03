@@ -123,20 +123,39 @@ struct Cli {
     refresh_channel: Option<String>,
 
     /// Read the named channel's chunk files, take the next `--next` items
-    /// from now forward, and write a plain-text report naming each item and
-    /// its audit trail, then exit. Named the same way `--refresh-channel`
-    /// accepts a channel (exact name, bare name, channel number, or `all`).
+    /// from now forward, and write a report naming each item, its audit
+    /// trail, and the overlay config in effect for it, then exit. Named the
+    /// same way `--refresh-channel` accepts a channel (exact name, bare
+    /// name, channel number, or `all`).
+    ///
+    /// With `--list` and no channel name, lists every channel instead of
+    /// reporting one — see `--list`'s own doc comment.
     ///
     /// Reads only the chunk files already on disk: no generation runs, no
     /// catalog is opened, and no plugin is evaluated (ADR 0011) — this
     /// reports what will actually air, not what a re-simulation believes
     /// would air.
-    #[arg(long, value_name = "CHANNEL")]
+    #[arg(long, value_name = "CHANNEL", num_args = 0..=1, default_missing_value = "")]
     audit: Option<String>,
 
     /// With `--audit`, how many upcoming items to report.
     #[arg(long, value_name = "N", requires = "audit", default_value_t = 10)]
     next: usize,
+
+    /// With `--audit`, output format for the report: `text` (default, the
+    /// existing human-readable rendering, byte-identical to before this
+    /// flag existed) or `json` (the EPG TUI's shape — see
+    /// `audit_report::render_json`).
+    #[arg(long, value_enum, requires = "audit", default_value_t = ReportFormat::Text)]
+    format: ReportFormat,
+
+    /// With `--audit` and no channel name, list every channel in the station
+    /// config instead of reporting one: its folder name, its declared dial
+    /// number (the same one ETV-next writes into `channelN.json` and the
+    /// XMLTV guide shows as `ersatztv.<N>`), and its display name. Lets a
+    /// caller map an XMLTV channel id back onto a channel folder.
+    #[arg(long, requires = "audit")]
+    list: bool,
 
     /// Check every `*.rhai` in this directory against the plugin hook
     /// contract, print one line per script, and exit. Non-zero if any script
@@ -158,6 +177,14 @@ struct Cli {
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum LogFormat {
     Pretty,
+    Json,
+}
+
+/// `--audit`'s output format. Distinct from [`LogFormat`] — one names how the
+/// process logs, the other names how the report it writes is shaped.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    Text,
     Json,
 }
 
@@ -221,7 +248,10 @@ fn main() -> ExitCode {
     }
 
     if let Some(target) = cli.audit.as_deref() {
-        return audit(config, target, cli.next);
+        if cli.list {
+            return list_channels(config, cli.format);
+        }
+        return audit(config, target, cli.next, cli.format);
     }
 
     init_tracing(cli.log_format);
@@ -704,13 +734,14 @@ fn resolve_channels<'a>(
 }
 
 /// Read `target`'s chunk files, take the next `next` items from now forward,
-/// and write a plain-text audit report to a temp file, then print its path.
+/// and write an audit report (text or JSON, per `format`) to a temp file,
+/// then print its path.
 ///
 /// Reads only the chunk files already on disk: no catalog is opened and no
 /// plugin runs on this path, which is the whole point (ADR 0011) — the
 /// report describes what will actually air, not what a re-simulation of a
 /// plugin's `pick()` believes would air.
-fn audit(config_path: &Path, target: &str, next: usize) -> ExitCode {
+fn audit(config_path: &Path, target: &str, next: usize, format: ReportFormat) -> ExitCode {
     let station = match config::load(config_path) {
         Ok(s) => s,
         Err(err) => {
@@ -780,14 +811,93 @@ fn audit(config_path: &Path, target: &str, next: usize) -> ExitCode {
         }
     };
 
-    let report = audit_report::render(&channel.name, now, &items);
-    let path = std::env::temp_dir().join(format!("etv-station-audit-{}.txt", channel.name));
+    let (report, extension) = match format {
+        ReportFormat::Text => (audit_report::render(&channel.name, now, &items), "txt"),
+        ReportFormat::Json => (
+            audit_report::render_json(&channel.name, now, &items),
+            "json",
+        ),
+    };
+    let path = std::env::temp_dir().join(format!("etv-station-audit-{}.{extension}", channel.name));
     if let Err(err) = std::fs::write(&path, report) {
         eprintln!("audit: writing {}: {err}", path.display());
         return ExitCode::from(1);
     }
     println!("{}", path.display());
     ExitCode::SUCCESS
+}
+
+/// One line of `--audit --list`'s output: a channel's folder name, its
+/// declared dial number, and its display name.
+struct ChannelListing {
+    name: String,
+    number: i64,
+    display_name: String,
+}
+
+/// Every channel in the station config, keyed by the same dial number
+/// `etv_next.rs`'s `ChannelRender::number` writes into `channelN.json` —
+/// read from the identical field (`ch.config.number`), never recomputed, so
+/// the two cannot drift. `display_name` falls back to the identity, mirroring
+/// `ChannelRender`'s and `etv_next.rs`'s own fallback (#158).
+fn channel_listing(station: &config::Station) -> Vec<ChannelListing> {
+    station
+        .channels
+        .iter()
+        .map(|ch| ChannelListing {
+            name: ch.name.clone(),
+            number: ch.config.number,
+            display_name: ch
+                .config
+                .display_name
+                .clone()
+                .unwrap_or_else(|| ch.name.clone()),
+        })
+        .collect()
+}
+
+/// Load the station config and print `--audit --list`'s channel listing,
+/// text or JSON per `format`.
+fn list_channels(config_path: &Path, format: ReportFormat) -> ExitCode {
+    let station = match config::load(config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("audit: failed to load configuration: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let listing = channel_listing(&station);
+    match format {
+        ReportFormat::Json => {
+            let listed: Vec<serde_json::Value> = listing
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "name": c.name,
+                        "number": c.number,
+                        "display_name": c.display_name,
+                    })
+                })
+                .collect();
+            match serde_json::to_string_pretty(&listed) {
+                Ok(json) => {
+                    println!("{json}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("audit: serializing channel list: {err}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        ReportFormat::Text => {
+            for c in &listing {
+                println!("{}\t{}\t{}", c.number, c.name, c.display_name);
+            }
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
@@ -935,5 +1045,87 @@ fn init_tracing(format: LogFormat) {
     match format {
         LogFormat::Pretty => builder.init(),
         LogFormat::Json => builder.json().init(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal but real channel config: one entries-block with one lavfi
+    /// item, which is all `validate::validate_channel` requires to accept it
+    /// — the same shape `config/load.rs`'s own `resolves_path_referenced_block`
+    /// test writes.
+    fn write_channel_toml(dir: &Path, filename: &str, number: i64, display_name: Option<&str>) {
+        let display_line = display_name
+            .map(|d| format!("display_name = {d:?}\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            dir.join(filename),
+            format!(
+                "number = {number}\n\
+                 {display_line}\
+                 [[rule.blocks]]\n\
+                 order = \"manual\"\n\
+                 [[rule.blocks.entries]]\n\
+                 kind = \"item\"\n\
+                 [rule.blocks.entries.source]\n\
+                 kind = \"lavfi\"\n\
+                 params = \"testsrc\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_station_toml(dir: &Path, channels: &[&str]) {
+        let channel_list = channels
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.join("station.toml"),
+            format!(
+                "output_base = {:?}\n\
+                 channels = [{channel_list}]\n\
+                 [normalization.audio]\n\
+                 [normalization.video]\n",
+                dir.join("out").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `--list --format json`'s `number` for each channel must be exactly the
+    /// declared `number:` — the same field `etv_next.rs`'s `ChannelRender`
+    /// reads (`ch.config.number`) to write `channelN.json`. Two channels with
+    /// non-sequential numbers proves this isn't secretly positional.
+    #[test]
+    fn channel_listing_number_matches_the_declared_config_field() {
+        let dir = tempfile::tempdir().unwrap();
+        write_channel_toml(dir.path(), "a.toml", 7, Some("Channel A"));
+        write_channel_toml(dir.path(), "b.toml", 3, None);
+        write_station_toml(dir.path(), &["a.toml", "b.toml"]);
+
+        let station = config::load(&dir.path().join("station.toml")).unwrap();
+        let listing = channel_listing(&station);
+
+        assert_eq!(listing.len(), 2);
+        let a = listing.iter().find(|c| c.name == "a").unwrap();
+        assert_eq!(a.number, 7, "must be the declared number, not a position");
+        assert_eq!(a.display_name, "Channel A");
+
+        let b = listing.iter().find(|c| c.name == "b").unwrap();
+        assert_eq!(b.number, 3);
+        // No `display_name:` authored — falls back to identity, matching
+        // `etv_next.rs`'s `ChannelRender`/render fallback (#158).
+        assert_eq!(b.display_name, "b");
+
+        // Cross-checked directly against the field `etv_next.rs` uses to
+        // build `ChannelRender` — same source, not a second computation.
+        for ch in &station.channels {
+            let listed = listing.iter().find(|c| c.name == ch.name).unwrap();
+            assert_eq!(listed.number, ch.config.number);
+        }
     }
 }

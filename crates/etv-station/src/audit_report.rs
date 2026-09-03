@@ -15,6 +15,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use ersatztv_playout::playout::Playout;
+use etv_overlay::overlay_spec::OverlaySpec;
+use etv_overlay::overlay_timeline::OverlayTimelineSource;
 use time::OffsetDateTime;
 
 use crate::errors::StationError;
@@ -30,6 +32,13 @@ pub struct ReportItem {
     pub finish: OffsetDateTime,
     pub title: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    /// The overlay config in effect at `start`: the covering span's spec, the
+    /// channel's `base` for an instant no span covers, `None` for a span that
+    /// explicitly draws nothing, and `None` for every item on a channel with
+    /// no `overlay.json` on disk at all. Resolved by
+    /// [`etv_overlay::overlay_timeline::OverlayTimeline::spec_at`], never
+    /// reimplemented here.
+    pub overlay_spec: Option<OverlaySpec>,
 }
 
 /// Read `output_folder`'s chunk files, discard chunks that have already
@@ -45,6 +54,13 @@ pub async fn upcoming(
     next: usize,
 ) -> Result<Vec<ReportItem>, StationError> {
     let files = scan::scan_output_folder(output_folder).await?;
+
+    // Best-effort: a channel with no `overlay.json` on disk (or one this
+    // process cannot parse) leaves `overlay_source` unloaded, and
+    // `spec_at` on an unloaded source returns `None` for every item — which
+    // is exactly "no overlay configured" for this report, not an error.
+    let mut overlay_source = OverlayTimelineSource::new(output_folder);
+    let _ = overlay_source.refresh();
 
     let mut items: Vec<ReportItem> = Vec::new();
     for file in &files {
@@ -74,12 +90,14 @@ pub async fn upcoming(
                 .program
                 .as_ref()
                 .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
+            let overlay_spec = overlay_source.spec_at(item.start).cloned();
             items.push(ReportItem {
                 id: item.id,
                 start: item.start,
                 finish: item.finish,
                 title,
                 metadata: item.metadata,
+                overlay_spec,
             });
         }
     }
@@ -117,6 +135,77 @@ pub fn render(channel: &str, generated_at: OffsetDateTime, items: &[ReportItem])
         render_audit_trail(&mut out, item.metadata.as_ref());
     }
     out
+}
+
+/// Render `items` as the JSON shape the EPG TUI reads: `{channel,
+/// generated_at, items: [{id, start, finish, title, overlay_spec, audit,
+/// metadata}]}`.
+///
+/// `audit` is `metadata.audit` verbatim (an empty array when the key is
+/// absent, mirroring [`render_audit_trail`]'s "unexplained" case rather than
+/// omitting the field), and `metadata` is everything else in the blob with
+/// the `audit` key removed — so a consumer sees the per-stage records under
+/// their own key without them being duplicated inside `metadata` too.
+/// `overlay_spec` is the whole [`OverlaySpec`], serialized exactly as
+/// `overlay.json` already holds it, or `null` — never an invented identity
+/// string, since `OverlaySpec` itself carries no id, name or path.
+pub fn render_json(channel: &str, generated_at: OffsetDateTime, items: &[ReportItem]) -> String {
+    let rendered_items: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            let (audit, metadata) = split_audit(item.metadata.as_ref());
+            serde_json::json!({
+                "id": item.id,
+                "start": rfc3339(item.start),
+                "finish": rfc3339(item.finish),
+                "title": item.title,
+                "overlay_spec": item.overlay_spec,
+                "audit": audit,
+                "metadata": metadata,
+            })
+        })
+        .collect();
+
+    let report = serde_json::json!({
+        "channel": channel,
+        "generated_at": rfc3339(generated_at),
+        "items": rendered_items,
+    });
+    serde_json::to_string_pretty(&report).expect("report JSON is built entirely from owned data")
+}
+
+/// `t` as an RFC3339 string — the same wire format `PlayoutItem.start`/
+/// `.finish` already use (`#[serde(with = "time::serde::rfc3339")]` in
+/// `ersatztv_playout::playout`), so a consumer parses every timestamp in this
+/// report the one way it already has to parse a chunk file's own timestamps.
+fn rfc3339(t: OffsetDateTime) -> String {
+    t.format(&time::format_description::well_known::Rfc3339)
+        .expect("an OffsetDateTime read back from a chunk file always formats as RFC3339")
+}
+
+/// Split `metadata` into its `audit` value and the rest of the blob with the
+/// `audit` key removed. `None` metadata, and metadata that is not an object,
+/// render as an empty audit array and a `null` metadata object — the JSON
+/// equivalent of [`render_audit_trail`]'s "unexplained" line.
+///
+/// An `audit` key that is present passes through **verbatim, whatever its
+/// shape**, and is not coerced to an array. [`crate::score`] refuses a
+/// non-object metadata blob at pick time, so a non-array `audit` should be
+/// unreachable; if one ever arrives it is data corruption, and a reader
+/// seeing the wrong shape is more use than this function silently emptying it.
+/// A consumer iterating `audit` therefore checks it is a list first.
+fn split_audit(metadata: Option<&serde_json::Value>) -> (serde_json::Value, serde_json::Value) {
+    let Some(serde_json::Value::Object(map)) = metadata else {
+        return (
+            serde_json::Value::Array(Vec::new()),
+            serde_json::Value::Null,
+        );
+    };
+    let mut rest = map.clone();
+    let audit = rest
+        .remove("audit")
+        .unwrap_or(serde_json::Value::Array(Vec::new()));
+    (audit, serde_json::Value::Object(rest))
 }
 
 fn render_audit_trail(out: &mut String, metadata: Option<&serde_json::Value>) {
@@ -276,6 +365,8 @@ fn format_value(v: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use ersatztv_playout::playout::{Playout, PlayoutItem, ProgramMetadata};
+    use etv_overlay::overlay_spec::PixelFormat;
+    use etv_overlay::overlay_timeline::{OverlaySpan, OverlayTimeline};
     use time::Duration;
     use time::macros::datetime;
 
@@ -505,5 +596,184 @@ mod tests {
         let straddler_count = items.iter().filter(|i| i.id == "straddler").count();
         assert_eq!(straddler_count, 1, "boundary item must not be duplicated");
         assert_eq!(items.len(), 2, "before + straddler, deduped");
+    }
+
+    fn overlay_spec_fixture(framerate: u32) -> OverlaySpec {
+        OverlaySpec {
+            width: 1280,
+            height: 720,
+            framerate,
+            pixel_format: PixelFormat::Rgba8,
+            script: None,
+            config: None,
+            layers: vec![],
+        }
+    }
+
+    fn hand_built_item(overlay_spec: Option<OverlaySpec>) -> ReportItem {
+        ReportItem {
+            id: "entry-0".to_string(),
+            start: datetime!(2026-04-20 12:00 UTC),
+            finish: datetime!(2026-04-20 12:30 UTC),
+            title: Some("Title 0".to_string()),
+            metadata: Some(serde_json::json!({
+                "audit": [
+                    { "stage": "pool", "by": "taste-cosine", "verdict": "picked" }
+                ],
+                "other_key": "kept",
+            })),
+            overlay_spec,
+        }
+    }
+
+    /// `render_json`'s documented shape: `{channel, generated_at, items:
+    /// [{id, start, finish, title, overlay_spec, audit, metadata}]}`, with
+    /// `audit` split out of `metadata` verbatim and `metadata` holding
+    /// everything else.
+    #[test]
+    fn render_json_matches_the_documented_shape() {
+        let generated_at = datetime!(2026-04-20 12:00 UTC);
+        let item = hand_built_item(Some(overlay_spec_fixture(30)));
+        let report = render_json("ch", generated_at, std::slice::from_ref(&item));
+        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+        assert_eq!(parsed["channel"], "ch");
+        assert!(parsed["generated_at"].is_string());
+        let items = parsed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+
+        let rendered = &items[0];
+        assert_eq!(rendered["id"], "entry-0");
+        assert!(rendered["start"].is_string());
+        assert!(rendered["finish"].is_string());
+        assert_eq!(rendered["title"], "Title 0");
+        assert_eq!(
+            rendered["overlay_spec"]["framerate"], 30,
+            "overlay_spec is the whole OverlaySpec object, not an id string"
+        );
+        assert_eq!(
+            rendered["audit"],
+            serde_json::json!([{ "stage": "pool", "by": "taste-cosine", "verdict": "picked" }]),
+        );
+        assert_eq!(
+            rendered["metadata"],
+            serde_json::json!({ "other_key": "kept" }),
+            "metadata carries everything except audit, which lives under its own key"
+        );
+        assert!(
+            rendered["metadata"].get("audit").is_none(),
+            "audit must not also be duplicated inside metadata"
+        );
+    }
+
+    /// An item whose metadata has no `audit` key (or no metadata at all)
+    /// renders an empty array, mirroring `render_audit_trail`'s
+    /// "unexplained" case — never an omitted field.
+    #[test]
+    fn missing_audit_key_renders_an_empty_array_not_an_omitted_field() {
+        let mut item = hand_built_item(None);
+        item.metadata = Some(serde_json::json!({ "some_other_key": 1 }));
+        let report = render_json("ch", datetime!(2026-04-20 12:00 UTC), &[item]);
+        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(parsed["items"][0]["audit"], serde_json::json!([]));
+
+        let mut no_metadata_item = hand_built_item(None);
+        no_metadata_item.metadata = None;
+        let report = serde_json::from_str::<serde_json::Value>(&render_json(
+            "ch",
+            datetime!(2026-04-20 12:00 UTC),
+            &[no_metadata_item],
+        ))
+        .unwrap();
+        assert_eq!(report["items"][0]["audit"], serde_json::json!([]));
+        assert!(report["items"][0]["metadata"].is_null());
+    }
+
+    /// A serialized `overlay_spec` object deserializes back into an
+    /// `OverlaySpec` — a consumer writes `render_json`'s output to a file and
+    /// hands it to `etv-overlay dump-text`, so the round trip must hold.
+    #[test]
+    fn overlay_spec_round_trips_through_the_rendered_json() {
+        let spec = overlay_spec_fixture(30);
+        let item = hand_built_item(Some(spec.clone()));
+        let report = render_json("ch", datetime!(2026-04-20 12:00 UTC), &[item]);
+        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+        let round_tripped: OverlaySpec =
+            serde_json::from_value(parsed["items"][0]["overlay_spec"].clone()).unwrap();
+        assert_eq!(round_tripped, spec);
+    }
+
+    /// Write a channel's `overlay.json` timeline the same way the station
+    /// writes it, so `upcoming` can resolve each item's `overlay_spec`
+    /// exactly as the daemon would.
+    fn write_overlay_timeline(folder: &Path, timeline: &OverlayTimeline) {
+        std::fs::write(
+            folder.join(etv_overlay::overlay_timeline::OVERLAY_TIMELINE_FILE_NAME),
+            serde_json::to_vec(timeline).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A covering span's spec, `base` for an uncovered instant, `None` for a
+    /// span that explicitly draws nothing, and `None` throughout for a
+    /// channel with no `overlay.json` — all resolved via
+    /// `OverlayTimeline::spec_at`, never reimplemented in `upcoming`.
+    #[tokio::test]
+    async fn overlay_spec_follows_the_timeline_fallback_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three half-hour items: [12:00,12:30) covered by a span, [12:30,13:00)
+        // covered by a span that draws nothing, [13:00,13:30) uncovered.
+        write_chunk(dir.path(), datetime!(2026-04-20 12:00 UTC), 3, no_audit).await;
+
+        let base = overlay_spec_fixture(30);
+        let covering = overlay_spec_fixture(31);
+        let timeline = OverlayTimeline {
+            base: base.clone(),
+            spans: vec![
+                OverlaySpan {
+                    start: datetime!(2026-04-20 12:00 UTC),
+                    finish: datetime!(2026-04-20 12:30 UTC),
+                    spec: Some(covering.clone()),
+                },
+                OverlaySpan {
+                    start: datetime!(2026-04-20 12:30 UTC),
+                    finish: datetime!(2026-04-20 13:00 UTC),
+                    spec: None,
+                },
+            ],
+        };
+        write_overlay_timeline(dir.path(), &timeline);
+
+        let now = datetime!(2026-04-20 12:00 UTC);
+        let items = upcoming(dir.path(), now, 10).await.unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[0].overlay_spec,
+            Some(covering),
+            "a covered instant reads its span's spec"
+        );
+        assert_eq!(
+            items[1].overlay_spec, None,
+            "a span that explicitly draws nothing must not fall back to base"
+        );
+        assert_eq!(
+            items[2].overlay_spec,
+            Some(base),
+            "an uncovered instant falls back to base"
+        );
+    }
+
+    /// A channel with no `overlay.json` on disk at all is not an error — every
+    /// item's `overlay_spec` is simply `null`.
+    #[tokio::test]
+    async fn no_overlay_json_yields_null_overlay_spec_for_every_item() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), datetime!(2026-04-20 12:00 UTC), 2, no_audit).await;
+
+        let now = datetime!(2026-04-20 12:00 UTC);
+        let items = upcoming(dir.path(), now, 10).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.overlay_spec.is_none()));
     }
 }
