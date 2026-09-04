@@ -897,9 +897,10 @@ def build_app(host: str):
                 if keep_kind == "item":
                     keep_title = keep_payload[0].title if keep_payload[0] is not None else None
                     keep_key = (keep_title, keep_row_ts)
-            lv.clear()
             self.programme_rows = []
+            rows: list[ListItem] = []
             if self.selected_channel is None:
+                lv.clear()
                 self.refresh_detail()
                 return
             now = datetime.now(timezone.utc)
@@ -939,8 +940,10 @@ def build_app(host: str):
                         f"[dim]   Last EPG: {escape(last.title or '(untitled)')} — "
                         f"ended {_fmt_dt_sec(last.stop)} ({ago} ago)[/dim]"
                     )
-                lv.append(ListItem(Label(label), name="empty"))
+                rows.append(ListItem(Label(label), name="empty"))
                 self.programme_rows.append(("empty", None, last))
+                lv.clear()
+                lv.extend(rows)
                 lv.index = 0
                 self.refresh_detail()
                 return
@@ -1019,7 +1022,7 @@ def build_app(host: str):
             # reads oldest-at-top, so "this is as far back as the guide goes"
             # belongs above the oldest block, where scrolling up runs into it.
             if self.history:
-                lv.append(
+                rows.append(
                     ListItem(
                         Label(
                             f"[yellow]⏶ Start of retained EPG: {_fmt_dt_sec(win_start, with_date=True)}[/yellow]\n"
@@ -1077,7 +1080,7 @@ def build_app(host: str):
                     for idx, line in enumerate(open_lines):
                         glyph = "┌" if idx == 0 else ("└" if idx == n - 1 else "│")
                         resolved.append(line.replace("\x00", glyph, 1))
-                lv.append(ListItem(Label("\n".join(resolved)), name="item"))
+                rows.append(ListItem(Label("\n".join(resolved)), name="item"))
                 row_idx = len(self.programme_rows)
                 self.programme_rows.append(("item", open_row_ts, open_payload))
                 title = open_payload[0].title if open_payload is not None and open_payload[0] is not None else None
@@ -1161,7 +1164,7 @@ def build_app(host: str):
             # opened with its own bound row and ends at `now`, which is not an
             # edge of the data — there is nothing to say down there.
             if not self.history:
-                lv.append(
+                rows.append(
                     ListItem(
                         Label(
                             f"[red]⚠ Last EPG data: {_fmt_dt_sec(end_bound)}[/red]\n"
@@ -1176,6 +1179,8 @@ def build_app(host: str):
             elif keep_kind == "start":
                 select_idx = 0
 
+            lv.clear()
+            lv.extend(rows)
             lv.index = select_idx
             self.refresh_detail()
 
