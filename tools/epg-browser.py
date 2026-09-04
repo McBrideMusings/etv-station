@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1571,8 +1572,116 @@ def build_app(host: str):
     return EpgBrowserApp(host)
 
 
-def run_tui(host: str) -> None:
-    build_app(host).run()
+class _TimingRecorder:
+    """Opt-in event timer for a running EpgBrowserApp session. Built and wired
+    in only when --timing/ETV_EPG_TIMING is set (see install_timing and
+    run_tui below) — nothing here runs on the hot path otherwise.
+
+    Records every (elapsed, kind, name, extra) event handed to it, writes a
+    line immediately for anything at or above `threshold_secs` (default
+    50ms) so a slow session yields a short file rather than a full
+    transcript, and keeps running per-(kind, name) totals for the exit
+    summary."""
+
+    def __init__(self, path: str, threshold_secs: float = 0.05) -> None:
+        self.threshold_secs = threshold_secs
+        self._fh = open(path, "a", buffering=1)  # line-buffered: a slow
+        # session's lines land in the file even if the process is later killed
+        self._events: list[tuple[float, str, str, str]] = []
+        # (kind, name) -> [count: int, total_secs: float] — a two-slot list, not
+        # a uniform one, so it is annotated as a bare list rather than
+        # list[float], which the int count would make untrue.
+        self._totals: dict[tuple[str, str], list] = {}
+        self._fh.write(
+            f"# epg-browser timing started {datetime.now(timezone.utc).isoformat()} "
+            f"threshold={threshold_secs * 1000:.0f}ms\n"
+        )
+
+    def record(self, elapsed_secs: float, kind: str, name: str, extra: str = "") -> None:
+        self._events.append((elapsed_secs, kind, name, extra))
+        totals_key = (kind, name)
+        bucket = self._totals.setdefault(totals_key, [0, 0.0])
+        bucket[0] += 1
+        bucket[1] += elapsed_secs
+        if elapsed_secs >= self.threshold_secs:
+            self._fh.write(f"{elapsed_secs * 1000:8.1f}ms  {kind:8s} {name:30s}{extra}\n")
+
+    def write_summary(self) -> None:
+        """Called once on exit (normal quit or exception) so even a killed
+        or short session leaves a usable summary."""
+        try:
+            self._fh.write("\n# --- slowest 20 events ---\n")
+            slowest = sorted(self._events, key=lambda e: e[0], reverse=True)[:20]
+            for elapsed_secs, kind, name, extra in slowest:
+                self._fh.write(f"{elapsed_secs * 1000:8.1f}ms  {kind:8s} {name:30s}{extra}\n")
+            self._fh.write("\n# --- totals per message type ---\n")
+            by_total = sorted(self._totals.items(), key=lambda kv: kv[1][1], reverse=True)
+            for (kind, name), (count, total_secs) in by_total:
+                avg_ms = (total_secs / count) * 1000 if count else 0.0
+                self._fh.write(
+                    f"{kind:8s} {name:30s} count={count:5d} "
+                    f"total={total_secs * 1000:9.1f}ms avg={avg_ms:7.2f}ms\n"
+                )
+        finally:
+            self._fh.close()
+
+
+def install_timing(recorder: _TimingRecorder) -> None:
+    """Monkey-patch the two Textual choke points every event passes through:
+    MessagePump._dispatch_message (every message dispatched to the app or any
+    widget) and App._display (every screen repaint). Only called when a
+    timing path is set — textual is imported here, not at module scope, so
+    an unpatched run never even defines these wrappers."""
+    from textual.app import App
+    from textual.message_pump import MessagePump
+
+    orig_dispatch_message = MessagePump._dispatch_message
+
+    async def timed_dispatch_message(self, message):
+        start = time.perf_counter()
+        try:
+            return await orig_dispatch_message(self, message)
+        finally:
+            elapsed = time.perf_counter() - start
+            recorder.record(elapsed, "message", type(message).__name__, f" widget={type(self).__name__}")
+
+    MessagePump._dispatch_message = timed_dispatch_message
+
+    orig_display = App._display
+
+    def timed_display(self, screen, renderable):
+        start = time.perf_counter()
+        try:
+            return orig_display(self, screen, renderable)
+        finally:
+            elapsed = time.perf_counter() - start
+            # ChopsUpdate.chops (a per-line map of screen fragments) is the
+            # honest proxy for how many tty bytes a repaint actually wrote —
+            # a full non-chopped render (LayoutUpdate, or None) has no chops.
+            chops = getattr(renderable, "chops", None)
+            if chops is not None:
+                extra = f" chops={sum(len(line) for line in chops)}"
+            elif renderable is not None:
+                extra = " full-render"
+            else:
+                extra = ""
+            name = type(renderable).__name__ if renderable is not None else "None"
+            recorder.record(elapsed, "repaint", name, extra)
+
+    App._display = timed_display
+
+
+def run_tui(host: str, timing_path: str | None = None) -> None:
+    app = build_app(host)
+    if not timing_path:
+        app.run()
+        return
+    recorder = _TimingRecorder(timing_path)
+    install_timing(recorder)
+    try:
+        app.run()
+    finally:
+        recorder.write_summary()
 
 
 # --- entry point -------------------------------------------------------------
@@ -1583,6 +1692,11 @@ def main() -> None:
     parser.add_argument("--host", help="explicit station URL, e.g. http://station.example:8419")
     parser.add_argument("--local", action="store_true", help="target local dev (127.0.0.1:8409)")
     parser.add_argument("--prod", action="store_true", help="target prod (PROD_URL, the default)")
+    parser.add_argument(
+        "--timing",
+        help="write per-message/per-repaint timing to this path (env: ETV_EPG_TIMING); "
+        "off by default, costs nothing when unset",
+    )
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("channels", help="JSON: every channel + its current programme")
@@ -1598,6 +1712,7 @@ def main() -> None:
 
     args = parser.parse_args()
     host = resolve_host(args.host, args.local)
+    timing_path = args.timing or os.environ.get("ETV_EPG_TIMING")
 
     if args.command == "channels":
         cmd_channels(host)
@@ -1608,7 +1723,7 @@ def main() -> None:
     elif args.command == "artwork-check":
         cmd_artwork_check(host, args.channel_id)
     else:
-        run_tui(host)
+        run_tui(host, timing_path)
 
 
 if __name__ == "__main__":
