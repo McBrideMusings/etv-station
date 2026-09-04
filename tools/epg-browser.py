@@ -444,8 +444,17 @@ def find_matching_audit_item(report: dict, start: datetime) -> dict | None:
     """The report item whose `start` names the same instant as `start` — the
     EPG's tz-aware Python datetime and the report's RFC3339 text are two
     different wire formats for the same clock, so this compares instants
-    (both converted to UTC), never the raw strings."""
-    target = start.astimezone(timezone.utc)
+    (both converted to UTC), never the raw strings.
+
+    Compared to whole-second resolution, not exact equality: XMLTV's
+    datetime format (XMLTV_DATETIME above) can only express whole seconds,
+    while the audit report's RFC3339 `start` keeps microseconds
+    (crates/etv-station/src/audit_report.rs's `rfc3339`). The two can name
+    the same instant — '2026-09-04T01:26:04.678777Z' and
+    '2026-09-04T01:26:04+00:00' — and never compare equal at full
+    precision, so the whole second is the real resolution of this match,
+    not a tolerance window."""
+    target = start.astimezone(timezone.utc).replace(microsecond=0)
     for item in report.get("items", []) if isinstance(report, dict) else []:
         raw = item.get("start") if isinstance(item, dict) else None
         if not raw:
@@ -454,7 +463,7 @@ def find_matching_audit_item(report: dict, start: datetime) -> dict | None:
             item_start = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if item_start.astimezone(timezone.utc) == target:
+        if item_start.astimezone(timezone.utc).replace(microsecond=0) == target:
             return item
     return None
 
