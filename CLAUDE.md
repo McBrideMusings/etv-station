@@ -47,6 +47,7 @@ admin overlay-watch <channel-dir>        # live isolated overlay preview in VLC,
 admin verify-accel                       # prove channels encode on the GPU, not silently on the CPU
 admin backup                             # snapshot history.db / catalog.db / .device_id on the host
 admin audit <channel> [--next N]         # why each upcoming item is on a channel's schedule
+admin epg                                # browse the live schedule (TUI); `d` audits the highlighted item
 admin plugin-check                       # would this branch's binary load the plugin scripts prod has?
 
 git subtree pull --prefix=vendor/etv-next etv-upstream main --squash   # absorb upstream ErsatzTV/next
