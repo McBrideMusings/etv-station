@@ -119,7 +119,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `docs/roadmap.md` | Now / Next / Later / Deferred. Direction, not task tracking. |
 | `docs/architecture.md` | Distillation of PRD §Architecture for quick reference. |
 | `docs/schema.md` | Config schema reference — station / channel / block files, entry & source kinds, `ProgramMetadata`, order/mode/filter, with YAML examples. |
-| `docs/adr/` | Architecture Decision Records — why a non-obvious call was made (e.g. `0001-reload-generation-revert.md`). `index.md` explains the convention: ADRs are historical snapshots, and code drift is annotated, never edited away. |
+| `docs/adr/` | Architecture Decision Records — what was decided, stated as true now (e.g. `0001-reload-generation-revert.md`). No rationale, no rejected options, no consequences — three sentences is the target, fifteen lines the ceiling. Git history carries the "why"; a decision that reverses an earlier one is rewritten in place. |
 | `docs/file-map.md` | This page. |
 | `docs/index.md` | VitePress landing. |
 | `docs/.vitepress/config.mts` | VitePress config. |
