@@ -259,10 +259,36 @@ enum Cmd {
         #[arg(long)]
         duration: f64,
         /// How many evenly spaced instants across `[0, duration)` to
-        /// evaluate.
-        #[arg(long, default_value_t = 24)]
-        samples: u32,
+        /// evaluate. Defaults to roughly one sample per second of
+        /// `--duration`, capped at [`DEFAULT_MAX_SAMPLES`] so a multi-hour
+        /// item doesn't silently evaluate tens of thousands of times — pass
+        /// this explicitly to override either direction. A fixed low count
+        /// (the old default was a flat 24 regardless of duration) samples
+        /// too coarsely to ever land on a short-lived on-screen "snipe" in a
+        /// long item, reporting a confident "no text" that is really "not
+        /// looked for often enough".
+        #[arg(long)]
+        samples: Option<u32>,
     },
+}
+
+/// Ceiling on the sampling default so a several-hour item doesn't evaluate
+/// tens of thousands of times with nothing said about it. `--samples` still
+/// overrides this explicitly in either direction.
+const DEFAULT_MAX_SAMPLES: u32 = 3600;
+
+/// Resolve `--samples` into an actual sample count: an explicit override
+/// wins outright; otherwise default to one sample per second of `duration`
+/// (rounded up so a sub-second duration still gets at least one sample),
+/// bounded by [`DEFAULT_MAX_SAMPLES`].
+fn resolve_sample_count(duration: f64, samples: Option<u32>) -> u32 {
+    match samples {
+        Some(n) => n.max(1),
+        None => {
+            let per_second = duration.max(0.0).ceil() as u32;
+            per_second.clamp(1, DEFAULT_MAX_SAMPLES)
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1006,6 +1032,12 @@ struct TextSpan {
 struct DumpTextOutput {
     spec: String,
     samples: u32,
+    /// Seconds between two consecutive sampled instants — `duration /
+    /// samples`. Printed so a reader can tell "no text" (the script really
+    /// never draws anything) from "not looked for often enough" (the
+    /// interval is wider than however long the text is on screen), which is
+    /// the distinction dump-text's coarse fixed-count default used to erase.
+    interval_secs: f64,
     texts: Vec<TextSpan>,
 }
 
@@ -1013,13 +1045,15 @@ fn dump_text(
     spec_path: PathBuf,
     program: DumpTextProgram,
     duration: f64,
-    samples: u32,
+    samples: Option<u32>,
 ) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&spec_path)?;
-    let texts = collect_texts(&spec, &program, duration, samples)?;
+    let sample_count = resolve_sample_count(duration, samples);
+    let texts = collect_texts(&spec, &program, duration, sample_count)?;
     let output = DumpTextOutput {
         spec: spec_path.display().to_string(),
-        samples,
+        samples: sample_count,
+        interval_secs: duration / sample_count as f64,
         texts,
     };
     println!("{}", serde_json::to_string(&output)?);
@@ -1318,5 +1352,64 @@ layers: []
             "expected frame index in error: {msg}"
         );
         assert!(msg.contains("boom"), "expected the rhai error text: {msg}");
+    }
+
+    /// Regression for the bug this item fixes: `fixtures/snipe_pulse.yaml`
+    /// draws its text for 5s out of every 528s, offset 50s from the start —
+    /// a stand-in for a real now/next snipe that is on screen a few seconds
+    /// at a time across a multi-thousand-second item. Over a 2763s item (the
+    /// real prod duration this bug was measured against), the old fixed
+    /// default of 24 evenly spaced samples lands on none of the visible
+    /// windows and reports zero text — the exact false negative the EPG
+    /// audit screen showed for a working overlay. `resolve_sample_count`'s
+    /// new interval-based default (~1/sec, capped) lands inside the window
+    /// repeatedly over the same run.
+    #[test]
+    fn dump_text_default_sampling_catches_a_brief_recurring_snipe_the_old_24_default_missed() {
+        let spec = OverlaySpec::from_path(&fixture("fixtures/snipe_pulse.yaml")).unwrap();
+        let mut program = dump_program();
+        program.title = "NOW".to_string();
+        let duration = 2763.0;
+
+        let old_default = collect_texts(&spec, &program, duration, 24).unwrap();
+        assert!(
+            old_default.is_empty(),
+            "sanity: the old fixed-24 default should miss this fixture entirely, got {old_default:?}"
+        );
+
+        let new_default_samples = resolve_sample_count(duration, None);
+        assert!(
+            new_default_samples > 24,
+            "expected the interval-based default to sample far more densely \
+             than the old fixed 24, got {new_default_samples}"
+        );
+        let new_default = collect_texts(&spec, &program, duration, new_default_samples).unwrap();
+        assert_eq!(
+            new_default.len(),
+            1,
+            "expected the snipe text to be caught, got {new_default:?}"
+        );
+        assert_eq!(new_default[0].content, "NOW");
+    }
+
+    #[test]
+    fn resolve_sample_count_explicit_override_wins() {
+        assert_eq!(resolve_sample_count(2763.0, Some(24)), 24);
+        assert_eq!(resolve_sample_count(2763.0, Some(0)), 1, "0 clamps up to 1");
+    }
+
+    #[test]
+    fn resolve_sample_count_defaults_to_about_one_per_second_capped() {
+        assert_eq!(resolve_sample_count(10.0, None), 10);
+        assert_eq!(
+            resolve_sample_count(0.4, None),
+            1,
+            "sub-second durations still get at least one sample"
+        );
+        assert_eq!(
+            resolve_sample_count(6.0 * 3600.0, None),
+            DEFAULT_MAX_SAMPLES,
+            "a six-hour item is capped rather than evaluating 21600 times"
+        );
     }
 }

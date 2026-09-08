@@ -1,0 +1,17 @@
+width: 1280
+height: 720
+framerate: 30
+pixel_format: rgba8
+script: scripts/snipe_pulse.rhai
+config:
+  period_secs: 528
+  window_secs: 5
+  phase_secs: 50
+layers:
+  - type: text
+    content: "NOW"
+    font_family: Helvetica
+    font_size: 34.0
+    color: [255, 255, 255, 235]
+    corner: bottom_right
+    margin: 24
