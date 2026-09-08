@@ -733,6 +733,18 @@ def build_app(host: str):
             self.channel_name_by_number: dict[int, str] | None = None
             # channel folder name -> parsed `--audit --format json` report.
             self.audit_cache: dict[str, dict] = {}
+            # (tvg_id, programme start isoformat) -> (classification_line, overlay_text|None),
+            # for the main-pane compact summary below. Shares audit_cache and
+            # channel_name_by_number above with AuditScreen rather than
+            # re-fetching anything the full-screen audit already pulled.
+            self.audit_summary_cache: dict[tuple[str, str], tuple[str, str | None]] = {}
+            # The (tvg_id, start) currently displayed/pending in the main
+            # pane, and the summary itself. None summary means "nothing to
+            # show yet" — no placeholder, no spinner, per the item's
+            # requirement that an unfetched channel shows nothing rather
+            # than thrash.
+            self._audit_summary_key: tuple[str, str] | None = None
+            self._audit_summary: tuple[str, str | None] | None = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -1271,7 +1283,97 @@ def build_app(host: str):
                 else "live — now at the top, scroll down"
             )
 
+        def _maybe_fetch_audit_summary(self) -> None:
+            """Kick off (or reuse the cache for) the compact audit summary
+            for whatever programme is currently highlighted. Cheap no-op
+            when the highlight hasn't actually moved to a new programme
+            since the last call — this runs on every refresh_detail(),
+            including the 15s tick, so it must not respawn a worker for an
+            unchanged selection."""
+            programme = None
+            row = self._selected_row()
+            if row is not None:
+                kind, _, payload = row
+                if kind == "item":
+                    programme = payload[0]
+            if programme is None or self.selected_channel is None:
+                self._audit_summary_key = None
+                self._audit_summary = None
+                return
+            key = (self.selected_channel, programme.start.isoformat())
+            if key == self._audit_summary_key:
+                return
+            self._audit_summary_key = key
+            cached = self.audit_summary_cache.get(key)
+            if cached is not None:
+                self._audit_summary = cached
+                return
+            self._audit_summary = None  # nothing to show until the fetch lands
+            chan = self.channels.get(self.selected_channel)
+            if chan is None or chan.number is None:
+                return
+            next_title = self._next_programme_title(programme)
+            self._fetch_audit_summary_worker(key, chan.number, programme, next_title)
+
+        @work(exclusive=True, thread=True, group="audit-summary")
+        def _fetch_audit_summary_worker(
+            self,
+            key: tuple[str, str],
+            chan_number: int,
+            programme: "Programme",
+            next_title: str | None,
+        ) -> None:
+            """Same fetch/cache path as AuditScreen._load_worker (channel
+            number -> name map, then the per-channel audit report), reused
+            rather than duplicated. Runs off the event loop thread so the
+            main pane's own render never blocks on it; a failure here just
+            leaves the summary empty rather than surfacing an error — the
+            full trail on `d` is where errors get explained."""
+            worker = get_current_worker()
+            try:
+                if self.channel_name_by_number is None:
+                    self.channel_name_by_number = fetch_channel_number_map()
+                if worker.is_cancelled:
+                    return
+                name = self.channel_name_by_number.get(chan_number)
+                if name is None:
+                    return
+                report = self.audit_cache.get(name)
+                if report is None:
+                    report = fetch_audit_report(name)
+                    if worker.is_cancelled:
+                        return
+                    self.audit_cache[name] = report
+                item = find_matching_audit_item(report, programme.start)
+                if worker.is_cancelled or item is None:
+                    return
+                raw_audit = item.get("audit", []) if isinstance(item, dict) else []
+                classification_line = render_classification(raw_audit).splitlines()[0]
+                overlay_spec = item.get("overlay_spec") if isinstance(item, dict) else None
+                overlay_text = None
+                if overlay_spec is not None:
+                    # Show the result's text whether or not the dump-text run
+                    # succeeded — a failure string ("etv-overlay binary not
+                    # found", a bad script path) is exactly the kind of thing
+                    # a viewer should see without pressing `d`, same as
+                    # AuditScreen's own Overlay section shows it unconditionally.
+                    overlay_text = run_overlay_dump_text(overlay_spec, programme, next_title)["text"]
+                if worker.is_cancelled:
+                    return
+                summary = (classification_line, overlay_text)
+                self.audit_summary_cache[key] = summary
+                self.call_from_thread(self._apply_audit_summary, key, summary)
+            except RuntimeError:
+                return  # fetch failed — the pane just stays quiet for this item
+
+        def _apply_audit_summary(self, key: tuple[str, str], summary: tuple[str, str | None]) -> None:
+            if key != self._audit_summary_key:
+                return  # highlight moved again before this landed — stale
+            self._audit_summary = summary
+            self.refresh_detail()
+
         def refresh_detail(self) -> None:
+            self._maybe_fetch_audit_summary()
             body = self.query_one("#detail-body", Static)
             if self.load_error is not None:
                 body.update(
@@ -1334,6 +1436,12 @@ def build_app(host: str):
                         lines.append(f"[b]Selected show[/b]  ({_fmt_dt_sec(p.start)} → {_fmt_dt_sec(p.stop)})")
                         lines.append(f"  [b]{self._programme_headline(p)}[/b]")
                         lines.extend(self._programme_fields(p))
+                        if self._audit_summary is not None:
+                            classification_line, overlay_text = self._audit_summary
+                            lines.append("")
+                            lines.append(f"  classification: {escape(classification_line)}")
+                            if overlay_text:
+                                lines.append(f"  overlay: {escape(overlay_text)}")
             body.update("\n".join(lines))
 
         def action_open_vlc(self) -> None:
