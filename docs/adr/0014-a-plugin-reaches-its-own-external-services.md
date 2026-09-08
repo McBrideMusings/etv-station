@@ -1,0 +1,3 @@
+# A plugin reaches its own external services; the base binary carries no client for one
+
+A plugin script that needs data from an external service reaches it itself, via `ctx.http(url, method, body)` and `parse_json(text)` — two source-agnostic primitives the base engine exposes to every script. No external service whose only consumer is a plugin gets a dedicated compiled client, crate dependency, or schema-aware reader in this repository. A catalog lookup a script needs to join its own fetched data against (`ctx.entry_id_for(source, id)`) stays a base primitive, since the catalog itself is core, not any one plugin's dependency.
