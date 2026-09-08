@@ -603,12 +603,22 @@ def run_overlay_dump_text(overlay_spec: dict, programme: "Programme", next_title
     except json.JSONDecodeError:
         return {"ok": False, "text": f"etv-overlay dump-text printed non-JSON output:\n{result.stdout.strip()}"}
     texts = parsed.get("texts", [])
+    samples = parsed.get("samples")
+    interval = parsed.get("interval_secs")
+    sampled_at = (
+        f"{samples} samples, one every {interval:.1f}s"
+        if samples is not None and interval is not None
+        else None
+    )
     if not texts:
-        return {"ok": True, "text": "(no text layers drawn over this run)"}
+        suffix = f" ({sampled_at})" if sampled_at else ""
+        return {"ok": True, "text": f"(no text layers drawn over this run{suffix})"}
     lines = [
         f"[{t.get('first_at', 0):.1f}s–{t.get('last_at', 0):.1f}s] {t.get('content', '')!r}"
         for t in texts
     ]
+    if sampled_at:
+        lines.append(f"({sampled_at})")
     return {"ok": True, "text": "\n".join(lines)}
 
 
