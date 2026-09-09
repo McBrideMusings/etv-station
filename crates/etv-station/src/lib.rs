@@ -28,3 +28,4 @@ pub mod score;
 pub mod sequence;
 pub mod tautulli;
 pub mod tz;
+pub mod value_fmt;

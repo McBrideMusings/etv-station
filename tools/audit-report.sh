@@ -4,14 +4,10 @@
 #
 # WHY THIS IS A SCRIPT AND NOT A ONE-LINE admin.toml ENTRY. `admin
 # refresh-channel` and `admin backfill-history` are single `ssh … docker exec`
-# lines because the station's own stdout is the whole answer. `--audit` is
-# different in two ways:
-#
-#   1. It writes the report to a FILE inside the container and prints only that
-#      path. Printing the report therefore needs a second remote call to read
-#      the file back — two steps admin.toml's `run` string cannot sequence.
-#   2. Bare `admin audit`, with no channel, has to answer "which channels have
-#      one" and exit 0. A list is an answer, not a usage error.
+# lines because the station's own stdout is the whole answer. `--audit` still
+# needs a wrapper for one reason: bare `admin audit`, with no channel, has to
+# answer "which channels have one" and exit 0 rather than a usage error, which
+# takes a branch admin.toml's `run` string cannot express.
 #
 # WHAT IT DELIBERATELY DOES NOT NEED. `taste-debug` is the counterexample this
 # exists to avoid: it runs locally, so it needs a local copy of catalog.db and
@@ -19,6 +15,11 @@
 # telling you to scp two databases. `--audit` reads chunk JSON and nothing else
 # — no catalog, no plexdb snapshot, no plugin evaluation (ADR 0011) — so this
 # wrapper never copies a database anywhere and never needs one present.
+#
+# THE PER-CHANNEL REPORT IS ONE REMOTE CALL, NOT TWO (etv-station-400). The
+# binary's `--audit-out -` writes the report straight to its own stdout instead
+# of a file, so `docker exec`'s stdout over the one ssh call below already IS
+# the report — there is no longer a path to read back with a second ssh.
 #
 # Usage:
 #   tools/audit-report.sh                             # list channels, exit 0
@@ -91,22 +92,14 @@ if [[ $# -eq 0 || ${1:-} == "--list" ]]; then
   exit 0
 fi
 
-# One remote invocation, then one remote read. The station prints the path it
-# wrote and nothing else on stdout, so the path is the whole capture; anything
-# it says on stderr (a refusal naming the channels that exist) passes through
-# to the caller untouched.
-path=$(ssh "$target" "docker exec etv-station etv-station --config '$config' --audit $*") || {
+# One remote invocation. `--audit-out -` makes the station's own stdout the
+# report itself, so this single ssh call is the whole capture; anything it
+# says on stderr (a refusal naming the channels that exist) passes through to
+# the caller untouched.
+report=$(ssh "$target" "docker exec etv-station etv-station --config '$config' --audit $* --audit-out -") || {
   # The station already explained itself on stderr — naming an unknown channel,
   # or naming every channel an ambiguous one matched. Do not restate it.
   exit 1
 }
 
-if [[ -z $path ]]; then
-  echo "audit: the station printed no report path" >&2
-  exit 2
-fi
-
-ssh "$target" "docker exec etv-station cat '$path'" || {
-  echo "audit: the station reported $path but it could not be read back" >&2
-  exit 2
-}
+printf '%s\n' "$report"
