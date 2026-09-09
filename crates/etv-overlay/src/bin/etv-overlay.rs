@@ -360,6 +360,7 @@ fn program_context_for(p: PreviewProgram) -> ProgramContext {
         next_year: p.next_year,
         item_elapsed: p.item_elapsed,
         item_remaining: p.item_remaining,
+        metadata: serde_json::Value::Null,
     }
 }
 
@@ -1015,6 +1016,7 @@ fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
         // Overwritten per-sample in `collect_texts`.
         item_elapsed: -1.0,
         item_remaining: -1.0,
+        metadata: serde_json::Value::Null,
     }
 }
 

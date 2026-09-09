@@ -179,6 +179,18 @@ impl RhaiEngine {
         scope.push_constant("next_year", program.next_year);
         scope.push_constant("item_elapsed", program.item_elapsed);
         scope.push_constant("item_remaining", program.item_remaining);
+        // The current item's opaque metadata blob (ADR 0016) — the one
+        // channel through which anything plugin-specific reaches a script.
+        // No Rust code here reads a key inside it. Same conversion as
+        // `config` above; anything unrepresentable in Rhai drops to unit
+        // rather than failing the whole evaluation.
+        scope.push_constant(
+            "metadata",
+            rhai::serde::to_dynamic(&program.metadata).unwrap_or_else(|e| {
+                tracing::warn!("item metadata is not representable in Rhai: {e}");
+                Dynamic::UNIT
+            }),
+        );
 
         let value = self
             .engine
@@ -500,6 +512,46 @@ fade:
             }
             _ => panic!("expected text layer"),
         }
+    }
+
+    /// A script reads a key out of the opaque `metadata` blob directly from
+    /// scope (ADR 0016) — no Rust code here interprets `attribution`.
+    #[test]
+    fn script_reads_a_key_out_of_metadata() {
+        let script = write_script(
+            r#"
+            #{ layers: [ #{ content: "By " + metadata.attribution } ] }
+            "#,
+        );
+        let mut engine = RhaiEngine::new(vec![text("placeholder")]);
+        engine.load_script(script.path()).unwrap();
+
+        let mut ctx = ProgramContext::unknown();
+        ctx.metadata = serde_json::json!({ "attribution": "Bob Example" });
+
+        let state = engine.evaluate(0.0, 0, &ctx);
+        match &state.layers[0].kind {
+            OverlayKind::Text { content, .. } => assert_eq!(content, "By Bob Example"),
+            _ => panic!("expected text layer"),
+        }
+    }
+
+    /// An item with no metadata must evaluate without panicking or erroring —
+    /// the script sees unit, not a missing-field error.
+    #[test]
+    fn missing_metadata_evaluates_without_panicking() {
+        let script = write_script(
+            r#"
+            #{ visible: metadata == () }
+            "#,
+        );
+        let mut engine = RhaiEngine::new(vec![watermark()]);
+        engine.load_script(script.path()).unwrap();
+
+        let state = engine
+            .try_evaluate(0.0, 0, &ProgramContext::unknown())
+            .unwrap();
+        assert!(state.visible);
     }
 
     #[test]

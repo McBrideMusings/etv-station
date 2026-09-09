@@ -210,6 +210,7 @@ The `etv-overlay pipe` subprocess (one per channel, supervised by `overlay_super
 | `next_sub_title` | string  | next item's `program.sub_title`                 |
 | `item_elapsed`   | float   | seconds since current item's `start` (`-1.0` if unknown) |
 | `item_remaining` | float   | seconds until current item's `finish` (`-1.0` if unknown) |
+| `metadata`       | dynamic | currently-airing item's opaque `metadata` blob, verbatim (`()` if absent) |
 
 Schedule access is read-only against the chunked playout JSON the station already writes (`{start}_{finish}.json`), scanned on a 1Hz mtime poll and binary-searched per frame. A second file in the same folder, `overlay.json`, carries the resolved overlay cascade's timeline (#48, ADR 0007): a `base` spec plus a list of `{start, finish, spec}` block spans, written by the station at each generation and polled by the overlay process on the same 1Hz cadence. When wallclock-now moves into a new span the process rebuilds its Rhai engine from that span's script and layers in place — same canvas, same fifo, no respawn — because ETV-next's ffmpeg is reading that fifo continuously and a fifo teardown mid-stream is the failure ADR 0007 exists to avoid. An uncovered moment (before the first generation, or a gap the station hasn't filled yet) falls back to `base` rather than going blank.
 

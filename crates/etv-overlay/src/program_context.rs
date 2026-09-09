@@ -57,6 +57,11 @@ pub struct ProgramContext {
     pub item_elapsed: f64,
     /// Seconds until the current item's `finish`. `-1.0` when unknown.
     pub item_remaining: f64,
+    /// The current item's opaque `metadata` blob, carried verbatim from the
+    /// playout JSON (`PlayoutItem::metadata` in `vendor/etv-next`). No Rust
+    /// code here reads a key inside it — it exists only to reach the overlay
+    /// script's scope (ADR 0016). `Value::Null` when absent.
+    pub metadata: serde_json::Value,
 }
 
 impl ProgramContext {
@@ -75,6 +80,7 @@ impl ProgramContext {
             next_year: -1,
             item_elapsed: -1.0,
             item_remaining: -1.0,
+            metadata: serde_json::Value::Null,
         }
     }
 }
@@ -99,6 +105,11 @@ struct ItemRow {
     finish: OffsetDateTime,
     #[serde(default)]
     program: Option<ProgramRow>,
+    /// Item-level opaque passthrough (`PlayoutItem::metadata` in
+    /// `vendor/etv-next`), a sibling of `program` rather than a field inside
+    /// it. Carried verbatim into [`ProgramContext::metadata`] (ADR 0016).
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -253,6 +264,7 @@ impl ProgramContextSource {
             next_year: nxt.year,
             item_elapsed: elapsed,
             item_remaining: remaining,
+            metadata: item.metadata.clone().unwrap_or(serde_json::Value::Null),
         }
     }
 }
@@ -542,6 +554,47 @@ mod tests {
             src.current_at(datetime!(2026-04-13 00:05 UTC)).title,
             "Alpha"
         );
+    }
+
+    /// A chunk carrying item-level `metadata` (ADR 0016) — the opaque JSON a
+    /// plugin attaches to a picked item, a sibling of `program` rather than
+    /// nested inside it.
+    const METADATA_CHUNK: &str = r#"{
+        "version": "test",
+        "items": [
+            {
+                "id": "a",
+                "start": "2026-04-13T00:00:00Z",
+                "finish": "2026-04-13T00:10:00Z",
+                "program": { "title": "Alpha" },
+                "metadata": { "attribution": "Bob Example", "count": 3 }
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn carries_item_metadata_through_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), "1_2.json", METADATA_CHUNK);
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
+        assert_eq!(ctx.metadata["attribution"], "Bob Example");
+        assert_eq!(ctx.metadata["count"], 3);
+    }
+
+    /// An item with no `metadata` key must not panic the parse, and must
+    /// read as `Value::Null` rather than an error.
+    #[test]
+    fn an_item_with_no_metadata_reads_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), "chunk_a.json", TWO_ITEM_CHUNK);
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
+        assert!(ctx.metadata.is_null());
     }
 
     #[test]
