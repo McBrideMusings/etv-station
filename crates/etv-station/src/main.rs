@@ -900,6 +900,42 @@ fn list_channels(config_path: &Path, format: ReportFormat) -> ExitCode {
     }
 }
 
+/// Extract divergence messages from a determinism report.
+/// Returns the lines to print when the two passes disagree.
+/// When entries differ, only the entry message prints. When entries match but
+/// audits differ, only the audit message prints. Never both — audit divergence
+/// is trivial when entries already differ.
+fn divergence_messages(report: &etv_station::determinism::DeterminismReport) -> Vec<String> {
+    let diff = match report.difference.as_ref() {
+        Some(d) => d,
+        None => return Vec::new(), // identical, no messages
+    };
+
+    if diff.entry_a != diff.entry_b {
+        vec![format!(
+            "check-determinism: {} — DIFFERS at position {}: pass A = {}, pass B = {} \
+             (lengths {} vs {})",
+            report.channel,
+            diff.position,
+            diff.entry_a.as_deref().unwrap_or("<none — pass A ended>"),
+            diff.entry_b.as_deref().unwrap_or("<none — pass B ended>"),
+            report.pass_a_len,
+            report.pass_b_len,
+        )]
+    } else if diff.audit_a != diff.audit_b {
+        vec![format!(
+            "check-determinism: {} — audit trail at position {} differs: \
+             pass A = {}, pass B = {}",
+            report.channel,
+            diff.position,
+            diff.audit_a.as_deref().unwrap_or("<no audit trail>"),
+            diff.audit_b.as_deref().unwrap_or("<no audit trail>"),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
     let mut station = match config::load(config_path) {
         Ok(s) => s,
@@ -917,29 +953,8 @@ fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(report) => {
-            let diff = report
-                .difference
-                .as_ref()
-                .expect("checked above: identical branch already handled");
-            println!(
-                "check-determinism: {} — DIFFERS at position {}: pass A = {}, pass B = {} \
-                 (lengths {} vs {})",
-                report.channel,
-                diff.position,
-                diff.entry_a.as_deref().unwrap_or("<none — pass A ended>"),
-                diff.entry_b.as_deref().unwrap_or("<none — pass B ended>"),
-                report.pass_a_len,
-                report.pass_b_len,
-            );
-            if diff.audit_a != diff.audit_b {
-                println!(
-                    "check-determinism: {} — audit trail at position {} also differs: \
-                     pass A = {}, pass B = {}",
-                    report.channel,
-                    diff.position,
-                    diff.audit_a.as_deref().unwrap_or("<no audit trail>"),
-                    diff.audit_b.as_deref().unwrap_or("<no audit trail>"),
-                );
+            for line in divergence_messages(&report) {
+                println!("{line}");
             }
             ExitCode::from(1)
         }
@@ -1127,5 +1142,73 @@ mod tests {
             let listed = listing.iter().find(|c| c.name == ch.name).unwrap();
             assert_eq!(listed.number, ch.config.number);
         }
+    }
+
+    /// When entries differ, the output reports the entry divergence once.
+    /// The audit trail line only prints when entries match but audits differ,
+    /// not when entries already diverge (#402).
+    #[test]
+    fn determinism_check_entry_divergence_no_secondary_audit_line() {
+        use etv_station::determinism::{DeterminismReport, Difference};
+
+        // Simulate a Difference where entries diverge — entry_a = Some("item1"),
+        // entry_b = Some("item2"), audits also differ trivially.
+        let report = DeterminismReport {
+            channel: "test-ch".to_string(),
+            pass_a_len: 5,
+            pass_b_len: 5,
+            difference: Some(Difference {
+                position: 2,
+                entry_a: Some("item1".to_string()),
+                entry_b: Some("item2".to_string()),
+                audit_a: Some(r#"{"stage":"pool"}"#.to_string()),
+                audit_b: Some(r#"{"stage":"sequence"}"#.to_string()),
+            }),
+        };
+
+        let messages = divergence_messages(&report);
+        assert_eq!(messages.len(), 1, "should produce exactly one message");
+        assert!(
+            messages[0].contains("DIFFERS at position 2"),
+            "must report entry divergence"
+        );
+        assert!(
+            !messages[0].contains("audit trail"),
+            "must not report audit divergence when entries already differ"
+        );
+    }
+
+    /// When entries match but audit trails differ, the output reports only the
+    /// audit divergence (#402, #391). This detects non-deterministic `audit()`
+    /// implementations even when `pick()` is stable.
+    #[test]
+    fn determinism_check_matching_entries_different_audits() {
+        use etv_station::determinism::{DeterminismReport, Difference};
+
+        // Simulate a Difference where entries match but audits differ.
+        let report = DeterminismReport {
+            channel: "test-ch".to_string(),
+            pass_a_len: 3,
+            pass_b_len: 3,
+            difference: Some(Difference {
+                position: 1,
+                entry_a: Some("item1".to_string()),
+                entry_b: Some("item1".to_string()),
+                audit_a: Some(r#"{"stage":"pool","verdict":"picked"}"#.to_string()),
+                audit_b: Some(r#"{"stage":"pool","verdict":"shuffled"}"#.to_string()),
+            }),
+        };
+
+        let messages = divergence_messages(&report);
+        assert_eq!(messages.len(), 1, "should produce exactly one message");
+        assert!(
+            messages[0].contains("audit trail at position 1 differs"),
+            "must report audit divergence when entries match: {}",
+            messages[0]
+        );
+        assert!(
+            !messages[0].contains("DIFFERS at position"),
+            "must not report entry divergence when entries match"
+        );
     }
 }
