@@ -331,27 +331,36 @@ pub fn resolve_plugin_path(base_dir: &Path, plugin: &Path) -> PathBuf {
 /// implements the hook itself.
 pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer", "annotate"];
 
-/// Read the hook names a plugin script declares, without running its scoring
-/// path or touching the catalog.
+/// Read and compile `script_path` once (#408) — the single read+compile every
+/// load-time plugin check shares now, so a caller that needs more than one
+/// inspection (declared hooks, missing required functions, …) compiles the
+/// script a single time and hands the resulting [`rhai::AST`] to each.
 ///
-/// Compiles the script and calls `hooks()` alone — `sources()` and `pick()`
-/// are never invoked here, which is what lets a load-time refusal happen
-/// without a catalog handle or a full generation.
-///
-/// Every failure names the script: an unreadable or uncompilable file, a
-/// missing or throwing `hooks()`, a non-string entry, an empty array (a plugin
-/// must declare at least one hook), or a name outside [`KNOWN_HOOKS`].
-pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
+/// The only failure is an unreadable or uncompilable file, named against the
+/// script.
+pub fn compile_plugin(script_path: &Path) -> Result<rhai::AST, String> {
+    #[cfg(test)]
+    test_support::note_compile();
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
     let engine = engine();
-    let ast = engine
+    engine
         .compile(&source)
-        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
+        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))
+}
 
+/// [`declared_hooks`], given a script already compiled by [`compile_plugin`]
+/// (#408) — the shared half of the load-time check, so a caller that also
+/// needs [`missing_required_fns_from_ast`] does not compile the script twice.
+///
+/// Every failure names the script: a missing or throwing `hooks()`, a
+/// non-string entry, an empty array (a plugin must declare at least one
+/// hook), or a name outside [`KNOWN_HOOKS`].
+pub fn declared_hooks_from_ast(ast: &rhai::AST, script_path: &Path) -> Result<Vec<String>, String> {
+    let engine = engine();
     let mut scope = Scope::new();
     let declared: Array = engine
-        .call_fn(&mut scope, &ast, "hooks", ())
+        .call_fn(&mut scope, ast, "hooks", ())
         .map_err(|e| format!("plugin {}: hooks(): {e}", script_path.display()))?;
 
     if declared.is_empty() {
@@ -381,6 +390,22 @@ pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
         hooks.push(name);
     }
     Ok(hooks)
+}
+
+/// Read the hook names a plugin script declares, without running its scoring
+/// path or touching the catalog.
+///
+/// Compiles the script and calls `hooks()` alone — `sources()` and `pick()`
+/// are never invoked here, which is what lets a load-time refusal happen
+/// without a catalog handle or a full generation.
+///
+/// A convenience wrapper over [`compile_plugin`] +
+/// [`declared_hooks_from_ast`] for a caller that needs the hooks and nothing
+/// else; a caller that also needs [`missing_required_fns_from_ast`] should
+/// call those two directly and share one compile (#408).
+pub fn declared_hooks(script_path: &Path) -> Result<Vec<String>, String> {
+    let ast = compile_plugin(script_path)?;
+    declared_hooks_from_ast(&ast, script_path)
 }
 
 /// The station-owned set of selection stages an `audit()` record may name
@@ -447,22 +472,33 @@ pub const REQUIRED_HOOK_FNS: &[RequiredFn] = &[RequiredFn {
 /// returned slice, and it is the caller's job (config-load validation,
 /// `--check-plugins`, and [`pick`] itself) to turn that into a refusal naming
 /// the pool or the plugin.
+///
+/// A convenience wrapper over [`compile_plugin`] +
+/// [`missing_required_fns_from_ast`] for a caller that has not already
+/// compiled the script; a caller that also needs [`declared_hooks_from_ast`]
+/// should call both `_from_ast` functions directly and share one compile
+/// (#408).
 pub fn missing_required_fns(
     script_path: &Path,
     hooks: &[String],
 ) -> Result<Vec<&'static RequiredFn>, String> {
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
-    let engine = engine();
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
+    let ast = compile_plugin(script_path)?;
+    Ok(missing_required_fns_from_ast(&ast, hooks))
+}
+
+/// [`missing_required_fns`], given a script already compiled by
+/// [`compile_plugin`] (#408) — pure inspection of the function table, so this
+/// cannot fail: there is no I/O left once `ast` exists.
+pub fn missing_required_fns_from_ast(
+    ast: &rhai::AST,
+    hooks: &[String],
+) -> Vec<&'static RequiredFn> {
     let defined: Vec<&str> = ast.iter_functions().map(|f| f.name).collect();
-    Ok(REQUIRED_HOOK_FNS
+    REQUIRED_HOOK_FNS
         .iter()
         .filter(|req| hooks.iter().any(|h| h == req.hook))
         .filter(|req| !defined.contains(&req.name))
-        .collect())
+        .collect()
 }
 
 /// What walking one plugin script found: the hooks it declares, or the reason
@@ -518,8 +554,12 @@ pub fn check_plugin_dir(dir: &Path) -> Result<Vec<PluginCheck>, String> {
     Ok(paths
         .into_iter()
         .map(|path| {
-            let result = declared_hooks(&path).and_then(|hooks| {
-                let missing = missing_required_fns(&path, &hooks)?;
+            // One compile per script (#408), shared by both inspections
+            // below — `declared_hooks`/`missing_required_fns` each compiled
+            // it separately before this.
+            let result = compile_plugin(&path).and_then(|ast| {
+                let hooks = declared_hooks_from_ast(&ast, &path)?;
+                let missing = missing_required_fns_from_ast(&ast, &hooks);
                 Ok((hooks, missing))
             });
             PluginCheck { path, result }
@@ -1351,23 +1391,21 @@ pub fn pick(
     }
 
     // The `pool_provider` contract functions (#389, ADR 0011, ADR 0013): read
-    // from `REQUIRED_HOOK_FNS` so this and config-load validation can never
-    // disagree about what is required. Checked here too, not only at config
-    // load (`crate::config::validate`), because a unit fixture driving `pick`
-    // directly bypasses load-time validation entirely.
-    for req in REQUIRED_HOOK_FNS
-        .iter()
-        .filter(|r| r.hook == "pool_provider")
+    // from `REQUIRED_HOOK_FNS` (via the shared `missing_required_fns_from_ast`,
+    // #408) so this and config-load validation can never disagree about what
+    // is required. Checked here too, not only at config load
+    // (`crate::config::validate`), because a unit fixture driving `pick`
+    // directly bypasses load-time validation entirely. `ast` is already
+    // compiled (from `cache`), so this adds no extra compile.
+    if let Some(req) = missing_required_fns_from_ast(ast, &[String::from("pool_provider")]).first()
     {
-        if !ast.iter_functions().any(|f| f.name == req.name) {
-            return Err(format!(
-                "scorer plugin {} declares pool_provider but implements no \
-                 {} — {}",
-                script_path.display(),
-                req.signature,
-                req.why
-            ));
-        }
+        return Err(format!(
+            "scorer plugin {} declares pool_provider but implements no \
+             {} — {}",
+            script_path.display(),
+            req.signature,
+            req.why
+        ));
     }
 
     let mut audit_scope = Scope::new();
@@ -1870,6 +1908,32 @@ fn insert_opt_int(m: &mut Map, key: &str, value: Option<i64>) {
         key.into(),
         value.map(Dynamic::from).unwrap_or(Dynamic::UNIT),
     );
+}
+
+/// Test-only instrumentation for [`compile_plugin`] (#408): counts how many
+/// times a script actually gets compiled, on this thread, so a test can prove
+/// two inspections that used to each compile the script independently now
+/// share one compile. `pub(crate)` so `config::validate`'s own tests — which
+/// exercise the load-time path that used to double-compile — can use it too.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COMPILE_COUNT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note_compile() {
+        COMPILE_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Run `f` with this thread's compile count reset to zero, and return how
+    /// many compiles it caused.
+    pub(crate) fn count_compiles(f: impl FnOnce()) -> u32 {
+        COMPILE_COUNT.with(|c| c.set(0));
+        f();
+        COMPILE_COUNT.with(|c| c.get())
+    }
 }
 
 #[cfg(test)]
@@ -2569,6 +2633,29 @@ fn audit(ctx, picks, workspace) { throw "audit must not run"; }
         assert!(checks.iter().all(|c| c.is_ok()));
         assert!(checks[0].path.ends_with("a-seq.rhai"));
         assert_eq!(checks[0].result.as_ref().unwrap().0, vec!["sequencer"]);
+    }
+
+    /// #408: checking one script used to compile it twice — once for
+    /// `declared_hooks`, again for `missing_required_fns`. `check_plugin_dir`
+    /// now shares one [`compile_plugin`] call between the two inspections.
+    #[test]
+    fn checking_one_script_compiles_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("scorer.rhai"),
+            "fn hooks() { [\"pool_provider\"] }\nfn audit(ctx, picks, workspace) { #{} }\n",
+        )
+        .unwrap();
+
+        let compiles = test_support::count_compiles(|| {
+            let checks = check_plugin_dir(dir.path()).unwrap();
+            assert_eq!(checks.len(), 1);
+            assert!(checks[0].is_ok());
+        });
+        assert_eq!(
+            compiles, 1,
+            "check_plugin_dir compiled the script {compiles} times"
+        );
     }
 
     /// A file that will not compile is a refusal, not a silent skip — the
