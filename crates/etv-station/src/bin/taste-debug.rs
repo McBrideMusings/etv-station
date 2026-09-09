@@ -29,6 +29,7 @@ use etv_station::catalog::Catalog;
 use etv_station::config::{self, DatastoreGrant};
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use etv_station::tautulli::{self, HistoryScope};
+use etv_station::value_fmt::format_value;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -343,24 +344,5 @@ fn print_rows_marked(
             ""
         };
         println!("{:3}. {:<45} {}{}", i + 1, title, fields, mark);
-    }
-}
-
-fn format_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Array(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(format_value)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => match n.as_f64() {
-            Some(f) => format!("{f:.4}"),
-            None => n.to_string(),
-        },
-        other => other.to_string(),
     }
 }

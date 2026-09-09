@@ -157,6 +157,20 @@ struct Cli {
     #[arg(long, requires = "audit")]
     list: bool,
 
+    /// With `--audit`, write the report to this path instead of a generated
+    /// `std::env::temp_dir()` path, then print nothing about it — the caller
+    /// named the destination, so echoing it back adds nothing. `-` writes the
+    /// report itself to stdout instead of a file, which is what
+    /// `tools/audit-report.sh` uses to fetch a report over ssh in one remote
+    /// call rather than a second read of the path the station printed
+    /// (etv-station-400).
+    ///
+    /// With no `--audit-out`, behaviour is unchanged from before this flag
+    /// existed: the report is written to `std::env::temp_dir()` and that path
+    /// is printed.
+    #[arg(long, value_name = "PATH", requires = "audit")]
+    audit_out: Option<PathBuf>,
+
     /// Check every `*.rhai` in this directory against the plugin hook
     /// contract, print one line per script, and exit. Non-zero if any script
     /// fails to compile, declares no hooks, or declares a hook whose required
@@ -251,7 +265,13 @@ fn main() -> ExitCode {
         if cli.list {
             return list_channels(config, cli.format);
         }
-        return audit(config, target, cli.next, cli.format);
+        return audit(
+            config,
+            target,
+            cli.next,
+            cli.format,
+            cli.audit_out.as_deref(),
+        );
     }
 
     init_tracing(cli.log_format);
@@ -734,14 +754,21 @@ fn resolve_channels<'a>(
 }
 
 /// Read `target`'s chunk files, take the next `next` items from now forward,
-/// and write an audit report (text or JSON, per `format`) to a temp file,
-/// then print its path.
+/// and write an audit report (text or JSON, per `format`) to `audit_out` —
+/// or, with `audit_out` absent, to a generated temp file whose path is then
+/// printed.
 ///
 /// Reads only the chunk files already on disk: no catalog is opened and no
 /// plugin runs on this path, which is the whole point (ADR 0011) — the
 /// report describes what will actually air, not what a re-simulation of a
 /// plugin's `pick()` believes would air.
-fn audit(config_path: &Path, target: &str, next: usize, format: ReportFormat) -> ExitCode {
+fn audit(
+    config_path: &Path,
+    target: &str,
+    next: usize,
+    format: ReportFormat,
+    audit_out: Option<&Path>,
+) -> ExitCode {
     let station = match config::load(config_path) {
         Ok(s) => s,
         Err(err) => {
@@ -818,12 +845,26 @@ fn audit(config_path: &Path, target: &str, next: usize, format: ReportFormat) ->
             "json",
         ),
     };
-    let path = std::env::temp_dir().join(format!("etv-station-audit-{}.{extension}", channel.name));
-    if let Err(err) = std::fs::write(&path, report) {
-        eprintln!("audit: writing {}: {err}", path.display());
-        return ExitCode::from(1);
+    match audit_out {
+        Some(path) if path == Path::new("-") => {
+            print!("{report}");
+        }
+        Some(path) => {
+            if let Err(err) = std::fs::write(path, report) {
+                eprintln!("audit: writing {}: {err}", path.display());
+                return ExitCode::from(1);
+            }
+        }
+        None => {
+            let path = std::env::temp_dir()
+                .join(format!("etv-station-audit-{}.{extension}", channel.name));
+            if let Err(err) = std::fs::write(&path, report) {
+                eprintln!("audit: writing {}: {err}", path.display());
+                return ExitCode::from(1);
+            }
+            println!("{}", path.display());
+        }
     }
-    println!("{}", path.display());
     ExitCode::SUCCESS
 }
 

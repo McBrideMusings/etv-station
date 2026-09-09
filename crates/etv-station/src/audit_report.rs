@@ -21,6 +21,9 @@ use time::OffsetDateTime;
 
 use crate::errors::StationError;
 use crate::scan;
+/// Shared with `taste-debug`'s metadata printer (etv-station-398) — see
+/// [`crate::value_fmt`] for why this is one function and not two copies.
+use crate::value_fmt::format_value;
 
 /// One item on the upcoming schedule, flattened out of whichever chunk file
 /// held it. Plain owned data — no [`ersatztv_playout::playout::PlayoutItem`]
@@ -71,17 +74,13 @@ pub async fn upcoming(
         if file.finish <= now {
             continue;
         }
-        let bytes = tokio::fs::read(&file.path)
-            .await
-            .map_err(|source| StationError::Io {
-                path: file.path.clone(),
-                source,
-            })?;
-        let playout: Playout =
-            serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
-                path: file.path.clone(),
-                source,
-            })?;
+        let Some(playout) = read_chunk_playout(&file.path).await? else {
+            eprintln!(
+                "audit: {} vanished between listing and read, skipping",
+                file.path.display()
+            );
+            continue;
+        };
         for item in playout.items {
             if item.finish <= now {
                 continue;
@@ -109,6 +108,35 @@ pub async fn upcoming(
 
     items.truncate(next);
     Ok(items)
+}
+
+/// Read and parse one chunk file, treating "it is gone" as a normal outcome
+/// rather than a failure.
+///
+/// `--audit` reads chunk files nothing guarantees are quiescent — the daemon
+/// can rename or delete one out from under this read between
+/// `scan::scan_output_folder`'s directory listing and this call
+/// (etv-station-401). `Ok(None)` is that race, and the caller's cue to skip
+/// the file with a note rather than abort the whole report. Any other I/O
+/// failure (a permissions error, a disk error) is real and still propagates,
+/// same as a malformed chunk still fails with [`StationError::PlayoutCorrupt`].
+async fn read_chunk_playout(path: &Path) -> Result<Option<Playout>, StationError> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StationError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let playout: Playout =
+        serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(Some(playout))
 }
 
 /// Render `items` (already the upcoming slice — this does no filtering or
@@ -331,36 +359,6 @@ fn clock(t: OffsetDateTime) -> String {
     format!("{stamp} {:+03}:{:02}", h, m.abs())
 }
 
-/// Lifted from `taste-debug`'s printer (ADR 0002: metadata is opaque to the
-/// station) so a `detail` value renders the same way here as it does there.
-fn format_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Array(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(format_value)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        serde_json::Value::String(s) => s.clone(),
-        // A whole number prints whole. Rhai has one numeric type, so a count
-        // and a rank arrive as floats and rendered at a fixed 4dp they read as
-        // `candidate_count=11543.0000` and `rank=9.0000` — precision that is
-        // not merely noise but actively misleading about what the value is.
-        // A genuine fraction keeps 4dp, trailing zeros trimmed.
-        serde_json::Value::Number(n) => match n.as_f64() {
-            Some(f) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", f as i64),
-            Some(f) => {
-                let s = format!("{f:.4}");
-                s.trim_end_matches('0').trim_end_matches('.').to_string()
-            }
-            None => n.to_string(),
-        },
-        other => other.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +407,68 @@ mod tests {
 
     fn no_audit(_i: usize) -> Option<serde_json::Value> {
         None
+    }
+
+    /// A chunk file gone by the time it is read (deleted or renamed out from
+    /// under `--audit` between the directory listing and this call,
+    /// etv-station-401) is a normal outcome, not an I/O error.
+    #[tokio::test]
+    async fn read_chunk_playout_reports_a_vanished_file_as_none_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir
+            .path()
+            .join("2026-04-20T00-00-00Z_2026-04-20T01-00-00Z.json");
+
+        let result = read_chunk_playout(&missing).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    /// A chunk file that exists but is not valid playout JSON is a real
+    /// failure and must still surface as one — only "gone" is swallowed.
+    #[tokio::test]
+    async fn read_chunk_playout_still_fails_on_a_genuinely_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.json");
+        tokio::fs::write(&path, b"not json").await.unwrap();
+
+        let err = read_chunk_playout(&path).await.unwrap_err();
+        assert!(matches!(err, StationError::PlayoutCorrupt { .. }));
+    }
+
+    /// End to end: a chunk file that `scan::scan_output_folder`'s directory
+    /// listing sees but that is gone by the time `upcoming` opens it — a
+    /// dangling symlink deterministically reproduces the race (etv-station-401)
+    /// without actually racing anything — is skipped, and the report still
+    /// completes with the items the surviving chunk holds.
+    #[tokio::test]
+    async fn upcoming_skips_a_chunk_file_that_vanished_before_it_could_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(dir.path(), datetime!(2026-04-20 12:00 UTC), 2, no_audit).await;
+
+        let vanished_name = crate::emit::chunk_filename(
+            datetime!(2026-04-20 13:00 UTC),
+            datetime!(2026-04-20 14:00 UTC),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("no-such-target.json"),
+            dir.path().join(vanished_name),
+        )
+        .unwrap();
+
+        let now = datetime!(2026-04-20 12:00 UTC);
+        let items = upcoming(dir.path(), now, 10).await.unwrap();
+
+        assert_eq!(
+            items.len(),
+            2,
+            "the surviving chunk's items are still reported"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|i| i.start < datetime!(2026-04-20 13:00 UTC))
+        );
     }
 
     #[tokio::test]
