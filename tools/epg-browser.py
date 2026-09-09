@@ -1090,7 +1090,7 @@ def build_app(host: str):
             if self.history:
                 start_text = (
                     f"[yellow]⏶ Start of retained EPG: {_fmt_dt_sec(win_start, with_date=True)}[/yellow]\n"
-                    "[dim]   nothing older than this is still in the guide[/dim]"
+                    "[dim]   nothing older is still in the guide[/dim]"
                 )
                 rows.append(ListItem(Label(start_text), name="start"))
                 row_texts.append(("start", start_text))

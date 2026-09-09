@@ -163,113 +163,135 @@ async def check(width: int, height: int) -> bool:
         def now(cls, tz=None):
             return now
 
-    epgb.datetime = _FrozenDatetime
-    epgb.fetch_lineup = lambda host: fixture(now)
-    app = epgb.build_app("http://127.0.0.1:8409")
     ok = True
-    async with app.run_test(size=(width, height)) as pilot:
-        # The lineup fetch now runs on a thread worker (#422) — drain it
-        # before asserting, or these checks race the fixture landing.
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        wide = app.query_one("#layout").has_class("wide")
-        print(f"=== {width}x{height} — detail {'right column' if wide else 'bottom row'} ===")
-        panes = ("#layout", "#channels", "#programmes", "#detail")
-        for sel in panes:
-            r = app.query_one(sel).region
-            print(f"  {sel:12} x={r.x:<4} y={r.y:<4} w={r.width:<4} h={r.height}")
+    try:
+        epgb.datetime = _FrozenDatetime
+        epgb.fetch_lineup = lambda host: fixture(now)
+        app = epgb.build_app("http://127.0.0.1:8409")
+        async with app.run_test(size=(width, height)) as pilot:
+            # The lineup fetch now runs on a thread worker (#422) — drain it
+            # before asserting, or these checks race the fixture landing.
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            wide = app.query_one("#layout").has_class("wide")
+            print(f"=== {width}x{height} — detail {'right column' if wide else 'bottom row'} ===")
+            panes = ("#layout", "#channels", "#programmes", "#detail")
+            for sel in panes:
+                r = app.query_one(sel).region
+                print(f"  {sel:12} x={r.x:<4} y={r.y:<4} w={r.width:<4} h={r.height}")
 
-        right = max(app.query_one(s).region.right for s in panes)
-        bottom = max(app.query_one(s).region.bottom for s in panes)
-        for what, got, limit in (("right edge", right, width), ("bottom edge", bottom, height)):
-            good = got <= limit
+            right = max(app.query_one(s).region.right for s in panes)
+            bottom = max(app.query_one(s).region.bottom for s in panes)
+            for what, got, limit in (("right edge", right, width), ("bottom edge", bottom, height)):
+                good = got <= limit
+                ok &= good
+                print(f"  {what:12} {got} <= {limit}  {'OK' if good else 'OVERFLOW'}")
+
+            # The detail pane holds the widest single line in the app — the full
+            # stream URL. Stacked, it must span the terminal; as a column, it must
+            # still be wide enough for that line plus its 1-column padding.
+            detail_w = app.query_one("#detail").content_size.width
+            floor = DETAIL_MIN if wide else width - 2
+            good = detail_w >= floor
             ok &= good
-            print(f"  {what:12} {got} <= {limit}  {'OK' if good else 'OVERFLOW'}")
+            print(f"  {'detail width':12} {detail_w} >= {floor} (terminal {width})  {'OK' if good else 'TOO NARROW'}")
 
-        # The detail pane holds the widest single line in the app — the full
-        # stream URL. Stacked, it must span the terminal; as a column, it must
-        # still be wide enough for that line plus its 1-column padding.
-        detail_w = app.query_one("#detail").content_size.width
-        floor = DETAIL_MIN if wide else width - 2
-        good = detail_w >= floor
-        ok &= good
-        print(f"  {'detail width':12} {detail_w} >= {floor} (terminal {width})  {'OK' if good else 'TOO NARROW'}")
+            # Report-only: a changeover row can still clip at 80 columns. The full
+            # text is always in the detail pane, so this is not a failure. A row
+            # is one item now and can be several lines tall (one per 15-minute
+            # boundary it crosses), with the title only on its first line and a
+            # bare clock plus gutter rule on every line after it — so this
+            # measures every line of every row, not just the first. Forward
+            # mode's tolerance stays report-only here — history mode's own
+            # widest-row check below is a hard assertion, but that is a
+            # separate, deliberate call for this item, not a change to
+            # forward mode's existing behaviour.
+            pane = app.query_one("#programmes").region.width
+            rows = [
+                len(line)
+                for i in app.query("#programmes ListItem")
+                for line in _label_text(i.query_one("Label")).split("\n")
+            ]
+            widest = max(rows, default=0)
+            print(
+                f"  {'widest row':12} {widest} chars, pane {pane}  "
+                f"{'fits' if widest <= pane else 'clips (detail pane has it)'}"
+            )
 
-        # Report-only: a changeover row can still clip at 80 columns. The full
-        # text is always in the detail pane, so this is not a failure. A row
-        # is one item now and can be several lines tall (one per 15-minute
-        # boundary it crosses), with the title only on its first line and a
-        # bare clock plus gutter rule on every line after it — so this
-        # measures every line of every row, not just the first.
-        pane = app.query_one("#programmes").region.width
-        rows = [
-            len(line) for i in app.query("#programmes ListItem") for line in _label_text(i.query_one("Label")).split("\n")
-        ]
-        widest = max(rows, default=0)
-        print(f"  {'widest row':12} {widest} chars, pane {pane}  {'fits' if widest <= pane else 'clips (detail pane has it)'}")
+            # The gutter's real cost: the title-elision budget a row keeps once
+            # PREFIX_W is subtracted from the programmes pane. Asserted, not just
+            # reported, so a prefix that grows again fails the suite instead of
+            # silently eating into TITLE_MIN.
+            budget = pane - PREFIX_W
+            good = budget >= TITLE_MIN
+            ok &= good
+            print(f"  {'title budget':12} {budget} >= {TITLE_MIN} (pane {pane} - prefix {PREFIX_W})  {'OK' if good else 'TOO NARROW'}")
 
-        # The gutter's real cost: the title-elision budget a row keeps once
-        # PREFIX_W is subtracted from the programmes pane. Asserted, not just
-        # reported, so a prefix that grows again fails the suite instead of
-        # silently eating into TITLE_MIN.
-        budget = pane - PREFIX_W
-        good = budget >= TITLE_MIN
-        ok &= good
-        print(f"  {'title budget':12} {budget} >= {TITLE_MIN} (pane {pane} - prefix {PREFIX_W})  {'OK' if good else 'TOO NARROW'}")
+            # One ListItem per media item, not per 15-minute block (#415) — the
+            # fixture channel (ersatztv.1, selected by default) has 3
+            # back-to-back hour-long programmes from `now`, so its rows should be
+            # exactly those 3 items plus the "Last EPG data" bound row, not the
+            # ~13 block rows a hard-coded block-per-row sidebar would produce.
+            assert app.selected_channel == "ersatztv.1", f"fixture default selection changed: {app.selected_channel}"
+            row_count = len(app.query("#programmes ListItem"))
+            expected = 4
+            good = row_count == expected
+            ok &= good
+            print(f"  {'item rows':12} {row_count} == {expected} (3 programmes + end-of-EPG bound row)  {'OK' if good else 'WRONG COUNT'}")
 
-        # One ListItem per media item, not per 15-minute block (#415) — the
-        # fixture channel (ersatztv.1, selected by default) has 3
-        # back-to-back hour-long programmes from `now`, so its rows should be
-        # exactly those 3 items plus the "Last EPG data" bound row, not the
-        # ~13 block rows a hard-coded block-per-row sidebar would produce.
-        assert app.selected_channel == "ersatztv.1", f"fixture default selection changed: {app.selected_channel}"
-        row_count = len(app.query("#programmes ListItem"))
-        expected = 4
-        good = row_count == expected
-        ok &= good
-        print(f"  {'item rows':12} {row_count} == {expected} (3 programmes + end-of-EPG bound row)  {'OK' if good else 'WRONG COUNT'}")
+            # Now flip into history mode — the fixture's second, back-to-back run
+            # of shows ending exactly at `now` gives it a non-empty window (see
+            # fixture()'s docstring). action_toggle_history calls _load_programmes
+            # directly (no thread worker involved), so a pause is enough to let
+            # the rebuilt rows land before asserting on them.
+            app.action_toggle_history()
+            await pilot.pause()
+            print(f"=== {width}x{height} — HISTORY mode ===")
 
-        # Now flip into history mode — the fixture's second, back-to-back run
-        # of shows ending exactly at `now` gives it a non-empty window (see
-        # fixture()'s docstring). action_toggle_history calls _load_programmes
-        # directly (no thread worker involved), so a pause is enough to let
-        # the rebuilt rows land before asserting on them.
-        app.action_toggle_history()
-        await pilot.pause()
-        print(f"=== {width}x{height} — HISTORY mode ===")
+            pane_hist = app.query_one("#programmes").region.width
+            rows_hist = [
+                len(line)
+                for i in app.query("#programmes ListItem")
+                for line in _label_text(i.query_one("Label")).split("\n")
+            ]
+            widest_hist = max(rows_hist, default=0)
+            good = widest_hist <= pane_hist
+            ok &= good
+            # Unlike forward mode above, this IS the failure — history mode has
+            # no separate detail-pane fallback view that makes an overflowing
+            # row harmless, and this is precisely the row #381 exists to catch:
+            # a history row 2 characters wider than a title-only budget would
+            # predict, from the date-qualified stamp, and no guard noticing.
+            print(
+                f"  {'widest row':12} {widest_hist} <= {pane_hist} (pane)  "
+                f"{'OK' if good else 'OVERFLOW'}"
+            )
 
-        pane_hist = app.query_one("#programmes").region.width
-        rows_hist = [
-            len(line)
-            for i in app.query("#programmes ListItem")
-            for line in _label_text(i.query_one("Label")).split("\n")
-        ]
-        widest_hist = max(rows_hist, default=0)
-        print(
-            f"  {'widest row':12} {widest_hist} chars, pane {pane_hist}  "
-            f"{'fits' if widest_hist <= pane_hist else 'clips (detail pane has it)'}"
-        )
+            budget_hist = pane_hist - HISTORY_PREFIX_W
+            good = budget_hist >= HISTORY_TITLE_MIN
+            ok &= good
+            print(
+                f"  {'title budget':12} {budget_hist} >= {HISTORY_TITLE_MIN} "
+                f"(pane {pane_hist} - prefix {HISTORY_PREFIX_W})  {'OK' if good else 'TOO NARROW'}"
+            )
 
-        budget_hist = pane_hist - HISTORY_PREFIX_W
-        good = budget_hist >= HISTORY_TITLE_MIN
-        ok &= good
-        print(
-            f"  {'title budget':12} {budget_hist} >= {HISTORY_TITLE_MIN} "
-            f"(pane {pane_hist} - prefix {HISTORY_PREFIX_W})  {'OK' if good else 'TOO NARROW'}"
-        )
-
-        # 1 "Start of retained EPG" bound row + the 3 back-to-back historical
-        # programmes, with no gap segments between them (they were built to
-        # cover the window with zero seams — see fixture()).
-        row_count_hist = len(app.query("#programmes ListItem"))
-        expected_hist = 4
-        good = row_count_hist == expected_hist
-        ok &= good
-        print(
-            f"  {'item rows':12} {row_count_hist} == {expected_hist} "
-            f"(3 programmes + start-of-history bound row)  {'OK' if good else 'WRONG COUNT'}"
-        )
-    epgb.datetime = real_datetime
+            # 1 "Start of retained EPG" bound row + the 3 back-to-back historical
+            # programmes, with no gap segments between them (they were built to
+            # cover the window with zero seams — see fixture()).
+            row_count_hist = len(app.query("#programmes ListItem"))
+            expected_hist = 4
+            good = row_count_hist == expected_hist
+            ok &= good
+            print(
+                f"  {'item rows':12} {row_count_hist} == {expected_hist} "
+                f"(3 programmes + start-of-history bound row)  {'OK' if good else 'WRONG COUNT'}"
+            )
+    finally:
+        # epgb is a module cached in sys.modules and shared by every check()
+        # call in this run — an exception raised anywhere above (an assert,
+        # a query_one miss) must not leave it patched to this call's frozen
+        # `now` for whatever check() call runs next.
+        epgb.datetime = real_datetime
     return ok
 
 
