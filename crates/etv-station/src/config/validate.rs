@@ -796,7 +796,12 @@ fn validate_plugin_declares_pool_provider(
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, plugin);
-    let hooks = crate::score::declared_hooks(&script_path)
+    // One compile, shared by both inspections below (#408) — this used to
+    // compile the script once for `declared_hooks` and again for
+    // `missing_required_fns`.
+    let ast = crate::score::compile_plugin(&script_path)
+        .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
+    let hooks = crate::score::declared_hooks_from_ast(&ast, &script_path)
         .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
     if !hooks.iter().any(|h| h == "pool_provider") {
         return Err(bad(format!(
@@ -815,8 +820,7 @@ fn validate_plugin_declares_pool_provider(
     // `pick()`. Adding to that list is a breaking change for every plugin
     // script on a deployed host, including ones with no copy in this
     // checkout — read its doc comment before you do.
-    let missing = crate::score::missing_required_fns(&script_path, &hooks)
-        .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
+    let missing = crate::score::missing_required_fns_from_ast(&ast, &hooks);
     if let Some(req) = missing.first() {
         return Err(bad(format!(
             "pool {:?} names plugin {} via `plugin:`, which declares the \
@@ -1868,6 +1872,40 @@ mod tests {
 fn audit(ctx, picks, workspace) { #{} }"#,
         )
         .unwrap();
+    }
+
+    /// #408: `validate_plugin_declares_pool_provider` used to compile the
+    /// script twice — once inside `declared_hooks`, again inside
+    /// `missing_required_fns` — because it ran the hook check and the
+    /// required-function check as two separate calls each reading and
+    /// compiling the file. It now compiles once and shares the `AST` between
+    /// both. (Not routed through the whole-channel `validate_plugin_script`
+    /// helper — `validate_plugin_capabilities`, the pool's other plugin
+    /// check, does its own separate compile via `declared_capabilities` and
+    /// is out of this fix's scope, so it would inflate the count here.)
+    #[test]
+    fn validating_one_plugin_script_compiles_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("scorer.rhai");
+        std::fs::write(
+            &script,
+            r#"fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }"#,
+        )
+        .unwrap();
+        let pool = plugin_pool("shows", script.clone());
+        let bad = |message: String| ConfigError::Validation {
+            path: dir.path().join("channel.yaml"),
+            message,
+        };
+
+        let compiles = crate::score::test_support::count_compiles(|| {
+            validate_plugin_declares_pool_provider(&pool, &script, dir.path(), &bad).unwrap();
+        });
+        assert_eq!(
+            compiles, 1,
+            "validation compiled the script {compiles} times"
+        );
     }
 
     /// A relative `plugin:` path is checked against the channel config's own
