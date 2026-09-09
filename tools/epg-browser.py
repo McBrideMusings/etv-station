@@ -755,6 +755,15 @@ def build_app(host: str):
             # than thrash.
             self._audit_summary_key: tuple[str, str] | None = None
             self._audit_summary: tuple[str, str | None] | None = None
+            # (name, text) per row from the last successful _load_programmes
+            # build — the cheapest rebuild is the one that never touches the
+            # widget tree because the resolved output is byte-identical to
+            # what's already on screen (etv-station-d4ss.12). None before the
+            # first build ever completes, so the first call always draws.
+            self._last_row_signature: tuple[tuple[str, str], ...] | None = None
+            # Set by run_tui when --timing/ETV_EPG_TIMING is active; otherwise
+            # None, and _load_programmes's recorder.record call is skipped.
+            self._timing_recorder = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -813,7 +822,7 @@ def build_app(host: str):
             self.query_one("#channels", ListView).focus()
             self.action_refresh()
             self.set_interval(self.REFRESH_SECS, self.action_refresh)
-            self.set_interval(self.TICK_SECS, lambda: self._load_programmes(keep_selection=True))
+            self.set_interval(self.TICK_SECS, lambda: self._load_programmes(keep_selection=True, reason="tick"))
 
         def action_refresh(self) -> None:
             """Kick off a lineup fetch on a thread worker and return
@@ -877,14 +886,39 @@ def build_app(host: str):
                 # that was selected before, so resync selected_channel to
                 # what's actually highlighted rather than leaving it stale.
                 self.selected_channel = list(self.channels.keys())[keep_index]
-            self._load_programmes(keep_selection=True)
+            self._load_programmes(keep_selection=True, reason="lineup")
 
         @staticmethod
         def _floor_block(dt: datetime, minutes: int) -> datetime:
             floored_minute = (dt.minute // minutes) * minutes
             return dt.replace(minute=floored_minute, second=0, microsecond=0)
 
-        def _load_programmes(self, keep_selection: bool = False) -> None:
+        def _apply_programme_rows(
+            self, rows: list[ListItem], row_texts: list[tuple[str, str]], select_idx: int
+        ) -> None:
+            """The one place _load_programmes actually touches #programmes.
+            Skips lv.clear()/extend() (and therefore every ListItem Compose
+            they'd cause) when this build's rendered rows are identical to
+            the last build that actually drew — the fix half of
+            etv-station-d4ss.12: a rebuild that changes nothing on screen
+            should cost nothing on screen, whatever triggered it."""
+            assert len(rows) == len(row_texts), (
+                "row_texts drifted out of sync with rows — every rows.append() "
+                "in _load_programmes needs a matching row_texts.append(), or "
+                "the skip-if-unchanged signature stops covering every row"
+            )
+            lv = self.query_one("#programmes", ListView)
+            signature = tuple(row_texts)
+            if signature == self._last_row_signature and lv.index == select_idx and len(lv) == len(rows):
+                self.refresh_detail()
+                return
+            self._last_row_signature = signature
+            lv.clear()
+            lv.extend(rows)
+            lv.index = select_idx
+            self.refresh_detail()
+
+        def _load_programmes(self, keep_selection: bool = False, reason: str = "unknown") -> None:
             """(Re)populate the #programmes sidebar with one row per media
             item, each row's height snapped to the BLOCK_MINUTES grid (one
             line per boundary it crosses). Every item is rendered, on-air or
@@ -910,7 +944,14 @@ def build_app(host: str):
             ends of the list. On a periodic rebuild, whatever item the user had
             highlighted stays highlighted (by its title and real start time,
             not row index, since the list shifts every time a block rolls
-            over or an item's row is regrouped)."""
+            over or an item's row is regrouped).
+
+            `reason` names the caller for --timing attribution
+            (etv-station-d4ss.12) — every call site passes an explicit string
+            rather than this reading inspect.stack(), since the four callers
+            are all known and a literal is cheaper and exact."""
+            if self._timing_recorder is not None:
+                self._timing_recorder.record(0.0, "load_programmes", reason, force=True)
             lv = self.query_one("#programmes", ListView)
             keep_kind = None
             keep_key = None
@@ -921,6 +962,11 @@ def build_app(host: str):
                     keep_key = (keep_title, keep_row_ts)
             self.programme_rows = []
             rows: list[ListItem] = []
+            # Parallel to rows: (name, rendered text) per row, compared
+            # against the previous build in _apply_programme_rows so a
+            # rebuild whose output is byte-identical never touches the
+            # widget tree (etv-station-d4ss.12).
+            row_texts: list[tuple[str, str]] = []
             if self.selected_channel is None:
                 lv.clear()
                 self.refresh_detail()
@@ -963,11 +1009,9 @@ def build_app(host: str):
                         f"ended {_fmt_dt_sec(last.stop)} ({ago} ago)[/dim]"
                     )
                 rows.append(ListItem(Label(label), name="empty"))
+                row_texts.append(("empty", label))
                 self.programme_rows.append(("empty", None, last))
-                lv.clear()
-                lv.extend(rows)
-                lv.index = 0
-                self.refresh_detail()
+                self._apply_programme_rows(rows, row_texts, 0)
                 return
 
             # The window both modes render, as real unrounded timestamps. One
@@ -1044,15 +1088,12 @@ def build_app(host: str):
             # reads oldest-at-top, so "this is as far back as the guide goes"
             # belongs above the oldest block, where scrolling up runs into it.
             if self.history:
-                rows.append(
-                    ListItem(
-                        Label(
-                            f"[yellow]⏶ Start of retained EPG: {_fmt_dt_sec(win_start, with_date=True)}[/yellow]\n"
-                            "[dim]   nothing older than this is still in the guide[/dim]"
-                        ),
-                        name="start",
-                    )
+                start_text = (
+                    f"[yellow]⏶ Start of retained EPG: {_fmt_dt_sec(win_start, with_date=True)}[/yellow]\n"
+                    "[dim]   nothing older than this is still in the guide[/dim]"
                 )
+                rows.append(ListItem(Label(start_text), name="start"))
+                row_texts.append(("start", start_text))
                 self.programme_rows.append(("start", win_start, None))
 
             select_idx = 0
@@ -1102,7 +1143,9 @@ def build_app(host: str):
                     for idx, line in enumerate(open_lines):
                         glyph = "┌" if idx == 0 else ("└" if idx == n - 1 else "│")
                         resolved.append(line.replace("\x00", glyph, 1))
-                rows.append(ListItem(Label("\n".join(resolved)), name="item"))
+                item_text = "\n".join(resolved)
+                rows.append(ListItem(Label(item_text), name="item"))
+                row_texts.append(("item", item_text))
                 row_idx = len(self.programme_rows)
                 self.programme_rows.append(("item", open_row_ts, open_payload))
                 title = open_payload[0].title if open_payload is not None and open_payload[0] is not None else None
@@ -1186,25 +1229,19 @@ def build_app(host: str):
             # opened with its own bound row and ends at `now`, which is not an
             # edge of the data — there is nothing to say down there.
             if not self.history:
-                rows.append(
-                    ListItem(
-                        Label(
-                            f"[red]⚠ Last EPG data: {_fmt_dt_sec(end_bound)}[/red]\n"
-                            "[dim]   nothing scheduled after this[/dim]"
-                        ),
-                        name="end",
-                    )
+                end_text = (
+                    f"[red]⚠ Last EPG data: {_fmt_dt_sec(end_bound)}[/red]\n"
+                    "[dim]   nothing scheduled after this[/dim]"
                 )
+                rows.append(ListItem(Label(end_text), name="end"))
+                row_texts.append(("end", end_text))
                 self.programme_rows.append(("end", end_bound, None))
                 if keep_kind == "end":
                     select_idx = len(self.programme_rows) - 1
             elif keep_kind == "start":
                 select_idx = 0
 
-            lv.clear()
-            lv.extend(rows)
-            lv.index = select_idx
-            self.refresh_detail()
+            self._apply_programme_rows(rows, row_texts, select_idx)
 
         @staticmethod
         def _programme_headline(p: Programme) -> str:
@@ -1263,7 +1300,7 @@ def build_app(host: str):
             if event.list_view.id == "channels":
                 if event.item is not None and event.item.name and event.item.name != self.selected_channel:
                     self.selected_channel = event.item.name
-                    self._load_programmes()
+                    self._load_programmes(reason="channel_change")
                 else:
                     self.refresh_detail()
             elif event.list_view.id == "programmes":
@@ -1283,7 +1320,7 @@ def build_app(host: str):
             keep_selection=False picks."""
             self.history = not self.history
             self._sync_mode_subtitle()
-            self._load_programmes()
+            self._load_programmes(reason="history_toggle")
             self.query_one("#programmes", ListView).focus()
 
         def _sync_mode_subtitle(self) -> None:
@@ -1720,13 +1757,21 @@ class _TimingRecorder:
             f"threshold={threshold_secs * 1000:.0f}ms\n"
         )
 
-    def record(self, elapsed_secs: float, kind: str, name: str, extra: str = "") -> None:
+    def record(
+        self, elapsed_secs: float, kind: str, name: str, extra: str = "", force: bool = False
+    ) -> None:
+        """`force` writes the line immediately regardless of threshold_secs —
+        for an event whose elapsed time is meaningless (etv-station-d4ss.12's
+        rebuild-attribution calls always pass 0.0, since what matters is WHICH
+        reason fired, not how long logging it took) but whose occurrence must
+        still survive a kill or crash, not wait for write_summary()'s final
+        totals table."""
         self._events.append((elapsed_secs, kind, name, extra))
         totals_key = (kind, name)
         bucket = self._totals.setdefault(totals_key, [0, 0.0])
         bucket[0] += 1
         bucket[1] += elapsed_secs
-        if elapsed_secs >= self.threshold_secs:
+        if force or elapsed_secs >= self.threshold_secs:
             self._fh.write(f"{elapsed_secs * 1000:8.1f}ms  {kind:8s} {name:30s}{extra}\n")
 
     def write_summary(self) -> None:
@@ -1801,6 +1846,7 @@ def run_tui(host: str, timing_path: str | None = None) -> None:
         return
     recorder = _TimingRecorder(timing_path)
     install_timing(recorder)
+    app._timing_recorder = recorder
     try:
         app.run()
     finally:
