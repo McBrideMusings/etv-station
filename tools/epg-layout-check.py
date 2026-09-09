@@ -42,8 +42,14 @@ PREFIX_W = 21  # marker+space, `chNNN `, the 2-column ┌/│/└ gutter, the
 # everything on a programme row before the title starts.
 TITLE_MIN = 25  # title-elision budget a row must keep at MIN_WIDTH: the
 # 46-wide stacked programmes pane minus PREFIX_W. This is forward mode's
-# worst case (the mode the fixture drives); history mode's 11-char stamp
-# is 2 wider still, giving it a budget of 23, not asserted here.
+# worst case.
+HISTORY_PREFIX_W = PREFIX_W + 2  # history's stamp is `MM-DD HH:MM` (11
+# chars) rather than forward's worst-case weekday-qualified `Wed HH:MM`
+# (9 chars) — a calendar date, not a weekday, is what disambiguates a
+# window exactly HISTORY_DAYS deep.
+HISTORY_TITLE_MIN = TITLE_MIN - 2  # 46-wide pane minus HISTORY_PREFIX_W —
+# measured against prod, a history row lands at exactly 46 characters in
+# the 46-wide pane, i.e. this budget is hit with nothing to spare.
 
 SRC = Path(__file__).resolve().parent / "epg-browser.py"
 spec = importlib.util.spec_from_file_location("epg_browser", SRC)
@@ -52,18 +58,32 @@ sys.modules["epg_browser"] = epgb
 spec.loader.exec_module(epgb)
 
 
-def fixture() -> tuple[dict, list]:
+def fixture(now: datetime | None = None) -> tuple[dict, list]:
     """Two channels and a back-to-back run of long-titled shows, so the
-    programme rows include a worst-case changeover: the second and third
-    shows start at unrounded `now + i hours`, mid-block relative to the
-    15-minute grid, so their rows open on their own real unrounded start time
-    rather than the block-clock time the first show's row gets (as the
-    window's first segment, its row always opens on a block boundary — see
+    programme rows include a worst-case changeover: the forward-mode shows
+    start at unrounded `now + i hours`, mid-block relative to the 15-minute
+    grid, so their rows open on their own real unrounded start time rather
+    than the block-clock time the first show's row gets (as the window's
+    first segment, its row always opens on a block boundary — see
     epg-browser.py's `_load_programmes`). Each row's title is stated once, on
     its first line, with a ┌/│/└ gutter rule marking the rest. `number` is
     set because every row is prefixed with the channel number, and a fixture
-    without one measures a row six characters narrower than prod draws."""
-    now = datetime.now(timezone.utc)
+    without one measures a row six characters narrower than prod draws.
+
+    A second, back-to-back run of shows at `now - (3-i) hours` ending exactly
+    at `now` gives history mode ([now - HISTORY_DAYS, now]) a non-empty
+    window with no gap segments, so check() can toggle into it and measure
+    real rows rather than the "No EPG history retained" placeholder.
+
+    `now` is a parameter, not read fresh here, so a caller can freeze it to
+    the same instant epg-browser's own `datetime.now()` is patched to return
+    for the duration of a check() run — see check()'s _FrozenDatetime. The
+    forward and history windows both have `now` as one edge, so if it moved
+    between the fixture being built and the app re-deriving "now" itself,
+    a show at that exact boundary could drift across it (real time only
+    advances, so the drift is always in the same direction) and get counted
+    in both windows, or dropped from both."""
+    now = now if now is not None else datetime.now(timezone.utc)
     channels = {
         f"ersatztv.{n}": epgb.Channel(
             tvg_id=f"ersatztv.{n}",
@@ -92,6 +112,23 @@ def fixture() -> tuple[dict, list]:
                 icon="http://station.example:8419/artwork/imdb_tt28754309.jpg",
             )
         )
+    for i, title in enumerate(["Selling the OC", "The Real Housewives of Latvia", "Below Deck Down Under"]):
+        start = now - timedelta(hours=3 - i)
+        progs.append(
+            epgb.Programme(
+                channel_id="ersatztv.1",
+                start=start,
+                stop=start + timedelta(hours=1),
+                title=title,
+                sub_title="Reunion",
+                desc="The cast confronts the season's fallout on camera, one last time.",
+                season=1,
+                episode=i + 1,
+                categories=["Reality"],
+                rating="TV-14",
+                icon="http://station.example:8419/artwork/imdb_tt00000000.jpg",
+            )
+        )
     return channels, progs
 
 
@@ -110,70 +147,151 @@ def _label_text(label) -> str:
 
 
 async def check(width: int, height: int) -> bool:
-    epgb.fetch_lineup = lambda host: fixture()
-    app = epgb.build_app("http://127.0.0.1:8409")
+    # Freeze epg-browser's own idea of "now" to the instant the fixture was
+    # built. Both the forward and history windows have `now` as one edge, and
+    # the fixture's boundary-straddling shows (Shoresy starts exactly at
+    # `now`; Below Deck Down Under ends exactly at `now`) are deliberately
+    # placed there. Real time only advances, so if _load_programmes re-read
+    # a live clock on each call, the second call (the toggle into history,
+    # moments later in wall-clock time) would see a slightly later `now` and
+    # a boundary show could drift across it — see fixture()'s docstring.
+    now = datetime.now(timezone.utc)
+    real_datetime = epgb.datetime
+
+    class _FrozenDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
     ok = True
-    async with app.run_test(size=(width, height)) as pilot:
-        # The lineup fetch now runs on a thread worker (#422) — drain it
-        # before asserting, or these checks race the fixture landing.
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        wide = app.query_one("#layout").has_class("wide")
-        print(f"=== {width}x{height} — detail {'right column' if wide else 'bottom row'} ===")
-        panes = ("#layout", "#channels", "#programmes", "#detail")
-        for sel in panes:
-            r = app.query_one(sel).region
-            print(f"  {sel:12} x={r.x:<4} y={r.y:<4} w={r.width:<4} h={r.height}")
+    try:
+        epgb.datetime = _FrozenDatetime
+        epgb.fetch_lineup = lambda host: fixture(now)
+        app = epgb.build_app("http://127.0.0.1:8409")
+        async with app.run_test(size=(width, height)) as pilot:
+            # The lineup fetch now runs on a thread worker (#422) — drain it
+            # before asserting, or these checks race the fixture landing.
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            wide = app.query_one("#layout").has_class("wide")
+            print(f"=== {width}x{height} — detail {'right column' if wide else 'bottom row'} ===")
+            panes = ("#layout", "#channels", "#programmes", "#detail")
+            for sel in panes:
+                r = app.query_one(sel).region
+                print(f"  {sel:12} x={r.x:<4} y={r.y:<4} w={r.width:<4} h={r.height}")
 
-        right = max(app.query_one(s).region.right for s in panes)
-        bottom = max(app.query_one(s).region.bottom for s in panes)
-        for what, got, limit in (("right edge", right, width), ("bottom edge", bottom, height)):
-            good = got <= limit
+            right = max(app.query_one(s).region.right for s in panes)
+            bottom = max(app.query_one(s).region.bottom for s in panes)
+            for what, got, limit in (("right edge", right, width), ("bottom edge", bottom, height)):
+                good = got <= limit
+                ok &= good
+                print(f"  {what:12} {got} <= {limit}  {'OK' if good else 'OVERFLOW'}")
+
+            # The detail pane holds the widest single line in the app — the full
+            # stream URL. Stacked, it must span the terminal; as a column, it must
+            # still be wide enough for that line plus its 1-column padding.
+            detail_w = app.query_one("#detail").content_size.width
+            floor = DETAIL_MIN if wide else width - 2
+            good = detail_w >= floor
             ok &= good
-            print(f"  {what:12} {got} <= {limit}  {'OK' if good else 'OVERFLOW'}")
+            print(f"  {'detail width':12} {detail_w} >= {floor} (terminal {width})  {'OK' if good else 'TOO NARROW'}")
 
-        # The detail pane holds the widest single line in the app — the full
-        # stream URL. Stacked, it must span the terminal; as a column, it must
-        # still be wide enough for that line plus its 1-column padding.
-        detail_w = app.query_one("#detail").content_size.width
-        floor = DETAIL_MIN if wide else width - 2
-        good = detail_w >= floor
-        ok &= good
-        print(f"  {'detail width':12} {detail_w} >= {floor} (terminal {width})  {'OK' if good else 'TOO NARROW'}")
+            # Report-only: a changeover row can still clip at 80 columns. The full
+            # text is always in the detail pane, so this is not a failure. A row
+            # is one item now and can be several lines tall (one per 15-minute
+            # boundary it crosses), with the title only on its first line and a
+            # bare clock plus gutter rule on every line after it — so this
+            # measures every line of every row, not just the first. Forward
+            # mode's tolerance stays report-only here — history mode's own
+            # widest-row check below is a hard assertion, but that is a
+            # separate, deliberate call for this item, not a change to
+            # forward mode's existing behaviour.
+            pane = app.query_one("#programmes").region.width
+            rows = [
+                len(line)
+                for i in app.query("#programmes ListItem")
+                for line in _label_text(i.query_one("Label")).split("\n")
+            ]
+            widest = max(rows, default=0)
+            print(
+                f"  {'widest row':12} {widest} chars, pane {pane}  "
+                f"{'fits' if widest <= pane else 'clips (detail pane has it)'}"
+            )
 
-        # Report-only: a changeover row can still clip at 80 columns. The full
-        # text is always in the detail pane, so this is not a failure. A row
-        # is one item now and can be several lines tall (one per 15-minute
-        # boundary it crosses), with the title only on its first line and a
-        # bare clock plus gutter rule on every line after it — so this
-        # measures every line of every row, not just the first.
-        pane = app.query_one("#programmes").region.width
-        rows = [
-            len(line) for i in app.query("#programmes ListItem") for line in _label_text(i.query_one("Label")).split("\n")
-        ]
-        widest = max(rows, default=0)
-        print(f"  {'widest row':12} {widest} chars, pane {pane}  {'fits' if widest <= pane else 'clips (detail pane has it)'}")
+            # The gutter's real cost: the title-elision budget a row keeps once
+            # PREFIX_W is subtracted from the programmes pane. Asserted, not just
+            # reported, so a prefix that grows again fails the suite instead of
+            # silently eating into TITLE_MIN.
+            budget = pane - PREFIX_W
+            good = budget >= TITLE_MIN
+            ok &= good
+            print(f"  {'title budget':12} {budget} >= {TITLE_MIN} (pane {pane} - prefix {PREFIX_W})  {'OK' if good else 'TOO NARROW'}")
 
-        # The gutter's real cost: the title-elision budget a row keeps once
-        # PREFIX_W is subtracted from the programmes pane. Asserted, not just
-        # reported, so a prefix that grows again fails the suite instead of
-        # silently eating into TITLE_MIN.
-        budget = pane - PREFIX_W
-        good = budget >= TITLE_MIN
-        ok &= good
-        print(f"  {'title budget':12} {budget} >= {TITLE_MIN} (pane {pane} - prefix {PREFIX_W})  {'OK' if good else 'TOO NARROW'}")
+            # One ListItem per media item, not per 15-minute block (#415) — the
+            # fixture channel (ersatztv.1, selected by default) has 3
+            # back-to-back hour-long programmes from `now`, so its rows should be
+            # exactly those 3 items plus the "Last EPG data" bound row, not the
+            # ~13 block rows a hard-coded block-per-row sidebar would produce.
+            assert app.selected_channel == "ersatztv.1", f"fixture default selection changed: {app.selected_channel}"
+            row_count = len(app.query("#programmes ListItem"))
+            expected = 4
+            good = row_count == expected
+            ok &= good
+            print(f"  {'item rows':12} {row_count} == {expected} (3 programmes + end-of-EPG bound row)  {'OK' if good else 'WRONG COUNT'}")
 
-        # One ListItem per media item, not per 15-minute block (#415) — the
-        # fixture channel (ersatztv.1, selected by default) has 3
-        # back-to-back hour-long programmes from `now`, so its rows should be
-        # exactly those 3 items plus the "Last EPG data" bound row, not the
-        # ~13 block rows a hard-coded block-per-row sidebar would produce.
-        assert app.selected_channel == "ersatztv.1", f"fixture default selection changed: {app.selected_channel}"
-        row_count = len(app.query("#programmes ListItem"))
-        expected = 4
-        good = row_count == expected
-        ok &= good
-        print(f"  {'item rows':12} {row_count} == {expected} (3 programmes + end-of-EPG bound row)  {'OK' if good else 'WRONG COUNT'}")
+            # Now flip into history mode — the fixture's second, back-to-back run
+            # of shows ending exactly at `now` gives it a non-empty window (see
+            # fixture()'s docstring). action_toggle_history calls _load_programmes
+            # directly (no thread worker involved), so a pause is enough to let
+            # the rebuilt rows land before asserting on them.
+            app.action_toggle_history()
+            await pilot.pause()
+            print(f"=== {width}x{height} — HISTORY mode ===")
+
+            pane_hist = app.query_one("#programmes").region.width
+            rows_hist = [
+                len(line)
+                for i in app.query("#programmes ListItem")
+                for line in _label_text(i.query_one("Label")).split("\n")
+            ]
+            widest_hist = max(rows_hist, default=0)
+            good = widest_hist <= pane_hist
+            ok &= good
+            # Unlike forward mode above, this IS the failure — history mode has
+            # no separate detail-pane fallback view that makes an overflowing
+            # row harmless, and this is precisely the row #381 exists to catch:
+            # a history row 2 characters wider than a title-only budget would
+            # predict, from the date-qualified stamp, and no guard noticing.
+            print(
+                f"  {'widest row':12} {widest_hist} <= {pane_hist} (pane)  "
+                f"{'OK' if good else 'OVERFLOW'}"
+            )
+
+            budget_hist = pane_hist - HISTORY_PREFIX_W
+            good = budget_hist >= HISTORY_TITLE_MIN
+            ok &= good
+            print(
+                f"  {'title budget':12} {budget_hist} >= {HISTORY_TITLE_MIN} "
+                f"(pane {pane_hist} - prefix {HISTORY_PREFIX_W})  {'OK' if good else 'TOO NARROW'}"
+            )
+
+            # 1 "Start of retained EPG" bound row + the 3 back-to-back historical
+            # programmes, with no gap segments between them (they were built to
+            # cover the window with zero seams — see fixture()).
+            row_count_hist = len(app.query("#programmes ListItem"))
+            expected_hist = 4
+            good = row_count_hist == expected_hist
+            ok &= good
+            print(
+                f"  {'item rows':12} {row_count_hist} == {expected_hist} "
+                f"(3 programmes + start-of-history bound row)  {'OK' if good else 'WRONG COUNT'}"
+            )
+    finally:
+        # epgb is a module cached in sys.modules and shared by every check()
+        # call in this run — an exception raised anywhere above (an assert,
+        # a query_one miss) must not leave it patched to this call's frozen
+        # `now` for whatever check() call runs next.
+        epgb.datetime = real_datetime
     return ok
 
 
