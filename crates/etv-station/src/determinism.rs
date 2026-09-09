@@ -314,6 +314,7 @@ mod tests {
             rule,
             groups: Vec::new(),
             overlay: None,
+            annotate: None,
         }
     }
 

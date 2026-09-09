@@ -325,10 +325,11 @@ pub fn resolve_plugin_path(base_dir: &Path, plugin: &Path) -> PathBuf {
 }
 
 /// Hook names the station understands (#159). `pool_provider` is wired up —
-/// it is what a `plugin:` pool has always meant. `sequencer` is declarable
-/// only; nothing calls it yet, so a script may claim it but the station does
-/// not act on it until a later slice implements the hook itself.
-pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer"];
+/// it is what a `plugin:` pool has always meant. `sequencer` and `annotate`
+/// (ADR 0017) are declarable only; nothing calls either yet, so a script may
+/// claim one but the station does not act on it until a later slice
+/// implements the hook itself.
+pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer", "annotate"];
 
 /// Read the hook names a plugin script declares, without running its scoring
 /// path or touching the catalog.

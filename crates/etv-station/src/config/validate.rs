@@ -143,6 +143,14 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     // names the same script a running channel would actually load.
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
+    if let Some(annotate) = &channel.annotate {
+        let bad = |message: String| ConfigError::Validation {
+            path: path.to_path_buf(),
+            message,
+        };
+        validate_plugin_declares_annotate(annotate, base_dir, &bad)?;
+    }
+
     // Pool names key the `.resume` sidecar, so they must be unique across the
     // whole channel — that is what lets the sidecar survive blocks being
     // reordered without a block index in the key.
@@ -988,6 +996,29 @@ fn validate_plugin_declares_sequencer(
     Ok(())
 }
 
+/// A channel naming a script for `annotate:` must be able to say the script
+/// does that job (ADR 0017) — the same check
+/// [`validate_plugin_declares_sequencer`] runs for a block's `sequencer:`,
+/// against the `annotate` hook instead. Channel-scoped, so `bad` here carries
+/// no block index — the error names the channel's config path alone.
+fn validate_plugin_declares_annotate(
+    annotate: &Path,
+    base_dir: &Path,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let script_path = crate::score::resolve_plugin_path(base_dir, annotate);
+    let hooks = crate::score::declared_hooks(&script_path).map_err(bad)?;
+    if !hooks.iter().any(|h| h == "annotate") {
+        return Err(bad(format!(
+            "channel names plugin {} via `annotate:`, which requires the plugin to \
+             declare the `annotate` hook, but it only declares: {}",
+            script_path.display(),
+            hooks.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// A pool's `groups` (#165) must each name a channel-declared group, and the
 /// groups a single pool combines must be disjoint — a show belonging to two
 /// of them would have no single rotation domain to land in. (A show
@@ -1147,6 +1178,7 @@ mod tests {
             rule: RuleConfig { blocks },
             groups: Vec::new(),
             overlay: None,
+            annotate: None,
         }
     }
 
@@ -1914,6 +1946,51 @@ fn pick(ctx) { throw "pick must not run at load time"; }
         let msg = format!("{err}");
         assert!(msg.contains("audit"), "msg = {msg}");
         assert!(msg.contains("scorer.rhai"), "msg = {msg}");
+    }
+
+    // ---- channel `annotate:` hook declaration (ADR 0017, etv-station-wvwr.1) --
+
+    /// A channel naming `annotate:` a script with this body, written next to
+    /// the channel config in a fresh temp directory. Unlike
+    /// [`validate_plugin_script`], the channel's one block draws from a plain
+    /// `entries:` list — `annotate:` has nothing to do with how a block or
+    /// pool sources items, so the fixture channel doesn't need a `plugin:`
+    /// pool at all.
+    fn validate_annotate_script(body: &str) -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("annotator.rhai");
+        std::fs::write(&script, body).unwrap();
+        let mut channel = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        channel.annotate = Some(script);
+        validate_channel(&dir.path().join("channel.yaml"), &channel)
+    }
+
+    /// A script whose `hooks()` includes `"annotate"` loads cleanly.
+    #[test]
+    fn a_channel_naming_a_script_that_declares_annotate_validates() {
+        validate_annotate_script(r#"fn hooks() { ["annotate"] }"#).unwrap();
+    }
+
+    /// A channel names `annotate:` a script that does not declare the
+    /// `annotate` hook — refused at load, naming the script and what it
+    /// declares instead.
+    #[test]
+    fn a_channel_naming_a_script_that_does_not_declare_annotate_is_rejected() {
+        let err = validate_annotate_script(r#"fn hooks() { ["sequencer"] }"#).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("annotate"), "msg = {msg}");
+        assert!(msg.contains("annotator.rhai"), "msg = {msg}");
+        assert!(msg.contains("sequencer"), "msg = {msg}");
+    }
+
+    /// A channel that omits `annotate:` entirely loads exactly as before —
+    /// the field is optional and its absence changes nothing. `channel_with`
+    /// never sets `annotate`, so this is just the ordinary happy path.
+    #[test]
+    fn a_channel_with_no_annotate_field_loads_unaffected() {
+        let channel = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        assert!(channel.annotate.is_none());
+        validate_channel(&dummy_path(), &channel).unwrap();
     }
 
     // ---- plugin capability declaration (#167) ------------------------------

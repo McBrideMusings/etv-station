@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -103,6 +104,22 @@ pub struct ChannelConfig {
     pub scoring: Option<ScoringConfig>,
 
     pub rule: RuleConfig,
+
+    /// A plugin that attaches metadata to every item on this channel's
+    /// already-built schedule, without selecting or ordering anything (ADR
+    /// 0017). Sibling to [`rule`](Self::rule) rather than nested inside it —
+    /// annotation runs once per item regardless of which block or pool put
+    /// that item there. Channel-scoped only: there is no pool-level or
+    /// block-level equivalent, since the schedule it walks does not exist
+    /// until the whole channel has resolved.
+    ///
+    /// At config load, the named script must declare the `annotate` hook
+    /// (`hooks()`, the same declaration `pool_provider`/`sequencer` already
+    /// use) — a script that doesn't fails load with a named error. `None`
+    /// (the default) means every item keeps whatever metadata its source and
+    /// blocks already gave it, unchanged from before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotate: Option<PathBuf>,
 
     /// Named show groups (#165), declared once and referenced by name from
     /// any pool's `groups:` field — see [`ShowGroup`]. Empty on every channel

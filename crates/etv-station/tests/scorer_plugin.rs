@@ -128,6 +128,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
         retention_days: 1,
         seed: Some(7),
         overlay: None,
+        annotate: None,
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {

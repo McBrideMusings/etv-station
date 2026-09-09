@@ -1807,6 +1807,7 @@ mod tests {
             rule: RuleConfig { blocks },
             groups: Vec::new(),
             overlay: None,
+            annotate: None,
         }
     }
 

@@ -105,6 +105,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
         retention_days: 1,
         seed: Some(7),
         overlay: None,
+        annotate: None,
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
