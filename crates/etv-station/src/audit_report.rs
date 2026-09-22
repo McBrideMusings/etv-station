@@ -260,6 +260,11 @@ fn render_audit_trail(out: &mut String, metadata: Option<&serde_json::Value>) {
         let by = map.get("by").map(format_value).unwrap_or_default();
         let verdict = map.get("verdict").map(format_value).unwrap_or_default();
         out.push_str(&format!("    [{stage}] {by}: {verdict}\n"));
+        // The viewer-facing sentence `scoring.explain` puts in the guide, so
+        // the report shows exactly what the EPG will say.
+        if let Some(guide) = map.get("guide").and_then(|g| g.as_str()) {
+            out.push_str(&format!("        guide: {guide}\n"));
+        }
 
         if let Some(detail) = map.get("detail").and_then(|d| d.as_object()) {
             render_detail(out, detail);
@@ -556,6 +561,34 @@ mod tests {
         assert!(
             report.contains("a_key_this_test_made_up  42\n"),
             "expected the invented key rendered whole, got:\n{report}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guide_sentence_prints_under_its_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = datetime!(2026-04-20 00:00 UTC);
+        write_chunk(dir.path(), start, 1, |_| {
+            Some(serde_json::json!({
+                "audit": [
+                    {
+                        "stage": "pool",
+                        "by": "taste-cosine",
+                        "verdict": "picked",
+                        "guide": "Picked for you: #3 of 900 films",
+                    }
+                ]
+            }))
+        })
+        .await;
+
+        let items = upcoming(dir.path(), start, 10).await.unwrap();
+        let report = render("ch", start, &items);
+        assert!(
+            report.contains(
+                "[pool] taste-cosine: picked\n        guide: Picked for you: #3 of 900 films\n"
+            ),
+            "expected the guide line under its stage, got:\n{report}",
         );
     }
 
