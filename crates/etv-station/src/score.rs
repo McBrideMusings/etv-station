@@ -93,6 +93,10 @@
 //!     // by       — which instance acted, e.g. "plugin:taste-cosine"
 //!     // verdict  — one line in the producer's own words; never read by the
 //!     //            station
+//!     // guide    — optional, 1-200 chars, non-empty when present: a
+//!     //            viewer-facing one-sentence reason, shown in the guide
+//!     //            when the channel turns on `scoring.explain`. Unlike
+//!     //            `verdict` and `detail`, this one IS read by the station.
 //!     // detail   — opaque, same treatment as `metadata` above; optional
 //!     #{ "ghost": #{ stage: "pool", by: "plugin:example", verdict: "ranked highest" } }
 //! }
@@ -1467,7 +1471,10 @@ fn parse_pick_envelope(script_path: &Path, value: Dynamic) -> Result<(Array, Dyn
 /// "cheaper to reject than explain" posture as the duplicate-id refusal in
 /// [`pick`] above. `verdict` and `detail` are never inspected, only carried:
 /// `detail` reuses the same non-finite-float refusal `metadata` already
-/// makes, the opaque treatment ADR 0002 gives both.
+/// makes, the opaque treatment ADR 0002 gives both. `guide` is the one
+/// exception — the station reads it back out in [`crate::daemon`] to build
+/// the guide's "why this was picked" line, so it gets its own shape
+/// checks: a non-empty string, at most 200 characters.
 fn merge_audit_into_metadata(
     script_path: &Path,
     items: &mut [PickedItem],
@@ -1553,6 +1560,39 @@ fn merge_audit_into_metadata(
                 )
             })?;
 
+        // Optional, viewer-facing — the plugin's own one-sentence reason for
+        // this pick, shown in the guide when the channel turns on
+        // `scoring.explain`. Unlike `verdict` and `detail`, this one
+        // *is* inspected, so it gets the same shape checks those two skip.
+        let guide = match map.get("guide") {
+            Some(v) => {
+                let s = v.clone().into_string().map_err(|actual| {
+                    format!(
+                        "scorer plugin {}: audit() record for {entry_id:?}'s `guide` must be a \
+                         string, got {actual}",
+                        script_path.display()
+                    )
+                })?;
+                if s.is_empty() {
+                    return Err(format!(
+                        "scorer plugin {}: audit() record for {entry_id:?}'s `guide` must not \
+                         be empty",
+                        script_path.display()
+                    ));
+                }
+                if s.chars().count() > 200 {
+                    return Err(format!(
+                        "scorer plugin {}: audit() record for {entry_id:?}'s `guide` must be at \
+                         most 200 characters, got {}",
+                        script_path.display(),
+                        s.chars().count()
+                    ));
+                }
+                Some(s)
+            }
+            None => None,
+        };
+
         // Opaque, the same treatment `metadata` gets (ADR 0002) — reuses the
         // exact non-finite-float refusal `parse_picked_item`'s own `metadata`
         // makes, rather than a second implementation of that rule.
@@ -1572,6 +1612,9 @@ fn merge_audit_into_metadata(
         record_json.insert("stage".into(), serde_json::Value::String(stage));
         record_json.insert("by".into(), serde_json::Value::String(by));
         record_json.insert("verdict".into(), serde_json::Value::String(verdict));
+        if let Some(guide) = guide {
+            record_json.insert("guide".into(), serde_json::Value::String(guide));
+        }
         if let Some(detail) = detail {
             record_json.insert("detail".into(), detail);
         }
@@ -3307,6 +3350,142 @@ fn audit(ctx, picks, workspace) {
         assert_eq!(audit[0]["by"], serde_json::json!("plugin:example"));
         assert_eq!(audit[0]["verdict"], serde_json::json!("ranked highest"));
         assert_eq!(audit[0]["detail"]["score"], serde_json::json!(0.9));
+    }
+
+    /// A valid `guide` string rides alongside `verdict`/`detail` into
+    /// `metadata.audit`, carried exactly as written.
+    #[test]
+    fn a_valid_guide_is_carried_into_the_audit_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { #{ picks: ["m1"], workspace: () } }
+fn audit(ctx, picks, workspace) {
+    #{ "m1": #{ stage: "pool", by: "plugin:example", verdict: "ranked highest", guide: "Because you loved The Wire" } }
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let got = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap();
+        let meta = got[0].metadata.as_ref().unwrap();
+        let audit = meta["audit"].as_array().unwrap();
+        assert_eq!(
+            audit[0]["guide"],
+            serde_json::json!("Because you loved The Wire")
+        );
+    }
+
+    /// A `guide` that is not a string is refused, naming the entry — the
+    /// same posture as `verdict`'s type check.
+    #[test]
+    fn a_non_string_guide_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { #{ picks: ["m1"], workspace: () } }
+fn audit(ctx, picks, workspace) {
+    #{ "m1": #{ stage: "pool", by: "test", verdict: "ranked highest", guide: 42 } }
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("`guide` must be a string"), "got {err}");
+        assert!(err.contains("m1"), "got {err}");
+    }
+
+    /// An empty `guide` is refused rather than silently producing a blank
+    /// guide line.
+    #[test]
+    fn an_empty_guide_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"
+fn sources() { #{} }
+fn pick(ctx) { #{ picks: ["m1"], workspace: () } }
+fn audit(ctx, picks, workspace) {
+    #{ "m1": #{ stage: "pool", by: "test", verdict: "ranked highest", guide: "" } }
+}
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("`guide` must not be empty"), "got {err}");
+    }
+
+    /// A `guide` over 200 characters is refused, naming the length it
+    /// actually got.
+    #[test]
+    fn a_too_long_guide_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(201);
+        let p = write(
+            &dir,
+            &format!(
+                r#"
+fn sources() {{ #{{}} }}
+fn pick(ctx) {{ #{{ picks: ["m1"], workspace: () }} }}
+fn audit(ctx, picks, workspace) {{
+    #{{ "m1": #{{ stage: "pool", by: "test", verdict: "ranked highest", guide: "{long}" }} }}
+}}
+"#
+            ),
+        );
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog(), &p, None).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "test",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("`guide` must be at most 200 characters, got 201"),
+            "got {err}"
+        );
     }
 
     /// An `audit()` record naming a `stage` outside the closed set is refused

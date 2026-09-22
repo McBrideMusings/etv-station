@@ -168,6 +168,12 @@ impl ChannelConfig {
         self.scoring.as_ref().is_some_and(|s| s.attribution)
     }
 
+    /// Whether this channel shows a "why this was picked" line in the guide
+    /// (`scoring.explain`).
+    pub fn explains_why(&self) -> bool {
+        self.scoring.as_ref().is_some_and(|s| s.explain)
+    }
+
     /// Whether anything on this channel reads the server's watch history.
     ///
     /// Two readers, not one: a scorer plugin ranks with it (#74), and
@@ -283,6 +289,17 @@ pub struct ScoringConfig {
     /// for it.
     #[serde(default)]
     pub attribution: bool,
+
+    /// Show a one-line "why this was picked" explanation in the guide, built
+    /// from each item's own `metadata.audit` trail (ADR 0011).
+    ///
+    /// Off by default and opt-in like [`attribution`](Self::attribution): a
+    /// plugin's `guide` sentence or a built-in stage's `verdict` is written
+    /// for a different reader (an operator running `admin audit`, or the
+    /// plugin author), so surfacing it to every viewer is a call the person
+    /// running the server makes per channel, in writing.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 /// Whose watch history a channel's scorer plugin sees (#112).
@@ -309,6 +326,7 @@ impl Default for ScoringConfig {
             taste_scope: TasteScope::default(),
             user: None,
             attribution: false,
+            explain: false,
         }
     }
 }

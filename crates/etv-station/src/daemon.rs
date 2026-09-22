@@ -2790,6 +2790,10 @@ async fn pattern_catch_up(
     // inside a tick, and the check sits in the per-item loop below.
     let attribution_wanted = channel.config.attributes_watchers();
 
+    // Whether this generation shows a "why this was picked" line, read once
+    // for the same reason (`scoring.explain`).
+    let explain_wanted = channel.config.explains_why();
+
     // How deep a recently-aired tail this channel's scorer sees. Read once —
     // it cannot change inside a tick.
     let recent_depth = channel
@@ -2931,6 +2935,7 @@ async fn pattern_catch_up(
             &channel.name,
             channel.config.display_name.as_deref(),
             attribution_wanted,
+            explain_wanted,
             &history,
         );
 
@@ -3294,6 +3299,44 @@ order = "manual"
 /// `items` and `durations` are already paired 1:1 by
 /// [`crate::duration::DurationCache::resolve_all`] — the same pairing the
 /// play-history `records` loop right after this call relies on.
+/// Capitalize a string's first character, leaving the rest untouched. Used
+/// once, to turn a `pool`-stage `verdict` (written for an operator reading
+/// `admin audit`, lowercase and mid-sentence like "ranked highest") into the
+/// start of a guide sentence.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The one-line "why this was picked" explanation for the guide
+/// (`scoring.explain`), or `None` when this item's audit trail (ADR
+/// 0011) can produce nothing.
+///
+/// Prefers the first `guide` any stage record carries — a plugin's own
+/// viewer-facing sentence, written for this purpose — over a built-in
+/// fallback: the first `pool`-stage record's `verdict`, capitalized. A
+/// `verdict` is written for `admin audit`'s operator reader, not a viewer,
+/// but it is the only thing every picked item has. `detail` is never read
+/// here or anywhere outside `admin audit` — it is opaque per ADR 0002.
+fn explain_line_for(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let audit = metadata?.get("audit")?.as_array()?;
+    if let Some(guide) = audit
+        .iter()
+        .find_map(|record| record.get("guide").and_then(|g| g.as_str()))
+    {
+        return Some(guide.to_string());
+    }
+    let verdict = audit
+        .iter()
+        .find(|record| record.get("stage").and_then(|s| s.as_str()) == Some("pool"))
+        .and_then(|record| record.get("verdict").and_then(|v| v.as_str()))?;
+    Some(format!("Why: {}", capitalize_first(verdict)))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_guide_and_attribution(
     items: &mut [crate::resolve::ResolvedItem],
     durations: &[Duration],
@@ -3301,6 +3344,7 @@ fn render_guide_and_attribution(
     channel_identity: &str,
     channel_display_name: Option<&str>,
     attribution_wanted: bool,
+    explain_wanted: bool,
     history: &[crate::score::WatchEvent],
 ) {
     let channel_name = channel_display_name.unwrap_or(channel_identity);
@@ -3328,18 +3372,33 @@ fn render_guide_and_attribution(
             .and_then(|c| c.line_for(&items[idx].id))
             .map(|line| line.to_string());
 
+        // Description order is synopsis, explain line, attribution line —
+        // built once here so both branches below append it in that order.
+        let explain = explain_wanted
+            .then(|| explain_line_for(items[idx].metadata.as_ref()))
+            .flatten();
+
         let Some(guide) = items[idx].guide.clone() else {
             // No `guide:` override anywhere in the cascade for this item —
             // the built-in defaults from `resolve` (series-title convention,
-            // genre categories) stand as written. `attribution: true` still
-            // applies its line on top, exactly as before #158.
-            if let Some(line) = &watched_by {
+            // genre categories) stand as written. `scoring.explain` and
+            // `attribution: true` still apply their lines on top, exactly as
+            // before #158.
+            if explain.is_some() || watched_by.is_some() {
                 let program = items[idx].program.get_or_insert_with(Default::default);
-                program.description = Some(crate::attribution::append_to_description(
-                    program.description.take(),
-                    line,
-                ));
-                stamped += 1;
+                if let Some(line) = &explain {
+                    program.description = Some(crate::attribution::append_to_description(
+                        program.description.take(),
+                        line,
+                    ));
+                }
+                if let Some(line) = &watched_by {
+                    program.description = Some(crate::attribution::append_to_description(
+                        program.description.take(),
+                        line,
+                    ));
+                    stamped += 1;
+                }
             }
             continue;
         };
@@ -3389,6 +3448,15 @@ fn render_guide_and_attribution(
             Some(t) => {
                 let rendered = crate::guide::render(t, &ctx);
                 program.description = (!rendered.is_empty()).then_some(rendered);
+                // A `guide:` template has no `{explain}` field to reference,
+                // so unlike `{watched_by}` there is no shorthand to check for
+                // — the explain line always appends here when explain is on.
+                if let Some(line) = &explain {
+                    program.description = Some(crate::attribution::append_to_description(
+                        program.description.take(),
+                        line,
+                    ));
+                }
                 // An explicit `{watched_by}` already carries the line — the
                 // shorthand appending it again would duplicate it (#158
                 // decision #4).
@@ -3403,6 +3471,12 @@ fn render_guide_and_attribution(
                 }
             }
             None => {
+                if let Some(line) = &explain {
+                    program.description = Some(crate::attribution::append_to_description(
+                        program.description.take(),
+                        line,
+                    ));
+                }
                 if let Some(line) = &watched_by {
                     program.description = Some(crate::attribution::append_to_description(
                         program.description.take(),
@@ -3483,6 +3557,7 @@ mod render_guide_and_attribution_tests {
             "diehard",
             None,
             false,
+            false,
             &[],
         );
         assert_eq!(
@@ -3508,6 +3583,7 @@ mod render_guide_and_attribution_tests {
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             Some("Die Hard 24/7"),
+            false,
             false,
             &[],
         );
@@ -3539,6 +3615,7 @@ mod render_guide_and_attribution_tests {
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             None,
+            false,
             false,
             &[],
         );
@@ -3584,6 +3661,7 @@ mod render_guide_and_attribution_tests {
             "diehard",
             None,
             false,
+            false,
             &[],
         );
         assert_eq!(
@@ -3617,6 +3695,7 @@ mod render_guide_and_attribution_tests {
             "diehard",
             None,
             true,
+            false,
             &history,
         );
         assert_eq!(
@@ -3645,6 +3724,7 @@ mod render_guide_and_attribution_tests {
             "diehard",
             None,
             true,
+            false,
             &history,
         );
         assert_eq!(
@@ -3674,6 +3754,7 @@ mod render_guide_and_attribution_tests {
             "diehard",
             None,
             true,
+            false,
             &history,
         );
         let desc = items[0]
@@ -3688,6 +3769,115 @@ mod render_guide_and_attribution_tests {
             desc.matches("Watched recently by bob").count(),
             1,
             "the line must appear exactly once, got {desc:?}"
+        );
+    }
+
+    /// Explain audit records with a `pool`-stage `verdict`, for the tests
+    /// below — no `guide` unless the test adds one.
+    fn audit_with_pool_verdict(verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "audit": [
+                { "stage": "pool", "by": "plugin:example", "verdict": verdict },
+            ],
+        })
+    }
+
+    /// `scoring.explain` prefers a plugin's own `guide` sentence over the
+    /// `verdict` fallback, and uses it verbatim — no "Why: " prefix.
+    #[test]
+    fn explain_prefers_guide_over_verdict() {
+        let mut items = vec![item_with_guide("a", "Die Hard", None)];
+        items[0].metadata = Some(serde_json::json!({
+            "audit": [
+                {
+                    "stage": "pool",
+                    "by": "plugin:example",
+                    "verdict": "ranked highest",
+                    "guide": "Because you loved The Wire",
+                },
+            ],
+        }));
+        let durations = vec![Duration::from_secs(60)];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            false,
+            true,
+            &[],
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().description.as_deref(),
+            Some("Because you loved The Wire")
+        );
+    }
+
+    /// With no `guide` anywhere in the audit trail, the line falls back to
+    /// the first `pool`-stage `verdict`, capitalized and prefixed "Why: ".
+    #[test]
+    fn explain_falls_back_to_verdict() {
+        let mut items = vec![item_with_guide("a", "Die Hard", None)];
+        items[0].metadata = Some(audit_with_pool_verdict("ranked highest"));
+        let durations = vec![Duration::from_secs(60)];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            false,
+            true,
+            &[],
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().description.as_deref(),
+            Some("Why: Ranked highest")
+        );
+    }
+
+    /// A channel that has not turned on `scoring.explain` gets no line, even
+    /// when the item's audit trail could produce one.
+    #[test]
+    fn explain_absent_when_flag_off() {
+        let mut items = vec![item_with_guide("a", "Die Hard", None)];
+        items[0].metadata = Some(audit_with_pool_verdict("ranked highest"));
+        let durations = vec![Duration::from_secs(60)];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            false,
+            false,
+            &[],
+        );
+        assert_eq!(items[0].program.as_ref().unwrap().description, None);
+    }
+
+    /// Description order is synopsis, explain line, attribution line — the
+    /// explain line lands before, not after, the #113 credit.
+    #[test]
+    fn explain_line_precedes_attribution_line() {
+        let mut items = vec![item_with_guide("a", "Die Hard", None)];
+        items[0].metadata = Some(audit_with_pool_verdict("ranked highest"));
+        let durations = vec![Duration::from_secs(60)];
+        let history = vec![watch("a", "bob")];
+        render_guide_and_attribution(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            true,
+            true,
+            &history,
+        );
+        assert_eq!(
+            items[0].program.as_ref().unwrap().description.as_deref(),
+            Some("Why: Ranked highest\n\nWatched recently by bob")
         );
     }
 }

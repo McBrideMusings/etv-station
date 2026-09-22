@@ -617,6 +617,18 @@ fade:
         assert_eq!(watched_by_line(""), "");
     }
 
+    /// A `scoring.explain` line sits between the synopsis and the
+    /// attribution credit — the reversed line search still finds the credit
+    /// as the last matching line, unbothered by the extra paragraph ahead of
+    /// it.
+    #[test]
+    fn watched_by_finds_the_credit_past_an_explain_line() {
+        assert_eq!(
+            watched_by_line("A hobbit sets out.\n\nWhy: Ranked highest\n\nWatched recently by bob"),
+            "Watched recently by bob",
+        );
+    }
+
     #[test]
     fn extra_layer_entries_are_ignored() {
         // Script returns 3 layer entries, base has 1.

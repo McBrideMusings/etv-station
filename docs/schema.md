@@ -1057,6 +1057,11 @@ to explain:
   code — a script that returns `"picked"` satisfies the contract just as
   well as one that explains itself in detail; the station cannot tell a
   lazy record from a thorough one.
+- `guide` — optional, a non-empty string of at most 200 characters. Unlike
+  `verdict` and `detail`, the station **does** read this one: it is the
+  viewer-facing "why this was picked" sentence shown in the guide when the
+  channel turns on `scoring.explain` (see below). Refused at pick time if
+  present but empty or too long, naming the entry and the length it got.
 - `detail` — opaque, the same treatment `metadata` gets: converted and
   carried untouched, refusing a non-finite float anywhere inside and naming
   the key. Optional.
@@ -1473,7 +1478,7 @@ A `plugin:` path is relative to the **channel config file's** directory, the
 same as a `block:` include — never to wherever the daemon was launched from.
 Absolute paths are used as written.
 
-Four knobs sit on the channel, under `scoring:`, all optional:
+Five knobs sit on the channel, under `scoring:`, all optional:
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -1482,6 +1487,7 @@ Four knobs sit on the channel, under `scoring:`, all optional:
 | `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
 | `user` | — | The account `single_user` follows: a Tautulli username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
 | `attribution` | `false` | Name who has been watching each item, in the guide and on screen. Off by default; see below. |
+| `explain` | `false` | Show a one-line "why this was picked" explanation in the guide, built from each item's `metadata.audit` trail. Off by default; see below. |
 
 `target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
 window — a generation lays the returned list end-to-end, so a hint covering 30
@@ -1561,6 +1567,47 @@ is a privacy decision, not a formatting one.
 It is also a second reader of the watch history, alongside a scorer plugin — so a
 channel with `attribution: true` and no `plugin:` pool still fetches history,
 where before only a plugin could cause a fetch (#131).
+
+#### `explain` — why each item was picked
+
+With `explain: true`, each item the channel schedules gets a "why" line
+appended to its guide description, built from that item's own
+`metadata.audit` trail (ADR 0011) — the same trail `admin audit` already
+reads:
+
+```
+A hobbit sets out.
+
+Because you loved The Wire
+```
+
+The line prefers the first `guide` sentence any audit stage record carries —
+a plugin's own viewer-facing reason, written for this purpose — and falls
+back to the first `pool`-stage record's `verdict`, capitalized and prefixed
+`Why: `, when no record has a `guide`:
+
+```
+A hobbit sets out.
+
+Why: Ranked highest
+```
+
+An item with no audit trail at all — nothing wrote one, or the channel has no
+`plugin:` pool and no built-in stage instrumented yet — gets no line, and its
+existing synopsis is never replaced, only appended to. `detail` is never read
+to build this line; it stays opaque per ADR 0002.
+
+Description order is synopsis, explain line, attribution line: with both
+`explain` and `attribution` on, the why comes before the credit.
+
+Like `attribution`, `explain` reaches the overlay too: the credit line is
+pulled back out of `description` by a fixed prefix search from the end, so an
+explain line ahead of it does not interfere.
+
+`explain` is opt-in for the same reason `attribution` is — a `verdict` is
+written for `admin audit`'s operator reader, not a viewer, so surfacing it
+(or a plugin's `guide`) to everyone watching the channel is a call made per
+channel, in writing, not derived automatically.
 
 History is fetched **once per distinct scope per refresh window**, not once per
 channel. Three channels following the same person share one `get_history` call
