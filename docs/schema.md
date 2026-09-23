@@ -983,6 +983,30 @@ and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
+#### `exclude_keywords` — tags that describe packaging, not subject
+
+```yaml
+config:
+  exclude_keywords: [duringcreditsstinger]
+```
+
+A list of TMDB keyword values the pool drops from scoring entirely. Each
+entry matches one whole keyword exactly: `duringcreditsstinger` drops that
+tag and nothing else, never a substring such as `stinger`. A bare string is
+refused, since the scorer would otherwise read it one character at a time.
+
+The keyword is dropped everywhere it enters the score: the taste, influence
+and house profiles, and each candidate's own keyword list. That last part
+matters. A keyword removed from the profiles but kept on candidates still
+counts toward a candidate's length in the cosine divisor, which lowers the
+score of every film that carries it. A candidate left with no keywords at all
+is treated like one that never had any: it is not counted in the
+document-frequency pass, and the exploration slot cannot draw it.
+
+It exists for tags like `duringcreditsstinger`, which marks a mid-credits
+scene. That tag appears alongside `superhero` and `comic`, so leaving it in
+counts the same taste twice. Empty by default.
+
 #### The record shape — `metadata` and a per-entry `take` (#166)
 
 Each element `pick()`'s `picks` array holds may be a bare `entry_id` string —
