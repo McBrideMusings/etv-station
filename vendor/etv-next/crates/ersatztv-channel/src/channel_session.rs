@@ -1726,39 +1726,60 @@ async fn touch_overlay_wanted_and_open_fifo(
 /// open succeeds, and polling — unlike reading — does not consume the bytes
 /// ffmpeg needs in order to stay frame-aligned.
 ///
-/// Every call reads from a brand-new fifo: the path is unlinked and recreated
-/// before the open. The previous item's ffmpeg leaves unread bytes in the
-/// kernel pipe, and they stay there until the producer closes its write end,
-/// which it only does after a write fails. Attaching to that pipe would start
-/// this item's stream mid-frame and shift the whole overlay. The recreated path
-/// names a pipe nobody has written to; the producer's next write to the old one
-/// fails with EPIPE, and its reopen lands on this one.
+/// Every call reads from a brand-new fifo. The previous item's ffmpeg leaves
+/// unread bytes in the kernel pipe, and they stay there until the producer
+/// closes its write end, which it only does after a write fails. Attaching to
+/// that pipe would start this item's stream mid-frame and shift the whole
+/// overlay. So the new pipe is built at a temp path and `rename`d onto `path`
+/// — never unlinked-then-recreated in two steps. `rename` replaces the
+/// directory entry atomically: the producer's concurrent nonblocking open of
+/// `path` (it retries this in a poll loop while waiting to reattach) always
+/// resolves to either the old fifo or the new one, never to nothing. A plain
+/// unlink-then-mkfifo leaves a window with no directory entry at all, and the
+/// producer's open in that window fails with `ENOENT`, which its retry loop
+/// treats as fatal (only `ENXIO`, "no reader yet", is retried) — crashing the
+/// writer and blacking out the overlay for the rest of the item, the same
+/// failure this function exists to remove. No reader can reach the old pipe
+/// any more, so the producer's next write to it fails with EPIPE, and its
+/// reopen lands on the new one.
 #[cfg(unix)]
 fn open_overlay_fifo(path: &Path, timeout: Duration) -> Result<OverlayFifoReader, ChannelError> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    match std::fs::remove_file(path) {
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".next");
+    let tmp_path = PathBuf::from(tmp_name);
+
+    // Clear a leftover from a prior attempt that mkfifo'd but never reached
+    // the rename below (e.g. this function erroring out between the two).
+    match std::fs::remove_file(&tmp_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(ChannelError::StreamFailure(format!(
-                "failed to replace overlay fifo {}: {e}",
-                path.display()
+                "failed to clear stale overlay fifo {}: {e}",
+                tmp_path.display()
             )));
         }
     }
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
-        ChannelError::StreamFailure(format!("overlay fifo path {}: {e}", path.display()))
+    let c_tmp_path = std::ffi::CString::new(tmp_path.as_os_str().as_bytes()).map_err(|e| {
+        ChannelError::StreamFailure(format!("overlay fifo path {}: {e}", tmp_path.display()))
     })?;
-    // SAFETY: `c_path` is a valid NUL-terminated string for the whole call.
+    // SAFETY: `c_tmp_path` is a valid NUL-terminated string for the whole call.
     // 0o660 matches the station supervisor's own `ensure_fifo`.
-    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o660) } != 0 {
+    if unsafe { libc::mkfifo(c_tmp_path.as_ptr(), 0o660) } != 0 {
         return Err(ChannelError::StreamFailure(format!(
             "failed to create overlay fifo {}: {}",
-            path.display(),
+            tmp_path.display(),
             std::io::Error::last_os_error()
+        )));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        return Err(ChannelError::StreamFailure(format!(
+            "failed to install overlay fifo {}: {e}",
+            path.display()
         )));
     }
 
@@ -2503,6 +2524,64 @@ mod tests {
         assert_eq!(&buf, b"fresh", "read a previous reader's leftover bytes");
 
         writer.join().unwrap();
+    }
+
+    /// `open_overlay_fifo` must never leave `path` without a directory entry:
+    /// a concurrent nonblocking writer-side open (the producer's reopen retry
+    /// loop, `FifoWriter::open_for_writing` in etv-overlay) treats any error
+    /// but `ENXIO` as fatal, so a bare unlink-then-mkfifo — with `path` gone
+    /// for the moment in between — crashes that writer with `ENOENT` instead
+    /// of retrying. Hammer the race: one thread repeatedly calls
+    /// `open_overlay_fifo` on the same path while another repeatedly attempts
+    /// the producer's exact nonblocking `O_WRONLY` open, and assert it only
+    /// ever sees "no reader yet" (`ENXIO`) or success — never `ENOENT`.
+    #[test]
+    fn open_overlay_fifo_never_leaves_path_absent_for_a_racing_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_fifo(dir.path());
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let worst_errno = std::sync::Arc::new(AtomicI32::new(0));
+
+        let writer_path = path.clone();
+        let writer_stop = stop.clone();
+        let writer_worst = worst_errno.clone();
+        let writer = std::thread::spawn(move || {
+            while !writer_stop.load(Ordering::Relaxed) {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&writer_path)
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let errno = e.raw_os_error().unwrap_or(0);
+                        if errno != libc::ENXIO {
+                            writer_worst.store(errno, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let _ = open_overlay_fifo(&path, Duration::from_millis(1));
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let worst = worst_errno.load(Ordering::Relaxed);
+        assert_eq!(
+            worst,
+            0,
+            "producer's nonblocking open saw errno {worst} ({}), not just ENXIO — \
+             the fifo path was absent for a moment during a reader handoff",
+            std::io::Error::from_raw_os_error(worst),
+        );
     }
 
     /// The regression this guards: `signal_overlay_wanted_and_wait_ready` used
