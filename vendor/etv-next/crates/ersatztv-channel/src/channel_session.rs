@@ -1725,10 +1725,42 @@ async fn touch_overlay_wanted_and_open_fifo(
 /// `POLLIN` instead: the producer writes its first frame as soon as its own
 /// open succeeds, and polling — unlike reading — does not consume the bytes
 /// ffmpeg needs in order to stay frame-aligned.
+///
+/// Every call reads from a brand-new fifo: the path is unlinked and recreated
+/// before the open. The previous item's ffmpeg leaves unread bytes in the
+/// kernel pipe, and they stay there until the producer closes its write end,
+/// which it only does after a write fails. Attaching to that pipe would start
+/// this item's stream mid-frame and shift the whole overlay. The recreated path
+/// names a pipe nobody has written to; the producer's next write to the old one
+/// fails with EPIPE, and its reopen lands on this one.
 #[cfg(unix)]
 fn open_overlay_fifo(path: &Path, timeout: Duration) -> Result<OverlayFifoReader, ChannelError> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(ChannelError::StreamFailure(format!(
+                "failed to replace overlay fifo {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+        ChannelError::StreamFailure(format!("overlay fifo path {}: {e}", path.display()))
+    })?;
+    // SAFETY: `c_path` is a valid NUL-terminated string for the whole call.
+    // 0o660 matches the station supervisor's own `ensure_fifo`.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o660) } != 0 {
+        return Err(ChannelError::StreamFailure(format!(
+            "failed to create overlay fifo {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
 
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -2416,6 +2448,59 @@ mod tests {
         let mut buf = [0u8; 5];
         file.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"frame");
+
+        writer.join().unwrap();
+    }
+
+    /// Each item must read from a pipe no earlier reader touched. When the
+    /// previous item's ffmpeg exits, the bytes it left unread stay in the kernel
+    /// pipe for as long as the producer still holds its write end — and the
+    /// producer only lets go after a write fails, then a backoff. A new reader
+    /// that attaches to that same pipe starts mid-frame, which shifts or tiles
+    /// the whole overlay for the rest of the item.
+    ///
+    /// Set up exactly that: stale bytes in a pipe whose writer is still open and
+    /// whose reader is gone. The writer thread then behaves like the producer —
+    /// write, and on EPIPE reopen the path and write again.
+    #[test]
+    fn open_overlay_fifo_never_hands_ffmpeg_a_previous_readers_leftovers() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_fifo(dir.path());
+
+        let old_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let mut old_writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        old_writer.write_all(b"stale").unwrap();
+        drop(old_reader);
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut file = old_writer;
+            loop {
+                match file.write_all(b"fresh") {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                        file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&writer_path)
+                            .unwrap();
+                    }
+                    Err(e) => panic!("write: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let mut file = open_overlay_fifo(&path, Duration::from_secs(5)).unwrap();
+        let mut buf = [0u8; 5];
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"fresh", "read a previous reader's leftover bytes");
 
         writer.join().unwrap();
     }
