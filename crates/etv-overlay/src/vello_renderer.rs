@@ -57,6 +57,18 @@ fn build_text_layout(
     layout
 }
 
+/// One decoded source image plus whatever drawn-size shrinks of it have
+/// already been computed. `raw` is decoded once per path and used both for
+/// its aspect ratio and, when a layer draws it at or above its own size, as
+/// the image actually drawn. `shrunk` holds an area-averaged copy per
+/// distinct `(drawn_width, drawn_height)` a layer has asked for — usually
+/// exactly one entry, since a given layer's config height doesn't change
+/// frame to frame.
+struct ImageCacheEntry {
+    raw: PenikoImage,
+    shrunk: HashMap<(u32, u32), PenikoImage>,
+}
+
 pub struct VelloRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -68,12 +80,15 @@ pub struct VelloRenderer {
     height: u32,
     padded_bytes_per_row: u32,
     unpadded_bytes_per_row: u32,
-    // `None` caches a decode failure so a logo that keeps failing every frame
-    // (missing file, unsupported format) is only ever opened and decoded once
-    // per process, not 30x/sec. Fixing the file in place doesn't clear this
-    // cache — the overlay process needs a restart to pick it up, which the
-    // supervisor already does on config reload.
-    image_cache: HashMap<PathBuf, Option<PenikoImage>>,
+    // `None` caches a decode failure so an image that keeps failing every
+    // frame (missing file, unsupported format) is only ever opened and
+    // decoded once per process, not 30x/sec. Fixing the file in place
+    // doesn't clear this cache — the overlay process needs a restart to pick
+    // it up, which the supervisor already does on config reload. Each entry
+    // also holds a lazily-populated cache of that source shrunk to whatever
+    // drawn sizes have actually been requested (#3djq) — see
+    // [`ImageCacheEntry`].
+    image_cache: HashMap<PathBuf, Option<ImageCacheEntry>>,
     font_context: FontContext,
     layout_context: LayoutContext<()>,
     warned_missing_glyphs: HashSet<String>,
@@ -466,31 +481,55 @@ impl VelloRenderer {
                 let brush = Gradient::new_linear(from, to).with_stops([near, far]);
                 scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect);
             }
-            OverlayKind::Logo {
+            OverlayKind::Image {
                 path,
                 corner,
                 margin,
-                height: logo_height,
+                height: image_height,
             } => {
-                // A logo that cannot be decoded drops just this layer instead
-                // of taking the whole render down: every other layer still
-                // draws, render_frame still returns a full frame, and the
-                // fifo keeps a writer (#302).
-                let Some(image) = self.load_or_get_image(path) else {
+                // An image that cannot be decoded drops just this layer
+                // instead of taking the whole render down: every other layer
+                // still draws, render_frame still returns a full frame, and
+                // the fifo keeps a writer (#302).
+                let Some(entry) = self.load_or_get_image(path) else {
                     return Ok(());
                 };
-                let image = image.clone();
-                let aspect = image.image.width as f64 / image.image.height as f64;
-                let h = *logo_height as f64;
+                let (src_w, src_h) = (entry.raw.image.width, entry.raw.image.height);
+                let raw = entry.raw.clone();
+                let aspect = src_w as f64 / src_h as f64;
+                let h = *image_height as f64;
                 let w = h * aspect;
-                let (x0, y0) =
+                let (x0_static, y0_static) =
                     corner_origin_f64(*corner, *margin as f64, w, h, self.width, self.height);
-                let x0 = x0 + layer.offset_x as f64;
-                let y0 = y0 + layer.offset_y as f64;
-                let scale_x = w / image.image.width as f64;
-                let scale_y = h / image.image.height as f64;
-                let transform =
-                    Affine::translate((x0, y0)) * Affine::scale_non_uniform(scale_x, scale_y);
+
+                let drawn_w = (w.round() as u32).max(1);
+                let drawn_h = (h.round() as u32).max(1);
+
+                let (image, transform) = if drawn_w < src_w && drawn_h < src_h {
+                    // Drawn smaller than the source: pre-shrink with an
+                    // area-average filter and draw 1:1. Vello 0.9 samples
+                    // images with no minification filtering, so scaling a
+                    // large source down purely in the draw transform aliases
+                    // into hard on/off stair-step edges. The static position
+                    // snaps to a whole pixel; `offset_x`/`offset_y` (the
+                    // script-driven animated part) stays fractional.
+                    let shrunk = self
+                        .load_or_get_shrunk_image(path, drawn_w, drawn_h)
+                        .clone();
+                    let x0 = x0_static.round() + layer.offset_x as f64;
+                    let y0 = y0_static.round() + layer.offset_y as f64;
+                    (shrunk, Affine::translate((x0, y0)))
+                } else {
+                    let image = raw;
+                    let x0 = x0_static + layer.offset_x as f64;
+                    let y0 = y0_static + layer.offset_y as f64;
+                    let scale_x = w / src_w as f64;
+                    let scale_y = h / src_h as f64;
+                    (
+                        image,
+                        Affine::translate((x0, y0)) * Affine::scale_non_uniform(scale_x, scale_y),
+                    )
+                };
                 let image_with_alpha = image.with_alpha(opacity);
                 scene.draw_image(&image_with_alpha, transform);
             }
@@ -614,22 +653,25 @@ impl VelloRenderer {
 
     /// Infallible: a PNG that cannot be decoded is not a render failure, only
     /// a missing layer. Logs once per path (not once per frame) and caches
-    /// the negative result so a persistently bad logo is opened and decoded
+    /// the negative result so a persistently bad image is opened and decoded
     /// exactly once, not on every frame.
-    fn load_or_get_image(&mut self, path: &Path) -> Option<&PenikoImage> {
+    fn load_or_get_image(&mut self, path: &Path) -> Option<&ImageCacheEntry> {
         use std::collections::hash_map::Entry;
         let warned = &mut self.warned_bad_images;
         let slot = match self.image_cache.entry(path.to_path_buf()) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let decoded = match decode_png(path) {
-                    Ok(image) => Some(image),
+                    Ok(image) => Some(ImageCacheEntry {
+                        raw: image,
+                        shrunk: HashMap::new(),
+                    }),
                     Err(err) => {
                         if warned.insert(path.to_path_buf()) {
                             tracing::error!(
                                 path = %path.display(),
                                 error = %err,
-                                "logo image could not be decoded; dropping this layer and continuing to render",
+                                "image could not be decoded; dropping this layer and continuing to render",
                             );
                         }
                         None
@@ -639,6 +681,44 @@ impl VelloRenderer {
             }
         };
         slot.as_ref()
+    }
+
+    /// Returns `path`'s source image area-averaged down to `(drawn_w,
+    /// drawn_h)`, computing and caching it on first request for that exact
+    /// drawn size ([`shrink_image_box`]). Only called once
+    /// [`Self::load_or_get_image`] has already confirmed `path` decodes, so
+    /// the raw entry is always present here.
+    fn load_or_get_shrunk_image(
+        &mut self,
+        path: &Path,
+        drawn_w: u32,
+        drawn_h: u32,
+    ) -> &PenikoImage {
+        let already_cached = self
+            .image_cache
+            .get(path)
+            .and_then(|slot| slot.as_ref())
+            .expect("load_or_get_image must be called first and must have returned Some")
+            .shrunk
+            .contains_key(&(drawn_w, drawn_h));
+        if !already_cached {
+            let entry = self.image_cache[path]
+                .as_ref()
+                .expect("just checked Some above");
+            let shrunk = PenikoImage::new(shrink_image_box(&entry.raw.image, drawn_w, drawn_h));
+            self.image_cache
+                .get_mut(path)
+                .and_then(|slot| slot.as_mut())
+                .expect("just checked Some above")
+                .shrunk
+                .insert((drawn_w, drawn_h), shrunk);
+        }
+        self.image_cache[path]
+            .as_ref()
+            .expect("just checked Some above")
+            .shrunk
+            .get(&(drawn_w, drawn_h))
+            .expect("just inserted or already present")
     }
 
     fn copy_target_to_buffer(&self) {
@@ -740,7 +820,7 @@ fn corner_origin_f64(
 
 fn decode_png(path: &Path) -> anyhow::Result<PenikoImage> {
     let file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("open logo {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("open image {}: {e}", path.display()))?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     // Folds 16-bit -> 8-bit, sub-8-bit -> 8-bit, Indexed -> Rgb/Rgba, and
     // Grayscale+tRNS -> GrayscaleAlpha at read time. It does NOT fold
@@ -782,6 +862,122 @@ fn decode_png(path: &Path) -> anyhow::Result<PenikoImage> {
         width: frame_info.width,
         height: frame_info.height,
     }))
+}
+
+/// Shrinks `src` to `(dst_w, dst_h)` with an area-average (box) filter. Only
+/// called for a drawn size smaller than the source — Vello 0.9 draws images
+/// with no minification filtering, so scaling a large source down purely in
+/// the draw transform aliases into hard on/off stair-step edges; pre-shrinking
+/// to the drawn size and drawing 1:1 is what actually anti-aliases.
+///
+/// Each output pixel is the weighted average of every source pixel it
+/// overlaps, weighted by the fraction of the source pixel's area that falls
+/// inside the output pixel's footprint — an exact box filter, not a naive
+/// nearest-block average. Averaging happens in premultiplied alpha (color
+/// weighted by its own alpha before summing) so a fully transparent source
+/// pixel's leftover color channel — often black, whatever an encoder left
+/// there — cannot darken an adjacent opaque pixel; straight-alpha sources are
+/// un-premultiplied back on the way out, matching `src.alpha_type`.
+fn shrink_image_box(src: &ImageData, dst_w: u32, dst_h: u32) -> ImageData {
+    let (src_w, src_h) = (src.width, src.height);
+    let bytes = src.data.as_ref();
+    let dst_w = dst_w.max(1);
+    let dst_h = dst_h.max(1);
+    let sx = src_w as f64 / dst_w as f64;
+    let sy = src_h as f64 / dst_h as f64;
+    let premultiplied_src = matches!(src.alpha_type, ImageAlphaType::AlphaPremultiplied);
+
+    let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for oy in 0..dst_h {
+        let y0 = oy as f64 * sy;
+        let y1 = (oy as f64 + 1.0) * sy;
+        let iy0 = y0.floor() as u32;
+        let iy1 = ((y1.ceil() as u32).max(iy0 + 1)).min(src_h);
+        for ox in 0..dst_w {
+            let x0 = ox as f64 * sx;
+            let x1 = (ox as f64 + 1.0) * sx;
+            let ix0 = x0.floor() as u32;
+            let ix1 = ((x1.ceil() as u32).max(ix0 + 1)).min(src_w);
+
+            let mut acc_r = 0.0f64;
+            let mut acc_g = 0.0f64;
+            let mut acc_b = 0.0f64;
+            let mut acc_a = 0.0f64;
+            let mut weight = 0.0f64;
+
+            for iy in iy0..iy1 {
+                let wy = overlap1d(iy as f64, iy as f64 + 1.0, y0, y1);
+                if wy <= 0.0 {
+                    continue;
+                }
+                for ix in ix0..ix1 {
+                    let wx = overlap1d(ix as f64, ix as f64 + 1.0, x0, x1);
+                    if wx <= 0.0 {
+                        continue;
+                    }
+                    let w = wx * wy;
+                    let idx = ((iy * src_w + ix) * 4) as usize;
+                    let (r, g, b, a) = (
+                        bytes[idx] as f64,
+                        bytes[idx + 1] as f64,
+                        bytes[idx + 2] as f64,
+                        bytes[idx + 3] as f64,
+                    );
+                    let (pr, pg, pb) = if premultiplied_src {
+                        (r, g, b)
+                    } else {
+                        let af = a / 255.0;
+                        (r * af, g * af, b * af)
+                    };
+                    acc_r += w * pr;
+                    acc_g += w * pg;
+                    acc_b += w * pb;
+                    acc_a += w * a;
+                    weight += w;
+                }
+            }
+
+            if weight <= 0.0 {
+                continue; // out is zero-initialized: fully transparent black.
+            }
+            let avg_a = (acc_a / weight).clamp(0.0, 255.0);
+            let (out_r, out_g, out_b) = if premultiplied_src {
+                (
+                    (acc_r / weight).round().clamp(0.0, 255.0) as u8,
+                    (acc_g / weight).round().clamp(0.0, 255.0) as u8,
+                    (acc_b / weight).round().clamp(0.0, 255.0) as u8,
+                )
+            } else if avg_a > 0.0 {
+                let af = avg_a / 255.0;
+                (
+                    ((acc_r / weight) / af).round().clamp(0.0, 255.0) as u8,
+                    ((acc_g / weight) / af).round().clamp(0.0, 255.0) as u8,
+                    ((acc_b / weight) / af).round().clamp(0.0, 255.0) as u8,
+                )
+            } else {
+                (0, 0, 0)
+            };
+
+            let out_idx = ((oy * dst_w + ox) * 4) as usize;
+            out[out_idx] = out_r;
+            out[out_idx + 1] = out_g;
+            out[out_idx + 2] = out_b;
+            out[out_idx + 3] = avg_a.round() as u8;
+        }
+    }
+
+    ImageData {
+        data: Blob::from(out),
+        format: ImageFormat::Rgba8,
+        alpha_type: src.alpha_type,
+        width: dst_w,
+        height: dst_h,
+    }
+}
+
+/// The length of the overlap between two 1-D intervals, or 0 if disjoint.
+fn overlap1d(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+    (a1.min(b1) - a0.max(b0)).max(0.0)
 }
 
 fn expand_rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
@@ -902,6 +1098,71 @@ mod tests {
         assert_eq!(align_up(256, 256), 256);
         assert_eq!(align_up(257, 256), 512);
         assert_eq!(align_up(1920 * 4, 256), 7680);
+    }
+
+    /// A 20x1 source with a hard edge at x=12 (opaque red, then fully
+    /// transparent pixels whose leftover color channel is green — a common
+    /// PNG-encoder artifact) shrunk 5x to 4x1. The destination pixel at
+    /// source range [10, 15) straddles the edge (2 opaque source pixels, 3
+    /// transparent ones), so it must come out at an intermediate alpha
+    /// rather than a hard 0/255 step, and its color must stay pure red —
+    /// proving the average happened in premultiplied alpha (the transparent
+    /// pixels contribute zero color) rather than in straight RGB, which
+    /// would bleed the leftover green into the edge.
+    #[test]
+    fn shrink_image_box_grades_hard_edges_without_bleed() {
+        let (src_w, src_h) = (20u32, 1u32);
+        let mut pixels = vec![0u8; (src_w * src_h * 4) as usize];
+        for x in 0..src_w {
+            let idx = (x * 4) as usize;
+            if x < 12 {
+                pixels[idx..idx + 4].copy_from_slice(&[255, 0, 0, 255]); // opaque red
+            } else {
+                pixels[idx..idx + 4].copy_from_slice(&[0, 255, 0, 0]); // transparent, leftover green
+            }
+        }
+        let src = ImageData {
+            data: Blob::from(pixels),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: src_w,
+            height: src_h,
+        };
+
+        let shrunk = shrink_image_box(&src, 4, 1);
+        assert_eq!((shrunk.width, shrunk.height), (4, 1));
+        let out = shrunk.data.as_ref();
+
+        // Fully inside the opaque region: solid red.
+        assert_eq!(
+            &out[0..4],
+            &[255, 0, 0, 255],
+            "pixel fully inside the opaque region should stay pure opaque red"
+        );
+
+        // The destination pixel covering source [10, 15) straddles the edge.
+        let edge = &out[8..12];
+        assert!(
+            edge[3] > 0 && edge[3] < 255,
+            "expected a graded (partially covered) alpha at the hard edge, got {}",
+            edge[3]
+        );
+        assert_eq!(
+            edge[1], 0,
+            "a fully transparent source pixel's leftover color must not bleed into an \
+             opaque neighbour, got green={}",
+            edge[1]
+        );
+        assert_eq!(
+            edge[0], 255,
+            "the edge pixel's visible color should stay red"
+        );
+
+        // Fully inside the transparent region: fully transparent.
+        assert_eq!(
+            out[15], 0,
+            "pixel fully inside the transparent region should stay fully transparent"
+        );
     }
 
     #[test]

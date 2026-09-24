@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn an_inline_spec_parses_as_a_spec() {
         let parsed = decl(
-            "overlay:\n  width: 1280\n  height: 720\n  framerate: 30\n  layers:\n    - type: logo\n      path: logo.png\n      corner: bottom_right\n      height: 56\n",
+            "overlay:\n  width: 1280\n  height: 720\n  framerate: 30\n  layers:\n    - type: image\n      path: logo.png\n      corner: bottom_right\n      height: 56\n",
         );
         let OverlayDecl::Inline(spec) = parsed else {
             panic!("expected an inline spec, got {parsed:?}");
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(spec.layers.len(), 1);
         assert!(matches!(
             spec.layers[0],
-            OverlayKind::Logo {
+            OverlayKind::Image {
                 corner: Corner::BottomRight,
                 height: 56,
                 ..
@@ -573,7 +573,7 @@ mod tests {
             ..spec(1280)
         }));
         let channel = decl(
-            "overlay:\n  extend:\n    layers:\n      - type: logo\n        path: logo.png\n        corner: bottom_right\n",
+            "overlay:\n  extend:\n    layers:\n      - type: image\n        path: logo.png\n        corner: bottom_right\n",
         );
         let chain = resolve_decl(at(&station, STATION_DIR), at(&channel, CHANNEL_DIR), None);
         assert_eq!(
@@ -588,10 +588,10 @@ mod tests {
         match &resolved.layers[1] {
             // Appended last so it draws on top, and re-rooted against the
             // channel's own directory rather than the station's.
-            OverlayKind::Logo { path, .. } => {
+            OverlayKind::Image { path, .. } => {
                 assert_eq!(path, Path::new(CHANNEL_DIR).join("logo.png").as_path())
             }
-            other => panic!("expected the channel's logo, got {other:?}"),
+            other => panic!("expected the channel's image, got {other:?}"),
         }
     }
 
@@ -686,16 +686,16 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("shared")).unwrap();
         std::fs::write(
             dir.path().join("shared/mark.yaml"),
-            "width: 1280\nheight: 720\nframerate: 30\nlayers:\n  - type: logo\n    path: logo.png\n    corner: bottom_right\n",
+            "width: 1280\nheight: 720\nframerate: 30\nlayers:\n  - type: image\n    path: logo.png\n    corner: bottom_right\n",
         )
         .unwrap();
 
         let loaded = load_decl(&OverlayDecl::File("shared/mark.yaml".into()), dir.path()).unwrap();
 
-        // The logo path is relative to the SPEC file's own directory, which is
+        // The image path is relative to the SPEC file's own directory, which is
         // `shared/`, not the directory the reference was written in.
-        let OverlayKind::Logo { path, .. } = &loaded.layers[0] else {
-            panic!("expected a logo layer");
+        let OverlayKind::Image { path, .. } = &loaded.layers[0] else {
+            panic!("expected an image layer");
         };
         assert_eq!(path.as_path(), dir.path().join("shared/logo.png"));
     }
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn an_inline_specs_paths_resolve_against_the_carrying_config() {
         let mut inline = spec(1280);
-        inline.layers = vec![OverlayKind::Logo {
+        inline.layers = vec![OverlayKind::Image {
             path: "logo.png".into(),
             corner: Corner::BottomRight,
             margin: 24,
@@ -717,8 +717,8 @@ mod tests {
             Path::new("/etc/etv/channels/085-hbo"),
         )
         .unwrap();
-        let OverlayKind::Logo { path, .. } = &loaded.layers[0] else {
-            panic!("expected a logo layer");
+        let OverlayKind::Image { path, .. } = &loaded.layers[0] else {
+            panic!("expected an image layer");
         };
         assert_eq!(path, Path::new("/etc/etv/channels/085-hbo/logo.png"));
     }

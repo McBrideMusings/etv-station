@@ -98,7 +98,7 @@ One mechanism that can act on an item on its way into a schedule, and the unit a
 
 Borrowed industry terms for the things an overlay draws. None of these are schema keys or code identifiers — they exist here so an overlay author can name what they are building and search for real reference material instead of inventing a word for it. Everything below is one of the [[overlay cascade]]'s layers.
 
-- **Bug** (also **DOG**, "digital on-screen graphic") — the persistent channel mark parked in a corner. `type: logo` is a bug. Every deployed channel here has one.
+- **Bug** (also **DOG**, "digital on-screen graphic") — the persistent channel mark parked in a corner. `type: image` is a bug. Every deployed channel here has one.
 - **Chyron** — any machine-generated on-screen text. From the Chyron Corporation, whose character generators the term outlived; **char gen** / **CG** are the equipment words, **Aston** the British equivalent (Aston Broadcast Systems). `shared/title-chyron.rhai` is one.
 - **Lower third** — a chyron in the bottom third of the frame, usually a name-and-role bar. Positional, not a news-only form: "You're watching *Die Hard*" in the same place is still a lower third.
 - **Snipe** — the promotional graphic that slides in over running content to advertise something else, typically what's on next. Distinct from a lower third, which is about what's on *now*.

@@ -117,13 +117,17 @@ pub enum OverlayKind {
     /// grayscale+alpha, palette, and 16-bit PNGs are normalized to 8-bit
     /// RGB/RGBA at decode time; a source that still cannot be decoded (a
     /// genuinely corrupt file, or a missing path) drops just this layer —
-    /// logged once — rather than failing the whole render (#302).
-    Logo {
+    /// logged once — rather than failing the whole render (#302). Drawn
+    /// smaller than its source, the image is area-averaged down to its drawn
+    /// size before drawing (#3djq) — Vello 0.9 samples without minification
+    /// filtering, so scaling a large source down in the draw transform alone
+    /// aliases into stair-stepped edges.
+    Image {
         path: PathBuf,
         corner: Corner,
         #[serde(default = "default_margin")]
         margin: u32,
-        #[serde(default = "default_logo_height")]
+        #[serde(default = "default_image_height")]
         height: u32,
     },
     /// A gradient band along one edge of the frame, opaque at the edge and
@@ -191,7 +195,7 @@ fn default_color() -> [u8; 4] {
     [220, 50, 50, 220]
 }
 
-fn default_logo_height() -> u32 {
+fn default_image_height() -> u32 {
     96
 }
 
@@ -282,7 +286,7 @@ impl OverlaySpec {
         Ok(spec.with_paths_relative_to(path.parent()))
     }
 
-    /// Re-root this spec's `script` and every `logo` path against `base`, the
+    /// Re-root this spec's `script` and every `image` path against `base`, the
     /// directory the spec was authored in. Split out from [`Self::from_path`]
     /// because a spec can also arrive inline in a channel YAML, where the same
     /// base-relative rule has to hold against a different file's directory.
@@ -291,8 +295,8 @@ impl OverlaySpec {
             self.script = Some(resolve_relative(&script, base));
         }
         for layer in &mut self.layers {
-            if let OverlayKind::Logo { path: logo, .. } = layer {
-                *logo = resolve_relative(logo, base);
+            if let OverlayKind::Image { path: image, .. } = layer {
+                *image = resolve_relative(image, base);
             }
         }
         self
@@ -370,7 +374,7 @@ width: 1280
 height: 720
 framerate: 30
 layers:
-  - type: logo
+  - type: image
     path: logo.png
     corner: bottom_right
     margin: 24
@@ -385,7 +389,7 @@ layers:
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.layers.len(), 2);
-        assert!(matches!(spec.layers[0], OverlayKind::Logo { .. }));
+        assert!(matches!(spec.layers[0], OverlayKind::Image { .. }));
         assert!(matches!(spec.layers[1], OverlayKind::Text { .. }));
     }
 

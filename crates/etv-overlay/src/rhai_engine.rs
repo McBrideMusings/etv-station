@@ -290,7 +290,7 @@ fn apply_content_override(kind: &mut OverlayKind, mut content: String) {
 fn apply_corner_override(kind: &mut OverlayKind, new_corner: Corner) {
     match kind {
         OverlayKind::Watermark { corner, .. }
-        | OverlayKind::Logo { corner, .. }
+        | OverlayKind::Image { corner, .. }
         | OverlayKind::Text { corner, .. } => {
             *corner = new_corner;
         }

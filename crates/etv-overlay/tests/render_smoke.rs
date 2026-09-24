@@ -61,13 +61,13 @@ fn renders_watermark_with_visible_box() {
     );
 }
 
-/// A logo pointing at a file that cannot be decoded as a PNG must not fail
-/// `render_frame` — the frame still comes out, and every other layer
-/// (a sibling watermark here) still draws. Losing the logo is cosmetic;
+/// An image layer pointing at a file that cannot be decoded as a PNG must not
+/// fail `render_frame` — the frame still comes out, and every other layer
+/// (a sibling watermark here) still draws. Losing the image is cosmetic;
 /// losing the whole frame would starve the channel's HLS fifo of a writer
 /// and black out the channel (#302).
 #[test]
-fn an_undecodable_logo_drops_only_its_layer() {
+fn an_undecodable_image_drops_only_its_layer() {
     let mut renderer = match VelloRenderer::new(320, 240, PixelFormat::Rgba8) {
         Ok(r) => r,
         Err(e) => {
@@ -77,12 +77,12 @@ fn an_undecodable_logo_drops_only_its_layer() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let bad_logo = dir.path().join("not_a_png.png");
-    std::fs::write(&bad_logo, b"this is not a png file").unwrap();
+    let bad_image = dir.path().join("not_a_png.png");
+    std::fs::write(&bad_image, b"this is not a png file").unwrap();
 
     let state = OverlayState::from_layers(vec![
-        OverlayKind::Logo {
-            path: bad_logo,
+        OverlayKind::Image {
+            path: bad_image,
             corner: Corner::TopLeft,
             margin: 10,
             height: 40,
@@ -97,18 +97,120 @@ fn an_undecodable_logo_drops_only_its_layer() {
 
     let frame = renderer
         .render_frame(&state)
-        .expect("an undecodable logo must not fail the whole render");
+        .expect("an undecodable image must not fail the whole render");
     assert_eq!(frame.len(), 320 * 240 * 4);
 
     // The sibling watermark still drew: top-right box spans x in [220, 300],
-    // y in [20, 100] — the bad logo cost only its own layer.
+    // y in [20, 100] — the bad image cost only its own layer.
     let x = 260usize;
     let y = 60usize;
     let idx = (y * 320 + x) * 4;
     assert!(
         frame[idx + 3] > 100,
-        "watermark should still render even though the logo failed to decode, got alpha={}",
+        "watermark should still render even though the image failed to decode, got alpha={}",
         frame[idx + 3]
+    );
+}
+
+/// Writes a `width`x`height` RGBA8 PNG to `path` from raw pixel bytes, using
+/// the `png` crate's own encoder — a real file on disk, decoded by the same
+/// `decode_png` the renderer uses in production.
+fn write_rgba_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(rgba).unwrap();
+}
+
+/// Drives the full downscale path through `render_frame` — a synthetic PNG
+/// source, decoded, area-averaged down to its drawn size, and rasterized —
+/// rather than calling the box-filter function directly. `shrink_image_box`
+/// has its own unit test for the filter math (`vello_renderer.rs`); this is
+/// the coverage that the render arm actually reaches for a drawn size smaller
+/// than the source, that the whole-pixel-snapped static position lands where
+/// expected, and that the resulting `(path, drawn_w, drawn_h)`-cached image
+/// paints graded pixels rather than a hard on/off step (#3djq).
+///
+/// Source is 200x20 with a hard edge at x=122: opaque red up to there, then
+/// fully transparent pixels whose leftover color channel is green (mirrors a
+/// common PNG-encoder artifact). Drawn at height 4 (so width 40, both well
+/// under the 200x20 source — the shrink path, not the scaled-draw one), the
+/// 5x downscale puts that same edge inside destination column 24 (covering
+/// source x in [120, 125)), which must come out partially covered.
+#[test]
+fn a_downscaled_image_grades_a_hard_edge_through_the_real_render_path() {
+    let mut renderer = match VelloRenderer::new(320, 240, PixelFormat::Rgba8) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: no GPU available ({e})");
+            return;
+        }
+    };
+
+    let (src_w, src_h) = (200u32, 20u32);
+    let mut pixels = vec![0u8; (src_w * src_h * 4) as usize];
+    for y in 0..src_h {
+        for x in 0..src_w {
+            let idx = ((y * src_w + x) * 4) as usize;
+            if x < 122 {
+                pixels[idx..idx + 4].copy_from_slice(&[255, 0, 0, 255]); // opaque red
+            } else {
+                pixels[idx..idx + 4].copy_from_slice(&[0, 255, 0, 0]); // transparent, leftover green
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hard_edge.png");
+    write_rgba_png(&path, src_w, src_h, &pixels);
+
+    let state = OverlayState::from_layers(vec![OverlayKind::Image {
+        path,
+        corner: Corner::TopLeft,
+        margin: 0,
+        height: 4,
+    }]);
+    let frame = renderer
+        .render_frame(&state)
+        .expect("a downscaled image must render");
+
+    // Fully inside the opaque region (drawn column 5, well clear of the
+    // edge at drawn column 24): solid, opaque, no green.
+    let solid_idx = (320 + 5) * 4;
+    assert!(
+        frame[solid_idx + 3] > 240,
+        "pixel fully inside the opaque region should be nearly opaque, got alpha={}",
+        frame[solid_idx + 3]
+    );
+    assert!(
+        frame[solid_idx + 1] < 15,
+        "pixel fully inside the opaque region should carry no green, got green={}",
+        frame[solid_idx + 1]
+    );
+
+    // Drawn column 24 straddles the edge (2/5 source coverage opaque) —
+    // graded alpha, not a hard 0/255 step, and no green bleed from the
+    // transparent region's leftover color.
+    let edge_idx = (320 + 24) * 4;
+    let edge_alpha = frame[edge_idx + 3];
+    assert!(
+        edge_alpha > 10 && edge_alpha < 245,
+        "expected a graded (partially covered) alpha at the hard edge, got {edge_alpha}",
+    );
+    assert!(
+        frame[edge_idx + 1] < 15,
+        "the transparent region's leftover green must not bleed into the edge, got green={}",
+        frame[edge_idx + 1]
+    );
+
+    // Fully inside the transparent region (drawn column 35): fully
+    // transparent.
+    let transparent_idx = (320 + 35) * 4;
+    assert!(
+        frame[transparent_idx + 3] < 15,
+        "pixel fully inside the transparent region should be nearly transparent, got alpha={}",
+        frame[transparent_idx + 3]
     );
 }
 

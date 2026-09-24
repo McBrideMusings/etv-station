@@ -661,7 +661,7 @@ overlay:                             # or write the spec inline
   height: 720
   framerate: 30
   layers:
-    - type: logo
+    - type: image
       path: logo.png
       corner: bottom_right
       height: 56
@@ -669,7 +669,7 @@ overlay:                             # or write the spec inline
 overlay:                             # or add to what the level above resolved
   extend:
     layers:
-      - type: logo
+      - type: image
         path: logo.png               # relative to THIS file's directory
         corner: bottom_right
         height: 56

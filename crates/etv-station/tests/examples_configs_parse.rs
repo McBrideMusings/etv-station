@@ -14,7 +14,7 @@
 //! media on disk, or a `PLEXDB_SNAPSHOT_PATH` pointing at a live Plex snapshot.
 //!
 //! `examples/overlays/` is not covered: those parse through the overlay crate's
-//! own loader, which reroots script and logo paths as it reads.
+//! own loader, which reroots script and image paths as it reads.
 //!
 //! Block-file coverage is split in two (#360). `examples/samples/blocks/`
 //! holds a tracked, generic fixture and is always present, so it is parsed

@@ -459,7 +459,7 @@ fn read_probe(path: &Path) -> Result<OverlayProbe, String> {
 }
 
 fn resolve_overlay_for(config_path: &Path, channel_name: &str) -> Result<String, String> {
-    // Absolute from here down, so the emitted spec's `script:` and logo paths
+    // Absolute from here down, so the emitted spec's `script:` and image paths
     // work from whatever directory the caller later loads it in — a preview
     // writes the spec to a temp dir and renders it from there.
     let absolute = config_path
