@@ -513,9 +513,10 @@ impl VelloRenderer {
                     // into hard on/off stair-step edges. The static position
                     // snaps to a whole pixel; `offset_x`/`offset_y` (the
                     // script-driven animated part) stays fractional.
-                    let shrunk = self
-                        .load_or_get_shrunk_image(path, drawn_w, drawn_h)
-                        .clone();
+                    let Some(shrunk) = self.load_or_get_shrunk_image(path, drawn_w, drawn_h) else {
+                        return Ok(());
+                    };
+                    let shrunk = shrunk.clone();
                     let x0 = x0_static.round() + layer.offset_x as f64;
                     let y0 = y0_static.round() + layer.offset_y as f64;
                     (shrunk, Affine::translate((x0, y0)))
@@ -685,40 +686,20 @@ impl VelloRenderer {
 
     /// Returns `path`'s source image area-averaged down to `(drawn_w,
     /// drawn_h)`, computing and caching it on first request for that exact
-    /// drawn size ([`shrink_image_box`]). Only called once
-    /// [`Self::load_or_get_image`] has already confirmed `path` decodes, so
-    /// the raw entry is always present here.
+    /// drawn size ([`shrink_image_box`]). `None` when `path` has no decoded
+    /// entry — [`Self::load_or_get_image`] is what populates one.
     fn load_or_get_shrunk_image(
         &mut self,
         path: &Path,
         drawn_w: u32,
         drawn_h: u32,
-    ) -> &PenikoImage {
-        let already_cached = self
-            .image_cache
-            .get(path)
-            .and_then(|slot| slot.as_ref())
-            .expect("load_or_get_image must be called first and must have returned Some")
-            .shrunk
-            .contains_key(&(drawn_w, drawn_h));
-        if !already_cached {
-            let entry = self.image_cache[path]
-                .as_ref()
-                .expect("just checked Some above");
-            let shrunk = PenikoImage::new(shrink_image_box(&entry.raw.image, drawn_w, drawn_h));
-            self.image_cache
-                .get_mut(path)
-                .and_then(|slot| slot.as_mut())
-                .expect("just checked Some above")
-                .shrunk
-                .insert((drawn_w, drawn_h), shrunk);
-        }
-        self.image_cache[path]
-            .as_ref()
-            .expect("just checked Some above")
-            .shrunk
-            .get(&(drawn_w, drawn_h))
-            .expect("just inserted or already present")
+    ) -> Option<&PenikoImage> {
+        let ImageCacheEntry { raw, shrunk } = self.image_cache.get_mut(path)?.as_mut()?;
+        Some(
+            shrunk.entry((drawn_w, drawn_h)).or_insert_with(|| {
+                PenikoImage::new(shrink_image_box(&raw.image, drawn_w, drawn_h))
+            }),
+        )
     }
 
     fn copy_target_to_buffer(&self) {
