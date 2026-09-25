@@ -60,7 +60,10 @@ pub struct ProfileEntry {
     /// A CEL expression over `item`, resolved like a pool's `sources`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<String>,
-    pub weight: f64,
+    /// Optional here only so a missing one reaches [`check`] and is refused
+    /// naming the entry; every entry that passes has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
 }
 
 /// What one entry points at, once its shape has been checked.
@@ -141,7 +144,7 @@ const TAG_KEYS: &[(&str, &str)] = &[
 
 /// Check one authored entry: exactly one reference key, a non-empty value,
 /// a finite non-zero weight, and an `item:` in one of its two shapes.
-pub fn check(entry: &ProfileEntry) -> Result<(Reference, String), String> {
+pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, f64), String> {
     let tags = [
         &entry.genre,
         &entry.label,
@@ -192,10 +195,13 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String), String> {
     if value.trim().is_empty() {
         return Err(format!("has an empty `{key}`"));
     }
-    if !entry.weight.is_finite() {
+    let Some(weight) = entry.weight else {
+        return Err(format!("`{key}: {value}` has no `weight`"));
+    };
+    if !weight.is_finite() {
         return Err(format!("`{key}: {value}` has a non-finite weight"));
     }
-    if entry.weight == 0.0 {
+    if weight == 0.0 {
         return Err(format!(
             "`{key}: {value}` has weight 0, which weights nothing — remove the entry"
         ));
@@ -217,7 +223,7 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String), String> {
             }
         }
     };
-    Ok((reference, value.clone()))
+    Ok((reference, value.clone(), weight))
 }
 
 fn parse_item(raw: &str) -> Result<ItemRef, String> {
@@ -273,12 +279,12 @@ fn push_checked(
 ) -> Result<(), String> {
     for (i, entry) in entries.iter().enumerate() {
         let position = i + 1;
-        let (reference, written) =
+        let (reference, written, weight) =
             check(entry).map_err(|m| format!("profile entry {position} in {origin} {m}"))?;
         out.push(LoadedEntry {
             reference,
             written,
-            weight: entry.weight,
+            weight,
             origin: origin.to_string(),
             position,
         });
@@ -393,13 +399,13 @@ mod tests {
 
     #[test]
     fn a_keyword_entry_normalizes_its_value() {
-        let (r, _) = check(&entry("{ keyword: \"  Bank   Heist \", weight: 2.0 }")).unwrap();
+        let (r, _, _) = check(&entry("{ keyword: \"  Bank   Heist \", weight: 2.0 }")).unwrap();
         assert_eq!(r, Reference::Keyword("bank heist".into()));
     }
 
     #[test]
     fn a_tag_entry_names_the_item_map_key() {
-        let (r, _) = check(&entry("{ director: Michael Mann, weight: 1.0 }")).unwrap();
+        let (r, _, _) = check(&entry("{ director: Michael Mann, weight: 1.0 }")).unwrap();
         assert_eq!(
             r,
             Reference::Tag {
@@ -428,6 +434,15 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_weight_is_refused_naming_the_entry() {
+        let msg = check(&entry("{ keyword: heist }")).unwrap_err();
+        assert!(
+            msg.contains("`keyword: heist` has no `weight`"),
+            "msg = {msg}"
+        );
+    }
+
+    #[test]
     fn a_non_finite_weight_is_refused() {
         let msg = check(&entry("{ keyword: heist, weight: .inf }")).unwrap_err();
         assert!(msg.contains("non-finite"), "msg = {msg}");
@@ -441,7 +456,7 @@ mod tests {
 
     #[test]
     fn item_references_parse_in_both_shapes() {
-        let (r, _) = check(&entry("{ item: \"imdb:tt0113277\", weight: -1 }")).unwrap();
+        let (r, _, _) = check(&entry("{ item: \"imdb:tt0113277\", weight: -1 }")).unwrap();
         assert_eq!(
             r,
             Reference::Item(ItemRef::External {
@@ -449,7 +464,7 @@ mod tests {
                 value: "tt0113277".into()
             })
         );
-        let (r, _) = check(&entry("{ item: \"Heat (1995)\", weight: -1 }")).unwrap();
+        let (r, _, _) = check(&entry("{ item: \"Heat (1995)\", weight: -1 }")).unwrap();
         assert_eq!(
             r,
             Reference::Item(ItemRef::TitleYear {
