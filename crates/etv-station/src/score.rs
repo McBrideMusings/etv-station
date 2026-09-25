@@ -277,6 +277,12 @@ pub struct ScoreCache {
     /// returning bare ids leaves this empty, which is the whole point of the
     /// widening being additive.
     pub(crate) picked_extras: HashMap<(String, String), PickedExtra>,
+    /// Each plugin pool's resolved taste profile (etv-station-sctf.2), keyed
+    /// by pool name — resolved by [`Self::prepare_profile`] in the
+    /// catalog-reading half and read back by [`pick`] as `ctx.profile`. Keyed
+    /// by pool rather than by script and sources, since two pools sharing a
+    /// script and a candidate set still author their own profiles.
+    profiles: HashMap<String, crate::profile::ResolvedProfile>,
 }
 
 /// The metadata blob and/or take override one `entry_id` carried in a plugin
@@ -789,6 +795,12 @@ struct ScoreCtx {
     /// value the station already holds and the sandbox provably cannot
     /// obtain, not a capability a pool grants or withholds.
     account_id: Option<i64>,
+    /// The pool's resolved taste profile (etv-station-sctf.2), one map per
+    /// entry, files first then inline. Gated on `catalog_read`, the same as
+    /// `sets`: an `item` or `set` entry carries full catalog item maps.
+    profile: Option<Dynamic>,
+    /// The pool's `exclude_keywords`, each through the keyword rule.
+    exclude_keywords: Dynamic,
 }
 
 /// What a script gets back for reading a `ctx` field its pool was not granted
@@ -836,6 +848,16 @@ impl ScoreCtx {
 
     fn get_seed(&mut self) -> i64 {
         self.seed
+    }
+
+    fn get_profile(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
+        self.profile
+            .clone()
+            .ok_or_else(|| ungranted("catalog_read"))
+    }
+
+    fn get_exclude_keywords(&mut self) -> Dynamic {
+        self.exclude_keywords.clone()
     }
 
     /// `ctx.account_id` (#278): the resolved account id as a Rhai integer, or
@@ -1150,6 +1172,8 @@ pub(crate) fn engine() -> Engine {
         .register_get("recent", ScoreCtx::get_recent)
         .register_get("seed", ScoreCtx::get_seed)
         .register_get("account_id", ScoreCtx::get_account_id)
+        .register_get("profile", ScoreCtx::get_profile)
+        .register_get("exclude_keywords", ScoreCtx::get_exclude_keywords)
         .register_fn("datastore", ScoreCtx::get_datastore);
     engine
         .register_type_with_name::<Datastore>("Datastore")
@@ -1197,6 +1221,34 @@ impl ScoreCache {
         let cached = compile_and_resolve(catalog, &engine(), script_path, sources)?;
         self.entries.insert(key, cached);
         Ok(())
+    }
+
+    /// Load and resolve `pool`'s taste profile and `exclude_keywords` against
+    /// the catalog, for [`pick`] to hand over as `ctx.profile` and
+    /// `ctx.exclude_keywords`. Touches the catalog, so it belongs to the same
+    /// half as [`Self::prepare`]. A pool that authored neither stores nothing,
+    /// and its script reads empty arrays.
+    pub fn prepare_profile(
+        &mut self,
+        catalog: &Catalog,
+        pool: &crate::config::Pool,
+        base_dir: &Path,
+    ) -> Result<(), String> {
+        if pool.profile.is_empty()
+            && pool.profile_files.is_empty()
+            && pool.exclude_keywords.is_empty()
+        {
+            return Ok(());
+        }
+        let entries = crate::profile::load(pool, base_dir)?;
+        let resolved = crate::profile::resolve(catalog, &entries, &pool.exclude_keywords)?;
+        self.profiles.insert(pool.name.clone(), resolved);
+        Ok(())
+    }
+
+    /// The resolved profile [`Self::prepare_profile`] stored for `pool_name`.
+    pub fn profile(&self, pool_name: &str) -> Option<&crate::profile::ResolvedProfile> {
+        self.profiles.get(pool_name)
     }
 
     /// Stash the metadata/take-override half of what a plugin pool's `pick()`
@@ -1358,6 +1410,20 @@ pub fn pick(
         datastores: granted.datastores,
         seed: mixed_seed(seed, pool_name),
         account_id: inputs.account_id,
+        profile: granted.catalog_read.then(|| {
+            Dynamic::from_array(
+                cache
+                    .profile(pool_name)
+                    .map(|p| p.entries.clone())
+                    .unwrap_or_default(),
+            )
+        }),
+        exclude_keywords: Dynamic::from_array(
+            cache
+                .profile(pool_name)
+                .map(|p| p.exclude_keywords.clone())
+                .unwrap_or_default(),
+        ),
     };
 
     // `audit()` needs its own `ctx`, built from the same inputs `pick()` gets
@@ -2094,6 +2160,211 @@ weights:
         )
         .unwrap();
         assert_eq!(got, vec!["m2", "m1"]);
+    }
+
+    // ---- taste profile (etv-station-sctf.2) --------------------------------
+
+    /// A catalog with two films titled "Heat" in 1986 (ambiguous by title) and
+    /// one in 1995 carrying an IMDb entry id and a TMDB external id.
+    fn profile_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        for (id, title, year) in [
+            ("imdb:tt0113277", "Heat", 1995),
+            ("fs:heat-a", "Heat", 1986),
+            ("fs:heat-b", "Heat", 1986),
+            ("m2", "Beta", 2002),
+        ] {
+            let mut e = Entry::new(id, "movie", title, Source::Plex);
+            e.year = Some(year);
+            c.upsert_entry(&e).unwrap();
+        }
+        c.add_external_id(
+            crate::catalog::model::ExternalNs::Tmdb,
+            "949",
+            "movie",
+            "imdb:tt0113277",
+        )
+        .unwrap();
+        c.add_tag("m2", TagNs::Genre, "Horror").unwrap();
+        c
+    }
+
+    /// A script that reports `ctx.profile` by returning one pick per entry,
+    /// `<kind>:<value or member ids>:<weight>@<origin>`, in the order it
+    /// arrived. `pick()` checks only that each id is a unique string, so the
+    /// order of the returned list is the order the script saw.
+    const PROFILE_ECHO: &str = r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let out = [];
+    for e in ctx.profile {
+        let what = if e.kind == "item" || e.kind == "set" {
+            let ids = [];
+            for i in e.items { ids.push(i.entry_id); }
+            ids.sort();
+            ids.reduce(|s, x| if s == () { x } else { s + "," + x })
+        } else { e.namespace + "=" + e.value };
+        out.push(e.kind + ":" + what + ":" + e.weight + "@" + e.origin);
+    }
+    for k in ctx.exclude_keywords { out.push("exclude:" + k); }
+    if out.is_empty() { out.push("no-profile:" + ctx.profile.len() + ":" + ctx.exclude_keywords.len()); }
+    #{ picks: out, workspace: () }
+}
+fn audit(ctx, picks, workspace) { #{} }
+"#;
+
+    fn profile_pool(yaml_src: &str) -> crate::config::Pool {
+        serde_norway::from_str(yaml_src).unwrap()
+    }
+
+    fn run_profile(
+        catalog: &Catalog,
+        dir: &tempfile::TempDir,
+        pool: &crate::config::Pool,
+    ) -> Result<Vec<String>, String> {
+        let p = write(dir, PROFILE_ECHO);
+        let mut cache = ScoreCache::default();
+        cache.prepare_profile(catalog, pool, dir.path())?;
+        run(
+            catalog,
+            &p,
+            &ScoreInputs::default(),
+            &pool.name,
+            None,
+            &mut cache,
+        )
+    }
+
+    #[test]
+    fn profile_arrives_files_first_then_inline_with_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.yaml"),
+            "- { keyword: \" Bank   Heist \", weight: 2.0 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.yaml"),
+            "- { genre: Horror, weight: -1.0 }\n",
+        )
+        .unwrap();
+        let pool = profile_pool(
+            r#"
+name: movies
+plugin: plugin.rhai
+profile_files: [a.yaml, b.yaml]
+profile:
+  - { item: "Heat (1995)", weight: -1.5 }
+  - { set: 'item.year == 2002', weight: 3.0 }
+exclude_keywords: ["DuringCreditsStinger "]
+"#,
+        );
+        let got = run_profile(&profile_catalog(), &dir, &pool).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "keyword:keywords=bank heist:2.0@a.yaml",
+                "tag:genres=horror:-1.0@b.yaml",
+                "item:imdb:tt0113277:-1.5@inline",
+                "set:m2:3.0@inline",
+                "exclude:duringcreditsstinger",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_item_resolves_by_external_id_either_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool(
+            r#"
+name: movies
+plugin: plugin.rhai
+profile:
+  - { item: "imdb:tt0113277", weight: 1.0 }
+  - { item: "tmdb:949", weight: 2.0 }
+"#,
+        );
+        let got = run_profile(&profile_catalog(), &dir, &pool).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "item:imdb:tt0113277:1.0@inline",
+                "item:imdb:tt0113277:2.0@inline"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_title_fails_listing_the_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { item: \"Heat (1986)\", weight: 1.0 }\n",
+        );
+        let msg = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
+        assert!(msg.contains("profile entry 1 in inline"), "msg = {msg}");
+        assert!(msg.contains("fs:heat-a, fs:heat-b"), "msg = {msg}");
+    }
+
+    #[test]
+    fn an_unmatched_id_fails_naming_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { item: \"imdb:tt9999999\", weight: 1.0 }\n",
+        );
+        let msg = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
+        assert!(msg.contains("imdb:tt9999999"), "msg = {msg}");
+        assert!(msg.contains("matches no catalog item"), "msg = {msg}");
+    }
+
+    #[test]
+    fn a_set_matching_nothing_fails_naming_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { set: 'item.year == 1800', weight: 1.0 }\n",
+        );
+        let msg = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
+        assert!(msg.contains("profile entry 1 in inline"), "msg = {msg}");
+        assert!(msg.contains("matches no catalog items"), "msg = {msg}");
+    }
+
+    /// `ctx.profile` carries full item maps for `item`/`set` entries, so it
+    /// sits behind `catalog_read` exactly like `ctx.sets`.
+    #[test]
+    fn profile_needs_catalog_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = profile_catalog();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { item: \"tmdb:949\", weight: 1.0 }\n",
+        );
+        let p = write(&dir, PROFILE_ECHO);
+        let mut cache = ScoreCache::default();
+        cache.prepare(&catalog, &p, None).unwrap();
+        cache.prepare_profile(&catalog, &pool, dir.path()).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            0,
+            "movies",
+            None,
+            GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("capability `catalog_read` not declared"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn a_pool_without_a_profile_reads_empty_arrays() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool("name: movies\nplugin: plugin.rhai\n");
+        assert_eq!(
+            run_profile(&profile_catalog(), &dir, &pool).unwrap(),
+            vec!["no-profile:0:0"]
+        );
     }
 
     /// `item.library` (#128) has to reach a scorer's item maps, not just the CEL

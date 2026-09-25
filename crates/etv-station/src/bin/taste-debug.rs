@@ -195,6 +195,12 @@ fn main() -> Result<(), String> {
     cache
         .prepare(&catalog, &script_path, pool_cfg.sources.as_ref())
         .map_err(|e| format!("prepare: {e}"))?;
+    cache
+        .prepare_profile(&catalog, pool_cfg, &channel_dir)
+        .map_err(|e| format!("profile: {e}"))?;
+    if let Some(profile) = cache.profile(&cli.pool) {
+        print_profile(profile);
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -310,6 +316,52 @@ fn main() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// One line per resolved profile entry: origin, weight, what it resolved to.
+fn print_profile(profile: &etv_station::profile::ResolvedProfile) {
+    println!("=== taste profile ({} entries) ===", profile.entries.len());
+    for entry in &profile.entries {
+        let Some(m) = entry.clone().try_cast::<rhai::Map>() else {
+            continue;
+        };
+        let field = |k: &str| m.get(k).map(|v| v.to_string()).unwrap_or_default();
+        let resolved = match field("kind").as_str() {
+            "item" | "set" => {
+                let members = m
+                    .get("items")
+                    .and_then(|v| v.clone().try_cast::<rhai::Array>())
+                    .unwrap_or_default();
+                let titles: Vec<String> = members
+                    .iter()
+                    .take(5)
+                    .filter_map(|i| i.clone().try_cast::<rhai::Map>())
+                    .map(|i| i.get("title").map(|t| t.to_string()).unwrap_or_default())
+                    .collect();
+                format!("{} item(s): {}", members.len(), titles.join(", "))
+            }
+            _ => format!("{} = {:?}", field("namespace"), field("value")),
+        };
+        println!(
+            "  {:>+6.2}  {:<8} {:<40} -> {}   [{}]",
+            m.get("weight")
+                .and_then(|w| w.as_float().ok())
+                .unwrap_or(0.0),
+            field("kind"),
+            field("reference"),
+            resolved,
+            field("origin"),
+        );
+    }
+    if !profile.exclude_keywords.is_empty() {
+        let ex: Vec<String> = profile
+            .exclude_keywords
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        println!("  exclude_keywords: {}", ex.join(", "));
+    }
+    println!();
 }
 
 fn print_rows(items: &[PickedItem], title_of: &impl Fn(&str) -> String, limit: usize) {

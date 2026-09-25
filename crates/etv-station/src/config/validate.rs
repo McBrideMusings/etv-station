@@ -733,6 +733,13 @@ fn validate_block_pools<'a>(
                     }
                 }
             }
+            // The taste profile's shape (etv-station-sctf.2): every entry names
+            // exactly one reference with a finite non-zero weight, and every
+            // profile file reads and parses. Catalog lookups wait for the
+            // generation; a malformed entry never needs one to be refused.
+            crate::profile::load(pool, base_dir)
+                .and_then(|_| crate::profile::check_exclude_keywords(pool))
+                .map_err(|m| bad(format!("pool {:?}: {m}", pool.name)))?;
             // Checked last among this pool's plugin checks — it is the one
             // that reads the script off disk, so the cheaper structural checks
             // above get to report first when more than one thing is wrong.
@@ -748,6 +755,20 @@ fn validate_block_pools<'a>(
                  candidate sets a scorer plugin ranks, and a pool drawing from `expr` \
                  or `groups` has no script to hand them to; use `expr` to narrow this \
                  pool instead",
+                pool.name
+            )));
+        }
+        // Same reasoning as `sources`: a profile is read by a scorer script,
+        // and a pool with none would carry weights that never apply.
+        if pool.plugin.is_none()
+            && (!pool.profile.is_empty()
+                || !pool.profile_files.is_empty()
+                || !pool.exclude_keywords.is_empty())
+        {
+            return Err(bad(format!(
+                "pool {:?} sets `profile`, `profile_files` or `exclude_keywords` without a \
+                 `plugin` — they weight a scorer plugin's ranking, and a pool drawing from \
+                 `expr` or `groups` has no script to hand them to",
                 pool.name
             )));
         }
@@ -1118,6 +1139,9 @@ mod tests {
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
             sources: None,
+            profile: Vec::new(),
+            profile_files: Vec::new(),
+            exclude_keywords: Vec::new(),
             groups: Vec::new(),
             order: None,
             bucket_order: None,
@@ -1586,6 +1610,89 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("empty `sources` table"), "msg = {msg}");
         assert!(msg.contains("nothing to rank"), "msg = {msg}");
+    }
+
+    /// A profile weights a scorer's ranking; a pool with no scorer would carry
+    /// weights that never apply.
+    #[test]
+    fn rejects_a_profile_without_a_plugin() {
+        let mut movies = pool("movies");
+        movies.profile = vec![serde_norway::from_str("{ keyword: heist, weight: 1.0 }").unwrap()];
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pool \"movies\""), "msg = {msg}");
+        assert!(msg.contains("without a `plugin`"), "msg = {msg}");
+    }
+
+    #[test]
+    fn rejects_profile_files_or_exclude_keywords_without_a_plugin() {
+        let mut files = pool("files");
+        files.profile_files = vec!["p.yaml".into()];
+        let mut exclude = pool("exclude");
+        exclude.exclude_keywords = vec!["duringcreditsstinger".into()];
+        for p in [files, exclude] {
+            let name = p.name.clone();
+            let block = pattern_block(vec![p], vec![step(&name, 1)]);
+            let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains(&format!("pool {name:?}")), "msg = {msg}");
+            assert!(msg.contains("without a `plugin`"), "msg = {msg}");
+        }
+    }
+
+    /// A malformed entry fails the load naming the pool, the origin and the
+    /// position, before the script is read off disk.
+    #[test]
+    fn rejects_a_profile_entry_with_two_references() {
+        let mut movies = pool("movies");
+        movies.expr = None;
+        movies.plugin = Some("taste.rhai".into());
+        movies.profile = vec![
+            serde_norway::from_str("{ keyword: heist, weight: 1.0 }").unwrap(),
+            serde_norway::from_str("{ keyword: heist, genre: Crime, weight: 1.0 }").unwrap(),
+        ];
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pool \"movies\""), "msg = {msg}");
+        assert!(msg.contains("profile entry 2 in inline"), "msg = {msg}");
+        assert!(msg.contains("keyword, genre"), "msg = {msg}");
+    }
+
+    #[test]
+    fn rejects_an_unreadable_profile_file() {
+        let mut movies = pool("movies");
+        movies.expr = None;
+        movies.plugin = Some("taste.rhai".into());
+        movies.profile_files = vec!["profiles/missing.yaml".into()];
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dummy_path(), &channel_with(vec![block])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("profile file profiles/missing.yaml"),
+            "msg = {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_weight_in_a_profile_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.yaml"),
+            "- { genre: Horror, weight: -1 }\n- { keyword: heist, weight: 0 }\n",
+        )
+        .unwrap();
+        let mut movies = pool("movies");
+        movies.expr = None;
+        movies.plugin = Some("taste.rhai".into());
+        movies.profile_files = vec!["p.yaml".into()];
+        let block = pattern_block(vec![movies], vec![step("movies", 1)]);
+        let err = validate_channel(&dir.path().join("channel.yaml"), &channel_with(vec![block]))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("profile entry 2 in p.yaml"), "msg = {msg}");
+        assert!(msg.contains("weight 0"), "msg = {msg}");
     }
 
     #[test]

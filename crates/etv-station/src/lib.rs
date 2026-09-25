@@ -19,6 +19,7 @@ pub mod history;
 pub mod overlay_supervisor;
 pub mod overlay_timeline;
 pub mod pattern;
+pub mod profile;
 pub mod reconcile;
 pub mod resolve;
 pub mod resume;

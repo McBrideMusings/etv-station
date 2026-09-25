@@ -873,6 +873,60 @@ resolve fails the channel's generation naming the pool and the set, and says
 `channel-authored source` rather than naming the script, so the error points at
 the file the expression is actually written in.
 
+#### Pool `profile`, `profile_files` and `exclude_keywords` — a taste profile
+
+A plugin pool can carry a **taste profile**: signed weights on keywords, catalog
+tag values, single items and CEL-defined sets. The station resolves every
+reference and hands the result to the script as `ctx.profile`. The script does
+all the weight math (ADR 0002).
+
+```yaml
+- name: movies
+  plugin: "../plugins/taste-cosine.rhai"
+  profile_files: ["../profiles/pierce.yaml"]
+  profile:
+    - { keyword: heist,            weight:  2.0 }
+    - { genre: Horror,             weight: -1.0 }
+    - { director: Michael Mann,    weight:  1.0 }
+    - { item: "imdb:tt0113277",    weight: -1.0 }
+    - { item: "Grown Ups (2010)",  weight: -1.0 }
+    - { set: 'item.collections.contains("Guilty Pleasures")', weight: 3.0 }
+  exclude_keywords: [duringcreditsstinger]
+```
+
+**An entry** names exactly one reference and a `weight`:
+
+| Key | Resolves to |
+|---|---|
+| `keyword` | the value lowercased, trimmed, whitespace collapsed |
+| `genre`, `label`, `cast`, `director`, `writer`, `producer`, `country`, `studio`, `content_rating` | the value lowercased, under the item-map key it is read from (`genres`, `labels`, `cast`, `directors`, `writers`, `producers`, `countries`, `studio`, `content_rating`) |
+| `item` | one catalog entry, by external id (`imdb:…`, `tmdb:…`, `tvdb:…`, or an `entry_id` of that shape) or by exact `Title (Year)` among non-episodes |
+| `set` | every entry a CEL expression matches, resolved like `sources` |
+
+`weight` must be finite and non-zero; its sign says favor or disfavor.
+
+**`profile_files`** are YAML lists of entries, relative to the channel file.
+Their entries arrive first, in list order, then the inline `profile`. A file
+holds a person's standing likes and dislikes, and several pools can name it.
+
+**`exclude_keywords`** go through the `keyword` rule and reach the script as
+`ctx.exclude_keywords`.
+
+**`ctx.profile`** is one map per entry: `kind` (`keyword`, `tag`, `item`,
+`set`), `namespace` and `value` for a keyword or tag, `items` (full item maps,
+the same shape as `ctx.sets`) for an item or set, `weight`, `reference` (as
+written) and `origin` (the profile file's path as written, or `inline`). A pool
+with no profile reads empty arrays. Reading `ctx.profile` needs the
+`catalog_read` capability, the same as `ctx.sets`, since `item` and `set`
+entries carry catalog item maps; `ctx.exclude_keywords` is not gated.
+
+Rejected at load, naming the pool, origin and position: any of the three on a
+pool with no `plugin`; an entry naming zero or two references, an empty value,
+an unknown key, a zero or non-finite weight, or an `item` in neither shape; an
+unreadable profile file; an empty `exclude_keywords` value. Failing the
+generation, naming the entry: an `item` matching no entry or several (listed),
+and a `set` that fails to resolve or matches nothing.
+
 #### An `influence` set — a curated list guides a taste pool without gating it
 (#410)
 

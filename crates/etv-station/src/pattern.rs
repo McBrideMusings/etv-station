@@ -1112,6 +1112,9 @@ pub(crate) fn resolve_pool_sources(
                 score_cache
                     .prepare(catalog, &path, cfg.sources.as_ref())
                     .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+                score_cache
+                    .prepare_profile(catalog, cfg, score_env.base_dir)
+                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
                 pool_ids.push(None);
             }
             (None, None, true) => {
@@ -1859,6 +1862,9 @@ mod tests {
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
             sources: None,
+            profile: Vec::new(),
+            profile_files: Vec::new(),
+            exclude_keywords: Vec::new(),
             groups: Vec::new(),
             order: Some(Order::parse("title:asc").unwrap()),
             bucket_order: None,
@@ -1881,6 +1887,9 @@ mod tests {
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
             sources: None,
+            profile: Vec::new(),
+            profile_files: Vec::new(),
+            exclude_keywords: Vec::new(),
             groups: Vec::new(),
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             bucket_order: None,
@@ -1907,6 +1916,9 @@ mod tests {
             expr: None,
             plugin: Some(script.to_path_buf()),
             sources: None,
+            profile: Vec::new(),
+            profile_files: Vec::new(),
+            exclude_keywords: Vec::new(),
             groups: Vec::new(),
             order: None,
             bucket_order: None,
@@ -1996,6 +2008,9 @@ mod tests {
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
             sources: None,
+            profile: Vec::new(),
+            profile_files: Vec::new(),
+            exclude_keywords: Vec::new(),
             groups: Vec::new(),
             order: Some(Order::parse("season:asc,episode:asc").unwrap()),
             bucket_order: None,
@@ -2296,6 +2311,9 @@ mod tests {
             expr: None,
             plugin: None,
             sources: None,
+            profile: Vec::new(),
+            profile_files: Vec::new(),
+            exclude_keywords: Vec::new(),
             groups: vec!["rupaul".into()],
             order: None,
             bucket_order: Some(Order::parse("title:asc").unwrap()),

@@ -600,6 +600,47 @@ impl Catalog {
         Ok(row)
     }
 
+    /// Every `entry_id` an external GUID names, across media types, in id order
+    /// — the lookup a channel author's `imdb:tt…` or `tmdb:…` reference makes.
+    /// Unlike [`Self::entry_id_for_external_id`] the caller has no kind to
+    /// offer, so a tmdb number shared by a film and an episode returns both and
+    /// the caller decides what two matches mean.
+    pub fn entry_ids_for_external_value(
+        &self,
+        namespace: ExternalNs,
+        value: &str,
+    ) -> Result<Vec<String>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT entry_id FROM entry_external_ids
+              WHERE namespace = ?1 AND value = ?2 ORDER BY entry_id",
+        )?;
+        let ids = stmt
+            .query_map(params![namespace.as_str(), value], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Every non-episode entry whose title matches `title` case-insensitively
+    /// and whose year is `year`, in id order. An episode's `title` is the
+    /// episode's own name, so it is never what "Title (Year)" means.
+    pub fn entry_ids_by_title_year(
+        &self,
+        title: &str,
+        year: i64,
+    ) -> Result<Vec<String>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entry_id FROM entries
+              WHERE title = ?1 COLLATE NOCASE AND year = ?2 AND type != 'episode'
+              ORDER BY entry_id",
+        )?;
+        let ids = stmt
+            .query_map(params![title, year], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// The `entry_id` a `(source, source_id)` provenance row resolves to, if any.
     /// Used to map a Plex `ratingKey` back to its catalog entry — e.g. resolving
     /// a collection's members to entry ids.

@@ -330,6 +330,32 @@ pub struct Pool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<BTreeMap<String, String>>,
 
+    /// This pool's taste profile (etv-station-sctf.2): signed weights on
+    /// keywords, catalog tag values, single items and CEL-defined sets, handed
+    /// to [`Pool::plugin`] as `ctx.profile` after [`Pool::profile_files`]'
+    /// entries. See [`crate::profile`].
+    ///
+    /// A pool field rather than a `config:` key because the station has to
+    /// read it: every reference is resolved against the catalog, and a bad one
+    /// fails the load or the generation naming the entry, which `config:`, a
+    /// carrier the station never reads, cannot do. The weighting itself stays
+    /// the script's (ADR 0002).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile: Vec<crate::profile::ProfileEntry>,
+
+    /// Files of profile entries loaded before [`Pool::profile`], in list
+    /// order, each a YAML list of entries. Relative to the channel config's
+    /// directory, like [`Pool::plugin`]. This is how several pools share one
+    /// person's standing likes and dislikes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_files: Vec<PathBuf>,
+
+    /// Keywords this pool's scorer drops from scoring entirely, resolved the
+    /// way a profile `keyword:` entry is and handed over as
+    /// `ctx.exclude_keywords`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_keywords: Vec<String>,
+
     /// Named show groups (#165) this pool draws its items from — every member
     /// show's episodes, across every group listed, unioned. Mutually
     /// exclusive with [`Pool::expr`] and [`Pool::plugin`]: a pool names
