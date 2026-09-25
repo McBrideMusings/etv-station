@@ -1897,27 +1897,25 @@ async fn truncate_playout_at(
     Ok(0)
 }
 
-/// The instant the ledger may be truncated from after a wipe: where the
-/// generation loop will actually resume.
+/// Where the schedule a wipe at `wiped_from` left on disk actually ends — the
+/// instant the generation loop resumes at, and so the instant both the ledger
+/// and the resume state are rewound to.
 ///
-/// **Not `wiped_from`.** [`wipe_playout_from`] deliberately spares the chunk
-/// file that *contains* `wiped_from` — it also holds earlier items that are
-/// still valid — so coverage, and the airings describing it, survive past that
-/// instant. The generation loop then picks up at the surviving frontier. Cutting
-/// history at `wiped_from` instead deletes the rows for everything in between,
+/// **Not `wiped_from`.** A wipe can spare items past its own cut — the sweep
+/// and the coverage heal leave the chunk file holding a boundary-straddling
+/// item whole — so coverage, and the airings describing it, survive past that
+/// instant. The generation loop then picks up at the surviving frontier.
+///
+/// Cutting history at `wiped_from` deletes the rows for everything in between,
 /// and nothing ever rewrites them: the schedule stays on disk and still airs
-/// while the ledger forgets it.
+/// while the ledger forgets it. A channel whose ledger has that hole reads as
+/// having no past — its `advance = "resume"` pools restart every series at the
+/// top, and its adjacency seam stops seeing what just aired.
 ///
-/// A channel whose ledger has that hole reads as having no past. Its
-/// `advance = "resume"` pools restart every series at the top, and its
-/// adjacency seam — the only thing that stops a `no_repeat_within` rule being
-/// evaluated against an empty history — stops seeing what just aired. Both fail
-/// silently, because within any single generation there was no clash to report.
-///
-/// Both wipe sites call this rather than each doing the arithmetic: two copies
-/// of "where does the ledger get cut" is how they came to disagree in the first
-/// place.
-async fn ledger_cut_after_wipe(
+/// Rewinding resume state to `wiped_from` is the same mistake from the other
+/// side: it restores the rotation and list position from before the spared
+/// items aired, so the next generation re-airs them (#378).
+async fn surviving_frontier(
     output: &Path,
     wiped_from: OffsetDateTime,
 ) -> Result<OffsetDateTime, StationError> {
@@ -1927,6 +1925,30 @@ async fn ledger_cut_after_wipe(
             .unwrap_or(wiped_from)
             .max(wiped_from),
     )
+}
+
+/// After a wipe at `wiped_from`, rewind the resume state and cut the ledger to
+/// the [`surviving_frontier`], and persist the rewound state. Returns the
+/// frontier.
+///
+/// Every wipe site calls this rather than each doing the arithmetic: two copies
+/// of "where does the rewind land" is how the ledger and the resume state came
+/// to disagree in the first place.
+async fn rewind_to_surviving(
+    channel: &LoadedChannel,
+    ctx: StationContext<'_>,
+    resume: &mut crate::resume::ResumeMap,
+    wiped_from: OffsetDateTime,
+) -> Result<OffsetDateTime, StationError> {
+    let output = &channel.output_folder;
+    let frontier = surviving_frontier(output, wiped_from).await?;
+    // No checkpoint at or before the frontier means its state was pruned after
+    // airing; the pools continue from where they stand — a possible seam
+    // glitch, never black.
+    resume.rewind_to(frontier);
+    ctx.history_db.truncate_from(&channel.name, frontier)?;
+    crate::resume::save(output, resume).await?;
+    Ok(frontier)
 }
 
 /// The earliest instant it is safe to wipe and regenerate from, given a raw
@@ -2144,7 +2166,7 @@ mod regen_floor_tests {
         .unwrap();
         wipe_playout_from(&channel, boundary).await.unwrap();
 
-        let cut = ledger_cut_after_wipe(&channel.output_folder, boundary)
+        let cut = surviving_frontier(&channel.output_folder, boundary)
             .await
             .unwrap();
         assert_eq!(
@@ -2229,7 +2251,7 @@ mod regen_floor_tests {
         let dir = tempdir().unwrap();
         let channel = ch(&dir);
         let boundary = datetime!(2026-01-01 06:00 UTC);
-        let cut = ledger_cut_after_wipe(&channel.output_folder, boundary)
+        let cut = surviving_frontier(&channel.output_folder, boundary)
             .await
             .unwrap();
         assert_eq!(cut, boundary);
@@ -2412,16 +2434,9 @@ async fn refresh_forward(
     now: OffsetDateTime,
     reason: &'static str,
 ) -> Result<(), StationError> {
-    let output = &channel.output_folder;
     let regen_from = airing_item_finish(channel, now).await?;
     let removed = wipe_playout_from(channel, regen_from).await?;
-    // Best-effort pool alignment: rewind to the checkpoint covering the cut if
-    // one survives, else leave the pools where they are and accept a seam
-    // glitch. Either way the stale schedule is gone.
-    resume.rewind_to(regen_from);
-    let cut = ledger_cut_after_wipe(output, regen_from).await?;
-    ctx.history_db.truncate_from(&channel.name, cut)?;
-    crate::resume::save(output, resume).await?;
+    let cut = rewind_to_surviving(channel, ctx, resume, regen_from).await?;
     tracing::info!(
         event = "resume.refresh",
         channel = %channel.name,
@@ -2656,11 +2671,9 @@ async fn pattern_catch_up(
         // The deleted spans have records: pool checkpoints in the sidecar and
         // airings in the play-history store, both dated in the span just
         // removed. Left standing, `tail()` would hand the scorer a "recently
-        // aired" list from years in the future. Same two calls the
-        // coverage-heal path makes below, at the same cutoff.
-        resume.rewind_to(unreachable);
-        ctx.history_db.truncate_from(&channel.name, unreachable)?;
-        crate::resume::save(output, &resume).await?;
+        // aired" list from years in the future. Same rewind the coverage-heal
+        // path makes below.
+        rewind_to_surviving(channel, ctx, &mut resume, unreachable).await?;
     }
     if swept.total() > 0 {
         tracing::info!(
@@ -2697,23 +2710,7 @@ async fn pattern_catch_up(
         let boundary = tzmod::chunk_boundary_at_or_before(gap, channel.config.chunk_hours, ctx.tz);
         let regen_from = regen_floor(channel, boundary).await?;
         let removed = wipe_playout_from(channel, regen_from).await?;
-        // Best-effort pool alignment: rewind to the checkpoint covering the hole
-        // if it survives, else leave the pools as they are and accept a possible
-        // seam glitch — either way the black is gone once the loop regenerates.
-        resume.rewind_to(regen_from);
-        // Truncate the ledger from where regeneration will actually resume, not
-        // from `regen_from`. The wipe deliberately spares the chunk file that
-        // *contains* `regen_from`, so coverage — and the airings describing it —
-        // survive past that instant. Truncating from `regen_from` deleted those
-        // rows, and the generation loop below then picked up at the surviving
-        // frontier, so nothing ever rewrote them: each heal punched a hole in
-        // the ledger exactly as wide as the chunk it spared, for content that
-        // still aired. Both consumers read the result as "this channel has no
-        // past" — the resume cursor restarts every series at its top, and the
-        // adjacency seam stops seeing what just aired.
-        let resume_at = ledger_cut_after_wipe(output, regen_from).await?;
-        ctx.history_db.truncate_from(&channel.name, resume_at)?;
-        crate::resume::save(output, &resume).await?;
+        let resume_at = rewind_to_surviving(channel, ctx, &mut resume, regen_from).await?;
         tracing::warn!(
             event = "coverage.heal",
             channel = %channel.name,
@@ -2863,9 +2860,9 @@ async fn pattern_catch_up(
         // The borrow stays inside the block deliberately: a `&Catalog` held
         // across the `.await`s further down would make this task's future
         // non-`Send` and it would not compile at the `tokio::spawn`.
-        let (items, resume_out, show_ids) = {
+        let (items, resume_out, progress, show_ids) = {
             let reader = catalog.as_ref();
-            let (items, resume_out) = crate::resolve::resolve_channel_with_resume(
+            let (items, resume_out, progress) = crate::resolve::resolve_channel_with_resume(
                 &channel.config,
                 &channel.config_path,
                 ctx.identity_roots,
@@ -2896,7 +2893,7 @@ async fn pattern_catch_up(
                 Some(cat) => cat.show_ids_for(&ids)?,
                 None => HashMap::new(),
             };
-            (items, resume_out, show_ids)
+            (items, resume_out, progress, show_ids)
         };
 
         // No "the channel ran out" branch: every series loops, so a pattern
@@ -2908,12 +2905,20 @@ async fn pattern_catch_up(
         // on-screen error card of the same length, so the channel keeps its
         // shape instead of failing over one bad file.
         let (mut items, durations, probe_stats) = cache.resolve_all(items).await?;
-        if probe_stats.error_cards > 0 || probe_stats.dropped > 0 {
+        // A dropped item still counts as consumed: the state entering the next
+        // kept item already includes it, so only its own entry goes.
+        let progress: Vec<crate::resume::Progress> = progress
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !probe_stats.dropped.contains(i))
+            .map(|(_, p)| p)
+            .collect();
+        if probe_stats.error_cards > 0 || !probe_stats.dropped.is_empty() {
             tracing::warn!(
                 event = "generation.unreadable_media",
                 channel = %channel.name,
                 error_cards = probe_stats.error_cards,
-                dropped = probe_stats.dropped,
+                dropped = probe_stats.dropped.len(),
                 "some items could not be read; see the per-item warnings above",
             );
         }
@@ -2947,7 +2952,7 @@ async fn pattern_catch_up(
         // anchor means treating them as already aired, which is the whole claim
         // the anchor makes, and the list position the resolve just recorded has
         // moved past them.
-        let (items_slice, durations_slice, seq_start) =
+        let (items_slice, durations_slice, progress_slice, seq_start) =
             match channel.config.anchor.filter(|_| first_generation) {
                 Some(anchor) => {
                     let (skip, into_item) = crate::rule::phase_at(anchor, from, &durations);
@@ -2960,9 +2965,14 @@ async fn pattern_catch_up(
                             "joined the sequence mid-list from the configured anchor",
                         );
                     }
-                    (&items[skip..], &durations[skip..], from - into_item)
+                    (
+                        &items[skip..],
+                        &durations[skip..],
+                        &progress[skip..],
+                        from - into_item,
+                    )
                 }
-                None => (&items[..], &durations[..], from),
+                None => (&items[..], &durations[..], &progress[..], from),
             };
         first_generation = false;
 
@@ -3005,6 +3015,16 @@ async fn pattern_catch_up(
         )
         .await?;
         log_emission(&channel.name, phase, &written, from, to);
+
+        // Checkpoint every item boundary this generation wrote, on top of the
+        // one at `from`. A wipe cuts at an item boundary anywhere inside the
+        // generation and spares everything before it; rewinding to `from`
+        // instead would re-air all of that (#378).
+        for ((start, _), progress) in rule.item_spans(seq_start).zip(progress_slice) {
+            if start > from {
+                resume.checkpoint_at(start, progress);
+            }
+        }
 
         // Which overlay config each block just emitted puts on screen (#48).
         // Retained on the same horizon `sweep_window` prunes chunk files to,
@@ -3285,6 +3305,346 @@ order = "manual"
              history past what it actually wiped.",
             orphaned.len(),
             orphaned.first(),
+        );
+    }
+
+    /// A flat `manual` list of eight distinct 2h30m items: 20 hours a loop,
+    /// so one startup generation lays several 6-hour chunks and an item
+    /// straddles every chunk boundary.
+    fn ch_list(dir: &tempfile::TempDir) -> LoadedChannel {
+        let entries: String = (0..8)
+            .map(|i| {
+                format!(
+                    r#"
+[[rule.blocks.entries]]
+kind = "item"
+in_point = "0s"
+out_point = "2h30m"
+[rule.blocks.entries.source]
+kind = "lavfi"
+params = "testsrc=size=64x64:rate=1 [out{i}]"
+"#
+                )
+            })
+            .collect();
+        let config: ChannelConfig = toml::from_str(&format!(
+            r#"
+number = 1
+window_days = 1
+chunk_hours = 6
+roll_interval = "1h"
+
+[[rule.blocks]]
+mode = "all"
+order = "manual"
+{entries}"#
+        ))
+        .expect("fixture channel config parses");
+        LoadedChannel {
+            overlays: Default::default(),
+            name: "listch".into(),
+            config_path: PathBuf::from("listch.toml"),
+            output_folder: dir.path().to_path_buf(),
+            config,
+        }
+    }
+
+    /// A wipe that spares a boundary-straddling chunk rewinds the list
+    /// position only past what it removed (#378).
+    ///
+    /// One startup generation lays items 0..7 across several chunks from one
+    /// checkpoint. The heal's wipe spares the chunk before the boundary it
+    /// cuts at, so items that generation laid stay on disk. Rewinding to the
+    /// generation's checkpoint put the position back to item 0, and the
+    /// regenerated span re-aired the list from the top right after the spared
+    /// chunk — the backward step seen in the live guide just past 6-hour
+    /// chunk boundaries.
+    #[tokio::test]
+    async fn a_partial_wipe_rewinds_the_list_position_only_past_what_it_spared() {
+        let dir = tempdir().unwrap();
+        let channel = ch_list(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = HistoryDb::open_in_memory().unwrap();
+        let mut catalog: Option<Catalog> = None;
+
+        let mut resume = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            crate::resume::ResumeMap::new(),
+            "startup",
+        )
+        .await
+        .expect("a hermetic lavfi channel resolves cleanly");
+
+        // A boundary-straddling item sits in both neighbouring chunk files, so
+        // each airing is counted once.
+        let airings = |folder: PathBuf| async move {
+            let mut a = airings_on_disk(&folder).await;
+            a.dedup();
+            a
+        };
+
+        // The first generation lays the list in order from item 0, so its
+        // first eight airings name each item's list index.
+        let laid = airings(channel.output_folder.clone()).await;
+        let index: HashMap<String, usize> = laid
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(i, (id, _))| (id.clone(), i))
+            .collect();
+        assert_eq!(index.len(), 8, "eight distinct items, got {laid:?}");
+
+        let mut files = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        files.sort_by_key(|f| f.start);
+        let boundary = files[1].start;
+        let regen_from = regen_floor(&channel, boundary).await.unwrap();
+        assert!(
+            regen_from > boundary,
+            "the fixture must straddle the boundary so the wipe spares a chunk",
+        );
+        wipe_playout_from(&channel, regen_from).await.unwrap();
+        let frontier = rewind_to_surviving(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut resume,
+            regen_from,
+        )
+        .await
+        .unwrap();
+
+        let spared = airings(channel.output_folder.clone()).await;
+        let (last_id, _) = spared.last().expect("the wipe spares the first chunk");
+        assert_eq!(
+            resume.position,
+            (index[last_id] + 1) % 8,
+            "the position must follow the last spared item ({last_id}), not the \
+             generation's checkpoint; frontier {frontier}",
+        );
+
+        pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            resume,
+            "roll",
+        )
+        .await
+        .expect("the channel regenerates past the frontier");
+
+        let after = airings(channel.output_folder.clone()).await;
+        let steps: Vec<(usize, usize)> = after
+            .windows(2)
+            .map(|w| (index[&w[0].0], index[&w[1].0]))
+            .filter(|(a, b)| *b != (a + 1) % 8)
+            .collect();
+        assert!(
+            steps.is_empty(),
+            "every airing must follow its predecessor in list order; broken at {steps:?}",
+        );
+    }
+
+    /// Five 2h30m films and three twelve-episode shows of one hour each. The
+    /// files do not exist, so every item airs as an error card for its
+    /// catalogued length — which is still a slot, a ledger row and a step in
+    /// the rotation, and needs no media on disk.
+    fn pattern_catalog() -> Catalog {
+        use crate::catalog::{Entry as CatEntry, EntrySource, Source};
+        let cat = Catalog::open_in_memory().unwrap();
+        let add = |id: String, kind: &str, secs: i64, show: Option<(&str, i64)>| {
+            let mut e = CatEntry::new(id.clone(), kind, format!("Title {id}"), Source::Plex);
+            e.duration_ms = Some(secs * 1000);
+            if let Some((show_id, episode)) = show {
+                e.show_id = Some(show_id.into());
+                e.show = Some(show_id.trim_start_matches("show:").to_string());
+                e.season = Some(1);
+                e.episode = Some(episode);
+            }
+            cat.upsert_entry(&e).unwrap();
+            cat.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.clone(),
+                playback_path: format!("/nonexistent/etv-378/{id}.mkv"),
+                last_seen: None,
+                missing_since: None,
+            })
+            .unwrap();
+        };
+        for n in 1..=5 {
+            add(format!("mov-{n}"), "movie", 9000, None);
+        }
+        for show in ["a", "b", "c"] {
+            for n in 1..=12 {
+                add(
+                    format!("{show}-e{n:02}"),
+                    "episode",
+                    3600,
+                    Some((&format!("show:{show}"), n)),
+                );
+            }
+        }
+        cat
+    }
+
+    fn ch_pattern(dir: &tempfile::TempDir) -> LoadedChannel {
+        let config: ChannelConfig = toml::from_str(
+            r#"
+number = 1
+window_days = 1
+chunk_hours = 6
+roll_interval = "1h"
+
+[[rule.blocks]]
+mode = "all"
+
+[[rule.blocks.pools]]
+name = "movies"
+expr = 'item.type == "movie"'
+order = "title:asc"
+select = "round_robin"
+advance = "resume"
+
+[[rule.blocks.pools]]
+name = "shows"
+expr = 'item.type == "episode"'
+order = "season:asc,episode:asc"
+select = "round_robin"
+advance = "resume"
+
+[[rule.blocks.pattern]]
+pool = "movies"
+take = 1
+
+[[rule.blocks.pattern]]
+pool = "shows"
+take = 2
+"#,
+        )
+        .expect("fixture channel config parses");
+        LoadedChannel {
+            overlays: Default::default(),
+            name: "patternch".into(),
+            config_path: PathBuf::from("patternch.toml"),
+            output_folder: dir.path().to_path_buf(),
+            config,
+        }
+    }
+
+    /// The pattern half of #378, through the daemon's own checkpoint loop:
+    /// a wipe sparing a boundary-straddling chunk rewinds `pools[x].next` only
+    /// past what survived, so the regenerated span continues each rotation
+    /// instead of replaying it from the generation's start.
+    #[tokio::test]
+    async fn a_partial_wipe_on_a_pattern_channel_repeats_no_rotation_step() {
+        let dir = tempdir().unwrap();
+        let channel = ch_pattern(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = HistoryDb::open_in_memory().unwrap();
+        let mut catalog = Some(pattern_catalog());
+
+        let mut resume = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            crate::resume::ResumeMap::new(),
+            "startup",
+        )
+        .await
+        .expect("the catalogued channel resolves cleanly");
+
+        let mut files = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        files.sort_by_key(|f| f.start);
+        // Two chunks in, so several visits survive: the rotation the survivors
+        // left must differ from the one the whole generation ended on, or a
+        // rewind that restored nothing would pass by coincidence.
+        let boundary = files[2].start;
+        let regen_from = regen_floor(&channel, boundary).await.unwrap();
+        assert!(
+            regen_from > boundary,
+            "the fixture must straddle the boundary so the wipe spares a chunk",
+        );
+        wipe_playout_from(&channel, regen_from).await.unwrap();
+        rewind_to_surviving(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut resume,
+            regen_from,
+        )
+        .await
+        .unwrap();
+
+        pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            resume,
+            "roll",
+        )
+        .await
+        .expect("the channel regenerates past the frontier");
+
+        let mut after = airings_on_disk(&channel.output_folder).await;
+        after.dedup();
+        let ids: Vec<&str> = after.iter().map(|(id, _)| id.as_str()).collect();
+
+        // Films rotate one step per visit, in title order, wrapping at five.
+        let films: Vec<u32> = ids
+            .iter()
+            .filter_map(|id| id.strip_prefix("mov-"))
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let film_breaks: Vec<_> = films.windows(2).filter(|w| w[1] != w[0] % 5 + 1).collect();
+        assert!(
+            film_breaks.is_empty(),
+            "the film rotation replayed or skipped at {film_breaks:?}; films {films:?}",
+        );
+
+        // Shows take turns two episodes at a time, a -> b -> c, and each show
+        // continues its own episodes: never a repeat, never a step back.
+        let episodes: Vec<(&str, u32)> = ids
+            .iter()
+            .filter(|id| !id.starts_with("mov-"))
+            .map(|id| (&id[..1], id[3..].parse().unwrap()))
+            .collect();
+        for show in ["a", "b", "c"] {
+            let eps: Vec<u32> = episodes
+                .iter()
+                .filter(|(s, _)| *s == show)
+                .map(|(_, e)| *e)
+                .collect();
+            assert!(
+                eps.windows(2).all(|w| w[1] == w[0] + 1),
+                "show {show} repeated or stepped back: {eps:?}",
+            );
+        }
+        // Turns are compared as runs of one show rather than as pairs: a wipe
+        // cutting mid-visit spares that visit's first episode, and the
+        // regenerated span redoes the visit — a film, then the same show's
+        // next two — so that turn runs three episodes long across the seam.
+        let mut visits: Vec<&str> = episodes.iter().map(|(s, _)| *s).collect();
+        visits.dedup();
+        let visit_breaks: Vec<_> = visits
+            .windows(2)
+            .filter(|w| {
+                let next = match w[0] {
+                    "a" => "b",
+                    "b" => "c",
+                    _ => "a",
+                };
+                w[1] != next
+            })
+            .collect();
+        assert!(
+            visit_breaks.is_empty(),
+            "the show rotation replayed a turn at {visit_breaks:?}; visits {visits:?}",
         );
     }
 }

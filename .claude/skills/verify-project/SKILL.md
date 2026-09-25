@@ -185,6 +185,55 @@ the daemon consumes it on its next tick — it does not rewrite playout itself,
 because the daemon owns those files. A marker that is still there a minute later
 means the daemon is not ticking.
 
+## Verifying a partial wipe re-airs nothing (#378)
+
+Every wipe — a refresh, a coverage heal, the window sweep — cuts at an item
+boundary that can sit inside a generation, and rewinds the `.resume` state to
+where the surviving schedule ends. If it rewinds any further, the regenerated span
+repeats items the kept schedule already aired: in the guide, the same series
+twice in a row with the second at a lower episode.
+
+The regression tests are
+`a_partial_wipe_rewinds_the_list_position_only_past_what_it_spared` (`daemon.rs`,
+a real `regen_floor` wipe on a flat list),
+`a_partial_wipe_on_a_pattern_channel_repeats_no_rotation_step` (`daemon.rs`, the
+same wipe on a pattern channel whose missing files air as error cards), and
+`a_partial_wipe_rewinds_pool_rotation_only_past_what_it_removed` (`resolve.rs`,
+the per-item rotation state on its own).
+
+At the daemon, the committed lavfi channel loops three items (`testsrc`,
+`smptebars`, `mandelbrot`) and each generation lays all three, so a forced refresh
+usually cuts mid-generation. Boot it, then force a few refreshes a minute apart:
+
+```bash
+mkdir -p tmp && rm -rf examples/output/test
+env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
+  ./target/debug/etv-station --config examples/station-test.yaml
+# in another shell, three times, ~70s apart (the marker is read on the next tick):
+./target/debug/etv-station --config examples/station-test.yaml --refresh-channel test
+```
+
+Then stop the daemon and walk the airings on disk in order:
+
+```bash
+python3 - examples/output/test <<'EOF'
+import glob, json, os, sys
+order = ["testsrc", "smptebars", "mandelbrot"]
+seen = {}
+for p in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    for i in json.load(open(p)).get("items", []):
+        seen[(i["start"], i["id"])] = i
+a = sorted(seen.values(), key=lambda i: i["start"])
+idx = lambda i: next(n for n, s in enumerate(order) if s in i["id"])
+print(sum(idx(y) != (idx(x) + 1) % 3 for x, y in zip(a, a[1:])), "out-of-order steps")
+EOF
+```
+
+Look for: `0 out-of-order steps`, and one `event="resume.refresh"` line per forced
+refresh in the daemon log. A straddling item appears in both neighbouring chunk
+files; the `(start, id)` key counts it once. Measured 2026-09-25: 1444 airings, 0
+steps with per-item checkpoints; 3 steps (one per refresh) with them disabled.
+
 ## Verifying a restart's resume decision (skip vs rewind)
 
 On startup, `daemon.rs:2181`/`:2211` decides, per channel, whether a written-but-unaired

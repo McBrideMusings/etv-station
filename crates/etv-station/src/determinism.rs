@@ -205,7 +205,7 @@ fn generate_once(
     fill: Option<std::time::Duration>,
     window_start: OffsetDateTime,
 ) -> Result<Vec<(String, Option<String>)>, StationError> {
-    let (items, _resume_out) = resolve_channel_with_resume(
+    let (items, _resume_out, _) = resolve_channel_with_resume(
         &channel.config,
         &channel.config_path,
         identity_roots,

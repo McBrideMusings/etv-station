@@ -749,6 +749,11 @@ pub struct BlockBuild {
     pub ids: Vec<String>,
     /// Per-pool resume state for the `.resume` sidecar.
     pub resume: BTreeMap<String, PoolResume>,
+    /// `progress[k]` is what `resume` would be had only `ids[..k]` aired — one
+    /// longer than `ids`, ending on `resume` itself. The daemon checkpoints
+    /// every item boundary from it, so a wipe that spares part of a
+    /// generation rewinds the rotation only past what it removed (#378).
+    pub progress: Vec<BTreeMap<String, PoolResume>>,
     /// Flattened `entry_id -> metadata` from `ScoreCache::picked_extras`.
     pub metadata: HashMap<String, serde_json::Value>,
     /// This pool's own `guide:` per drawn `entry_id` (#289).
@@ -808,6 +813,11 @@ pub fn build(
     };
 
     let mut out = Vec::new();
+    // Pool state entering each drawn id — the state before that id's visit.
+    // A visit is the unit the rotation moves in, so every id of one visit
+    // shares the snapshot taken before it: regenerating from mid-visit redoes
+    // the visit, and the ledger's cursor skips whatever of it already aired.
+    let mut progress: Vec<BTreeMap<String, PoolResume>> = Vec::new();
     // This pool's own `guide:` (#289), the rung between the block and the
     // item — recorded per drawn id as the pattern walks, so a caller left
     // with only a flat id list (`resolve::resolve_pool_block_items`) can
@@ -873,7 +883,9 @@ pub fn build(
                     );
                 }
             }
+            let before = pools_resume(&runtimes);
             let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
+            progress.extend(std::iter::repeat_n(before, drawn.len()));
             if budget.is_some() {
                 laid += runtimes[idx].runtime_of(&drawn);
             }
@@ -948,10 +960,8 @@ pub fn build(
         }
     }
 
-    let resume_out = runtimes
-        .iter()
-        .map(|rt| (rt.cfg.name.clone(), rt.to_resume()))
-        .collect();
+    let resume_out = pools_resume(&runtimes);
+    progress.push(resume_out.clone());
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
     // #173 to read. See [`flatten_picked_extras`] (#203) for why the pool
@@ -973,9 +983,18 @@ pub fn build(
     Ok(BlockBuild {
         ids: out,
         resume: resume_out,
+        progress,
         metadata: metadata_out,
         guides: guide_out,
     })
+}
+
+/// Every pool's resume state as the walk stands now.
+fn pools_resume(runtimes: &[PoolRuntime]) -> BTreeMap<String, PoolResume> {
+    runtimes
+        .iter()
+        .map(|rt| (rt.cfg.name.clone(), rt.to_resume()))
+        .collect()
 }
 
 /// Append `staged`'s `audit` records onto `existing`'s, leaving every other

@@ -241,6 +241,7 @@ fn resolve_cfg(
         None,
         OffsetDateTime::now_utc(),
     )
+    .map(|(items, resume, _)| (items, resume))
 }
 
 fn resolve(

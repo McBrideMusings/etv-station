@@ -75,7 +75,7 @@
 //!   pattern walk gives a cycle, translated to the sequencer's atomic unit
 //!   (an item, since there is no cycle).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -225,22 +225,31 @@ pub fn build(
     // generation's `ctx.resume.<pool>.next` reports; a pool the script never
     // drew from reports `None`, same as a freshly-resolved pool the pattern
     // walk has not yet visited.
+    //
+    // The same derivation runs over every prefix of the timeline too, so the
+    // daemon can checkpoint each item boundary (#378).
+    let resume_after = |last_series: &HashMap<usize, usize>| -> BTreeMap<String, PoolResume> {
+        series_by_pool
+            .iter()
+            .enumerate()
+            .map(|(pool_idx, (name, series))| {
+                let next = last_series.get(&pool_idx).and_then(|&si| {
+                    (!series.is_empty()).then(|| series[(si + 1) % series.len()].key.clone())
+                });
+                (name.clone(), PoolResume { next })
+            })
+            .collect()
+    };
     let mut last_series: HashMap<usize, usize> = HashMap::new();
+    let mut progress = Vec::with_capacity(arranged.len() + 1);
     for id in &arranged {
+        progress.push(resume_after(&last_series));
         if let Some(&(pool_idx, si)) = item_location.get(id) {
             last_series.insert(pool_idx, si);
         }
     }
-    let resume_out = series_by_pool
-        .iter()
-        .enumerate()
-        .map(|(pool_idx, (name, series))| {
-            let next = last_series.get(&pool_idx).and_then(|&si| {
-                (!series.is_empty()).then(|| series[(si + 1) % series.len()].key.clone())
-            });
-            (name.clone(), PoolResume { next })
-        })
-        .collect();
+    let resume_out = resume_after(&last_series);
+    progress.push(resume_out.clone());
 
     // The metadata half of what plugin pools picked (#166) — `arrange()` sees
     // a pool's `pick()` record only as the bare `entry_id`s in `ctx.pools`,
@@ -264,6 +273,7 @@ pub fn build(
     Ok(BlockBuild {
         ids: arranged,
         resume: resume_out,
+        progress,
         metadata: metadata_out,
         guides: guide_out,
     })

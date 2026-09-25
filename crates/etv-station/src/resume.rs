@@ -67,19 +67,25 @@ pub struct ResumeMap {
     #[serde(default, skip_serializing_if = "is_start")]
     pub position: usize,
 
-    /// Where each not-yet-aired generation *started* from, newest last.
+    /// The scheduling state at each not-yet-aired item boundary, oldest first.
     ///
     /// Forward materialization otherwise makes a pattern channel's emitted
     /// future permanent: nothing rewrites it, so a config or overlay edit would
     /// only take effect once the already-written window had fully aired (the
     /// #53 sharp edge, made worse by never wiping). These checkpoints are the
-    /// way back — each records the pool state immediately *before* the
-    /// generation that begins at `start`, so a channel can throw away its
-    /// unaired chunks, rewind to the matching pool state, and regenerate from
-    /// the current config without losing or repeating a single item.
+    /// way back — each records the state that holds if everything before
+    /// `start` airs and nothing after it does, so a channel can throw away its
+    /// unaired schedule, rewind to the matching state, and regenerate from the
+    /// current config without losing or repeating a single item.
+    ///
+    /// One per emitted item, not one per generation. A wipe cuts at an item
+    /// boundary that can sit anywhere inside a generation — it spares the chunk
+    /// holding a boundary-straddling item, and a refresh cuts after the item on
+    /// screen — so a per-generation record rewound past content still on disk,
+    /// and the next generation re-aired it (#378).
     ///
     /// Only future entries are worth keeping; [`prune_elapsed`] drops the rest,
-    /// which bounds the list to the generations covering one window.
+    /// which bounds the list to the items covering one window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
 
@@ -109,8 +115,8 @@ pub struct ResumeMap {
     pub config_id: Option<String>,
 }
 
-/// The scheduling state immediately before the generation that starts at
-/// `start` — the pool rotation, and a flat channel's list position.
+/// The scheduling state at the item boundary `start` — the pool rotation, and
+/// a flat channel's list position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     #[serde(with = "time::serde::rfc3339")]
@@ -121,6 +127,15 @@ pub struct Checkpoint {
     /// rewinds below, so a config edit re-emits the same items rather than
     /// jumping the cursor past a span it just threw away.
     #[serde(default, skip_serializing_if = "is_start")]
+    pub position: usize,
+}
+
+/// The scheduling state a generation would leave behind had it stopped after
+/// some prefix of its items — what the resolver reports per item so the daemon
+/// can checkpoint every item boundary rather than only the generation's start.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub pools: BTreeMap<String, PoolResume>,
     pub position: usize,
 }
 
@@ -174,23 +189,40 @@ impl ResumeMap {
         });
     }
 
-    /// Drop checkpoints for generations that have already begun airing — their
+    /// Record the state at the item boundary `start`, inside a generation that
+    /// already checkpointed its own start. Skipped when it matches the latest
+    /// checkpoint: a rewind landing here would restore the same state from that
+    /// one, so the duplicate only grows the sidecar.
+    pub fn checkpoint_at(&mut self, start: OffsetDateTime, progress: &Progress) {
+        if let Some(last) = self.checkpoints.last()
+            && (last.start >= start
+                || (last.pools == progress.pools && last.position == progress.position))
+        {
+            return;
+        }
+        self.checkpoints.push(Checkpoint {
+            start,
+            pools: progress.pools.clone(),
+            position: progress.position,
+        });
+    }
+
+    /// Drop checkpoints for item boundaries that have already aired — their
     /// content is a record now, not something to regenerate.
     pub fn prune_elapsed(&mut self, now: OffsetDateTime) {
         self.checkpoints.retain(|c| c.start > now);
     }
 
-    /// Rewind to the generation that was airing at `instant`: restore the pool
-    /// state recorded before it and drop it (and every later checkpoint), so the
-    /// span from `instant` on can be regenerated. Returns that generation's start
-    /// instant, or `None` when no checkpoint covers `instant` — its record was
-    /// pruned after it aired, so its pool state is gone and the caller must
-    /// regenerate from the current pools instead (a possible seam glitch, never
-    /// black).
+    /// Rewind to the latest checkpoint at or before `instant`: restore the
+    /// state recorded there and drop it (and every later checkpoint), so the
+    /// span from `instant` on can be regenerated. Returns that checkpoint's
+    /// instant, or `None` when none covers `instant` — its record was pruned
+    /// after it aired, so its state is gone and the caller must regenerate
+    /// from the current pools instead (a possible seam glitch, never black).
     ///
-    /// Targets a specific instant — the start of an observed coverage hole, or
-    /// the next item boundary a config refresh cuts at — and rewinds only as far
-    /// as that, leaving healthy earlier chunks in place.
+    /// `instant` must be where the surviving schedule actually ends, not where
+    /// a wipe began: a wipe spares whole items past its own cut, and rewinding
+    /// to the cut re-airs them.
     pub fn rewind_to(&mut self, instant: OffsetDateTime) -> Option<OffsetDateTime> {
         let idx = self.checkpoints.iter().rposition(|c| c.start <= instant)?;
         let cp = self.checkpoints[idx].clone();
@@ -395,6 +427,35 @@ mod tests {
         // gone, so the caller must regenerate from the current pools.
         assert!(map.rewind_to(at(3)).is_none());
         assert_eq!(map.pools, pools_with("e2"), "state left untouched");
+    }
+
+    /// Item checkpoints inside a generation land where a partial wipe can cut,
+    /// and one equal to the latest adds nothing a rewind would not already
+    /// restore from that one.
+    #[test]
+    fn item_checkpoints_rewind_to_the_boundary_a_wipe_left() {
+        let mut map = ResumeMap::new();
+        map.pools = pools_with("e0");
+        map.checkpoint(at(0));
+        let step = |next: &str, position| Progress {
+            pools: pools_with(next),
+            position,
+        };
+        map.checkpoint_at(at(1), &step("e1", 1));
+        map.checkpoint_at(at(2), &step("e1", 1));
+        map.checkpoint_at(at(3), &step("e2", 2));
+        map.checkpoint_at(at(3), &step("e3", 3));
+        assert_eq!(
+            map.checkpoints.iter().map(|c| c.start).collect::<Vec<_>>(),
+            vec![at(0), at(1), at(3)],
+            "an unchanged state and a non-advancing instant add no checkpoint",
+        );
+
+        // The surviving schedule ends at hour 2: the state that held there is
+        // the one recorded at hour 1, not the generation's start.
+        assert_eq!(map.rewind_to(at(2)), Some(at(1)));
+        assert_eq!(map.pools, pools_with("e1"));
+        assert_eq!(map.position, 1);
     }
 
     #[test]

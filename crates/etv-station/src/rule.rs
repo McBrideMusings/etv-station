@@ -70,6 +70,21 @@ impl<'a> Sequential<'a> {
     pub fn total_duration(&self) -> time::Duration {
         time::Duration::seconds_f64(self.durations.iter().map(|d| d.as_secs_f64()).sum())
     }
+
+    /// Each item's `(start, finish)` when the sequence begins at `start_utc`.
+    /// The one walk every consumer reads — emission, and the per-item resume
+    /// checkpoints a wipe rewinds to — so none can disagree by a rounding
+    /// step about where an item starts.
+    pub fn item_spans(
+        &self,
+        start_utc: OffsetDateTime,
+    ) -> impl Iterator<Item = (OffsetDateTime, OffsetDateTime)> + '_ {
+        self.durations.iter().scan(start_utc, |at, dur| {
+            let start = *at;
+            *at = start + time::Duration::seconds_f64(dur.as_secs_f64());
+            Some((start, *at))
+        })
+    }
 }
 
 impl Rule for Sequential<'_> {
@@ -84,9 +99,7 @@ impl Rule for Sequential<'_> {
         }
 
         let mut out = Vec::new();
-        let mut item_start_utc = start_utc;
-        for (idx, dur) in self.durations.iter().enumerate() {
-            let item_finish_utc = item_start_utc + time::Duration::seconds_f64(dur.as_secs_f64());
+        for (idx, (item_start_utc, item_finish_utc)) in self.item_spans(start_utc).enumerate() {
             // Past the window — the sequence is ordered, so nothing later can
             // qualify either.
             if item_start_utc >= to {
@@ -102,7 +115,6 @@ impl Rule for Sequential<'_> {
                     item_finish_utc,
                 ));
             }
-            item_start_utc = item_finish_utc;
         }
         out
     }
@@ -118,9 +130,7 @@ impl Rule for Sequential<'_> {
             return out;
         }
 
-        let mut item_start_utc = start_utc;
-        for (idx, dur) in self.durations.iter().enumerate() {
-            let item_finish_utc = item_start_utc + time::Duration::seconds_f64(dur.as_secs_f64());
+        for (idx, (item_start_utc, item_finish_utc)) in self.item_spans(start_utc).enumerate() {
             if item_start_utc >= to {
                 break;
             }
@@ -140,7 +150,6 @@ impl Rule for Sequential<'_> {
                     }),
                 }
             }
-            item_start_utc = item_finish_utc;
         }
         out
     }

@@ -201,7 +201,7 @@ fn resolve_items(
         None,
         time::OffsetDateTime::now_utc(),
     )
-    .map(|(items, _)| items)
+    .map(|(items, _, _)| items)
 }
 
 fn resolve_with(cfg: &ChannelConfig, cat: &Catalog, inputs: ScoreInputs) -> Vec<String> {
@@ -398,7 +398,7 @@ fn audit(ctx, picks, workspace) { #{} }
     cfg.rule.blocks[0].pools[0].plugin = Some(PathBuf::from("plugins/pick-one.rhai"));
 
     let state = GenerationState::default();
-    let (items, _) = resolve_channel_with_resume(
+    let (items, _, _) = resolve_channel_with_resume(
         &cfg,
         &dir.path().join("foryou.yaml"),
         &[],

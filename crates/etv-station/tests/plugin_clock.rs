@@ -162,7 +162,7 @@ fn resolve_at(
     window_start: time::OffsetDateTime,
 ) -> Vec<String> {
     let state = GenerationState::default();
-    let (items, _) = resolve_channel_with_resume(
+    let (items, _, _) = resolve_channel_with_resume(
         cfg,
         Path::new("clock.yaml"),
         &[],

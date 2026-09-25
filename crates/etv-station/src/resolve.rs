@@ -48,7 +48,7 @@
 //! already have their own empty-pool policy (`on_short`), so `fallback` is
 //! rejected there at validation.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
@@ -63,7 +63,7 @@ use crate::config::{
 use crate::constrain::{ItemKeys, Limits, RepeatGap};
 use crate::errors::ConfigError;
 use crate::guide::{GuideConfig, GuideFields};
-use crate::resume::{GenerationState, ResumeMap};
+use crate::resume::{GenerationState, PoolResume, Progress, ResumeMap};
 
 /// A concrete, ordered item ready for duration probing and sequencing. Produced
 /// by [`resolve_channel`] — the post-resolution counterpart to the on-disk
@@ -139,7 +139,7 @@ pub fn resolve_channel(
     path_index: Option<&HashMap<String, String>>,
     catalog: Option<&Catalog>,
 ) -> Result<Vec<ResolvedItem>, ConfigError> {
-    let (items, _) = resolve_channel_with_resume(
+    let (items, _, _) = resolve_channel_with_resume(
         config,
         path,
         identity_roots,
@@ -170,6 +170,10 @@ pub fn resolve_channel(
 /// map — but it does report the list position it reached (#118), which is what
 /// lets the next generation continue rather than replay.
 ///
+/// The third value runs parallel to the items: the state entering each one,
+/// which the daemon checkpoints at every item boundary so a wipe that spares
+/// part of this generation rewinds only past what it removed (#378).
+///
 /// `fill` is how much airtime the caller still needs covered, and it bounds one
 /// generation whichever shape the channel is. A pattern block with no authored
 /// `cycles` stops once it has laid that much down instead of running until its
@@ -197,7 +201,7 @@ pub fn resolve_channel_with_resume(
     scoring: &crate::score::ScoreInputs,
     fill: Option<Duration>,
     window_start: OffsetDateTime,
-) -> Result<(Vec<ResolvedItem>, ResumeMap), ConfigError> {
+) -> Result<(Vec<ResolvedItem>, ResumeMap, Vec<Progress>), ConfigError> {
     // Every generation reads one fixed clock: a plugin's `timestamp()`/
     // `elapsed()` calls see `window_start`, advancing by
     // `score::PLUGIN_CLOCK_STEP` per read, for the whole resolve. Two runs of
@@ -245,8 +249,18 @@ pub fn resolve_channel_with_resume(
     // (#146): a pattern block already bounds itself inside `resolve_block`
     // (#140), so only an entries block's own span still needs cutting here.
     let mut block_spans: Vec<(usize, usize, bool)> = Vec::new();
+    // Parallel to `out`: where each item sits in its block's progress, so the
+    // state after any prefix of the final list can be named (#378).
+    let mut steps: Vec<Step> = Vec::new();
+    // Per block: a pool block's `BlockBuild::progress`, empty for an entries
+    // block, whose progress is its list position instead.
+    let mut pool_progress: Vec<Vec<BTreeMap<String, PoolResume>>> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
-        let block_items = resolve_block(
+        let BlockItems {
+            items: block_items,
+            steps: block_steps,
+            pool_progress: block_progress,
+        } = resolve_block(
             include,
             idx,
             path,
@@ -296,6 +310,8 @@ pub fn resolve_channel_with_resume(
             item.block = idx;
             item
         }));
+        steps.extend(block_steps);
+        pool_progress.push(block_progress);
         block_spans.push((span_start, out.len(), block_is_pattern));
     }
 
@@ -331,16 +347,18 @@ pub fn resolve_channel_with_resume(
         .map(|(start, end, _)| (*start, *end))
         .collect();
     let has_pattern_block = block_spans.iter().any(|(_, _, is_pattern)| *is_pattern);
+    let mut seat: Option<EntriesSeat> = None;
     if !entries_spans.is_empty() {
         if !has_pattern_block {
             // No pattern block in the channel: every item in `out` belongs to
             // an entries block, so this is exactly #118's original whole-list
             // cut — unchanged.
             let whole = 0..out.len();
-            resume_out.position = cut_entries_window(
+            seat = cut_entries_window(
                 &mut out,
                 &mut limits,
                 &mut separate_fields,
+                &mut steps,
                 whole,
                 state.resume.position,
                 fill,
@@ -352,10 +370,11 @@ pub fn resolve_channel_with_resume(
             // block(s): cut that block's own span in place, leaving the
             // pattern blocks' already-bounded output untouched.
             let (start, end) = entries_spans[0];
-            resume_out.position = cut_entries_window(
+            seat = cut_entries_window(
                 &mut out,
                 &mut limits,
                 &mut separate_fields,
+                &mut steps,
                 start..end,
                 state.resume.position,
                 fill,
@@ -386,6 +405,9 @@ pub fn resolve_channel_with_resume(
                 ),
             });
         }
+        // An empty entries span seats nothing, and the position stays where
+        // it was.
+        resume_out.position = seat.map_or(state.resume.position, |s| s.position(s.laid));
     }
 
     if out.is_empty() {
@@ -462,9 +484,82 @@ pub fn resolve_channel_with_resume(
             );
         }
         out = permute(out, &result.order);
+        steps = permute(steps, &result.order);
     }
 
-    Ok((out, resume_out))
+    let progress = progress_per_item(&steps, &pool_progress, seat, resume_out.position);
+    Ok((out, resume_out, progress))
+}
+
+/// Where one item sits in the progress of the block that produced it.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// The `seq`-th id pattern or sequencer block `block` drew.
+    Pool { block: usize, seq: usize },
+    /// `offset` items past where this generation seated the entries list.
+    Entry { offset: usize },
+}
+
+/// One block's resolved items and where each sits in that block's progress.
+struct BlockItems {
+    items: Vec<ResolvedItem>,
+    steps: Vec<Step>,
+    /// A pool block's [`crate::pattern::BlockBuild::progress`]; empty for an
+    /// entries block.
+    pool_progress: Vec<BTreeMap<String, PoolResume>>,
+}
+
+/// Where [`cut_entries_window`] seated the entries list: `start` into a list
+/// of `total`, with `laid` items taken from there.
+#[derive(Debug, Clone, Copy)]
+struct EntriesSeat {
+    start: usize,
+    total: usize,
+    laid: usize,
+}
+
+impl EntriesSeat {
+    /// The list position once `aired` of the laid items have aired.
+    fn position(&self, aired: usize) -> usize {
+        (self.start + aired) % self.total
+    }
+}
+
+/// The state entering each item of the final list: what `resume_out` would
+/// hold had the generation stopped just before it (#378).
+///
+/// Each block advances to just past the furthest of its own items already in
+/// the prefix. The adjacency pass can move an item later than one that
+/// followed it in its block; a wipe landing between the two then skips the
+/// moved item rather than re-airing the one it swapped with. A re-air is the
+/// visible failure — the same episode twice in a row — so the skip is the
+/// side to err on.
+fn progress_per_item(
+    steps: &[Step],
+    pool_progress: &[Vec<BTreeMap<String, PoolResume>>],
+    seat: Option<EntriesSeat>,
+    position_without_entries: usize,
+) -> Vec<Progress> {
+    let mut pool_aired = vec![0usize; pool_progress.len()];
+    let mut entries_aired = 0usize;
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let mut pools = BTreeMap::new();
+        for (block, progress) in pool_progress.iter().enumerate() {
+            if let Some(at) = progress.get(pool_aired[block]) {
+                pools.extend(at.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+        }
+        out.push(Progress {
+            pools,
+            position: seat.map_or(position_without_entries, |s| s.position(entries_aired)),
+        });
+        match *step {
+            Step::Pool { block, seq } => pool_aired[block] = pool_aired[block].max(seq + 1),
+            Step::Entry { offset } => entries_aired = entries_aired.max(offset + 1),
+        }
+    }
+    out
 }
 
 /// Resolve a channel's blocks down to a candidate entry-id fingerprint set
@@ -793,35 +888,39 @@ fn items_covering(runtimes: &[Duration], fill: Duration) -> usize {
 }
 
 /// Rotate-and-cut one contiguous span of `items` (and its parallel `limits` /
-/// `separate_fields`) to seat it where the last generation left off and trim
-/// it to the airtime still wanted (#118) — used both for an entries-only
-/// channel's whole list and, per block, for a single entries block sharing a
-/// channel with pattern block(s) (#146). `range` must index all three slices
-/// consistently; on return the three have shrunk (or stayed the same size, if
-/// `fill` is `None`) by the same amount, at the same position.
+/// `separate_fields` / `steps`) to seat it where the last generation left off
+/// and trim it to the airtime still wanted (#118) — used both for an
+/// entries-only channel's whole list and, per block, for a single entries
+/// block sharing a channel with pattern block(s) (#146). `range` must index
+/// all four slices consistently; on return they have shrunk (or stayed the
+/// same size, if `fill` is `None`) by the same amount, at the same position,
+/// and each surviving step names its item's offset from the seat.
 ///
-/// Returns the position the *next* generation should resume from. A `range`
-/// that names an empty span is a no-op, returning `position` unchanged — the
+/// Returns where the list was seated and how much of it was laid — what the
+/// next generation's position and every per-item checkpoint are read from. A
+/// `range` that names an empty span is a no-op returning `None` — the
 /// division below would otherwise panic on an empty entries block.
 #[allow(clippy::too_many_arguments)]
 fn cut_entries_window(
     items: &mut Vec<ResolvedItem>,
     limits: &mut Vec<Limits>,
     separate_fields: &mut Vec<Option<String>>,
+    steps: &mut Vec<Step>,
     range: std::ops::Range<usize>,
     position: usize,
     fill: Option<Duration>,
     catalog: Option<&Catalog>,
     nominal: Duration,
-) -> usize {
+) -> Option<EntriesSeat> {
     let total = range.len();
     if total == 0 {
-        return position;
+        return None;
     }
     let insert_at = range.start;
     let mut span_items: Vec<ResolvedItem> = items.drain(range.clone()).collect();
     let mut span_limits: Vec<Limits> = limits.drain(range.clone()).collect();
-    let mut span_fields: Vec<Option<String>> = separate_fields.drain(range).collect();
+    let mut span_fields: Vec<Option<String>> = separate_fields.drain(range.clone()).collect();
+    steps.drain(range);
 
     let start = position % total;
     span_items.rotate_left(start);
@@ -843,15 +942,19 @@ fn cut_entries_window(
     items.splice(insert_at..insert_at, span_items);
     limits.splice(insert_at..insert_at, span_limits);
     separate_fields.splice(insert_at..insert_at, span_fields);
+    steps.splice(
+        insert_at..insert_at,
+        (0..laid).map(|offset| Step::Entry { offset }),
+    );
 
-    (start + laid) % total
+    Some(EntriesSeat { start, total, laid })
 }
 
 /// Reorder `items` by `perm` (a permutation of `0..items.len()`).
 /// [`ResolvedItem`] is not `Clone`, so items are moved out of slots rather than
 /// copied.
-fn permute(items: Vec<ResolvedItem>, perm: &[usize]) -> Vec<ResolvedItem> {
-    let mut slots: Vec<Option<ResolvedItem>> = items.into_iter().map(Some).collect();
+fn permute<T>(items: Vec<T>, perm: &[usize]) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
     perm.iter()
         .map(|&i| {
             slots[i]
@@ -877,7 +980,7 @@ fn resolve_block(
     window_start: OffsetDateTime,
     resume_out: &mut ResumeMap,
     channel_guide: Option<&GuideConfig>,
-) -> Result<Vec<ResolvedItem>, ConfigError> {
+) -> Result<BlockItems, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
         message,
@@ -909,12 +1012,7 @@ fn resolve_block(
             inputs: scoring,
             base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
         };
-        let crate::pattern::BlockBuild {
-            ids,
-            resume: pools,
-            metadata,
-            guides: pool_guides,
-        } = crate::pattern::build(
+        let build = crate::pattern::build(
             cat,
             &include.pools,
             groups,
@@ -927,15 +1025,13 @@ fn resolve_block(
             fill,
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
-        resume_out.pools.extend(pools);
+        resume_out.pools.extend(build.resume.clone());
 
         return resolve_pool_block_items(
             cat,
-            &ids,
+            build,
             defaults,
             guide_defaults,
-            &pool_guides,
-            &metadata,
             include.mode,
             idx,
             path,
@@ -961,12 +1057,7 @@ fn resolve_block(
             .as_ref()
             .expect("resolve_block reaches this branch only when `sequencer` is set");
         let script_path = crate::score::resolve_plugin_path(base_dir, sequencer);
-        let crate::pattern::BlockBuild {
-            ids,
-            resume: pools,
-            metadata,
-            guides: pool_guides,
-        } = crate::sequence::build(
+        let build = crate::sequence::build(
             cat,
             &include.pools,
             groups,
@@ -981,15 +1072,13 @@ fn resolve_block(
             },
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
-        resume_out.pools.extend(pools);
+        resume_out.pools.extend(build.resume.clone());
 
         return resolve_pool_block_items(
             cat,
-            &ids,
+            build,
             defaults,
             guide_defaults,
-            &pool_guides,
-            &metadata,
             include.mode,
             idx,
             path,
@@ -1110,7 +1199,16 @@ fn resolve_block(
         items.truncate(n);
     }
 
-    Ok(items)
+    // Placeholder offsets: `cut_entries_window` seats every entries span and
+    // rewrites them from where it seated the list.
+    let steps = (0..items.len())
+        .map(|offset| Step::Entry { offset })
+        .collect();
+    Ok(BlockItems {
+        items,
+        steps,
+        pool_progress: Vec::new(),
+    })
 }
 
 /// Turn a pool block's drawn `entry_id` list into its [`ResolvedItem`]s:
@@ -1118,23 +1216,30 @@ fn resolve_block(
 /// `mode: count` shortfall truncate/warn. A `pattern:` block and a
 /// `sequencer:` block do all three identically once each has its own ids in
 /// hand, so any future per-drawn-item field added here reaches both at once.
-#[allow(clippy::too_many_arguments)]
+///
+/// Each item's step keeps its index into the drawn ids, so a skipped id still
+/// counts as drawn when the per-item checkpoints are read from `progress`.
 fn resolve_pool_block_items(
     cat: &Catalog,
-    ids: &[String],
+    build: crate::pattern::BlockBuild,
     defaults: Option<&ProgramMetadata>,
     guide_defaults: Option<&GuideConfig>,
-    pool_guides: &HashMap<String, GuideConfig>,
-    metadata: &HashMap<String, serde_json::Value>,
     mode: Mode,
     idx: usize,
     path: &Path,
-) -> Result<Vec<ResolvedItem>, ConfigError> {
+) -> Result<BlockItems, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
         message,
     };
-    let mut items: Vec<ResolvedItem> = ids
+    let crate::pattern::BlockBuild {
+        ids,
+        resume: _,
+        progress,
+        metadata,
+        guides: pool_guides,
+    } = build;
+    let (mut items, mut steps): (Vec<ResolvedItem>, Vec<Step>) = ids
         .iter()
         .map(|id| {
             // The pool rung (#289) sits between the block and the item: a
@@ -1148,8 +1253,9 @@ fn resolve_pool_block_items(
         .collect::<Result<Vec<_>, String>>()
         .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
         .into_iter()
-        .flatten()
-        .collect();
+        .enumerate()
+        .filter_map(|(seq, item)| item.map(|item| (item, Step::Pool { block: idx, seq })))
+        .unzip();
     // A plugin pool's metadata blob (#166), attached after the catalog
     // lookup above so it lands on the airing even though `catalog_item`
     // itself has no pool/plugin context to draw one from. Empty for a block
@@ -1174,8 +1280,13 @@ fn resolve_pool_block_items(
             );
         }
         items.truncate(n);
+        steps.truncate(n);
     }
-    Ok(items)
+    Ok(BlockItems {
+        items,
+        steps,
+        pool_progress: progress,
+    })
 }
 
 /// Resolve a `query` entry against the catalog: run the CEL query, apply the
@@ -1923,7 +2034,7 @@ mod tests {
             tail: vec!["lavfi:a".to_string()],
             ..Default::default()
         };
-        let (items, _) = resolve_channel_with_resume(
+        let (items, _, _) = resolve_channel_with_resume(
             &channel(vec![constrained(inc, 1)]),
             path(),
             &[],
@@ -1997,7 +2108,7 @@ mod tests {
             tail: vec!["lavfi:a".to_string()],
             ..Default::default()
         };
-        let (items, _) = resolve_channel_with_resume(
+        let (items, _, _) = resolve_channel_with_resume(
             &channel(vec![constrained_within(inc, Duration::from_secs(7200))]),
             path(),
             &[],
@@ -3044,7 +3155,7 @@ mod tests {
     fn pattern_block_resolves_through_the_channel() {
         let cat = interleave_catalog();
         let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
-        let (items, resume) = resolve_channel_with_resume(
+        let (items, resume, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3082,7 +3193,7 @@ mod tests {
         let cat = interleave_catalog();
         let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
 
-        let (first, next) = resolve_channel_with_resume(
+        let (first, next, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3101,7 +3212,7 @@ mod tests {
         );
 
         let next = advance_state(&cat, &GenerationState::empty(), next, &first);
-        let (second, _) = resolve_channel_with_resume(
+        let (second, _, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3122,13 +3233,86 @@ mod tests {
         );
     }
 
+    /// A wipe that spares part of a generation rewinds the pool rotation only
+    /// past what it removed (#378).
+    ///
+    /// The daemon checkpoints every item boundary from the per-item progress
+    /// and rewinds to where the surviving schedule ends. With the first three
+    /// items spared, the rotation must stand where those three left it: the
+    /// next generation continues with `mov-2` and `inv`, rather than rewinding
+    /// to the generation's start and re-airing `mov-1` on top of the copy
+    /// still on disk.
+    #[test]
+    fn a_partial_wipe_rewinds_pool_rotation_only_past_what_it_removed() {
+        let cat = interleave_catalog();
+        let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
+        let (first, resume_out, progress) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            None,
+            t0(),
+        )
+        .unwrap();
+        assert_eq!(progress.len(), first.len(), "one entering state per item");
+
+        // What the daemon records: the generation's own checkpoint, then one
+        // per later item boundary, one hour apart here.
+        let hour = time::Duration::hours(1);
+        let mut resume = ResumeMap::new();
+        resume.checkpoint(t0());
+        for (i, p) in progress.iter().enumerate().skip(1) {
+            resume.checkpoint_at(t0() + hour * i as i32, p);
+        }
+        let checkpoints = std::mem::take(&mut resume.checkpoints);
+        resume = resume_out;
+        resume.checkpoints = checkpoints;
+
+        // The wipe spared mov-1, got-e1, got-e2: the surviving schedule ends at
+        // the start of item 3.
+        const SPARED: usize = 3;
+        resume.rewind_to(t0() + hour * SPARED as i32);
+        assert_eq!(resume.pools, progress[SPARED].pools);
+        assert_ne!(
+            resume.pools,
+            ResumeMap::new().pools,
+            "rewound to the generation's start, not to what survived",
+        );
+
+        let next = advance_state(&cat, &GenerationState::empty(), resume, &first[..SPARED]);
+        let (second, _, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &next,
+            &Default::default(),
+            None,
+            t0(),
+        )
+        .unwrap();
+        let spared: Vec<&str> = first[..SPARED].iter().map(|i| i.id.as_str()).collect();
+        let second_ids: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(spared, vec!["mov-1", "got-e1", "got-e2"]);
+        assert_eq!(
+            &second_ids[..SPARED],
+            &["mov-2", "inv-e1", "inv-e2"],
+            "the regenerated span must continue after the spared items, got {second_ids:?}",
+        );
+    }
+
     /// The same three inputs always produce the same two outputs — the property
     /// the whole no-live-cursor model rests on.
     #[test]
     fn generation_is_a_pure_function_of_catalog_config_and_resume() {
         let cat = interleave_catalog();
         let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
-        let (first, next) = resolve_channel_with_resume(
+        let (first, next, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3142,7 +3326,7 @@ mod tests {
         .unwrap();
         let state = advance_state(&cat, &GenerationState::empty(), next, &first);
 
-        let (a, ra) = resolve_channel_with_resume(
+        let (a, ra, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3154,7 +3338,7 @@ mod tests {
             t0(),
         )
         .unwrap();
-        let (b, rb) = resolve_channel_with_resume(
+        let (b, rb, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3185,7 +3369,7 @@ mod tests {
         let cfg = channel(vec![interleave_block(crate::config::Advance::Resume)]);
 
         // Window 1 airs both shows; GoT reaches e2.
-        let (first, next) = resolve_channel_with_resume(
+        let (first, next, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3209,7 +3393,7 @@ mod tests {
             }
         }
         let narrowed_cfg = channel(vec![narrowed]);
-        let (away, next_away) = resolve_channel_with_resume(
+        let (away, next_away, _) = resolve_channel_with_resume(
             &narrowed_cfg,
             path(),
             &[],
@@ -3228,7 +3412,7 @@ mod tests {
         let state = advance_state(&cat, &state, next_away, &away);
 
         // It comes back. It must continue at e3, not restart at e1.
-        let (back, _) = resolve_channel_with_resume(
+        let (back, _, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3264,7 +3448,7 @@ mod tests {
 
         let cat = interleave_catalog();
         let cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
-        let (items, _) = resolve_channel_with_resume(
+        let (items, _, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3323,7 +3507,7 @@ mod tests {
     #[test]
     fn an_entries_channel_records_its_list_position_and_no_pools() {
         let inc = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
-        let (_, next) = resolve_channel_with_resume(
+        let (_, next, _) = resolve_channel_with_resume(
             &channel(vec![inc]),
             path(),
             &[],
@@ -3356,7 +3540,7 @@ mod tests {
         );
         let mut state = GenerationState::empty();
         state.resume.position = at;
-        let (items, next) = resolve_channel_with_resume(
+        let (items, next, _) = resolve_channel_with_resume(
             &channel(vec![inc]),
             path(),
             &[],
@@ -3451,7 +3635,7 @@ mod tests {
         inc.cycles = Some(20); // long enough to run past every series' end
         let cfg = channel(vec![inc]);
 
-        let (played, next) = resolve_channel_with_resume(
+        let (played, next, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3467,7 +3651,7 @@ mod tests {
 
         // Second window, after everything has aired at least once: still full.
         let state = advance_state(&cat, &GenerationState::empty(), next, &played);
-        let (items, _) = resolve_channel_with_resume(
+        let (items, _, _) = resolve_channel_with_resume(
             &cfg,
             path(),
             &[],
@@ -3544,7 +3728,7 @@ mod tests {
     #[test]
     fn a_mixed_channels_entries_block_is_cut_to_the_window_while_its_pattern_block_is_untouched() {
         let cat = interleave_catalog();
-        let (items, resume) = resolve_channel_with_resume(
+        let (items, resume, _) = resolve_channel_with_resume(
             &mixed_channel(),
             path(),
             &[],
@@ -3600,8 +3784,8 @@ mod tests {
             .unwrap()
         };
 
-        let (first, next) = generation(0);
-        let (second, _) = generation(next.position);
+        let (first, next, _) = generation(0);
+        let (second, _, _) = generation(next.position);
 
         for (items, expected_entries_tail) in [
             (&first, ["lavfi:0", "lavfi:1", "lavfi:2"]),

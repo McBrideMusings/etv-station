@@ -35,8 +35,10 @@ pub struct ProbeStats {
     /// an on-screen error card took the slot.
     pub error_cards: usize,
     /// Items whose file could not be opened AND whose length was unknown, so
-    /// there was no slot to put a card in and the item was left out.
-    pub dropped: usize,
+    /// there was no slot to put a card in and the item was left out — by
+    /// index into the list [`DurationCache::resolve_all`] was handed, so the
+    /// caller can drop whatever it keeps parallel to that list.
+    pub dropped: Vec<usize>,
 }
 
 impl DurationCache {
@@ -99,7 +101,7 @@ impl DurationCache {
         let mut kept = Vec::with_capacity(items.len());
         let mut durations = Vec::with_capacity(items.len());
         let mut stats = ProbeStats::default();
-        for mut item in items {
+        for (index, mut item) in items.into_iter().enumerate() {
             match self.duration_for(&item, &mut stats).await {
                 Ok(d) => {
                     kept.push(item);
@@ -134,7 +136,7 @@ impl DurationCache {
                                 reason = %reason,
                                 "file could not be read and its length is unknown; leaving it out",
                             );
-                            stats.dropped += 1;
+                            stats.dropped.push(index);
                         }
                     }
                 }
@@ -409,7 +411,7 @@ mod tests {
             "the broken item keeps its place in the list"
         );
         assert_eq!(stats.error_cards, 1);
-        assert_eq!(stats.dropped, 0);
+        assert!(stats.dropped.is_empty());
         assert_eq!(
             durations[0],
             Duration::from_secs(4891),
@@ -441,7 +443,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "bars");
         assert_eq!(durations, vec![Duration::from_secs(30)]);
-        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.dropped, vec![0]);
         assert_eq!(stats.error_cards, 0);
     }
 

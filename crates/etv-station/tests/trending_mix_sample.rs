@@ -236,7 +236,7 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
     let cat = trending_catalog();
     let cfg = config();
 
-    let (first, next) = resolve_channel_with_resume(
+    let (first, next, _) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],
@@ -287,7 +287,7 @@ fn trending_mix_sample_continues_each_show_across_the_window_seam() {
     );
 
     // Window 2 is generated from that projection — no live cursor anywhere.
-    let (second, _) = resolve_channel_with_resume(
+    let (second, _, _) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],
@@ -337,7 +337,7 @@ fn trending_mix_sample_loops_the_shorter_show_without_disturbing_the_longer() {
     let cat = trending_catalog();
     let cfg = config();
 
-    let (first, next) = resolve_channel_with_resume(
+    let (first, next, _) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],
@@ -350,7 +350,7 @@ fn trending_mix_sample_loops_the_shorter_show_without_disturbing_the_longer() {
     )
     .unwrap();
     let state = advance_state(&cat, &GenerationState::empty(), next, &first);
-    let (second, _) = resolve_channel_with_resume(
+    let (second, _, _) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],

@@ -244,7 +244,7 @@ fn kungfu_sample_holds_no_repeat_across_the_generation_seam() {
     let cat = kungfu_catalog();
     let cfg = config();
 
-    let (first, resume) = resolve_channel_with_resume(
+    let (first, resume, _) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],
@@ -260,7 +260,7 @@ fn kungfu_sample_holds_no_repeat_across_the_generation_seam() {
 
     // Second generation, handed the ledger the first one wrote.
     let state = advance_state(&cat, &GenerationState::empty(), resume, &first);
-    let (second, _) = resolve_channel_with_resume(
+    let (second, _, _) = resolve_channel_with_resume(
         &cfg,
         &sample_path(),
         &[],
@@ -295,7 +295,7 @@ fn kungfu_sample_keeps_broadcasting_after_playing_everything() {
     let cfg = config();
     let mut state = GenerationState::empty();
     for pass in 0..5 {
-        let (items, resume) = resolve_channel_with_resume(
+        let (items, resume, _) = resolve_channel_with_resume(
             &cfg,
             &sample_path(),
             &[],

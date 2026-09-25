@@ -387,7 +387,7 @@ fn a_records_metadata_reaches_the_resolved_item_on_a_sequencer_block() {
     let cfg = forwarding_sequencer_channel(&arrange, foryou_pool(&plugin));
 
     let state = GenerationState::default();
-    let (items, _) = resolve_channel_with_resume(
+    let (items, _, _) = resolve_channel_with_resume(
         &cfg,
         Path::new("foryou.yaml"),
         &[],
@@ -432,7 +432,7 @@ async fn a_records_metadata_is_readable_in_the_emitted_playout_json_for_a_sequen
     let cfg = forwarding_sequencer_channel(&arrange, foryou_pool(&plugin));
 
     let state = GenerationState::default();
-    let (items, _) = resolve_channel_with_resume(
+    let (items, _, _) = resolve_channel_with_resume(
         &cfg,
         Path::new("foryou.yaml"),
         &[],
