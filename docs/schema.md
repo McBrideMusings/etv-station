@@ -927,65 +927,55 @@ unreadable profile file; an empty `exclude_keywords` value. Failing the
 generation, naming the entry: an `item` matching no entry or several (listed),
 and a `set` that fails to resolve or matches nothing.
 
-#### An `influence` set — a curated list guides a taste pool without gating it
-(#410)
+#### How `taste-cosine.rhai` scores a taste profile
 
-`taste-cosine.rhai` reads one set name it does not declare in `sources()`:
-`influence`. A pool that authors one, and gives `config.influence_weight` a
-non-zero value, gets its ranking tilted toward that set's subject matter:
+`taste-cosine.rhai` turns `ctx.profile` into two weight maps and adds them to
+the watch-history taste term:
 
-```yaml
-- name: movies
-  plugin: "../plugins/taste-cosine.rhai"
-  sources:
-    movies:    'item.type == "movie"'
-    influence: 'item.collections.contains("Pierce''s Guilty Pleasures")'
-  config:
-    influence_weight: 3.0
+```text
+score = (taste_weight · taste + favor) / (1 + unusual_weight · house + disfavor)
 ```
 
-The set's `tmdb_keywords` are aggregated into a second weight map — each
-keyword weighted by the **share of the set carrying it**, so a 69-film set and
-a 690-film set produce comparable numbers — and a candidate's cosine against
-that map is added to its cosine against the account's taste vector, scaled by
-`influence_weight`.
+**Netting.** Every entry adds its weight to one or more `(namespace, value)`
+pairs. A `keyword` or tag entry adds its whole weight to its one pair. An
+`item` or `set` entry spreads its weight over every keyword and genre its
+members carry, each pair getting `weight × (members carrying it / member
+count)` — so a 20-film set and a 200-film set with the same shares weight
+every candidate identically. The pairs are summed across entries: a net above
+zero goes to the **favor** map, below zero its size goes to the **disfavor**
+map, and exactly zero is dropped. `{ keyword: heist, weight: 2 }` plus
+`{ item: "Heat (1995)", weight: -1 }`, where heist is Heat's one keyword,
+leaves heist favored by 1.
 
-**`influence_weight` is not a fraction.** The two cosines share their idf
-scaling and their `sqrt(keyword count)` divisor, but not their magnitude: a
-taste vector built from thousands of plays runs about 20x an influence profile
-whose weights are shares bounded by 1.0. Sweep the value against the real
-snapshot with `tools/taste-debug.sh` instead of reasoning about it. On
-`002-for-pierce`, over one 56-slot generation, `0.25` moved nothing, `3.0` made
-the tilt a quarter of the taste score and changed 8 slots, and `25.0` let the
-collection drive rather than guide.
+**Scoring.** `favor` is the sum over namespaces of a candidate's cosine
+against the favor map in that namespace: the idf-scaled weights of the
+candidate's own values that the map holds, divided by the square root of how
+many values the candidate has in that namespace. idf (`1 + ln(documents /
+documents carrying the value)`) is computed per namespace over the pool's
+candidates. `disfavor` is the same against the disfavor map. Disfavor sits
+under the fraction, so a profile of nothing but negative weights can pull a
+score toward zero and never below it.
 
-**It is a profile, not a candidate list.** Nothing in the set is added to the
-pool, nothing outside it is removed, and a film inside it gets no bonus for
-membership — only for the keywords it shares, on the same terms as every other
-candidate. That is the distinction from a `kind: query` entry naming the same
-collection: the query channel can play those films and nothing else, while a
-tilted pool plays the whole library in an order the collection nudged.
+A candidate's keywords are its `tmdb_keywords` in the granted datastore; its
+tag values come from its catalog item map, lowercased. On a `unit: show` pool
+a show's tag values are the union over its episodes — every episode carries
+its show's genres.
 
-`sources` replaces the script's own table wholesale, so a pool adding
-`influence` must also write the set it ranks (`movies` or `shows`) — see
-[Pool `sources`](#pool-sources-the-channel-says-which-items-the-script-may-rank-210).
-Any CEL expression works; a collection is just the common case.
+**`config.taste_weight`** (default `1.0`, refused below `0`) scales the taste term. The taste
+vector is divided by its own strongest weight first, so its top keyword weighs
+1.0 on every account and a profile weight of `1` means "as strong as my
+strongest taste". At `0` the taste vector is never read and the pool ranks on
+its profile alone — a pool built around a seed list with no watch history
+involved.
 
-The default weight is `0.0`, so a pool that authors no influence set scores
-exactly what it scored before. Every pick's audit detail carries `taste_score`,
-`influence_score`, `influence_weight` and `on_influence` (the keywords the set
-actually contributed), and a tilted pick's verdict gains `, tilted toward the
-influence set` — so `admin audit <channel>` is how the weight gets tuned
-against real numbers rather than guessed.
-
-**The join is keyword-to-keyword, not id-to-id**, so an influence set works on
-a `unit: show` pool as readily as on a `unit: movie` one — the set's members
-and the pool's candidates never have to be the same kind of thing. The set's
-`tmdb_keywords` are aggregated into a weight map; a candidate is scored on its
-own keywords against that map. A show carries `tmdb_keywords` the same way a
-film does, so a collection of 24 films tilts a series ranking perfectly well:
-on `003-for-madi`, 5 of the 12 series its shows pool returns draw a nonzero
-`influence_score` from a film-only collection.
+Every pick's audit detail carries `taste_weight`, `favor_score`,
+`disfavor_score`, `favor_matches` and `disfavor_matches` (the five
+`namespace: value` pairs that weighed most on each side), and `profile_entries` — each entry
+that fed either term, with its `kind`, `reference` as written, `weight` and
+`origin`. The verdict gains `, tilted toward the taste profile's favor` and
+`, held back by the taste profile's disfavor` when the pick matched that side,
+and a `taste_weight: 0` pool's verdict reads `ranked by the taste profile
+alone`. The playout `metadata` carries `favor_score` and `disfavor_score`.
 
 #### `seen` and `unusual_weight` — two pools, two pitches (#411)
 
@@ -994,9 +984,9 @@ running a *comfort* movie pool and a *discovery* movie pool side by side:
 
 ```yaml
 - name: comfort
-  config: { seen: only,    influence_weight: 3.0 }
+  config: { seen: only }
 - name: discovery
-  config: { seen: exclude, influence_weight: 3.0, unusual_weight: 0.1 }
+  config: { seen: exclude, unusual_weight: 0.1 }
 ```
 
 **`seen`** partitions the candidates on whether the channel's account has ever
@@ -1024,8 +1014,8 @@ both sorts below a title carrying no keywords at all and inverts the recency
 damping, which is a multiply by a number in (0, 1]. Clamping at zero is worse
 still — it collapses every penalised title into one bucket.
 
-Unlike `influence_weight` it is scale-free, a ratio against 1.0 rather than
-against the house vector's magnitude, so useful values are small. Measured on
+It is scale-free, a ratio against 1.0 rather than against the house
+vector's magnitude, so useful values are small. Measured on
 `002-for-pierce`, watching for the failure mode where titles the account's own
 taste says nothing about float up purely because the house dislikes them:
 `0.05`–`0.25` are clean, `0.5` puts 8 such titles in 42 picks, `1.0` puts 22
@@ -1040,22 +1030,22 @@ config.
 #### `exclude_keywords` — tags that describe packaging, not subject
 
 ```yaml
-config:
-  exclude_keywords: [duringcreditsstinger]
+exclude_keywords: [duringcreditsstinger]
 ```
 
-A list of TMDB keyword values the pool drops from scoring entirely. Each
-entry matches one whole keyword exactly: `duringcreditsstinger` drops that
-tag and nothing else, never a substring such as `stinger`. A bare string is
-refused, since the scorer would otherwise read it one character at a time.
+A pool field beside `profile` (see above), reaching `taste-cosine.rhai` as
+`ctx.exclude_keywords`. The script refuses an `exclude_keywords` written under
+`config:`. Each entry matches one whole keyword exactly:
+`duringcreditsstinger` drops that tag and nothing else, never a substring such
+as `stinger`.
 
-The keyword is dropped everywhere it enters the score: the taste, influence
-and house profiles, and each candidate's own keyword list. That last part
-matters. A keyword removed from the profiles but kept on candidates still
-counts toward a candidate's length in the cosine divisor, which lowers the
-score of every film that carries it. A candidate left with no keywords at all
-is treated like one that never had any: it is not counted in the
-document-frequency pass, and the exploration slot cannot draw it.
+The keyword is dropped everywhere it enters the score: the taste, house and
+profile maps, and each candidate's own keyword list. That last part matters. A
+keyword removed from the maps but kept on candidates still counts toward a
+candidate's length in the cosine divisor, which lowers the score of every film
+that carries it. A candidate left with no keywords at all is treated like one
+that never had any: it is not counted in the document-frequency pass, and the
+exploration slot cannot draw it.
 
 It exists for tags like `duringcreditsstinger`, which marks a mid-credits
 scene. That tag appears alongside `superhero` and `comic`, so leaving it in

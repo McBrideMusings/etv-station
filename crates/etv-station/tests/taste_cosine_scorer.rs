@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
+use etv_station::catalog::{Catalog, Entry, EntrySource, Source, TagNs};
 use etv_station::config::DatastoreGrant;
 use etv_station::score::{
     Capability, GrantedCapabilities, PickedItem, PoolSources, ScoreCache, ScoreInputs,
@@ -76,17 +76,18 @@ fn write_taste_fixture(path: &Path) {
             "INSERT INTO items (item_id, type) VALUES
                  ('mov-a', 'movie'), ('mov-b', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie');
              -- mov-a: keywords contact + time, watched once below — this is what
-             -- defines the pooled weights (0.5 each: sqrt(1 play) / 2 keywords).
+             -- defines the pooled weights (0.5 each: sqrt(1 play) / 2 keywords,
+             -- which the script normalizes to 1.0 each against the strongest).
              -- Of the four titles, three carry an in-namespace fact at all
              -- (mov-a, mov-c, mov-d; mov-b has none) so doc_count = 3, and the
              -- keyword document frequencies are contact=2 (mov-a, mov-c),
              -- time=2 (mov-a, mov-d), desert=1 (mov-d only) (#294).
              -- mov-c: contact only (on-profile, df 2 of 3 -> idf factor
-             --   1 + ln(3/2)) -> 0.5 * (1 + ln(3/2)) / sqrt(1).
+             --   1 + ln(3/2)) -> 1.0 * (1 + ln(3/2)) / sqrt(1).
              -- mov-d: time (on-profile, df 2 of 3 -> idf factor 1 + ln(3/2))
              --   + desert (off-profile, contributes nothing to the sum, but
              --   still counts toward the sqrt(n) divisor) ->
-             --   0.5 * (1 + ln(3/2)) / sqrt(2).
+             --   1.0 * (1 + ln(3/2)) / sqrt(2).
              -- mov-b: no keywords at all -> ineligible, score 0.0.
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
                  ('mov-a', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
@@ -100,31 +101,36 @@ fn write_taste_fixture(path: &Path) {
         .unwrap();
 }
 
-/// Two accounts' plays in one store (#278): account 42 watches `acct-a`
-/// once, account 99 watches `acct-b` twice (a rewatch, so its own weights
-/// scale to `sqrt(2)/2` rather than coincidentally landing on the same
-/// `0.5` account 42's single play produces — the whole point being that
-/// account 42's vector, account 99's vector, and the vector pooling both
-/// must be three genuinely different numbers, not just three different
-/// orderings of the same ones).
+/// Two accounts' plays in one store (#278), shaped so that account 42's
+/// vector, account 99's vector, and the vector pooling both give `contact`
+/// three genuinely different weights AFTER the script divides each vector by
+/// its own strongest weight.
 ///
-/// `acct-a` and `acct-b` share the `contact` keyword and each carry one
-/// keyword the other does not (`time`, `space`), so `acct-c` — `contact`
-/// only, never watched by anyone — scores differently under all three
-/// vectors: 42 alone, 99 alone, and the two pooled together.
+/// Account 42 watches `acct-a` (contact + time, 0.5 each) and `acct-x` (time
+/// only, 1.0), so its raw vector is contact 0.5, time 1.5 — `contact` is a
+/// third of its strongest keyword. Account 99 watches `acct-b` twice (contact
+/// and space, sqrt(2)/2 each), so `contact` IS its strongest keyword. Pooled,
+/// contact is 0.5 + sqrt(2)/2 against time's 1.5.
+///
+/// `acct-c` — `contact` only, never watched, and `contact` sits on every
+/// candidate so its idf is exactly 1 — therefore scores that normalized
+/// `contact` weight directly under each vector. `acct-x` is in the store
+/// but not the catalog, so it is never a candidate.
 fn write_two_account_fixture(path: &Path) {
     empty_store(path)
         .execute_batch(
             "INSERT INTO items (item_id, type) VALUES
-                 ('acct-a', 'movie'), ('acct-b', 'movie'), ('acct-c', 'movie');
+                 ('acct-a', 'movie'), ('acct-b', 'movie'), ('acct-c', 'movie'), ('acct-x', 'movie');
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
                  ('acct-a', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
                  ('acct-a', 'tmdb_keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
                  ('acct-b', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
                  ('acct-b', 'tmdb_keywords', 'keyword', 'space', '2026-01-01T00:00:00+00:00'),
-                 ('acct-c', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00');
+                 ('acct-c', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('acct-x', 'tmdb_keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'acct-a', 42, 1700000000),
+                 ('h4', 'acct-x', 42, 1700000003),
                  ('h2', 'acct-b', 99, 1700000001),
                  ('h3', 'acct-b', 99, 1700000002);",
         )
@@ -187,9 +193,9 @@ impl Scorer {
         Self::new_sourced(cat, write_store, None)
     }
 
-    /// The same, for a pool that writes its own candidate queries — the shape
-    /// an influence-tilted pool needs (#410), since the `influence` set is
-    /// channel-authored and the script declares no default for it.
+    /// The same, for a pool that writes its own candidate queries — narrowing
+    /// the candidates to part of a catalog that also holds titles a profile
+    /// references but the pool must not air.
     fn new_sourced(
         cat: &Catalog,
         write_store: impl FnOnce(&Path),
@@ -230,18 +236,6 @@ impl Scorer {
             None,
             &[],
         )
-    }
-
-    /// One generation on a pool tilted toward an influence set (#410).
-    /// `influence_weight` is the pool's `config:` value; the set itself came
-    /// from the `sources:` table this scorer was built with. Exploration is
-    /// off, so the order under test is the tilted ranking itself.
-    fn pick_tilted(&self, target_count: usize, influence_weight: f64) -> Vec<PickedItem> {
-        let config = serde_json::json!({
-            "exploration_fraction": 0.0,
-            "influence_weight": influence_weight,
-        });
-        self.pick_for("movies", 0, target_count, Some(config), None, &[])
     }
 
     /// One generation on a channel that has already aired something (#254's
@@ -293,6 +287,21 @@ impl Scorer {
         account_id: Option<i64>,
         recent: &[&str],
     ) -> Vec<PickedItem> {
+        self.try_pick_for(pool, seed, target_count, config, account_id, recent)
+            .unwrap()
+    }
+
+    /// [`Self::pick_for`] without the unwrap, for a test asserting that a
+    /// generation fails.
+    fn try_pick_for(
+        &self,
+        pool: &str,
+        seed: u64,
+        target_count: usize,
+        config: Option<serde_json::Value>,
+        account_id: Option<i64>,
+        recent: &[&str],
+    ) -> Result<Vec<PickedItem>, String> {
         let inputs = ScoreInputs {
             target_count,
             account_id,
@@ -309,7 +318,6 @@ impl Scorer {
             config.as_ref(),
             grant(&self.db),
         )
-        .unwrap()
     }
 }
 
@@ -400,25 +408,23 @@ fn a_single_user_channel_ranks_on_that_accounts_vector_not_the_pooled_one() {
     let acct_99 = scorer.pick_scoped("movies", 3, Some(99));
     let pooled = scorer.pick_scoped("movies", 3, None);
 
-    // Account 42's own vector: `contact` and `time` at 0.5 each, from its one
-    // play of `acct-a` (sqrt(1 play) / 2 keywords).
-    let expected_42 = 0.5;
+    // Account 42's own vector: contact 0.5 against time's 1.5, so `contact`
+    // normalizes to a third.
     let c42 = score_of(&acct_42, "acct-c");
-    assert_close(c42, expected_42, "account 42's acct-c score");
+    assert_close(c42, 0.5 / 1.5, "account 42's acct-c score");
 
-    // Account 99's own vector: `contact` and `space` at sqrt(2)/2 each, from
-    // its two plays (a rewatch) of `acct-b`.
-    let expected_99 = 2.0_f64.sqrt() / 2.0;
+    // Account 99's own vector: `contact` ties `space` for strongest, so it
+    // normalizes to exactly 1.0.
     let c99 = score_of(&acct_99, "acct-c");
-    assert_close(c99, expected_99, "account 99's acct-c score");
+    assert_close(c99, 1.0, "account 99's acct-c score");
 
     // The pooled vector sums both accounts' contributions to `contact`
-    // rather than averaging or picking one — plex-db-ex#39's rollup, summed
-    // not normalised per account.
+    // rather than averaging or picking one — plex-db-ex#39's rollup — and is
+    // then normalized against its own strongest keyword, `time` at 1.5.
     let cpooled = score_of(&pooled, "acct-c");
     assert_close(
         cpooled,
-        expected_42 + expected_99,
+        (0.5 + 2.0_f64.sqrt() / 2.0) / 1.5,
         "the pooled acct-c score",
     );
 
@@ -455,18 +461,19 @@ fn the_committed_example_plugin_runs_and_scores_correctly() {
         "highest cosine score first, entry_id breaking the score-0.0 tie: {ids:?}"
     );
 
-    // mov-d carries "time" (on profile, weight 0.5 — mov-a's lone play split
-    // across its two keywords — scaled by the idf factor 1 + ln(doc_count /
+    // mov-d carries "time" (on profile: mov-a's lone play splits 0.5 across
+    // its two keywords, and dividing the vector by its strongest weight, also
+    // 0.5, brings it to 1.0 — scaled by the idf factor 1 + ln(doc_count /
     // df), where doc_count is 3 (mov-a, mov-c, mov-d each carry a fact;
     // mov-b carries none) and "time"'s own df is 2 (mov-a, mov-d)) and
     // "desert" (off profile, contributes 0 to the sum but still counts
-    // toward the sqrt(n) divisor): sum 0.5 * (1 + ln(3/2)), divided by
+    // toward the sqrt(n) divisor): sum 1.0 * (1 + ln(3/2)), divided by
     // sqrt(2) keywords — #254's worked table, extended by #294's idf term,
     // applied to this fixture's own numbers rather than restated
     // abstractly.
     let mov_d = picked.iter().find(|p| p.id == "mov-d").unwrap();
     let score = mov_d.metadata.as_ref().unwrap()["score"].as_f64().unwrap();
-    let expected = 0.5 * (1.0 + (3.0_f64 / 2.0).ln()) / 2.0_f64.sqrt();
+    let expected = (1.0 + (3.0_f64 / 2.0).ln()) / 2.0_f64.sqrt();
     assert!(
         (score - expected).abs() < 1e-9,
         "mov-d score = {score}, expected {expected}"
@@ -939,8 +946,8 @@ fn detail_f64(p: &PickedItem, key: &str) -> f64 {
 /// and the head of it aired on a loop. `ctx.recent` is the only input that
 /// moves as the channel plays.
 ///
-/// `write_taste_fixture`'s undamped ranking is mov-a (0.9938) > mov-c
-/// (0.7027) > mov-d (0.4969) > mov-b (0.0), pinned by
+/// `write_taste_fixture`'s undamped ranking is mov-a (1.9876) > mov-c
+/// (1.4055) > mov-d (0.9938) > mov-b (0.0), pinned by
 /// `the_committed_example_plugin_runs_and_scores_correctly` above. Airing
 /// mov-a puts it at distance 1 in the tail, so it keeps 1/(1+25) = 3.8% of
 /// its cosine and lands third — behind both titles it beat a moment ago,
@@ -963,8 +970,8 @@ fn a_recent_airing_drops_a_title_below_the_ones_it_was_beating() {
 
 /// Damped, not excluded — the judgement a fixed cooldown window cannot
 /// express. Pushed far enough back in the tail (distance 100, so it keeps
-/// 100/(100+25) = 80% of its cosine), mov-a's 0.9938 * 0.8 = 0.795 still
-/// clears mov-c's undamped 0.7027 and it returns to the top on its own.
+/// 100/(100+25) = 80% of its cosine), mov-a's 1.9876 * 0.8 = 1.5901 still
+/// clears mov-c's undamped 1.4055 and it returns to the top on its own.
 #[test]
 fn a_far_enough_back_airing_stops_mattering_and_the_title_returns() {
     let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
@@ -1136,7 +1143,7 @@ fn admin_audit_prints_the_damping_for_a_recently_aired_pick() {
 /// each). `sh-b` carries `contact` only; `sh-c` carries `time` plus the
 /// off-profile `desert`; `sh-d` carries nothing and is ineligible. Those are
 /// exactly `write_taste_fixture`'s four movies with show ids, so the same
-/// hand-computed cosines apply: sh-a 0.9938 > sh-b 0.7027 > sh-c 0.4969 >
+/// hand-computed cosines apply: sh-a 1.9876 > sh-b 1.4055 > sh-c 0.9938 >
 /// sh-d 0.0.
 fn write_shows_fixture(path: &Path) {
     empty_store(path)
@@ -1289,7 +1296,7 @@ fn every_episode_of_a_picked_show_comes_back_not_just_the_next_few() {
 /// episode almost never repeats, so damping the episode id would do nothing;
 /// damping the series is what "Columbo has been on a lot lately" means.
 ///
-/// `sh-a` leads on cosine (0.9938 against sh-b's 0.7027). Airing one of its
+/// `sh-a` leads on cosine (1.9876 against sh-b's 1.4055). Airing one of its
 /// episodes puts the whole show at distance 1, so it keeps 1/(1+25) of its
 /// score and drops to third — behind two shows whose episodes never aired.
 #[test]
@@ -1420,188 +1427,11 @@ fn the_deleted_scorer_is_gone() {
 }
 
 // ---------------------------------------------------------------------------
-// #410 — a channel-authored INFLUENCE set tilts the ranking without gating it.
-//
-// The fixture is `write_taste_fixture`'s arithmetic with two extra films that
-// are not candidates. Pooled taste comes from the one played movie: `mov-a`
-// carries `contact` and `time`, so both weigh 0.5. The candidate set is the
-// three `mov-*` titles, so doc_count = 3 and the document frequencies are
-// contact = 2 (a, c), time = 2 (a, d), desert = 1 (d) — idf factors
-// 1 + ln(3/2) for the first two and 1 + ln(3) for `desert`.
-//
-// The influence set is `gp-1` and `gp-2`, both carrying `desert` and nothing
-// else, so the influence profile is exactly `desert -> 1.0` (both members of
-// two carry it). `desert` is the keyword the account's own history has no
-// opinion about at all, which is what makes the tilt visible rather than
-// merely additive to an existing preference:
-//
-//   mov-a  taste (0.5·idfC + 0.5·idfT)/√2 = 0.993813   influence 0
-//   mov-c  taste  0.5·idfC                = 0.702733   influence 0
-//   mov-d  taste  0.5·idfT/√2             = 0.496905   influence idfD/√2 = 1.483946
-//
-// So `mov-d` is last untilted and first at influence_weight 0.5 — and `mov-c`,
-// which shares nothing with the influence set, still airs. That is the whole
-// claim: a guide, not a gate.
-// ---------------------------------------------------------------------------
-
-fn write_influence_fixture(path: &Path) {
-    empty_store(path)
-        .execute_batch(
-            "INSERT INTO items (item_id, type) VALUES
-                 ('mov-a', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie'),
-                 ('gp-1', 'movie'), ('gp-2', 'movie');
-             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('mov-a', 'tmdb_keywords', 'keyword', 'contact', 't'),
-                 ('mov-a', 'tmdb_keywords', 'keyword', 'time', 't'),
-                 ('mov-c', 'tmdb_keywords', 'keyword', 'contact', 't'),
-                 ('mov-d', 'tmdb_keywords', 'keyword', 'time', 't'),
-                 ('mov-d', 'tmdb_keywords', 'keyword', 'desert', 't'),
-                 ('gp-1', 'tmdb_keywords', 'keyword', 'desert', 't'),
-                 ('gp-2', 'tmdb_keywords', 'keyword', 'desert', 't');
-             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
-                 ('h1', 'mov-a', 42, 1700000000);",
-        )
-        .unwrap();
-}
-
-/// The candidates and the influence set as a pool would author them: two CEL
-/// expressions over one catalog, disjoint here only so the arithmetic above
-/// stays hand-checkable — nothing requires them to be.
-fn influence_sources() -> PoolSources {
-    [
-        (
-            "movies".to_string(),
-            r#"item.title.startsWith("mov-")"#.to_string(),
-        ),
-        (
-            "influence".to_string(),
-            r#"item.title.startsWith("gp-")"#.to_string(),
-        ),
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn influence_scorer() -> Scorer {
-    let cat = catalog_of(["mov-a", "mov-c", "mov-d", "gp-1", "gp-2"]);
-    Scorer::new_sourced(&cat, write_influence_fixture, Some(influence_sources()))
-}
-
-/// The acceptance criterion. The same catalog and the same taste vector
-/// produce a different order once the influence set is weighted, and the
-/// title that moves is the one sharing the influence set's keyword.
-#[test]
-fn an_influence_set_reorders_the_ranking_it_shares_keywords_with() {
-    let scorer = influence_scorer();
-
-    let plain = scorer.pick_tilted(3, 0.0);
-    assert_eq!(
-        order_of(&plain),
-        vec!["mov-a", "mov-c", "mov-d"],
-        "at weight 0 the ranking must be the plain taste cosine"
-    );
-
-    let tilted = scorer.pick_tilted(3, 0.5);
-    assert_eq!(
-        order_of(&tilted),
-        vec!["mov-d", "mov-a", "mov-c"],
-        "at weight 0.5 the title carrying the influence set's keyword must lead"
-    );
-}
-
-/// The tilt is a guide, not a gate: every candidate is still returned, and one
-/// sharing nothing at all with the influence set still airs.
-#[test]
-fn a_tilted_pool_still_returns_candidates_the_influence_set_says_nothing_about() {
-    let picked = influence_scorer().pick_tilted(3, 4.0);
-    let mut ids = order_of(&picked);
-    ids.sort_unstable();
-    assert_eq!(
-        ids,
-        vec!["mov-a", "mov-c", "mov-d"],
-        "even at weight 4.0 the influence set must not narrow the candidates"
-    );
-}
-
-/// The two halves of the score are hand-checkable and both reported, so a
-/// pick that only aired because of the tilt can be told apart from one the
-/// account's own history chose.
-#[test]
-fn the_audit_reports_both_cosines_and_the_weight_between_them() {
-    let picked = influence_scorer().pick_tilted(3, 0.5);
-    let d = picked.iter().find(|p| p.id == "mov-d").unwrap();
-
-    let idf_time = 1.0 + (3.0f64 / 2.0).ln();
-    let idf_desert = 1.0 + 3.0f64.ln();
-    let taste = 0.5 * idf_time / 2.0f64.sqrt();
-    let influence = idf_desert / 2.0f64.sqrt();
-
-    assert_close(detail_f64(d, "taste_score"), taste, "mov-d's taste cosine");
-    assert_close(
-        detail_f64(d, "influence_score"),
-        influence,
-        "mov-d's influence cosine",
-    );
-    assert_close(detail_f64(d, "influence_weight"), 0.5, "the weight");
-    assert_close(
-        detail_f64(d, "base_score"),
-        taste + 0.5 * influence,
-        "base_score against taste + weight * influence",
-    );
-    assert_eq!(
-        detail_of(d)["on_influence"][0].as_str(),
-        Some("desert"),
-        "the audit must name which keyword the influence set contributed"
-    );
-    assert_eq!(
-        d.metadata.as_ref().unwrap()["audit"][0]["verdict"].as_str(),
-        Some("ranked by keyword cosine against pooled taste, tilted toward the influence set"),
-        "a tilted pick must say so"
-    );
-}
-
-/// A candidate sharing nothing with the influence set gets no tilt clause and
-/// no influence score, on the very same tilted pool — the verdict has to stay
-/// true per pick, not per pool.
-#[test]
-fn a_candidate_the_influence_set_never_touched_reads_as_an_ordinary_pick() {
-    let picked = influence_scorer().pick_tilted(3, 0.5);
-    let c = picked.iter().find(|p| p.id == "mov-c").unwrap();
-
-    assert_close(detail_f64(c, "influence_score"), 0.0, "mov-c's tilt");
-    assert_eq!(
-        c.metadata.as_ref().unwrap()["audit"][0]["verdict"].as_str(),
-        Some("ranked by keyword cosine against pooled taste"),
-        "an untouched candidate must not claim a tilt it never got"
-    );
-}
-
-/// The default is zero, so every pool that predates #410 — and every pool that
-/// authors no influence set — scores exactly what it scored before. Checked
-/// against the untouched `write_taste_fixture` rather than by asserting the
-/// default's value, so it fails if the influence branch ever runs unasked.
-#[test]
-fn a_pool_with_no_influence_set_is_untouched_by_the_feature() {
-    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
-    let picked = scorer.pick("movies", 0, 4, Some(0.0));
-    let c = picked.iter().find(|p| p.id == "mov-c").unwrap();
-
-    assert_close(detail_f64(c, "influence_score"), 0.0, "an untilted pool");
-    assert_close(detail_f64(c, "influence_weight"), 0.0, "an untilted pool");
-    assert_close(
-        detail_f64(c, "base_score"),
-        detail_f64(c, "taste_score"),
-        "base_score must be the taste cosine alone when nothing tilts it",
-    );
-}
-
-// ---------------------------------------------------------------------------
 // #411 — `seen` partitions the candidates and `unusual_weight` pushes away
 // from the house.
 //
-// The fixture is the influence one plus a second account, so "this account's
-// taste" and "the house's taste" are genuinely different vectors rather than
-// the same numbers twice. Account 42 played mov-a only; account 99 played
+// The fixture holds two accounts, so "this account's taste" and "the house's
+// taste" are genuinely different vectors rather than the same numbers twice. Account 42 played mov-a only; account 99 played
 // mov-c twice, which puts `contact` heavily into the pooled vector and not at
 // all into 42's own past `mov-a`'s share of it.
 //
@@ -1614,16 +1444,13 @@ fn write_seen_fixture(path: &Path) {
     empty_store(path)
         .execute_batch(
             "INSERT INTO items (item_id, type) VALUES
-                 ('mov-a', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie'),
-                 ('gp-1', 'movie'), ('gp-2', 'movie');
+                 ('mov-a', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie');
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
                  ('mov-a', 'tmdb_keywords', 'keyword', 'contact', 't'),
                  ('mov-a', 'tmdb_keywords', 'keyword', 'time', 't'),
                  ('mov-c', 'tmdb_keywords', 'keyword', 'contact', 't'),
                  ('mov-d', 'tmdb_keywords', 'keyword', 'time', 't'),
-                 ('mov-d', 'tmdb_keywords', 'keyword', 'desert', 't'),
-                 ('gp-1', 'tmdb_keywords', 'keyword', 'desert', 't'),
-                 ('gp-2', 'tmdb_keywords', 'keyword', 'desert', 't');
+                 ('mov-d', 'tmdb_keywords', 'keyword', 'desert', 't');
              -- Account 42 has played mov-a and nothing else. Account 99's two
              -- plays of mov-c exist only to make the pooled vector differ
              -- from 42's; they must never make mov-c look watched to 42.
@@ -1664,8 +1491,7 @@ impl Scorer {
 }
 
 fn seen_scorer() -> Scorer {
-    let cat = catalog_of(["mov-a", "mov-c", "mov-d", "gp-1", "gp-2"]);
-    Scorer::new_sourced(&cat, write_seen_fixture, Some(influence_sources()))
+    Scorer::new(&catalog_of(["mov-a", "mov-c", "mov-d"]), write_seen_fixture)
 }
 
 /// The acceptance criterion, and the property two movie pools in one block
@@ -1797,4 +1623,406 @@ fn the_verdict_names_the_half_of_the_library_a_pick_came_from() {
         v.contains("never played") && v.contains("what the house watches"),
         "a discovery pick must name both, got: {v}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// etv-station-sctf.3 — the taste profile's favor and disfavor terms.
+//
+// score = (taste_weight · taste + favor) / (1 + unusual_weight · house + disfavor)
+//
+// Four candidates, their keywords (doc_count 4) and genres (3 carry one):
+//
+//   p-heist   heist, vault      Crime
+//   p-horror  ghost             Horror
+//   p-both    heist, ghost      Crime, Horror
+//   p-none    picnic            —
+//
+// So df(heist) = df(ghost) = 2 of 4 keywords documents, idf 1 + ln 2; and
+// df(crime) = df(horror) = 2 of 3 genre documents, idf 1 + ln(3/2). `Heat
+// (1995)` carries heist and nothing else; it is in the catalog, so an `item:`
+// entry can name it, but outside the pool's `sources:`, so it never airs. Its
+// one play is the whole taste vector: heist at 1.0.
+// ---------------------------------------------------------------------------
+
+fn write_profile_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('p-heist', 'movie'), ('p-horror', 'movie'), ('p-both', 'movie'),
+                 ('p-none', 'movie'), ('heat', 'movie');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('p-heist', 'tmdb_keywords', 'keyword', 'heist', 't'),
+                 ('p-heist', 'tmdb_keywords', 'keyword', 'vault', 't'),
+                 ('p-horror', 'tmdb_keywords', 'keyword', 'ghost', 't'),
+                 ('p-both', 'tmdb_keywords', 'keyword', 'heist', 't'),
+                 ('p-both', 'tmdb_keywords', 'keyword', 'ghost', 't'),
+                 ('p-none', 'tmdb_keywords', 'keyword', 'picnic', 't'),
+                 ('heat', 'tmdb_keywords', 'keyword', 'heist', 't');
+             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+                 ('h1', 'heat', 42, 1700000000);",
+        )
+        .unwrap();
+}
+
+/// The same store with no `plays` table, so any read of a taste vector fails.
+fn write_profile_fixture_without_plays(path: &Path) {
+    write_profile_fixture(path);
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch("DROP TABLE plays;")
+        .unwrap();
+}
+
+fn profile_catalog() -> Catalog {
+    let cat = catalog_of(["p-heist", "p-horror", "p-both", "p-none"]);
+    let mut heat = Entry::new("heat", "movie", "Heat", Source::Plex);
+    heat.year = Some(1995);
+    cat.upsert_entry(&heat).unwrap();
+    for (id, genre) in [
+        ("p-heist", "Crime"),
+        ("p-horror", "Horror"),
+        ("p-both", "Crime"),
+        ("p-both", "Horror"),
+    ] {
+        cat.add_tag(id, TagNs::Genre, genre).unwrap();
+    }
+    cat
+}
+
+fn profile_sources() -> PoolSources {
+    [(
+        "movies".to_string(),
+        r#"item.title.startsWith("p-")"#.to_string(),
+    )]
+    .into_iter()
+    .collect()
+}
+
+impl Scorer {
+    /// A scorer whose pool `pool` carries `profile_yaml` — the pool's
+    /// `profile:` list exactly as a channel would author it — resolved the
+    /// way the daemon resolves it, before `pick`.
+    fn with_profile(mut self, cat: &Catalog, pool: &str, profile_yaml: &str) -> Self {
+        let pool: etv_station::config::Pool = serde_norway::from_str(&format!(
+            "name: {pool}\nplugin: plugin.rhai\nprofile:\n{profile_yaml}"
+        ))
+        .unwrap();
+        self.cache
+            .prepare_profile(cat, &pool, self._dir.path())
+            .unwrap();
+        self
+    }
+
+    /// One generation of the `movies` pool at `taste_weight`, exploration off.
+    fn pick_profiled(&self, taste_weight: f64) -> Result<Vec<PickedItem>, String> {
+        let config = serde_json::json!({
+            "exploration_fraction": 0.0,
+            "taste_weight": taste_weight,
+        });
+        self.try_pick_for("movies", 0, 10, Some(config), None, &[])
+    }
+}
+
+fn profile_scorer(write_store: impl FnOnce(&Path), profile_yaml: &str) -> Scorer {
+    let cat = profile_catalog();
+    Scorer::new_sourced(&cat, write_store, Some(profile_sources())).with_profile(
+        &cat,
+        "movies",
+        profile_yaml,
+    )
+}
+
+fn pick_of<'a>(picked: &'a [PickedItem], id: &str) -> &'a PickedItem {
+    picked.iter().find(|p| p.id == id).unwrap()
+}
+
+/// Entries that disagree on one keyword net out before scoring: `+2 heist`
+/// plus `−1 Heat`, where Heat's one keyword is heist, leaves heist in the
+/// favor map at 1 — so p-heist's favor is exactly one heist match.
+#[test]
+fn a_keyword_and_an_item_sharing_it_net_to_their_difference() {
+    let picked = profile_scorer(
+        write_profile_fixture,
+        "  - { keyword: heist, weight: 2.0 }\n  - { item: \"Heat (1995)\", weight: -1.0 }\n",
+    )
+    .pick_profiled(0.0)
+    .unwrap();
+    let p = pick_of(&picked, "p-heist");
+
+    let idf_heist = 1.0 + 2.0_f64.ln();
+    assert_close(
+        detail_f64(p, "favor_score"),
+        1.0 * idf_heist / 2.0_f64.sqrt(),
+        "p-heist's favor at net heist = 1",
+    );
+    assert_close(detail_f64(p, "disfavor_score"), 0.0, "p-heist's disfavor");
+    assert_eq!(
+        detail_of(p)["favor_matches"],
+        serde_json::json!(["keywords: heist"])
+    );
+    let refs: Vec<&str> = detail_of(p)["profile_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        refs,
+        ["heist", "Heat (1995)"],
+        "both entries fed heist, so both are named"
+    );
+    assert_eq!(
+        detail_of(p)["profile_entries"][0]["origin"].as_str(),
+        Some("inline")
+    );
+}
+
+/// A hand-computed favor and disfavor for one named title, across two
+/// namespaces: p-both matches `+2 heist` among its two keywords and `−1
+/// Horror` among its two genres, each cosine with its own namespace's idf.
+#[test]
+fn favor_and_disfavor_match_a_hand_computed_score() {
+    let picked = profile_scorer(
+        write_profile_fixture,
+        "  - { keyword: heist, weight: 2.0 }\n  - { genre: Horror, weight: -1.0 }\n",
+    )
+    .pick_profiled(0.0)
+    .unwrap();
+    let p = pick_of(&picked, "p-both");
+
+    let favor = 2.0 * (1.0 + 2.0_f64.ln()) / 2.0_f64.sqrt();
+    let disfavor = 1.0 * (1.0 + 1.5_f64.ln()) / 2.0_f64.sqrt();
+    assert_close(detail_f64(p, "favor_score"), favor, "p-both's favor");
+    assert_close(
+        detail_f64(p, "disfavor_score"),
+        disfavor,
+        "p-both's disfavor",
+    );
+    assert_close(
+        detail_f64(p, "score"),
+        favor / (1.0 + disfavor),
+        "p-both's score",
+    );
+    assert_eq!(
+        detail_of(p)["disfavor_matches"],
+        serde_json::json!(["genres: horror"])
+    );
+    assert_eq!(
+        p.metadata.as_ref().unwrap()["audit"][0]["verdict"].as_str(),
+        Some(
+            "ranked by the taste profile alone, tilted toward the taste profile's favor, \
+             held back by the taste profile's disfavor"
+        ),
+    );
+}
+
+/// `taste_weight: 0` ranks on the profile alone and never reads the taste
+/// vector: against a store with no `plays` table it succeeds, where the same
+/// store at the default weight fails on the taste read.
+#[test]
+fn taste_weight_zero_ranks_on_the_profile_and_never_reads_taste() {
+    let scorer = profile_scorer(
+        write_profile_fixture_without_plays,
+        "  - { keyword: ghost, weight: 1.0 }\n",
+    );
+
+    let picked = scorer.pick_profiled(0.0).unwrap();
+    assert_eq!(
+        order_of(&picked),
+        ["p-horror", "p-both", "p-heist", "p-none"],
+        "ghost alone decides: p-horror (1 of 1 keywords) over p-both (1 of 2)"
+    );
+    for p in &picked {
+        assert_close(
+            detail_f64(p, "taste_score"),
+            0.0,
+            &format!("{}'s taste", p.id),
+        );
+        assert_close(detail_f64(p, "taste_weight"), 0.0, "the weight");
+    }
+
+    assert!(
+        scorer.pick_profiled(1.0).is_err(),
+        "at taste_weight 1 the same store must fail on the taste read"
+    );
+}
+
+/// A profile of nothing but negative weights can pull a score toward zero
+/// but never below it: disfavor sits under the fraction.
+#[test]
+fn a_disfavor_only_profile_never_produces_a_negative_score() {
+    let picked = profile_scorer(
+        write_profile_fixture,
+        "  - { genre: Horror, weight: -5.0 }\n  - { keyword: heist, weight: -3.0 }\n",
+    )
+    .pick_profiled(1.0)
+    .unwrap();
+
+    for p in &picked {
+        assert!(
+            detail_f64(p, "score") >= 0.0,
+            "{} scored {}",
+            p.id,
+            detail_f64(p, "score")
+        );
+    }
+    let both = pick_of(&picked, "p-both");
+    assert!(detail_f64(both, "disfavor_score") > 0.0);
+    assert!(detail_f64(both, "base_score") > 0.0, "taste still counts");
+    assert_close(
+        detail_f64(both, "base_score"),
+        detail_f64(both, "taste_score") / (1.0 + detail_f64(both, "disfavor_score")),
+        "p-both's base_score against taste / (1 + disfavor)",
+    );
+}
+
+/// A set of `n` members where a quarter carry heist, half carry ghost and a
+/// fifth are Horror. The set's own members are outside `sources:`.
+fn set_scorer(n: usize) -> Scorer {
+    let cat = profile_catalog();
+    let members: Vec<String> = (0..n).map(|i| format!("s-{i:03}")).collect();
+    for (i, id) in members.iter().enumerate() {
+        add(&cat, id, "movie");
+        if i % 5 == 0 {
+            cat.add_tag(id, TagNs::Genre, "Horror").unwrap();
+        }
+    }
+    let write = |db: &Path| {
+        write_profile_fixture(db);
+        let conn = rusqlite::Connection::open(db).unwrap();
+        for (i, id) in members.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO items (item_id, type) VALUES (?1, 'movie')",
+                [id],
+            )
+            .unwrap();
+            for (kw, carries) in [("heist", i < n / 4), ("ghost", i < n / 2)] {
+                if carries {
+                    conn.execute(
+                        "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
+                         VALUES (?1, 'tmdb_keywords', 'keyword', ?2, 't')",
+                        [id, kw],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    };
+    Scorer::new_sourced(&cat, write, Some(profile_sources())).with_profile(
+        &cat,
+        "movies",
+        "  - { set: 'item.title.startsWith(\"s-\")', weight: 2.0 }\n",
+    )
+}
+
+/// A set entry spreads its weight by the SHARE of members carrying each
+/// keyword and genre, so a 20-member set and a 200-member set with the same
+/// shares weight every candidate identically.
+#[test]
+fn sets_of_different_sizes_with_equal_shares_score_identically() {
+    let small = set_scorer(20).pick_profiled(0.0).unwrap();
+    let large = set_scorer(200).pick_profiled(0.0).unwrap();
+
+    assert_eq!(order_of(&small), order_of(&large));
+    for p in &small {
+        assert_close(
+            detail_f64(p, "score"),
+            detail_f64(pick_of(&large, &p.id), "score"),
+            &format!("{}'s score, 20 members against 200", p.id),
+        );
+    }
+    // p-both: heist share 1/4 and ghost share 1/2 of weight 2 over its two
+    // keywords; Horror share 1/5 of weight 2 over its two genres.
+    let idf_kw = 1.0 + 2.0_f64.ln();
+    let idf_genre = 1.0 + 1.5_f64.ln();
+    let expected =
+        (0.5 * idf_kw + 1.0 * idf_kw) / 2.0_f64.sqrt() + 0.4 * idf_genre / 2.0_f64.sqrt();
+    assert_close(
+        detail_f64(pick_of(&small, "p-both"), "favor_score"),
+        expected,
+        "p-both's favor from the set",
+    );
+}
+
+/// On a shows pool a genre entry reads the show's genres off its episodes —
+/// every episode carries its show's genres. sh-d, which has no keywords and
+/// ranked last, carries Drama on its episodes; `+1 Drama` gives it a favor of
+/// exactly 1 (the only genre document, so idf 1, one genre, so divisor 1) and
+/// lifts it past sh-c's 0.9938.
+#[test]
+fn a_shows_pool_reads_genres_off_the_episodes() {
+    let cat = shows_catalog();
+    for (season, episode) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
+        let id = format!("sh-d-s{season}e{episode:02}");
+        cat.add_tag(&id, TagNs::Genre, "Drama").unwrap();
+    }
+    let scorer = Scorer::new(&cat, write_shows_fixture).with_profile(
+        &cat,
+        "shows",
+        "  - { genre: Drama, weight: 1.0 }\n",
+    );
+    let picked = scorer.pick_shows(8, &[]);
+
+    let d = picked.iter().find(|p| p.id.starts_with("sh-d")).unwrap();
+    assert_close(detail_f64(d, "favor_score"), 1.0, "sh-d's favor");
+    let show_order: Vec<&str> = picked
+        .iter()
+        .map(|p| &p.id[..4])
+        .fold(Vec::new(), |mut acc, s| {
+            if acc.last() != Some(&s) {
+                acc.push(s);
+            }
+            acc
+        });
+    assert_eq!(show_order, ["sh-a", "sh-b", "sh-d", "sh-c"]);
+}
+
+/// A tag field that is a single string rather than a list — `studio` — matches
+/// too: p-heist is the only candidate with a studio, so its idf is 1 and its
+/// one value makes the divisor 1, for a favor of exactly the weight.
+#[test]
+fn a_single_valued_tag_field_matches_a_tag_entry() {
+    let cat = profile_catalog();
+    let mut heist = Entry::new("p-heist", "movie", "p-heist", Source::Plex);
+    heist.studio = Some("Warner Bros.".into());
+    cat.upsert_entry(&heist).unwrap();
+    let picked = Scorer::new_sourced(&cat, write_profile_fixture, Some(profile_sources()))
+        .with_profile(
+            &cat,
+            "movies",
+            "  - { studio: Warner Bros., weight: 1.5 }\n",
+        )
+        .pick_profiled(0.0)
+        .unwrap();
+
+    let p = pick_of(&picked, "p-heist");
+    assert_close(detail_f64(p, "favor_score"), 1.5, "p-heist's studio favor");
+    assert_eq!(
+        detail_of(p)["favor_matches"],
+        serde_json::json!(["studio: warner bros."])
+    );
+}
+
+/// `exclude_keywords` under `config:` is refused, not silently ignored:
+/// `config:` is opaque to the station, so nothing else would notice.
+#[test]
+fn exclude_keywords_under_config_is_refused() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let config = serde_json::json!({ "exclude_keywords": ["time"] });
+    let err = scorer
+        .try_pick_for("movies", 0, 3, Some(config), None, &[])
+        .unwrap_err();
+    assert!(err.contains("pool field"), "err = {err}");
+}
+
+/// A negative `taste_weight` is refused: it would drive scores negative.
+#[test]
+fn a_negative_taste_weight_is_refused() {
+    let err = profile_scorer(
+        write_profile_fixture,
+        "  - { keyword: heist, weight: 1.0 }\n",
+    )
+    .pick_profiled(-1.0)
+    .unwrap_err();
+    assert!(err.contains("taste_weight"), "err = {err}");
 }

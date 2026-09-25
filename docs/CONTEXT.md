@@ -111,3 +111,15 @@ Borrowed industry terms for the things an overlay draws. None of these are schem
 ## Regeneration fingerprint
 
 The hash stamped on a [[generation]]'s checkpoint recording what its author declared: the channel's config bytes and its resolved [[overlay cascade]] bytes. Compared at channel-loop startup — daemon start or SIGHUP, never the catalog refresh timer — and a mismatch rewinds the channel to its earliest unaired checkpoint. Deliberately blind to the catalog: which entries the pools resolve to is not part of it, so a film arriving in Plex never moves a slot that has already been published. See ADR 0010.
+
+## Taste profile
+
+A pool's list of signed weights on keywords, catalog tags, single items and CEL-defined sets, written as `profile:` and `profile_files:` on a plugin pool. The station resolves each reference; the scorer script does all the weighting.
+
+## Profile entry
+
+One reference (a keyword, a catalog tag value, an `item:`, or a `set:`) and one non-zero weight, from a profile file or inline. Its origin is carried into the audit.
+
+## Favor / disfavor
+
+The two halves of a netted taste profile. Every entry's weight is summed per (namespace, value): pairs that net positive form the favor map, which adds to a score, and pairs that net negative form the disfavor map, which divides it. So a profile can lower a score but never make it negative.
