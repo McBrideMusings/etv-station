@@ -226,6 +226,26 @@ fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
 // Zero by default.
 fn unusual_weight(ctx) { tunable(ctx, "unusual_weight", 0.0).to_float() }
 
+// Keyword values this pool drops from scoring entirely, matched whole and
+// exactly — `duringcreditsstinger` drops that tag and nothing else, never a
+// substring like `stinger`. For a tag that describes how a film is packaged
+// rather than what it is about: `duringcreditsstinger` rides along with
+// `superhero` and `comic`, so leaving it in double-counts the same taste.
+//
+// Dropped at every place a keyword enters — the taste, influence and house
+// profiles AND each candidate's own keyword list — so an excluded tag counts
+// neither toward a match nor toward a candidate's length in the sqrt divisor
+// or the document-frequency pass. Dropping it from the profiles alone would
+// still penalise every film that carries it.
+//
+// Empty by default. A bare string is refused rather than read: Rhai would
+// iterate it character by character and exclude single letters.
+fn exclude_keywords(ctx) {
+    let v = tunable(ctx, "exclude_keywords", []);
+    if type_of(v) != "array" { throw "exclude_keywords must be a list of keywords, got " + type_of(v); }
+    v
+}
+
 // How many shows a `unit = "show"` pool hands back. Not `target_count`: a
 // show expands to every episode it has, so asking for one show per scheduled
 // item would return tens of thousands of ids. This is how many series the
@@ -443,6 +463,10 @@ fn pick(ctx) {
     // of its own.
     let enrichment = ds.enrichment_for_many(units, ns);
 
+    // exclude_keywords() as a lookup, so each check below is one map probe.
+    let excluded = #{};
+    for k in exclude_keywords(ctx) { excluded[k.to_string()] = true; }
+
     // One account's taste vector when the channel is `single_user`-scoped
     // (#278) and the station resolved that account's id; the house's pooled
     // vector otherwise (#254, plex-db-ex#39) — one call either way, not one
@@ -458,7 +482,7 @@ fn pick(ctx) {
     };
     let weights = #{};
     for attr in taste.attributes {
-        if attr.namespace == ns {
+        if attr.namespace == ns && excluded[attr.value] == () {
             weights[attr.key + "\x01" + attr.value] = attr.weight;
         }
     }
@@ -492,7 +516,7 @@ fn pick(ctx) {
                 let facts = infl_enrichment[id];
                 if facts == () { continue; }
                 for f in facts {
-                    if f.namespace == ns {
+                    if f.namespace == ns && excluded[f.value] == () {
                         let k = f.key + "\x01" + f.value;
                         let c = infl_weights[k];
                         infl_weights[k] = if c == () { inc } else { c + inc };
@@ -510,7 +534,7 @@ fn pick(ctx) {
     if gamma != 0.0 && ctx.account_id != () {
         let house = ds.pooled_taste_vector();
         for attr in house.attributes {
-            if attr.namespace == ns {
+            if attr.namespace == ns && excluded[attr.value] == () {
                 house_weights[attr.key + "\x01" + attr.value] = attr.weight;
             }
         }
@@ -541,14 +565,18 @@ fn pick(ctx) {
     for unit in units {
         let facts = enrichment[unit];
         if facts != () {
-            doc_count += 1;
+            // A candidate whose every keyword is excluded is not a document:
+            // it has nothing left for this scorer to read.
+            let kept = 0;
             for f in facts {
-                if f.namespace == ns {
+                if f.namespace == ns && excluded[f.value] == () {
+                    kept += 1;
                     let k = f.key + "\x01" + f.value;
                     let c = df[k];
                     df[k] = if c == () { 1 } else { c + 1 };
                 }
             }
+            if kept > 0 { doc_count += 1; }
         }
     }
 
@@ -563,18 +591,21 @@ fn pick(ctx) {
         // profile — not needed for ranking, only so a ranking can be
         // explained: see the `metadata` attached below.
         let on_profile = [];
+        // Each on_profile keyword's contribution to taste_score, index for
+        // index, so the guide line can name the keywords that weighed most
+        // rather than whichever the catalog happened to list first.
+        let on_profile_w = [];
         // The same, for the influence profile. Empty on every pool that
         // authored no influence set, which is what makes a guilty pick
         // distinguishable from an ordinary one in the audit.
         let on_influence = [];
         if facts != () {
-            eligible = true;
             let n = 0;
             let sum = 0.0;
             let infl_sum = 0.0;
             let house_sum = 0.0;
             for f in facts {
-                if f.namespace == ns {
+                if f.namespace == ns && excluded[f.value] == () {
                     n += 1;
                     let k = f.key + "\x01" + f.value;
                     let w = weights[k];
@@ -596,6 +627,7 @@ fn pick(ctx) {
                         if w != () {
                             sum += w * idf;
                             on_profile.push(f.value);
+                            on_profile_w.push(w * idf);
                         }
                         if iw != () {
                             infl_sum += iw * idf;
@@ -624,6 +656,9 @@ fn pick(ctx) {
             // The influence cosine uses the same divisor, so the two are on
             // one scale and `beta` is a ratio between them rather than an
             // arbitrary constant (#410).
+            // Eligible for exploration only with a keyword left after
+            // exclude_keywords(), for the same reason as the df pass above.
+            eligible = n > 0;
             if n > 0 {
                 let divisor = n.to_float().sqrt();
                 taste_score = sum / divisor;
@@ -675,6 +710,7 @@ fn pick(ctx) {
             recency_factor: factor,
             eligible: eligible,
             on_profile: on_profile,
+            on_profile_w: on_profile_w,
             on_influence: on_influence,
             // The seeded key this candidate draws if an exploration slot
             // reaches it — computed once here, not per slot, since a
@@ -854,6 +890,7 @@ fn pick(ctx) {
             draw: if source == "explore" { "exploration" } else { "ranked" },
             near_misses: near_misses,
             on_profile: row.on_profile,
+            on_profile_w: row.on_profile_w,
             source: source,
         };
         selected.push(row.id);
@@ -959,6 +996,56 @@ fn pick(ctx) {
 // low-ranked accident. Also reports the bounded near-miss list pick()
 // captured for each pick (#393) — the candidates ranked immediately above it
 // and the script's own reason each one did not air.
+// The `n` keywords that added most to a pick's taste score, heaviest first.
+fn top_keywords(words, weights, n) {
+    let pairs = [];
+    for i in 0..words.len {
+        pairs.push(#{ k: words[i], c: weights[i] });
+    }
+    pairs.sort(|a, b| {
+        if a.c > b.c { -1 } else if a.c < b.c { 1 }
+        else if a.k < b.k { -1 } else if a.k > b.k { 1 }
+        else { 0 }
+    });
+    let out = [];
+    for p in pairs {
+        if out.len >= n { break; }
+        if !out.contains(p.k) { out.push(p.k); }
+    }
+    out
+}
+
+// The one sentence a viewer reads in the guide (etv-station-puhx): the
+// audit's verdict in plain words, with the rank and the keywords behind it.
+// The station prints it as-is and refuses anything over 200 characters, so
+// the keyword list is capped at three and each keyword at 30 characters.
+fn guide_line(r, candidate_count) {
+    if r.draw == "exploration" {
+        return "Picked for you: a deliberate wildcard outside your usual taste";
+    }
+    let noun = if r.unit == () { "films" } else { "series" };
+    let line = "Picked for you: #" + r.rank + " of " + candidate_count + " " + noun + " by taste match";
+    let kws = top_keywords(r.on_profile, r.on_profile_w, 3);
+    if kws.len > 0 {
+        let short = [];
+        for k in kws {
+            short.push(if k.len > 30 { k.sub_string(0, 30) } else { k });
+        }
+        let joined = short[0];
+        for i in 1..short.len {
+            joined += if i == short.len - 1 { " and " } else { ", " };
+            joined += short[i];
+        }
+        line += " (" + joined + ")";
+    }
+    if r.seen == "only" {
+        line += ", one you've watched before";
+    } else if r.seen == "exclude" {
+        line += ", one you haven't seen";
+    }
+    line
+}
+
 fn audit(ctx, picks, workspace) {
     let out = #{};
     for p in picks {
@@ -1028,12 +1115,16 @@ fn audit(ctx, picks, workspace) {
         if r != () && r.unusual_weight > 0.0 && r.house_score > 0.0 {
             verdict = verdict + ", pushed away from what the house watches";
         }
-        out[p.entry_id] = #{
+        let record = #{
             stage: "pool",
             by: "plugin:taste-cosine",
             verdict: verdict,
             detail: detail,
         };
+        if r != () {
+            record.guide = guide_line(r, workspace.candidate_count);
+        }
+        out[p.entry_id] = record;
     }
     out
 }
