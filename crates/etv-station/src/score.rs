@@ -931,6 +931,29 @@ impl Datastore {
             .collect())
     }
 
+    /// The stored keyword a raw spelling maps to, or `()` for a spelling the
+    /// store has never seen — the same lookup [`crate::profile::resolve`]
+    /// runs for a `keyword:` profile entry, exposed here so a script can
+    /// explain a candidate's own keywords the same way.
+    fn keyword_for_surface(&mut self, surface: &str) -> Result<Dynamic, Box<EvalAltResult>> {
+        let keyword = self
+            .lock()
+            .keyword_for_surface(surface)
+            .map_err(|e| format!("datastore: keyword_for_surface({surface:?}): {e}"))?;
+        Ok(keyword.map(Dynamic::from).unwrap_or(Dynamic::UNIT))
+    }
+
+    /// Every raw spelling the store recorded for a stored `keyword` — the
+    /// audit's way of showing which spelling(s) actually earned a candidate
+    /// its match, rather than only the stemmed form the score math uses.
+    fn surfaces_for_keyword(&mut self, keyword: &str) -> Result<Array, Box<EvalAltResult>> {
+        let surfaces = self
+            .lock()
+            .surfaces_for_keyword(keyword)
+            .map_err(|e| format!("datastore: surfaces_for_keyword({keyword:?}): {e}"))?;
+        Ok(surfaces.into_iter().map(Dynamic::from).collect())
+    }
+
     fn edges_from(&mut self, item_id: &str, edge_type: &str) -> Result<Array, Box<EvalAltResult>> {
         let edges = self
             .lock()
@@ -1184,7 +1207,9 @@ pub(crate) fn engine() -> Engine {
         .register_fn("taste_vector_for", Datastore::taste_vector_for)
         .register_fn("pooled_taste_vector", Datastore::pooled_taste_vector)
         .register_fn("watched_units_for", Datastore::watched_units_for)
-        .register_fn("watched_units", Datastore::watched_units);
+        .register_fn("watched_units", Datastore::watched_units)
+        .register_fn("keyword_for_surface", Datastore::keyword_for_surface)
+        .register_fn("surfaces_for_keyword", Datastore::surfaces_for_keyword);
     engine
         .register_fn("timestamp", clock_read)
         .register_fn("elapsed", |t0: f64| clock_read() - t0);
@@ -1228,6 +1253,13 @@ impl ScoreCache {
     /// `ctx.exclude_keywords`. Touches the catalog, so it belongs to the same
     /// half as [`Self::prepare`]. A pool that authored neither stores nothing,
     /// and its script reads empty arrays.
+    ///
+    /// A `keyword` reference resolves against the pool's first granted
+    /// datastore (`pool.datastores`) — the same store a keyword-reading
+    /// scorer script names via its own `datastore_name()`/`capabilities()` —
+    /// opened fresh here exactly as [`GrantedCapabilities::with_datastores`]
+    /// does for [`pick`], for the same reason: a `Reader::open` is one file
+    /// open plus one `SELECT`, cheap enough to redo rather than cache.
     pub fn prepare_profile(
         &mut self,
         catalog: &Catalog,
@@ -1241,7 +1273,19 @@ impl ScoreCache {
             return Ok(());
         }
         let entries = crate::profile::load(pool, base_dir)?;
-        let resolved = crate::profile::resolve(catalog, &entries, &pool.exclude_keywords)?;
+        let keyword_store = match pool.datastores.first() {
+            Some(grant) => Some(
+                plexdb_reader::Reader::open(&grant.path)
+                    .map_err(|e| format!("datastore {:?} at {:?}: {e}", grant.name, grant.path))?,
+            ),
+            None => None,
+        };
+        let resolved = crate::profile::resolve(
+            catalog,
+            &entries,
+            &pool.exclude_keywords,
+            keyword_store.as_ref(),
+        )?;
         self.profiles.insert(pool.name.clone(), resolved);
         Ok(())
     }
@@ -2217,6 +2261,28 @@ fn audit(ctx, picks, workspace) { #{} }
         serde_norway::from_str(yaml_src).unwrap()
     }
 
+    /// A minimal real plexdb store, schema v10, holding only `keyword_forms`
+    /// — the one table a pool's `keyword`/`exclude_keywords` resolution reads
+    /// (`crate::profile::resolve_keyword_surface`). `forms` is
+    /// `(surface, stored keyword)` pairs.
+    fn write_keyword_store_fixture(path: &std::path::Path, forms: &[(&str, &str)]) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES ({version});
+             CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);",
+            version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+        ))
+        .unwrap();
+        for (surface, keyword) in forms {
+            conn.execute(
+                "INSERT INTO keyword_forms (surface, keyword) VALUES (?1, ?2)",
+                (surface, keyword),
+            )
+            .unwrap();
+        }
+    }
+
     fn run_profile(
         catalog: &Catalog,
         dir: &tempfile::TempDir,
@@ -2248,17 +2314,29 @@ fn audit(ctx, picks, workspace) { #{} }
             "- { genre: Horror, weight: -1.0 }\n",
         )
         .unwrap();
-        let pool = profile_pool(
+        let db = dir.path().join("taste.db");
+        write_keyword_store_fixture(
+            &db,
+            &[
+                ("bank heist", "bank heist"),
+                ("duringcreditsstinger", "duringcreditsstinger"),
+            ],
+        );
+        let pool = profile_pool(&format!(
             r#"
 name: movies
 plugin: plugin.rhai
+datastores:
+  - name: taste
+    path: "{db}"
 profile_files: [a.yaml, b.yaml]
 profile:
-  - { item: "Heat (1995)", weight: -1.5 }
-  - { set: 'item.year == 2002', weight: 3.0 }
+  - {{ item: "Heat (1995)", weight: -1.5 }}
+  - {{ set: 'item.year == 2002', weight: 3.0 }}
 exclude_keywords: ["DuringCreditsStinger "]
 "#,
-        );
+            db = db.display(),
+        ));
         let got = run_profile(&profile_catalog(), &dir, &pool).unwrap();
         assert_eq!(
             got,
@@ -2270,6 +2348,54 @@ exclude_keywords: ["DuringCreditsStinger "]
                 "exclude:duringcreditsstinger",
             ]
         );
+    }
+
+    /// The store's own stemmed spelling, not the surface as written, is what
+    /// `ctx.profile` carries — proving `keyword: Heists` really goes through
+    /// `keyword_forms` rather than just lowercasing (etv-station-sctf.1).
+    #[test]
+    fn a_keyword_resolves_through_keyword_forms_to_its_stored_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("taste.db");
+        write_keyword_store_fixture(&db, &[("heists", "heist")]);
+        let pool = profile_pool(&format!(
+            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
+             profile:\n  - {{ keyword: Heists, weight: 1.0 }}\n",
+            db = db.display(),
+        ));
+        let got = run_profile(&profile_catalog(), &dir, &pool).unwrap();
+        assert_eq!(got, vec!["keyword:keywords=heist:1.0@inline"]);
+    }
+
+    /// A spelling `keyword_forms` has never seen fails naming the entry and
+    /// the spelling, rather than silently passing it through unmatched.
+    #[test]
+    fn an_unresolvable_keyword_spelling_fails_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("taste.db");
+        write_keyword_store_fixture(&db, &[("heists", "heist")]);
+        let pool = profile_pool(&format!(
+            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
+             profile:\n  - {{ keyword: nosuchword, weight: 1.0 }}\n",
+            db = db.display(),
+        ));
+        let msg = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
+        assert!(msg.contains("profile entry 1 in inline"), "msg = {msg}");
+        assert!(msg.contains("\"nosuchword\""), "msg = {msg}");
+        assert!(msg.contains("matches no stored keyword"), "msg = {msg}");
+    }
+
+    /// A `keyword` entry on a pool that grants no datastore fails naming the
+    /// entry, rather than resolving against nothing.
+    #[test]
+    fn a_keyword_entry_without_a_granted_datastore_fails_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { keyword: heist, weight: 1.0 }\n",
+        );
+        let msg = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
+        assert!(msg.contains("profile entry 1 in inline"), "msg = {msg}");
+        assert!(msg.contains("grants none"), "msg = {msg}");
     }
 
     #[test]

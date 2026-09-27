@@ -898,7 +898,7 @@ all the weight math (ADR 0002).
 
 | Key | Resolves to |
 |---|---|
-| `keyword` | the value lowercased, trimmed, whitespace collapsed |
+| `keyword` | the value lowercased, trimmed, whitespace collapsed, then looked up in the pool's first granted datastore's `keyword_forms` — its stored, stemmed form (`Heists` resolves because the store recorded that spelling, not because the station stems it) |
 | `genre`, `label`, `cast`, `director`, `writer`, `producer`, `country`, `studio`, `content_rating` | the value lowercased, under the item-map key it is read from (`genres`, `labels`, `cast`, `directors`, `writers`, `producers`, `countries`, `studio`, `content_rating`) |
 | `item` | one catalog entry, by external id (`imdb:…`, `tmdb:…`, `tvdb:…`, or an `entry_id` of that shape) or by exact `Title (Year)` among non-episodes |
 | `set` | every entry a CEL expression matches, resolved like `sources` |
@@ -924,8 +924,10 @@ Rejected at load, naming the pool, origin and position: any of the three on a
 pool with no `plugin`; an entry naming zero or two references, an empty value,
 an unknown key, a zero or non-finite weight, or an `item` in neither shape; an
 unreadable profile file; an empty `exclude_keywords` value. Failing the
-generation, naming the entry: an `item` matching no entry or several (listed),
-and a `set` that fails to resolve or matches nothing.
+generation, naming the entry and the spelling: an `item` matching no entry or
+several (listed); a `set` that fails to resolve or matches nothing; a
+`keyword` or `exclude_keywords` spelling `keyword_forms` has never seen, or a
+`keyword`/`exclude_keywords` entry on a pool that grants no datastore.
 
 #### How `taste-cosine.rhai` scores a taste profile
 

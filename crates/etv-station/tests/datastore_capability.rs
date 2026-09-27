@@ -181,6 +181,101 @@ fn pick(ctx) { ctx.datastore("taste_db"); ["must not reach here"] }
     assert!(err.contains("taste_db"), "got {err}");
 }
 
+/// A fixture whose `enrichment` table carries two literal rows for the same
+/// `(item_id, namespace, key, value)` — the pre-source-column shape two
+/// sources recording the same keyword produced before schema v10 (ADR-0016)
+/// collapsed `enrichment`'s primary key to include `source`. The reader's
+/// `GROUP BY`/`DISTINCT` dedup doesn't care what made the rows duplicate,
+/// only that they carry the same four columns, so this reproduces the shape
+/// without needing a `source` column at all. Also carries one `keyword_forms`
+/// row, for the keyword-surface accessors (etv-station-sctf.1).
+fn write_dupe_and_keyword_form_fixture(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES ({version});
+         CREATE TABLE items (
+             item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
+             show_item_id TEXT, season INTEGER, episode INTEGER
+         );
+         CREATE TABLE enrichment (
+             item_id TEXT NOT NULL, namespace TEXT NOT NULL,
+             key TEXT NOT NULL, value TEXT NOT NULL, fetched_at TEXT NOT NULL
+         );
+         CREATE TABLE plays (
+             history_key TEXT PRIMARY KEY, item_id TEXT NOT NULL,
+             plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL
+         );
+         CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);
+         INSERT INTO items (item_id, type) VALUES ('dup-a', 'movie');
+         INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+             ('dup-a', 'keywords', 'keyword', 'heist', '2026-01-01T00:00:00+00:00'),
+             ('dup-a', 'keywords', 'keyword', 'heist', '2026-01-01T00:00:00+00:00');
+         INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+             ('h1', 'dup-a', 42, 1700000000);
+         INSERT INTO keyword_forms (surface, keyword) VALUES ('heists', 'heist');",
+        version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+    ))
+    .unwrap();
+}
+
+/// The concern the vendor refresh fixes: before it, `taste-cosine.rhai` summed
+/// every enrichment row per candidate with no dedup, so two sources recording
+/// the same `(item, keyword)` double-counted it in both `enrichment_for` and
+/// the taste rollup's per-attribute share. The reader's own `GROUP
+/// BY`/`DISTINCT` collapse (schema v10, ADR-0016) is what the scorer now
+/// relies on for that, with no counting logic of its own.
+#[test]
+fn a_duplicate_item_keyword_row_from_two_sources_counts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("taste.db");
+    write_dupe_and_keyword_form_fixture(&db);
+    let reader = plexdb_reader::Reader::open(&db).unwrap();
+
+    let facts = reader.enrichment_for("dup-a", "keywords").unwrap();
+    assert_eq!(
+        facts.len(),
+        1,
+        "two rows for the same (item, keyword) must collapse to one fact"
+    );
+
+    // One play of a title whose only distinct keyword is duplicated: if the
+    // rollup counted the duplicate, this would divide `sqrt(1)` by 2
+    // attributes instead of 1.
+    let vector = reader.taste_vector_for(42).unwrap();
+    assert_eq!(
+        vector.attributes.len(),
+        1,
+        "one played title with one distinct keyword contributes one attribute"
+    );
+    assert_eq!(
+        vector.attributes[0].weight, 1.0,
+        "a duplicated fact must not shrink the share a real play contributes"
+    );
+}
+
+/// `ctx.datastore(name).keyword_for_surface`/`surfaces_for_keyword` (#181,
+/// etv-station-sctf.1) — the same `keyword_forms` lookup a `keyword:` profile
+/// entry resolves through, exposed to a script so it can explain a
+/// candidate's own keywords with a spelling a viewer recognizes.
+#[test]
+fn keyword_for_surface_and_surfaces_for_keyword_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("taste.db");
+    write_dupe_and_keyword_form_fixture(&db);
+    let reader = plexdb_reader::Reader::open(&db).unwrap();
+
+    assert_eq!(
+        reader.keyword_for_surface("Heists").unwrap(),
+        Some("heist".to_string())
+    );
+    assert_eq!(reader.keyword_for_surface("nosuchword").unwrap(), None);
+    assert_eq!(
+        reader.surfaces_for_keyword("heist").unwrap(),
+        vec!["heists".to_string()]
+    );
+}
+
 /// A plugin granted one datastore reaching for a *different* name it was
 /// never granted fails the same way — the grant is per name, not a single
 /// on/off switch.

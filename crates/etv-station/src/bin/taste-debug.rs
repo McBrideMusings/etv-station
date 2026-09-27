@@ -21,6 +21,11 @@
 //!
 //! Omit `--account-id` to score against the pooled (house-wide) taste vector,
 //! matching what 001-for-you/channel.yaml does.
+//!
+//! `--resolve <surface>` (etv-station-sctf.1) checks one keyword spelling
+//! against the pool's datastore instead of running a pick — the same
+//! `keyword_forms` lookup a `keyword:` profile entry resolves through — and
+//! exits before the catalog or plugin is ever opened.
 
 use std::path::{Path, PathBuf};
 
@@ -85,6 +90,15 @@ struct Cli {
     /// Skip the second, extended run entirely — just the realistic slate.
     #[arg(long)]
     no_extended: bool,
+
+    /// Resolve one keyword spelling against the pool's datastore and exit —
+    /// the same `keyword_forms` lookup a `keyword:` profile entry runs
+    /// (etv-station-sctf.1), for checking a spelling before writing it into a
+    /// channel. `--channel`/`--catalog` are still required, to find which
+    /// datastore to check against, but no pick runs and the catalog is never
+    /// opened.
+    #[arg(long)]
+    resolve: Option<String>,
 }
 
 fn expand_env(raw: &str) -> Result<String, String> {
@@ -164,6 +178,18 @@ fn main() -> Result<(), String> {
         .first()
         .map(|g| g.name.clone())
         .unwrap_or_else(|| "taste".to_string());
+
+    if let Some(surface) = &cli.resolve {
+        let reader = plexdb_reader::Reader::open(&plexdb_path).map_err(|e| e.to_string())?;
+        match reader
+            .keyword_for_surface(surface)
+            .map_err(|e| e.to_string())?
+        {
+            Some(stored) => println!("{surface:?} resolves to {stored:?}"),
+            None => println!("{surface:?} is unknown — no stored keyword matches it"),
+        }
+        return Ok(());
+    }
 
     // A single_user channel resolves its own account the same way a live
     // generation does — from its own scoring.user, via Tautulli — so this

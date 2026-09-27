@@ -12,9 +12,12 @@
 //! - [`load`] reads `profile_files` and the inline `profile`, and checks each
 //!   entry's shape. It needs only the filesystem, so config validation runs it
 //!   and a malformed entry fails the load.
-//! - [`resolve`] looks every reference up in the catalog. It runs in the
+//! - [`resolve`] looks every reference up in the catalog, and a `keyword`
+//!   reference against the pool's granted datastore's `keyword_forms` table
+//!   ([`plexdb_reader::Reader::keyword_for_surface`]). It runs in the
 //!   catalog-reading half of a generation ([`crate::score::ScoreCache`]'s
-//!   prepare step), so an unmatched item fails the generation, not the load.
+//!   prepare step), so an unmatched item or keyword spelling fails the
+//!   generation, not the load.
 
 use std::path::Path;
 
@@ -300,20 +303,49 @@ pub fn check_exclude_keywords(pool: &Pool) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve every loaded entry against the catalog.
+/// The stored keyword a normalized surface spelling maps to, via the
+/// datastore's `keyword_forms` table (etv-station-sctf.1) — the one function
+/// a keyword's resolution goes through, so a spelling `keyword_forms` has
+/// never seen fails naming itself rather than being passed through unmatched.
+fn resolve_keyword_surface(
+    reader: &plexdb_reader::Reader,
+    surface: &str,
+) -> Result<String, String> {
+    reader
+        .keyword_for_surface(surface)
+        .map_err(|e| format!("keyword {surface:?}: {e}"))?
+        .ok_or_else(|| format!("keyword {surface:?} matches no stored keyword"))
+}
+
+/// Resolve every loaded entry against the catalog. `keyword_store` is the
+/// pool's granted datastore (its first grant — the same one a channel author
+/// points a `keyword:`-reading scorer at), needed only when an entry or
+/// `exclude_keywords` names a keyword; `None` fails such an entry naming the
+/// pool's missing grant, rather than resolving nothing.
 pub fn resolve(
     catalog: &Catalog,
     entries: &[LoadedEntry],
     exclude_keywords: &[String],
+    keyword_store: Option<&plexdb_reader::Reader>,
 ) -> Result<ResolvedProfile, String> {
     let mut out = Array::with_capacity(entries.len());
     for entry in entries {
         let mut m = Map::new();
         match &entry.reference {
             Reference::Keyword(k) => {
+                let reader = keyword_store.ok_or_else(|| {
+                    format!(
+                        "{}: `keyword: {}` needs a granted datastore to resolve its spelling \
+                         against — this pool grants none",
+                        entry.locate(),
+                        entry.written
+                    )
+                })?;
+                let stored = resolve_keyword_surface(reader, k)
+                    .map_err(|msg| format!("{}: {msg}", entry.locate()))?;
                 m.insert("kind".into(), "keyword".into());
                 m.insert("namespace".into(), "keywords".into());
-                m.insert("value".into(), k.clone().into());
+                m.insert("value".into(), stored.into());
             }
             Reference::Tag { namespace, value } => {
                 m.insert("kind".into(), "tag".into());
@@ -348,10 +380,23 @@ pub fn resolve(
         m.insert("origin".into(), entry.origin.clone().into());
         out.push(Dynamic::from_map(m));
     }
-    let exclude = exclude_keywords
-        .iter()
-        .map(|k| Dynamic::from(normalize_keyword(k)))
-        .collect();
+    let exclude = if exclude_keywords.is_empty() {
+        Array::new()
+    } else {
+        let reader = keyword_store.ok_or_else(|| {
+            "`exclude_keywords` needs a granted datastore to resolve its spellings against — \
+             this pool grants none"
+                .to_string()
+        })?;
+        let mut resolved = Array::with_capacity(exclude_keywords.len());
+        for raw in exclude_keywords {
+            let surface = normalize_keyword(raw);
+            let stored = resolve_keyword_surface(reader, &surface)
+                .map_err(|msg| format!("exclude_keywords: {msg}"))?;
+            resolved.push(Dynamic::from(stored));
+        }
+        resolved
+    };
     Ok(ResolvedProfile {
         entries: out,
         exclude_keywords: exclude,

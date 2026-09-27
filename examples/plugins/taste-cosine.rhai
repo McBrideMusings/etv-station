@@ -250,12 +250,26 @@ fn tag_values(field) {
     out
 }
 
-// Profile map keys (`bucket \x01 value`) as `bucket: value`, for the audit.
-fn display_keys(keys) {
+// Profile map keys (`bucket \x01 value`) as `bucket: value`, for the audit —
+// a `keywords` value's stored form gains the raw spelling(s) the store
+// actually recorded for it (`ds.surfaces_for_keyword`, #181), so the audit
+// shows what a viewer would recognize alongside the stemmed form the score
+// math ran on. Every other bucket is already a value a channel author wrote
+// verbatim, so it needs no such lookup.
+fn display_keys(ds, keys) {
     let out = [];
     for k in keys {
         let parts = k.split("\x01");
-        out.push(parts[0] + ": " + parts[1]);
+        let bucket = parts[0];
+        let value = parts[1];
+        let shown = value;
+        if bucket == keyword_bucket() {
+            let surfaces = ds.surfaces_for_keyword(value);
+            if surfaces.len > 0 {
+                shown += " (" + surfaces.reduce(|s, x| if s == () { x } else { s + ", " + x }) + ")";
+            }
+        }
+        out.push(bucket + ": " + shown);
     }
     out
 }
@@ -1032,8 +1046,8 @@ fn pick(ctx) {
             // The five pairs that weighed most on each side — a heavily
             // tagged title can match dozens, and the audit record has a byte
             // budget (ADR 0011).
-            favor_matches: top_keywords(display_keys(row.on_favor), row.on_favor_w, 5),
-            disfavor_matches: top_keywords(display_keys(row.on_disfavor), row.on_disfavor_w, 5),
+            favor_matches: top_keywords(display_keys(ds, row.on_favor), row.on_favor_w, 5),
+            disfavor_matches: top_keywords(display_keys(ds, row.on_disfavor), row.on_disfavor_w, 5),
             profile_entries: profile_entries,
             // The house term and the half of the library this pool drew from
             // (#411), so an audit line says which of the two movie pools a

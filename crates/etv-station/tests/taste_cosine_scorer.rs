@@ -59,7 +59,8 @@ fn empty_store(path: &Path) -> rusqlite::Connection {
          CREATE TABLE plays (
              history_key TEXT PRIMARY KEY, item_id TEXT NOT NULL,
              plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL
-         );",
+         );
+         CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);",
         version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
     ))
     .unwrap();
@@ -1658,6 +1659,8 @@ fn write_profile_fixture(path: &Path) {
                  ('p-both', 'keywords', 'keyword', 'ghost', 't'),
                  ('p-none', 'keywords', 'keyword', 'picnic', 't'),
                  ('heat', 'keywords', 'keyword', 'heist', 't');
+             INSERT INTO keyword_forms (surface, keyword) VALUES
+                 ('heist', 'heist'), ('ghost', 'ghost');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'heat', 42, 1700000000);",
         )
@@ -1704,7 +1707,9 @@ impl Scorer {
     /// way the daemon resolves it, before `pick`.
     fn with_profile(mut self, cat: &Catalog, pool: &str, profile_yaml: &str) -> Self {
         let pool: etv_station::config::Pool = serde_norway::from_str(&format!(
-            "name: {pool}\nplugin: plugin.rhai\nprofile:\n{profile_yaml}"
+            "name: {pool}\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
+             profile:\n{profile_yaml}",
+            db = self.db.display(),
         ))
         .unwrap();
         self.cache
@@ -1758,7 +1763,7 @@ fn a_keyword_and_an_item_sharing_it_net_to_their_difference() {
     assert_close(detail_f64(p, "disfavor_score"), 0.0, "p-heist's disfavor");
     assert_eq!(
         detail_of(p)["favor_matches"],
-        serde_json::json!(["keywords: heist"])
+        serde_json::json!(["keywords: heist (heist)"])
     );
     let refs: Vec<&str> = detail_of(p)["profile_entries"]
         .as_array()
