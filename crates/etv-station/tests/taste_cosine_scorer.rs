@@ -90,11 +90,11 @@ fn write_taste_fixture(path: &Path) {
              --   1.0 * (1 + ln(3/2)) / sqrt(2).
              -- mov-b: no keywords at all -> ineligible, score 0.0.
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('mov-a', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
-                 ('mov-a', 'tmdb_keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
-                 ('mov-c', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
-                 ('mov-d', 'tmdb_keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
-                 ('mov-d', 'tmdb_keywords', 'keyword', 'desert', '2026-01-01T00:00:00+00:00');
+                 ('mov-a', 'keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('mov-a', 'keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
+                 ('mov-c', 'keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('mov-d', 'keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
+                 ('mov-d', 'keywords', 'keyword', 'desert', '2026-01-01T00:00:00+00:00');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'mov-a', 42, 1700000000);",
         )
@@ -122,12 +122,12 @@ fn write_two_account_fixture(path: &Path) {
             "INSERT INTO items (item_id, type) VALUES
                  ('acct-a', 'movie'), ('acct-b', 'movie'), ('acct-c', 'movie'), ('acct-x', 'movie');
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('acct-a', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
-                 ('acct-a', 'tmdb_keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
-                 ('acct-b', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
-                 ('acct-b', 'tmdb_keywords', 'keyword', 'space', '2026-01-01T00:00:00+00:00'),
-                 ('acct-c', 'tmdb_keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
-                 ('acct-x', 'tmdb_keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00');
+                 ('acct-a', 'keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('acct-a', 'keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00'),
+                 ('acct-b', 'keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('acct-b', 'keywords', 'keyword', 'space', '2026-01-01T00:00:00+00:00'),
+                 ('acct-c', 'keywords', 'keyword', 'contact', '2026-01-01T00:00:00+00:00'),
+                 ('acct-x', 'keywords', 'keyword', 'time', '2026-01-01T00:00:00+00:00');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'acct-a', 42, 1700000000),
                  ('h4', 'acct-x', 42, 1700000003),
@@ -343,7 +343,7 @@ fn large_scorer(n_eligible: usize, n_ineligible: usize) -> Scorer {
             if id.starts_with("el-") {
                 conn.execute(
                     "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
-                     VALUES (?1, 'tmdb_keywords', 'keyword', ?2, 't')",
+                     VALUES (?1, 'keywords', 'keyword', ?2, 't')",
                     rusqlite::params![id, format!("kw{i}")],
                 )
                 .unwrap();
@@ -867,15 +867,15 @@ fn write_idf_fixture(path: &Path) {
              -- multi), so doc_count = 6. df(common) = 5 (gen1-4, multi);
              -- df(rare) = 2 (rare1, multi).
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('seed',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
-                 ('seed',  'tmdb_keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00'),
-                 ('gen1',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
-                 ('gen2',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
-                 ('gen3',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
-                 ('gen4',  'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
-                 ('rare1', 'tmdb_keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00'),
-                 ('multi', 'tmdb_keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
-                 ('multi', 'tmdb_keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00');
+                 ('seed',  'keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('seed',  'keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00'),
+                 ('gen1',  'keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('gen2',  'keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('gen3',  'keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('gen4',  'keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('rare1', 'keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00'),
+                 ('multi', 'keywords', 'keyword', 'common', '2026-01-01T00:00:00+00:00'),
+                 ('multi', 'keywords', 'keyword', 'rare',   '2026-01-01T00:00:00+00:00');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'seed', 42, 1700000000);",
         )
@@ -1151,11 +1151,11 @@ fn write_shows_fixture(path: &Path) {
             "INSERT INTO items (item_id, type) VALUES
                  ('sh-a', 'show'), ('sh-b', 'show'), ('sh-c', 'show'), ('sh-d', 'show');
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('sh-a', 'tmdb_keywords', 'keyword', 'contact', 't'),
-                 ('sh-a', 'tmdb_keywords', 'keyword', 'time', 't'),
-                 ('sh-b', 'tmdb_keywords', 'keyword', 'contact', 't'),
-                 ('sh-c', 'tmdb_keywords', 'keyword', 'time', 't'),
-                 ('sh-c', 'tmdb_keywords', 'keyword', 'desert', 't');
+                 ('sh-a', 'keywords', 'keyword', 'contact', 't'),
+                 ('sh-a', 'keywords', 'keyword', 'time', 't'),
+                 ('sh-b', 'keywords', 'keyword', 'contact', 't'),
+                 ('sh-c', 'keywords', 'keyword', 'time', 't'),
+                 ('sh-c', 'keywords', 'keyword', 'desert', 't');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'sh-a', 42, 1700000000);",
         )
@@ -1446,11 +1446,11 @@ fn write_seen_fixture(path: &Path) {
             "INSERT INTO items (item_id, type) VALUES
                  ('mov-a', 'movie'), ('mov-c', 'movie'), ('mov-d', 'movie');
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('mov-a', 'tmdb_keywords', 'keyword', 'contact', 't'),
-                 ('mov-a', 'tmdb_keywords', 'keyword', 'time', 't'),
-                 ('mov-c', 'tmdb_keywords', 'keyword', 'contact', 't'),
-                 ('mov-d', 'tmdb_keywords', 'keyword', 'time', 't'),
-                 ('mov-d', 'tmdb_keywords', 'keyword', 'desert', 't');
+                 ('mov-a', 'keywords', 'keyword', 'contact', 't'),
+                 ('mov-a', 'keywords', 'keyword', 'time', 't'),
+                 ('mov-c', 'keywords', 'keyword', 'contact', 't'),
+                 ('mov-d', 'keywords', 'keyword', 'time', 't'),
+                 ('mov-d', 'keywords', 'keyword', 'desert', 't');
              -- Account 42 has played mov-a and nothing else. Account 99's two
              -- plays of mov-c exist only to make the pooled vector differ
              -- from 42's; they must never make mov-c look watched to 42.
@@ -1651,13 +1651,13 @@ fn write_profile_fixture(path: &Path) {
                  ('p-heist', 'movie'), ('p-horror', 'movie'), ('p-both', 'movie'),
                  ('p-none', 'movie'), ('heat', 'movie');
              INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('p-heist', 'tmdb_keywords', 'keyword', 'heist', 't'),
-                 ('p-heist', 'tmdb_keywords', 'keyword', 'vault', 't'),
-                 ('p-horror', 'tmdb_keywords', 'keyword', 'ghost', 't'),
-                 ('p-both', 'tmdb_keywords', 'keyword', 'heist', 't'),
-                 ('p-both', 'tmdb_keywords', 'keyword', 'ghost', 't'),
-                 ('p-none', 'tmdb_keywords', 'keyword', 'picnic', 't'),
-                 ('heat', 'tmdb_keywords', 'keyword', 'heist', 't');
+                 ('p-heist', 'keywords', 'keyword', 'heist', 't'),
+                 ('p-heist', 'keywords', 'keyword', 'vault', 't'),
+                 ('p-horror', 'keywords', 'keyword', 'ghost', 't'),
+                 ('p-both', 'keywords', 'keyword', 'heist', 't'),
+                 ('p-both', 'keywords', 'keyword', 'ghost', 't'),
+                 ('p-none', 'keywords', 'keyword', 'picnic', 't'),
+                 ('heat', 'keywords', 'keyword', 'heist', 't');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'heat', 42, 1700000000);",
         )
@@ -1900,7 +1900,7 @@ fn set_scorer(n: usize) -> Scorer {
                 if carries {
                     conn.execute(
                         "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
-                         VALUES (?1, 'tmdb_keywords', 'keyword', ?2, 't')",
+                         VALUES (?1, 'keywords', 'keyword', ?2, 't')",
                         [id, kw],
                     )
                     .unwrap();

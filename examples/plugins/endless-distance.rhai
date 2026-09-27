@@ -95,7 +95,7 @@ fn pick(ctx) {
     // inside the walk below. The store connection behind `ds` was opened
     // once for this whole generation, so this is a single, consistent read
     // of it — a snapshot, not a live poll.
-    let grouped = ds.enrichment_for_many(ids, "tmdb_keywords");
+    let grouped = ds.enrichment_for_many(ids, "keywords");
 
     // Build every id-keyed structure the walk needs *before* the walk, per
     // #172: `keywords` (this title's tokens, one `key|value` string per
@@ -129,7 +129,7 @@ fn pick(ctx) {
     }
 
     if candidates.len == 0 {
-        throw "endless-distance: no candidate in this pool's sources carries tmdb_keywords";
+        throw "endless-distance: no candidate in this pool's sources carries keywords";
     }
 
     // The walk's starting point: the most recently aired item this pool

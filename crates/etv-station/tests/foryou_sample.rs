@@ -143,13 +143,13 @@ fn write_taste_fixture(path: &Path) {
              ('mov-her', 'movie'), ('mov-interstellar', 'movie'), ('mov-moon', 'movie'),
              ('mov-solaris', 'movie');
          INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-             ('mov-contact', 'tmdb_keywords', 'keyword', 'signal', '2026-01-01T00:00:00+00:00'),
-             ('mov-contact', 'tmdb_keywords', 'keyword', 'alien', '2026-01-01T00:00:00+00:00'),
-             ('mov-contact', 'tmdb_keywords', 'keyword', 'thriller', '2026-01-01T00:00:00+00:00'),
-             ('mov-dune', 'tmdb_keywords', 'keyword', 'signal', '2026-01-01T00:00:00+00:00'),
-             ('mov-dune', 'tmdb_keywords', 'keyword', 'alien', '2026-01-01T00:00:00+00:00'),
-             ('mov-arrival', 'tmdb_keywords', 'keyword', 'signal', '2026-01-01T00:00:00+00:00'),
-             ('mov-arrival', 'tmdb_keywords', 'keyword', 'linguistics', '2026-01-01T00:00:00+00:00');
+             ('mov-contact', 'keywords', 'keyword', 'signal', '2026-01-01T00:00:00+00:00'),
+             ('mov-contact', 'keywords', 'keyword', 'alien', '2026-01-01T00:00:00+00:00'),
+             ('mov-contact', 'keywords', 'keyword', 'thriller', '2026-01-01T00:00:00+00:00'),
+             ('mov-dune', 'keywords', 'keyword', 'signal', '2026-01-01T00:00:00+00:00'),
+             ('mov-dune', 'keywords', 'keyword', 'alien', '2026-01-01T00:00:00+00:00'),
+             ('mov-arrival', 'keywords', 'keyword', 'signal', '2026-01-01T00:00:00+00:00'),
+             ('mov-arrival', 'keywords', 'keyword', 'linguistics', '2026-01-01T00:00:00+00:00');
          INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
              ('h1', 'mov-contact', 42, 1700000000);",
         version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,

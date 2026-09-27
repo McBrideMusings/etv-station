@@ -850,7 +850,7 @@ second show at all. `001-for-you` uses it; `002`/`003` use `"show"`, which
 suits their `take: 3`.
 
 A `unit: "show"` pool ranks the **series**, not the episode. An episode
-carries no `tmdb_keywords` of its own, so the script resolves each one to its
+carries no `keywords` of its own, so the script resolves each one to its
 show through the catalog's GUID-derived `show_id` (#274 — the change that
 made this possible; before it, `show_id` came from the show's title and
 joined to nothing) and scores the show, then hands back the top `show_count`
@@ -956,7 +956,7 @@ candidates. `disfavor` is the same against the disfavor map. Disfavor sits
 under the fraction, so a profile of nothing but negative weights can pull a
 score toward zero and never below it.
 
-A candidate's keywords are its `tmdb_keywords` in the granted datastore; its
+A candidate's keywords are its `keywords` in the granted datastore; its
 tag values come from its catalog item map, lowercased. On a `unit: show` pool
 a show's tag values are the union over its episodes — every episode carries
 its show's genres.

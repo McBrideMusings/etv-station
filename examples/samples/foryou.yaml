@@ -112,7 +112,7 @@ rule:
             # this default, decided by a per-slot coin flip seeded from
             # `ctx.seed` rather than a fixed stride, so which slots explore
             # varies by seed and reproduces for a pinned one. Never draws a
-            # title the store has no `tmdb_keywords` fact for.
+            # title the store has no `keywords` fact for.
             exploration_fraction: 0.2
           select: round_robin
           advance: restart

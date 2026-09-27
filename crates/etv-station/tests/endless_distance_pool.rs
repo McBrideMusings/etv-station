@@ -1,7 +1,7 @@
 //! Acceptance tests for the Endless pool provider (#176):
 //! `examples/plugins/endless-distance.rhai` picks each item by keyword-cosine
 //! distance from the item picked before it, inside a declared band that
-//! drifts over the run, reading `tmdb_keywords` from a granted plex-db-ex
+//! drifts over the run, reading `keywords` from a granted plex-db-ex
 //! snapshot.
 //!
 //! Every fixture here is written fresh by this file (mirroring
@@ -25,7 +25,7 @@ fn plugin_path() -> PathBuf {
 }
 
 /// Writes a minimal plexdb-schema store: one `movie` row per `(item_id,
-/// keywords)` pair, each keyword landing as one `tmdb_keywords` enrichment
+/// keywords)` pair, each keyword landing as one `keywords` enrichment
 /// row with `key = "keyword"`. An entry with an empty keyword slice gets no
 /// enrichment rows at all — a title the real store never tagged.
 fn write_fixture(path: &Path, movies: &[(&str, &[&str])]) {
@@ -61,7 +61,7 @@ fn write_fixture(path: &Path, movies: &[(&str, &[&str])]) {
         for kw in *keywords {
             conn.execute(
                 "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
-                 VALUES (?1, 'tmdb_keywords', 'keyword', ?2, '2026-01-01T00:00:00+00:00')",
+                 VALUES (?1, 'keywords', 'keyword', ?2, '2026-01-01T00:00:00+00:00')",
                 (id, kw),
             )
             .unwrap();
@@ -214,7 +214,7 @@ fn walks_the_band_then_jumps_when_the_local_neighbourhood_is_exhausted() {
     );
 }
 
-/// A title with zero `tmdb_keywords` rows is excluded from the candidate set
+/// A title with zero `keywords` rows is excluded from the candidate set
 /// entirely — never picked, and never scored as if it were distance 1.0 from
 /// everything (which would make it indistinguishable from a real, ordinary
 /// far-away title).

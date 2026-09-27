@@ -36,7 +36,7 @@
 // was the gap that made #254 ship movies-only, and it is closed. Verified
 // against the live snapshot: all 1,633 distinct catalog `show_id`s match a
 // `type='show'` row in the plex-db-ex store, 1,550 of them carrying
-// tmdb_keywords.
+// keywords.
 //
 // A shows pool therefore ranks SERIES, not episodes: an episode has no
 // keywords to score, and ordering episodes by anything but season/episode
@@ -231,7 +231,7 @@ fn datastore_name() { "taste" }
 // exploration eligibility rule below reads "has a fact in a namespace this
 // scorer reads" rather than "has TMDB keywords" — a second namespace this
 // scorer grows into later is one more line here, not a rewritten rule.
-fn enrichment_namespace() { "tmdb_keywords" }
+fn enrichment_namespace() { "keywords" }
 
 // The datastore row a profile member's keywords live on: the title itself, or
 // for an episode, its show — an episode carries no keywords of its own.
@@ -488,7 +488,7 @@ fn pick(ctx) {
         // keys its `items` rows on, which is what makes this join possible
         // at all. Verified against the live snapshot: all 1,633 distinct
         // show_ids in the catalog match a `type='show'` row there, 1,550 of
-        // them carrying tmdb_keywords.
+        // them carrying keywords.
         //
         // One pass over the episodes, grouping each under its show. An
         // episode with no `show_id` is dropped rather than aired as a series
@@ -883,7 +883,7 @@ fn pick(ctx) {
     }
 
     // The candidates an exploration slot may draw from — only ones the
-    // store has at least one `tmdb_keywords` fact for (#254). A title with
+    // store has at least one `keywords` fact for (#254). A title with
     // none is not "on-profile with weight zero"; it is a title this scorer
     // cannot say anything about, and handing it to a surprise slot reads as
     // the recommender being broken rather than as a surprise.
