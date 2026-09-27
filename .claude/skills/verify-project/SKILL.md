@@ -171,6 +171,31 @@ never lands inside what is on screen. Unedited channels must stay silent: the
 hash excludes the catalog precisely so a Plex ingest does not rewrite a
 taste-scored channel's future.
 
+**This recipe only proves a content edit to an already-serving channel reaches
+the screen.** It does not prove a channel starting to load (or stopping) is
+now visible in the *lineup* — check that separately, always, after any
+`admin deploy files` that touches `channel.yaml` or a plugin a channel's
+`channel.yaml` references:
+
+```bash
+ssh "$UNRAID_USER@$UNRAID_HOST" \
+  "cat /mnt/user/appdata/etv-station/etv-next/lineup.json" | grep -c '"number"'
+# expect: the count of channel directories under deploy/appdata/channels/
+```
+
+The daemon re-renders `lineup.json` on every `SIGHUP`-triggered generation
+(`rerender_etv_next` in `daemon.rs`), so `admin reload` now covers this too —
+but reading the daemon's own logs (`chunk.write`, `resume.load`,
+`channel.load_failed`'s *absence*) is not the same check and does not catch a
+regression in that render path. The lineup file itself, or the actual channel
+count on `/channels.m3u`, is the only thing that proves what ETV-next is
+serving. This is what bit prod on 2026-09-27: 53 of 62 channels silently
+dropped from the lineup by a stale `channel.yaml` overlay schema after a code
+deploy, invisible in the daemon's own (healthy-looking) logs for three days,
+and even after a first-pass fix, still invisible because a check of the
+daemon's internal state was mistaken for a check of what was actually being
+served.
+
 To force one without a config change:
 
 ```bash
