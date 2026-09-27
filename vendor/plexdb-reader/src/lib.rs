@@ -37,6 +37,13 @@
 //! the source, so all four are `Option<_>` here — collapsing a missing `rank`
 //! to `0` would make "unordered" and "ranked first" indistinguishable.
 //!
+//! Keywords live in the one `keywords` namespace, whatever source wrote them
+//! (ADR-0016). [`Reader::keyword_for_surface`] and
+//! [`Reader::surfaces_for_keyword`] read `keyword_forms`, the store's map
+//! between raw spellings and the stemmed form it keeps. Every read that returns
+//! enrichment returns each `(key, value)` once per title even when several
+//! sources carry it, and `source` never reaches a caller.
+//!
 //! [adr-0003]: https://github.com/McBrideMusings/plex-db-ex/blob/main/docs/adr/0003-rust-reader-crate-behind-a-plugin-capability-grant.md
 
 mod error;
@@ -46,7 +53,7 @@ mod schema;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, Row};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 
 pub use error::ReaderError;
 pub use model::{CollectionMembership, Edge, EnrichmentFact, TasteAttribute, TasteVector};
@@ -74,6 +81,16 @@ type AttributesByItem = BTreeMap<String, Vec<AttributeKey>>;
 /// with this exact constant and proves a write against it fails.
 const OPEN_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY;
 
+/// The whole of the spelling rule this crate applies: lowercase, trim, collapse
+/// whitespace runs to one space.
+fn normalize_surface(surface: &str) -> String {
+    surface
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A read-only handle on a `plexdb.db` store.
 #[derive(Debug)]
 pub struct Reader {
@@ -99,15 +116,20 @@ impl Reader {
 
     /// Every enrichment fact recorded for `item_id` under `namespace`, in
     /// `(key, value)` order. Empty, not an error, when nothing is recorded.
+    ///
+    /// Each `(key, value)` comes back once, however many sources list it (the
+    /// store's primary key carries `source`, ADR-0016); `source` is never
+    /// returned, and `fetched_at` is the newest of the sources' stamps.
     pub fn enrichment_for(
         &self,
         item_id: &str,
         namespace: &str,
     ) -> Result<Vec<EnrichmentFact>, ReaderError> {
         let mut stmt = self.conn.prepare(
-            "SELECT namespace, key, value, fetched_at \
+            "SELECT namespace, key, value, MAX(fetched_at) \
              FROM enrichment \
              WHERE item_id = ?1 AND namespace = ?2 \
+             GROUP BY namespace, key, value \
              ORDER BY key, value",
         )?;
         let rows = stmt
@@ -125,6 +147,9 @@ impl Reader {
     /// normal) — never an error, and never an empty entry a caller has to
     /// tell apart from "absent". Empty input returns an empty map without
     /// touching the database.
+    ///
+    /// A `(key, value)` two sources both carry appears once per id, exactly as
+    /// in [`Self::enrichment_for`].
     ///
     /// One `SELECT ... WHERE item_id IN (...) AND namespace = ?` per chunk
     /// of ids, not one query per id: a scorer ranking a whole candidate set
@@ -169,9 +194,10 @@ impl Reader {
             // `item_id` comes last so the first four columns are exactly the
             // ones [`Self::enrichment_row`] reads.
             let sql = format!(
-                "SELECT namespace, key, value, fetched_at, item_id \
+                "SELECT namespace, key, value, MAX(fetched_at), item_id \
                  FROM enrichment \
                  WHERE item_id IN ({placeholders}) AND namespace = ? \
+                 GROUP BY item_id, namespace, key, value \
                  ORDER BY item_id, key, value"
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -188,6 +214,48 @@ impl Reader {
         }
 
         Ok(by_item)
+    }
+
+    /// The stored keyword a raw spelling maps to, or `None` for a spelling the
+    /// store has never seen.
+    ///
+    /// `surface` is lowercased, trimmed and its whitespace runs collapsed to one
+    /// space, then looked up in `keyword_forms`. **Nothing else happens here, and
+    /// in particular no stemming**: the stored keywords are stemmed by the
+    /// Python writer and only it (ADR-0016), so `Heists` resolves because the
+    /// writer recorded that spelling, not because this crate can derive `heist`.
+    /// `Bank-Heist` is likewise found only when `bank-heist` was recorded.
+    ///
+    /// The writer stores each surface as the source spelled it, so the stored
+    /// side is lowercased and trimmed in the query too (SQLite's `lower` covers
+    /// ASCII only). Spellings differing only by case share one stored keyword,
+    /// so which row answers does not matter.
+    pub fn keyword_for_surface(&self, surface: &str) -> Result<Option<String>, ReaderError> {
+        let surface = normalize_surface(surface);
+        let keyword = self
+            .conn
+            .query_row(
+                "SELECT keyword FROM keyword_forms WHERE lower(trim(surface)) = ?1 \
+                 ORDER BY surface LIMIT 1",
+                (surface,),
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(keyword)
+    }
+
+    /// Every raw spelling the store recorded for `keyword`, sorted — for
+    /// showing a person "bank-heist" beside the stored `bank heist`. Empty, not
+    /// an error, for a keyword nothing maps to. `keyword` is matched exactly:
+    /// it is a stored value, not a spelling.
+    pub fn surfaces_for_keyword(&self, keyword: &str) -> Result<Vec<String>, ReaderError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT surface FROM keyword_forms WHERE keyword = ?1 ORDER BY surface")?;
+        let rows = stmt
+            .query_map((keyword,), |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Edges of `edge_type` pointing *out of* `item_id`, ranked ascending.
@@ -299,7 +367,7 @@ impl Reader {
 
     /// Every unit one Plex account has ever played, as ids — the lifetime
     /// answer to "has this been watched", which no fixed-length history tail
-    /// can give (issue #62).
+    /// can give (issue #60).
     ///
     /// A unit is what [`Self::taste_vector_for`] weighs: a film is its own
     /// unit, an episode rolls up to its show. So a caller ranking films gets
@@ -489,6 +557,9 @@ impl Reader {
 
     /// Every title's attributes, keyed by `item_id`.
     ///
+    /// `DISTINCT` over `(item_id, namespace, key, value)` with no `source`, so a
+    /// keyword two sources both list counts once toward the rollup (ADR-0016).
+    ///
     /// No filter, deliberately. `enrichment` holds facts about titles and
     /// nothing else since schema v7 — writers record their own progress in
     /// `enrichment_cursor`, a table this rollup never reads (ADR-0013).
@@ -604,11 +675,12 @@ mod tests {
             setup
                 .execute_batch(
                     "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                     INSERT INTO schema_version (version) VALUES (8);
+                     INSERT INTO schema_version (version) VALUES (10);
                      CREATE TABLE items (item_id TEXT PRIMARY KEY);
                      CREATE TABLE enrichment (
                          item_id    TEXT NOT NULL,
                          namespace  TEXT NOT NULL,
+                         source     TEXT NOT NULL,
                          key        TEXT NOT NULL,
                          value      TEXT NOT NULL,
                          fetched_at TEXT NOT NULL
@@ -618,8 +690,8 @@ mod tests {
             for i in 0..10 {
                 setup
                     .execute(
-                        "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
-                         VALUES (?1, 'ns', 'k', ?2, 't')",
+                        "INSERT INTO enrichment (item_id, namespace, source, key, value, fetched_at) \
+                         VALUES (?1, 'ns', 's', 'k', ?2, 't')",
                         rusqlite::params![format!("id{i}"), format!("v{i}")],
                     )
                     .expect("seed a fact");

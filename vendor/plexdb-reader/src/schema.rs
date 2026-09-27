@@ -18,9 +18,9 @@ use crate::error::ReaderError;
 
 /// The schema version this crate's accessors are written against.
 ///
-/// Currently version 8 — `items`, `external_ids`, `plex_items`, `enrichment`,
+/// Currently version 10 — `items`, `external_ids`, `plex_items`, `enrichment`,
 /// `enrichment_cursor`, `plays`, `plays_ingest_cursor`, `edges`, `collection`,
-/// `collection_membership` — see `plexdb/schema.py`.
+/// `collection_membership`, `keyword_forms` — see `plexdb/schema.py`.
 ///
 /// Versions 4, 5 and 6 added things this crate does not read: Tautulli's
 /// `seconds_watched`/`tautulli_id` on `plays` (issue #9), then `kind` on
@@ -39,7 +39,19 @@ use crate::error::ReaderError;
 /// still reports; no accessor here reads it. The gate still demands an exact
 /// match rather than a minimum, so a v7 store — missing the column — is
 /// still refused rather than silently read as if it had it.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 8;
+///
+/// **Version 9 does not change what this crate reads.** It adds `title_map` and
+/// `title_map_state`, the tag explorer's stored map; no accessor here reads
+/// them.
+///
+/// **Version 10 changes what this crate reads** (ADR-0016). `enrichment` and
+/// `enrichment_cursor` carry `source` in their primary key, so the enrichment
+/// reads collapse rows that differ only by source; keywords moved from the
+/// `tmdb_keywords` namespace to `keywords`; and `keyword_forms` is new, read by
+/// [`crate::Reader::keyword_for_surface`] and
+/// [`crate::Reader::surfaces_for_keyword`]. A v8 or v9 store, with one row per
+/// fact and no `keyword_forms`, is refused by the exact-match gate.
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 10;
 
 /// Confirm `conn` is a plexdb store at exactly [`SUPPORTED_SCHEMA_VERSION`].
 pub(crate) fn check(conn: &Connection, path: &Path) -> Result<(), ReaderError> {
