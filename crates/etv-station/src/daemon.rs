@@ -18,6 +18,7 @@ use crate::config::{ChannelConfig, LoadedChannel, ScoringConfig, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
 use crate::errors::{ConfigError, StationError};
+use crate::etv_next;
 use crate::history::HistoryDb;
 use crate::overlay_supervisor;
 use crate::scan;
@@ -95,6 +96,16 @@ pub async fn run(station: Station) -> Result<(), StationError> {
                 _ => return Err(e),
             },
         };
+
+        // Keep ETV-next's served lineup in step with the config generation the
+        // daemon just committed to. This is the same render the container
+        // entrypoint runs once at boot; without it here, a channel that starts
+        // (or stops) parsing never reaches ETV-next's channel roster until the
+        // whole container restarts — ETV-next reads lineup.json once, at its
+        // own startup, and SIGHUP only ever reached this daemon.
+        if let Some(out_dir) = etv_next_out_dir_from_env() {
+            rerender_etv_next(&config_path, out_dir);
+        }
 
         // Spawn the generation, run it until a signal, then tear it down. The
         // whole generation is joined before we return here, which is what lets
@@ -1261,6 +1272,60 @@ fn log_reconcile_outcome(outcome: Result<crate::reconcile::ReconcileCounts, Stat
             event = "reconcile.failed",
             error = %e,
             "could not reconcile playout against the catalog; leaving it as it is",
+        ),
+    }
+}
+
+/// Where to re-render ETV-next's lineup on a generation change, or `None`
+/// when this daemon isn't running under a shape that also owns doing so —
+/// every dev workflow that runs the daemon and ETV-next as separately-managed
+/// processes rather than one container's entrypoint chain. The only place
+/// this crate reads `ETV_NEXT_DIR`, kept separate from
+/// [`rerender_etv_next`] so a test can exercise that function with an
+/// explicit directory instead of mutating process environment — see
+/// `credentials_from_env` in `tautulli.rs` for why that mutation is unsound
+/// under Rust 2024 the moment `cargo test` runs another thread that reads
+/// the environment (#132).
+fn etv_next_out_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("ETV_NEXT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Re-render ETV-next's `lineup.json` + `channelN.json` for the config at
+/// `config_path` into `out_dir` — the same render `--render-etv-next`
+/// performs once at container boot.
+///
+/// A failure here does not touch `do_reload`/`first_err`: the daemon keeps
+/// serving playout JSON under the new generation regardless, exactly as a
+/// bad `ETV_ACCEL` at startup would fail `--render-etv-next` without
+/// stopping this daemon from running. What's stale is only the roster
+/// ETV-next itself reads at its own next start.
+fn rerender_etv_next(config_path: &Path, out_dir: PathBuf) {
+    let opts = match etv_next::RenderOptions::from_env(out_dir) {
+        Ok(opts) => opts,
+        Err(e) => {
+            tracing::error!(
+                event = "etv_next.render_failed",
+                error = %e,
+                "could not build ETV-next render options after a config generation change; \
+                 its served lineup is now stale until the container restarts",
+            );
+            return;
+        }
+    };
+    match etv_next::render(config_path, &opts) {
+        Ok(rendered) => tracing::info!(
+            event = "etv_next.rendered",
+            lineup = %rendered.lineup_path.display(),
+            channels = rendered.channels,
+            "re-rendered ETV-next's lineup for the current config generation",
+        ),
+        Err(e) => tracing::error!(
+            event = "etv_next.render_failed",
+            error = %e,
+            "could not re-render ETV-next's lineup after a config generation change; \
+             its served lineup is now stale until the container restarts",
         ),
     }
 }
@@ -5208,5 +5273,26 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         let (_dir, path) = write_station("Totally/Bogus/Zone");
         let station = crate::config::load(&path).expect("bogus tz still parses as config");
         assert!(prepare_generation(&station).await.is_err());
+    }
+
+    /// The bug this guards: SIGHUP only ever reached the long-running daemon
+    /// process, never the separate `--render-etv-next` invocation the
+    /// container entrypoint runs once at boot. A channel moving from
+    /// failing-to-load to loading (or the reverse) changed what this daemon
+    /// rolled but never reached ETV-next's served lineup until the whole
+    /// container restarted — invisible because the daemon's own logs looked
+    /// perfectly healthy throughout.
+    #[tokio::test]
+    async fn rerender_etv_next_writes_the_current_generations_lineup() {
+        let (_station_dir, path) = write_station("UTC");
+        let out_dir = tempfile::tempdir().unwrap();
+
+        rerender_etv_next(&path, out_dir.path().to_path_buf());
+
+        let lineup_path = out_dir.path().join("lineup.json");
+        let contents = std::fs::read_to_string(&lineup_path)
+            .expect("rerender_etv_next must write lineup.json into out_dir");
+        let lineup: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(lineup["channels"].as_array().unwrap().len(), 1);
     }
 }
