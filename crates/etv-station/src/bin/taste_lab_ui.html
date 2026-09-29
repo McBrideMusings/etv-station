@@ -10,11 +10,6 @@
   section { margin-bottom: 16px; }
   label { display: inline-block; min-width: 120px; }
   select, input[type=text], input[type=number] { padding: 3px 6px; }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { border: 1px solid #ccc; padding: 3px 6px; text-align: left; }
-  th { background: #f0f0f0; position: sticky; top: 0; }
-  .scroll { max-height: 400px; overflow-y: auto; }
-  .row { margin-bottom: 6px; }
   .muted { color: #777; font-size: 12px; }
   .err { color: #a00; font-weight: bold; }
   .searchbox { position: relative; display: inline-block; }
@@ -23,8 +18,139 @@
   .suggestions div { padding: 3px 6px; cursor: pointer; }
   .suggestions div:hover { background: #eef; }
   button { cursor: pointer; }
-  .cols { display: flex; gap: 24px; }
-  .cols > div { flex: 1; min-width: 0; }
+  .row { margin-bottom: 6px; }
+
+  /* Shown next to Load/re-score the moment a load option (channel, plugin
+     source, account, cycles) changes — the pools/schedule below still
+     reflect whatever was loaded last, and this is the only place that says
+     so before the user scrolls down and reads stale numbers as current. */
+  .stale-notice { color: #b80; font-size: 12px; margin-left: 10px; }
+  #loadBtn.stale { border-color: #b80; box-shadow: 0 0 0 2px rgba(187, 136, 0, 0.25); }
+
+  /* A spinning ring, not just the word "Scoring…" — motion is what reads as
+     "still working" at a glance; static text next to a static page can look
+     identical to a hang. */
+  .spinner {
+    display: inline-block; width: 13px; height: 13px; margin-right: 6px; vertical-align: -2px;
+    border: 2px solid #ccc; border-top-color: #556; border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Pools/Schedule fade toward transparent (never fully gone — losing your
+     place in a 60-row schedule while it reloads is its own problem) and
+     stop accepting clicks the moment a re-score starts, so what's on screen
+     never gets mistaken for the answer to whatever just changed. */
+  .layout.loading { opacity: 0.35; pointer-events: none; }
+
+  /* Key/value panel for sources:/config:/audit detail. A flat two-column grid; a value that is itself an object/array
+     recurses into a nested grid, indented. */
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; font-size: 12.5px; }
+  .kv .k { color: #555; white-space: nowrap; }
+  .kv .v { word-break: break-word; }
+  .kv-nested { grid-column: 1 / -1; margin: 2px 0 4px 14px; border-left: 2px solid #eee; padding-left: 8px; }
+  /* Explicit size: this can render outside a `.kv` grid (an empty object
+     short-circuits before the grid wrapper exists), and it must never read
+     larger than the populated rows it stands in for. */
+  .kv-empty { color: #999; font-style: italic; font-size: 12.5px; }
+  /* A value nobody on this pool actually wrote — the plugin script's own
+     default (sources:) or simply nothing (config:) — reads visually
+     different from an explicit, pool-authored value. */
+  .kv-default .k, .kv-default .v { font-style: italic; color: #777; }
+
+  /* Two columns once there's room: pools on the left, the schedule (the
+     part read continuously) on the right — a schedule that reflows under a
+     tall, per-pool candidate list is much harder to scan than one that has
+     its own column. Narrower than ~900px there isn't room for two, so it
+     stacks. */
+  .layout { display: flex; gap: 22px; align-items: flex-start; transition: opacity 0.15s ease; }
+  .col-pools { flex: 1 1 380px; min-width: 0; }
+  .col-schedule { flex: 1.3 1 460px; min-width: 0; }
+  @media (max-width: 900px) {
+    .layout { flex-direction: column; }
+  }
+
+  /* Pool sections (sources/config/profile/candidates), one per pool
+     referenced by the channel's pattern, collapsed by default so the
+     schedule stays the star. */
+  .pool-section { border: 1px solid #ddd; border-radius: 4px; padding: 8px 10px; margin-bottom: 8px; }
+  .pool-section summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+  .pool-section .candidate-count { font-weight: normal; color: #777; font-size: 12px; }
+  .scroll { max-height: 320px; overflow-y: auto; }
+
+  table.profileTable, table.candidatesTable { border-collapse: collapse; width: 100%; font-size: 12.5px; margin-top: 6px; }
+  table.profileTable th, table.profileTable td,
+  table.candidatesTable th, table.candidatesTable td { border: 1px solid #ddd; padding: 2px 6px; text-align: left; }
+  table.candidatesTable th { position: sticky; top: 0; background: #f5f5f5; }
+  tr.candidate-picked { background: #dcefdc; font-weight: 600; }
+  tr.candidate-nearmiss { background: #fff6d8; }
+  .legend { font-size: 11px; color: #777; margin-top: 4px; }
+
+  /* One labelled field inside a pool card (sources:, config:, profile,
+     candidates) — label, its one-line explanation, and its value are kept
+     close together (small margins below), while the gap BEFORE each field
+     is large, so the label reads as bound to its own value, never to the
+     field above it (ref/gui/grouping.md — proximity: the gap inside a group
+     must read as clearly smaller than the gap between groups). */
+  .pool-field { margin-top: 16px; }
+  .pool-field:first-child { margin-top: 10px; }
+  .pool-field h2 { margin: 0 0 2px 0; }
+  .field-hint { font-size: 11px; font-style: italic; color: #999; margin: 0 0 4px 0; }
+  .default-tag { font-size: 10.5px; font-style: italic; color: #b80; font-weight: normal; margin-left: 6px; }
+  .legend .swatch { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; vertical-align: middle; }
+  .legend .swatch:first-child { margin-left: 0; }
+  .legend .picked-swatch { background: #dcefdc; }
+  .legend .nearmiss-swatch { background: #fff6d8; }
+
+  /* A pool this session's selected schedule entry actually drew from — the
+     pool itself always stays in place (see .sched-expand below for why
+     nothing here gets inserted or removed), this just marks which one. */
+  .pool-section.pool-focused { border-color: #55c; }
+  .candidates-focus-note { color: #55c; font-weight: normal; }
+
+  /* The unified schedule — one row per air-order entry (or "visit" block for
+     a multi-episode show pick). */
+  #schedule { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  .sched-entry {
+    border: 1px solid #ccc; border-radius: 4px; padding: 6px 10px; cursor: pointer;
+    background: #fff; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  .sched-entry:hover { background: #f7f9ff; border-color: #99a; }
+  .sched-entry.selected { background: #eef2ff; border-color: #55c; }
+  .sched-entry .pos { color: #999; font-size: 11px; min-width: 28px; }
+  .sched-entry .pool-tag {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .02em; color: #556;
+    background: #eef; border-radius: 3px; padding: 1px 5px;
+  }
+  .sched-entry .title { font-weight: 600; }
+  .sched-entry .sub { color: #777; font-size: 12px; }
+  .sched-entry.static-entry { color: #999; font-style: italic; cursor: default; background: #fafafa; }
+  .sched-entry.static-entry:hover { background: #fafafa; border-color: #ccc; }
+  .wrap-marker { color: #b80; font-size: 11px; }
+  .cycle-divider {
+    display: flex; align-items: center; gap: 8px; color: #aaa; font-size: 11px;
+    margin: 6px 0 2px 0;
+  }
+  .cycle-divider::before, .cycle-divider::after { content: ""; flex: 1; border-top: 1px dashed #ddd; }
+
+  /* The click-to-inspect detail, expanded INLINE under the row that was
+     clicked — never a separate panel elsewhere on the page. Only that one
+     row's own height changes (pushing later rows down, same as any
+     accordion), and nothing above or beside it ever moves. */
+  .sched-expand {
+    border: 1px solid #99a; border-top: none; border-radius: 0 0 4px 4px; padding: 10px 12px;
+    background: #fbfbff; margin-top: -6px;
+  }
+  .sched-expand h3 { margin: 0 0 4px 0; font-size: 14px; }
+  .sched-expand .verdict { font-size: 13px; margin: 4px 0 8px 0; }
+  .sched-expand .episode-block { border-top: 1px solid #e2e2ee; padding-top: 8px; margin-top: 8px; }
+  .sched-expand .episode-block:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+  .sched-expand .episode-title { font-weight: 600; font-size: 13px; }
+  .near-misses table { border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+  .near-misses th, .near-misses td { border: 1px solid #ddd; padding: 2px 6px; text-align: left; }
+  .weight-edit { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .weight-edit input { width: 64px; }
+  .weight-edit .saved { color: #2a2; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -32,10 +158,10 @@
 <div id="status" class="muted"></div>
 
 <section>
-  <h2>Pool</h2>
+  <h2>Channel</h2>
   <div class="row">
-    <label>Channel / pool</label>
-    <select id="poolPicker"></select>
+    <label>Channel</label>
+    <select id="channelPicker"></select>
   </div>
   <div class="row">
     <label>Use deployed plugin</label>
@@ -47,78 +173,52 @@
     <select id="accountPicker"><option value="">(resolve from channel / pooled)</option></select>
   </div>
   <div class="row">
-    <label>target_count</label>
-    <input type="number" id="targetCount" value="20" style="width:70px">
-    <label style="min-width:auto; margin-left:16px">extended_target_count</label>
-    <input type="number" id="extendedTargetCount" value="300" style="width:80px">
+    <label>Cycles</label>
+    <input type="number" id="cycles" value="3" min="1" max="50" style="width:60px">
+    <button id="moreCyclesBtn" type="button">+10 cycles &amp; reload</button>
+    <span class="muted">how many times to walk the channel's pattern — more cycles is what surfaces how often a pool starts repeating</span>
   </div>
   <div class="row">
     <button id="loadBtn">Load / re-score</button>
+    <span id="staleNotice" class="stale-notice" hidden>⚠ Options changed since the last load — everything below is for the old selection until you click Load / re-score.</span>
   </div>
 </section>
 
-<section>
-  <h2>sources: (read-only)</h2>
-  <pre id="sources" class="muted">(no pool loaded)</pre>
-  <h2>config: (read-only)</h2>
-  <pre id="config" class="muted">(no pool loaded)</pre>
-</section>
-
-<section>
-  <h2>Taste profile</h2>
-  <div class="row">
-    <button id="copyProfileBtn">Copy profile: YAML</button>
-    <span class="muted">paste into the pool's real channel.yaml — this tool never writes the file itself</span>
+<div class="layout" id="layout">
+  <div class="col-pools">
+    <section>
+      <h2>Pools</h2>
+      <div id="pools"><div class="muted">(no channel loaded — pick a channel above and Load / re-score)</div></div>
+    </section>
   </div>
-  <table id="profileTable">
-    <thead><tr><th>weight</th><th>kind</th><th>reference</th><th></th></tr></thead>
-    <tbody></tbody>
-  </table>
 
-  <div class="row" style="margin-top:10px">
-    <label>Kind</label>
-    <select id="addKind">
-      <option value="keyword">keyword</option>
-      <option value="genre">genre</option>
-      <option value="label">label</option>
-      <option value="cast">cast</option>
-      <option value="director">director</option>
-      <option value="writer">writer</option>
-      <option value="producer">producer</option>
-      <option value="country">country</option>
-      <option value="studio">studio</option>
-      <option value="content_rating">content_rating</option>
-      <option value="item">item</option>
-      <option value="set">set (CEL)</option>
-    </select>
-    <span class="searchbox">
-      <input type="text" id="addValue" placeholder="value (type to search)" style="width:260px">
-      <div id="addSuggestions" class="suggestions" hidden></div>
-    </span>
-    <label style="min-width:auto; margin-left:10px">weight</label>
-    <input type="number" id="addWeight" value="1.0" step="0.1" style="width:70px">
-    <button id="addBtn">Add</button>
-  </div>
-</section>
-
-<div class="cols">
-  <div>
-    <h2>In the pool (<span id="inPoolTotal">0</span> candidates, showing top <span id="inPoolShown">0</span>)</h2>
-    <div class="scroll">
-      <table id="inPoolTable"><thead><tr><th>#</th><th>title</th><th>metadata</th></tr></thead><tbody></tbody></table>
-    </div>
-  </div>
-  <div>
-    <h2>Selected (<span id="selectedTotal">0</span> — what would actually air)</h2>
-    <div class="scroll">
-      <table id="selectedTable"><thead><tr><th>#</th><th>title</th><th>metadata</th></tr></thead><tbody></tbody></table>
-    </div>
+  <div class="col-schedule">
+    <section>
+      <h2>Schedule <span class="muted">— what would air, in pattern order, interleaving every pool. Click a row to expand it in place.</span></h2>
+      <div id="schedule"><div class="muted">(no channel loaded — pick a channel above and Load / re-score)</div></div>
+    </section>
   </div>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
+const EMPTY_MESSAGE = '<div class="muted">(no channel loaded — pick a channel above and Load / re-score)</div>';
 let lastResult = null;
+let selectedEntryKey = null;
+
+// A schedule entry's identity across a re-score — never its array index.
+// build_schedule (taste-lab.rs) rebuilds the whole flat list from scratch on
+// every score, and a weight edit made from inside the open inspector can
+// change that very pool's ranking, which can change how many items a step's
+// "visit" grouping produces — the entry that used to be at index 4 is not
+// guaranteed to still be the same pick. (cycle, block_index, pool_name,
+// first item id) is what actually names one pick, so renderResult below can
+// re-find the same conceptual entry after a re-render, or correctly notice
+// it's gone and close the inspector instead of showing whatever now happens
+// to sit at the old index.
+function entryKey(entry) {
+  return `${entry.cycle}:${entry.block_index}:${entry.pool_name}:${entry.entries[0].id}`;
+}
 
 function setStatus(msg, isErr) {
   const el = $('status');
@@ -126,11 +226,27 @@ function setStatus(msg, isErr) {
   el.className = isErr ? 'err' : 'muted';
 }
 
+// Every request that re-scores (a fresh /api/select, a weight edit, adding
+// or removing a profile entry) goes through this — one spinner, one fade,
+// so the "this is stale, wait" signal looks the same no matter which
+// control triggered it. Pools/Schedule are what actually goes stale — the
+// Channel form above `#layout` stays fully interactive throughout.
+function setLoading(isLoading) {
+  $('layout').classList.toggle('loading', isLoading);
+  $('loadBtn').disabled = isLoading;
+  $('moreCyclesBtn').disabled = isLoading;
+  if (isLoading) {
+    const el = $('status');
+    el.innerHTML = '<span class="spinner"></span>Scoring…';
+    el.className = 'muted';
+  }
+}
+
 // Never throws on a well-formed error response (`{error, ...}` — the server
-// still fills in sources/config/plugin_path on a scoring failure, see
-// describe_session in taste-lab.rs) — only on something actually broken
+// still fills in pools/schedule on a partial scoring failure, see
+// rescore_and_respond in taste-lab.rs) — only on something actually broken
 // (network failure, non-JSON body). Callers check `data.error` themselves so
-// the descriptive fields render alongside the error instead of being lost.
+// descriptive fields render alongside the error instead of being lost.
 async function api(method, path, body) {
   const opts = { method };
   if (body !== undefined) {
@@ -143,16 +259,16 @@ async function api(method, path, body) {
 
 async function loadChannels() {
   const data = await api('GET', '/api/channels');
-  const picker = $('poolPicker');
+  const picker = $('channelPicker');
   picker.innerHTML = '';
-  for (const p of data.pools) {
+  for (const c of data.channels) {
     const opt = document.createElement('option');
-    opt.value = JSON.stringify({ channel_path: p.channel_path, pool_name: p.pool_name });
-    opt.textContent = `${p.channel_name} / ${p.pool_name}`;
+    opt.value = c.channel_path;
+    opt.textContent = c.display_name ? `${c.channel_name} — ${c.display_name}` : c.channel_name;
     picker.appendChild(opt);
   }
-  if (data.pools.length === 0) {
-    setStatus('No plugin-backed pools found under the configured --channels-dir.', true);
+  if (data.channels.length === 0) {
+    setStatus('No channel with a plugin-backed pattern pool found under the configured --channels-dir.', true);
   }
 }
 
@@ -168,31 +284,198 @@ async function loadTautulliUsers() {
   }
 }
 
-function renderMetadata(m) {
-  if (m === null || m === undefined) return '';
-  if (typeof m === 'object') {
-    return Object.entries(m).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
-  }
-  return String(m);
-}
-
-function renderTable(bodyId, rows) {
-  const tbody = document.querySelector('#' + bodyId + ' tbody');
-  tbody.innerHTML = '';
-  rows.forEach((r, i) => {
-    const tr = document.createElement('tr');
-    const title = r.year ? `${r.title} (${r.year})` : r.title;
-    tr.innerHTML = `<td>${i + 1}</td><td>${escapeHtml(title)}</td><td>${escapeHtml(renderMetadata(r.metadata))}</td>`;
-    tbody.appendChild(tr);
-  });
-}
-
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-function renderProfile(profile) {
-  const tbody = document.querySelector('#profileTable tbody');
+function titleWithYear(item) {
+  return item.year ? `${item.title} (${item.year})` : item.title;
+}
+
+function episodeCode(item) {
+  return `S${item.season ?? '?'}E${item.episode ?? '?'}`;
+}
+
+// ---- Generic key/value rendering ------------------------------------------
+
+function renderScalar(v) {
+  if (v === null || v === undefined) return '<span class="kv-empty">—</span>';
+  if (typeof v === 'number') return Number.isInteger(v) ? String(v) : v.toFixed(3);
+  return escapeHtml(String(v));
+}
+
+function isScalarArray(value) {
+  return Array.isArray(value) && value.every((v) => v === null || typeof v !== 'object');
+}
+
+function renderKv(value) {
+  if (value === null || value === undefined) return '<span class="kv-empty">—</span>';
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '<span class="kv-empty">(empty)</span>';
+    if (isScalarArray(value)) return value.map(renderScalar).join(', ');
+    return value.map((v) => `<div class="kv-nested">${renderKv(v)}</div>`).join('');
+  }
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.length === 0) return '<span class="kv-empty">(empty)</span>';
+    const rows = keys.map((k) => {
+      const v = value[k];
+      const isNested = v !== null && typeof v === 'object' && !isScalarArray(v);
+      const valueHtml = isNested
+        ? `<div class="kv-nested">${renderKv(v)}</div>`
+        : `<div class="v">${renderKv(v)}</div>`;
+      return `<div class="k">${escapeHtml(k)}</div>${valueHtml}`;
+    }).join('');
+    return `<div class="kv">${rows}</div>`;
+  }
+  return renderScalar(value);
+}
+
+// ---- Pools: sources:/config:/profile/candidates, collapsed disclosures ---
+//
+// Every pool the channel's pattern draws from is ALWAYS rendered here, in
+// the same order, whether or not a schedule entry is selected — the number
+// and identity of pool sections never changes, only an individual
+// <details>'s open/closed state, exactly like any other accordion the user
+// already toggled by hand. `poolOpenState` remembers that per pool across
+// re-renders so a manual toggle survives the next re-score.
+//
+// `focus`, when set (`{ poolName, pickedIds, nearMissIds }` — see
+// renderResult), names the ONE pool a selected schedule entry drew from —
+// every pool is blind to the others (module docs: "Neither is a whitelist —
+// both rank the whole movie library... Pools are blind to each other"), so a
+// pick can only ever have come from its own pool. That pool is forced open
+// and scrolled to, and its candidate table highlights the picked row(s) and
+// any near-misses — nothing is hidden or inserted elsewhere to say so.
+//
+// While a schedule entry is selected, `focus` also forces every OTHER pool
+// closed, so jumping from a shows pick to a movies pick and back never
+// leaves an unrelated candidate list open; only the pool the current pick
+// came from stays open. `poolOpenState` still remembers a manual
+// toggle, but only takes effect again once nothing is selected (`focus`
+// null) — clicking a schedule row is allowed to override it for as long as
+// that row stays open.
+let poolOpenState = {};
+
+function renderPools(pools, focus) {
+  const container = $('pools');
+  container.innerHTML = '';
+
+  const names = Object.keys(pools).sort();
+  if (names.length === 0) {
+    container.innerHTML = EMPTY_MESSAGE;
+    return;
+  }
+
+  for (const name of names) {
+    const pool = pools[name];
+    const isFocused = !!(focus && focus.poolName === name);
+    const details = document.createElement('details');
+    details.className = 'pool-section' + (isFocused ? ' pool-focused' : '');
+    details.open = focus ? isFocused : !!poolOpenState[name];
+    details.addEventListener('toggle', () => { poolOpenState[name] = details.open; });
+    const summary = document.createElement('summary');
+    summary.innerHTML = `${escapeHtml(name)} <span class="candidate-count">(${pool.candidate_count} ranked candidates — plugin: ${escapeHtml(pool.plugin_path)})</span>`;
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.innerHTML = `
+      <div class="pool-field">
+        <h2>sources:${pool.sources_authored ? '' : ' <span class="default-tag">(using the plugin\'s own default)</span>'}</h2>
+        <div class="field-hint">Which items this pool is allowed to pick from, as a named filter.</div>
+        <div class="${pool.sources_authored ? '' : 'kv-default'}">${renderKv(pool.sources_effective)}</div>
+      </div>
+      <div class="pool-field">
+        <h2>config:${pool.config_authored ? '' : ' <span class="default-tag">(none written)</span>'}</h2>
+        <div class="field-hint">Extra settings this pool passes to the plugin — what each one does is up to the plugin, not taste-lab.</div>
+        <div class="${pool.config_authored ? '' : 'kv-default'}">${renderKv(pool.config)}</div>
+      </div>
+      <div class="pool-field">
+        <h2>profile</h2>
+        <div class="field-hint">Keyword/genre/cast/… weights this pool's own score is tilted by.</div>
+        <table class="profileTable">
+          <thead><tr><th>weight</th><th>kind</th><th>reference</th><th></th></tr></thead>
+          <tbody class="profile-tbody" data-pool="${escapeHtml(name)}"></tbody>
+        </table>
+        <div class="row add-entry-row" data-pool="${escapeHtml(name)}">
+          <select class="add-kind">
+            <option value="keyword">keyword</option>
+            <option value="genre">genre</option>
+            <option value="label">label</option>
+            <option value="cast">cast</option>
+            <option value="director">director</option>
+            <option value="writer">writer</option>
+            <option value="producer">producer</option>
+            <option value="country">country</option>
+            <option value="studio">studio</option>
+            <option value="content_rating">content_rating</option>
+            <option value="item">item</option>
+            <option value="set">set (CEL)</option>
+          </select>
+          <span class="searchbox">
+            <input type="text" class="add-value" placeholder="value (type to search)" style="width:170px">
+            <div class="add-suggestions suggestions" hidden></div>
+          </span>
+          <input type="number" class="add-weight" value="1.0" step="0.1" style="width:60px" title="weight">
+          <button type="button" class="add-entry-btn">Add</button>
+        </div>
+        <div class="row"><button class="copy-profile-btn">Copy profile: YAML</button>
+          <span class="muted">paste into the pool's real channel.yaml — this tool never writes the file itself</span></div>
+      </div>
+      <div class="pool-field">
+        <h2>candidates <span class="muted">(showing ${pool.candidates.length} of ${pool.candidate_count}, ranked)</span>${isFocused ? ' <span class="candidates-focus-note">— this pick came from here</span>' : ''}</h2>
+        <div class="scroll">
+          <table class="candidatesTable">
+            <thead><tr><th>#</th><th>title</th><th>verdict</th></tr></thead>
+            <tbody class="candidates-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    `;
+    details.appendChild(body);
+    container.appendChild(details);
+
+    renderProfileTable(body.querySelector('.profile-tbody'), name, pool.profile);
+    renderCandidatesTable(body.querySelector('.candidates-tbody'), pool.candidates, isFocused ? focus : null);
+    wireAddEntryRow(body.querySelector('.add-entry-row'), name);
+    body.querySelector('.copy-profile-btn').addEventListener('click', () => copyProfileYaml(name));
+    if (isFocused) {
+      body.insertAdjacentHTML('beforeend', `
+        <div class="legend">
+          <span class="swatch picked-swatch"></span>this pick
+          <span class="swatch nearmiss-swatch"></span>near miss — ranked just below, not chosen this visit
+        </div>`);
+      details.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+}
+
+// `focus` is null when this pool isn't the one a selected entry drew from —
+// plain rows, no highlighting. When set, a picked or near-missed id can be
+// outside the `CANDIDATES_SHOWN` cap taste-lab.rs applies (a low-ranked
+// near-miss on a huge pool, most often); those rows simply aren't in this
+// list to highlight, same as any other candidate past the cap.
+function renderCandidatesTable(tbody, candidates, focus) {
+  tbody.innerHTML = '';
+  const pickedIds = focus ? focus.pickedIds : null;
+  const nearMissIds = focus ? focus.nearMissIds : null;
+  let firstPicked = null;
+  candidates.forEach((c, i) => {
+    const tr = document.createElement('tr');
+    if (pickedIds && pickedIds.has(c.id)) {
+      tr.className = 'candidate-picked';
+      if (!firstPicked) firstPicked = tr;
+    } else if (nearMissIds && nearMissIds.has(c.id)) {
+      tr.className = 'candidate-nearmiss';
+    }
+    const verdict = c.audit ? c.audit.verdict : '';
+    tr.innerHTML = `<td>${i + 1}</td><td>${escapeHtml(titleWithYear(c))}</td><td class="muted">${escapeHtml(verdict)}</td>`;
+    tbody.appendChild(tr);
+  });
+  if (firstPicked) firstPicked.scrollIntoView({ block: 'center' });
+}
+
+function renderProfileTable(tbody, poolName, profile) {
   tbody.innerHTML = '';
   for (const entry of profile.entries) {
     const tr = document.createElement('tr');
@@ -201,13 +484,13 @@ function renderProfile(profile) {
     weightInput.step = '0.1';
     weightInput.style.width = '70px';
     weightInput.value = entry.weight;
-    weightInput.addEventListener('change', () => updateWeight(entry.index, parseFloat(weightInput.value)));
+    weightInput.addEventListener('change', () => updateWeight(poolName, entry.index, parseFloat(weightInput.value)));
     const weightTd = document.createElement('td');
     weightTd.appendChild(weightInput);
 
     const removeBtn = document.createElement('button');
     removeBtn.textContent = 'remove';
-    removeBtn.addEventListener('click', () => removeEntry(entry.index));
+    removeBtn.addEventListener('click', () => removeEntry(poolName, entry.index));
     const removeTd = document.createElement('td');
     removeTd.appendChild(removeBtn);
 
@@ -223,154 +506,436 @@ function renderProfile(profile) {
   }
 }
 
-// Renders whatever the payload carries. On a scoring failure the server
-// still sends pool_name/plugin_path/sources/config (see describe_session in
-// taste-lab.rs) but no profile/in_pool/selected — those sections are left
-// as they were rather than cleared, and the error banner takes over status.
+// ---- Schedule: one unified, air-order, click-to-inspect list -------------
+
+function entryLabel(entry) {
+  if (entry.kind === 'static') {
+    return `<span class="sub">${escapeHtml(entry.pool_name)} — ${escapeHtml(entry.note)}</span>`;
+  }
+  const first = entry.entries[0];
+  if (entry.kind === 'visit') {
+    const eps = entry.entries.map(episodeCode).join(', ');
+    return `<span class="title">${escapeHtml(first.show || first.title)}</span> <span class="sub">${entry.entries.length} episodes — ${escapeHtml(eps)}</span>`;
+  }
+  return `<span class="title">${escapeHtml(titleWithYear(first))}</span>`;
+}
+
+// Builds the row list plus, for the selected row only, an empty
+// `.sched-expand` slot directly beneath it — `renderResult` fills that slot
+// (via `fillInspectorPanel`) right after calling this, so the detail lands
+// inline in the row's own position rather than in a panel elsewhere on the
+// page. Clicking the already-selected row's own summary line toggles it
+// closed again (accordion, not a fixed-open modal).
+function renderSchedule(schedule) {
+  const container = $('schedule');
+  container.innerHTML = '';
+  if (schedule.length === 0) {
+    container.innerHTML = EMPTY_MESSAGE;
+    return;
+  }
+  let lastCycle = null;
+  let pos = 0;
+  schedule.forEach((entry, i) => {
+    if (entry.cycle !== lastCycle) {
+      lastCycle = entry.cycle;
+      pos = 0;
+      const divider = document.createElement('div');
+      divider.className = 'cycle-divider';
+      divider.textContent = `cycle ${entry.cycle + 1}`;
+      container.appendChild(divider);
+    }
+    pos += 1;
+    const key = entry.kind !== 'static' ? entryKey(entry) : null;
+    const isSelected = key !== null && key === selectedEntryKey;
+    const row = document.createElement('div');
+    row.className = 'sched-entry' + (entry.kind === 'static' ? ' static-entry' : '') + (isSelected ? ' selected' : '');
+    const wrapMarker = entry.wrapped ? '<span class="wrap-marker" title="this pool\'s ranking was exhausted and restarted from the top">↺ restarted</span>' : '';
+    row.innerHTML = `
+      <span class="pos">${pos}.</span>
+      <span class="pool-tag">${escapeHtml(entry.pool_name)}</span>
+      ${entryLabel(entry)}
+      ${wrapMarker}
+    `;
+    if (key !== null) {
+      row.addEventListener('click', () => {
+        selectedEntryKey = isSelected ? null : key;
+        renderResult(lastResult);
+      });
+    }
+    container.appendChild(row);
+    if (isSelected) {
+      const expand = document.createElement('div');
+      expand.className = 'sched-expand';
+      expand.id = 'inspector';
+      container.appendChild(expand);
+    }
+  });
+}
+
+// ---- Inspector: pool, full audit detail, near-misses, weight editing -----
+
+function auditVerdictLine(audit) {
+  if (!audit) return '<span class="muted">no audit record for this pick</span>';
+  const guide = audit.guide ? ` — “${escapeHtml(audit.guide)}”` : '';
+  return `<div class="verdict">${escapeHtml(audit.verdict)}${guide}</div>`;
+}
+
+function renderNearMisses(nearMisses) {
+  if (!nearMisses || nearMisses.length === 0) return '';
+  const rows = nearMisses.map((nm) => `
+    <tr>
+      <td>${escapeHtml(titleWithYear({ title: nm.title || nm.id, year: nm.year }))}</td>
+      <td>${typeof nm.score === 'number' ? nm.score.toFixed(3) : ''}</td>
+      <td>${escapeHtml(nm.reason || '')}</td>
+    </tr>`).join('');
+  return `
+    <div class="near-misses">
+      <strong>Near misses</strong> — ranked just below this pick in the same pool
+      <table>
+        <thead><tr><th>title</th><th>score</th><th>reason</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+// Matches an audit detail's `profile_entries` (kind/reference/weight, no
+// index — see taste-cosine.rhai's audit()) back to the pool's own resolved
+// `profile.entries` (which DOES carry `index`, see profile_json in
+// taste-lab.rs) so the inspector can edit the exact entry that moved this
+// pick, without the server having to thread an index through the plugin
+// boundary.
+function findEditableIndex(poolName, kind, reference) {
+  const pool = lastResult?.pools?.[poolName];
+  if (!pool) return null;
+  const match = pool.profile.entries.find((e) => e.kind === kind && e.reference === reference);
+  return match ? match.index : null;
+}
+
+function renderProfileEntries(poolName, profileEntries) {
+  if (!profileEntries || profileEntries.length === 0) return '';
+  const rows = profileEntries.map((pe) => {
+    const idx = findEditableIndex(poolName, pe.kind, pe.reference);
+    const editor = idx === null
+      ? '<span class="muted">not editable here</span>'
+      : `<span class="weight-edit">
+           <input type="number" step="0.1" value="${pe.weight}" data-pool="${escapeHtml(poolName)}" data-index="${idx}">
+           <span class="saved" hidden>saved</span>
+         </span>`;
+    return `<div class="k">${escapeHtml(pe.kind)}: ${escapeHtml(pe.reference)}</div><div class="v">${editor}</div>`;
+  }).join('');
+  return `<div class="kv">${rows}</div>`;
+}
+
+// The score/audit fields, favor/disfavor matches, editable profile entries
+// and near-misses — everything about ONE audit record, independent of how
+// many episodes it turns out to explain. Split out of renderEpisodeAudit so
+// a group of episodes with identical scoring (see groupByAudit) renders this
+// body once instead of once per episode.
+function renderAuditBody(poolName, audit, fallbackMetadata) {
+  const detail = audit && audit.detail;
+  let body = auditVerdictLine(audit);
+  if (detail) {
+    const scoreRow = {
+      score: detail.score, base_score: detail.base_score, taste_score: detail.taste_score,
+      favor_score: detail.favor_score, disfavor_score: detail.disfavor_score,
+      house_score: detail.house_score, rank: detail.rank, candidate_count: detail.candidate_count,
+      draw: detail.draw, recency_factor: detail.recency_factor,
+    };
+    body += `<div class="kv">${Object.entries(scoreRow).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => `<div class="k">${k}</div><div class="v">${renderScalar(v)}</div>`).join('')}</div>`;
+    if (detail.favor_matches && detail.favor_matches.length) {
+      body += `<div class="k" style="margin-top:6px"><strong>favor matches</strong></div>${renderKv(detail.favor_matches)}`;
+    }
+    if (detail.disfavor_matches && detail.disfavor_matches.length) {
+      body += `<div class="k" style="margin-top:6px"><strong>disfavor matches</strong></div>${renderKv(detail.disfavor_matches)}`;
+    }
+    if (detail.profile_entries && detail.profile_entries.length) {
+      body += `<div class="k" style="margin-top:6px"><strong>profile entries behind this pick</strong></div>${renderProfileEntries(poolName, detail.profile_entries)}`;
+    }
+    body += renderNearMisses(detail.near_misses);
+  } else if (fallbackMetadata) {
+    body += `<div class="muted">no full audit detail — raw metadata:</div>${renderKv(fallbackMetadata)}`;
+  }
+  return body;
+}
+
+// A show pool scores the SERIES, not the episode — taste-cosine.rhai's own
+// comments say why: "an episode carries no keywords of its own" (only its
+// show does), so every episode in a visit shares one audit record
+// byte-for-byte. Grouping
+// consecutive episodes whose `audit.detail` serializes identically collapses
+// them to one explanation instead of repeating it per episode — exactly
+// what shows up as separate episodes only when the audit genuinely differs
+// (e.g. a mixed-source visit), which this still handles correctly since it
+// never merges across an actual difference.
+function groupByAudit(items) {
+  const groups = [];
+  for (const item of items) {
+    const sig = JSON.stringify(item.audit ? item.audit.detail : null);
+    const last = groups[groups.length - 1];
+    if (last && last.sig === sig) {
+      last.items.push(item);
+    } else {
+      groups.push({ sig, items: [item] });
+    }
+  }
+  return groups;
+}
+
+function renderEpisodeAudit(poolName, group) {
+  const items = group.items;
+  const first = items[0];
+  const label = items.length > 1
+    ? `${escapeHtml(first.show || first.title)} — ${items.length} episodes, identical scoring (${items.map(episodeCode).join(', ')})`
+    : escapeHtml((first.show ? `${episodeCode(first)} — ` : '') + titleWithYear(first));
+  const body = renderAuditBody(poolName, first.audit, first.metadata);
+  return `<div class="episode-block"><div class="episode-title">${label}</div>${body}</div>`;
+}
+
+// Fills the `.sched-expand` slot `renderSchedule` already placed under the
+// selected row — never creates or moves the slot itself, so filling it
+// changes only that element's own contents, not its position.
+function fillInspectorPanel(panel, entry) {
+  const header = `<h3>${escapeHtml(entry.pool_name)} — ${entry.kind === 'visit' ? `${entry.entries.length}-episode visit` : 'pick'}</h3>`;
+  const groups = groupByAudit(entry.entries);
+  const body = groups.map((g) => renderEpisodeAudit(entry.pool_name, g)).join('');
+  panel.innerHTML = header + body;
+  panel.querySelectorAll('.weight-edit input').forEach((input) => {
+    input.addEventListener('change', async () => {
+      const poolName = input.dataset.pool;
+      const index = parseInt(input.dataset.index, 10);
+      await updateWeight(poolName, index, parseFloat(input.value));
+      const saved = input.nextElementSibling;
+      if (saved) { saved.hidden = false; setTimeout(() => { saved.hidden = true; }, 1500); }
+    });
+  });
+}
+
+// Every id a selected entry's picks were chosen over — union across every
+// episode in a visit, since a multi-episode visit can (rarely) span picks
+// with different near-misses even after groupByAudit collapses the
+// identical-scoring common case.
+function focusForEntry(entry) {
+  const pickedIds = new Set(entry.entries.map((item) => item.id));
+  const nearMissIds = new Set();
+  for (const item of entry.entries) {
+    const nearMisses = item.audit && item.audit.detail && item.audit.detail.near_misses;
+    if (nearMisses) for (const nm of nearMisses) nearMissIds.add(nm.id);
+  }
+  return { poolName: entry.pool_name, pickedIds, nearMissIds };
+}
+
+// ---- Top-level render / actions -------------------------------------------
+
+// Renders whatever the payload carries. On a partial scoring failure the
+// server still sends pools/schedule for whatever DID score (see
+// rescore_and_respond in taste-lab.rs) — those sections render as-is and the
+// error banner takes over status, rather than the page going blank.
+//
+// This is also the single re-render path for every user action that can
+// leave a schedule row expanded: a fresh /api/select, a weight edit from
+// that row's own panel, and a plain click on a row (toggling it open or
+// closed) all end up here — see renderSchedule's click handler, which calls
+// this directly with the already-cached `lastResult` rather than keeping a
+// separate toggle path. Pools, schedule and the expanded row's panel are
+// built from the one `data` object every time, so they can never disagree
+// about which entry (if any) is open.
 function renderResult(data) {
   lastResult = data;
-  if (data.pool_name !== undefined) {
-    $('sources').textContent = data.sources ? JSON.stringify(data.sources, null, 2) : '(script default — no pool-authored sources:)';
-    $('config').textContent = (data.config !== null && data.config !== undefined) ? JSON.stringify(data.config, null, 2) : '(no config: block)';
-  }
-  if (data.profile) renderProfile(data.profile);
-  if (data.in_pool) {
-    $('inPoolTotal').textContent = data.in_pool.total;
-    $('inPoolShown').textContent = data.in_pool.shown;
-    renderTable('inPoolTable', data.in_pool.rows);
-  }
-  if (data.selected) {
-    $('selectedTotal').textContent = data.selected.total;
-    renderTable('selectedTable', data.selected.rows);
+  // A rescore can change which pick a pool makes (that's the point of a
+  // weight edit) — re-locate the previously open entry by identity rather
+  // than trusting the old array position, and close the inspector rather
+  // than silently show whatever now happens to be at that position if the
+  // entry it named no longer exists.
+  const openEntry = (data.schedule && selectedEntryKey !== null)
+    ? data.schedule.find((e) => e.kind !== 'static' && entryKey(e) === selectedEntryKey)
+    : null;
+  const valid = !!openEntry;
+  if (!valid) selectedEntryKey = null;
+
+  if (data.pools) renderPools(data.pools, valid ? focusForEntry(openEntry) : null);
+  if (data.schedule) renderSchedule(data.schedule);
+  if (valid) {
+    const panel = $('inspector');
+    if (panel) fillInspectorPanel(panel, openEntry);
   }
   if (data.error) {
     setStatus(data.error, true);
   } else {
-    setStatus(`Loaded pool "${data.pool_name}" — plugin: ${data.plugin_path}`, false);
+    setStatus(`Loaded "${data.channel_name}" — ${Object.keys(data.pools || {}).length} pool(s), ${(data.schedule || []).length} schedule entries`, false);
   }
 }
 
-async function selectPool() {
-  const picked = $('poolPicker').value;
-  if (!picked) return;
-  const { channel_path, pool_name } = JSON.parse(picked);
+// ---- Stale-options indicator ----------------------------------------------
+//
+// The pools/schedule below stay exactly as they were from the last
+// /api/select until the user clicks Load/re-score again — changing the
+// channel, plugin source, account or cycle count doesn't touch them. Without
+// this, scrolling down after such a change reads as "here's what the new
+// selection looks like" when it's actually the old one.
+let loadedOptionsKey = null;
+
+function currentOptionsKey() {
+  return JSON.stringify({
+    channel_path: $('channelPicker').value,
+    use_deployed_plugin: $('useDeployed').checked,
+    account: $('accountPicker').value,
+    cycles: $('cycles').value,
+  });
+}
+
+function checkStale() {
+  const stale = loadedOptionsKey !== null && currentOptionsKey() !== loadedOptionsKey;
+  $('staleNotice').hidden = !stale;
+  $('loadBtn').classList.toggle('stale', stale);
+}
+
+async function selectChannel() {
+  const channel_path = $('channelPicker').value;
+  if (!channel_path) return;
   const account = $('accountPicker').value;
   const body = {
     channel_path,
-    pool_name,
     use_deployed_plugin: $('useDeployed').checked,
-    target_count: parseInt($('targetCount').value, 10),
-    extended_target_count: parseInt($('extendedTargetCount').value, 10),
+    cycles: parseInt($('cycles').value, 10) || 3,
   };
   if (account) body.account_id = parseInt(account, 10);
   try {
-    setStatus('Scoring…', false);
+    setLoading(true);
+    selectedEntryKey = null;
     const data = await api('POST', '/api/select', body);
     renderResult(data);
+    loadedOptionsKey = currentOptionsKey();
+    checkStale();
   } catch (e) {
     setStatus(e.message, true);
+  } finally {
+    setLoading(false);
   }
 }
 
-async function updateWeight(index, weight) {
+// One profile edit: POST it, then re-render from the response. renderResult
+// rebuilds every pool's DOM, including the add-entry row, so a freshly
+// rendered `add-value` input is already empty — nothing to reset by hand.
+async function editProfile(path, body) {
   try {
-    const data = await api('POST', '/api/profile/update', { index, weight });
+    setLoading(true);
+    const data = await api('POST', path, body);
     renderResult(data);
   } catch (e) {
     setStatus(e.message, true);
+  } finally {
+    setLoading(false);
   }
 }
 
-async function removeEntry(index) {
-  try {
-    const data = await api('POST', '/api/profile/remove', { index });
-    renderResult(data);
-  } catch (e) {
-    setStatus(e.message, true);
-  }
+function updateWeight(poolName, index, weight) {
+  return editProfile('/api/profile/update', { pool_name: poolName, index, weight });
 }
 
-async function addEntry() {
-  const kind = $('addKind').value;
-  const value = $('addValue').value.trim();
-  const weight = parseFloat($('addWeight').value);
+function removeEntry(poolName, index) {
+  return editProfile('/api/profile/remove', { pool_name: poolName, index });
+}
+
+// The "add a profile entry" controls live inside each pool's own profile
+// field, next to the profile table they edit (ref/gui/grouping.md:
+// proximity). Each row is wired to the one pool its own DOM position already
+// names, so there's no pool to pick.
+function wireAddEntryRow(row, poolName) {
+  const kindSel = row.querySelector('.add-kind');
+  const valueInput = row.querySelector('.add-value');
+  const suggestBox = row.querySelector('.add-suggestions');
+  const weightInput = row.querySelector('.add-weight');
+  row.querySelector('.add-entry-btn').addEventListener('click', () => addEntryFor(poolName, kindSel.value, valueInput.value.trim(), parseFloat(weightInput.value)));
+  valueInput.addEventListener('input', () => onAddValueInputFor(poolName, kindSel.value, valueInput, suggestBox));
+}
+
+async function addEntryFor(poolName, kind, value, weight) {
   if (!value) return;
-  const body = { weight };
-  body[kind] = value;
-  try {
-    const data = await api('POST', '/api/profile/add', body);
-    renderResult(data);
-    if (!data.error) {
-      $('addValue').value = '';
-      $('addSuggestions').hidden = true;
-    }
-  } catch (e) {
-    setStatus(e.message, true);
-  }
+  await editProfile('/api/profile/add', { pool_name: poolName, weight, [kind]: value });
+}
+
+const SEARCHABLE_KINDS = ['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'item'];
+
+// What a search result shows in the suggestion list.
+function suggestionLabel(kind, r) {
+  if (kind === 'keyword') return `${r.surface} → ${r.keyword}`;
+  if (kind === 'item') return titleWithYear(r);
+  return r;
+}
+
+// What clicking a search result puts in the value input.
+function suggestionValue(kind, r) {
+  if (kind === 'keyword') return r.surface;
+  if (kind === 'item') return titleWithYear(r);
+  return r;
 }
 
 let searchTimer = null;
-async function onAddValueInput() {
+async function onAddValueInputFor(poolName, kind, valueInput, suggestBox) {
   clearTimeout(searchTimer);
-  const kind = $('addKind').value;
-  const q = $('addValue').value.trim();
-  const box = $('addSuggestions');
-  if (q.length < 2 || !['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'item'].includes(kind)) {
-    box.hidden = true;
+  const q = valueInput.value.trim();
+  if (q.length < 2 || !SEARCHABLE_KINDS.includes(kind)) {
+    suggestBox.hidden = true;
     return;
   }
   searchTimer = setTimeout(async () => {
     try {
       let url;
       if (kind === 'keyword') {
-        url = '/api/search/keyword?q=' + encodeURIComponent(q);
+        url = '/api/search/keyword?q=' + encodeURIComponent(q) + '&pool_name=' + encodeURIComponent(poolName);
       } else if (kind === 'item') {
         url = '/api/search/item?q=' + encodeURIComponent(q);
       } else {
         url = '/api/search/tag?namespace=' + encodeURIComponent(kind) + '&q=' + encodeURIComponent(q);
       }
       const data = await api('GET', url);
-      box.innerHTML = '';
+      suggestBox.innerHTML = '';
       const items = data.results;
       for (const r of items) {
         const div = document.createElement('div');
-        const text = (kind === 'keyword') ? `${r.surface} → ${r.keyword}` :
-                     (kind === 'item') ? (r.year ? `${r.title} (${r.year})` : r.title) : r;
-        div.textContent = text;
+        div.textContent = suggestionLabel(kind, r);
         div.addEventListener('click', () => {
-          $('addValue').value = (kind === 'keyword') ? r.surface :
-                                 (kind === 'item') ? (r.year ? `${r.title} (${r.year})` : r.title) : r;
-          box.hidden = true;
+          valueInput.value = suggestionValue(kind, r);
+          suggestBox.hidden = true;
         });
-        box.appendChild(div);
+        suggestBox.appendChild(div);
       }
-      box.hidden = items.length === 0;
+      suggestBox.hidden = items.length === 0;
     } catch (e) {
-      box.hidden = true;
+      suggestBox.hidden = true;
     }
   }, 200);
 }
 
-async function copyProfileYaml() {
-  const yaml = lastResult && lastResult.profile_yaml;
+async function copyProfileYaml(poolName) {
+  const yaml = lastResult?.pools?.[poolName]?.profile_yaml;
   if (!yaml) {
     setStatus('Nothing to copy — the profile has no entries.', true);
     return;
   }
   try {
     await navigator.clipboard.writeText(yaml);
-    setStatus('Copied profile: YAML to clipboard.', false);
+    setStatus(`Copied ${poolName}'s profile: YAML to clipboard.`, false);
   } catch (e) {
     setStatus('Clipboard write failed: ' + e.message, true);
   }
 }
 
-$('loadBtn').addEventListener('click', selectPool);
-$('copyProfileBtn').addEventListener('click', copyProfileYaml);
-$('addBtn').addEventListener('click', addEntry);
-$('addValue').addEventListener('input', onAddValueInput);
+$('loadBtn').addEventListener('click', selectChannel);
+$('moreCyclesBtn').addEventListener('click', () => {
+  const el = $('cycles');
+  const max = parseInt(el.max, 10) || 50;
+  el.value = Math.min(max, (parseInt(el.value, 10) || 3) + 10);
+  selectChannel();
+});
+$('channelPicker').addEventListener('change', checkStale);
+$('useDeployed').addEventListener('change', checkStale);
+$('accountPicker').addEventListener('change', checkStale);
+$('cycles').addEventListener('input', checkStale);
 document.addEventListener('click', (e) => {
-  if (!e.target.closest('.searchbox')) $('addSuggestions').hidden = true;
+  if (!e.target.closest('.searchbox')) {
+    document.querySelectorAll('.add-suggestions').forEach((box) => { box.hidden = true; });
+  }
 });
 
 loadChannels();

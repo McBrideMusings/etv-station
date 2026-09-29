@@ -1952,6 +1952,26 @@ fn compile_and_resolve(
     })
 }
 
+/// The CEL expressions a pool will actually score against — its own
+/// `sources:` table when it wrote one, otherwise its script's own
+/// `sources()` — for a caller that only wants to show or explain them, never
+/// score with them (`taste-lab`'s pool inspector and [`resolve_source_ids`]).
+/// Recompiles the script fresh each call rather than sharing [`ScoreCache`]'s
+/// compiled-AST cache: cheap, and it keeps a read-only caller from taking a
+/// `&mut ScoreCache`.
+pub fn effective_sources(
+    script_path: &Path,
+    pool_sources: Option<&PoolSources>,
+) -> Result<Vec<(String, String)>, String> {
+    let engine = engine();
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
+    let ast = engine
+        .compile(&source)
+        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
+    declared_sources(&engine, &ast, script_path, pool_sources)
+}
+
 /// A plugin pool's candidate entry ids — its declared sources resolved
 /// against the catalog, with no `pick()` call (#182). This is the "the query
 /// itself still runs, the scorer does not" half of the generation
@@ -1967,14 +1987,7 @@ pub(crate) fn resolve_source_ids(
     script_path: &Path,
     pool_sources: Option<&PoolSources>,
 ) -> Result<Vec<String>, String> {
-    let engine = engine();
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
-
-    let declared = declared_sources(&engine, &ast, script_path, pool_sources)?;
+    let declared = effective_sources(script_path, pool_sources)?;
     let whose = source_error_prefix(script_path, pool_sources);
 
     let mut ids = Vec::new();

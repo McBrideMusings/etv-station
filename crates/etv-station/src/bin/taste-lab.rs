@@ -1,24 +1,35 @@
 //! taste-lab: iteratively tune a pool's taste-profile weights against real
 //! data (etv-station-sctf.8) — a dev tool, not part of the daemon, same
 //! category as `taste-debug`. Serves a small local web UI over
-//! `score::{ScoreCache, pick}`, the real scoring path (ADR-0020): a picker
-//! over real `deploy/appdata/channels/*/channel.yaml` pools, live keyword/
-//! genre/item search, and two live tables (every ranked pool candidate, and
-//! what would actually air) that re-score in place as a profile entry is
-//! added, reweighted, or removed — no file write, no process restart.
+//! `score::{ScoreCache, pick}`, the real scoring path (ADR-0020): a channel
+//! picker, live keyword/genre/item search, and one unified schedule
+//! (etv-station-sctf.9) — every plugin-backed pool the channel's `pattern:`
+//! draws from, interleaved in pattern order exactly as [`build_schedule`]
+//! walks it, each entry click-to-inspect for its full audit detail — that
+//! re-scores in place as a profile entry is added, reweighted, or removed —
+//! no file write, no process restart.
+//!
+//! A show pool's `take: N` draws N consecutive items from its ranked list;
+//! [`build_schedule`] renders a run of those that share a catalog `show_id`
+//! as ONE schedule entry (a "visit"), not N separate rows. `taste-cosine.rhai`
+//! already returns a picked show's episodes grouped together ("the order
+//! below is broadcast order AND rotation order at once" — its own LAYOUT
+//! comment), so this reads that grouping back off the catalog rather than
+//! re-deriving it.
 //!
 //! A throwaway spike (etv-station-sctf.1's follow-up, deleted per the spike
-//! lifecycle) proved this shape works end to end against real production
-//! data, and surfaced two real bugs that are this tool's actual scope:
+//! lifecycle) proved the scoring shape works end to end against real
+//! production data, and surfaced two real bugs that are this tool's actual
+//! scope:
 //!
 //! - **Perf.** Against the real ~11,634-movie catalog, a debug build's
 //!   `pick()` took 15-22s, called twice per edit (~40s per weight tweak).
 //!   `ScoreCache::prepare`'s `sources:` resolution already caches correctly
-//!   across edits within one process; the two `pick()` calls did not, and
-//!   cost the most. Fixed two ways: this bin must be run `--release`
-//!   (`tools/taste-lab.sh` does), and [`score_session`] below derives
-//!   "selected" as a prefix of one full-pool `pick()` run instead of running
-//!   it twice.
+//!   across edits within one process; two `pick()` calls per edit did not,
+//!   and cost the most. Fixed two ways: this bin must be run `--release`
+//!   (`tools/taste-lab.sh` does), and [`score_pool`] below runs `pick()`
+//!   exactly once per pool per edit, only for the pool an edit actually
+//!   touched — every other pool's cached ranking is untouched.
 //! - **Fidelity.** The pool's own real `sources:` (or, absent one, its
 //!   script's own default `sources()`) is always what gets scored against —
 //!   never `sources: None`'s silent whole-library substitute. Achieved by
@@ -42,11 +53,12 @@
 //! local catalog/plexdb cache
 //! `tools/taste-debug.sh` already uses.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use etv_station::catalog::{Catalog, TagNs, like_escape};
-use etv_station::config::{self, DatastoreGrant, Pool};
+use etv_station::catalog::{Catalog, Entry as CatalogEntry, TagNs, like_escape};
+use etv_station::config::{self, DatastoreGrant, Pool, Take};
 use etv_station::profile::ProfileEntry;
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use etv_station::tautulli::{self, HistoryScope};
@@ -102,14 +114,64 @@ fn clone_pool(pool: &Pool) -> Result<Pool, String> {
     serde_json::from_value(value).map_err(|e| format!("clone pool: {e}"))
 }
 
-/// One real plugin-backed pool this tool found under `--channels-dir`.
-struct DiscoveredPool {
-    channel_path: PathBuf,
-    channel_name: String,
+/// One `pattern:` step this tool will walk when it assembles a channel's
+/// unified schedule (etv-station-sctf.9) — a flattened, block-order copy of
+/// every `[[rule.blocks]].pattern` entry across the channel, naming the block
+/// it came from and whether its pool is one this tool can score at all.
+///
+/// A pool with no `plugin:` (a static/query pool) cannot run through
+/// `score::pick()` — out of this ticket's scope, same as the rest of the
+/// pattern engine (module docs) — so its steps are kept (the schedule must
+/// still show where they sit in pattern order) but flagged `has_plugin:
+/// false` and never scored; [`build_schedule`] renders them as a `"static"`
+/// placeholder entry instead of drawing from a ranked list.
+struct PlanStep {
+    block_index: usize,
+    block_name: String,
     pool_name: String,
+    take: Take,
+    has_plugin: bool,
 }
 
-fn discover_pools(channels_dir: &Path) -> Vec<DiscoveredPool> {
+/// One channel this tool found under `--channels-dir` with at least one
+/// plugin-backed pattern pool.
+struct DiscoveredChannel {
+    channel_path: PathBuf,
+    channel_name: String,
+    display_name: Option<String>,
+}
+
+/// Every `pattern:` step across `channel`'s blocks, in block-then-pattern
+/// order — the walk order [`build_schedule`] repeats for each cycle.
+fn pattern_plan(channel: &config::ChannelConfig) -> Vec<PlanStep> {
+    let mut out = Vec::new();
+    for (block_index, block) in channel.rule.blocks.iter().enumerate() {
+        if !block.is_pattern() {
+            continue;
+        }
+        let block_name = block
+            .program()
+            .and_then(|p| p.title.clone())
+            .unwrap_or_else(|| format!("block {block_index}"));
+        for step in &block.pattern {
+            let has_plugin = block
+                .pools
+                .iter()
+                .find(|p| p.name == step.pool)
+                .is_some_and(|p| p.plugin.is_some());
+            out.push(PlanStep {
+                block_index,
+                block_name: block_name.clone(),
+                pool_name: step.pool.clone(),
+                take: step.take,
+                has_plugin,
+            });
+        }
+    }
+    out
+}
+
+fn discover_channels(channels_dir: &Path) -> Vec<DiscoveredChannel> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(channels_dir) else {
         return out;
@@ -124,38 +186,59 @@ fn discover_pools(channels_dir: &Path) -> Vec<DiscoveredPool> {
         let Ok(channel) = config::read_channel(&channel_path) else {
             continue;
         };
+        if !pattern_plan(&channel).iter().any(|s| s.has_plugin) {
+            continue;
+        }
         let channel_name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        for block in &channel.rule.blocks {
-            for pool in &block.pools {
-                if pool.plugin.is_some() {
-                    out.push(DiscoveredPool {
-                        channel_path: channel_path.clone(),
-                        channel_name: channel_name.clone(),
-                        pool_name: pool.name.clone(),
-                    });
-                }
-            }
-        }
+        out.push(DiscoveredChannel {
+            channel_path,
+            channel_name,
+            display_name: channel.display_name.clone(),
+        });
     }
     out
 }
 
-/// The currently selected channel/pool and the live-edited working copy of
-/// its profile. Rebuilt wholesale by `POST /api/select`; every other
-/// endpoint mutates `pool.profile` in place and re-scores.
-struct Session {
-    channel_dir: PathBuf,
-    pool_name: String,
+/// One plugin-backed pool referenced by the selected channel's pattern —
+/// a live-edited working copy of its profile, plus the last full ranked
+/// list `score_pool` computed for it. `full` is `None` until the first
+/// (re)score, and stays populated across an edit to a *different* pool: only
+/// [`score_pool`] on this pool's own name recomputes it, which is what makes
+/// a weight tweak on one pool cheap instead of re-scoring the whole channel.
+///
+/// `sources_effective` and `candidates_json` cache work `build_payload`
+/// would otherwise redo for every pool on every request, not only the one an
+/// edit touched — `sources_effective` never changes for the pool's lifetime
+/// in this session (it depends only on the plugin script and the pool's own
+/// `sources:`, neither of which this tool ever mutates), so it's computed
+/// once in [`build_pool_working`]. `candidates_json` depends on `full`, so
+/// it's recomputed exactly when `full` is, inside [`score_pool`], instead of
+/// on every response.
+struct PoolWorking {
     pool: Pool,
     plugin_path: PathBuf,
     plexdb_path: PathBuf,
     datastore_name: String,
+    full: Option<Vec<PickedItem>>,
+    sources_effective: Option<Vec<(String, String)>>,
+    candidates_json: Vec<Value>,
+}
+
+/// The currently selected channel and the live-edited working copy of every
+/// plugin-backed pool its pattern draws from. Rebuilt wholesale by `POST
+/// /api/select`; every profile-editing endpoint mutates one [`PoolWorking`]
+/// in place and re-scores only that pool.
+struct Session {
+    channel_path: PathBuf,
+    channel_dir: PathBuf,
+    channel_name: String,
     account_id: Option<i64>,
-    target_count: usize,
-    extended_target_count: usize,
+    cycles: usize,
+    plan: Vec<PlanStep>,
+    pools: HashMap<String, PoolWorking>,
 }
 
 struct AppState {
@@ -290,63 +373,53 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn api_channels(state: &AppState) -> Value {
-    let pools = discover_pools(&state.channels_dir);
-    let list: Vec<Value> = pools
+    let channels = discover_channels(&state.channels_dir);
+    let list: Vec<Value> = channels
         .iter()
-        .map(|p| {
+        .map(|c| {
             json!({
-                "channel_path": p.channel_path.display().to_string(),
-                "channel_name": p.channel_name,
-                "pool_name": p.pool_name,
+                "channel_path": c.channel_path.display().to_string(),
+                "channel_name": c.channel_name,
+                "display_name": c.display_name,
             })
         })
         .collect();
-    json!({ "pools": list })
+    json!({ "channels": list })
 }
 
 #[derive(serde::Deserialize)]
 struct SelectRequest {
     channel_path: String,
-    pool_name: String,
     #[serde(default)]
     account_id: Option<i64>,
     #[serde(default)]
     use_deployed_plugin: bool,
     #[serde(default)]
-    target_count: Option<usize>,
-    #[serde(default)]
-    extended_target_count: Option<usize>,
+    cycles: Option<usize>,
 }
 
-fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> {
-    let req: SelectRequest =
-        serde_json::from_str(body).map_err(|e| format!("bad request body: {e}"))?;
-
-    let channel_path = PathBuf::from(&req.channel_path);
-    let channel = config::read_channel(&channel_path).map_err(|e| e.to_string())?;
-    let channel_dir = channel_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let pool = channel
-        .rule
-        .blocks
-        .iter()
-        .flat_map(|b| b.pools.iter())
-        .find(|p| p.name == req.pool_name)
-        .ok_or_else(|| format!("no pool named {:?} in {}", req.pool_name, req.channel_path))?;
+/// Build the working copy of one plugin-backed pool named by a pattern step —
+/// resolves which plugin script to score against (deployed vs. this
+/// checkout's `examples/plugins/`, see module docs), expands its datastore
+/// grant's env references, and clones the pool so profile edits never touch
+/// the real `channel.yaml`.
+fn build_pool_working(
+    state: &AppState,
+    channel_dir: &Path,
+    pool: &Pool,
+    use_deployed_plugin: bool,
+) -> Result<PoolWorking, String> {
     let plugin = pool
         .plugin
         .as_ref()
-        .ok_or_else(|| format!("pool {:?} has no `plugin:`", req.pool_name))?;
+        .ok_or_else(|| format!("pool {:?} has no `plugin:`", pool.name))?;
     let deployed_path = if plugin.is_absolute() {
         plugin.clone()
     } else {
         channel_dir.join(plugin)
     };
 
-    let plugin_path = if req.use_deployed_plugin {
+    let plugin_path = if use_deployed_plugin {
         deployed_path.clone()
     } else {
         let basename = deployed_path
@@ -363,7 +436,63 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
     }
 
     if pool.datastores.is_empty() {
-        return Err(format!("pool {:?} declares no datastores", req.pool_name));
+        return Err(format!("pool {:?} declares no datastores", pool.name));
+    }
+
+    let mut pool_owned = clone_pool(pool)?;
+    // `ScoreCache::prepare_profile` opens `pool.datastores.first()` itself,
+    // reading its raw `path` — unlike `score::pick`, which this tool hands
+    // an explicitly-expanded grant. Expanding every grant here once, on the
+    // working copy, is what makes a `keyword:` profile entry resolve instead
+    // of failing to open a literal `${PLEXDB_SNAPSHOT_PATH}`.
+    for ds in &mut pool_owned.datastores {
+        ds.path = expand_env(&ds.path)?;
+    }
+    let first_grant = pool_owned
+        .datastores
+        .first()
+        .expect("checked non-empty above");
+    let plexdb_path = PathBuf::from(&first_grant.path);
+    let datastore_name = first_grant.name.clone();
+
+    // Computed once here rather than per-request (see `PoolWorking`'s doc):
+    // depends only on the plugin script and the pool's own `sources:`,
+    // neither of which changes for the rest of this session.
+    let sources_effective =
+        etv_station::score::effective_sources(&plugin_path, pool_owned.sources.as_ref()).ok();
+
+    Ok(PoolWorking {
+        pool: pool_owned,
+        plugin_path,
+        plexdb_path,
+        datastore_name,
+        full: None,
+        sources_effective,
+        candidates_json: Vec::new(),
+    })
+}
+
+fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> {
+    let req: SelectRequest =
+        serde_json::from_str(body).map_err(|e| format!("bad request body: {e}"))?;
+
+    let channel_path = PathBuf::from(&req.channel_path);
+    let channel = config::read_channel(&channel_path).map_err(|e| e.to_string())?;
+    let channel_dir = channel_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let channel_name = channel_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let plan = pattern_plan(&channel);
+    if !plan.iter().any(|s| s.has_plugin) {
+        return Err(format!(
+            "channel {:?} has no plugin-backed pattern pool",
+            req.channel_path
+        ));
     }
 
     let account_id = match req.account_id {
@@ -385,51 +514,99 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
         },
     };
 
-    let mut pool_owned = clone_pool(pool)?;
-    // `ScoreCache::prepare_profile` opens `pool.datastores.first()` itself,
-    // reading its raw `path` — unlike `score::pick`, which this tool hands
-    // an explicitly-expanded grant. Expanding every grant here once, on the
-    // working copy, is what makes a `keyword:` profile entry resolve instead
-    // of failing to open a literal `${PLEXDB_SNAPSHOT_PATH}`.
-    for ds in &mut pool_owned.datastores {
-        ds.path = expand_env(&ds.path)?;
-    }
-    let first_grant = pool_owned
-        .datastores
-        .first()
-        .expect("checked non-empty above");
-    let plexdb_path = PathBuf::from(&first_grant.path);
-    let datastore_name = first_grant.name.clone();
-
     // A fresh cache, not a reused one: `ScoreCache::prepare_profile` only
     // ever runs once per generation in the daemon, so it treats "this pool's
     // profile is empty" as "nothing to resolve" and leaves whatever it
     // resolved last time sitting in its cache — correct there, wrong here,
-    // where the same pool name can be re-selected many times with a
-    // different (or emptied-back-out) profile each time. Without this, a
-    // fresh `/api/select` for a pool silently kept scoring against a
-    // *previous session's* edited profile instead of the real channel.yaml's
-    // own (unresolved sources: still get re-cached for free on the next
-    // score_session, since `prepare` keys on script path + sources).
+    // where the same channel can be re-selected many times with different
+    // (or emptied-back-out) profiles each time.
     state.cache = ScoreCache::default();
 
+    let mut pools = HashMap::new();
+    for step in plan.iter().filter(|s| s.has_plugin) {
+        if pools.contains_key(&step.pool_name) {
+            continue;
+        }
+        let pool = channel
+            .rule
+            .blocks
+            .get(step.block_index)
+            .and_then(|b| b.pools.iter().find(|p| p.name == step.pool_name))
+            .ok_or_else(|| format!("pool {:?} vanished from its own block", step.pool_name))?;
+        let working = build_pool_working(state, &channel_dir, pool, req.use_deployed_plugin)?;
+        pools.insert(step.pool_name.clone(), working);
+    }
+
+    let pool_names: Vec<String> = pools.keys().cloned().collect();
     state.session = Some(Session {
+        channel_path,
         channel_dir,
-        pool_name: req.pool_name,
-        pool: pool_owned,
-        plugin_path,
-        plexdb_path,
-        datastore_name,
+        channel_name,
         account_id,
-        target_count: req.target_count.unwrap_or(20),
-        extended_target_count: req.extended_target_count.unwrap_or(300),
+        // Watching how often a pool starts repeating needs enough passes to
+        // actually see a repeat, and a cycle costs no extra `pick()` call —
+        // score_pool ranks each pool once regardless of `cycles`, so this
+        // only adds cheap catalog lookups and a longer JSON payload/DOM,
+        // never a slower re-score.
+        cycles: req.cycles.unwrap_or(3).clamp(1, 50),
+        plan,
+        pools,
     });
 
-    Ok(score_or_describe_error(state))
+    let mut errors = Vec::new();
+    for name in &pool_names {
+        if let Err(e) = score_pool(state, name) {
+            errors.push(format!("{name}: {e}"));
+        }
+    }
+
+    // `plan` has at least one plugin step (checked above), so `pool_names`
+    // is never empty and "every pool failed" is distinct from "none did".
+    let response = if errors.is_empty() {
+        (200, build_payload(state))
+    } else if errors.len() == pool_names.len() {
+        (400, payload_with_error(state, errors.join("; ")))
+    } else {
+        let message = format!("some pools failed to score: {}", errors.join("; "));
+        (200, payload_with_error(state, message))
+    };
+    Ok(response)
+}
+
+/// [`build_payload`] with an `"error"` field added — a failed score still
+/// returns every pool's real config and the schedule, not a blank page.
+fn payload_with_error(state: &AppState, error: String) -> Value {
+    let mut payload = build_payload(state);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("error".to_string(), json!(error));
+    }
+    payload
+}
+
+/// Re-score one pool in place and rebuild the whole payload — the shape every
+/// profile-editing endpoint returns. Only the touched pool re-runs `pick()`;
+/// every other pool's cached `full` ranking (and so its contribution to the
+/// schedule) is untouched.
+fn rescore_and_respond(state: &mut AppState, pool_name: &str) -> (u16, Value) {
+    match score_pool(state, pool_name) {
+        Ok(()) => (200, build_payload(state)),
+        Err(e) => (400, payload_with_error(state, e)),
+    }
+}
+
+fn session_pool_mut<'a>(
+    session: &'a mut Session,
+    pool_name: &str,
+) -> Result<&'a mut PoolWorking, String> {
+    session
+        .pools
+        .get_mut(pool_name)
+        .ok_or_else(|| format!("no pool named {pool_name:?} in the selected channel"))
 }
 
 #[derive(serde::Deserialize)]
 struct ProfileAddRequest {
+    pool_name: String,
     #[serde(flatten)]
     entry: ProfileEntry,
 }
@@ -446,13 +623,15 @@ fn api_profile_add(state: &mut AppState, body: &str) -> Result<(u16, Value), Str
     let session = state
         .session
         .as_mut()
-        .ok_or_else(|| "no pool selected".to_string())?;
-    session.pool.profile.push(req.entry);
-    Ok(score_or_describe_error(state))
+        .ok_or_else(|| "no channel selected".to_string())?;
+    let pool = session_pool_mut(session, &req.pool_name)?;
+    pool.pool.profile.push(req.entry);
+    Ok(rescore_and_respond(state, &req.pool_name))
 }
 
 #[derive(serde::Deserialize)]
 struct ProfileUpdateRequest {
+    pool_name: String,
     index: usize,
     weight: f64,
 }
@@ -466,18 +645,20 @@ fn api_profile_update(state: &mut AppState, body: &str) -> Result<(u16, Value), 
     let session = state
         .session
         .as_mut()
-        .ok_or_else(|| "no pool selected".to_string())?;
-    let entry = session
+        .ok_or_else(|| "no channel selected".to_string())?;
+    let pool = session_pool_mut(session, &req.pool_name)?;
+    let entry = pool
         .pool
         .profile
         .get_mut(req.index)
         .ok_or_else(|| format!("no profile entry at index {}", req.index))?;
     entry.weight = Some(req.weight);
-    Ok(score_or_describe_error(state))
+    Ok(rescore_and_respond(state, &req.pool_name))
 }
 
 #[derive(serde::Deserialize)]
 struct ProfileRemoveRequest {
+    pool_name: String,
     index: usize,
 }
 
@@ -487,36 +668,43 @@ fn api_profile_remove(state: &mut AppState, body: &str) -> Result<(u16, Value), 
     let session = state
         .session
         .as_mut()
-        .ok_or_else(|| "no pool selected".to_string())?;
-    if req.index >= session.pool.profile.len() {
+        .ok_or_else(|| "no channel selected".to_string())?;
+    let pool = session_pool_mut(session, &req.pool_name)?;
+    if req.index >= pool.pool.profile.len() {
         return Err(format!("no profile entry at index {}", req.index));
     }
-    session.pool.profile.remove(req.index);
-    Ok(score_or_describe_error(state))
+    pool.pool.profile.remove(req.index);
+    Ok(rescore_and_respond(state, &req.pool_name))
 }
 
-/// The session's real config, independent of whether scoring it succeeds —
-/// `sources:`/`config:`/which plugin script/which account, all read straight
-/// off the pool with no catalog access and nothing that can fail. Used to
-/// answer "what am I actually pointed at" even when `pick()` errors out (a
-/// schema mismatch between the picked plugin script and this pool's
-/// `config:`, most often), so a failed select still shows the real pool
-/// instead of leaving the page blank.
-fn describe_session(session: &Session) -> Value {
-    let sources = match &session.pool.sources {
-        Some(map) => json!(map),
-        None => json!(null),
-    };
+/// One pool's real config, independent of whether scoring it succeeds —
+/// `sources:`/`config:`/which plugin script, all read straight off the pool
+/// with no catalog access and nothing that can fail. Used to answer "what am
+/// I actually pointed at" even when `pick()` errors out (a schema mismatch
+/// between the picked plugin script and this pool's `config:`, most often),
+/// so a failed select still shows the real pool instead of leaving the page
+/// blank.
+fn describe_pool(name: &str, pw: &PoolWorking) -> Value {
+    let sources_authored = pw.pool.sources.is_some();
+    // What the pool will actually score against, whether or not it wrote its
+    // own `sources:` — cached on `pw` at select time (see `PoolWorking`'s
+    // doc), not recomputed per request. `None` here means `build_pool_working`
+    // failed to compile the script, which already surfaces as the pool's own
+    // `pick()` error elsewhere, so it's shown as unknown rather than twice.
+    let sources_effective = pw
+        .sources_effective
+        .clone()
+        .map(|pairs| Value::Object(pairs.into_iter().map(|(k, v)| (k, json!(v))).collect()));
     json!({
-        "pool_name": session.pool_name,
-        "plugin_path": session.plugin_path.display().to_string(),
-        "plexdb_path": session.plexdb_path.display().to_string(),
-        "account_id": session.account_id,
-        "target_count": session.target_count,
-        "extended_target_count": session.extended_target_count,
-        "sources": sources,
-        "config": session.pool.config.clone().unwrap_or(Value::Null),
-        "profile_yaml": profile_yaml(&session.pool),
+        "pool_name": name,
+        "plugin_path": pw.plugin_path.display().to_string(),
+        "plexdb_path": pw.plexdb_path.display().to_string(),
+        "sources_authored": sources_authored,
+        "sources_effective": sources_effective,
+        "config": pw.pool.config.clone().unwrap_or_else(|| json!({})),
+        "config_authored": pw.pool.config.is_some(),
+        "profile_yaml": profile_yaml(&pw.pool),
+        "candidate_count": pw.full.as_ref().map(|f| f.len()).unwrap_or(0),
     })
 }
 
@@ -548,46 +736,36 @@ fn profile_yaml(pool: &Pool) -> String {
     format!("profile:\n{indented}\n")
 }
 
-/// [`score_session`], but a failure still returns the session's real
-/// `sources:`/`config:`/plugin path (via [`describe_session`]) alongside the
-/// error instead of losing them — see that function's doc for why.
-fn score_or_describe_error(state: &mut AppState) -> (u16, Value) {
-    match score_session(state) {
-        Ok(v) => (200, v),
-        Err(e) => {
-            let mut v = state
-                .session
-                .as_ref()
-                .map(describe_session)
-                .unwrap_or_else(|| json!({}));
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("error".to_string(), json!(e));
-            }
-            (400, v)
-        }
-    }
-}
+/// Run one full-pool `pick()` for `pool_name` against its real `sources:`,
+/// real (working-copy) profile, real capabilities/datastores — see the
+/// module docs for why one call per pool, not two — and store the ranked
+/// list on its [`PoolWorking::full`] for [`build_schedule`] to draw from.
+/// Every other pool's `full` is untouched, which is what makes a weight
+/// tweak on one pool cheap.
+fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
+    const EXTENDED_TARGET_COUNT: usize = 300;
 
-/// Run one full-pool `pick()` against the session's real `sources:`, real
-/// profile, real capabilities/datastores — see the module docs for why one
-/// call, not two. `selected` is a prefix of `full`, not a second run.
-fn score_session(state: &mut AppState) -> Result<Value, String> {
     let session = state
         .session
         .as_ref()
-        .ok_or_else(|| "no pool selected".to_string())?;
+        .ok_or_else(|| "no channel selected".to_string())?;
+    let account_id = session.account_id;
+    let channel_dir = session.channel_dir.clone();
+    let pw = session
+        .pools
+        .get(pool_name)
+        .ok_or_else(|| format!("no pool named {pool_name:?} in the selected channel"))?;
+    let plugin_path = pw.plugin_path.clone();
+    let plexdb_path = pw.plexdb_path.display().to_string();
+    let datastore_name = pw.datastore_name.clone();
 
     state
         .cache
-        .prepare(
-            &state.catalog,
-            &session.plugin_path,
-            session.pool.sources.as_ref(),
-        )
+        .prepare(&state.catalog, &plugin_path, pw.pool.sources.as_ref())
         .map_err(|e| format!("prepare: {e}"))?;
     state
         .cache
-        .prepare_profile(&state.catalog, &session.pool, &session.channel_dir)
+        .prepare_profile(&state.catalog, &pw.pool, &channel_dir)
         .map_err(|e| format!("profile: {e}"))?;
 
     let now = std::time::SystemTime::now()
@@ -595,79 +773,240 @@ fn score_session(state: &mut AppState) -> Result<Value, String> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let mut full_config = session.pool.config.clone().unwrap_or_else(|| json!({}));
+    let mut full_config = pw.pool.config.clone().unwrap_or_else(|| json!({}));
     if let Some(obj) = full_config.as_object_mut() {
         obj.insert("exploration_fraction".to_string(), json!(0.0));
     }
     let inputs = ScoreInputs {
-        target_count: session.extended_target_count,
+        target_count: EXTENDED_TARGET_COUNT,
         now,
-        account_id: session.account_id,
+        account_id,
         ..Default::default()
     };
-    let grant = GrantedCapabilities::from_names(&session.pool.capabilities).with_datastores(&[
+    let grant = GrantedCapabilities::from_names(&pw.pool.capabilities).with_datastores(&[
         DatastoreGrant {
-            name: session.datastore_name.clone(),
-            path: session.plexdb_path.display().to_string(),
+            name: datastore_name,
+            path: plexdb_path,
         },
     ])?;
 
     let full = etv_station::score::pick(
         &state.cache,
-        &session.plugin_path,
-        session.pool.sources.as_ref(),
+        &plugin_path,
+        pw.pool.sources.as_ref(),
         &inputs,
         0,
-        &session.pool_name,
+        pool_name,
         Some(&full_config),
         grant,
     )
     .map_err(|e| format!("pick: {e}"))?;
 
-    let selected_len = session.target_count.min(full.len());
-    let selected = &full[..selected_len];
-
-    // The full ranked list can be thousands of rows; the payload shows the
-    // top slice plus the true count rather than every row.
-    const IN_POOL_SHOWN: usize = 300;
-    let in_pool_rows: Vec<Value> = full
+    // Computed here, alongside `full`, rather than by `build_payload` on
+    // every request — this is the one place `full` actually changes, so
+    // it's the one place its derived `candidates` view needs to change too.
+    let candidates_json: Vec<Value> = full
         .iter()
-        .take(IN_POOL_SHOWN)
-        .map(|item| picked_item_json(&state.catalog, item))
-        .collect();
-    let selected_rows: Vec<Value> = selected
-        .iter()
-        .map(|item| picked_item_json(&state.catalog, item))
+        .take(CANDIDATES_SHOWN)
+        .map(|item| {
+            let entry = state.catalog.entry(&item.id).ok().flatten();
+            picked_item_json(&state.catalog, item, entry.as_ref())
+        })
         .collect();
 
-    let profile = profile_json(&state.cache, &session.pool_name);
-    let mut payload = describe_session(session);
-    let obj = payload
-        .as_object_mut()
-        .expect("describe_session returns an object");
-    obj.insert("profile".to_string(), profile);
-    obj.insert(
-        "in_pool".to_string(),
-        json!({ "total": full.len(), "shown": in_pool_rows.len(), "rows": in_pool_rows }),
-    );
-    obj.insert(
-        "selected".to_string(),
-        json!({ "total": selected.len(), "rows": selected_rows }),
-    );
-    Ok(payload)
+    let session = state.session.as_mut().expect("checked above");
+    let pw = session_pool_mut(session, pool_name).expect("checked above");
+    pw.full = Some(full);
+    pw.candidates_json = candidates_json;
+    Ok(())
 }
 
-fn picked_item_json(catalog: &Catalog, item: &PickedItem) -> Value {
-    let (title, year) = match catalog.entry(&item.id) {
-        Ok(Some(e)) => (e.title, e.year),
-        _ => ("<unknown>".to_string(), None),
+/// How many of a pool's ranked candidates the payload carries — the full
+/// list can be thousands of rows (a movies pool ranks the whole library),
+/// and every one already costs a catalog lookup (see [`picked_item_json`]),
+/// so this caps it. `candidate_count` in [`describe_pool`] still reports
+/// the true total.
+const CANDIDATES_SHOWN: usize = 300;
+
+/// Every pool's description — including its own ranked-candidate list, up to
+/// [`CANDIDATES_SHOWN`], each carrying the same real audit detail the
+/// schedule's picks do (`score::pick`'s `audit()` call covers every
+/// candidate it returned, not only the ones a pattern step drew, so this is
+/// the same data, not a second query) — plus the channel's unified,
+/// pattern-interleaved schedule (etv-station-sctf.9). The whole response
+/// body for `/api/select` and every profile-editing endpoint.
+fn build_payload(state: &AppState) -> Value {
+    let session = state.session.as_ref().expect("caller checked");
+    let mut pools_json = serde_json::Map::new();
+    for (name, pw) in &session.pools {
+        let mut desc = describe_pool(name, pw);
+        if let Some(obj) = desc.as_object_mut() {
+            obj.insert("profile".to_string(), profile_json(&state.cache, name));
+            // Cached on `pw` by `score_pool`, the one place `full` (and so
+            // this derived view) actually changes — a pool an edit didn't
+            // touch pays nothing here, not even the catalog lookups a fresh
+            // `picked_item_json` per candidate would cost.
+            obj.insert("candidates".to_string(), json!(pw.candidates_json));
+        }
+        pools_json.insert(name.clone(), desc);
+    }
+    let schedule = build_schedule(&state.catalog, session);
+    json!({
+        "channel_path": session.channel_path.display().to_string(),
+        "channel_name": session.channel_name,
+        "account_id": session.account_id,
+        "cycles": session.cycles,
+        "pools": pools_json,
+        "schedule": schedule,
+    })
+}
+
+/// A demo cap for `take: "all"` — real size depends on which bucket a live
+/// visit picks, not knowable from a ranked list alone (see [`Take`]'s own
+/// docs), so this tool shows a bounded slice rather than modeling the real
+/// pattern engine's bucket-draining rule (out of this ticket's scope, see
+/// module docs).
+const TAKE_ALL_DEMO_CAP: usize = 12;
+
+/// Walk `session.plan` for `session.cycles` passes, each step slicing the
+/// next `take` items off its pool's cached ranked list (a per-pool cursor
+/// that only ever advances — a simplification of the real `advance: resume`/
+/// `restart` state machine the daemon runs, out of this ticket's scope, see
+/// module docs — and wraps back to the top once a pool runs out, which reads
+/// as a coherent moment-in-time schedule without ever repeating a title
+/// inside the same session view).
+///
+/// A step's slice is split into one schedule entry per run of consecutive
+/// items sharing the same catalog `show_id` — this is what turns a show
+/// pool's `take: 3` into ONE "visit" block instead of three separate rows
+/// (etv-station-sctf.9's acceptance criteria), driven by the real grouping
+/// `taste-cosine.rhai` already produced (module docs), not a second guess
+/// at it.
+fn build_schedule(catalog: &Catalog, session: &Session) -> Vec<Value> {
+    let mut cursors: HashMap<&str, usize> = HashMap::new();
+    let mut out = Vec::new();
+
+    for cycle in 0..session.cycles {
+        for step in &session.plan {
+            if !step.has_plugin {
+                out.push(json!({
+                    "cycle": cycle,
+                    "block_index": step.block_index,
+                    "block_name": step.block_name,
+                    "pool_name": step.pool_name,
+                    "kind": "static",
+                    "note": "static pool (no `plugin:` — taste-lab only models plugin-backed pools)",
+                }));
+                continue;
+            }
+            let Some(pw) = session.pools.get(&step.pool_name) else {
+                continue;
+            };
+            let Some(full) = pw.full.as_ref() else {
+                continue;
+            };
+            if full.is_empty() {
+                continue;
+            }
+            let take = step.take.count().unwrap_or(TAKE_ALL_DEMO_CAP).max(1);
+            let cursor = cursors.entry(step.pool_name.as_str()).or_insert(0);
+            let wrapped = *cursor >= full.len();
+            if wrapped {
+                *cursor = 0;
+            }
+            let end = (*cursor + take).min(full.len());
+            let slice = &full[*cursor..end];
+            *cursor = end;
+
+            // One catalog lookup per item, reused for both the `show_id`
+            // grouping test below and `picked_item_json` — a second lookup
+            // per item would double this function's SQLite round trips for
+            // no reason, since both already want the same `Entry`.
+            let looked_up: Vec<Option<CatalogEntry>> = slice
+                .iter()
+                .map(|item| catalog.entry(&item.id).ok().flatten())
+                .collect();
+            let show_id_at = |k: usize| looked_up[k].as_ref().and_then(|e| e.show_id.as_deref());
+
+            let mut i = 0;
+            while i < slice.len() {
+                let mut j = i + 1;
+                if let Some(show_id) = show_id_at(i) {
+                    while j < slice.len() && show_id_at(j) == Some(show_id) {
+                        j += 1;
+                    }
+                }
+                let group = &slice[i..j];
+                let entries: Vec<Value> = group
+                    .iter()
+                    .zip(&looked_up[i..j])
+                    .map(|(item, entry)| picked_item_json(catalog, item, entry.as_ref()))
+                    .collect();
+                out.push(json!({
+                    "cycle": cycle,
+                    "block_index": step.block_index,
+                    "block_name": step.block_name,
+                    "pool_name": step.pool_name,
+                    "kind": if group.len() > 1 { "visit" } else { "single" },
+                    "wrapped": wrapped,
+                    "entries": entries,
+                }));
+                i = j;
+            }
+        }
+    }
+    out
+}
+
+/// One picked item, ready for the schedule — title/show/season/episode read
+/// from `entry` (the caller's own catalog lookup, reused rather than
+/// repeated here — see [`build_schedule`]'s grouping loop), plus its own
+/// `audit` record (the plugin's `audit()` output `score::pick` already
+/// merged into `metadata.audit`, #389/#392/#393) with every near-miss's id
+/// resolved to a title too, so the inspector never has to look anything up
+/// itself.
+fn picked_item_json(catalog: &Catalog, item: &PickedItem, entry: Option<&CatalogEntry>) -> Value {
+    let (title, year, show, season, episode) = match entry {
+        Some(e) => (e.title.clone(), e.year, e.show.clone(), e.season, e.episode),
+        None => ("<unknown>".to_string(), None, None, None, None),
     };
     json!({
         "id": item.id,
         "title": title,
         "year": year,
+        "show": show,
+        "season": season,
+        "episode": episode,
         "metadata": item.metadata,
+        "audit": enrich_audit(catalog, item.metadata.as_ref()),
     })
+}
+
+/// The first `audit()` record `score::pick` attached to this item's
+/// `metadata.audit` (module docs: `pick()` runs `audit()` itself and merges
+/// its stage records in, keyed to the picked item), with every
+/// `detail.near_misses[].id` resolved to a title/year — the near-miss list
+/// is entry ids and a score/reason on its own (see `taste-cosine.rhai`'s
+/// `audit()`), useless to a reader without knowing what they name.
+fn enrich_audit(catalog: &Catalog, metadata: Option<&Value>) -> Option<Value> {
+    let mut audit = metadata?.get("audit")?.as_array()?.first()?.clone();
+    let near_misses = audit
+        .get_mut("detail")
+        .and_then(|d| d.get_mut("near_misses"))
+        .and_then(|nm| nm.as_array_mut());
+    if let Some(near_misses) = near_misses {
+        for row in near_misses.iter_mut() {
+            let id = row.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            let Some(id) = id else { continue };
+            if let Ok(Some(e)) = catalog.entry(&id)
+                && let Some(obj) = row.as_object_mut()
+            {
+                obj.insert("title".to_string(), json!(e.title));
+                obj.insert("year".to_string(), json!(e.year));
+            }
+        }
+    }
+    Some(audit)
 }
 
 fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
@@ -699,14 +1038,38 @@ fn open_plexdb_readonly(path: &Path) -> Result<Connection, String> {
         .map_err(|e| format!("open {}: {e}", path.display()))
 }
 
+/// The plexdb path to search against: the `pool_name` query param if one was
+/// given, else the session's first pool (by name — a channel's plugin-backed
+/// pools nearly always share one `datastores:` grant, per module docs, so
+/// any of them resolves the same plexdb).
+fn resolve_search_plexdb(
+    session: &Session,
+    params: &HashMap<String, String>,
+) -> Result<PathBuf, String> {
+    let pw = match params.get("pool_name") {
+        Some(name) => session
+            .pools
+            .get(name)
+            .ok_or_else(|| format!("no pool named {name:?} in the selected channel"))?,
+        None => session
+            .pools
+            .iter()
+            .min_by_key(|(name, _)| name.as_str())
+            .map(|(_, pw)| pw)
+            .ok_or_else(|| "selected channel has no plugin-backed pool".to_string())?,
+    };
+    Ok(pw.plexdb_path.clone())
+}
+
 fn api_search_keyword(state: &AppState, query: &str) -> Result<(u16, Value), String> {
     let params = parse_query(query);
     let q = params.get("q").cloned().unwrap_or_default();
     let session = state
         .session
         .as_ref()
-        .ok_or_else(|| "no pool selected".to_string())?;
-    let conn = open_plexdb_readonly(&session.plexdb_path)?;
+        .ok_or_else(|| "no channel selected".to_string())?;
+    let plexdb_path = resolve_search_plexdb(session, &params)?;
+    let conn = open_plexdb_readonly(&plexdb_path)?;
     let pattern = format!("%{}%", like_escape(&q));
     let mut stmt = conn
         .prepare(
