@@ -221,8 +221,25 @@ fn main() -> Result<(), String> {
     cache
         .prepare(&catalog, &script_path, pool_cfg.sources.as_ref())
         .map_err(|e| format!("prepare: {e}"))?;
+    // `prepare_profile` opens `pool.datastores.first()` itself, reading its
+    // raw `path` — fine for the real daemon, which only ever sees a pool
+    // whose `${VAR}` datastore references `config::load`'s full pipeline
+    // already expanded, but `read_channel` above is the bare single-file
+    // parse this tool uses instead, which does not run that expansion pass.
+    // A pool profile with no `keyword:` entry never took this path before
+    // (`prepare_profile` skips a pool with nothing to resolve), so this went
+    // unnoticed until a real channel's pool first authored one. Same fix as
+    // taste-lab.rs: a JSON-round-trip clone (`Pool` has no `Clone`) with the
+    // grant path already expanded.
+    let mut pool_for_profile: config::Pool = serde_json::from_value(
+        serde_json::to_value(pool_cfg).map_err(|e| format!("clone pool: {e}"))?,
+    )
+    .map_err(|e| format!("clone pool: {e}"))?;
+    for ds in &mut pool_for_profile.datastores {
+        ds.path = expand_env(&ds.path)?;
+    }
     cache
-        .prepare_profile(&catalog, pool_cfg, &channel_dir)
+        .prepare_profile(&catalog, &pool_for_profile, &channel_dir)
         .map_err(|e| format!("profile: {e}"))?;
     if let Some(profile) = cache.profile(&cli.pool) {
         print_profile(profile);

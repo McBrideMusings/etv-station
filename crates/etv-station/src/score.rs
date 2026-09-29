@@ -1270,6 +1270,20 @@ impl ScoreCache {
             && pool.profile_files.is_empty()
             && pool.exclude_keywords.is_empty()
         {
+            // Still records an (empty) entry rather than leaving `self.profiles`
+            // untouched — [`pick`] reads a missing entry as empty anyway
+            // (`cache.profile(pool_name).map(...).unwrap_or_default()`), so this
+            // changes nothing observable for the daemon's own one-call-per-pool-
+            // per-generation usage. It matters for a caller that calls this more
+            // than once for the same pool within one `ScoreCache`'s lifetime
+            // (`taste-lab`, tuning a profile down to nothing): without it, a
+            // stale non-empty resolution from an earlier call would keep
+            // answering [`Self::profile`] forever, even after the pool's own
+            // profile emptied back out.
+            self.profiles.insert(
+                pool.name.clone(),
+                crate::profile::ResolvedProfile::default(),
+            );
             return Ok(());
         }
         let entries = crate::profile::load(pool, base_dir)?;

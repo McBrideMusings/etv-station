@@ -876,6 +876,51 @@ impl Catalog {
         )
     }
 
+    /// Titles matching `query` case-insensitively (a substring search), for
+    /// picking an `item:` profile reference by name rather than by an exact
+    /// `"Title (Year)"`. Episodes are excluded, same as
+    /// [`Self::entry_ids_by_title_year`]: an episode's `title` is its own
+    /// name, never what a profile author means by "the item".
+    pub fn search_titles(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Option<i64>)>, CatalogError> {
+        let pattern = format!("%{}%", like_escape(query));
+        let mut stmt = self.conn.prepare(
+            "SELECT entry_id, title, year FROM entries
+              WHERE title LIKE ?1 COLLATE NOCASE AND type != 'episode'
+              ORDER BY title, year LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct tag values in `namespace` matching `query` case-insensitively
+    /// — browsing what genres/cast/directors/… exist before writing a
+    /// profile entry that names one.
+    pub fn search_tag_values(
+        &self,
+        namespace: TagNs,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, CatalogError> {
+        let pattern = format!("%{}%", like_escape(query));
+        self.query_strings(
+            "SELECT DISTINCT value FROM tags WHERE namespace = ?1 AND value LIKE ?2 COLLATE NOCASE
+              ORDER BY value LIMIT ?3",
+            params![namespace.as_str(), pattern, limit as i64],
+        )
+    }
+
     /// Members of a collection in authored `position` order, `entry_id`
     /// breaking ties for a total order.
     pub fn collection_members(&self, collection_id: &str) -> Result<Vec<String>, CatalogError> {
@@ -945,6 +990,17 @@ impl Catalog {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(out)
     }
+}
+
+/// Strip SQLite `LIKE` wildcards out of a user-typed search term before
+/// wrapping it in `%…%`, so a query containing `%` or `_` searches for that
+/// literal text instead of matching everything (or an unintended single
+/// character). `pub` so a caller running its own `LIKE` query against a
+/// sibling store — `taste-lab`'s plexdb `keyword_forms` search, which this
+/// module has no accessor for — escapes the same way instead of a second,
+/// possibly-drifting copy of this rule.
+pub fn like_escape(raw: &str) -> String {
+    raw.replace(['%', '_'], "")
 }
 
 /// Run a prepared `entry_sources` query (columns in the canonical `source,
@@ -1599,5 +1655,54 @@ mod tests {
         ))
         .unwrap();
         assert!(!c.all_episode_type(&ids).unwrap());
+    }
+
+    #[test]
+    fn search_titles_matches_a_substring_case_insensitively_and_excludes_episodes() {
+        let c = cat();
+        c.upsert_entry(&Entry::new("m1", "movie", "The Heat", Source::Plex))
+            .unwrap();
+        c.upsert_entry(&Entry::new("m2", "movie", "Heatwave", Source::Plex))
+            .unwrap();
+        c.upsert_entry(&Entry::new("m3", "movie", "Cold War", Source::Plex))
+            .unwrap();
+        c.upsert_entry(&Entry::new("e1", "episode", "The Heat Is On", Source::Plex))
+            .unwrap();
+
+        let hits = c.search_titles("heat", 10).unwrap();
+        let titles: Vec<&str> = hits.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert_eq!(titles, vec!["Heatwave", "The Heat"]);
+    }
+
+    #[test]
+    fn search_titles_treats_percent_and_underscore_as_literal_text() {
+        let c = cat();
+        c.upsert_entry(&Entry::new("m1", "movie", "100% Wolf", Source::Plex))
+            .unwrap();
+        c.upsert_entry(&Entry::new("m2", "movie", "Everything Else", Source::Plex))
+            .unwrap();
+
+        // A naive LIKE '%100% Wolf%' would match every title; the escaped
+        // search must match only the one that actually contains "100".
+        let hits = c.search_titles("100", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, "100% Wolf");
+    }
+
+    #[test]
+    fn search_tag_values_returns_distinct_matches_across_entries() {
+        let c = cat();
+        c.upsert_entry(&Entry::new("m1", "movie", "A", Source::Plex))
+            .unwrap();
+        c.upsert_entry(&Entry::new("m2", "movie", "B", Source::Plex))
+            .unwrap();
+        c.add_tag("m1", TagNs::Genre, "Heist").unwrap();
+        c.add_tag("m2", TagNs::Genre, "Heist").unwrap();
+        c.add_tag("m1", TagNs::Genre, "Comedy").unwrap();
+        c.add_tag("m1", TagNs::Director, "Heist Movies Inc")
+            .unwrap();
+
+        let hits = c.search_tag_values(TagNs::Genre, "heist", 10).unwrap();
+        assert_eq!(hits, vec!["Heist"]);
     }
 }

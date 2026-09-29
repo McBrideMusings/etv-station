@@ -1,0 +1,380 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>taste-lab</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 16px; color: #111; }
+  h1 { font-size: 18px; }
+  h2 { font-size: 14px; margin-top: 24px; }
+  section { margin-bottom: 16px; }
+  label { display: inline-block; min-width: 120px; }
+  select, input[type=text], input[type=number] { padding: 3px 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #ccc; padding: 3px 6px; text-align: left; }
+  th { background: #f0f0f0; position: sticky; top: 0; }
+  .scroll { max-height: 400px; overflow-y: auto; }
+  .row { margin-bottom: 6px; }
+  .muted { color: #777; font-size: 12px; }
+  .err { color: #a00; font-weight: bold; }
+  .searchbox { position: relative; display: inline-block; }
+  .suggestions { position: absolute; background: white; border: 1px solid #999; z-index: 10;
+    max-height: 200px; overflow-y: auto; min-width: 260px; }
+  .suggestions div { padding: 3px 6px; cursor: pointer; }
+  .suggestions div:hover { background: #eef; }
+  button { cursor: pointer; }
+  .cols { display: flex; gap: 24px; }
+  .cols > div { flex: 1; min-width: 0; }
+</style>
+</head>
+<body>
+<h1>taste-lab</h1>
+<div id="status" class="muted"></div>
+
+<section>
+  <h2>Pool</h2>
+  <div class="row">
+    <label>Channel / pool</label>
+    <select id="poolPicker"></select>
+  </div>
+  <div class="row">
+    <label>Use deployed plugin</label>
+    <input type="checkbox" id="useDeployed">
+    <span class="muted">unchecked = examples/plugins/ (this checkout's in-development script)</span>
+  </div>
+  <div class="row">
+    <label>Tautulli account</label>
+    <select id="accountPicker"><option value="">(resolve from channel / pooled)</option></select>
+  </div>
+  <div class="row">
+    <label>target_count</label>
+    <input type="number" id="targetCount" value="20" style="width:70px">
+    <label style="min-width:auto; margin-left:16px">extended_target_count</label>
+    <input type="number" id="extendedTargetCount" value="300" style="width:80px">
+  </div>
+  <div class="row">
+    <button id="loadBtn">Load / re-score</button>
+  </div>
+</section>
+
+<section>
+  <h2>sources: (read-only)</h2>
+  <pre id="sources" class="muted">(no pool loaded)</pre>
+  <h2>config: (read-only)</h2>
+  <pre id="config" class="muted">(no pool loaded)</pre>
+</section>
+
+<section>
+  <h2>Taste profile</h2>
+  <div class="row">
+    <button id="copyProfileBtn">Copy profile: YAML</button>
+    <span class="muted">paste into the pool's real channel.yaml — this tool never writes the file itself</span>
+  </div>
+  <table id="profileTable">
+    <thead><tr><th>weight</th><th>kind</th><th>reference</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="row" style="margin-top:10px">
+    <label>Kind</label>
+    <select id="addKind">
+      <option value="keyword">keyword</option>
+      <option value="genre">genre</option>
+      <option value="label">label</option>
+      <option value="cast">cast</option>
+      <option value="director">director</option>
+      <option value="writer">writer</option>
+      <option value="producer">producer</option>
+      <option value="country">country</option>
+      <option value="studio">studio</option>
+      <option value="content_rating">content_rating</option>
+      <option value="item">item</option>
+      <option value="set">set (CEL)</option>
+    </select>
+    <span class="searchbox">
+      <input type="text" id="addValue" placeholder="value (type to search)" style="width:260px">
+      <div id="addSuggestions" class="suggestions" hidden></div>
+    </span>
+    <label style="min-width:auto; margin-left:10px">weight</label>
+    <input type="number" id="addWeight" value="1.0" step="0.1" style="width:70px">
+    <button id="addBtn">Add</button>
+  </div>
+</section>
+
+<div class="cols">
+  <div>
+    <h2>In the pool (<span id="inPoolTotal">0</span> candidates, showing top <span id="inPoolShown">0</span>)</h2>
+    <div class="scroll">
+      <table id="inPoolTable"><thead><tr><th>#</th><th>title</th><th>metadata</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+  <div>
+    <h2>Selected (<span id="selectedTotal">0</span> — what would actually air)</h2>
+    <div class="scroll">
+      <table id="selectedTable"><thead><tr><th>#</th><th>title</th><th>metadata</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastResult = null;
+
+function setStatus(msg, isErr) {
+  const el = $('status');
+  el.textContent = msg;
+  el.className = isErr ? 'err' : 'muted';
+}
+
+// Never throws on a well-formed error response (`{error, ...}` — the server
+// still fills in sources/config/plugin_path on a scoring failure, see
+// describe_session in taste-lab.rs) — only on something actually broken
+// (network failure, non-JSON body). Callers check `data.error` themselves so
+// the descriptive fields render alongside the error instead of being lost.
+async function api(method, path, body) {
+  const opts = { method };
+  if (body !== undefined) {
+    opts.headers = { 'Content-Type': 'application/json' };
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  return await res.json();
+}
+
+async function loadChannels() {
+  const data = await api('GET', '/api/channels');
+  const picker = $('poolPicker');
+  picker.innerHTML = '';
+  for (const p of data.pools) {
+    const opt = document.createElement('option');
+    opt.value = JSON.stringify({ channel_path: p.channel_path, pool_name: p.pool_name });
+    opt.textContent = `${p.channel_name} / ${p.pool_name}`;
+    picker.appendChild(opt);
+  }
+  if (data.pools.length === 0) {
+    setStatus('No plugin-backed pools found under the configured --channels-dir.', true);
+  }
+}
+
+async function loadTautulliUsers() {
+  const data = await api('GET', '/api/tautulli/users');
+  if (data.error) return; // Tautulli not configured — picker stays at its one option.
+  const picker = $('accountPicker');
+  for (const u of data.results) {
+    const opt = document.createElement('option');
+    opt.value = u.user_id;
+    opt.textContent = `${u.display_name} (${u.user_id})`;
+    picker.appendChild(opt);
+  }
+}
+
+function renderMetadata(m) {
+  if (m === null || m === undefined) return '';
+  if (typeof m === 'object') {
+    return Object.entries(m).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
+  }
+  return String(m);
+}
+
+function renderTable(bodyId, rows) {
+  const tbody = document.querySelector('#' + bodyId + ' tbody');
+  tbody.innerHTML = '';
+  rows.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    const title = r.year ? `${r.title} (${r.year})` : r.title;
+    tr.innerHTML = `<td>${i + 1}</td><td>${escapeHtml(title)}</td><td>${escapeHtml(renderMetadata(r.metadata))}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderProfile(profile) {
+  const tbody = document.querySelector('#profileTable tbody');
+  tbody.innerHTML = '';
+  for (const entry of profile.entries) {
+    const tr = document.createElement('tr');
+    const weightInput = document.createElement('input');
+    weightInput.type = 'number';
+    weightInput.step = '0.1';
+    weightInput.style.width = '70px';
+    weightInput.value = entry.weight;
+    weightInput.addEventListener('change', () => updateWeight(entry.index, parseFloat(weightInput.value)));
+    const weightTd = document.createElement('td');
+    weightTd.appendChild(weightInput);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = 'remove';
+    removeBtn.addEventListener('click', () => removeEntry(entry.index));
+    const removeTd = document.createElement('td');
+    removeTd.appendChild(removeBtn);
+
+    tr.appendChild(weightTd);
+    const kindTd = document.createElement('td');
+    kindTd.textContent = entry.kind || '';
+    tr.appendChild(kindTd);
+    const refTd = document.createElement('td');
+    refTd.textContent = entry.reference || '';
+    tr.appendChild(refTd);
+    tr.appendChild(removeTd);
+    tbody.appendChild(tr);
+  }
+}
+
+// Renders whatever the payload carries. On a scoring failure the server
+// still sends pool_name/plugin_path/sources/config (see describe_session in
+// taste-lab.rs) but no profile/in_pool/selected — those sections are left
+// as they were rather than cleared, and the error banner takes over status.
+function renderResult(data) {
+  lastResult = data;
+  if (data.pool_name !== undefined) {
+    $('sources').textContent = data.sources ? JSON.stringify(data.sources, null, 2) : '(script default — no pool-authored sources:)';
+    $('config').textContent = (data.config !== null && data.config !== undefined) ? JSON.stringify(data.config, null, 2) : '(no config: block)';
+  }
+  if (data.profile) renderProfile(data.profile);
+  if (data.in_pool) {
+    $('inPoolTotal').textContent = data.in_pool.total;
+    $('inPoolShown').textContent = data.in_pool.shown;
+    renderTable('inPoolTable', data.in_pool.rows);
+  }
+  if (data.selected) {
+    $('selectedTotal').textContent = data.selected.total;
+    renderTable('selectedTable', data.selected.rows);
+  }
+  if (data.error) {
+    setStatus(data.error, true);
+  } else {
+    setStatus(`Loaded pool "${data.pool_name}" — plugin: ${data.plugin_path}`, false);
+  }
+}
+
+async function selectPool() {
+  const picked = $('poolPicker').value;
+  if (!picked) return;
+  const { channel_path, pool_name } = JSON.parse(picked);
+  const account = $('accountPicker').value;
+  const body = {
+    channel_path,
+    pool_name,
+    use_deployed_plugin: $('useDeployed').checked,
+    target_count: parseInt($('targetCount').value, 10),
+    extended_target_count: parseInt($('extendedTargetCount').value, 10),
+  };
+  if (account) body.account_id = parseInt(account, 10);
+  try {
+    setStatus('Scoring…', false);
+    const data = await api('POST', '/api/select', body);
+    renderResult(data);
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+}
+
+async function updateWeight(index, weight) {
+  try {
+    const data = await api('POST', '/api/profile/update', { index, weight });
+    renderResult(data);
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+}
+
+async function removeEntry(index) {
+  try {
+    const data = await api('POST', '/api/profile/remove', { index });
+    renderResult(data);
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+}
+
+async function addEntry() {
+  const kind = $('addKind').value;
+  const value = $('addValue').value.trim();
+  const weight = parseFloat($('addWeight').value);
+  if (!value) return;
+  const body = { weight };
+  body[kind] = value;
+  try {
+    const data = await api('POST', '/api/profile/add', body);
+    renderResult(data);
+    if (!data.error) {
+      $('addValue').value = '';
+      $('addSuggestions').hidden = true;
+    }
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+}
+
+let searchTimer = null;
+async function onAddValueInput() {
+  clearTimeout(searchTimer);
+  const kind = $('addKind').value;
+  const q = $('addValue').value.trim();
+  const box = $('addSuggestions');
+  if (q.length < 2 || !['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'item'].includes(kind)) {
+    box.hidden = true;
+    return;
+  }
+  searchTimer = setTimeout(async () => {
+    try {
+      let url;
+      if (kind === 'keyword') {
+        url = '/api/search/keyword?q=' + encodeURIComponent(q);
+      } else if (kind === 'item') {
+        url = '/api/search/item?q=' + encodeURIComponent(q);
+      } else {
+        url = '/api/search/tag?namespace=' + encodeURIComponent(kind) + '&q=' + encodeURIComponent(q);
+      }
+      const data = await api('GET', url);
+      box.innerHTML = '';
+      const items = data.results;
+      for (const r of items) {
+        const div = document.createElement('div');
+        const text = (kind === 'keyword') ? `${r.surface} → ${r.keyword}` :
+                     (kind === 'item') ? (r.year ? `${r.title} (${r.year})` : r.title) : r;
+        div.textContent = text;
+        div.addEventListener('click', () => {
+          $('addValue').value = (kind === 'keyword') ? r.surface :
+                                 (kind === 'item') ? (r.year ? `${r.title} (${r.year})` : r.title) : r;
+          box.hidden = true;
+        });
+        box.appendChild(div);
+      }
+      box.hidden = items.length === 0;
+    } catch (e) {
+      box.hidden = true;
+    }
+  }, 200);
+}
+
+async function copyProfileYaml() {
+  const yaml = lastResult && lastResult.profile_yaml;
+  if (!yaml) {
+    setStatus('Nothing to copy — the profile has no entries.', true);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(yaml);
+    setStatus('Copied profile: YAML to clipboard.', false);
+  } catch (e) {
+    setStatus('Clipboard write failed: ' + e.message, true);
+  }
+}
+
+$('loadBtn').addEventListener('click', selectPool);
+$('copyProfileBtn').addEventListener('click', copyProfileYaml);
+$('addBtn').addEventListener('click', addEntry);
+$('addValue').addEventListener('input', onAddValueInput);
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.searchbox')) $('addSuggestions').hidden = true;
+});
+
+loadChannels();
+loadTautulliUsers();
+</script>
+</body>
+</html>

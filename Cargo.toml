@@ -34,6 +34,9 @@ serde_norway = "0.9"
 # editing one repo's copy without the other turns both suites red (#184).
 sha2 = "0.10"
 thiserror = "2"
+# Dev-tool only (taste-lab's local UI server): synchronous, no async runtime
+# pulled in for a single-user, sequential-request local tool.
+tiny_http = "0.12"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 time-tz = "2"
 tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }

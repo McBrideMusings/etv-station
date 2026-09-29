@@ -312,17 +312,26 @@ fn redact_key(e: impl std::fmt::Display, key: &str) -> String {
     text.replace(key, "<redacted>")
 }
 
-fn request_rows(url: &str, key: &str, scope: &HistoryScope) -> Result<Vec<HistoryRow>, String> {
+/// `GET /api/v2?apikey=…&cmd=<cmd>[&extra query params]`, decoded as far as
+/// `response.data` — the one request/decode shape every Tautulli endpoint
+/// below shares, differing only in the command, any extra params, and how
+/// deep under `data` the payload sits ([`request_rows`] unwraps one level
+/// further, into `data.data`, itself).
+fn request_response_data(
+    url: &str,
+    key: &str,
+    cmd: &str,
+    extra: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
     let endpoint = format!(
-        "{}/api/v2?apikey={}&cmd=get_history&length={HISTORY_ROWS}",
+        "{}/api/v2?apikey={}&cmd={cmd}",
         url.trim_end_matches('/'),
         key
     );
-
     let mut request = ureq::get(&endpoint).timeout(TIMEOUT);
-    // Percent-encoded by `ureq`, which is why the scope is appended here rather
-    // than formatted into the string above — see `HistoryScope::query_param`.
-    if let Some((param, value)) = scope.query_param() {
+    // Percent-encoded by `ureq`, which is why params are appended here rather
+    // than formatted into the string above.
+    for (param, value) in extra {
         request = request.query(param, value);
     }
 
@@ -332,13 +341,54 @@ fn request_rows(url: &str, key: &str, scope: &HistoryScope) -> Result<Vec<Histor
         .into_json()
         .map_err(|e| format!("decode response: {}", redact_key(e, key)))?;
 
-    let data = body
-        .get("response")
+    body.get("response")
         .and_then(|r| r.get("data"))
-        .and_then(|d| d.get("data"))
+        .cloned()
+        .ok_or_else(|| "response has no response.data".to_string())
+}
+
+fn request_rows(url: &str, key: &str, scope: &HistoryScope) -> Result<Vec<HistoryRow>, String> {
+    let length = HISTORY_ROWS.to_string();
+    let mut params: Vec<(&str, &str)> = vec![("length", &length)];
+    if let Some((param, value)) = scope.query_param() {
+        params.push((param, value));
+    }
+    let data = request_response_data(url, key, "get_history", &params)?;
+    let data = data
+        .get("data")
         .ok_or_else(|| "response has no response.data.data array".to_string())?;
 
     serde_json::from_value(data.clone()).map_err(|e| format!("decode history rows: {e}"))
+}
+
+/// One row of Tautulli's `get_users` — a picker's-worth of a Plex account,
+/// not the full record `get_history` rows carry.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TautulliUser {
+    pub user_id: i64,
+    #[serde(default)]
+    pub friendly_name: Option<String>,
+    pub username: String,
+}
+
+impl TautulliUser {
+    /// What a person recognises: the friendly name when Tautulli has one,
+    /// else the username — same preference order as [`HistoryRow::watcher`].
+    pub fn display_name(&self) -> &str {
+        self.friendly_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&self.username)
+    }
+}
+
+/// Every account Tautulli knows about, for a person to pick from — unlike
+/// [`fetch_rows`], this surfaces a reachability failure rather than
+/// degrading to an empty list, since a picker with no accounts and a picker
+/// that failed to load look identical otherwise.
+pub fn fetch_users(url: &str, key: &str) -> Result<Vec<TautulliUser>, String> {
+    let data = request_response_data(url, key, "get_users", &[])?;
+    serde_json::from_value(data).map_err(|e| format!("decode users: {e}"))
 }
 
 /// Join history rows to catalog entries by Plex `ratingKey`, emitting one
