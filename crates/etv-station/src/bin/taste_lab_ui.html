@@ -21,7 +21,7 @@
   .row { margin-bottom: 6px; }
 
   /* Shown next to Load/re-score the moment a load option (channel, plugin
-     source, account, cycles) changes — the pools/schedule below still
+     source, account, days) changes — the pools/schedule below still
      reflect whatever was loaded last, and this is the only place that says
      so before the user scrolls down and reads stale numbers as current. */
   .stale-notice { color: #b80; font-size: 12px; margin-left: 10px; }
@@ -124,14 +124,11 @@
   }
   .sched-entry .title { font-weight: 600; }
   .sched-entry .sub { color: #777; font-size: 12px; }
-  .sched-entry.static-entry { color: #999; font-style: italic; cursor: default; background: #fafafa; }
-  .sched-entry.static-entry:hover { background: #fafafa; border-color: #ccc; }
-  .wrap-marker { color: #b80; font-size: 11px; }
-  .cycle-divider {
+  .generation-divider {
     display: flex; align-items: center; gap: 8px; color: #aaa; font-size: 11px;
     margin: 6px 0 2px 0;
   }
-  .cycle-divider::before, .cycle-divider::after { content: ""; flex: 1; border-top: 1px dashed #ddd; }
+  .generation-divider::before, .generation-divider::after { content: ""; flex: 1; border-top: 1px dashed #ddd; }
 
   /* The click-to-inspect detail, expanded INLINE under the row that was
      clicked — never a separate panel elsewhere on the page. Only that one
@@ -173,10 +170,10 @@
     <select id="accountPicker"><option value="">(resolve from channel / pooled)</option></select>
   </div>
   <div class="row">
-    <label>Cycles</label>
-    <input type="number" id="cycles" value="3" min="1" max="50" style="width:60px">
-    <button id="moreCyclesBtn" type="button">+10 cycles &amp; reload</button>
-    <span class="muted">how many times to walk the channel's pattern — more cycles is what surfaces how often a pool starts repeating</span>
+    <label>Days</label>
+    <input type="number" id="days" value="3" min="1" max="14" style="width:60px">
+    <button id="moreDaysBtn" type="button">+3 days &amp; reload</button>
+    <span class="muted">days of the daemon's roll ticks to replay, after its first window; each generation sees what earlier ones aired</span>
   </div>
   <div class="row">
     <button id="loadBtn">Load / re-score</button>
@@ -207,17 +204,16 @@ let lastResult = null;
 let selectedEntryKey = null;
 
 // A schedule entry's identity across a re-score — never its array index.
-// build_schedule (taste-lab.rs) rebuilds the whole flat list from scratch on
+// simulate_schedule (taste-lab.rs) replays the whole schedule from scratch on
 // every score, and a weight edit made from inside the open inspector can
-// change that very pool's ranking, which can change how many items a step's
-// "visit" grouping produces — the entry that used to be at index 4 is not
-// guaranteed to still be the same pick. (cycle, block_index, pool_name,
-// first item id) is what actually names one pick, so renderResult below can
+// change every later generation's picks — the entry that used to be at index
+// 4 is not guaranteed to still be the same pick. (generation, block_index,
+// pool_name, first item id) is what actually names one pick, so renderResult below can
 // re-find the same conceptual entry after a re-render, or correctly notice
 // it's gone and close the inspector instead of showing whatever now happens
 // to sit at the old index.
 function entryKey(entry) {
-  return `${entry.cycle}:${entry.block_index}:${entry.pool_name}:${entry.entries[0].id}`;
+  return `${entry.generation}:${entry.block_index}:${entry.pool_name}:${entry.entries[0].id}`;
 }
 
 function setStatus(msg, isErr) {
@@ -234,7 +230,7 @@ function setStatus(msg, isErr) {
 function setLoading(isLoading) {
   $('layout').classList.toggle('loading', isLoading);
   $('loadBtn').disabled = isLoading;
-  $('moreCyclesBtn').disabled = isLoading;
+  $('moreDaysBtn').disabled = isLoading;
   if (isLoading) {
     const el = $('status');
     el.innerHTML = '<span class="spinner"></span>Scoring…';
@@ -423,7 +419,7 @@ function renderPools(pools, focus) {
           <span class="muted">paste into the pool's real channel.yaml — this tool never writes the file itself</span></div>
       </div>
       <div class="pool-field">
-        <h2>candidates <span class="muted">(showing ${pool.candidates.length} of ${pool.candidate_count}, ranked)</span>${isFocused ? ' <span class="candidates-focus-note">— this pick came from here</span>' : ''}</h2>
+        <h2>candidates <span class="muted">(showing ${pool.candidates.length} of ${pool.candidate_count}, ranked from the profile alone — no airing history, no exploration draws)</span>${isFocused ? ' <span class="candidates-focus-note">— this pick came from here</span>' : ''}</h2>
         <div class="scroll">
           <table class="candidatesTable">
             <thead><tr><th>#</th><th>title</th><th>verdict</th></tr></thead>
@@ -508,10 +504,15 @@ function renderProfileTable(tbody, poolName, profile) {
 
 // ---- Schedule: one unified, air-order, click-to-inspect list -------------
 
+// Seconds since the replay began, as "day 2 14:30" (day 1 is the first).
+function formatOffset(secs) {
+  const day = Math.floor(secs / 86400) + 1;
+  const hh = String(Math.floor((secs % 86400) / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+  return `day ${day} ${hh}:${mm}`;
+}
+
 function entryLabel(entry) {
-  if (entry.kind === 'static') {
-    return `<span class="sub">${escapeHtml(entry.pool_name)} — ${escapeHtml(entry.note)}</span>`;
-  }
   const first = entry.entries[0];
   if (entry.kind === 'visit') {
     const eps = entry.entries.map(episodeCode).join(', ');
@@ -533,35 +534,32 @@ function renderSchedule(schedule) {
     container.innerHTML = EMPTY_MESSAGE;
     return;
   }
-  let lastCycle = null;
+  let lastGeneration = null;
   let pos = 0;
-  schedule.forEach((entry, i) => {
-    if (entry.cycle !== lastCycle) {
-      lastCycle = entry.cycle;
+  schedule.forEach((entry) => {
+    if (entry.generation !== lastGeneration) {
+      lastGeneration = entry.generation;
       pos = 0;
       const divider = document.createElement('div');
-      divider.className = 'cycle-divider';
-      divider.textContent = `cycle ${entry.cycle + 1}`;
+      divider.className = 'generation-divider';
+      divider.textContent = `generation ${entry.generation + 1} — starts ${formatOffset(entry.offset_secs)} — ctx.target_count ${entry.target_count}`;
       container.appendChild(divider);
     }
     pos += 1;
-    const key = entry.kind !== 'static' ? entryKey(entry) : null;
-    const isSelected = key !== null && key === selectedEntryKey;
+    const key = entryKey(entry);
+    const isSelected = key === selectedEntryKey;
     const row = document.createElement('div');
-    row.className = 'sched-entry' + (entry.kind === 'static' ? ' static-entry' : '') + (isSelected ? ' selected' : '');
-    const wrapMarker = entry.wrapped ? '<span class="wrap-marker" title="this pool\'s ranking was exhausted and restarted from the top">↺ restarted</span>' : '';
+    row.className = 'sched-entry' + (isSelected ? ' selected' : '');
     row.innerHTML = `
       <span class="pos">${pos}.</span>
       <span class="pool-tag">${escapeHtml(entry.pool_name)}</span>
       ${entryLabel(entry)}
-      ${wrapMarker}
+      <span class="sub">${formatOffset(entry.offset_secs)}</span>
     `;
-    if (key !== null) {
-      row.addEventListener('click', () => {
-        selectedEntryKey = isSelected ? null : key;
-        renderResult(lastResult);
-      });
-    }
+    row.addEventListener('click', () => {
+      selectedEntryKey = isSelected ? null : key;
+      renderResult(lastResult);
+    });
     container.appendChild(row);
     if (isSelected) {
       const expand = document.createElement('div');
@@ -747,7 +745,7 @@ function renderResult(data) {
   // than silently show whatever now happens to be at that position if the
   // entry it named no longer exists.
   const openEntry = (data.schedule && selectedEntryKey !== null)
-    ? data.schedule.find((e) => e.kind !== 'static' && entryKey(e) === selectedEntryKey)
+    ? data.schedule.find((e) => entryKey(e) === selectedEntryKey)
     : null;
   const valid = !!openEntry;
   if (!valid) selectedEntryKey = null;
@@ -769,7 +767,7 @@ function renderResult(data) {
 //
 // The pools/schedule below stay exactly as they were from the last
 // /api/select until the user clicks Load/re-score again — changing the
-// channel, plugin source, account or cycle count doesn't touch them. Without
+// channel, plugin source, account or day count doesn't touch them. Without
 // this, scrolling down after such a change reads as "here's what the new
 // selection looks like" when it's actually the old one.
 let loadedOptionsKey = null;
@@ -779,7 +777,7 @@ function currentOptionsKey() {
     channel_path: $('channelPicker').value,
     use_deployed_plugin: $('useDeployed').checked,
     account: $('accountPicker').value,
-    cycles: $('cycles').value,
+    days: $('days').value,
   });
 }
 
@@ -796,7 +794,7 @@ async function selectChannel() {
   const body = {
     channel_path,
     use_deployed_plugin: $('useDeployed').checked,
-    cycles: parseInt($('cycles').value, 10) || 3,
+    days: parseInt($('days').value, 10) || 3,
   };
   if (account) body.account_id = parseInt(account, 10);
   try {
@@ -922,16 +920,16 @@ async function copyProfileYaml(poolName) {
 }
 
 $('loadBtn').addEventListener('click', selectChannel);
-$('moreCyclesBtn').addEventListener('click', () => {
-  const el = $('cycles');
-  const max = parseInt(el.max, 10) || 50;
-  el.value = Math.min(max, (parseInt(el.value, 10) || 3) + 10);
+$('moreDaysBtn').addEventListener('click', () => {
+  const el = $('days');
+  const max = parseInt(el.max, 10) || 14;
+  el.value = Math.min(max, (parseInt(el.value, 10) || 3) + 3);
   selectChannel();
 });
 $('channelPicker').addEventListener('change', checkStale);
 $('useDeployed').addEventListener('change', checkStale);
 $('accountPicker').addEventListener('change', checkStale);
-$('cycles').addEventListener('input', checkStale);
+$('days').addEventListener('input', checkStale);
 document.addEventListener('click', (e) => {
   if (!e.target.closest('.searchbox')) {
     document.querySelectorAll('.add-suggestions').forEach((box) => { box.hidden = true; });

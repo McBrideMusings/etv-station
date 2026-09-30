@@ -3,19 +3,21 @@
 //! category as `taste-debug`. Serves a small local web UI over
 //! `score::{ScoreCache, pick}`, the real scoring path (ADR-0020): a channel
 //! picker, live keyword/genre/item search, and one unified schedule
-//! (etv-station-sctf.9) — every plugin-backed pool the channel's `pattern:`
-//! draws from, interleaved in pattern order exactly as [`build_schedule`]
-//! walks it, each entry click-to-inspect for its full audit detail — that
-//! re-scores in place as a profile entry is added, reweighted, or removed —
-//! no file write, no process restart.
+//! (etv-station-sctf.9) that re-scores in place as a profile entry is added,
+//! reweighted, or removed — no file write, no process restart.
 //!
-//! A show pool's `take: N` draws N consecutive items from its ranked list;
-//! [`build_schedule`] renders a run of those that share a catalog `show_id`
-//! as ONE schedule entry (a "visit"), not N separate rows. `taste-cosine.rhai`
-//! already returns a picked show's episodes grouped together ("the order
-//! below is broadcast order AND rotation order at once" — its own LAYOUT
-//! comment), so this reads that grouping back off the catalog rather than
-//! re-deriving it.
+//! The schedule is the daemon's, replayed ([`simulate_schedule`], built on
+//! `etv_station::simulate`): the same generation loop, the same
+//! `ctx.target_count` per generation, and each generation's airings fed
+//! forward as the next one's `ctx.recent`, so a scorer's repeat suppression
+//! shows up in the schedule as it does on air. A pool's own ranked list (the
+//! candidate table) is a different view: one full `pick()` with empty
+//! `ctx.recent` and no exploration slots, i.e. what the profile alone ranks
+//! first.
+//!
+//! A run of consecutive airings of one show from one pool (a season the
+//! pattern took whole) renders as ONE schedule entry (a "visit"), not one row
+//! per episode; the grouping is read off the catalog's `show_id`.
 //!
 //! A throwaway spike (etv-station-sctf.1's follow-up, deleted per the spike
 //! lifecycle) proved the scoring shape works end to end against real
@@ -58,7 +60,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use etv_station::catalog::{Catalog, Entry as CatalogEntry, TagNs, like_escape};
-use etv_station::config::{self, DatastoreGrant, Pool, Take};
+use etv_station::config::{self, DatastoreGrant, Pool};
 use etv_station::profile::ProfileEntry;
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use etv_station::tautulli::{self, HistoryScope};
@@ -114,22 +116,14 @@ fn clone_pool(pool: &Pool) -> Result<Pool, String> {
     serde_json::from_value(value).map_err(|e| format!("clone pool: {e}"))
 }
 
-/// One `pattern:` step this tool will walk when it assembles a channel's
-/// unified schedule (etv-station-sctf.9) — a flattened, block-order copy of
-/// every `[[rule.blocks]].pattern` entry across the channel, naming the block
-/// it came from and whether its pool is one this tool can score at all.
-///
-/// A pool with no `plugin:` (a static/query pool) cannot run through
-/// `score::pick()` — out of this ticket's scope, same as the rest of the
-/// pattern engine (module docs) — so its steps are kept (the schedule must
-/// still show where they sit in pattern order) but flagged `has_plugin:
-/// false` and never scored; [`build_schedule`] renders them as a `"static"`
-/// placeholder entry instead of drawing from a ranked list.
+/// One `pattern:` step of the selected channel — which pool it draws from and
+/// whether that pool is one this tool can score (has a `plugin:`). Only the
+/// plugin-backed pools get a working copy the person can edit; the simulated
+/// schedule ([`simulate_schedule`]) runs every pool the channel has, so a
+/// static pool's items still appear where the pattern puts them.
 struct PlanStep {
     block_index: usize,
-    block_name: String,
     pool_name: String,
-    take: Take,
     has_plugin: bool,
 }
 
@@ -141,18 +135,13 @@ struct DiscoveredChannel {
     display_name: Option<String>,
 }
 
-/// Every `pattern:` step across `channel`'s blocks, in block-then-pattern
-/// order — the walk order [`build_schedule`] repeats for each cycle.
+/// Every `pattern:` step across `channel`'s blocks, in block-then-pattern order.
 fn pattern_plan(channel: &config::ChannelConfig) -> Vec<PlanStep> {
     let mut out = Vec::new();
     for (block_index, block) in channel.rule.blocks.iter().enumerate() {
         if !block.is_pattern() {
             continue;
         }
-        let block_name = block
-            .program()
-            .and_then(|p| p.title.clone())
-            .unwrap_or_else(|| format!("block {block_index}"));
         for step in &block.pattern {
             let has_plugin = block
                 .pools
@@ -161,9 +150,7 @@ fn pattern_plan(channel: &config::ChannelConfig) -> Vec<PlanStep> {
                 .is_some_and(|p| p.plugin.is_some());
             out.push(PlanStep {
                 block_index,
-                block_name: block_name.clone(),
                 pool_name: step.pool.clone(),
-                take: step.take,
                 has_plugin,
             });
         }
@@ -236,9 +223,16 @@ struct Session {
     channel_dir: PathBuf,
     channel_name: String,
     account_id: Option<i64>,
-    cycles: usize,
-    plan: Vec<PlanStep>,
+    /// How many days of roll ticks the simulated schedule covers.
+    days: u32,
+    /// The channel exactly as its `channel.yaml` reads, as JSON: `Pool` and
+    /// `ChannelConfig` are not `Clone`, so [`simulate_schedule`] rebuilds a
+    /// fresh config from this each run and swaps in the working pools.
+    config_json: Value,
     pools: HashMap<String, PoolWorking>,
+    /// The simulated schedule, cached: it is recomputed by
+    /// [`resimulate`] after a score, not on every request.
+    schedule: Vec<Value>,
 }
 
 struct AppState {
@@ -395,7 +389,7 @@ struct SelectRequest {
     #[serde(default)]
     use_deployed_plugin: bool,
     #[serde(default)]
-    cycles: Option<usize>,
+    days: Option<u32>,
 }
 
 /// Build the working copy of one plugin-backed pool named by a pattern step —
@@ -543,14 +537,10 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
         channel_dir,
         channel_name,
         account_id,
-        // Watching how often a pool starts repeating needs enough passes to
-        // actually see a repeat, and a cycle costs no extra `pick()` call —
-        // score_pool ranks each pool once regardless of `cycles`, so this
-        // only adds cheap catalog lookups and a longer JSON payload/DOM,
-        // never a slower re-score.
-        cycles: req.cycles.unwrap_or(3).clamp(1, 50),
-        plan,
+        days: req.days.unwrap_or(DEFAULT_DAYS).clamp(1, MAX_DAYS),
+        config_json: serde_json::to_value(&channel).map_err(|e| format!("channel config: {e}"))?,
         pools,
+        schedule: Vec::new(),
     });
 
     let mut errors = Vec::new();
@@ -559,15 +549,19 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
             errors.push(format!("{name}: {e}"));
         }
     }
+    let all_pools_failed = errors.len() == pool_names.len();
+    if !all_pools_failed && let Err(e) = resimulate(state) {
+        errors.push(format!("schedule: {e}"));
+    }
 
     // `plan` has at least one plugin step (checked above), so `pool_names`
     // is never empty and "every pool failed" is distinct from "none did".
     let response = if errors.is_empty() {
         (200, build_payload(state))
-    } else if errors.len() == pool_names.len() {
+    } else if all_pools_failed {
         (400, payload_with_error(state, errors.join("; ")))
     } else {
-        let message = format!("some pools failed to score: {}", errors.join("; "));
+        let message = format!("some pools failed: {}", errors.join("; "));
         (200, payload_with_error(state, message))
     };
     Ok(response)
@@ -583,14 +577,18 @@ fn payload_with_error(state: &AppState, error: String) -> Value {
     payload
 }
 
-/// Re-score one pool in place and rebuild the whole payload — the shape every
-/// profile-editing endpoint returns. Only the touched pool re-runs `pick()`;
-/// every other pool's cached `full` ranking (and so its contribution to the
-/// schedule) is untouched.
+/// Re-score one pool in place, replay the schedule, and rebuild the whole
+/// payload — the shape every profile-editing endpoint returns. Only the
+/// touched pool re-runs its own full ranking (the candidate list); the
+/// simulated schedule runs the channel's whole generation loop again, because
+/// an edit to one pool changes what it draws in every later generation.
 fn rescore_and_respond(state: &mut AppState, pool_name: &str) -> (u16, Value) {
-    match score_pool(state, pool_name) {
+    if let Err(e) = score_pool(state, pool_name) {
+        return (400, payload_with_error(state, e));
+    }
+    match resimulate(state) {
         Ok(()) => (200, build_payload(state)),
-        Err(e) => (400, payload_with_error(state, e)),
+        Err(e) => (200, payload_with_error(state, format!("schedule: {e}"))),
     }
 }
 
@@ -739,7 +737,7 @@ fn profile_yaml(pool: &Pool) -> String {
 /// Run one full-pool `pick()` for `pool_name` against its real `sources:`,
 /// real (working-copy) profile, real capabilities/datastores — see the
 /// module docs for why one call per pool, not two — and store the ranked
-/// list on its [`PoolWorking::full`] for [`build_schedule`] to draw from.
+/// list on its [`PoolWorking::full`] for the candidate table.
 /// Every other pool's `full` is untouched, which is what makes a weight
 /// tweak on one pool cheap.
 fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
@@ -810,7 +808,12 @@ fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
         .take(CANDIDATES_SHOWN)
         .map(|item| {
             let entry = state.catalog.entry(&item.id).ok().flatten();
-            picked_item_json(&state.catalog, item, entry.as_ref())
+            picked_item_json(
+                &state.catalog,
+                &item.id,
+                item.metadata.as_ref(),
+                entry.as_ref(),
+            )
         })
         .collect();
 
@@ -850,135 +853,185 @@ fn build_payload(state: &AppState) -> Value {
         }
         pools_json.insert(name.clone(), desc);
     }
-    let schedule = build_schedule(&state.catalog, session);
     json!({
         "channel_path": session.channel_path.display().to_string(),
         "channel_name": session.channel_name,
         "account_id": session.account_id,
-        "cycles": session.cycles,
+        "days": session.days,
         "pools": pools_json,
-        "schedule": schedule,
+        "schedule": session.schedule,
     })
 }
 
-/// A demo cap for `take: "all"` — real size depends on which bucket a live
-/// visit picks, not knowable from a ranked list alone (see [`Take`]'s own
-/// docs), so this tool shows a bounded slice rather than modeling the real
-/// pattern engine's bucket-draining rule (out of this ticket's scope, see
-/// module docs).
-const TAKE_ALL_DEMO_CAP: usize = 12;
+/// Days of roll ticks the simulated schedule covers when a request names none,
+/// and the most it may ask for. Each generation runs every pool's full ranking
+/// again (about 10s on the real catalog), and a day holds anywhere from a few
+/// generations (a pattern cycle that runs ten hours) to one per hour, so this
+/// bounds how long an edit takes to show.
+const DEFAULT_DAYS: u32 = 3;
+const MAX_DAYS: u32 = 14;
 
-/// Walk `session.plan` for `session.cycles` passes, each step slicing the
-/// next `take` items off its pool's cached ranked list (a per-pool cursor
-/// that only ever advances — a simplification of the real `advance: resume`/
-/// `restart` state machine the daemon runs, out of this ticket's scope, see
-/// module docs — and wraps back to the top once a pool runs out, which reads
-/// as a coherent moment-in-time schedule without ever repeating a title
-/// inside the same session view).
-///
-/// A step's slice is split into one schedule entry per run of consecutive
-/// items sharing the same catalog `show_id` — this is what turns a show
-/// pool's `take: 3` into ONE "visit" block instead of three separate rows
-/// (etv-station-sctf.9's acceptance criteria), driven by the real grouping
-/// `taste-cosine.rhai` already produced (module docs), not a second guess
-/// at it.
-fn build_schedule(catalog: &Catalog, session: &Session) -> Vec<Value> {
-    let mut cursors: HashMap<&str, usize> = HashMap::new();
-    let mut out = Vec::new();
-
-    for cycle in 0..session.cycles {
-        for step in &session.plan {
-            if !step.has_plugin {
-                out.push(json!({
-                    "cycle": cycle,
-                    "block_index": step.block_index,
-                    "block_name": step.block_name,
-                    "pool_name": step.pool_name,
-                    "kind": "static",
-                    "note": "static pool (no `plugin:` — taste-lab only models plugin-backed pools)",
-                }));
-                continue;
-            }
-            let Some(pw) = session.pools.get(&step.pool_name) else {
-                continue;
-            };
-            let Some(full) = pw.full.as_ref() else {
-                continue;
-            };
-            if full.is_empty() {
-                continue;
-            }
-            let take = step.take.count().unwrap_or(TAKE_ALL_DEMO_CAP).max(1);
-            let cursor = cursors.entry(step.pool_name.as_str()).or_insert(0);
-            let wrapped = *cursor >= full.len();
-            if wrapped {
-                *cursor = 0;
-            }
-            let end = (*cursor + take).min(full.len());
-            let slice = &full[*cursor..end];
-            *cursor = end;
-
-            // One catalog lookup per item, reused for both the `show_id`
-            // grouping test below and `picked_item_json` — a second lookup
-            // per item would double this function's SQLite round trips for
-            // no reason, since both already want the same `Entry`.
-            let looked_up: Vec<Option<CatalogEntry>> = slice
-                .iter()
-                .map(|item| catalog.entry(&item.id).ok().flatten())
-                .collect();
-            let show_id_at = |k: usize| looked_up[k].as_ref().and_then(|e| e.show_id.as_deref());
-
-            let mut i = 0;
-            while i < slice.len() {
-                let mut j = i + 1;
-                if let Some(show_id) = show_id_at(i) {
-                    while j < slice.len() && show_id_at(j) == Some(show_id) {
-                        j += 1;
-                    }
-                }
-                let group = &slice[i..j];
-                let entries: Vec<Value> = group
-                    .iter()
-                    .zip(&looked_up[i..j])
-                    .map(|(item, entry)| picked_item_json(catalog, item, entry.as_ref()))
-                    .collect();
-                out.push(json!({
-                    "cycle": cycle,
-                    "block_index": step.block_index,
-                    "block_name": step.block_name,
-                    "pool_name": step.pool_name,
-                    "kind": if group.len() > 1 { "visit" } else { "single" },
-                    "wrapped": wrapped,
-                    "entries": entries,
-                }));
-                i = j;
-            }
+/// Replay the selected channel's schedule and cache it on the session.
+fn resimulate(state: &mut AppState) -> Result<(), String> {
+    let session = state
+        .session
+        .as_ref()
+        .ok_or_else(|| "no channel selected".to_string())?;
+    let result = simulate_schedule(&state.catalog, session);
+    let session = state.session.as_mut().expect("checked above");
+    match result {
+        Ok(schedule) => {
+            session.schedule = schedule;
+            Ok(())
+        }
+        Err(e) => {
+            session.schedule.clear();
+            Err(e)
         }
     }
-    out
+}
+
+/// Run the daemon's generation loop ([`etv_station::simulate::simulate`]) over
+/// the channel as `channel.yaml` writes it, with each plugin pool replaced by
+/// its live-edited working copy — so a profile weight changed in the UI
+/// changes what every later generation draws, and the pool's repeat
+/// suppression (`ctx.recent`) sees what the earlier generations aired.
+///
+/// One schedule entry per run of consecutive airings from the same pool and
+/// the same catalog `show_id` — a season the pattern took whole is one "visit"
+/// block, a film is a "single". Pool and block come from the airing's own
+/// `select` audit stage and `block` index, not from a second reading of the
+/// pattern.
+fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>, String> {
+    let mut config: config::ChannelConfig = serde_json::from_value(session.config_json.clone())
+        .map_err(|e| format!("channel config: {e}"))?;
+    for block in &mut config.rule.blocks {
+        for pool in &mut block.pools {
+            let Some(pw) = session.pools.get(&pool.name) else {
+                continue;
+            };
+            let mut working = clone_pool(&pw.pool)?;
+            // The script this session scores against (the checkout's own by
+            // default, see the module docs), absolute so it does not resolve
+            // against the channel directory.
+            working.plugin = Some(
+                std::path::absolute(&pw.plugin_path)
+                    .map_err(|e| format!("plugin path {}: {e}", pw.plugin_path.display()))?,
+            );
+            *pool = working;
+        }
+    }
+    let block_names: Vec<String> = config
+        .rule
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            b.program()
+                .and_then(|p| p.title.clone())
+                .unwrap_or_else(|| format!("block {i}"))
+        })
+        .collect();
+
+    let start = time::OffsetDateTime::now_utc();
+    let sim = etv_station::simulate::simulate(
+        &config,
+        &session.channel_path,
+        catalog,
+        session.account_id,
+        session.days,
+        start,
+    )?;
+
+    let mut out = Vec::new();
+    for generation in &sim.generations {
+        let looked_up: Vec<Option<CatalogEntry>> = generation
+            .airings
+            .iter()
+            .map(|a| catalog.entry(&a.id).ok().flatten())
+            .collect();
+        let pools: Vec<String> = generation
+            .airings
+            .iter()
+            .map(|a| {
+                drawn_from_pool(a.metadata.as_ref()).unwrap_or_else(|| "(no pool)".to_string())
+            })
+            .collect();
+
+        let mut i = 0;
+        while i < generation.airings.len() {
+            let mut j = i + 1;
+            if let Some(show_id) = generation.airings[i].show_id.as_deref() {
+                while j < generation.airings.len()
+                    && generation.airings[j].show_id.as_deref() == Some(show_id)
+                    && pools[j] == pools[i]
+                {
+                    j += 1;
+                }
+            }
+            let first = &generation.airings[i];
+            let entries: Vec<Value> = (i..j)
+                .map(|k| {
+                    let a = &generation.airings[k];
+                    picked_item_json(catalog, &a.id, a.metadata.as_ref(), looked_up[k].as_ref())
+                })
+                .collect();
+            out.push(json!({
+                "generation": generation.index,
+                "target_count": generation.target_count,
+                "offset_secs": (first.start - sim.start).whole_seconds(),
+                "block_index": first.block,
+                "block_name": block_names.get(first.block).cloned().unwrap_or_default(),
+                "pool_name": pools[i],
+                "kind": if j - i > 1 { "visit" } else { "single" },
+                "entries": entries,
+            }));
+            i = j;
+        }
+    }
+    Ok(out)
+}
+
+/// The pool an airing was drawn from, read off the pattern engine's `select`
+/// audit stage (`detail.pool`).
+fn drawn_from_pool(metadata: Option<&Value>) -> Option<String> {
+    metadata?
+        .get("audit")?
+        .as_array()?
+        .iter()
+        .find(|stage| stage.get("stage").and_then(Value::as_str) == Some("select"))?
+        .get("detail")?
+        .get("pool")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// One picked item, ready for the schedule — title/show/season/episode read
 /// from `entry` (the caller's own catalog lookup, reused rather than
-/// repeated here — see [`build_schedule`]'s grouping loop), plus its own
+/// repeated here — see [`simulate_schedule`]'s grouping loop), plus its own
 /// `audit` record (the plugin's `audit()` output `score::pick` already
 /// merged into `metadata.audit`, #389/#392/#393) with every near-miss's id
 /// resolved to a title too, so the inspector never has to look anything up
 /// itself.
-fn picked_item_json(catalog: &Catalog, item: &PickedItem, entry: Option<&CatalogEntry>) -> Value {
+fn picked_item_json(
+    catalog: &Catalog,
+    id: &str,
+    metadata: Option<&Value>,
+    entry: Option<&CatalogEntry>,
+) -> Value {
     let (title, year, show, season, episode) = match entry {
         Some(e) => (e.title.clone(), e.year, e.show.clone(), e.season, e.episode),
         None => ("<unknown>".to_string(), None, None, None, None),
     };
     json!({
-        "id": item.id,
+        "id": id,
         "title": title,
         "year": year,
         "show": show,
         "season": season,
         "episode": episode,
-        "metadata": item.metadata,
-        "audit": enrich_audit(catalog, item.metadata.as_ref()),
+        "metadata": metadata,
+        "audit": enrich_audit(catalog, metadata),
     })
 }
 
@@ -989,7 +1042,12 @@ fn picked_item_json(catalog: &Catalog, item: &PickedItem, entry: Option<&Catalog
 /// is entry ids and a score/reason on its own (see `taste-cosine.rhai`'s
 /// `audit()`), useless to a reader without knowing what they name.
 fn enrich_audit(catalog: &Catalog, metadata: Option<&Value>) -> Option<Value> {
-    let mut audit = metadata?.get("audit")?.as_array()?.first()?.clone();
+    let mut audit = metadata?
+        .get("audit")?
+        .as_array()?
+        .iter()
+        .find(|stage| stage.get("stage").and_then(Value::as_str) != Some("select"))?
+        .clone();
     let near_misses = audit
         .get_mut("detail")
         .and_then(|d| d.get_mut("near_misses"))

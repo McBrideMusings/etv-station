@@ -2699,7 +2699,11 @@ async fn forward_channel_loop(
 /// Clamped at both ends: at least one item, so a nearly-covered window still
 /// asks for something rather than handing a plugin a target of zero, and capped
 /// so no configuration can ask a plugin to rank an entire library.
-fn target_count(config: &ChannelConfig, from: OffsetDateTime, target: OffsetDateTime) -> usize {
+pub(crate) fn target_count(
+    config: &ChannelConfig,
+    from: OffsetDateTime,
+    target: OffsetDateTime,
+) -> usize {
     const MAX: i64 = 500;
     let per_item = config
         .scoring
