@@ -584,6 +584,11 @@ fn payload_with_error(state: &AppState, error: String) -> Value {
 /// an edit to one pool changes what it draws in every later generation.
 fn rescore_and_respond(state: &mut AppState, pool_name: &str) -> (u16, Value) {
     if let Err(e) = score_pool(state, pool_name) {
+        // The edit is already on the working copy, so a schedule replayed
+        // before it no longer describes the profile on screen.
+        if let Some(session) = state.session.as_mut() {
+            session.schedule.clear();
+        }
         return (400, payload_with_error(state, e));
     }
     match resimulate(state) {
