@@ -811,7 +811,7 @@ mod tests {
         None
     }
 
-    /// A minimal but real plexdb store at the schema version `plexdb-reader`
+    /// A minimal but real plexdb store at the reader shape `plexdb-reader`
     /// understands — just enough for the sample `foryou.yaml` channel's
     /// `movies` pool to open its granted `taste` datastore at load. Its
     /// contents are never read here; this test only proves the whole example
@@ -824,8 +824,10 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(&format!(
             "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES ({version});",
-            version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+             INSERT INTO schema_version (version) VALUES ({version});
+             CREATE TABLE reader_shape (version INTEGER NOT NULL);
+             INSERT INTO reader_shape (version) VALUES ({version});",
+            version = plexdb_reader::SUPPORTED_READER_SHAPE,
         ))
         .unwrap();
         path

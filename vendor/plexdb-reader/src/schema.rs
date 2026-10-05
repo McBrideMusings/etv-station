@@ -1,14 +1,20 @@
-//! Schema-version gate.
+//! Read-shape gate.
 //!
-//! `plexdb-reader`'s typed accessors are written against one exact schema
-//! shape. Rather than let a renamed or missing column surface as a
-//! confusing runtime query failure deep inside an accessor, [`check`] reads
-//! the store's own `schema_version` row at open time and refuses anything
-//! that isn't [`SUPPORTED_SCHEMA_VERSION`] — older *or* newer — naming both
-//! versions in the error.
+//! `plexdb-reader`'s typed accessors are written against one read shape: the
+//! tables, columns and row meanings they select. Rather than let a renamed or
+//! missing column surface as a confusing runtime query failure deep inside an
+//! accessor, [`check_store`] reads the store's own `reader_shape` row at open
+//! time and refuses anything that isn't [`SUPPORTED_READER_SHAPE`] — older
+//! *or* newer — naming both in the error.
 //!
-//! Mirrors `plexdb/schema.py::SCHEMA_VERSION`. Bump this constant, and the
-//! accessors it backs, in the same change that adds a new migration there.
+//! The gate is on `reader_shape`, not `schema_version`. Most migrations only
+//! add tables or columns no accessor reads; those leave `reader_shape` alone,
+//! so a reader built against an older schema keeps reading a newer store. A
+//! migration that changes what an accessor reads bumps `reader_shape`, and
+//! every reader built before it refuses the store rather than misreading it.
+//!
+//! Mirrors `plexdb/schema.py::READER_SHAPE`. Bump this constant, and the
+//! accessors it backs, in the same change that bumps that one.
 
 use std::path::Path;
 
@@ -16,54 +22,22 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::ReaderError;
 
-/// The schema version this crate's accessors are written against.
+/// The read shape this crate's accessors are written against.
 ///
-/// Currently version 10 — `items`, `external_ids`, `plex_items`, `enrichment`,
-/// `enrichment_cursor`, `plays`, `plays_ingest_cursor`, `edges`, `collection`,
-/// `collection_membership`, `keyword_forms` — see `plexdb/schema.py`.
+/// Shape 10 is the store as schema version 10 left it (ADR-0016):
+/// `enrichment` and `enrichment_cursor` carry `source` in their primary key,
+/// keywords live in the `keywords` namespace, and `keyword_forms` maps raw
+/// spellings to stemmed forms. Writers' fetch cursors live in
+/// `enrichment_cursor`, not `enrichment` (ADR-0013).
 ///
-/// Versions 4, 5 and 6 added things this crate does not read: Tautulli's
-/// `seconds_watched`/`tautulli_id` on `plays` (issue #9), then `kind` on
-/// `external_ids` and `rating_key` on `plays` (issue #23), then the two
-/// collection tables (issue #34), whose accessor is issue #29.
-///
-/// **Version 7 is different — it changed what this crate reads.** Writers'
-/// fetch cursors moved out of `enrichment` into `enrichment_cursor`, so
-/// `attributes_by_item` dropped the key-prefix filter that had been hiding
-/// them (issue #41, ADR-0013). Against a v6 store that query would now return
-/// the sentinels as real attributes, which is exactly why the gate demands an
-/// exact match rather than a minimum.
-///
-/// **Version 8 does not change what this crate reads.** It adds `last_seen`
-/// to `external_ids` (issue #57), recording which of a title's ids Plex
-/// still reports; no accessor here reads it. The gate still demands an exact
-/// match rather than a minimum, so a v7 store — missing the column — is
-/// still refused rather than silently read as if it had it.
-///
-/// **Version 9 does not change what this crate reads.** It adds `title_map` and
-/// `title_map_state`, the tag explorer's stored map; no accessor here reads
-/// them.
-///
-/// **Version 10 changes what this crate reads** (ADR-0016). `enrichment` and
-/// `enrichment_cursor` carry `source` in their primary key, so the enrichment
-/// reads collapse rows that differ only by source; keywords moved from the
-/// `tmdb_keywords` namespace to `keywords`; and `keyword_forms` is new, read by
-/// [`crate::Reader::keyword_for_surface`] and
-/// [`crate::Reader::surfaces_for_keyword`]. A v8 or v9 store, with one row per
-/// fact and no `keyword_forms`, is refused by the exact-match gate.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 10;
+/// `tests/test_schema.py` fails whenever this constant differs from
+/// `plexdb/schema.py::READER_SHAPE`.
+pub const SUPPORTED_READER_SHAPE: i64 = 10;
 
-/// Confirm `conn` is a plexdb store at exactly [`SUPPORTED_SCHEMA_VERSION`].
-pub(crate) fn check(conn: &Connection, path: &Path) -> Result<(), ReaderError> {
-    let has_version_table: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !has_version_table {
+/// Confirm `conn` is a plexdb store whose `reader_shape` is exactly
+/// [`SUPPORTED_READER_SHAPE`].
+pub fn check_store(conn: &Connection, path: &Path) -> Result<(), ReaderError> {
+    if !has_table(conn, "schema_version")? {
         return Err(ReaderError::NotAStore {
             path: path.to_path_buf(),
         });
@@ -78,13 +52,40 @@ pub(crate) fn check(conn: &Connection, path: &Path) -> Result<(), ReaderError> {
         path: path.to_path_buf(),
     })?;
 
-    if store_version != SUPPORTED_SCHEMA_VERSION {
-        return Err(ReaderError::UnsupportedSchemaVersion {
+    if !has_table(conn, "reader_shape")? {
+        return Err(ReaderError::NoReaderShape {
             path: path.to_path_buf(),
             store_version,
-            supported_version: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+
+    let store_shape: Option<i64> = conn
+        .query_row("SELECT version FROM reader_shape LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let store_shape = store_shape.ok_or_else(|| ReaderError::DamagedStore {
+        path: path.to_path_buf(),
+    })?;
+
+    if store_shape != SUPPORTED_READER_SHAPE {
+        return Err(ReaderError::UnsupportedReaderShape {
+            path: path.to_path_buf(),
+            store_shape,
+            supported_shape: SUPPORTED_READER_SHAPE,
         });
     }
 
     Ok(())
+}
+
+fn has_table(conn: &Connection, name: &str) -> Result<bool, ReaderError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }

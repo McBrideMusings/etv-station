@@ -57,7 +57,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 
 pub use error::ReaderError;
 pub use model::{CollectionMembership, Edge, EnrichmentFact, TasteAttribute, TasteVector};
-pub use schema::SUPPORTED_SCHEMA_VERSION;
+pub use schema::{SUPPORTED_READER_SHAPE, check_store};
 
 /// A title watched less than half a season contributes nothing. Hu, Koren &
 /// Volinsky (ICDM 2008) §6, applied to seasons rather than whole programmes:
@@ -110,7 +110,7 @@ impl Reader {
                 path: path.to_path_buf(),
                 source,
             })?;
-        schema::check(&conn, path)?;
+        schema::check_store(&conn, path)?;
         Ok(Self { conn })
     }
 
@@ -673,9 +673,11 @@ mod tests {
         {
             let setup = Connection::open(file.path()).expect("open for setup");
             setup
-                .execute_batch(
+                .execute_batch(&format!(
                     "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                     INSERT INTO schema_version (version) VALUES (10);
+                     INSERT INTO schema_version (version) VALUES (15);
+                     CREATE TABLE reader_shape (version INTEGER NOT NULL);
+                     INSERT INTO reader_shape (version) VALUES ({SUPPORTED_READER_SHAPE});
                      CREATE TABLE items (item_id TEXT PRIMARY KEY);
                      CREATE TABLE enrichment (
                          item_id    TEXT NOT NULL,
@@ -684,8 +686,8 @@ mod tests {
                          key        TEXT NOT NULL,
                          value      TEXT NOT NULL,
                          fetched_at TEXT NOT NULL
-                     );",
-                )
+                     );"
+                ))
                 .expect("build a minimal enrichment-only schema");
             for i in 0..10 {
                 setup

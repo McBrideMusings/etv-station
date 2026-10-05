@@ -48,6 +48,8 @@ fn empty_store(path: &Path) -> rusqlite::Connection {
     conn.execute_batch(&format!(
         "CREATE TABLE schema_version (version INTEGER NOT NULL);
          INSERT INTO schema_version (version) VALUES ({version});
+         CREATE TABLE reader_shape (version INTEGER NOT NULL);
+         INSERT INTO reader_shape (version) VALUES ({version});
          CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
@@ -61,7 +63,7 @@ fn empty_store(path: &Path) -> rusqlite::Connection {
              plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL
          );
          CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);",
-        version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+        version = plexdb_reader::SUPPORTED_READER_SHAPE,
     ))
     .unwrap();
     conn

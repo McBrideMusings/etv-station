@@ -24,6 +24,8 @@ fn write_fixture(path: &std::path::Path) {
     conn.execute_batch(&format!(
         "CREATE TABLE schema_version (version INTEGER NOT NULL);
          INSERT INTO schema_version (version) VALUES ({version});
+         CREATE TABLE reader_shape (version INTEGER NOT NULL);
+         INSERT INTO reader_shape (version) VALUES ({version});
          CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
@@ -48,7 +50,7 @@ fn write_fixture(path: &std::path::Path) {
              ('imdb:tt1', 'imdb:tt2', 'tmdb_similar', 1, '2026-01-01T00:00:00+00:00');
          INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
              ('h1', 'imdb:tt1', 42, 1700000000);",
-        version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+        version = plexdb_reader::SUPPORTED_READER_SHAPE,
     ))
     .unwrap();
 }
@@ -194,6 +196,8 @@ fn write_dupe_and_keyword_form_fixture(path: &std::path::Path) {
     conn.execute_batch(&format!(
         "CREATE TABLE schema_version (version INTEGER NOT NULL);
          INSERT INTO schema_version (version) VALUES ({version});
+         CREATE TABLE reader_shape (version INTEGER NOT NULL);
+         INSERT INTO reader_shape (version) VALUES ({version});
          CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
@@ -214,7 +218,7 @@ fn write_dupe_and_keyword_form_fixture(path: &std::path::Path) {
          INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
              ('h1', 'dup-a', 42, 1700000000);
          INSERT INTO keyword_forms (surface, keyword) VALUES ('heists', 'heist');",
-        version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+        version = plexdb_reader::SUPPORTED_READER_SHAPE,
     ))
     .unwrap();
 }

@@ -17,19 +17,26 @@ pub enum ReaderError {
     NotAStore { path: PathBuf },
 
     #[error(
-        "{path} has a schema_version table but no version row — the store is damaged, not empty"
+        "{path} has a schema_version or reader_shape table with no row — the store is damaged, \
+         not empty"
     )]
     DamagedStore { path: PathBuf },
 
     #[error(
-        "store at {path} is schema version {store_version}, but plexdb-reader only understands \
-         version {supported_version} — rebuild plexdb-reader against a matching plex-db-ex, or \
-         point it at a store of the version it understands"
+        "store at {path} is schema version {store_version}, which has no reader_shape table — \
+         migrate it with a plex-db-ex at schema version 15 or later"
     )]
-    UnsupportedSchemaVersion {
+    NoReaderShape { path: PathBuf, store_version: i64 },
+
+    #[error(
+        "store at {path} has reader shape {store_shape}, but plexdb-reader only understands \
+         reader shape {supported_shape} — rebuild plexdb-reader against a matching plex-db-ex, \
+         or point it at a store of the shape it understands"
+    )]
+    UnsupportedReaderShape {
         path: PathBuf,
-        store_version: i64,
-        supported_version: i64,
+        store_shape: i64,
+        supported_shape: i64,
     },
 
     #[error("store query failed: {0}")]

@@ -33,6 +33,8 @@ fn write_fixture(path: &Path, movies: &[(&str, &[&str])]) {
     conn.execute_batch(&format!(
         "CREATE TABLE schema_version (version INTEGER NOT NULL);
          INSERT INTO schema_version (version) VALUES ({version});
+         CREATE TABLE reader_shape (version INTEGER NOT NULL);
+         INSERT INTO reader_shape (version) VALUES ({version});
          CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
@@ -49,7 +51,7 @@ fn write_fixture(path: &Path, movies: &[(&str, &[&str])]) {
              history_key TEXT PRIMARY KEY, item_id TEXT NOT NULL,
              plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL
          );",
-        version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+        version = plexdb_reader::SUPPORTED_READER_SHAPE,
     ))
     .unwrap();
     for (id, keywords) in movies {

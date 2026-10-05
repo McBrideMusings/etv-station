@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 /// SHA-256 over the sorted `(relative path, contents)` pairs of every file under
 /// `vendor/plexdb-reader/src/`. Update by running the failing test, copying the actual
 /// hash it prints, and pasting it here — in the same commit as the copy that changed it.
-const VENDOR_SRC_SHA256: &str = "7b82c74181c8ef36e150ef73841611ff98690d7e08a46bad3376a7c5f0395db0";
+const VENDOR_SRC_SHA256: &str = "774e4a08798e3f7524388091e5f3e37f2c1aaae446567c14263981ebd72d682c";
 
 /// Resolved from `CARGO_MANIFEST_DIR`, so the test reads nothing outside this repository.
 fn vendored_src_dir() -> PathBuf {

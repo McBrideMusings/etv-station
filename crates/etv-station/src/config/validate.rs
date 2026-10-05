@@ -15,7 +15,7 @@ use crate::guide::GuideConfig;
 use crate::pattern::{MAX_CYCLES, MAX_TAKE};
 
 /// A datastore that stops being republished stays openable — the file is
-/// still there, still at a schema version this build understands — so
+/// still there, still at a reader shape this build understands — so
 /// `Reader::open` succeeding proves nothing about whether the sweep that
 /// writes it is still running. Two missed daily publishes is the line
 /// between "ran a little late" and "the pipeline is down and nobody's
@@ -920,7 +920,7 @@ fn validate_plugin_capabilities(
     }
 
     // Both sets agree now, so every grant here is also declared — prove each
-    // named datastore is actually openable, and at the schema version the
+    // named datastore is actually openable, and at the reader shape the
     // vendored `plexdb-reader` crate understands, before any plugin ever
     // runs (#181). `Reader::open` names both the found and the supported
     // version when they disagree, and names the path when the file is
@@ -2248,20 +2248,22 @@ fn capabilities() { [] }
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch(&format!(
             "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES ({version});"
+             INSERT INTO schema_version (version) VALUES ({version});
+             CREATE TABLE reader_shape (version INTEGER NOT NULL);
+             INSERT INTO reader_shape (version) VALUES ({version});"
         ))
         .unwrap();
     }
 
     /// A declared-and-granted datastore whose path opens cleanly — a real
-    /// plexdb store at the schema version `plexdb-reader` understands —
+    /// plexdb store at the reader shape `plexdb-reader` understands —
     /// validates, and the acceptance bar for #167: a station with no
     /// datastore grant anywhere never even reaches the open call.
     #[test]
     fn a_datastore_grant_that_opens_validates() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
-        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_READER_SHAPE);
         validate_plugin_script_with_capabilities(
             r#"
 fn hooks() { ["pool_provider"] }
@@ -2299,10 +2301,10 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
     /// in the store and the version this build understands — never a panic,
     /// and never an empty pool that looks like a scheduling result.
     #[test]
-    fn a_datastore_grant_at_the_wrong_schema_version_is_rejected_naming_both_versions() {
+    fn a_datastore_grant_at_the_wrong_reader_shape_is_rejected_naming_both_shapes() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
-        let wrong_version = plexdb_reader::SUPPORTED_SCHEMA_VERSION + 1;
+        let wrong_version = plexdb_reader::SUPPORTED_READER_SHAPE + 1;
         write_plexdb_fixture(&db, wrong_version);
         let err = validate_plugin_script_with_capabilities(
             r#"
@@ -2318,7 +2320,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         assert!(msg.contains("taste_db"), "msg = {msg}");
         assert!(msg.contains(&wrong_version.to_string()), "msg = {msg}");
         assert!(
-            msg.contains(&plexdb_reader::SUPPORTED_SCHEMA_VERSION.to_string()),
+            msg.contains(&plexdb_reader::SUPPORTED_READER_SHAPE.to_string()),
             "msg = {msg}"
         );
     }
@@ -2410,7 +2412,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
     fn a_datastore_grant_logs_its_age_at_load() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
-        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_READER_SHAPE);
 
         let (result, events) = capture_datastore_age_events(|| {
             validate_plugin_script_with_capabilities(
@@ -2443,7 +2445,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
     fn a_datastore_older_than_48_hours_logs_a_warning_naming_the_age_and_path() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
-        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_READER_SHAPE);
         let fifty_hours_ago = SystemTime::now() - Duration::from_secs(50 * 60 * 60);
         set_mtime(&db, fifty_hours_ago);
 
@@ -2480,7 +2482,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
     fn no_snapshot_age_prevents_a_load_even_well_past_the_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
-        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_SCHEMA_VERSION);
+        write_plexdb_fixture(&db, plexdb_reader::SUPPORTED_READER_SHAPE);
         let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
         set_mtime(&db, thirty_days_ago);
 

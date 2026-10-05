@@ -2297,8 +2297,10 @@ fn audit(ctx, picks, workspace) { #{} }
         conn.execute_batch(&format!(
             "CREATE TABLE schema_version (version INTEGER NOT NULL);
              INSERT INTO schema_version (version) VALUES ({version});
+             CREATE TABLE reader_shape (version INTEGER NOT NULL);
+             INSERT INTO reader_shape (version) VALUES ({version});
              CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);",
-            version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+            version = plexdb_reader::SUPPORTED_READER_SHAPE,
         ))
         .unwrap();
         for (surface, keyword) in forms {

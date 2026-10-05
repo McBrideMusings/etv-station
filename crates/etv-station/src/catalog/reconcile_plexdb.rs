@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
 use super::model::ExternalNs;
@@ -106,26 +106,14 @@ pub enum ReconcileOpenError {
         source: rusqlite::Error,
     },
 
-    #[error("plex-db-ex snapshot at {path} has no schema_version row — not a plexdb store")]
-    NotAStore { path: PathBuf },
-
-    #[error(
-        "plex-db-ex snapshot at {path} is schema version {found}, but this comparison is \
-         written against version {supported} (the version the vendored plexdb-reader crate \
-         also expects)"
-    )]
-    UnsupportedSchemaVersion {
-        path: PathBuf,
-        found: i64,
-        supported: i64,
-    },
+    #[error(transparent)]
+    Store(#[from] plexdb_reader::ReaderError),
 }
 
-/// Open a `plex-db-ex` snapshot read-only, refusing anything that isn't a
-/// plexdb store at exactly the schema version this comparison (and the
-/// vendored `plexdb-reader` crate) is written against — older or newer —
-/// rather than let a renamed or missing column surface as a confusing query
-/// failure deep inside [`reconcile`].
+/// Open a `plex-db-ex` snapshot read-only, refusing anything the vendored
+/// `plexdb-reader` crate would refuse — a store whose read shape this
+/// comparison is not written against — rather than let a renamed or missing
+/// column surface as a confusing query failure deep inside [`reconcile`].
 pub fn open_plexdb_readonly(path: impl AsRef<Path>) -> Result<Connection, ReconcileOpenError> {
     let path = path.as_ref();
     let conn =
@@ -135,25 +123,7 @@ pub fn open_plexdb_readonly(path: impl AsRef<Path>) -> Result<Connection, Reconc
                 source,
             }
         })?;
-    let version: Option<i64> = conn
-        .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|source| ReconcileOpenError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let version = version.ok_or_else(|| ReconcileOpenError::NotAStore {
-        path: path.to_path_buf(),
-    })?;
-    if version != plexdb_reader::SUPPORTED_SCHEMA_VERSION {
-        return Err(ReconcileOpenError::UnsupportedSchemaVersion {
-            path: path.to_path_buf(),
-            found: version,
-            supported: plexdb_reader::SUPPORTED_SCHEMA_VERSION,
-        });
-    }
+    plexdb_reader::check_store(&conn, path)?;
     Ok(conn)
 }
 
@@ -386,17 +356,12 @@ mod tests {
     use super::*;
     use crate::catalog::model::{Entry, EntrySource, Source};
 
-    /// A minimal plex-db-ex store: `schema_version`, `items`, `plex_items`,
-    /// `external_ids` — the exact subset this module reads, pinned by
-    /// `plexdb_reader::SUPPORTED_SCHEMA_VERSION` so a real drift in that
-    /// crate's pin fails this test too rather than silently comparing
-    /// against the wrong version.
+    /// A minimal plex-db-ex store: `items`, `plex_items`, `external_ids` —
+    /// the exact subset this module reads.
     fn plexdb_store() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory plexdb");
-        conn.execute_batch(&format!(
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES ({});
-             CREATE TABLE items (item_id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL);
+        conn.execute_batch(
+            "CREATE TABLE items (item_id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL);
              CREATE TABLE plex_items (
                  rating_key TEXT PRIMARY KEY,
                  item_id TEXT NOT NULL,
@@ -409,8 +374,7 @@ mod tests {
                  value TEXT NOT NULL,
                  kind TEXT NOT NULL
              );",
-            plexdb_reader::SUPPORTED_SCHEMA_VERSION
-        ))
+        )
         .expect("build a minimal plexdb schema");
         conn
     }
@@ -699,9 +663,11 @@ mod tests {
             setup
                 .execute_batch(&format!(
                     "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                     INSERT INTO schema_version (version) VALUES ({});
+                     INSERT INTO schema_version (version) VALUES (15);
+                     CREATE TABLE reader_shape (version INTEGER NOT NULL);
+                     INSERT INTO reader_shape (version) VALUES ({shape});
                      CREATE TABLE t (id INTEGER PRIMARY KEY);",
-                    plexdb_reader::SUPPORTED_SCHEMA_VERSION
+                    shape = plexdb_reader::SUPPORTED_READER_SHAPE
                 ))
                 .expect("build a minimal plexdb store");
         }
@@ -716,24 +682,26 @@ mod tests {
     }
 
     #[test]
-    fn open_plexdb_readonly_refuses_an_unsupported_schema_version() {
+    fn open_plexdb_readonly_refuses_an_unsupported_reader_shape() {
         let file = tempfile::NamedTempFile::new().expect("create a temp file");
         {
             let setup = Connection::open(file.path()).expect("open for setup");
-            let wrong_version = plexdb_reader::SUPPORTED_SCHEMA_VERSION + 1;
+            let wrong_shape = plexdb_reader::SUPPORTED_READER_SHAPE + 1;
             setup
                 .execute_batch(&format!(
                     "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                     INSERT INTO schema_version (version) VALUES ({wrong_version});"
+                     INSERT INTO schema_version (version) VALUES (15);
+                     CREATE TABLE reader_shape (version INTEGER NOT NULL);
+                     INSERT INTO reader_shape (version) VALUES ({wrong_shape});"
                 ))
-                .expect("build a store at the wrong version");
+                .expect("build a store at the wrong reader shape");
         }
 
-        let err = open_plexdb_readonly(file.path())
-            .expect_err("wrong schema version must refuse to open");
+        let err =
+            open_plexdb_readonly(file.path()).expect_err("wrong reader shape must refuse to open");
         assert!(matches!(
             err,
-            ReconcileOpenError::UnsupportedSchemaVersion { .. }
+            ReconcileOpenError::Store(plexdb_reader::ReaderError::UnsupportedReaderShape { .. })
         ));
     }
 }

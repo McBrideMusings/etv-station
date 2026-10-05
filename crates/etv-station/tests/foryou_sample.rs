@@ -125,6 +125,8 @@ fn write_taste_fixture(path: &Path) {
     conn.execute_batch(&format!(
         "CREATE TABLE schema_version (version INTEGER NOT NULL);
          INSERT INTO schema_version (version) VALUES ({version});
+         CREATE TABLE reader_shape (version INTEGER NOT NULL);
+         INSERT INTO reader_shape (version) VALUES ({version});
          CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
@@ -152,7 +154,7 @@ fn write_taste_fixture(path: &Path) {
              ('mov-arrival', 'keywords', 'keyword', 'linguistics', '2026-01-01T00:00:00+00:00');
          INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
              ('h1', 'mov-contact', 42, 1700000000);",
-        version = plexdb_reader::SUPPORTED_SCHEMA_VERSION,
+        version = plexdb_reader::SUPPORTED_READER_SHAPE,
     ))
     .unwrap();
 }
