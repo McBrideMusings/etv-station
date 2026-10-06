@@ -211,7 +211,9 @@ impl Scorer {
         // The two halves, in the order the daemon runs them: `prepare` reads
         // the catalog, `pick` below ranks what it found.
         let mut cache = ScoreCache::default();
-        cache.prepare(cat, &script, sources.as_ref()).unwrap();
+        cache
+            .prepare(cat, &script, sources.as_ref(), &Default::default())
+            .unwrap();
         Self {
             _dir: dir,
             db,
@@ -1717,6 +1719,17 @@ impl Scorer {
         self.cache
             .prepare_profile(cat, &pool, self._dir.path())
             .unwrap();
+        // The profile's exclusions are part of what `prepare` resolves, so
+        // the sets are resolved again under them — as the daemon resolves a
+        // profiled pool, profile first.
+        self.cache
+            .prepare(
+                cat,
+                &self.script,
+                self.sources.as_ref(),
+                &self.cache.excluded(&pool.name),
+            )
+            .unwrap();
         self
     }
 
@@ -1781,6 +1794,34 @@ fn a_keyword_and_an_item_sharing_it_net_to_their_difference() {
     assert_eq!(
         detail_of(p)["profile_entries"][0]["origin"].as_str(),
         Some("inline")
+    );
+}
+
+/// `exclude: true` removes titles from the pool outright (etv-station-sctf.7):
+/// a strongly favored keyword cannot bring back a title whose genre is
+/// excluded. A `−1 Horror` weight leaves p-horror and p-both ranked; the
+/// exclusion leaves them absent.
+#[test]
+fn an_excluded_tag_never_reaches_the_scorer() {
+    let picked = profile_scorer(
+        write_profile_fixture,
+        "  - { keyword: ghost, weight: 5.0 }\n  - { genre: Horror, exclude: true }\n",
+    )
+    .pick_profiled(0.0)
+    .unwrap();
+    let mut ids: Vec<&str> = picked.iter().map(|p| p.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["p-heist", "p-none"]);
+
+    let weighted = profile_scorer(
+        write_profile_fixture,
+        "  - { keyword: ghost, weight: 5.0 }\n  - { genre: Horror, weight: -1.0 }\n",
+    )
+    .pick_profiled(0.0)
+    .unwrap();
+    assert!(
+        weighted.iter().any(|p| p.id == "p-horror"),
+        "a negative weight scores a title down but leaves it a candidate"
     );
 }
 

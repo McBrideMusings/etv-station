@@ -242,6 +242,38 @@ fn audit(ctx, picks, workspace) { #{} }
     assert_eq!(got, vec!["mov-d", "mov-a", "mov-c", "mov-b"]);
 }
 
+/// A profile's `exclude: true` entries (etv-station-sctf.7) remove titles from
+/// a generation, not just from one call: the Sci-Fi film and Arrival never air,
+/// though the script returns every movie it is handed.
+#[test]
+fn profile_exclusions_keep_titles_off_the_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_plugin(
+        &dir,
+        "every.rhai",
+        r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let out = [];
+    for item in ctx.sets.movies { out.push(item.entry_id); }
+    #{ picks: out, workspace: () }
+}
+fn audit(ctx, picks, workspace) { #{} }
+"#,
+    );
+    let mut cfg = plugin_channel(&p, 1, 4);
+    cfg.rule.blocks[0].pools[0].profile = serde_norway::from_str(
+        "- { genre: sci-fi, exclude: true }\n- { item: \"Arrival (2016)\", exclude: true }\n",
+    )
+    .unwrap();
+    let got = resolve_with(&cfg, &catalog(), ScoreInputs::default());
+    assert!(!got.is_empty());
+    assert!(
+        got.iter().all(|id| id == "mov-c" || id == "mov-d"),
+        "only Contact and Dune remain candidates: {got:?}"
+    );
+}
+
 /// The interface boundary holds: swapping the script changes the channel, and
 /// the only thing that differs between these two runs is the file on disk.
 #[test]

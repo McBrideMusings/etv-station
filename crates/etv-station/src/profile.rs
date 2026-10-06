@@ -1,5 +1,7 @@
 //! A pool's taste profile (etv-station-sctf.2): signed weights on keywords,
-//! catalog tag values, single items and CEL-defined sets.
+//! catalog tag values, single items and CEL-defined sets — and, for a tag
+//! value or an item, `exclude: true`, which removes every matching title from
+//! the pool's candidates before the scorer sees them (etv-station-sctf.7).
 //!
 //! **The station resolves references; the script does all the weight math**
 //! (ADR 0002). This module turns what a channel author wrote into
@@ -19,16 +21,19 @@
 //!   prepare step), so an unmatched item or keyword spelling fails the
 //!   generation, not the load.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use rhai::{Array, Dynamic, Map};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
+use crate::catalog::TagNs;
 use crate::catalog::model::ExternalNs;
 use crate::config::Pool;
 
-/// One profile entry as authored: exactly one reference key and a `weight`.
+/// One profile entry as authored: exactly one reference key and either a
+/// `weight` or `exclude: true`.
 ///
 /// Every reference key is optional here so that "two keys" and "no key" reach
 /// [`check`] and get a message naming the entry, rather than a serde error
@@ -64,9 +69,26 @@ pub struct ProfileEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<String>,
     /// Optional here only so a missing one reaches [`check`] and is refused
-    /// naming the entry; every entry that passes has one.
+    /// naming the entry; every entry that passes has one or `exclude: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<f64>,
+    /// `true` removes every title this entry's tag or item reference matches
+    /// from the pool's candidates, in place of a `weight`. Unlike a negative
+    /// weight, which only scores a title down, an excluded title never reaches
+    /// the scorer. Unlike the pool's `exclude_keywords`, which zeroes a
+    /// keyword's contribution and leaves its titles in the pool, this removes
+    /// titles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<bool>,
+}
+
+/// What a checked entry does with what it references.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Effect {
+    /// Handed to the scorer in `ctx.profile` with this signed weight.
+    Weight(f64),
+    /// Removed from the pool's candidates; never reaches the scorer.
+    Exclude,
 }
 
 /// What one entry points at, once its shape has been checked.
@@ -100,7 +122,7 @@ pub struct LoadedEntry {
     pub reference: Reference,
     /// The reference exactly as authored, for error messages and the audit.
     pub written: String,
-    pub weight: f64,
+    pub effect: Effect,
     /// The profile file's path as written in `profile_files`, or `inline`.
     pub origin: String,
     /// 1-based position within its origin.
@@ -114,11 +136,28 @@ impl LoadedEntry {
 }
 
 /// A pool's profile, resolved against the catalog: what `ctx.profile` and
-/// `ctx.exclude_keywords` hold.
+/// `ctx.exclude_keywords` hold, and which titles leave the pool's candidates.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedProfile {
+    /// The weighted entries — `exclude: true` entries are not among them.
     pub entries: Array,
     pub exclude_keywords: Array,
+    /// Each `exclude: true` entry and the titles it matched.
+    pub exclusions: Vec<ResolvedExclusion>,
+    /// Every entry id any of [`Self::exclusions`] matched — what
+    /// [`crate::score::ScoreCache::prepare`] drops from the pool's sets.
+    pub excluded: BTreeSet<String>,
+}
+
+/// One `exclude: true` entry, resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedExclusion {
+    /// `key: value` as authored, e.g. `genre: Horror`.
+    pub reference: String,
+    pub origin: String,
+    /// The catalog entries it matched, in id order — whether or not they are
+    /// in the pool's sources.
+    pub entry_ids: Vec<String>,
 }
 
 /// The one rule a keyword reference goes through: lowercase, trimmed, runs of
@@ -131,23 +170,32 @@ pub fn normalize_keyword(raw: &str) -> String {
         .to_lowercase()
 }
 
+/// Where a tag key's values live in the catalog.
+#[derive(Debug, Clone, Copy)]
+enum TagColumn {
+    Tag(TagNs),
+    Studio,
+    ContentRating,
+}
+
 /// The catalog tag keys an entry may name, each paired with the key its
-/// values sit under on a `ctx.sets` item map.
-const TAG_KEYS: &[(&str, &str)] = &[
-    ("genre", "genres"),
-    ("label", "labels"),
-    ("cast", "cast"),
-    ("director", "directors"),
-    ("writer", "writers"),
-    ("producer", "producers"),
-    ("country", "countries"),
-    ("studio", "studio"),
-    ("content_rating", "content_rating"),
+/// values sit under on a `ctx.sets` item map and where the catalog keeps them.
+const TAG_KEYS: &[(&str, &str, TagColumn)] = &[
+    ("genre", "genres", TagColumn::Tag(TagNs::Genre)),
+    ("label", "labels", TagColumn::Tag(TagNs::Label)),
+    ("cast", "cast", TagColumn::Tag(TagNs::Cast)),
+    ("director", "directors", TagColumn::Tag(TagNs::Director)),
+    ("writer", "writers", TagColumn::Tag(TagNs::Writer)),
+    ("producer", "producers", TagColumn::Tag(TagNs::Producer)),
+    ("country", "countries", TagColumn::Tag(TagNs::Country)),
+    ("studio", "studio", TagColumn::Studio),
+    ("content_rating", "content_rating", TagColumn::ContentRating),
 ];
 
 /// Check one authored entry: exactly one reference key, a non-empty value,
-/// a finite non-zero weight, and an `item:` in one of its two shapes.
-pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, f64), String> {
+/// either a finite non-zero weight or `exclude: true` on a tag or item, and an
+/// `item:` in one of its two shapes.
+pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, Effect), String> {
     let tags = [
         &entry.genre,
         &entry.label,
@@ -163,7 +211,7 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, f64), String> {
     if let Some(v) = &entry.keyword {
         named.push(("keyword", v));
     }
-    for ((key, _), value) in TAG_KEYS.iter().zip(tags) {
+    for ((key, _, _), value) in TAG_KEYS.iter().zip(tags) {
         if let Some(v) = value {
             named.push((key, v));
         }
@@ -198,17 +246,45 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, f64), String> {
     if value.trim().is_empty() {
         return Err(format!("has an empty `{key}`"));
     }
-    let Some(weight) = entry.weight else {
-        return Err(format!("`{key}: {value}` has no `weight`"));
+    let effect = match (entry.exclude, entry.weight) {
+        (Some(true), Some(_)) => {
+            return Err(format!(
+                "`{key}: {value}` sets both `weight` and `exclude` — an excluded title is \
+                 never scored, so drop the weight"
+            ));
+        }
+        (Some(true), None) => {
+            if key == "keyword" || key == "set" {
+                return Err(format!(
+                    "`{key}: {value}` cannot be excluded — `exclude` takes a catalog tag or an \
+                     `item`; drop a keyword from scoring with the pool's `exclude_keywords`, \
+                     and narrow candidates by query with the pool's `sources`"
+                ));
+            }
+            Effect::Exclude
+        }
+        (Some(false), _) => {
+            return Err(format!(
+                "`{key}: {value}` has `exclude: false`, which excludes nothing — remove it"
+            ));
+        }
+        (None, None) => {
+            return Err(format!(
+                "`{key}: {value}` has no `weight` (or `exclude: true`)"
+            ));
+        }
+        (None, Some(weight)) => {
+            if !weight.is_finite() {
+                return Err(format!("`{key}: {value}` has a non-finite weight"));
+            }
+            if weight == 0.0 {
+                return Err(format!(
+                    "`{key}: {value}` has weight 0, which weights nothing — remove the entry"
+                ));
+            }
+            Effect::Weight(weight)
+        }
     };
-    if !weight.is_finite() {
-        return Err(format!("`{key}: {value}` has a non-finite weight"));
-    }
-    if weight == 0.0 {
-        return Err(format!(
-            "`{key}: {value}` has weight 0, which weights nothing — remove the entry"
-        ));
-    }
 
     let reference = match key {
         "keyword" => Reference::Keyword(normalize_keyword(value)),
@@ -217,8 +293,8 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, f64), String> {
         tag => {
             let namespace = TAG_KEYS
                 .iter()
-                .find(|(k, _)| *k == tag)
-                .map(|(_, ns)| *ns)
+                .find(|(k, _, _)| *k == tag)
+                .map(|(_, ns, _)| *ns)
                 .ok_or_else(|| format!("unknown reference key {tag:?}"))?;
             Reference::Tag {
                 namespace,
@@ -226,7 +302,7 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, f64), String> {
             }
         }
     };
-    Ok((reference, value.clone(), weight))
+    Ok((reference, value.clone(), effect))
 }
 
 fn parse_item(raw: &str) -> Result<ItemRef, String> {
@@ -282,12 +358,12 @@ fn push_checked(
 ) -> Result<(), String> {
     for (i, entry) in entries.iter().enumerate() {
         let position = i + 1;
-        let (reference, written, weight) =
+        let (reference, written, effect) =
             check(entry).map_err(|m| format!("profile entry {position} in {origin} {m}"))?;
         out.push(LoadedEntry {
             reference,
             written,
-            weight,
+            effect,
             origin: origin.to_string(),
             position,
         });
@@ -329,7 +405,15 @@ pub fn resolve(
     keyword_store: Option<&plexdb_reader::Reader>,
 ) -> Result<ResolvedProfile, String> {
     let mut out = Array::with_capacity(entries.len());
+    let mut exclusions = Vec::new();
     for entry in entries {
+        let weight = match entry.effect {
+            Effect::Weight(w) => w,
+            Effect::Exclude => {
+                exclusions.push(resolve_exclusion(catalog, entry)?);
+                continue;
+            }
+        };
         let mut m = Map::new();
         match &entry.reference {
             Reference::Keyword(k) => {
@@ -375,7 +459,7 @@ pub fn resolve(
                 m.insert("items".into(), Dynamic::from_array(items));
             }
         }
-        m.insert("weight".into(), entry.weight.into());
+        m.insert("weight".into(), weight.into());
         m.insert("reference".into(), entry.written.clone().into());
         m.insert("origin".into(), entry.origin.clone().into());
         out.push(Dynamic::from_map(m));
@@ -397,9 +481,62 @@ pub fn resolve(
         }
         resolved
     };
+    let excluded = exclusions
+        .iter()
+        .flat_map(|x| x.entry_ids.iter().cloned())
+        .collect();
     Ok(ResolvedProfile {
         entries: out,
         exclude_keywords: exclude,
+        exclusions,
+        excluded,
+    })
+}
+
+/// The catalog entries one `exclude: true` entry matches. A tag value matches
+/// ASCII-case-insensitively (`Horror` = `horror`, but `É` ≠ `é`); an item resolves exactly as a weighted `item:` does.
+/// Matching nothing fails, naming the entry, on the same terms as a `set`
+/// that matches nothing: a misspelt exclusion would otherwise exclude nothing
+/// and say so nowhere.
+fn resolve_exclusion(catalog: &Catalog, entry: &LoadedEntry) -> Result<ResolvedExclusion, String> {
+    let (key, entry_ids) = match &entry.reference {
+        Reference::Tag { namespace, .. } => {
+            let (key, _, column) = TAG_KEYS
+                .iter()
+                .find(|(_, ns, _)| ns == namespace)
+                .ok_or_else(|| format!("unknown tag namespace {namespace:?}"))?;
+            let value = entry.written.trim();
+            let ids = match column {
+                TagColumn::Tag(ns) => catalog.entry_ids_with_tag(*ns, value),
+                TagColumn::Studio => catalog.entry_ids_with_studio(value),
+                TagColumn::ContentRating => catalog.entry_ids_with_content_rating(value),
+            }
+            .map_err(|e| format!("{}: `{key}: {value}`: {e}", entry.locate()))?;
+            (*key, ids)
+        }
+        Reference::Item(item) => {
+            let id = resolve_item(catalog, item)
+                .map_err(|msg| format!("{}: `item: {}` {msg}", entry.locate(), entry.written))?;
+            ("item", vec![id])
+        }
+        Reference::Keyword(_) | Reference::Set(_) => {
+            return Err(format!(
+                "{}: only a tag or an `item` can be excluded",
+                entry.locate()
+            ));
+        }
+    };
+    let reference = format!("{key}: {}", entry.written.trim());
+    if entry_ids.is_empty() {
+        return Err(format!(
+            "{}: excluded `{reference}` matches no catalog items, so it would exclude nothing",
+            entry.locate()
+        ));
+    }
+    Ok(ResolvedExclusion {
+        reference,
+        origin: entry.origin.clone(),
+        entry_ids,
     })
 }
 
@@ -491,6 +628,38 @@ mod tests {
     fn a_non_finite_weight_is_refused() {
         let msg = check(&entry("{ keyword: heist, weight: .inf }")).unwrap_err();
         assert!(msg.contains("non-finite"), "msg = {msg}");
+    }
+
+    #[test]
+    fn a_tag_or_item_may_be_excluded_in_place_of_a_weight() {
+        let (_, _, effect) = check(&entry("{ genre: Horror, exclude: true }")).unwrap();
+        assert_eq!(effect, Effect::Exclude);
+        let (_, _, effect) = check(&entry("{ item: \"Heat (1995)\", exclude: true }")).unwrap();
+        assert_eq!(effect, Effect::Exclude);
+    }
+
+    #[test]
+    fn an_exclusion_with_a_weight_is_refused() {
+        let msg = check(&entry("{ genre: Horror, exclude: true, weight: -1 }")).unwrap_err();
+        assert!(msg.contains("both `weight` and `exclude`"), "msg = {msg}");
+    }
+
+    /// `exclude_keywords` already owns keywords, and `sources` owns queries.
+    #[test]
+    fn a_keyword_or_set_cannot_be_excluded() {
+        for yaml in [
+            "{ keyword: heist, exclude: true }",
+            "{ set: 'item.year < 1970', exclude: true }",
+        ] {
+            let msg = check(&entry(yaml)).unwrap_err();
+            assert!(msg.contains("cannot be excluded"), "msg = {msg}");
+        }
+    }
+
+    #[test]
+    fn exclude_false_is_refused() {
+        let msg = check(&entry("{ genre: Horror, exclude: false }")).unwrap_err();
+        assert!(msg.contains("excludes nothing"), "msg = {msg}");
     }
 
     #[test]

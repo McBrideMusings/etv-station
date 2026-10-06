@@ -1124,15 +1124,22 @@ pub(crate) fn resolve_pool_sources(
             }
             (None, Some(plugin), false) => {
                 let path = score_env.resolve_path(plugin);
-                // `cfg.sources` (#210) replaces whatever the script's own
-                // `sources()` declares, and is half the cache key — so two
-                // pools naming this script resolve together only when they
-                // asked for the same candidates.
-                score_cache
-                    .prepare(catalog, &path, cfg.sources.as_ref())
-                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+                // The profile first: its `exclude: true` entries name the ids
+                // `prepare` drops from the sets (etv-station-sctf.7).
                 score_cache
                     .prepare_profile(catalog, cfg, score_env.base_dir)
+                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
+                // `cfg.sources` (#210) replaces whatever the script's own
+                // `sources()` declares, and with the exclusions is the cache
+                // key — so two pools naming this script resolve together only
+                // when they asked for the same candidates.
+                score_cache
+                    .prepare(
+                        catalog,
+                        &path,
+                        cfg.sources.as_ref(),
+                        &score_cache.excluded(&cfg.name),
+                    )
                     .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
                 pool_ids.push(None);
             }

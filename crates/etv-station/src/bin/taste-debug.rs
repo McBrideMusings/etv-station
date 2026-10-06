@@ -218,9 +218,6 @@ fn main() -> Result<(), String> {
     let catalog = Catalog::open_readonly(&cli.catalog).map_err(|e| e.to_string())?;
 
     let mut cache = ScoreCache::default();
-    cache
-        .prepare(&catalog, &script_path, pool_cfg.sources.as_ref())
-        .map_err(|e| format!("prepare: {e}"))?;
     // `prepare_profile` opens `pool.datastores.first()` itself, reading its
     // raw `path` — fine for the real daemon, which only ever sees a pool
     // whose `${VAR}` datastore references `config::load`'s full pipeline
@@ -241,6 +238,16 @@ fn main() -> Result<(), String> {
     cache
         .prepare_profile(&catalog, &pool_for_profile, &channel_dir)
         .map_err(|e| format!("profile: {e}"))?;
+    // After the profile: its `exclude: true` entries name the ids `prepare`
+    // drops from the sets.
+    cache
+        .prepare(
+            &catalog,
+            &script_path,
+            pool_cfg.sources.as_ref(),
+            &cache.excluded(&cli.pool),
+        )
+        .map_err(|e| format!("prepare: {e}"))?;
     if let Some(profile) = cache.profile(&cli.pool) {
         print_profile(profile);
     }
@@ -403,6 +410,14 @@ fn print_profile(profile: &etv_station::profile::ResolvedProfile) {
             .map(|k| k.to_string())
             .collect();
         println!("  exclude_keywords: {}", ex.join(", "));
+    }
+    for x in &profile.exclusions {
+        println!(
+            "  exclude  {:<48} -> matches {} catalog item(s), none of them a candidate   [{}]",
+            x.reference,
+            x.entry_ids.len(),
+            x.origin,
+        );
     }
     println!();
 }

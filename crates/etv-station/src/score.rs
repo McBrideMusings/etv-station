@@ -225,8 +225,18 @@ const EXPOSED_TAGS: &[(&str, TagNs)] = &[
 /// one resolved set.
 pub type PoolSources = std::collections::BTreeMap<String, String>;
 
+/// Entry ids a pool's profile excludes (etv-station-sctf.7) — see
+/// [`crate::profile::ResolvedProfile::excluded`]. Empty for a pool that
+/// excludes nothing.
+pub type Excluded = std::collections::BTreeSet<String>;
+
+/// What one [`ScoreCache`] entry was resolved against: the script, the pool's
+/// own `sources` table if it wrote one, and the ids its profile excludes.
+type CacheKey = (PathBuf, Option<PoolSources>, Excluded);
+
 /// One generation's compiled scripts and resolved query sets, keyed by script
-/// path and the sources it was resolved against.
+/// path, the sources it was resolved against, and the ids the pool's profile
+/// excludes from them.
 ///
 /// A channel commonly points several pools at the same script — a `movies` pool
 /// and a `shows` pool ranked by the same taste — and a script's `sources()`
@@ -245,11 +255,16 @@ pub type PoolSources = std::collections::BTreeMap<String, String>;
 /// extra catalog pass are paid only by a pool that asked for something
 /// different, which is exactly the pool that needs them.
 ///
+/// The excluded ids are the third part of the key for the same reason: a
+/// profile's `exclude: true` entries (etv-station-sctf.7) remove titles from
+/// the resolved sets themselves, so a pool excluding horror cannot share sets
+/// with a sibling that does not. Pools excluding nothing still share.
+///
 /// Scoped to a single generation and dropped with it, so a catalog that changes
 /// between generations is picked up on the next one.
 #[derive(Debug, Default)]
 pub struct ScoreCache {
-    entries: HashMap<(PathBuf, Option<PoolSources>), CachedScript>,
+    entries: HashMap<CacheKey, CachedScript>,
     /// The metadata/take-override half of what a plugin pool's `pick()` just
     /// returned (#166), keyed by `(pool name, entry_id)`. `resolve_pool_sources`
     /// still returns bare ids, so widening it would ripple into every caller.
@@ -1218,12 +1233,19 @@ pub(crate) fn engine() -> Engine {
 
 impl ScoreCache {
     /// Compile `script_path` and resolve every query it will read, if this
-    /// cache has not already done so for this `sources` table.
+    /// cache has not already done so for this `sources` table and `excluded`
+    /// set.
     ///
     /// `sources` is the pool's own table when it authored one (#210) and `None`
     /// when it did not, in which case the script's `sources()` is called for
     /// them. [`pick`] must be handed the same value, since the two together are
     /// the cache key.
+    ///
+    /// `excluded` is [`Self::excluded`] for the pool, so a pool with a profile
+    /// runs [`Self::prepare_profile`] first. Every id in it is dropped from
+    /// each resolved set before the set is built, so the script never sees an
+    /// excluded title in `ctx.sets` (etv-station-sctf.7). [`pick`] reads the
+    /// same set back from the pool's stored profile.
     ///
     /// **This is the only half of scoring that touches the catalog.** Callers
     /// run every pool's `prepare` up front, while the catalog handle is in
@@ -1238,12 +1260,17 @@ impl ScoreCache {
         catalog: &Catalog,
         script_path: &Path,
         sources: Option<&PoolSources>,
+        excluded: &Excluded,
     ) -> Result<(), String> {
-        let key = (script_path.to_path_buf(), sources.cloned());
+        let key = (
+            script_path.to_path_buf(),
+            sources.cloned(),
+            excluded.clone(),
+        );
         if self.entries.contains_key(&key) {
             return Ok(());
         }
-        let cached = compile_and_resolve(catalog, &engine(), script_path, sources)?;
+        let cached = compile_and_resolve(catalog, &engine(), script_path, sources, excluded)?;
         self.entries.insert(key, cached);
         Ok(())
     }
@@ -1300,6 +1327,15 @@ impl ScoreCache {
             &pool.exclude_keywords,
             keyword_store.as_ref(),
         )?;
+        for x in &resolved.exclusions {
+            tracing::info!(
+                pool = %pool.name,
+                reference = %x.reference,
+                origin = %x.origin,
+                matched = x.entry_ids.len(),
+                "profile exclusion resolved"
+            );
+        }
         self.profiles.insert(pool.name.clone(), resolved);
         Ok(())
     }
@@ -1307,6 +1343,16 @@ impl ScoreCache {
     /// The resolved profile [`Self::prepare_profile`] stored for `pool_name`.
     pub fn profile(&self, pool_name: &str) -> Option<&crate::profile::ResolvedProfile> {
         self.profiles.get(pool_name)
+    }
+
+    /// The entry ids `pool_name`'s profile excludes from its candidates —
+    /// empty when it excludes nothing or has no stored profile. What
+    /// [`Self::prepare`] takes and [`pick`] keys on.
+    pub fn excluded(&self, pool_name: &str) -> Excluded {
+        self.profiles
+            .get(pool_name)
+            .map(|p| p.excluded.clone())
+            .unwrap_or_default()
     }
 
     /// Stash the metadata/take-override half of what a plugin pool's `pick()`
@@ -1402,10 +1448,16 @@ pub fn pick(
 ) -> Result<Vec<PickedItem>, String> {
     let engine = engine();
 
-    // `sources` is half the cache key (#210), so the same value the pool handed
-    // `prepare` has to come back here — a mismatch would find no entry and
-    // report the bug below rather than quietly ranking another pool's set.
-    let key = (script_path.to_path_buf(), sources.cloned());
+    // `sources` is part of the cache key (#210), so the same value the pool
+    // handed `prepare` has to come back here — a mismatch would find no entry
+    // and report the bug below rather than quietly ranking another pool's set.
+    // The excluded ids, the key's third part, come from the pool's own stored
+    // profile, the same place its `prepare` call read them.
+    let key = (
+        script_path.to_path_buf(),
+        sources.cloned(),
+        cache.excluded(pool_name),
+    );
     let cached = cache.entries.get(&key).ok_or_else(|| {
         format!(
             "scorer plugin {}: pick() called before prepare() — this is a bug in \
@@ -1925,6 +1977,7 @@ fn compile_and_resolve(
     engine: &Engine,
     script_path: &Path,
     pool_sources: Option<&PoolSources>,
+    excluded: &Excluded,
 ) -> Result<CachedScript, String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
@@ -1937,9 +1990,21 @@ fn compile_and_resolve(
 
     let mut sets = Map::new();
     for (name, cel) in declared {
-        let ids = catalog
+        let mut ids = catalog
             .resolve_query(&cel)
             .map_err(|e| format!("{whose} {name:?} ({cel}): {e}"))?;
+        if !excluded.is_empty() {
+            let before = ids.len();
+            ids.retain(|id| !excluded.contains(id));
+            tracing::debug!(
+                plugin = %script_path.display(),
+                set = %name,
+                candidates = before,
+                excluded = before - ids.len(),
+                remaining = ids.len(),
+                "profile exclusions removed candidates"
+            );
+        }
         let items = load_items(catalog, &ids).map_err(|e| format!("{whose} {name:?}: {e}"))?;
         sets.insert(name.into(), Dynamic::from_array(items));
     }
@@ -2140,7 +2205,7 @@ mod tests {
         pool_config: Option<&serde_json::Value>,
         cache: &mut ScoreCache,
     ) -> Result<Vec<String>, String> {
-        cache.prepare(catalog, script_path, None)?;
+        cache.prepare(catalog, script_path, None, &cache.excluded(pool_name))?;
         pick(
             cache,
             script_path,
@@ -2330,6 +2395,34 @@ fn audit(ctx, picks, workspace) { #{} }
         )
     }
 
+    /// An `exclude: true` entry weights nothing, so it is not in
+    /// `ctx.profile`; the script sees an empty profile.
+    #[test]
+    fn an_exclusion_is_not_handed_to_the_script_as_a_profile_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { genre: Horror, exclude: true }\n",
+        );
+        let got = run_profile(&profile_catalog(), &dir, &pool).unwrap();
+        assert_eq!(got, vec!["no-profile:0:0"]);
+    }
+
+    /// An exclusion that matches no catalog title fails the generation naming
+    /// the entry, rather than excluding nothing and saying so nowhere.
+    #[test]
+    fn an_exclusion_matching_nothing_fails_naming_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { genre: Western, exclude: true }\n",
+        );
+        let err = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
+        assert!(err.contains("profile entry 1 in inline"), "err = {err}");
+        assert!(
+            err.contains("`genre: Western` matches no catalog items"),
+            "err = {err}"
+        );
+    }
+
     #[test]
     fn profile_arrives_files_first_then_inline_with_origins() {
         let dir = tempfile::tempdir().unwrap();
@@ -2493,7 +2586,9 @@ profile:
         );
         let p = write(&dir, PROFILE_ECHO);
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog, &p, None).unwrap();
+        cache
+            .prepare(&catalog, &p, None, &Default::default())
+            .unwrap();
         cache.prepare_profile(&catalog, &pool, dir.path()).unwrap();
         let err = pick(
             &cache,
@@ -3178,7 +3273,9 @@ fn pick(ctx) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3209,7 +3306,9 @@ fn pick(ctx) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3246,7 +3345,9 @@ fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let inputs = ScoreInputs {
             target_count: 3,
             recent: vec!["m2".into()],
@@ -3287,7 +3388,9 @@ fn audit(ctx, picks, workspace) { #{} }
              fn audit(ctx, picks, workspace) { #{} }\n",
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let got = pick(
             &cache,
             &p,
@@ -3354,7 +3457,9 @@ fn audit(ctx, picks, workspace) { #{} }
              fn audit(ctx, picks, workspace) { #{} }\n",
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let inputs = ScoreInputs {
             account_id,
             ..Default::default()
@@ -3405,7 +3510,9 @@ fn audit(ctx, picks, workspace) { #{} }
              }\n",
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let got = pick(
             &cache,
             &p,
@@ -3450,7 +3557,9 @@ fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let got = pick(
             &cache,
             &p,
@@ -3482,7 +3591,9 @@ fn audit(ctx, picks, workspace) { #{} }
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let got = pick(
             &cache,
             &p,
@@ -3515,7 +3626,9 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3545,7 +3658,9 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
                 ),
             );
             let mut cache = ScoreCache::default();
-            cache.prepare(&catalog(), &p, None).unwrap();
+            cache
+                .prepare(&catalog(), &p, None, &Default::default())
+                .unwrap();
             let err = pick(
                 &cache,
                 &p,
@@ -3576,7 +3691,9 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
             ),
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3601,7 +3718,9 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
             "fn sources() { #{} }\nfn pick(ctx) { #{ picks: [#{ metadata: #{ x: 1 } }], workspace: () } }\n",
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3630,7 +3749,9 @@ fn pick(ctx) { #{ picks: ["m1", #{ entry_id: "m1" }], workspace: () } }
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3655,7 +3776,9 @@ fn pick(ctx) { #{ picks: ["m1", #{ entry_id: "m1" }], workspace: () } }
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn sources() { #{} }\nfn pick(ctx) { [\"m1\"] }\n");
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3684,7 +3807,9 @@ fn pick(ctx) { #{ picks: ["m1", #{ entry_id: "m1" }], workspace: () } }
             "fn sources() { #{} }\nfn pick(ctx) { #{ picks: [\"m1\"], workspace: () } }\n",
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3721,7 +3846,9 @@ fn audit(ctx, picks, workspace) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let got = pick(
             &cache,
             &p,
@@ -3757,7 +3884,9 @@ fn audit(ctx, picks, workspace) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let got = pick(
             &cache,
             &p,
@@ -3794,7 +3923,9 @@ fn audit(ctx, picks, workspace) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let got = pick(
             &cache,
             &p,
@@ -3830,7 +3961,9 @@ fn audit(ctx, picks, workspace) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3862,7 +3995,9 @@ fn audit(ctx, picks, workspace) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3896,7 +4031,9 @@ fn audit(ctx, picks, workspace) {{
             ),
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3931,7 +4068,9 @@ fn audit(ctx, picks, workspace) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -3963,7 +4102,9 @@ fn audit(ctx, picks, workspace) {
 "#,
         );
         let mut cache = ScoreCache::default();
-        cache.prepare(&catalog(), &p, None).unwrap();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
         let err = pick(
             &cache,
             &p,
@@ -4019,13 +4160,22 @@ fn audit(ctx, picks, workspace) { #{} }
     }
 
     fn echo(cache: &ScoreCache, path: &Path, src: Option<&PoolSources>) -> Vec<String> {
+        echo_for(cache, path, src, "movies")
+    }
+
+    fn echo_for(
+        cache: &ScoreCache,
+        path: &Path,
+        src: Option<&PoolSources>,
+        pool_name: &str,
+    ) -> Vec<String> {
         pick(
             cache,
             path,
             src,
             &ScoreInputs::default(),
             0,
-            "movies",
+            pool_name,
             None,
             GrantedCapabilities {
                 catalog_read: true,
@@ -4053,7 +4203,9 @@ fn audit(ctx, picks, workspace) { #{} }
         )]);
 
         let mut cache = ScoreCache::default();
-        cache.prepare(&cat, &p, Some(&narrowed)).unwrap();
+        cache
+            .prepare(&cat, &p, Some(&narrowed), &Default::default())
+            .unwrap();
         assert_eq!(
             echo(&cache, &p, Some(&narrowed)),
             vec!["m1", "m2"],
@@ -4082,7 +4234,9 @@ fn audit(ctx, picks, workspace) { #{} }
         let table = sources(&[("features", r#"item.library == "Movies""#)]);
 
         let mut cache = ScoreCache::default();
-        cache.prepare(&cat, &p, Some(&table)).unwrap();
+        cache
+            .prepare(&cat, &p, Some(&table), &Default::default())
+            .unwrap();
         assert_eq!(echo(&cache, &p, Some(&table)), vec!["m1", "m2"]);
     }
 
@@ -4100,15 +4254,77 @@ fn audit(ctx, picks, workspace) { #{} }
         let concerts = sources(&[("movies", r#"item.library == "Concerts""#)]);
 
         let mut cache = ScoreCache::default();
-        cache.prepare(&cat, &p, Some(&features)).unwrap();
-        cache.prepare(&cat, &p, Some(&concerts)).unwrap();
+        cache
+            .prepare(&cat, &p, Some(&features), &Default::default())
+            .unwrap();
+        cache
+            .prepare(&cat, &p, Some(&concerts), &Default::default())
+            .unwrap();
         // And a third pool that authored nothing still gets the script's own.
-        cache.prepare(&cat, &p, None).unwrap();
+        cache.prepare(&cat, &p, None, &Default::default()).unwrap();
 
         assert_eq!(echo(&cache, &p, Some(&features)), vec!["m1", "m2"]);
         assert_eq!(echo(&cache, &p, Some(&concerts)), vec!["c1"]);
         // Catalog order, not the narrowed pools' — all four libraries.
         assert_eq!(echo(&cache, &p, None), vec!["c1", "m1", "m2", "p1"]);
+    }
+
+    /// A profile's `exclude: true` entries (etv-station-sctf.7) remove titles
+    /// from the pool's sets before the script runs — a tag match and an item
+    /// match both — while a sibling pool on the same script that excludes
+    /// nothing still sees every title.
+    #[test]
+    fn profile_exclusions_remove_titles_from_the_pools_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let cat = profile_catalog();
+        let movies = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { genre: horror, exclude: true }\n  - { item: \"Heat (1995)\", exclude: true }\n",
+        );
+        let others = profile_pool("name: others\nplugin: plugin.rhai\n");
+
+        let mut cache = ScoreCache::default();
+        for pool in [&movies, &others] {
+            cache.prepare_profile(&cat, pool, dir.path()).unwrap();
+            cache
+                .prepare(&cat, &p, None, &cache.excluded(&pool.name))
+                .unwrap();
+        }
+
+        assert_eq!(
+            echo_for(&cache, &p, None, "movies"),
+            vec!["fs:heat-a", "fs:heat-b"],
+            "the horror film and Heat (1995) are not candidates"
+        );
+        assert_eq!(
+            echo_for(&cache, &p, None, "others"),
+            vec!["fs:heat-a", "fs:heat-b", "imdb:tt0113277", "m2"]
+        );
+    }
+
+    /// `studio` and `content_rating` live in their own catalog columns rather
+    /// than the tags table, so each is its own lookup.
+    #[test]
+    fn studio_and_content_rating_exclusions_match_their_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let cat = profile_catalog();
+        let mut heat = cat.entry("imdb:tt0113277").unwrap().unwrap();
+        heat.studio = Some("Warner Bros.".into());
+        cat.upsert_entry(&heat).unwrap();
+        let mut beta = cat.entry("m2").unwrap().unwrap();
+        beta.content_rating = Some("R".into());
+        cat.upsert_entry(&beta).unwrap();
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { studio: warner bros., exclude: true }\n  - { content_rating: r, exclude: true }\n",
+        );
+
+        let mut cache = ScoreCache::default();
+        cache.prepare_profile(&cat, &pool, dir.path()).unwrap();
+        cache
+            .prepare(&cat, &p, None, &cache.excluded("movies"))
+            .unwrap();
+        assert_eq!(echo(&cache, &p, None), vec!["fs:heat-a", "fs:heat-b"]);
     }
 
     /// Two pools that wrote the same table share one resolved set, whatever
@@ -4128,8 +4344,12 @@ fn audit(ctx, picks, workspace) { #{} }
         ]);
 
         let mut cache = ScoreCache::default();
-        cache.prepare(&cat, &p, Some(&one)).unwrap();
-        cache.prepare(&cat, &p, Some(&other)).unwrap();
+        cache
+            .prepare(&cat, &p, Some(&one), &Default::default())
+            .unwrap();
+        cache
+            .prepare(&cat, &p, Some(&other), &Default::default())
+            .unwrap();
         assert_eq!(cache.entries.len(), 1);
     }
 
@@ -4144,6 +4364,7 @@ fn audit(ctx, picks, workspace) { #{} }
                 &library_catalog(),
                 &p,
                 Some(&sources(&[("movies", "item.library ==== 3")])),
+                &Default::default(),
             )
             .expect_err("a malformed CEL expression must fail preparation");
         assert!(err.contains("channel-authored source"), "got {err}");

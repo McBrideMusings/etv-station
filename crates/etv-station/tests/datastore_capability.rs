@@ -120,7 +120,9 @@ fn a_plugin_with_the_grant_reaches_every_accessor_and_gets_real_rows() {
 
     let cat = Catalog::open_in_memory().unwrap();
     let mut cache = ScoreCache::default();
-    cache.prepare(&cat, &script, None).unwrap();
+    cache
+        .prepare(&cat, &script, None, &Default::default())
+        .unwrap();
 
     // Mirrors what `pattern::resolve_pool_sources` does at generation time:
     // widen the boolean grants with the opened datastore handles.
@@ -167,7 +169,9 @@ fn pick(ctx) { ctx.datastore("taste_db"); ["must not reach here"] }
 
     let cat = Catalog::open_in_memory().unwrap();
     let mut cache = ScoreCache::default();
-    cache.prepare(&cat, &script, None).unwrap();
+    cache
+        .prepare(&cat, &script, None, &Default::default())
+        .unwrap();
 
     let err = pick(
         &cache,
@@ -301,7 +305,9 @@ fn pick(ctx) { ctx.datastore("other_db"); ["must not reach here"] }
 
     let cat = Catalog::open_in_memory().unwrap();
     let mut cache = ScoreCache::default();
-    cache.prepare(&cat, &script, None).unwrap();
+    cache
+        .prepare(&cat, &script, None, &Default::default())
+        .unwrap();
 
     let granted = GrantedCapabilities::from_names(&[])
         .with_datastores(&[DatastoreGrant {

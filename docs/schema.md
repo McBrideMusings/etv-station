@@ -876,9 +876,10 @@ the file the expression is actually written in.
 #### Pool `profile`, `profile_files` and `exclude_keywords` — a taste profile
 
 A plugin pool can carry a **taste profile**: signed weights on keywords, catalog
-tag values, single items and CEL-defined sets. The station resolves every
-reference and hands the result to the script as `ctx.profile`. The script does
-all the weight math (ADR 0002).
+tag values, single items and CEL-defined sets, plus exclusions that remove a tag
+value's or an item's titles from the pool. The station resolves every reference
+and hands the weighted ones to the script as `ctx.profile`. The script does all
+the weight math (ADR 0002).
 
 ```yaml
 - name: movies
@@ -891,10 +892,12 @@ all the weight math (ADR 0002).
     - { item: "imdb:tt0113277",    weight: -1.0 }
     - { item: "Grown Ups (2010)",  weight: -1.0 }
     - { set: 'item.collections.contains("Guilty Pleasures")', weight: 3.0 }
+    - { genre: Animation,          exclude: true }
+    - { item: "Cats (2019)",       exclude: true }
   exclude_keywords: [duringcreditsstinger]
 ```
 
-**An entry** names exactly one reference and a `weight`:
+**An entry** names exactly one reference and either a `weight` or `exclude: true`:
 
 | Key | Resolves to |
 |---|---|
@@ -905,12 +908,27 @@ all the weight math (ADR 0002).
 
 `weight` must be finite and non-zero; its sign says favor or disfavor.
 
+**`exclude: true`** in place of a `weight` removes every title the reference
+matches from the pool's candidates. It takes a catalog tag (matched against the
+catalog's own value, ignoring case for ASCII letters only — `horror` matches
+`Horror`, `élodie` does not match `Élodie`) or an `item`, never a
+`keyword` or a `set`. The station drops the matched entry ids from each of the
+pool's resolved `sources` sets before the script runs, so an excluded title is
+absent from `ctx.sets` and can never be picked — where a negative `weight` only
+scores it down and leaves it a candidate. An exclusion is not in `ctx.profile`.
+Two pools naming one script share resolved sets only when they exclude the same
+ids. Each resolved exclusion logs `profile exclusion resolved` (pool, reference,
+origin, `matched`) at info, and each set it narrows logs `profile exclusions
+removed candidates` (`candidates`, `excluded`, `remaining`) at debug; `taste-debug` prints each
+exclusion and its match count under the profile.
+
 **`profile_files`** are YAML lists of entries, relative to the channel file.
 Their entries arrive first, in list order, then the inline `profile`. A file
 holds a person's standing likes and dislikes, and several pools can name it.
 
 **`exclude_keywords`** go through the `keyword` rule and reach the script as
-`ctx.exclude_keywords`.
+`ctx.exclude_keywords`. A keyword excluded this way stops counting toward the
+score; the titles carrying it stay candidates.
 
 **`ctx.profile`** is one map per entry: `kind` (`keyword`, `tag`, `item`,
 `set`), `namespace` and `value` for a keyword or tag, `items` (full item maps,
@@ -922,10 +940,12 @@ entries carry catalog item maps; `ctx.exclude_keywords` is not gated.
 
 Rejected at load, naming the pool, origin and position: any of the three on a
 pool with no `plugin`; an entry naming zero or two references, an empty value,
-an unknown key, a zero or non-finite weight, or an `item` in neither shape; an
-unreadable profile file; an empty `exclude_keywords` value. Failing the
+an unknown key, a zero or non-finite weight, or an `item` in neither shape;
+`exclude: true` beside a `weight`, on a `keyword` or `set`, or `exclude: false`;
+an unreadable profile file; an empty `exclude_keywords` value. Failing the
 generation, naming the entry and the spelling: an `item` matching no entry or
-several (listed); a `set` that fails to resolve or matches nothing; a
+several (listed); a `set` that fails to resolve or matches nothing; an
+excluded tag value no catalog entry carries; a
 `keyword` or `exclude_keywords` spelling `keyword_forms` has never seen, or a
 `keyword`/`exclude_keywords` entry on a pool that grants no datastore.
 

@@ -876,6 +876,40 @@ impl Catalog {
         )
     }
 
+    /// Every entry carrying `value` in tag namespace `namespace`, matched
+    /// ASCII-case-insensitively (SQLite's `NOCASE`), in id order — what a profile's `exclude: true`
+    /// tag entry removes from a pool.
+    pub fn entry_ids_with_tag(
+        &self,
+        namespace: TagNs,
+        value: &str,
+    ) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT DISTINCT entry_id FROM tags
+              WHERE namespace = ?1 AND value = ?2 COLLATE NOCASE ORDER BY entry_id",
+            params![namespace.as_str(), value],
+        )
+    }
+
+    /// Every entry whose `studio` is `value`, ASCII-case-insensitively, in id
+    /// order.
+    pub fn entry_ids_with_studio(&self, value: &str) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT entry_id FROM entries WHERE studio = ?1 COLLATE NOCASE ORDER BY entry_id",
+            params![value],
+        )
+    }
+
+    /// Every entry whose `content_rating` is `value`, ASCII-case-insensitively,
+    /// in id order.
+    pub fn entry_ids_with_content_rating(&self, value: &str) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT entry_id FROM entries WHERE content_rating = ?1 COLLATE NOCASE
+              ORDER BY entry_id",
+            params![value],
+        )
+    }
+
     /// Titles matching `query` case-insensitively (a substring search), for
     /// picking an `item:` profile reference by name rather than by an exact
     /// `"Title (Year)"`. Episodes are excluded, same as

@@ -764,12 +764,18 @@ fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
 
     state
         .cache
-        .prepare(&state.catalog, &plugin_path, pw.pool.sources.as_ref())
-        .map_err(|e| format!("prepare: {e}"))?;
-    state
-        .cache
         .prepare_profile(&state.catalog, &pw.pool, &channel_dir)
         .map_err(|e| format!("profile: {e}"))?;
+    let excluded = state.cache.excluded(pool_name);
+    state
+        .cache
+        .prepare(
+            &state.catalog,
+            &plugin_path,
+            pw.pool.sources.as_ref(),
+            &excluded,
+        )
+        .map_err(|e| format!("prepare: {e}"))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1074,7 +1080,7 @@ fn enrich_audit(catalog: &Catalog, metadata: Option<&Value>) -> Option<Value> {
 
 fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
     let Some(resolved) = cache.profile(pool_name) else {
-        return json!({ "entries": [], "exclude_keywords": [] });
+        return json!({ "entries": [], "exclude_keywords": [], "exclusions": [] });
     };
     let entries: Vec<Value> = resolved
         .entries
@@ -1093,7 +1099,22 @@ fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
         .iter()
         .map(|d| rhai::serde::from_dynamic::<Value>(d).unwrap_or(Value::Null))
         .collect();
-    json!({ "entries": entries, "exclude_keywords": exclude_keywords })
+    let exclusions: Vec<Value> = resolved
+        .exclusions
+        .iter()
+        .map(|x| {
+            json!({
+                "reference": x.reference,
+                "origin": x.origin,
+                "entry_ids": x.entry_ids,
+            })
+        })
+        .collect();
+    json!({
+        "entries": entries,
+        "exclude_keywords": exclude_keywords,
+        "exclusions": exclusions,
+    })
 }
 
 fn open_plexdb_readonly(path: &Path) -> Result<Connection, String> {
