@@ -713,12 +713,42 @@ fn fs_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Ask the kernel to SIGTERM this process when the station daemon that spawned
+/// it dies. The daemon's own cleanup (`kill_on_drop`, the shutdown branch in
+/// `overlay_supervisor`) never runs when the daemon is SIGKILLed, and the
+/// orphan keeps its write end of the channel's fifo open. The respawned
+/// daemon then starts a second overlay on the same fifo, and two writers
+/// interleave their 3.7 MB frames mid-frame, which shifts every later frame
+/// ffmpeg reads. SIGTERM, not SIGKILL, so the handler installed by
+/// `install_shutdown_handlers` still runs.
+///
+/// Linux only: `PR_SET_PDEATHSIG` has no macOS equivalent, and the container
+/// is the only place the daemon is SIGKILLed and restarted in place.
+#[cfg(target_os = "linux")]
+fn die_with_parent() -> anyhow::Result<()> {
+    use nix::sys::signal::Signal;
+    let parent = nix::unistd::getppid();
+    nix::sys::prctl::set_pdeathsig(Signal::SIGTERM)?;
+    // The parent may have died between fork and the prctl above; the kernel
+    // only signals on a death that happens after the call, so re-check.
+    if nix::unistd::getppid() != parent {
+        anyhow::bail!("parent process exited before the overlay finished starting");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent() -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn pipe_to_fifo(
     fifo_path: PathBuf,
     create_fifo: bool,
     ready_file: Option<PathBuf>,
     playout_folder: PathBuf,
 ) -> anyhow::Result<()> {
+    die_with_parent()?;
     // The station's `prepare_generation` writes `overlay.json` for every
     // channel before it spawns any overlay process, so this loop only ever
     // turns on the spawn racing that write on the very first tick after it —
