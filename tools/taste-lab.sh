@@ -42,4 +42,8 @@ fi
 
 export PLEXDB_SNAPSHOT_PATH="$DEFAULT_PLEXDB"
 
-exec cargo run --quiet --release --bin taste-lab -- --catalog "$DEFAULT_CATALOG" "$@"
+# No `--quiet`: on a cold target/ the release build compiles ~480 crates
+# (the vello/wgpu stack included) for minutes, and cargo's per-crate
+# "Compiling ..." lines are the only sign in the task log that it isn't hung.
+echo "taste-lab: building release binary (minutes on a cold target/, seconds after)..." >&2
+exec cargo run --release --bin taste-lab -- --catalog "$DEFAULT_CATALOG" "$@"
