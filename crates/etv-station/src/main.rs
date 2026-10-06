@@ -317,6 +317,8 @@ fn main() -> ExitCode {
             );
         }
 
+        tokio::spawn(etv_station::memstat::run(std::time::Duration::from_secs(60)));
+
         match daemon::run(station).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {

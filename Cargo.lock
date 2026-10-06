@@ -921,6 +921,7 @@ dependencies = [
  "glob",
  "humantime",
  "humantime-serde",
+ "libc",
  "nix",
  "plexdb-reader",
  "regex",
