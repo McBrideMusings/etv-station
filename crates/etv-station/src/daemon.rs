@@ -1207,9 +1207,19 @@ enum RefreshKind {
     Forced,
 }
 
-/// One refresh tick: re-ingest the catalog, then sweep the already-written
-/// playout JSON so it agrees with what the catalog now says (docs/CONTEXT.md,
-/// "Catalog refresh" and "Reconciliation sweep").
+/// One refresh tick: [`refresh_and_sweep`], then hand the memory it freed
+/// back to the kernel.
+async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>, kind: RefreshKind) {
+    refresh_and_sweep(station, plex, kind).await;
+    // The refresh's temporary pile is freed by now but glibc keeps the pages;
+    // without this RSS ratchets up a step per refresh until the host's OOM
+    // watcher kills the daemon.
+    crate::memstat::trim_and_log("catalog_refresh");
+}
+
+/// Re-ingest the catalog, then sweep the already-written playout JSON so it
+/// agrees with what the catalog now says (docs/CONTEXT.md, "Catalog refresh"
+/// and "Reconciliation sweep").
 ///
 /// Everything here is logged and swallowed. A refresh is maintenance running
 /// underneath a station that is on the air; a Plex outage or an unreadable
@@ -1218,7 +1228,7 @@ enum RefreshKind {
 ///
 /// The sweep runs after the ingest, in the same tick, because the ingest is
 /// what makes it worth running: it is the pass that just learned the new path.
-async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>, kind: RefreshKind) {
+async fn refresh_and_sweep(station: &Station, plex: Option<&PlexEnv>, kind: RefreshKind) {
     tracing::info!(
         event = "catalog.refresh_start",
         forced = kind == RefreshKind::Forced,

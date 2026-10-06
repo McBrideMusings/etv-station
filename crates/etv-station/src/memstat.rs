@@ -82,6 +82,51 @@ pub fn sample() -> Option<MemSample> {
     None
 }
 
+/// Hand the pages glibc malloc holds freed back to the kernel
+/// (`malloc_trim(0)`, every arena), and log a `mem.trim` line with the
+/// process's memory before and after.
+///
+/// glibc returns freed memory to the kernel only from the top of each heap;
+/// a burst of allocations that is freed in the middle of a heap stays
+/// resident, so RSS ratchets up after every spike. The catalog refresh is
+/// such a spike (100-170 MB in the Plex fetch), so the daemon calls this once
+/// each refresh ends. Does nothing on a platform where [`sample`] has nothing
+/// to read.
+pub fn trim_and_log(reason: &'static str) {
+    let before = sample();
+    let started = std::time::Instant::now();
+    let released = release_free_pages();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (Some(before), Some(after)) = (before, sample()) else {
+        return;
+    };
+    tracing::info!(
+        event = "mem.trim",
+        reason,
+        released,
+        elapsed_ms,
+        rss_kb_before = before.rss_kb,
+        rss_kb_after = after.rss_kb,
+        free_held_bytes_before = before.free_held_bytes,
+        free_held_bytes_after = after.free_held_bytes,
+        in_use_bytes = after.in_use_bytes,
+        "returned freed heap memory to the kernel",
+    );
+}
+
+/// `malloc_trim(0)`: true when glibc returned any memory to the kernel.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_free_pages() -> bool {
+    // SAFETY: `malloc_trim` takes a padding size and only rearranges the
+    // allocator's own free lists; it frees nothing the program still owns.
+    unsafe { libc::malloc_trim(0) == 1 }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_free_pages() -> bool {
+    false
+}
+
 /// Log a `mem.sample` every `interval`, starting now, until the runtime drops
 /// the task. Returns at once on a platform where [`sample`] has nothing to read.
 pub async fn run(interval: Duration) {
@@ -133,5 +178,37 @@ mod tests {
     fn live_sample_reads_this_process() {
         let s = sample().expect("linux glibc sample");
         assert!(s.rss_kb > 0 && s.in_use_bytes > 0 && s.threads >= 1);
+    }
+
+    /// The catalog refresh allocates on a tokio worker, so its pile lands in a
+    /// non-main arena. Free a 128 MB pile made on another thread, keeping the
+    /// last block so the heap top stays pinned (glibc's own free-time trim then
+    /// releases nothing), and require the trim to give most of it back.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn trim_releases_a_pile_freed_inside_a_non_main_arena() {
+        const BLOCK: usize = 1024;
+        const BLOCKS: usize = 128 * 1024;
+        let held = std::thread::spawn(|| {
+            let mut pile: Vec<Vec<u8>> = (0..BLOCKS).map(|_| vec![1u8; BLOCK]).collect();
+            let last = pile.pop().unwrap();
+            drop(pile);
+            let before = sample().unwrap();
+            assert!(
+                before.free_held_bytes > (BLOCKS * BLOCK / 2) as u64,
+                "the freed pile should still be held: {before:?}",
+            );
+            assert!(release_free_pages(), "malloc_trim released nothing");
+            let after = sample().unwrap();
+            let fell_kb = before.rss_kb.saturating_sub(after.rss_kb);
+            assert!(
+                fell_kb > 64 * 1024,
+                "rss fell only {fell_kb} kB: before {before:?} after {after:?}",
+            );
+            last
+        })
+        .join()
+        .unwrap();
+        assert_eq!(held.len(), BLOCK);
     }
 }
