@@ -157,9 +157,12 @@ STATION_LOG_KEEP="${ETV_STATION_LOG_KEEP:-2}"
 # tested. Size is handled by rotate_log() on its own loop below, where it is a
 # plain stat-and-cp and cannot lose a line. The same reasoning is why
 # station-etv.log's cap (#299) is also done there rather than inside this awk.
+# `-W interactive` makes mawk (the image's awk) read a line at a time; without it
+# mawk holds input until its read buffer fills, so a quiet daemon's lines reach
+# neither the Docker log nor station-etv.log until a shutdown flushes them.
 run_logged() {
     if [ "$diag_ready" -eq 1 ]; then
-        "$@" > >(awk \
+        "$@" > >(awk -W interactive \
             -v prog="$diag_dir/ffmpeg-progress.log" \
             -v all="$diag_dir/station-etv.log" '
             /ffmpeg_progress/ { print >> prog; fflush(prog); next }
