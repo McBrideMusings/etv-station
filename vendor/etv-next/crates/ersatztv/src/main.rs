@@ -201,6 +201,7 @@ async fn run() -> Result<(), LineupError> {
                 .route("/channel/{filename}", get(stream))
                 .route("/channels.m3u", get(channel_playlist))
                 .route("/xmltv.xml", get(crate::xmltv::xmltv_epg))
+                .route("/health/channels.json", get(channel_health_report))
                 // Plex has no M3U tuner type — of its four device kinds only
                 // `hdhomerun` is both a live-TV protocol and publicly
                 // implementable — so a server that wants Plex to carry its
@@ -330,6 +331,66 @@ async fn stream(
         )],
         content,
     ))
+}
+
+#[derive(serde::Serialize)]
+struct ChannelHealthReport {
+    channels: Vec<ChannelHealthRow>,
+}
+
+#[derive(serde::Serialize)]
+struct ChannelHealthRow {
+    number: String,
+    name: String,
+    /// A worker is running for this channel right now.
+    active: bool,
+    consecutive_failures: u32,
+    /// Past `FAILURE_THRESHOLD`: `/channel/{number}.m3u8` answers 503 while
+    /// `retry_in_secs` is non-zero.
+    failed: bool,
+    /// Seconds until a respawn is allowed; `0` when it is allowed now.
+    retry_in_secs: u64,
+    last_failure: Option<LastFailureRow>,
+}
+
+#[derive(serde::Serialize)]
+struct LastFailureRow {
+    #[serde(with = "time::serde::rfc3339")]
+    at: time::OffsetDateTime,
+    cause: String,
+}
+
+/// Every channel's failure accounting, so a sweep can find a channel sitting
+/// behind the 503 guard without tuning in to it or reading logs.
+async fn channel_health_report(State(state): State<Arc<LineupState>>) -> impl IntoResponse {
+    let now = std::time::Instant::now();
+    let active: Vec<String> = state.active.lock().await.keys().cloned().collect();
+    let health = state.health.lock().await;
+    let channels = state
+        .channels
+        .iter()
+        .map(|channel| {
+            let h = health.get(channel.number());
+            ChannelHealthRow {
+                number: channel.number().to_owned(),
+                name: channel.name().to_owned(),
+                active: active.iter().any(|n| n == channel.number()),
+                consecutive_failures: h.consecutive_failures,
+                failed: h.is_failed(),
+                retry_in_secs: h
+                    .retry_after
+                    .map(|at| at.saturating_duration_since(now))
+                    // Round up: a guard with half a second left still refuses.
+                    .map(|left| left.as_secs() + u64::from(left.subsec_nanos() > 0))
+                    .unwrap_or(0),
+                last_failure: h.last_failure.map(|f| LastFailureRow {
+                    at: f.at,
+                    cause: f.cause,
+                }),
+            }
+        })
+        .collect();
+    axum::Json(ChannelHealthReport { channels })
 }
 
 struct LineupState {

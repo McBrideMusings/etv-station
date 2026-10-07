@@ -59,24 +59,46 @@ fn exit_code(err: &ChannelError) -> i32 {
     }
 }
 
+/// Leave the error's text where the server will read it as this exit's cause.
+/// Best effort: a worker that cannot write its own folder still exits with the
+/// right code, and the server falls back to naming the exit status alone.
+async fn write_exit_reason(output_folder: &Path, err: &ChannelError) {
+    let path = output_folder.join(ersatztv_core::EXIT_REASON_FILE_NAME);
+    if let Err(write_err) = tokio::fs::write(&path, err.to_string()).await {
+        log::warn!(
+            "failed to write exit reason to {}: {write_err}",
+            path.display()
+        );
+    }
+}
+
 #[tokio::main]
 pub async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    if let Err(err) = run().await {
+    let args = Args::parse();
+    let output_folder = match &args.command {
+        Commands::Run { output_folder, .. } => Some(output_folder.clone()),
+        Commands::Debug { .. } => None,
+    };
+
+    if let Err(err) = run(args).await {
         match &err {
             ChannelError::IdleTimeout(_) => log::info!("{err}"),
             _ => log::error!("{err}"),
         };
 
         let code = exit_code(&err);
+        if code != 0
+            && let Some(output_folder) = &output_folder
+        {
+            write_exit_reason(output_folder, &err).await;
+        }
         std::process::exit(code);
     }
 }
 
-async fn run() -> Result<(), ChannelError> {
-    let args = Args::parse();
-
+async fn run(args: Args) -> Result<(), ChannelError> {
     match args.command {
         Commands::Run {
             config_paths,

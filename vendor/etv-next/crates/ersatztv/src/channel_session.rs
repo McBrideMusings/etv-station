@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use ersatztv::error::LineupError;
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME, STALL_EXIT_CODE,
-    reap_run_folders, reap_unreferenced_run_folders,
+    EXIT_REASON_FILE_NAME, HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, READY_FILE_NAME,
+    STALL_EXIT_CODE, reap_run_folders, reap_unreferenced_run_folders,
 };
 use tokio::sync::{Mutex, watch};
 
-use crate::channel_health::HealthMap;
+use crate::channel_health::{ExitVerdict, FAILURE_THRESHOLD, HealthMap};
 use crate::channel_model::ChannelModel;
 
 /// Whether a viewer was still attached, judged the same way the channel worker
@@ -67,6 +67,65 @@ pub(crate) async fn reap_channel_run_folders(
     result
 }
 
+/// Why a worker exited, in one line: its exit status, plus the error text it
+/// left in [`EXIT_REASON_FILE_NAME`] if it left one. The file is removed here so
+/// the next run's exit can never be blamed on this one's cause.
+async fn exit_cause(
+    status: &std::io::Result<std::process::ExitStatus>,
+    exit_reason_file: &Path,
+) -> String {
+    let reason = tokio::fs::read_to_string(exit_reason_file).await.ok();
+    if reason.is_some() {
+        let _ = tokio::fs::remove_file(exit_reason_file).await;
+    }
+    let status = match status {
+        Ok(s) => s.to_string(),
+        Err(e) => format!("wait failed: {e}"),
+    };
+    match reason.as_deref().map(str::trim) {
+        Some(reason) if !reason.is_empty() => format!("{status}: {reason}"),
+        _ => status,
+    }
+}
+
+/// One line per change in a channel's health, so a channel heading for the
+/// 503 guard is visible on every step there rather than only once it arrives.
+fn log_verdict(number: &str, name: &str, verdict: ExitVerdict, cause: &str, uptime: Duration) {
+    let up = uptime.as_secs();
+    match verdict {
+        ExitVerdict::Failure {
+            consecutive,
+            crossed,
+            retry_in,
+        } => {
+            let backoff = match retry_in {
+                Some(wait) => format!("; next spawn allowed in {}s", wait.as_secs()),
+                None => String::new(),
+            };
+            log::warn!(
+                "channel {number} ({name}) failed with a viewer watching, {up}s after spawn: \
+                 {cause}; consecutive failures {consecutive}/{FAILURE_THRESHOLD}{backoff}"
+            );
+            if crossed {
+                log::error!(
+                    "channel {number} ({name}) is now FAILED after {consecutive} consecutive \
+                     failures; /channel/{number}.m3u8 answers 503 until a spawn is allowed in {}s",
+                    retry_in.unwrap_or_default().as_secs()
+                );
+            }
+        }
+        ExitVerdict::Recovered { cleared } => log::warn!(
+            "channel {number} ({name}) is no longer failed: a run of {up}s exited without \
+             failing under a viewer, clearing {cleared} consecutive failures"
+        ),
+        ExitVerdict::Cleared { cleared } => log::info!(
+            "channel {number} ({name}) exited healthily after {up}s; cleared {cleared} \
+             consecutive failures"
+        ),
+        ExitVerdict::Healthy => {}
+    }
+}
+
 pub struct ChannelSession {
     ready_receiver: watch::Receiver<bool>,
 }
@@ -77,6 +136,12 @@ impl ChannelSession {
         active: Arc<Mutex<HashMap<String, ChannelSession>>>,
         health: Arc<Mutex<HealthMap>>,
     ) -> Result<Self, LineupError> {
+        // A reason left by a run this server never reaped — it died between the
+        // worker's write and `exit_cause` — must not be blamed on this run's
+        // exit if this one dies to a signal and writes nothing.
+        let exit_reason_file = channel.output_folder().join(EXIT_REASON_FILE_NAME);
+        let _ = std::fs::remove_file(&exit_reason_file);
+
         let mut child = tokio::process::Command::new(channel_binary_path()?)
             .arg("run")
             .arg("--output-folder")
@@ -95,6 +160,7 @@ impl ChannelSession {
         let ready_file = channel.output_folder().join(READY_FILE_NAME);
         let heartbeat_file = channel.output_folder().join(HEARTBEAT_FILE_NAME);
         let channel_number = channel.number().to_owned();
+        let channel_name = channel.name().to_owned();
 
         tokio::spawn(async move {
             let ready_file_clone = ready_file.clone();
@@ -141,26 +207,17 @@ impl ChannelSession {
             // from an ordinary idle exit, and once the file is gone every exit
             // looks unwatched — so nothing would ever be counted.
             let viewer_attached = heartbeat_is_fresh(&heartbeat_file).await;
-            // Record and read back under one lock, so the count logged is the
-            // count stored — two locks could straddle another channel's update.
+            let cause = exit_cause(&status, &exit_reason_file).await;
             let uptime = started_at.elapsed();
-            let failures = {
-                let mut guard = health.lock().await;
-                guard.record_exit(
-                    &channel_number,
-                    viewer_attached,
-                    stalled,
-                    uptime,
-                    Instant::now(),
-                );
-                guard.get(&channel_number).consecutive_failures
-            };
-            if viewer_attached {
-                log::warn!(
-                    "channel {channel_number} exited while a viewer was watching; \
-                     consecutive failures now {failures}",
-                );
-            }
+            let verdict = health.lock().await.record_exit(
+                &channel_number,
+                viewer_attached,
+                stalled,
+                uptime,
+                Instant::now(),
+                cause.clone(),
+            );
+            log_verdict(&channel_number, &channel_name, verdict, &cause, uptime);
 
             // Reap this run's segment folder — the segments and .vtt
             // sidecars PlaylistManager's trim never reached, because it only
@@ -249,6 +306,31 @@ mod reap_tests {
             - ersatztv_core::SEGMENT_RETENTION
             - std::time::Duration::from_secs(60);
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(then)).unwrap();
+    }
+
+    // The worker's own error text is the cause; reading it must also consume
+    // it, or the next run's exit — a signal, say, which writes nothing — would
+    // be logged with this run's reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_cause_names_the_workers_reason_once() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join(super::EXIT_REASON_FILE_NAME);
+        std::fs::write(&file, "channel 32 terminated after ffmpeg stall\n").unwrap();
+        let stalled = Ok(std::process::ExitStatus::from_raw(75 << 8));
+
+        let cause = super::exit_cause(&stalled, &file).await;
+        assert!(
+            cause.ends_with(": channel 32 terminated after ffmpeg stall"),
+            "{cause}"
+        );
+        assert!(cause.contains("75"), "{cause}");
+        assert!(!file.exists(), "the reason must not outlive its run");
+
+        let again = super::exit_cause(&stalled, &file).await;
+        assert!(!again.contains("ffmpeg stall"), "{again}");
     }
 
     /// Exercises the exact call the exit-time cleanup in `spawn` makes:

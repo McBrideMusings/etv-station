@@ -27,6 +27,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use time::OffsetDateTime;
+
 /// Consecutive viewer-visible failures before a channel is declared failed and
 /// starts signalling. Two would fire on an unlucky pair (a stall that recurs
 /// once); three means the channel has failed every attempt across the whole
@@ -61,12 +63,43 @@ const BACKOFF: [Duration; 4] = [
     Duration::from_secs(300),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChannelHealth {
     /// Consecutive exits that happened while a viewer was still watching.
     pub consecutive_failures: u32,
     /// When a respawn may next be attempted. `None` means "any time".
     pub retry_after: Option<Instant>,
+    /// The most recent counted failure. Kept after the count clears, so the
+    /// health endpoint can still say what last went wrong on a channel that
+    /// has since recovered.
+    pub last_failure: Option<FailureRecord>,
+}
+
+/// One counted failure: when it happened and the worker's own account of why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureRecord {
+    pub at: OffsetDateTime,
+    pub cause: String,
+}
+
+/// What one recorded exit did to a channel's health — what the caller logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitVerdict {
+    /// Counted as a failure. `crossed` is true only on the exit that took the
+    /// channel past [`FAILURE_THRESHOLD`]; `retry_in` is how long until a
+    /// respawn is allowed again, `None` while the channel is not yet failed.
+    Failure {
+        consecutive: u32,
+        crossed: bool,
+        retry_in: Option<Duration>,
+    },
+    /// A failed channel exited healthily, clearing `cleared` failures.
+    Recovered { cleared: u32 },
+    /// A channel below the threshold exited healthily, clearing `cleared`
+    /// failures.
+    Cleared { cleared: u32 },
+    /// Healthy exit with nothing to clear.
+    Healthy,
 }
 
 impl ChannelHealth {
@@ -85,22 +118,41 @@ impl ChannelHealth {
     }
 
     /// A worker exited while a viewer was still attached.
-    fn record_failure(&mut self, now: Instant) {
+    fn record_failure(&mut self, now: Instant, cause: String) -> ExitVerdict {
+        let was_failed = self.is_failed();
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_failure = Some(FailureRecord {
+            at: OffsetDateTime::now_utc(),
+            cause,
+        });
+        let mut retry_in = None;
         if self.is_failed() {
             // Index from the first failure PAST the threshold, so the ramp
             // starts at its shortest delay rather than jumping mid-schedule.
             let step = (self.consecutive_failures - FAILURE_THRESHOLD) as usize;
             let wait = BACKOFF[step.min(BACKOFF.len() - 1)];
             self.retry_after = Some(now + wait);
+            retry_in = Some(wait);
+        }
+        ExitVerdict::Failure {
+            consecutive: self.consecutive_failures,
+            crossed: !was_failed && self.is_failed(),
+            retry_in,
         }
     }
 
     /// The channel served successfully, or exited with nobody watching. Either
     /// way it is not broken, so the count and the backoff both clear.
-    fn record_healthy(&mut self) {
+    fn record_healthy(&mut self) -> ExitVerdict {
+        let cleared = self.consecutive_failures;
+        let was_failed = self.is_failed();
         self.consecutive_failures = 0;
         self.retry_after = None;
+        match (was_failed, cleared) {
+            (true, _) => ExitVerdict::Recovered { cleared },
+            (false, 0) => ExitVerdict::Healthy,
+            (false, _) => ExitVerdict::Cleared { cleared },
+        }
     }
 }
 
@@ -114,7 +166,7 @@ impl HealthMap {
     pub fn get(&self, channel_number: &str) -> ChannelHealth {
         self.channels
             .get(channel_number)
-            .copied()
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -136,6 +188,8 @@ impl HealthMap {
     /// `uptime` still decides every other kind of failure, where the server has
     /// nothing better to go on: something that genuinely served for minutes
     /// before dying is not a channel that cannot start.
+    ///
+    /// `cause` is kept as the channel's `last_failure` when the exit counts.
     pub fn record_exit(
         &mut self,
         channel_number: &str,
@@ -143,12 +197,13 @@ impl HealthMap {
         stalled: bool,
         uptime: Duration,
         now: Instant,
-    ) {
+        cause: String,
+    ) -> ExitVerdict {
         let entry = self.channels.entry(channel_number.to_owned()).or_default();
         if viewer_attached && (stalled || uptime < HEALTHY_UPTIME) {
-            entry.record_failure(now);
+            entry.record_failure(now, cause)
         } else {
-            entry.record_healthy();
+            entry.record_healthy()
         }
     }
 }
@@ -159,6 +214,74 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    fn cause() -> String {
+        String::from("exit status: 75: channel 1 terminated after producing no segments")
+    }
+
+    // The verdict is what the session logs, so each transition must be named
+    // exactly once: a WARN per failure, the ERROR only on the crossing, and a
+    // recovery line only when a failed channel comes back.
+    #[test]
+    fn verdicts_name_each_failure_the_crossing_and_the_recovery() {
+        let mut map = HealthMap::default();
+        let now = t0();
+        let short = Duration::from_secs(3);
+        assert_eq!(
+            map.record_exit("1", true, true, short, now, cause()),
+            ExitVerdict::Failure {
+                consecutive: 1,
+                crossed: false,
+                retry_in: None
+            }
+        );
+        map.record_exit("1", true, true, short, now, cause());
+        assert_eq!(
+            map.record_exit("1", true, true, short, now, cause()),
+            ExitVerdict::Failure {
+                consecutive: 3,
+                crossed: true,
+                retry_in: Some(Duration::from_secs(30)),
+            }
+        );
+        assert_eq!(
+            map.record_exit("1", true, true, short, now, cause()),
+            ExitVerdict::Failure {
+                consecutive: 4,
+                crossed: false,
+                retry_in: Some(Duration::from_secs(60)),
+            }
+        );
+        assert_eq!(
+            map.record_exit("1", false, false, short, now, cause()),
+            ExitVerdict::Recovered { cleared: 4 }
+        );
+        assert_eq!(
+            map.record_exit("1", false, false, short, now, cause()),
+            ExitVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn a_failure_keeps_its_cause_after_the_count_clears() {
+        let mut map = HealthMap::default();
+        let now = t0();
+        map.record_exit("1", true, true, Duration::from_secs(3), now, cause());
+        assert_eq!(
+            map.record_exit(
+                "1",
+                false,
+                false,
+                Duration::from_secs(3),
+                now,
+                String::new()
+            ),
+            ExitVerdict::Cleared { cleared: 1 }
+        );
+        let h = map.get("1");
+        assert_eq!(h.consecutive_failures, 0);
+        assert_eq!(h.last_failure.map(|f| f.cause), Some(cause()));
     }
 
     #[test]
@@ -177,7 +300,7 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..10 {
-            map.record_exit("1", false, false, Duration::from_secs(10), now);
+            map.record_exit("1", false, false, Duration::from_secs(10), now, cause());
         }
         assert!(!map.get("1").is_failed());
         assert_eq!(map.get("1").consecutive_failures, 0);
@@ -187,11 +310,11 @@ mod tests {
     fn three_exits_under_a_viewer_mark_the_channel_failed() {
         let mut map = HealthMap::default();
         let now = t0();
-        map.record_exit("1", true, false, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         assert!(!map.get("1").is_failed(), "one failure is not a verdict");
-        map.record_exit("1", true, false, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         assert!(!map.get("1").is_failed(), "two failures is not a verdict");
-        map.record_exit("1", true, false, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         assert!(map.get("1").is_failed());
     }
 
@@ -202,7 +325,7 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, false, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         }
         let h = map.get("1");
         assert!(!h.may_spawn_at(now), "must not respawn immediately");
@@ -215,17 +338,17 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, false, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         }
         assert!(map.get("1").may_spawn_at(now + Duration::from_secs(30)));
-        map.record_exit("1", true, false, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         assert!(!map.get("1").may_spawn_at(now + Duration::from_secs(59)));
-        map.record_exit("1", true, false, Duration::from_secs(10), now);
+        map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         assert!(!map.get("1").may_spawn_at(now + Duration::from_secs(119)));
         // Far past the end of the schedule the wait must stay at the cap, not
         // run off the end of the array or grow without bound.
         for _ in 0..20 {
-            map.record_exit("1", true, false, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         }
         assert!(!map.get("1").may_spawn_at(now + Duration::from_secs(299)));
         assert!(map.get("1").may_spawn_at(now + Duration::from_secs(300)));
@@ -240,11 +363,11 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, false, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         }
         assert!(map.get("1").is_failed());
 
-        map.record_exit("1", true, false, HEALTHY_UPTIME, now);
+        map.record_exit("1", true, false, HEALTHY_UPTIME, now, cause());
         let h = map.get("1");
         assert!(!h.is_failed());
         assert!(h.may_spawn_at(now));
@@ -263,7 +386,7 @@ mod tests {
         // Each iteration models a full cycle: the worker came up, served, and
         // died well inside HEALTHY_UPTIME with a viewer still attached.
         for expected in 1..=FAILURE_THRESHOLD {
-            map.record_exit("1", true, false, Duration::from_secs(70), now);
+            map.record_exit("1", true, false, Duration::from_secs(70), now, cause());
             assert_eq!(
                 map.get("1").consecutive_failures,
                 expected,
@@ -287,7 +410,7 @@ mod tests {
         let long_enough_to_look_healthy = HEALTHY_UPTIME + Duration::from_secs(80);
 
         for expected in 1..=FAILURE_THRESHOLD {
-            map.record_exit("1", true, true, long_enough_to_look_healthy, now);
+            map.record_exit("1", true, true, long_enough_to_look_healthy, now, cause());
             assert_eq!(
                 map.get("1").consecutive_failures,
                 expected,
@@ -309,7 +432,7 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..10 {
-            map.record_exit("1", false, true, Duration::from_secs(10), now);
+            map.record_exit("1", false, true, Duration::from_secs(10), now, cause());
         }
         assert_eq!(map.get("1").consecutive_failures, 0);
     }
@@ -319,7 +442,7 @@ mod tests {
         let mut map = HealthMap::default();
         let now = t0();
         for _ in 0..FAILURE_THRESHOLD {
-            map.record_exit("1", true, false, Duration::from_secs(10), now);
+            map.record_exit("1", true, false, Duration::from_secs(10), now, cause());
         }
         assert!(map.get("1").is_failed());
         assert!(!map.get("2").is_failed());

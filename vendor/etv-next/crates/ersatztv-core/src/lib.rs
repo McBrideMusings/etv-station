@@ -194,6 +194,16 @@ pub const OVERLAY_WRITER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// [`ChannelError::Stalled`]: ../ersatztv_channel/error/enum.ChannelError.html
 pub const STALL_EXIT_CODE: i32 = 75;
 
+/// Written at the channel root by a worker that exits with an error, holding
+/// that error's text. The exit code says only "stalled" or "failed"; this says
+/// which item, which stall, which ffmpeg status — so the server can log the
+/// cause beside the failure count instead of leaving it to be matched up by
+/// timestamp among sixty channels' interleaved worker output. Written only on
+/// an error exit — a signal or a panic leaves none. The server removes it
+/// before each spawn and consumes it on each exit, so a run is never logged
+/// with an earlier run's reason.
+pub const EXIT_REASON_FILE_NAME: &str = ".exit-reason";
+
 pub const VERSION: &str = env!("ETV_VERSION_STRING");
 
 /// The generated, client-facing playlist a channel worker writes at the
