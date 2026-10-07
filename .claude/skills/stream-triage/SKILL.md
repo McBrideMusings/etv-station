@@ -81,14 +81,27 @@ ssh "$UNRAID_USER@$UNRAID_HOST" \
 ```
 channel <N> terminated after ffmpeg stall
 channel <N> exited with status exit status: 75
-channel <N> exited while a viewer was watching; consecutive failures now K
+channel <N> (<name>) failed with a viewer watching, <S>s after spawn: exit status: 75: <cause>; consecutive failures K/3
+channel <N> (<name>) is now FAILED after 3 consecutive failures; /channel/<N>.m3u8 answers 503 until a spawn is allowed in 30s
 ```
 
-Exit 75 is the stall detector, not a crash. Watch `K`: after enough consecutive
-failures ETV-next gives up and logs `channel <N> is failed; serving ended
-playlist to viewer`. **That** is the hard freeze a viewer never recovers from —
-an ordinary single stall self-heals in ~4s via respawn, and the viewer usually
-only sees a hiccup.
+Exit 75 is the stall detector, not a crash. `<cause>` is the worker's own error
+text, carried in `.exit-reason`. Read `<S>` next: a respawn that fails within a
+few seconds of spawning is not a second stall. Before etv-station-194 it was a
+respawn adopting the dead run's tail ("no segments produced for 82s" on its
+first check). Watch `K`: at 3 the ERROR line fires, `/channel/<N>.m3u8` answers
+503 with `Retry-After: 30`, and a viewer already holding the playlist gets
+`channel <N> is failed; serving ended playlist to viewer`. **That** is the hard
+freeze a viewer never recovers from. An ordinary single stall self-heals in ~4s
+via respawn, and the viewer usually only sees a hiccup. `channel <N> (<name>) is
+no longer failed` marks the count clearing. It fires on any exit that doesn't
+count as a failure, an idle exit with nobody watching included, so it does not
+prove a viewer was served.
+
+Every channel's count, failed flag, seconds left on the 503 guard and last cause
+are on `GET /health/channels.json`. `tools/channel-health.sh [base-url]` lists
+the unhealthy ones and exits 1 if any is failed (`admin channel-health` points
+it at the deployed station; `--all` lists every channel).
 
 A respawn resets `EXT-X-MEDIA-SEQUENCE` and bumps `EXT-X-DISCONTINUITY-SEQUENCE`.
 Many clients do not survive that even when the server is healthy again, so

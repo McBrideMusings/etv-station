@@ -588,6 +588,36 @@ happily rolling channels and nothing ever listened. Those URLs are the container
 with ETV-next. For the HTTP surface locally use `admin dev` (daemon + ETV-next), not
 `admin dev-station`.
 
+## Verifying channel failure accounting (etv-station-323)
+
+ETV-next counts a worker exit as a failure when a viewer's heartbeat is fresh
+and the run either stalled (exit 75) or lasted under 180s. Three in a row and
+`/channel/{n}.m3u8` answers 503 with `Retry-After: 30`. Every step is logged,
+and `GET /health/channels.json` returns the state.
+
+Locally, under `admin dev` against `examples/station-test.yaml`, keep a viewer
+polling `/session/1/live.m3u8` every 2s and force the failures:
+
+- **A real stall:** SIGSTOP every ffmpeg child of the channel-1 worker, once a
+  second, until the worker exits. Stopping one ffmpeg once is not enough: the
+  worker's lead-rebuild path kills and restarts it inside 60s.
+- **Fast kills:** SIGKILL the worker a few seconds after it respawns. A worker
+  older than 180s exits as healthy and clears the count. That is the design, not
+  a bug in the check.
+
+Pass, observed 2026-10-07:
+
+```
+channel 1 (Test Pattern Channel) failed with a viewer watching, 88s after spawn: exit status: 75: channel 1 terminated after ffmpeg stall; consecutive failures 2/3
+channel 1 (Test Pattern Channel) failed with a viewer watching, 6s after spawn: signal: 9 (SIGKILL); consecutive failures 3/3; next spawn allowed in 30s
+channel 1 (Test Pattern Channel) is now FAILED after 3 consecutive failures; /channel/1.m3u8 answers 503 until a spawn is allowed in 30s
+channel 1 (Test Pattern Channel) is no longer failed: a run of 102s exited without failing under a viewer, clearing 3 consecutive failures
+```
+
+Then `curl -D - http://127.0.0.1:8409/channel/1.m3u8` answers `503` and
+`retry-after: 30`, and `tools/channel-health.sh` prints the channel as `FAILED`
+and exits 1. Against prod: `admin channel-health`.
+
 ## Verifying hardware encoding (#258)
 
 `admin verify-accel` — read-only, over ssh, touches no container.
