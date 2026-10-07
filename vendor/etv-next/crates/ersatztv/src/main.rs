@@ -150,9 +150,10 @@ async fn run() -> Result<(), LineupError> {
             // nothing tied to a spawn or an exit that would ever collect it. This
             // sweep is that collector: it periodically reaps every channel's run
             // folders down to the live run plus every run folder the channel's
-            // current live.m3u8/live_sub.m3u8 still names (etv-station-262.1),
+            // current live.m3u8/live_sub.m3u8 still names (etv-station-262.1)
+            // plus every run folder written to within SEGMENT_RETENTION,
             // catching exactly the run folders the exit-time reap in
-            // `channel_session::spawn` could not see yet. The one-time
+            // `channel_session::spawn` left standing. The one-time
             // `empty_folder` above stays as it is — a cold start with no viewers
             // has nothing this sweep would improve on.
             //

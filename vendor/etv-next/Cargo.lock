@@ -693,6 +693,7 @@ dependencies = [
 name = "ersatztv-core"
 version = "0.1.0"
 dependencies = [
+ "filetime",
  "log",
  "serde",
  "serde_json",

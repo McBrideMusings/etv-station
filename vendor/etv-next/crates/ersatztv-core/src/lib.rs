@@ -17,6 +17,38 @@ pub const READY_FILE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const HEARTBEAT_FILE_NAME: &str = ".heartbeat";
 pub const HEARTBEAT_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long a segment stays on disk after it airs, whether or not the worker
+/// that wrote it is still running.
+///
+/// The served playlist only ever lists the newest ten segments, so this is not
+/// about tune-in; it is how long a player that stopped fetching can come back
+/// and still find the segment it was up to. That is the answer old LibVLC 3
+/// players survive: a 404, an empty segment, or a different segment in place
+/// of the one asked for ends their stream for good, while the real segment
+/// lets them play on and rejoin the live window through their own gap
+/// handling. A stalled player's heartbeat goes stale long before it returns, so
+/// the worker has usually exited by then — which is why the run-folder reaps
+/// below honour this too, not just `PlaylistManager`'s trim.
+pub const SEGMENT_RETENTION: Duration = Duration::from_mins(15);
+
+/// Whether `run_folder` was written to within [`SEGMENT_RETENTION`].
+///
+/// A directory's mtime moves whenever a segment is written into it or trimmed
+/// out of it, so it marks the run's last activity with one `stat`. A folder
+/// whose mtime cannot be read, or reads as in the future, is treated as recent:
+/// keeping it one more sweep costs disk, removing it costs a viewer.
+async fn written_within_retention(run_folder: &Path) -> bool {
+    let Ok(modified) = tokio::fs::metadata(run_folder)
+        .await
+        .and_then(|m| m.modified())
+    else {
+        return true;
+    };
+    modified
+        .elapsed()
+        .map_or(true, |age| age < SEGMENT_RETENTION)
+}
+
 /// Carries a session's HLS sequence counters across a worker restart, so a new
 /// worker numbers its first segment above the last one the previous worker
 /// published.
@@ -282,7 +314,8 @@ pub async fn list_run_folders(channel_folder: &Path) -> Result<Vec<PathBuf>, std
 
 /// Remove dead run folders under `channel_folder`. When `keep_newest` is
 /// `true` the single newest run folder (by [`list_run_folders`]'s ascending
-/// order) is left alone; every other run folder is removed recursively.
+/// order) is left alone; every other run folder last written more than
+/// [`SEGMENT_RETENTION`] ago is removed recursively.
 ///
 /// Pure mechanics only: this function has no opinion on whether a worker is
 /// live or a viewer is attached — the caller decides `keep_newest` from
@@ -308,6 +341,9 @@ pub async fn reap_run_folders(
 
     let mut removed = 0;
     for folder in folders {
+        if written_within_retention(&folder).await {
+            continue;
+        }
         remove_dir_all(&folder).await?;
         removed += 1;
     }
@@ -387,9 +423,9 @@ async fn run_folders_named_by_playlist(playlist_path: &Path) -> HashSet<String> 
 /// current playlist no longer does. That is bounded by one poll interval —
 /// about four seconds, the target segment duration — against a sweep that
 /// runs every sixty, so it is not the failure mode this function exists to
-/// close. No count and no age threshold are used to widen the margin further
-/// — both are guesses about how many runs can stack up or how long a grace
-/// period should be, and etv-station-262.1 explicitly rules both out.
+/// close. A folder no playlist names is still kept until it was last written
+/// more than [`SEGMENT_RETENTION`] ago: a player that stalled past the
+/// playlist's window comes back asking for a segment in exactly such a folder.
 ///
 /// After the run folders above are removed, this also removes a root
 /// playlist (`live.m3u8` and/or `live_sub.m3u8`, judged independently) that
@@ -419,7 +455,7 @@ pub async fn reap_unreferenced_run_folders(
 
     // The served playlist is a ten-segment shop window (`generate_playlist`'s
     // `Some(10)` cap in `ersatztv-channel`), not the worker's actual
-    // retention deque (~2 minutes). Unioning in what `.sequence` says the
+    // retention deque (`SEGMENT_RETENTION`, 15 minutes). Unioning in what `.sequence` says the
     // deque still holds closes that gap without weakening today's
     // playlist-only protection: in the steady state the deque is always a
     // superset of the served window, so this union equals the `.sequence`
@@ -435,7 +471,7 @@ pub async fn reap_unreferenced_run_folders(
         let Some(name) = folder.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if referenced.contains(name) {
+        if referenced.contains(name) || written_within_retention(&folder).await {
             continue;
         }
         remove_dir_all(&folder).await?;
@@ -669,10 +705,19 @@ mod empty_folder_tests {
 #[cfg(test)]
 mod run_folder_tests {
     use super::{
-        LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME, SEQUENCE_FILE_NAME,
-        SequenceState, is_run_folder_name, list_run_folders, new_run_folder_name, reap_run_folders,
-        reap_unreferenced_run_folders, run_folders_named_by_playlists,
+        LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME, SEGMENT_RETENTION,
+        SEQUENCE_FILE_NAME, SequenceState, is_run_folder_name, list_run_folders,
+        new_run_folder_name, reap_run_folders, reap_unreferenced_run_folders,
+        run_folders_named_by_playlists,
     };
+
+    /// Backdate `path`'s mtime past [`SEGMENT_RETENTION`], so a reap treats it
+    /// as a run nobody can still be coming back for.
+    fn aged(path: &std::path::Path) {
+        let then =
+            std::time::SystemTime::now() - SEGMENT_RETENTION - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(then)).unwrap();
+    }
 
     /// The direct guarantee two runs on the same channel depend on: neither can
     /// ever produce the same segment path, because their run folders never
@@ -749,6 +794,7 @@ mod run_folder_tests {
         tokio::fs::write(newer.join("live000000.ts"), b"segment")
             .await
             .unwrap();
+        aged(&older);
 
         let removed = reap_run_folders(root, true).await.unwrap();
 
@@ -767,12 +813,34 @@ mod run_folder_tests {
         let newer = root.join("r0000000000002-0000");
         tokio::fs::create_dir(&older).await.unwrap();
         tokio::fs::create_dir(&newer).await.unwrap();
+        aged(&older);
+        aged(&newer);
 
         let removed = reap_run_folders(root, false).await.unwrap();
 
         assert_eq!(removed, 2);
         assert!(!older.exists());
         assert!(!newer.exists());
+    }
+
+    /// A player that stalls past the playlist's window comes back for a
+    /// segment in a run folder its worker has already exited and no playlist
+    /// names. Neither reap may take that folder while it is inside
+    /// SEGMENT_RETENTION.
+    #[tokio::test]
+    async fn a_recently_written_dead_run_folder_survives_both_reaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let dead = root.join("r0000000000001-0000");
+        tokio::fs::create_dir(&dead).await.unwrap();
+        tokio::fs::write(dead.join("live000018.ts"), b"segment")
+            .await
+            .unwrap();
+
+        assert_eq!(reap_run_folders(root, false).await.unwrap(), 0);
+        assert_eq!(reap_unreferenced_run_folders(root, false).await.unwrap(), 0);
+        assert!(dead.join("live000018.ts").exists());
     }
 
     #[tokio::test]
@@ -883,6 +951,7 @@ mod run_folder_tests {
         let referenced_newer = root.join("r0000000000002-0000");
         tokio::fs::create_dir(&unreferenced_older).await.unwrap();
         tokio::fs::create_dir(&referenced_newer).await.unwrap();
+        aged(&unreferenced_older);
         tokio::fs::write(
             root.join("live.m3u8"),
             "r0000000000002-0000/live000000.ts\n",
@@ -1049,7 +1118,7 @@ mod run_folder_tests {
     }
 
     /// The defect etv-station-262.1 fixes: the served `live.m3u8` is a
-    /// ten-segment shop window, not the worker's ~2-minute retention deque,
+    /// ten-segment shop window, not the worker's 15-minute retention deque,
     /// so a folder can drop out of the playlist while the worker still
     /// holds — and could still serve — its segments. `.sequence`'s
     /// `run_folders` is the deque's own record and must protect a folder the
@@ -1111,6 +1180,7 @@ mod run_folder_tests {
         let newer = root.join("r0000000000002-0000");
         tokio::fs::create_dir(&older).await.unwrap();
         tokio::fs::create_dir(&newer).await.unwrap();
+        aged(&older);
         tokio::fs::write(
             root.join(LIVE_PLAYLIST_FILE_NAME),
             "r0000000000002-0000/live000000.ts\n",

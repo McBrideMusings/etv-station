@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use ersatztv_channel::error::ChannelError;
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, SEQUENCE_FILE_NAME, SequenceState,
-    is_run_folder_name, read_sequence_state,
+    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, SEGMENT_RETENTION, SEQUENCE_FILE_NAME,
+    SequenceState, is_run_folder_name, read_sequence_state,
 };
 use ffpipeline::pipeline::PtsOffset;
 use ffpipeline::web_vtt::{Cue, format_vtt_ts};
@@ -164,11 +164,25 @@ impl PlaylistManager {
         // still-tuned client is polling continuous across the respawn instead
         // of dropping the segments it was mid-playback on the instant this
         // worker's own `update()` runs (etv-station-262).
-        let adopted = adopt_segments(
+        let mut adopted = adopt_segments(
             Path::new(&output_files.generated_playlist_file),
             &output_folder,
         )
         .await;
+
+        // A previous run whose newest segment ended longer ago than the stall
+        // limit is not a session to continue: it stopped (idle exit) and its
+        // folder is only still on disk for SEGMENT_RETENTION. Continuing from
+        // its tail would start this run in the past and trip the stall check
+        // on the first update. Its files stay where they are for a returning
+        // player; this run starts at the present.
+        let stall_limit = Duration::from_secs((target_duration * STALL_TARGET_DURATIONS) as u64);
+        if adopted.back().is_some_and(|s| {
+            s.program_date_time + Duration::from_secs_f64(s.duration) + stall_limit
+                < OffsetDateTime::now_utc()
+        }) {
+            adopted.clear();
+        }
 
         // The playlist must never advertise a shorter target duration than any
         // segment it actually holds — the same clamp `update` applies to a
@@ -393,7 +407,7 @@ impl PlaylistManager {
         }
 
         // trim old segments
-        let cutoff = OffsetDateTime::now_utc() - Duration::from_mins(2);
+        let cutoff = OffsetDateTime::now_utc() - SEGMENT_RETENTION;
         while !self.segments.is_empty() && self.segments[0].program_date_time < cutoff {
             if let Some(removed) = self.segments.remove(0) {
                 self.media_sequence += 1;
@@ -1084,7 +1098,7 @@ mod tests {
     }
 
     /// The freeze this guards: the session encodes ahead of wall clock, so the
-    /// two-minute trim releases nothing and segments pile up. Publishing the
+    /// retention trim releases nothing and segments pile up. Publishing the
     /// oldest ten of that pile ends the window on a segment the client consumed
     /// a minute ago, leaving it nothing to fetch — it polls, backs off, and
     /// stops. The window has to sit at the live edge, not at the tail of the
@@ -1228,7 +1242,7 @@ mod tests {
         watch(dir.path()).await;
 
         let prior_run = "r0000000000000-9999";
-        // A few seconds old, well inside the two-minute trim window, so
+        // A few seconds old, well inside SEGMENT_RETENTION, so
         // `update()` neither drops them nor reorders this assertion.
         let first_pdt = OffsetDateTime::now_utc() - time::Duration::seconds(4);
         write_prior_playlist_n(dir.path(), prior_run, 10, first_pdt).await;
@@ -1399,7 +1413,7 @@ mod tests {
     }
 
     /// Adoption only defers the trim, it does not exempt it: an adopted
-    /// segment is dropped by the ordinary two-minute trim the same as any
+    /// segment is dropped by the ordinary retention trim the same as any
     /// other, and its file removed from the old run folder it still lives in.
     #[tokio::test]
     async fn adopted_segments_are_trimmed_and_their_files_removed_from_the_old_run_folder() {
@@ -1416,13 +1430,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Well in the past: the ordinary two-minute trim must drop it on the
-        // very first update, exactly as it would any other stale segment.
-        let prior_pdt = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let prior_pdt = OffsetDateTime::now_utc() - time::Duration::seconds(4);
         write_prior_playlist(dir.path(), prior_run, "live000000.ts", prior_pdt).await;
 
         let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
         assert_eq!(pm.segments.len(), 1, "the adopted segment must be seeded");
+
+        // Age it past SEGMENT_RETENTION in place: the ordinary trim must then
+        // drop it exactly as it would any other stale segment.
+        pm.segments[0].program_date_time -= SEGMENT_RETENTION + Duration::from_secs(60);
 
         pm.update().await.unwrap();
 
@@ -1438,6 +1454,55 @@ mod tests {
             !prior_folder.join("live000000.vtt").exists(),
             "its subtitle sidecar must be removed too"
         );
+    }
+
+    /// A player that stalled nine minutes comes back asking for the segment it
+    /// was up to. The trim must not have taken it.
+    #[tokio::test]
+    async fn a_nine_minute_old_segment_survives_the_trim() {
+        let dir = TempDir::new().unwrap();
+        let mut pm = manager(
+            dir.path(),
+            OffsetDateTime::now_utc() - time::Duration::minutes(9),
+        )
+        .await;
+        push_segments(&mut pm, 1);
+        let file = dir.path().join(&pm.segments[0].path);
+        tokio::fs::write(&file, b"segment").await.unwrap();
+
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.segments.len(), 1, "a nine-minute-old segment is kept");
+        assert!(file.exists());
+    }
+
+    /// A previous run whose newest segment ended long ago stopped; continuing
+    /// from its tail would start this run in the past and trip the stall check.
+    /// Its files stay on disk for a returning player, but it is not adopted.
+    #[tokio::test]
+    async fn a_previous_run_that_stopped_long_ago_is_not_adopted() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let prior_run = "r0000000000000-9999";
+        let prior_folder = dir.path().join(prior_run);
+        tokio::fs::create_dir_all(&prior_folder).await.unwrap();
+        tokio::fs::write(prior_folder.join("live000018.ts"), b"segment")
+            .await
+            .unwrap();
+        let prior_pdt = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        write_prior_playlist(dir.path(), prior_run, "live000018.ts", prior_pdt).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        assert!(
+            pm.segments.is_empty(),
+            "a stopped run's tail must not be adopted"
+        );
+
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), None, "a fresh run must not read as stalled");
+        assert!(prior_folder.join("live000018.ts").exists());
     }
 
     /// A folder round 3's sweep already collected must never be re-advertised

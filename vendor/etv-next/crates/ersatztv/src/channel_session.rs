@@ -164,11 +164,11 @@ impl ChannelSession {
 
             // Reap this run's segment folder — the segments and .vtt
             // sidecars PlaylistManager's trim never reached, because it only
-            // drops a segment once a *later* one pushes it outside the
-            // two-minute playlist window, and no later segment ever arrives
-            // once the worker has exited. Left alone, that tail (about two
-            // minutes of segments) sits on disk until this channel happens to
-            // be watched again — which, for an idle channel, may be never.
+            // drops a segment once it is older than SEGMENT_RETENTION while
+            // the worker is still running, and nothing trims once the worker
+            // has exited. A folder written to within SEGMENT_RETENTION is
+            // kept here (a stalled viewer may still come back for it) and
+            // collected by the periodic sweep in `main` once it ages out.
             // Done for every exit route: this point is reached whether the
             // worker returned cleanly, hit an error, or was killed out from
             // under it, since `child.wait()` above resolves either way.
@@ -242,6 +242,15 @@ mod reap_tests {
         reap_run_folders,
     };
 
+    /// Backdate `path`'s mtime past `SEGMENT_RETENTION`, so a reap treats it
+    /// as a run nobody can still be coming back for.
+    fn aged(path: &std::path::Path) {
+        let then = std::time::SystemTime::now()
+            - ersatztv_core::SEGMENT_RETENTION
+            - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(then)).unwrap();
+    }
+
     /// Exercises the exact call the exit-time cleanup in `spawn` makes:
     /// `keep_newest` decided by `heartbeat_is_fresh` on a heartbeat sampled
     /// before cleanup. No heartbeat at all reads as "nobody watching", so the
@@ -256,6 +265,7 @@ mod reap_tests {
         tokio::fs::write(dead_run.join("live000000.ts"), b"segment")
             .await
             .unwrap();
+        aged(&dead_run);
 
         let heartbeat_file = channel_root.join(HEARTBEAT_FILE_NAME);
         let viewer_attached = heartbeat_is_fresh(&heartbeat_file).await;
@@ -395,6 +405,7 @@ mod reap_tests {
         tokio::fs::write(new_run.join("live000000.ts"), b"segment")
             .await
             .unwrap();
+        aged(&dead_run);
 
         // The client's in-hand playlist: still points at the dead run's
         // segments, which have not scrolled out of the window yet.
