@@ -303,7 +303,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
         number: 1,
-        name: None,
+        name: "test".into(),
         display_name: None,
         guide: None,
         scoring: None,

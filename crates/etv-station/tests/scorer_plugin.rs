@@ -117,7 +117,7 @@ async fn assert_one_file_across_the_chunk(
 fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
     ChannelConfig {
         number: 1,
-        name: None,
+        name: "test".into(),
         display_name: None,
         guide: None,
         scoring: None,

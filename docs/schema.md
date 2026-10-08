@@ -502,7 +502,7 @@ seed: 1138                     # optional — every channel with no seed: of its
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
 | `overlay` | no | station-wide overlay default, the least specific level of the cascade every channel inherits from unless it says otherwise — see [Overlay cascade](#overlay-cascade) |
-| `seed` | no — default unset | int — station-wide random seed. Every channel that sets no `seed:` of its own inherits it, **salted with that channel's folder name** — see [Seed cascade](#seed-cascade). Unset means every unseeded channel keeps drawing a fresh wall-clock seed on every generation. |
+| `seed` | no — default unset | int — station-wide random seed. Every channel that sets no `seed:` of its own inherits it, **salted with that channel's `name`** — see [Seed cascade](#seed-cascade). Unset means every unseeded channel keeps drawing a fresh wall-clock seed on every generation. |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
 
@@ -524,9 +524,8 @@ advances the cursor past changes it did not write.
 Each entry in `channels` is resolved relative to the station file's directory. A
 glob expands to every matching file (matching nothing is an error); a literal
 path is taken as-is. Files matched by more than one entry appear once. A
-channel's **output folder is derived** — `{output_base}/{identity}`, where
-`identity` is the channel's `name` override (below) or, if unset, its config
-file's stem (e.g. `diehard.yaml` → `diehard`).
+channel's **output folder is derived** — `{output_base}/{name}`, where `name`
+is the channel's required `name:` (below), never its config file or folder name.
 
 ## Channel file
 
@@ -536,12 +535,12 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | Field | Required | Type / default |
 |---|---|---|
 | `number` | **yes** | int — the channel's dial number. See [Channel numbers](#channel-numbers). |
-| `name` | no — default: config file stem | string — channel identity override; drives the log label, overlay handshake, and output folder leaf. Must not contain path separators. |
+| `name` | **yes** | string — the channel's identity: the key its play history and series resume cursors are filed under, the salt on an inherited seed, the log label, overlay handshake, and output folder leaf. Must not be blank or contain path separators or control characters. See [Channel identity](#channel-identity). |
 | `window_days` | no — default `1` | int — how far ahead the schedule is written, and the span one generation is allowed to cover |
 | `chunk_hours` | no — default `6` | int — playout file size only; it does not bound a generation |
 | `roll_interval` | no — default `"3600s"` | duration |
 | `retention_days` | no — default `7` | int |
-| `seed` | no — inherited from the station `seed` when unset | int — seeds `random` order and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's folder name, then to a fresh wall-clock seed — see [Seed cascade](#seed-cascade). |
+| `seed` | no — inherited from the station `seed` when unset | int — seeds `random` order and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's `name`, then to a fresh wall-clock seed — see [Seed cascade](#seed-cascade). |
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
 
@@ -565,6 +564,29 @@ whole station — one bad channel config costs one channel, not the station
   logged naming both config files and the number; neither is silently
   preferred, and every channel with a unique number still serves.
 
+### Channel identity
+
+`name:` is the channel's identity (#414). It is required, and it is **never
+derived** from the config's file or folder name. It is the `channel` column on
+every `airings` row in `history.db` and the key every series resume cursor is
+read back by, so deriving it from the folder was the bug: renaming a channel's
+directory filed its whole play history under a string nothing queried again,
+and every show restarted at episode 1 without an error. With `name:` declared,
+the folder is free to be renamed or renumbered; changing `name:` itself is the
+one edit that starts a channel from an empty history.
+
+The same two failure behaviors as `number:`, scoped to the offending
+channel(s):
+
+- **A channel config with no `name:` fails to load.** An ERROR
+  (`channel.load_failed`) is logged naming the config file and the missing
+  field; the channel does not appear in the lineup, and every other channel
+  still serves.
+- **Two channels declaring the same `name:` are both refused.** An ERROR
+  (`channel.name_collision`) is logged naming both config files and the name;
+  neither is silently preferred, and every other channel still serves. Both
+  collision checks read the whole roster before either drops anything.
+
 ### Composing blocks — `rule.blocks`
 
 Each entry under `rule.blocks` is a **block include** (`config/rule.rs`,
@@ -575,10 +597,11 @@ fields are ignored and warned about; see [Unknown keys](#unknown-keys).
 **Reference form** — body lives in a separate file:
 
 ```yaml
-# channels/starwars.yaml — no output_folder; identity is the file stem "starwars",
-# so it writes to {output_base}/starwars
+# channels/starwars.yaml — no output_folder; identity is the declared name
+# "starwars", so it writes to {output_base}/starwars
 
 number: 24
+name: starwars
 rule:
   blocks:
     - block: "../blocks/starwars-timeline.yaml"
@@ -589,9 +612,10 @@ rule:
 **Inline form** — body lives in the channel file:
 
 ```yaml
-# channels/lotr.yaml — identity "lotr" from the file stem
+# channels/lotr.yaml — identity "lotr" from its declared name
 
 number: 26
+name: lotr
 rule:
   blocks:
     - mode: "all"
@@ -616,7 +640,7 @@ A channel's seed resolves in this order, first hit wins:
 
 1. **The channel's own `seed:`.** Pinned by hand, unaffected by anything the
    station says.
-2. **The station `seed:`, salted with the channel's folder name.** Applied at
+2. **The station `seed:`, salted with the channel's `name`.** Applied at
    config-load time, so everything downstream still reads one field.
 3. **A fresh wall-clock seed** — only when neither is set. The channel
    reshuffles on every generation, and the daemon logs this at INFO naming the
@@ -633,9 +657,9 @@ anything channel-specific — the shuffle consumes the seed as raw PRNG state,
 and a pattern roll mixes only `(seed, cycle, step, nonce)`. Handing every
 channel the same station number verbatim would make any two channels with the
 same candidate multiset produce the *identical* order. The salt is the
-channel's **folder name** — its identity on disk — and deliberately not its
-channel number, which is a presentation detail; renumbering a channel must not
-reshuffle it.
+channel's declared **`name`** — its identity — and deliberately not its channel
+number, which is a presentation detail, nor its folder name; renumbering a
+channel or renaming its folder must not reshuffle it.
 
 The derivation is a fixed algorithm (FNV-1a over the name, then the SplitMix64
 finalizer), not `DefaultHasher`, so one pinned station seed reproduces the same

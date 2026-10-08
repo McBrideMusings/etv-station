@@ -56,43 +56,6 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
     Ok(())
 }
 
-/// Reject two channels that write to the same `output_folder`. A shared folder
-/// silently misbehaves: both channels fight over the `.resume` sidecar and
-/// each startup prunes the other's `.durations.json` cache, forcing re-probes
-/// on every restart. Play history no longer lives in this folder (#111) —
-/// it is keyed by channel name in the shared `history.db`, so two channels
-/// only collide on it if their *names* also collide, which is rejected
-/// elsewhere.
-///
-/// Folders are compared exactly as the daemon uses them — verbatim, relative to
-/// the single process CWD (see `daemon::channel_loop`, which uses
-/// `LoadedChannel::output_folder` as-is), NOT resolved against each channel's
-/// own config directory. Two channels whose derived identities land on the same
-/// `{output_base}/{identity}` therefore collide, because at runtime both write
-/// the same path — that shared runtime target is the collision we must reject.
-///
-/// `channels` is `(identity, output_folder)` per channel.
-pub(super) fn validate_output_folders(
-    station_path: &Path,
-    channels: &[(&str, &Path)],
-) -> Result<(), ConfigError> {
-    let mut seen: HashMap<&Path, &str> = HashMap::new();
-    for (name, output_folder) in channels {
-        if let Some(prev) = seen.insert(output_folder, name) {
-            return Err(ConfigError::Validation {
-                path: station_path.to_path_buf(),
-                message: format!(
-                    "channels {:?} and {:?} both write to output_folder {}",
-                    prev,
-                    name,
-                    output_folder.display()
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Validate a channel after [`super::load`] has resolved every block-include
 /// into normalized inline form (path refs spliced, env vars expanded). The
 /// structural "exactly one of path/inline" check happens during load; this is
@@ -1194,7 +1157,7 @@ mod tests {
         ChannelConfig {
             number: 1,
             scoring: None,
-            name: None,
+            name: "test".into(),
             display_name: None,
             guide: None,
             window_days: 1,
@@ -2627,35 +2590,6 @@ fn audit(ctx, picks, workspace) { #{} }"#,
         b.cycles = Some(MAX_CYCLES + 1);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("maximum"), "err = {err}");
-    }
-
-    #[test]
-    fn rejects_shared_absolute_output_folder() {
-        let out = Path::new("/srv/out");
-        let err = validate_output_folders(&dummy_path(), &[("a", out), ("b", out)]).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("both write to output_folder"), "msg = {msg}");
-        assert!(
-            msg.contains("\"a\"") && msg.contains("\"b\""),
-            "msg = {msg}"
-        );
-    }
-
-    #[test]
-    fn rejects_identical_relative_output_folder() {
-        // Both channels write the same relative folder → at runtime both land on
-        // `<cwd>/out`, so this is a real collision the daemon can't tolerate.
-        let out = Path::new("out");
-        assert!(validate_output_folders(&dummy_path(), &[("a", out), ("b", out)]).is_err());
-    }
-
-    #[test]
-    fn accepts_distinct_output_folders() {
-        validate_output_folders(
-            &dummy_path(),
-            &[("a", Path::new("/srv/a")), ("b", Path::new("/srv/b"))],
-        )
-        .unwrap();
     }
 
     // ---- named show groups (#165) ------------------------------------------

@@ -44,9 +44,20 @@ STATIONS = [
 
 
 def channel_identity(channel_path: Path) -> tuple[str, Path]:
-    """Return (name the station knows this channel by, its station config)."""
+    """Return (name the station knows this channel by, its station config).
+
+    The name is the channel's declared `name:` (#414), never its file or
+    folder name.
+    """
     resolved = channel_path.resolve()
-    name = resolved.stem if resolved.is_file() else resolved.name
+    yaml_path = resolved / "channel.yaml" if resolved.is_dir() else resolved
+    try:
+        name = (yaml.safe_load(yaml_path.read_text()) or {}).get("name")
+    except OSError as e:
+        sys.exit(f"reading {yaml_path}: {e}")
+    if not name:
+        sys.exit(f"{yaml_path} declares no `name:`; the station will not load it")
+    name = str(name).strip()
     for root, station in STATIONS:
         if resolved == root or root in resolved.parents:
             return name, station

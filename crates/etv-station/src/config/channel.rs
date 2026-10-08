@@ -24,16 +24,18 @@ pub struct ChannelConfig {
     /// warned about.
     pub number: i64,
 
-    /// Optional channel identity override. When unset, the channel's identity
-    /// is its config file's stem (e.g. `diehard.yaml` -> `diehard`) — or, for
-    /// a file literally named `channel.yaml` (the per-channel-directory
-    /// layout, `channels/<name>/channel.yaml`), its parent directory's name,
-    /// since every file in that layout shares the same stem. The identity
-    /// drives the log label, the overlay handshake name, and the output
-    /// folder leaf under the station's `output_base`. Must not contain path
-    /// separators.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    /// This channel's identity (#414) — required, and never derived from the
+    /// config's file or folder name. It is the key every `airings` row and
+    /// every series resume cursor in `history.db` is filed under, the salt on
+    /// an inherited station seed, the log label, the overlay handshake name,
+    /// and the output folder leaf under the station's `output_base`. Deriving
+    /// it from the folder was the bug: renaming a channel's directory silently
+    /// orphaned its whole play history.
+    ///
+    /// A channel whose config omits this fails to load; two channels
+    /// declaring the same name both fail to load — see `config::load`. Must
+    /// not be empty or contain path separators or control characters.
+    pub name: String,
 
     /// The name shown to viewers — in the XMLTV guide's `<display-name>` and
     /// the lineup's channel name — as distinct from [`name`](Self::name),

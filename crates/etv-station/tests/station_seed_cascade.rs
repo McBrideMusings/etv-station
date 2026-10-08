@@ -26,8 +26,8 @@ const RULE: &str = "rule:\n\
                     \x20           params: testsrc\n";
 
 /// A station file plus two channel files, laid out the way the deployed
-/// station is: `channels/<folder>/channel.yaml`, so the identity each channel
-/// is salted with is genuinely its folder name.
+/// station is: `channels/<folder>/channel.yaml`, each declaring `name:` equal
+/// to its folder — the identity its seed is salted with.
 fn write_station(dir: &Path, station_seed: Option<&str>, beta_seed: Option<&str>) -> PathBuf {
     let mut station = String::from(
         "tz: \"UTC\"\n\
@@ -48,8 +48,8 @@ fn write_station(dir: &Path, station_seed: Option<&str>, beta_seed: Option<&str>
         let folder_dir = dir.join("channels").join(folder);
         fs::create_dir_all(&folder_dir).unwrap();
         let body = match own_seed {
-            Some(seed) => format!("number: {number}\nseed: {seed}\n{RULE}"),
-            None => format!("number: {number}\n{RULE}"),
+            Some(seed) => format!("number: {number}\nname: {folder}\nseed: {seed}\n{RULE}"),
+            None => format!("number: {number}\nname: {folder}\n{RULE}"),
         };
         fs::write(folder_dir.join("channel.yaml"), body).unwrap();
     }
@@ -67,7 +67,7 @@ fn seed_of(station: &config::Station, name: &str) -> Option<u64> {
 }
 
 #[test]
-fn unseeded_channels_inherit_the_station_seed_salted_by_folder_name() {
+fn unseeded_channels_inherit_the_station_seed_salted_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let station_path = write_station(dir.path(), Some("1138"), None);
 
@@ -112,8 +112,8 @@ fn with_no_station_seed_an_unseeded_channel_stays_unseeded() {
 }
 
 /// Renumbering a channel must not reshuffle it — the reason the salt is the
-/// folder name and not the channel number (#263 makes the number separately
-/// declarable). Two loads of the same folder name produce the same seed.
+/// declared name and not the channel number (#263 makes the number separately
+/// declarable). Two loads of the same name produce the same seed.
 #[test]
 fn the_derived_seed_is_stable_across_loads() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,5 +124,36 @@ fn the_derived_seed_is_stable_across_loads() {
     assert_eq!(
         seed_of(&first, "001-for-you"),
         seed_of(&second, "001-for-you")
+    );
+}
+
+/// #414: renaming a channel's folder keeps its identity — the key its play
+/// history and resume cursors are filed under — and therefore its seed.
+#[test]
+fn renaming_a_channel_folder_keeps_its_identity_and_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let station_path = write_station(dir.path(), Some("1138"), None);
+    let before = config::load(&station_path).unwrap();
+
+    let channels = dir.path().join("channels");
+    fs::rename(
+        channels.join("001-for-you"),
+        channels.join("010-for-you-renamed"),
+    )
+    .unwrap();
+    let after = config::load(&station_path).unwrap();
+
+    let renamed = after
+        .channels
+        .iter()
+        .find(|c| {
+            c.config_path
+                .starts_with(channels.join("010-for-you-renamed"))
+        })
+        .expect("renamed channel still loads");
+    assert_eq!(renamed.name, "001-for-you");
+    assert_eq!(
+        seed_of(&after, "001-for-you"),
+        seed_of(&before, "001-for-you")
     );
 }

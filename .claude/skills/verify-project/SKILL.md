@@ -200,7 +200,7 @@ To force one without a config change:
 
 ```bash
 admin refresh-channel 2               # by channel number, as the guide shows it
-admin refresh-channel 002-for-pierce  # by directory name
+admin refresh-channel 002-for-pierce  # by declared name:
 admin refresh-channel all             # every channel
 # expect: reason="forced" within one roll_interval, not instantly
 ```
@@ -298,7 +298,7 @@ cleanup before a commit.
 ## Verifying the seed cascade
 
 A channel with no `seed:` inherits the station `seed:`, salted with the
-channel's folder name (#324). Two surfaces prove it:
+channel's declared `name:` (#324, #414). Two surfaces prove it:
 
 ```bash
 cargo test -p etv-station --test station_seed_cascade   # load() → derived, salted, stable seeds
@@ -320,6 +320,47 @@ That second line is the pass condition for "an unseeded channel is visible
 rather than silent". Seeing it in a production log means that channel still
 redraws a wall-clock seed on every regeneration and reshuffles its whole future
 window whenever a catalog refresh changes its candidate set.
+
+## Verifying a folder rename keeps a channel's history (#414)
+
+A channel's identity is its required `name:`, never its folder. That string is
+the `channel` column on every `airings` row in `history.db`, the key series
+resume cursors are read by, the seed salt and the output folder leaf — so a
+folder rename must change none of them. Config-level proof:
+
+```bash
+cargo test -p etv-station --test station_seed_cascade renaming_a_channel_folder
+cargo test -p etv-station --lib config::load::tests::a_channel_with_no_name
+cargo test -p etv-station --lib config::load::tests::two_channels_sharing_a_name
+```
+
+At the daemon: copy `examples/station-test.yaml` into a scratch dir with
+`channels: [channels/*/channel.yaml]`, an absolute `output_base`, and
+`lavfi-test.yaml` (overlay path made absolute) at `channels/001-test/channel.yaml`.
+Boot it with the `env -u` invocation above until `event="chunk.write"`, stop it,
+`mv channels/001-test channels/009-test-renamed`, boot again, then:
+
+```bash
+sqlite3 <scratch>/out/history.db "select channel, count(*) from airings group by channel"
+```
+
+Look for: one row, `test`, before and after (2026-10-08: `test|1440`, then
+`test|1443`), the second boot's `event="channel.load" channel=test
+config=…/009-test-renamed/channel.yaml` followed by `resume.load` and a
+`chunk.write` continuing the first boot's window, and `out/` holding only `test/`.
+Delete the `name:` line and boot again: `event="channel.load_failed"` with
+``missing field `name` ``.
+
+Against prod, every `deploy/appdata/channels/*/channel.yaml` must declare a
+`name:` equal to the identity its history is already filed under (its folder
+name at the time #414 landed). Audit:
+
+```bash
+for f in deploy/appdata/channels/*/channel.yaml; do d=$(basename "$(dirname "$f")"); n=$(sed -n 's/^name: //p' "$f"); [ "$n" = "$d" ] || echo "DIFF $d -> ${n:-<none>}"; done
+```
+
+Empty output is a pass until a folder is deliberately renamed; after that, a
+`DIFF` line is expected and correct — the `name:` is what must not change.
 
 ## Verifying two builds emit the same schedule (playout-JSON parity)
 

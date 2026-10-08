@@ -150,10 +150,10 @@ struct Cli {
     format: ReportFormat,
 
     /// With `--audit` and no channel name, list every channel in the station
-    /// config instead of reporting one: its folder name, its declared dial
+    /// config instead of reporting one: its declared name, its declared dial
     /// number (the same one ETV-next writes into `channelN.json` and the
     /// XMLTV guide shows as `ersatztv.<N>`), and its display name. Lets a
-    /// caller map an XMLTV channel id back onto a channel folder.
+    /// caller map an XMLTV channel id back onto a channel.
     #[arg(long, requires = "audit")]
     list: bool,
 
@@ -452,6 +452,9 @@ struct OverlayProbe {
     overlay: Option<config::OverlayDecl>,
     #[serde(default)]
     channels: Vec<String>,
+    /// A channel file's declared identity (#414); absent on the station file.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 fn read_probe(path: &Path) -> Result<OverlayProbe, String> {
@@ -471,37 +474,45 @@ fn resolve_overlay_for(config_path: &Path, channel_name: &str) -> Result<String,
     let station = read_probe(&absolute)?;
 
     // Same globs the loader walks, matched on the name a channel is known by:
-    // its directory (deploy/appdata's layout) or its file stem (examples').
-    let mut channel_path = None;
+    // its declared `name:` (#414), never its file or folder name.
+    let mut found: Option<(PathBuf, OverlayProbe)> = None;
     let mut known = Vec::new();
     for pattern in &station.channels {
         let full = station_dir.join(pattern);
         let entries = glob::glob(&full.to_string_lossy())
             .map_err(|e| format!("bad channels pattern {pattern:?}: {e}"))?;
         for entry in entries.flatten() {
-            let name = if entry.file_name().and_then(|n| n.to_str()) == Some("channel.yaml") {
-                entry.parent().and_then(|p| p.file_name())
-            } else {
-                entry.file_stem()
-            }
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
+            // One unreadable or unnamed channel file costs that channel, not
+            // the preview of every other — the loader drops it the same way.
+            let Ok(probe) = read_probe(&entry) else {
+                continue;
+            };
+            let Some(name) = probe.name.as_deref().map(str::trim).map(str::to_string) else {
+                continue;
+            };
             if name == channel_name {
-                channel_path = Some(entry.clone());
+                // The loader drops every channel sharing a name, so a preview
+                // must not pick one of them as if it served.
+                if let Some((first, _)) = &found {
+                    return Err(format!(
+                        "channels {} and {} both declare name {channel_name:?}; \
+                         neither loads",
+                        first.display(),
+                        entry.display()
+                    ));
+                }
+                found = Some((entry.clone(), probe));
             }
             known.push(name);
         }
     }
-    let Some(channel_path) = channel_path else {
+    let Some((channel_path, channel)) = found else {
         known.sort();
         return Err(format!(
             "no channel named {channel_name:?}. Known: {}",
             known.join(", ")
         ));
     };
-
-    let channel = read_probe(&channel_path)?;
     let channel_dir = channel_path.parent().unwrap_or(Path::new("."));
 
     let station_level = station.overlay.as_ref().map(|d| (d, station_dir));
@@ -646,8 +657,8 @@ fn backfill_history(config_path: &Path, dry_run: bool) -> ExitCode {
 /// Mark one channel — or every channel — for a forced forward refresh.
 ///
 /// Resolution is deliberately forgiving, because the three names for a channel
-/// all show up in different places: the directory name is what the logs and the
-/// playout folder use, the bare name is what a person says, and the number is
+/// all show up in different places: the declared `name` is what the logs and
+/// the playout folder use, the bare name is what a person says, and the number is
 /// what the guide and the TV show. A prefix that matches more than one channel
 /// is refused rather than guessed at.
 fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
@@ -870,7 +881,7 @@ fn audit(
     ExitCode::SUCCESS
 }
 
-/// One line of `--audit --list`'s output: a channel's folder name, its
+/// One line of `--audit --list`'s output: a channel's declared name, its
 /// declared dial number, and its display name.
 struct ChannelListing {
     name: String,
@@ -1115,6 +1126,7 @@ mod tests {
     /// — the same shape `config/load.rs`'s own `resolves_path_referenced_block`
     /// test writes.
     fn write_channel_toml(dir: &Path, filename: &str, number: i64, display_name: Option<&str>) {
+        let name = filename.trim_end_matches(".toml");
         let display_line = display_name
             .map(|d| format!("display_name = {d:?}\n"))
             .unwrap_or_default();
@@ -1122,6 +1134,7 @@ mod tests {
             dir.join(filename),
             format!(
                 "number = {number}\n\
+                 name = {name:?}\n\
                  {display_line}\
                  [[rule.blocks]]\n\
                  order = \"manual\"\n\

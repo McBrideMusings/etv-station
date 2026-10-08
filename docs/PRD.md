@@ -180,7 +180,7 @@ A `channel.toml` declaring:
 
 | Field | Required | Description |
 |---|---|---|
-| `name` | no, default: config file stem | Channel identity override — drives the log label, overlay handshake, and output folder leaf. No path separators. |
+| `name` | yes | Channel identity — the key the channel's play history and series resume cursors are filed under, and the log label, overlay handshake, and output folder leaf. Never derived from the file or folder name, so a channel's folder can be renamed without losing its history. A config without it, or two configs sharing one, drop out of the lineup with an ERROR. No path separators. |
 | `window_days` | no, default 1 | How far into the future to materialize. Also the length of one generation, whichever shape the channel is: a pattern block with no `cycles` stops at the first cycle boundary that covers this span, and a flat `entries` list longer than the span stops at the item that covers it and resumes there next time. Neither can book the channel years ahead. |
 | `chunk_hours` | no, default 6 | Each playout JSON file's `[start, finish)` span. File size only — it does not gate how far ahead the scheduler works. |
 | `roll_interval` | no, default `1h` | How often to extend the window forward. |
@@ -188,7 +188,7 @@ A `channel.toml` declaring:
 | `rule` | yes | Rule type + rule-specific params. |
 | `items` | yes (for an entries block) | Ordered list with metadata. |
 
-A channel does **not** declare its own output folder. The daemon derives it as `{output_base}/{identity}`, where `output_base` is a station-level field and `identity` is the channel's `name` (above) or, unset, its config file stem. ETV-next still reads playout files from that same folder, configured on its own side.
+A channel does **not** declare its own output folder. The daemon derives it as `{output_base}/{name}`, where `output_base` is a station-level field and `name` is the channel's required `name` (above). ETV-next still reads playout files from that same folder, configured on its own side.
 
 A top-level station file (`station.toml` or `station.yaml`) declares `output_base` and lists the channel configs — mirrors how ETV-next's `lineup.json` lists its channels. It also carries the station-wide time zone (see below). Each `channels` entry is a literal path or a glob (e.g. `channels/*.yaml`) resolved relative to the station file; a glob expands to every match. The `ETV_STATION_OUTPUT_BASE` environment variable overrides `output_base` at runtime (the Docker-friendly knob), the same way `ETV_STATION_TZ` overrides `tz`.
 

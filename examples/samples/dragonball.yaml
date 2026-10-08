@@ -21,6 +21,7 @@
 # unless the station's `catalog_path` points at a populated catalog. Its
 # resolution is also proven by the `dragonball_sample` acceptance test.
 number: 9
+name: dragonball
 display_name: "Dragon Ball"
 window_days: 1
 roll_interval: "60s"

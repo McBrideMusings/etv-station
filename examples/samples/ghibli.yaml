@@ -19,6 +19,7 @@
 # unless the station's `catalog_path` points at a populated catalog. Its
 # resolution is also proven by the `studio_brand_sample` acceptance test.
 number: 10
+name: ghibli
 display_name: "Studio Ghibli"
 window_days: 1
 roll_interval: "60s"

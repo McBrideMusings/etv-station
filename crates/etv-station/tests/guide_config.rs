@@ -22,7 +22,7 @@ fn path() -> &'static Path {
 fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> ChannelConfig {
     ChannelConfig {
         number: 1,
-        name: None,
+        name: "test".into(),
         display_name: None,
         guide,
         scoring: None,

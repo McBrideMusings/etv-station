@@ -217,7 +217,7 @@ pub struct ChannelRender {
     /// Playout folder the station writes and ETV-next reads.
     pub folder: PathBuf,
     /// The channel's own `display_name` (#158) — never a second file. `None`
-    /// falls back to the identity resolved from the folder name.
+    /// falls back to the channel's declared `name`.
     pub display_name: Option<String>,
     /// The channel's live overlay, or `None` for a channel that has none. This
     /// is the only record of that decision: it used to be copied onto every

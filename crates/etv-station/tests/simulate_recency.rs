@@ -73,7 +73,7 @@ fn write_plugin(dir: &tempfile::TempDir) -> PathBuf {
 fn channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
         number: 1,
-        name: None,
+        name: "test".into(),
         display_name: None,
         guide: None,
         scoring: None,

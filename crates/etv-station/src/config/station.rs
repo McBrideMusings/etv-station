@@ -139,7 +139,7 @@ pub struct StationConfig {
     /// `(seed, cycle, step, nonce)` — so handing two channels the same number
     /// would make any two with the same candidate multiset shuffle
     /// *identically*. [`derive_channel_seed`] salts it with the channel's
-    /// folder name first.
+    /// declared `name` first.
     ///
     /// Unset means channels fall back to a fresh per-generation seed, which is
     /// what every station config meant before this key existed.
@@ -160,13 +160,13 @@ pub struct StationConfig {
     pub normalization: NormalizationConfig,
 }
 
-/// Mix a station [`seed`](StationConfig::seed) with one channel's folder name
-/// into the seed that channel actually uses.
+/// Mix a station [`seed`](StationConfig::seed) with one channel's declared
+/// `name` into the seed that channel actually uses.
 ///
-/// The salt is the **folder name**, not the channel number: the folder name is
-/// the channel's identity on disk, while the number is a presentation detail
-/// (#263 makes it separately declarable), and renumbering a channel must not
-/// reshuffle it.
+/// The salt is the **name**, not the channel number: the name is the channel's
+/// identity (#414), while the number is a presentation detail (#263 makes it
+/// separately declarable), and renumbering a channel or renaming its folder
+/// must not reshuffle it.
 ///
 /// Fixed algorithms end to end — FNV-1a over the name, then the SplitMix64
 /// finalizer — rather than `DefaultHasher`, whose output is explicitly not
@@ -239,7 +239,7 @@ mod tests {
         );
     }
 
-    /// Different folder names diverge; the same folder name under a different
+    /// Different channel names diverge; the same name under a different
     /// station seed diverges too.
     #[test]
     fn derivation_separates_channels_and_stations() {

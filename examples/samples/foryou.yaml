@@ -69,6 +69,7 @@
 # proven by the `foryou_sample` acceptance test, against a hand-built
 # fixture store.
 number: 2
+name: foryou
 display_name: "For You"
 window_days: 1
 roll_interval: "60s"

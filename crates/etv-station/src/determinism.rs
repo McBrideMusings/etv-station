@@ -302,7 +302,7 @@ mod tests {
         ChannelConfig {
             number: 1,
             scoring,
-            name: None,
+            name: "test".into(),
             display_name: None,
             guide: None,
             window_days: 1,
