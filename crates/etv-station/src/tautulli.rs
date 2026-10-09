@@ -517,22 +517,15 @@ mod tests {
     }
 
     /// Run [`resolve`] under a subscriber that captures `tautulli.join`.
-    ///
-    /// **Every** test in this module goes through here, including the ones that
-    /// only assert on the returned events. `tracing` caches callsite interest
-    /// process-globally: the first time `tautulli.join` is hit with no
-    /// subscriber installed, the callsite is registered against `NoSubscriber`
-    /// and cached as `Interest::never()` — which then silently blinds a test
-    /// running concurrently on another thread that *did* install one. Keeping
-    /// every call under a subscriber means the callsite is never registered
-    /// against the no-op, so the capture cannot race.
+    /// [`crate::test_tracing`] keeps the capture safe against other test
+    /// threads hitting the same callsite with no subscriber installed.
     fn resolve_capturing(
         catalog: &Catalog,
         rows: Vec<HistoryRow>,
     ) -> (Vec<WatchEvent>, Vec<(u64, u64, u64)>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureJoins(Arc::clone(&seen)));
-        let events = tracing::subscriber::with_default(subscriber, || resolve(catalog, rows));
+        let events = crate::test_tracing::with_default(subscriber, || resolve(catalog, rows));
         let logged = seen.lock().unwrap().clone();
         (events, logged)
     }

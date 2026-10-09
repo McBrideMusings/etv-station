@@ -3740,7 +3740,7 @@ mod tests {
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureWarn(Arc::clone(&seen)));
-        let stats = tracing::subscriber::with_default(subscriber, || {
+        let stats = crate::test_tracing::with_default(subscriber, || {
             ingest_collections(&cat, std::slice::from_ref(&coll), false).unwrap()
         });
 
@@ -3792,7 +3792,7 @@ mod tests {
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureAny(Arc::clone(&seen)));
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             ingest_collections(&cat, std::slice::from_ref(&coll), false).unwrap()
         });
 

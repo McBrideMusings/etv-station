@@ -4524,7 +4524,7 @@ mod shared_history_tests {
             name,
             seen: Arc::clone(&seen),
         });
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = crate::test_tracing::set_default(subscriber);
         (seen, guard)
     }
 

@@ -2351,7 +2351,7 @@ fn capabilities() { [#{ datastore: "taste_db" }] }
         let seen = Arc::new(Mutex::new(Vec::new()));
         let subscriber =
             tracing_subscriber::registry().with(CaptureDatastoreEvents(Arc::clone(&seen)));
-        let result = tracing::subscriber::with_default(subscriber, f);
+        let result = crate::test_tracing::with_default(subscriber, f);
         let events = seen.lock().unwrap().clone();
         (result, events)
     }
@@ -2531,7 +2531,7 @@ fn audit(ctx, picks, workspace) { #{} }"#,
         let seen = Arc::new(Mutex::new(Vec::new()));
         let subscriber =
             tracing_subscriber::registry().with(CaptureDisplayNameEvents(Arc::clone(&seen)));
-        let result = tracing::subscriber::with_default(subscriber, f);
+        let result = crate::test_tracing::with_default(subscriber, f);
         let events = seen.lock().unwrap().clone();
         (result, events)
     }
