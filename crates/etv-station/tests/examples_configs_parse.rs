@@ -37,21 +37,16 @@ fn examples_dir() -> PathBuf {
         .expect("examples/ exists at the repo root")
 }
 
-/// Every `.yaml`/`.yml`/`.toml` config directly inside `dir`, sorted so a
-/// failure names the same file on every run. Not recursive: each directory
-/// under `examples/` holds one kind of config and gets its own assertion.
-fn configs_in(dir: &Path) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
-        .map(|entry| entry.expect("readable dir entry").path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| matches!(e, "yaml" | "yml" | "toml"))
-        })
-        .collect();
+/// True for a `.yaml`/`.yml`/`.toml` file.
+fn is_config(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e, "yaml" | "yml" | "toml"))
+}
+
+/// Panics when `found` is empty, then sorts it so a failure names the same
+/// file on every run.
+fn nonempty_sorted(mut found: Vec<PathBuf>, dir: &Path) -> Vec<PathBuf> {
     found.sort();
     assert!(
         !found.is_empty(),
@@ -62,19 +57,61 @@ fn configs_in(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Like [`configs_in`], but for a directory that is legitimately absent —
-/// gitignored personal content that exists only on the machine that authored
-/// it, never on a fresh clone or a git worktree (#360). Missing entirely
-/// means "nothing to check": returns empty rather than failing. A directory
-/// that *does* exist is still handed to `configs_in`, so a present-but-empty
-/// leftover or a malformed file inside it still fails loudly — the local
-/// check only stops biting when the directory is gone, not when it's broken.
+/// Every git-tracked config directly inside `dir`. Not recursive: each
+/// directory under `examples/` holds one kind of config and gets its own
+/// assertion.
+///
+/// Asks git rather than reading the directory because `examples/channels/`
+/// mixes one tracked channel with gitignored personal ones the dev station
+/// globs. Reading the directory made a hand-written personal config turn this
+/// test red in the one checkout that had it, while every worktree and fresh
+/// clone stayed green.
+fn configs_in(dir: &Path) -> Vec<PathBuf> {
+    // Without `--full-name`, paths come back relative to `dir` itself, so
+    // nothing here assumes where the git toplevel is. A hook's `GIT_DIR` or
+    // `GIT_INDEX_FILE` would point the listing at another repo or index.
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .args(["ls-files", "-z", "--", "."])
+        .output()
+        .unwrap_or_else(|e| panic!("run git ls-files in {}: {e}", dir.display()));
+    assert!(
+        output.status.success(),
+        "git ls-files in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let found = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| dir.join(String::from_utf8_lossy(name).as_ref()))
+        .filter(|path| path.parent() == Some(dir) && is_config(path))
+        .collect();
+    nonempty_sorted(found, dir)
+}
+
+/// Every config on disk directly inside `dir`, tracked or not, for a
+/// directory that is legitimately absent — gitignored personal content that
+/// exists only on the machine that authored it, never on a fresh clone or a
+/// git worktree (#360). Missing entirely means "nothing to check": returns
+/// empty rather than failing. A directory that *does* exist must hold at
+/// least one config, so a present-but-empty leftover or a malformed file
+/// inside it still fails loudly — the local check only stops biting when the
+/// directory is gone, not when it's broken.
 fn optional_configs_in(dir: &Path) -> Vec<PathBuf> {
-    if dir.is_dir() {
-        configs_in(dir)
-    } else {
-        Vec::new()
+    if !dir.is_dir() {
+        return Vec::new();
     }
+    let found = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("readable dir entry").path())
+        .filter(|path| path.is_file() && is_config(path))
+        .collect();
+    nonempty_sorted(found, dir)
 }
 
 #[test]
