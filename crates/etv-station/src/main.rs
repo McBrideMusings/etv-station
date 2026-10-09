@@ -597,6 +597,15 @@ fn check_config(config_path: &Path) -> ExitCode {
     let device_id = etv_next::DeviceIdSource::Fixed("check-config");
     let rendered = match etv_next::render_with(config_path, &opts, device_id) {
         Ok(rendered) => rendered,
+        Err(etv_next::RenderError::NoChannels { path, dropped }) => {
+            eprintln!(
+                "check-config: no channel loads from {} ({} channel config(s) dropped):",
+                path.display(),
+                dropped.len()
+            );
+            print_dropped(&dropped);
+            return ExitCode::from(1);
+        }
         Err(err) => {
             eprintln!("check-config: {err}");
             return ExitCode::from(1);
@@ -615,10 +624,14 @@ fn check_config(config_path: &Path) -> ExitCode {
         rendered.dropped.len(),
         rendered.channels
     );
-    for dropped in &rendered.dropped {
-        eprintln!("  {}: {}", dropped.config_path.display(), dropped.reason);
-    }
+    print_dropped(&rendered.dropped);
     ExitCode::from(1)
+}
+
+fn print_dropped(dropped: &[etv_station::config::DroppedChannel]) {
+    for d in dropped {
+        eprintln!("  {}: {}", d.config_path.display(), d.reason);
+    }
 }
 
 /// Generate `channel_name` twice from identical inputs and print whether the

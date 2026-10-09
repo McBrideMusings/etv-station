@@ -192,8 +192,13 @@ pub enum RenderError {
         "ETV_ACCEL=vaapi also needs ETV_VAAPI_DEVICE (e.g. /dev/dri/renderD128) and ETV_VAAPI_DRIVER (e.g. iHD); without both, every channel silently encodes in software"
     )]
     VaapiIncomplete,
-    #[error("no channels resolved from {0}")]
-    NoChannels(PathBuf),
+    #[error("no channels resolved from {} ({} channel config(s) dropped)", .path.display(), .dropped.len())]
+    NoChannels {
+        path: PathBuf,
+        /// Every channel config that was found and dropped, so a caller can
+        /// name each one rather than report an empty lineup with no cause.
+        dropped: Vec<DroppedChannel>,
+    },
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
@@ -254,7 +259,10 @@ pub fn render_with(
 ) -> Result<Rendered, RenderError> {
     let station = config::load(config_path).map_err(|e| RenderError::Config(e.to_string()))?;
     if station.channels.is_empty() {
-        return Err(RenderError::NoChannels(config_path.to_path_buf()));
+        return Err(RenderError::NoChannels {
+            path: config_path.to_path_buf(),
+            dropped: station.dropped,
+        });
     }
     let channels: Vec<ChannelRender> = station
         .channels
