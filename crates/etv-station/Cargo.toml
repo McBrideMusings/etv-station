@@ -27,6 +27,8 @@ serde_ignored = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
 sha2 = { workspace = true }
+# `--check-config` renders into a scratch directory that must not outlive it.
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tiny_http = { workspace = true }
 time = { workspace = true }
@@ -43,7 +45,6 @@ tracing-subscriber = { workspace = true }
 # through that type in tests is what makes a renamed or mistyped key a build
 # failure here instead of a wrong value nobody sees until Plex is confused.
 ersatztv = { workspace = true }
-tempfile = { workspace = true }
 # `test-util` gates tokio's pausable clock, which is how the shared watch
 # history's refresh window is tested without a real sleep.
 tokio = { workspace = true, features = ["test-util"] }

@@ -53,6 +53,16 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
         });
     }
 
+    // The daemon parses `tz` before generating anything and exits on a name it
+    // does not know, so an unknown zone belongs to the config's validity, where
+    // `--check-config` sees it, rather than surfacing first in a running station.
+    if let Err(e) = crate::tz::parse(&station.tz) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -1306,6 +1316,30 @@ mod tests {
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
+    }
+
+    /// The daemon exits at startup on a zone it cannot parse, so the config is
+    /// invalid — not merely a value the daemon will trip over later.
+    #[test]
+    fn rejects_an_unknown_tz() {
+        let s = StationConfig {
+            overlay: None,
+            seed: None,
+            tz: "America/Atlantis".into(),
+            output_base: PathBuf::from("out"),
+            channels: vec!["channels/a.yaml".into()],
+            source_roots: vec![],
+            identity_roots: vec![],
+            catalog_path: None,
+            artwork_cache_dir: None,
+            catalog_refresh_secs: 900,
+            full_sweep_after_secs: 86_400,
+            device_id: None,
+            ffmpeg: crate::config::station::default_ffmpeg(),
+            normalization: crate::config::station::empty_normalization_for_test(),
+        };
+        let err = validate_station(&dummy_path(), &s).unwrap_err();
+        assert!(format!("{err}").contains("America/Atlantis"), "err = {err}");
     }
 
     #[test]

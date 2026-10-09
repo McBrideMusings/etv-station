@@ -41,7 +41,7 @@ use ersatztv_channel::config::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::config;
+use crate::config::{self, DroppedChannel};
 use ersatztv_playout::playout::OverlaySpec as PlayoutOverlaySpec;
 
 /// Which encoder every channel is built to use — station-wide; there is no
@@ -168,6 +168,10 @@ pub struct Rendered {
     /// when Plex shows a tuner that isn't the expected one, the container log
     /// is the first place anyone looks.
     pub device_id: String,
+    /// Channel configs the station found and left out of this lineup. The
+    /// render still succeeds — one bad channel costs one channel — so a caller
+    /// that must refuse on any (`--check-config`) reads it here.
+    pub dropped: Vec<DroppedChannel>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -226,8 +230,28 @@ pub struct ChannelRender {
     pub overlay: Option<PlayoutOverlaySpec>,
 }
 
+/// Where [`render_with`] gets the tuner identity it publishes.
+pub enum DeviceIdSource<'a> {
+    /// The configured id, else the one stored beside the station config,
+    /// minting and storing one when neither exists.
+    Resolve,
+    /// This value, read and written nowhere. For a render whose output is
+    /// thrown away (`--check-config`), which must neither mint a real identity
+    /// nor need write access to the config directory.
+    Fixed(&'a str),
+}
+
 /// Load the station config and render ETV-next's config from its channels.
 pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, RenderError> {
+    render_with(config_path, opts, DeviceIdSource::Resolve)
+}
+
+/// [`render`], with the tuner identity's source chosen by the caller.
+pub fn render_with(
+    config_path: &Path,
+    opts: &RenderOptions,
+    device_id: DeviceIdSource<'_>,
+) -> Result<Rendered, RenderError> {
     let station = config::load(config_path).map_err(|e| RenderError::Config(e.to_string()))?;
     if station.channels.is_empty() {
         return Err(RenderError::NoChannels(config_path.to_path_buf()));
@@ -245,17 +269,24 @@ pub fn render(config_path: &Path, opts: &RenderOptions) -> Result<Rendered, Rend
     // The station config is the only place the tuner identity can come from,
     // and this is the only entry point that has it. The minted id is kept beside
     // that config file — see `resolve_device_id` for why not on the data volume.
-    let device_id = resolve_device_id(
-        station.station.device_id.as_deref(),
-        config_dir(config_path),
-    )?;
-    render_channels(
+    let device_id = match device_id {
+        DeviceIdSource::Resolve => resolve_device_id(
+            station.station.device_id.as_deref(),
+            config_dir(config_path),
+        )?,
+        DeviceIdSource::Fixed(id) => id.to_string(),
+    };
+    let rendered = render_channels(
         &channels,
         &station.station.ffmpeg,
         &station.station.normalization,
         opts,
         &device_id,
-    )
+    )?;
+    Ok(Rendered {
+        dropped: station.dropped,
+        ..rendered
+    })
 }
 
 /// The directory holding the station config, which is where state that must
@@ -448,6 +479,7 @@ pub fn render_channels(
         lineup_path,
         channels: channels.len(),
         device_id: device_id.to_string(),
+        dropped: Vec::new(),
     })
 }
 

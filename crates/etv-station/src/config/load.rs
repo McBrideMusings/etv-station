@@ -15,6 +15,18 @@ pub struct Station {
     pub config_path: PathBuf,
     pub station: StationConfig,
     pub channels: Vec<LoadedChannel>,
+    /// Every channel config that was found but kept out of `channels`, with
+    /// why. The daemon logs these and serves the rest; `--check-config`
+    /// refuses on any, because a deploy that drops a channel is a deploy that
+    /// takes it off the air.
+    pub dropped: Vec<DroppedChannel>,
+}
+
+/// A channel config the loader found and left out of the lineup.
+#[derive(Debug, Clone)]
+pub struct DroppedChannel {
+    pub config_path: PathBuf,
+    pub reason: String,
 }
 
 #[derive(Debug)]
@@ -97,6 +109,7 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
     // lineup, rather than propagated with `?` and aborting every other
     // channel's load.
     let mut channels = Vec::with_capacity(channel_paths.len());
+    let mut dropped = Vec::new();
     for channel_path in channel_paths {
         match load_one_channel(&station, &base, &channel_path, env) {
             Ok(channel) => channels.push(channel),
@@ -108,16 +121,21 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
                     "channel config failed to load and will not appear in the lineup; \
                      every other channel still serves"
                 );
+                dropped.push(DroppedChannel {
+                    config_path: channel_path,
+                    reason: e.to_string(),
+                });
             }
         }
     }
 
-    reject_collisions(&mut channels);
+    dropped.extend(reject_collisions(&mut channels));
 
     Ok(Station {
         config_path: station_path.to_path_buf(),
         station,
         channels,
+        dropped,
     })
 }
 
@@ -176,7 +194,10 @@ fn load_one_channel(
 /// channel's own file. Both checks read the full roster before anything drops,
 /// so a channel whose name collides with a channel also dropped for its number
 /// still drops.
-fn reject_collisions(channels: &mut Vec<LoadedChannel>) {
+///
+/// Returns one [`DroppedChannel`] per channel removed. A channel that collides
+/// on both number and name is reported once, under its number.
+fn reject_collisions(channels: &mut Vec<LoadedChannel>) -> Vec<DroppedChannel> {
     let mut drop = colliding(
         channels,
         |c| c.config.number.to_string(),
@@ -188,9 +209,10 @@ fn reject_collisions(channels: &mut Vec<LoadedChannel>) {
                 "channels declare the same number and were all dropped from the lineup; \
                  every other channel still serves"
             );
+            format!("number {number} is declared by {paths}")
         },
     );
-    drop.extend(colliding(
+    for (idx, reason) in colliding(
         channels,
         |c| c.name.clone(),
         |name, paths| {
@@ -201,33 +223,44 @@ fn reject_collisions(channels: &mut Vec<LoadedChannel>) {
                 "channels declare the same name and were all dropped from the lineup; \
                  every other channel still serves"
             );
+            format!("name {name:?} is declared by {paths}")
         },
-    ));
-
-    if drop.is_empty() {
-        return;
+    ) {
+        drop.entry(idx).or_insert(reason);
     }
+
+    let mut dropped = Vec::with_capacity(drop.len());
     let mut idx = 0;
-    channels.retain(|_| {
-        let keep = !drop.contains(&idx);
+    channels.retain(|channel| {
+        let reason = drop.remove(&idx);
         idx += 1;
-        keep
+        match reason {
+            Some(reason) => {
+                dropped.push(DroppedChannel {
+                    config_path: channel.config_path.clone(),
+                    reason,
+                });
+                false
+            }
+            None => true,
+        }
     });
+    dropped
 }
 
-/// Indices of every channel sharing its `key` with another, calling
-/// `report(key, paths)` once per shared key.
+/// Every channel sharing its `key` with another, by index, mapped to the
+/// reason `report(key, paths)` returns — called once per shared key.
 fn colliding(
     channels: &[LoadedChannel],
     key: impl Fn(&LoadedChannel) -> String,
-    report: impl Fn(&str, &str),
-) -> HashSet<usize> {
+    report: impl Fn(&str, &str) -> String,
+) -> HashMap<usize, String> {
     let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, channel) in channels.iter().enumerate() {
         by_key.entry(key(channel)).or_default().push(idx);
     }
 
-    let mut drop: HashSet<usize> = HashSet::new();
+    let mut drop: HashMap<usize, String> = HashMap::new();
     for (k, indices) in &by_key {
         if indices.len() < 2 {
             continue;
@@ -236,8 +269,10 @@ fn colliding(
             .iter()
             .map(|&i| channels[i].config_path.display().to_string())
             .collect();
-        report(k, &paths.join(", "));
-        drop.extend(indices.iter().copied());
+        let reason = report(k, &paths.join(", "));
+        for &i in indices {
+            drop.insert(i, reason.clone());
+        }
     }
     drop
 }
@@ -1598,6 +1633,7 @@ mod tests {
         let station = load_with_env(&station_path, &no_env).expect("station still loads");
         assert_eq!(station.channels.len(), 1, "only b.yaml should load");
         assert_eq!(station.channels[0].name, "b");
+        assert_eq!(dropped_files(&station), ["a.yaml"]);
     }
 
     /// #263 rule 2: two channels declaring the same number both drop out;
@@ -1618,6 +1654,12 @@ mod tests {
         assert_eq!(station.channels.len(), 1, "only c.yaml should survive");
         assert_eq!(station.channels[0].name, "c");
         assert_eq!(station.channels[0].config.number, 2);
+        assert_eq!(dropped_files(&station), ["a.yaml", "b.yaml"]);
+        assert!(
+            station.dropped[0]
+                .reason
+                .starts_with("number 1 is declared by")
+        );
     }
 
     /// #263 rule 3: numbers need not be contiguous — a lineup with gaps loads
@@ -1700,5 +1742,23 @@ mod tests {
         let station = load_with_env(&station_path, &no_env).expect("station still loads");
         let names: Vec<&str> = station.channels.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["d"]);
+        assert_eq!(dropped_files(&station), ["a.yaml", "b.yaml", "c.yaml"]);
+    }
+
+    /// File names of every dropped channel config, sorted.
+    fn dropped_files(station: &Station) -> Vec<String> {
+        let mut files: Vec<String> = station
+            .dropped
+            .iter()
+            .map(|d| {
+                d.config_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        files.sort();
+        files
     }
 }

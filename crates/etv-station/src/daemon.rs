@@ -5281,16 +5281,18 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         assert!(db.exists());
     }
 
-    #[tokio::test]
-    async fn prepare_generation_rejects_invalid_timezone() {
-        // A non-empty-but-bogus tz passes `config::load`'s `validate_station`
-        // (which only checks non-empty) and is caught by the timezone parse in
-        // `prepare_generation` — the gate that, on reload, reverts to the
-        // previous config instead of running a broken one. tz is parsed before
-        // the mkdir, so this never touches the filesystem.
+    #[test]
+    fn config_load_rejects_invalid_timezone() {
+        // A non-empty-but-bogus tz fails `config::load` itself, so a reload
+        // keeps the previous config (`config.reload_failed`) and a deploy's
+        // `--check-config` refuses it, rather than either reaching
+        // `prepare_generation`.
         let (_dir, path) = write_station("Totally/Bogus/Zone");
-        let station = crate::config::load(&path).expect("bogus tz still parses as config");
-        assert!(prepare_generation(&station).await.is_err());
+        let err = crate::config::load(&path).expect_err("bogus tz must not load");
+        assert!(
+            err.to_string().contains("Totally/Bogus/Zone"),
+            "err = {err}"
+        );
     }
 
     /// The bug this guards: SIGHUP only ever reached the long-running daemon

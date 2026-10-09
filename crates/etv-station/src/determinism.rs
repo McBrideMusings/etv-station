@@ -344,6 +344,7 @@ mod tests {
                 output_folder: PathBuf::from("/tmp/out").join(name),
                 config,
             }],
+            dropped: Vec::new(),
         }
     }
 

@@ -42,6 +42,19 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     render_etv_next: Option<PathBuf>,
 
+    /// Do everything the container's start does to the config — load it with
+    /// this process's environment and render ETV-next's config from it, into
+    /// a throwaway directory — then exit non-zero if that would fail OR would
+    /// leave any channel config out of the lineup, naming each one and why.
+    ///
+    /// `--render-etv-next` deliberately serves the channels that load and
+    /// drops the rest, which is right for a running station and wrong for a
+    /// deploy: `admin deploy`'s preflight runs this from the new image,
+    /// before the running container is replaced, so a config the new image
+    /// cannot read refuses the deploy instead of taking channels off the air.
+    #[arg(long)]
+    check_config: bool,
+
     /// Generate the named channel twice from identical inputs (same catalog
     /// snapshot, seed, and resume state) and report whether the two
     /// schedules match, then exit — a debug check for a plugin that breaks
@@ -243,6 +256,11 @@ fn main() -> ExitCode {
     if let Some(dir) = cli.render_etv_next.as_deref() {
         init_tracing(cli.log_format);
         return render_etv_next(config, dir);
+    }
+
+    if cli.check_config {
+        init_tracing(cli.log_format);
+        return check_config(config);
     }
 
     if let Some(channel) = cli.check_determinism.as_deref() {
@@ -554,6 +572,53 @@ fn render_etv_next(config_path: &Path, out_dir: &Path) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The strict twin of [`render_etv_next`]: the same load and render, into a
+/// throwaway directory, but any dropped channel is a failure. See the
+/// `--check-config` flag for why the two differ. It writes nothing outside
+/// that directory — not even `.device_id` — so it runs against a read-only
+/// config mount.
+fn check_config(config_path: &Path) -> ExitCode {
+    let out_dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("check-config: cannot create a scratch directory: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let opts = match etv_next::RenderOptions::from_env(out_dir.path().to_path_buf()) {
+        Ok(opts) => opts,
+        Err(err) => {
+            eprintln!("check-config: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let device_id = etv_next::DeviceIdSource::Fixed("check-config");
+    let rendered = match etv_next::render_with(config_path, &opts, device_id) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            eprintln!("check-config: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    if rendered.dropped.is_empty() {
+        println!(
+            "check-config: {} channel(s) load from {}",
+            rendered.channels,
+            config_path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "check-config: {} channel config(s) would be left out of the lineup ({} load):",
+        rendered.dropped.len(),
+        rendered.channels
+    );
+    for dropped in &rendered.dropped {
+        eprintln!("  {}: {}", dropped.config_path.display(), dropped.reason);
+    }
+    ExitCode::from(1)
 }
 
 /// Generate `channel_name` twice from identical inputs and print whether the

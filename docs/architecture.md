@@ -135,6 +135,14 @@ The failure separation that two containers used to provide is kept by the entryp
 
 What is genuinely given up: independent resource limits and independent restart cadence for the two halves.
 
+### A deploy checks the config before it replaces the container
+
+The entrypoint's render serves the channels that load and drops the rest, which is right for a running station and wrong for a deploy: a new image that cannot read the deployed config would replace a working container and come up with channels missing, or not at all. So `admin deploy image` runs `etv-station --check-config` from the **new** image first, on the host, against the host's config mounted read-only and with the container's own env. `--check-config` is the same load and render into a throwaway directory, except that any channel left out of the lineup is a failure, named with its reason. It writes nothing outside that directory. A non-zero exit refuses the deploy with the old container still serving.
+
+Before replacing a healthy container, the deploy also tags its image `etv-station:previous`. The post-deploy prune of dangling images waits until the new container answers `/channels.m3u`, and the tag survives the prune either way. `/tmp/etv-station-restore.sh` on the host starts that tag.
+
+Both checks are wired in the untracked `admin.toml`'s `[docker_run.preflight]` and `[docker_run.health]`.
+
 ## The media has to be mounted, not streamed
 
 The catalog is read from Plex over HTTP, but the *media* never is. Every `entry_sources` row carries a `playback_path`, and the station hands it to the player as a local file — 86,232 of 86,232 rows in the production catalog are Plex-sourced paths under `/media`, resolved because the same share is mounted into the container at the same prefix.
