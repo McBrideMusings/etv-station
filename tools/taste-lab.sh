@@ -9,7 +9,8 @@
 # unusable. See the tool's own module doc for the rest of that story.
 #
 # Reuses tools/taste-debug.sh's local catalog/plexdb cache
-# (tmp/claude/scratchpad/taste-debug/) rather than a second one, and exports
+# (tmp/claude/scratchpad/taste-debug/, kept in step with the host by
+# tools/taste-cache.sh) rather than a second one, and exports
 # PLEXDB_SNAPSHOT_PATH so every pool's own `datastores: [{ path:
 # "${PLEXDB_SNAPSHOT_PATH}" }]` resolves to that local copy instead of the
 # production mount .env normally points it at.
@@ -26,19 +27,7 @@ CACHE_DIR="tmp/claude/scratchpad/taste-debug"
 DEFAULT_CATALOG="$CACHE_DIR/catalog.db"
 DEFAULT_PLEXDB="$CACHE_DIR/plexdb.snapshot.db"
 
-missing=()
-[ -f "$DEFAULT_CATALOG" ] || missing+=("catalog.db")
-[ -f "$DEFAULT_PLEXDB" ] || missing+=("plexdb.snapshot.db")
-
-if [ "${#missing[@]}" -gt 0 ]; then
-  echo "Missing local copy: ${missing[*]}" >&2
-  echo "Fetch from the Unraid host first:" >&2
-  echo "  mkdir -p $CACHE_DIR" >&2
-  for name in "${missing[@]}"; do
-    echo "  scp ${UNRAID_USER:-root}@${UNRAID_HOST:?set UNRAID_HOST in .env}:/mnt/user/appdata/etv-station/data/$name $CACHE_DIR/$name" >&2
-  done
-  exit 1
-fi
+bash tools/taste-cache.sh catalog.db plexdb.snapshot.db || exit 1
 
 export PLEXDB_SNAPSHOT_PATH="$DEFAULT_PLEXDB"
 

@@ -25,9 +25,9 @@
 # Neither database exists on a dev Mac; both live on the Unraid host at
 # /mnt/user/appdata/etv-station/data/{catalog.db,plexdb.snapshot.db}. This
 # defaults --catalog/--plexdb to a local read-only copy under
-# tmp/claude/scratchpad/taste-debug/ and prints the exact scp commands to
-# fetch one when it's missing, rather than handing a raw sqlite "unable to
-# open database file" error to a scorer bug that has nothing to do with it.
+# tmp/claude/scratchpad/taste-debug/, which tools/taste-cache.sh fetches when
+# it's missing or its schema has fallen behind the host's, rather than handing
+# a raw sqlite error to a scorer bug that has nothing to do with it.
 set -u
 
 if [ -f .env ]; then
@@ -129,25 +129,21 @@ if resolved_channel="$(flag_value --channel "${args[@]}")"; then
   echo "taste-debug: channel $resolved_channel"
 fi
 
-missing=()
+fetch=()
 if ! has_flag --catalog "${args[@]}"; then
-  [ -f "$DEFAULT_CATALOG" ] || missing+=("catalog.db")
+  fetch+=("catalog.db")
   args+=(--catalog "$DEFAULT_CATALOG")
 fi
 if ! has_flag --plexdb "${args[@]}"; then
-  [ -f "$DEFAULT_PLEXDB" ] || missing+=("plexdb.snapshot.db")
+  fetch+=("plexdb.snapshot.db")
   args+=(--plexdb "$DEFAULT_PLEXDB")
 fi
 
-if [ "${#missing[@]}" -gt 0 ]; then
-  echo "Missing local copy: ${missing[*]}" >&2
-  echo "Fetch from the Unraid host first:" >&2
-  echo "  mkdir -p $CACHE_DIR" >&2
-  for name in "${missing[@]}"; do
-    echo "  scp ${UNRAID_USER:-root}@${UNRAID_HOST:?set UNRAID_HOST in .env}:/mnt/user/appdata/etv-station/data/$name $CACHE_DIR/$name" >&2
-  done
-  echo "Or pass your own --catalog/--plexdb path." >&2
-  exit 1
+if [ "${#fetch[@]}" -gt 0 ]; then
+  bash tools/taste-cache.sh "${fetch[@]}" || {
+    echo "Or pass your own --catalog/--plexdb path." >&2
+    exit 1
+  }
 fi
 
 exec cargo run --quiet --bin taste-debug -- "${args[@]}"
