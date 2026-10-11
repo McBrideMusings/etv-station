@@ -352,18 +352,14 @@ fn main() -> ExitCode {
 /// the process CWD), so a caller polling these paths watches exactly the daemon's
 /// output. Config-load failure goes to stderr with a non-zero exit.
 fn list_folders(config_path: &Path) -> ExitCode {
-    match config::load(config_path) {
-        Ok(station) => {
-            for ch in &station.channels {
-                println!("{}", ch.output_folder.display());
-            }
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("failed to load configuration: {err}");
-            ExitCode::from(1)
-        }
+    let station = match load_for("list-folders", config_path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    for ch in &station.channels {
+        println!("{}", ch.output_folder.display());
     }
+    ExitCode::SUCCESS
 }
 
 /// Walk a directory of plugin scripts, print one line per script, and exit
@@ -502,10 +498,20 @@ fn resolve_overlay_for(config_path: &Path, channel_name: &str) -> Result<String,
         for entry in entries.flatten() {
             // One unreadable or unnamed channel file costs that channel, not
             // the preview of every other — the loader drops it the same way.
-            let Ok(probe) = read_probe(&entry) else {
-                continue;
+            // Named on stderr so the skipped channel isn't simply absent from
+            // the "Known:" list; stdout carries only the YAML (#420).
+            let probe = match read_probe(&entry) {
+                Ok(probe) => probe,
+                Err(err) => {
+                    eprintln!("dump-overlay: skipping {err}");
+                    continue;
+                }
             };
             let Some(name) = probe.name.as_deref().map(str::trim).map(str::to_string) else {
+                eprintln!(
+                    "dump-overlay: skipping {}: declares no `name`",
+                    entry.display()
+                );
                 continue;
             };
             if name == channel_name {
@@ -630,8 +636,53 @@ fn check_config(config_path: &Path) -> ExitCode {
 
 fn print_dropped(dropped: &[etv_station::config::DroppedChannel]) {
     for d in dropped {
-        eprintln!("  {}: {}", d.config_path.display(), d.reason);
+        eprintln!("{}", dropped_line(d));
     }
+}
+
+fn dropped_line(d: &etv_station::config::DroppedChannel) -> String {
+    format!("  {}: {}", d.config_path.display(), d.reason)
+}
+
+/// Load the station config for a one-shot mode, saying on stderr which channel
+/// configs the loader left out.
+///
+/// The loader drops a bad channel rather than failing the station (#263), and
+/// its `channel.load_failed` event goes through tracing — which these modes
+/// never install, because a fmt subscriber writes to stdout and `--list-folders`'
+/// stdout is parsed by the container entrypoint. Without this notice a dropped
+/// channel simply isn't there, and "the station has 58" reads as the station's
+/// real size (#420).
+fn load_for(prefix: &str, config_path: &Path) -> Result<config::Station, ExitCode> {
+    match config::load(config_path) {
+        Ok(station) => {
+            if let Some(notice) = dropped_notice(prefix, &station) {
+                eprintln!("{notice}");
+            }
+            Ok(station)
+        }
+        Err(err) => {
+            eprintln!("{prefix}: failed to load configuration: {err}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// The stderr notice [`load_for`] prints, or `None` when every channel loaded.
+fn dropped_notice(prefix: &str, station: &config::Station) -> Option<String> {
+    if station.dropped.is_empty() {
+        return None;
+    }
+    let mut notice = format!(
+        "{prefix}: {} channel config(s) failed to load and are left out ({} load):",
+        station.dropped.len(),
+        station.channels.len(),
+    );
+    for d in &station.dropped {
+        notice.push('\n');
+        notice.push_str(&dropped_line(d));
+    }
+    Some(notice)
 }
 
 /// Generate `channel_name` twice from identical inputs and print whether the
@@ -646,12 +697,9 @@ fn print_dropped(dropped: &[etv_station::config::DroppedChannel]) {
 /// station prints only the total. Exits non-zero when the pass itself fails —
 /// finding nothing to repair is success, not failure.
 fn backfill_history(config_path: &Path, dry_run: bool) -> ExitCode {
-    let station = match config::load(config_path) {
+    let station = match load_for("backfill-history", config_path) {
         Ok(s) => s,
-        Err(err) => {
-            eprintln!("backfill-history: failed to load configuration: {err}");
-            return ExitCode::from(1);
-        }
+        Err(code) => return code,
     };
 
     // Read-only: the repair reads `show_id` per entry and writes nothing here.
@@ -740,12 +788,9 @@ fn backfill_history(config_path: &Path, dry_run: bool) -> ExitCode {
 /// what the guide and the TV show. A prefix that matches more than one channel
 /// is refused rather than guessed at.
 fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
-    let station = match config::load(config_path) {
+    let station = match load_for("refresh-channel", config_path) {
         Ok(s) => s,
-        Err(err) => {
-            eprintln!("refresh-channel: failed to load configuration: {err}");
-            return ExitCode::from(1);
-        }
+        Err(code) => return code,
     };
 
     let matched = match resolve_channels(&station, target) {
@@ -860,12 +905,9 @@ fn audit(
     format: ReportFormat,
     audit_out: Option<&Path>,
 ) -> ExitCode {
-    let station = match config::load(config_path) {
+    let station = match load_for("audit", config_path) {
         Ok(s) => s,
-        Err(err) => {
-            eprintln!("audit: failed to load configuration: {err}");
-            return ExitCode::from(1);
-        }
+        Err(code) => return code,
     };
 
     let matched = match resolve_channels(&station, target) {
@@ -991,12 +1033,9 @@ fn channel_listing(station: &config::Station) -> Vec<ChannelListing> {
 /// Load the station config and print `--audit --list`'s channel listing,
 /// text or JSON per `format`.
 fn list_channels(config_path: &Path, format: ReportFormat) -> ExitCode {
-    let station = match config::load(config_path) {
+    let station = match load_for("audit", config_path) {
         Ok(s) => s,
-        Err(err) => {
-            eprintln!("audit: failed to load configuration: {err}");
-            return ExitCode::from(1);
-        }
+        Err(code) => return code,
     };
 
     let listing = channel_listing(&station);
@@ -1069,12 +1108,9 @@ fn divergence_messages(report: &etv_station::determinism::DeterminismReport) -> 
 }
 
 fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
-    let mut station = match config::load(config_path) {
+    let mut station = match load_for("check-determinism", config_path) {
         Ok(s) => s,
-        Err(err) => {
-            eprintln!("check-determinism: failed to load configuration: {err}");
-            return ExitCode::from(1);
-        }
+        Err(code) => return code,
     };
     match etv_station::determinism::check(&mut station, channel_name) {
         Ok(report) if report.is_identical() => {
@@ -1104,12 +1140,9 @@ fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
 /// code is non-zero when anything mismatches, so this can run as a check
 /// rather than be read by eye.
 fn reconcile_plexdb_cmd(config_path: &Path, plexdb_path: &Path) -> ExitCode {
-    let station = match config::load(config_path) {
+    let station = match load_for("reconcile-plexdb", config_path) {
         Ok(s) => s,
-        Err(err) => {
-            eprintln!("reconcile-plexdb: failed to load configuration: {err}");
-            return ExitCode::from(1);
-        }
+        Err(code) => return code,
     };
     let Some(catalog_path) = station.station.catalog_path.clone() else {
         eprintln!(
@@ -1276,6 +1309,29 @@ mod tests {
             let listed = listing.iter().find(|c| c.name == ch.name).unwrap();
             assert_eq!(listed.number, ch.config.number);
         }
+    }
+
+    /// A one-shot mode names every channel config the loader dropped, with its
+    /// path and reason, and stays silent when all of them loaded (#420).
+    #[test]
+    fn dropped_notice_names_each_dropped_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_channel_toml(dir.path(), "a.toml", 1, None);
+        write_station_toml(dir.path(), &["a.toml"]);
+        let station = config::load(&dir.path().join("station.toml")).unwrap();
+        assert_eq!(dropped_notice("audit", &station), None);
+
+        std::fs::write(dir.path().join("b.toml"), "name = \"b\"\n").unwrap();
+        write_station_toml(dir.path(), &["a.toml", "b.toml"]);
+        let station = config::load(&dir.path().join("station.toml")).unwrap();
+        let notice = dropped_notice("audit", &station).expect("b.toml was dropped");
+        assert!(
+            notice.starts_with(
+                "audit: 1 channel config(s) failed to load and are left out (1 load):"
+            ),
+            "{notice}"
+        );
+        assert!(notice.contains("b.toml: "), "{notice}");
     }
 
     /// When entries differ, the output reports the entry divergence once.
