@@ -388,9 +388,13 @@ back to a freeze that happened minutes earlier. On this Mac it can also fail
 with `CoreDeviceCLISupport.DiagnoseError error 0` on every device, a
 `--dry-run-only` included.
 
-`sudo log collect --device-udid <UDID>` (or `--device-name`) is no fallback for
-the Apple TV: run as root it fails with `failed to create archive: Device not
-configured (6)`, because the Apple TV is paired over the network, not attached.
+`sudo log collect --device-udid <UDID>` (or `--device-name`) is no fallback
+here either: run as root it fails with `failed to create archive: Device not
+configured (6)` against both the Apple TV and the iPhone, each of which
+`devicectl device info details` reports as `transportType: localNetwork`. Why is
+unknown; no source says log collection over the network is unsupported, and
+Apple publishes tvOS console-log instructions (sign-in required) under
+https://developer.apple.com/bug-reporting/profiles-and-logs/?platform=tvos
 Root comes from `SUDO_ASKPASS=<script running osascript display dialog with
 hidden answer> sudo -A …`; `! sudo -v` has no terminal to read a password from.
 With both routes down, test on the device by changing what the server sends
