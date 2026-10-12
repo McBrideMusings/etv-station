@@ -65,6 +65,7 @@ use etv_station::config::{self, DatastoreGrant, Pool};
 use etv_station::profile::ProfileEntry;
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use etv_station::tautulli::{self, HistoryScope};
+use etv_station::tune_in_still::TuneInStill;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
@@ -305,6 +306,10 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
             return;
         }
         (tiny_http::Method::Get, "/api/review") => api_review(state, &query),
+        (tiny_http::Method::Get, "/api/review/still") => {
+            serve_review_still(state, request, &query);
+            return;
+        }
         (tiny_http::Method::Get, "/api/channels") => Ok((200, api_channels(state))),
         (tiny_http::Method::Post, "/api/select") => api_select(state, &body),
         (tiny_http::Method::Post, "/api/profile/add") => api_profile_add(state, &body),
@@ -334,6 +339,13 @@ fn respond_json(request: tiny_http::Request, status: u16, body: &Value) {
     let response = tiny_http::Response::from_string(text)
         .with_status_code(status)
         .with_header(header);
+    let _ = request.respond(response);
+}
+
+fn respond_jpeg(request: tiny_http::Request, body: Vec<u8>) {
+    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..])
+        .expect("static header");
+    let response = tiny_http::Response::from_data(body).with_header(header);
     let _ = request.respond(response);
 }
 
@@ -1268,6 +1280,13 @@ struct ReviewState {
     /// path and dropped when the file's mtime changes, so a review does not
     /// ask Tautulli again on every request.
     accounts: HashMap<PathBuf, (std::time::SystemTime, Option<i64>)>,
+    /// Every tune-in still a review has offered, keyed by the file name its
+    /// URL carries, so `/api/review/still` renders it on first request.
+    stills: HashMap<String, TuneInStill>,
+    /// Where rendered stills are kept. A still's file name is a digest of
+    /// everything that decides it and the directory names this binary's
+    /// build, so a file here is never stale.
+    still_dir: PathBuf,
 }
 
 impl ReviewState {
@@ -1278,6 +1297,18 @@ impl ReviewState {
             library: None,
             previous: HashMap::new(),
             accounts: HashMap::new(),
+            stills: HashMap::new(),
+            // One directory per build of this binary, so a rebuilt renderer
+            // never serves a still the previous one drew.
+            still_dir: std::env::temp_dir().join("taste-lab-stills").join(
+                std::env::current_exe()
+                    .and_then(|p| p.metadata())
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -1421,7 +1452,13 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .collect();
     let mut entries: HashMap<String, Option<CatalogEntry>> = HashMap::new();
     let mut airings: Vec<etv_station::review::ReviewAiring> = Vec::new();
+    let mut simulated: Vec<&etv_station::simulate::SimulatedAiring> = Vec::new();
     for a in sim.generations.iter().flat_map(|g| &g.airings) {
+        // Every airing, past the span's end too, so the last one in the span
+        // still has a successor for its tune-in still's NEXT card. Airings
+        // run in time order, so `simulated[i]` is `airings[i]` for each `i`
+        // the span keeps.
+        simulated.push(a);
         if a.start >= end {
             continue;
         }
@@ -1447,7 +1484,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         });
     }
 
-    let review = build_review(state, &station, lc, &airings, start, end)?;
+    let review = build_review(state, &station, lc, &airings, &simulated, start, end)?;
     let summary = comparable_numbers(&review);
     let since_last = state.review.previous.insert(key.clone(), summary.clone());
     let since_last_json = since_last.map(|old| {
@@ -1758,6 +1795,7 @@ fn build_review(
     station: &config::Station,
     lc: &config::LoadedChannel,
     airings: &[etv_station::review::ReviewAiring],
+    simulated: &[&etv_station::simulate::SimulatedAiring],
     start: time::OffsetDateTime,
     end: time::OffsetDateTime,
 ) -> Result<Value, String> {
@@ -1802,21 +1840,31 @@ fn build_review(
         .collect();
 
     let seed = lc.config.seed.unwrap_or(0);
-    let samples: Vec<Value> = review::tune_in_samples(airings, start, end, seed, TUNE_IN_SAMPLES)
+    let mut samples: Vec<Value> = Vec::new();
+    for (n, t) in review::tune_in_samples(airings, start, end, seed, TUNE_IN_SAMPLES)
         .into_iter()
         .enumerate()
-        .map(|(n, t)| {
-            let next: Vec<usize> = (t.index + 1..airings.len()).take(2).collect();
-            json!({
-                "n": n + 1,
-                "at": t.at.unix_timestamp(),
-                "index": t.index,
-                "minutes_in": t.into.whole_minutes(),
-                "minutes_total": airings[t.index].duration.whole_minutes(),
-                "next": next,
-            })
-        })
-        .collect();
+    {
+        let next: Vec<usize> = (t.index + 1..airings.len()).take(2).collect();
+        let still = offer_still(
+            state,
+            station,
+            lc,
+            simulated[t.index],
+            simulated.get(t.index + 1).copied(),
+            t.into,
+            n + 1,
+        );
+        samples.push(json!({
+            "n": n + 1,
+            "at": t.at.unix_timestamp(),
+            "index": t.index,
+            "minutes_in": t.into.whole_minutes(),
+            "minutes_total": airings[t.index].duration.whole_minutes(),
+            "next": next,
+            "still": still,
+        }));
+    }
 
     let distinct = airings
         .iter()
@@ -1850,6 +1898,132 @@ fn build_review(
         "overlap": overlap,
         "samples": samples,
     }))
+}
+
+/// One tune-in sample's still, as the page reads it: `{url}` when there is a
+/// media file to grab a frame from, else `{unavailable, path?}` naming why
+/// not. Registers the still so its URL renders it on first request.
+fn offer_still(
+    state: &mut AppState,
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+    airing: &etv_station::simulate::SimulatedAiring,
+    next: Option<&etv_station::simulate::SimulatedAiring>,
+    into: time::Duration,
+    n: usize,
+) -> Value {
+    let sources = match state.catalog.sources_for(&airing.id) {
+        Ok(sources) => sources,
+        Err(e) => return json!({ "unavailable": format!("Catalog error: {e}") }),
+    };
+    let Some(source) = etv_station::resolve::pick_playback_source(&sources) else {
+        return json!({ "unavailable": "No media file in the catalog" });
+    };
+    let from = std::env::var("MEDIA_PATH_FROM").unwrap_or_default();
+    let to = std::env::var("MEDIA_PATH_TO").unwrap_or_default();
+    let media = PathBuf::from(etv_station::catalog::ingest::plex::translate_path(
+        &source.playback_path,
+        &from,
+        &to,
+    ));
+    if !media.exists() {
+        // With no remap there is no share to be unmounted, only a path
+        // that names nothing.
+        let unmounted = !to.is_empty() && !Path::new(&to).is_dir();
+        let why = if unmounted {
+            "Media not mounted"
+        } else {
+            "Media file not found"
+        };
+        return json!({ "unavailable": why, "path": media.display().to_string() });
+    }
+
+    let overlay = lc.overlays.for_block(airing.block).cloned();
+    let video = &station.station.normalization.video;
+    let canvas = match (video.width, video.height, &overlay) {
+        (Some(w), Some(h), _) => (w, h),
+        (_, _, Some(spec)) => (spec.width, spec.height),
+        _ => (1280, 720),
+    };
+    let still = TuneInStill {
+        media,
+        at_secs: into.as_seconds_f64(),
+        canvas,
+        overlay,
+        program: etv_station::tune_in_still::program_context(airing, next, into),
+    };
+    let channel: String = channel_key(&lc.config_path)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let id = format!(
+        "{channel}-s{}-n{n}-{}.jpg",
+        lc.config.seed.unwrap_or(0),
+        still.digest()
+    );
+    state.review.stills.insert(id.clone(), still);
+    json!({ "url": format!("/api/review/still?id={id}") })
+}
+
+/// `GET /api/review/still?id=…`: the still a review offered under `id`,
+/// rendered on first request and served from the still directory after. The
+/// render runs on its own thread, which answers the request, so a slow media
+/// read holds up that one image and not the rest of the tool. An id no review
+/// offered is a 404; a render that fails is a 500 naming why.
+fn serve_review_still(state: &AppState, request: tiny_http::Request, query: &str) {
+    let params = parse_query(query);
+    let Some((id, still)) = params
+        .get("id")
+        .and_then(|id| state.review.stills.get(id).map(|s| (id.clone(), s.clone())))
+    else {
+        respond_json(
+            request,
+            404,
+            &json!({ "error": "no such still; reload the review" }),
+        );
+        return;
+    };
+    let dir = state.review.still_dir.clone();
+    std::thread::spawn(move || match render_review_still(&dir, &id, &still) {
+        Ok(jpeg) => respond_jpeg(request, jpeg),
+        Err(e) => respond_json(request, 500, &json!({ "error": e })),
+    });
+}
+
+/// Distinguishes the scratch files of two renders of one still running at
+/// once, so neither renames the other's half-written file into place.
+static STILL_RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<u8>, String> {
+    let path = dir.join(id);
+    if let Ok(bytes) = std::fs::read(&path) {
+        eprintln!("taste-lab still: {id} cached");
+        return Ok(bytes);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let began = std::time::Instant::now();
+    let n = STILL_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{n}.partial.jpg"));
+    let rendered = still.render(Path::new("ffmpeg"), &tmp).inspect_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!(
+            "taste-lab still: {id} FAILED media={} at={:.1}s: {e}",
+            still.media.display(),
+            still.at_secs
+        )
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    eprintln!(
+        "taste-lab still: {id} media={} at={:.1}s title={:?} next_title={:?} overlay_time={:?} shows_next={} {}ms",
+        still.media.display(),
+        still.at_secs,
+        still.program.title,
+        still.program.next_title,
+        rendered.overlay_time,
+        rendered.shows_next,
+        began.elapsed().as_millis()
+    );
+    std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The numbers "Since last run" compares, in display order.

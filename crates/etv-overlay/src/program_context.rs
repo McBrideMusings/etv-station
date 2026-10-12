@@ -240,32 +240,65 @@ impl ProgramContextSource {
             return ProgramContext::unknown();
         }
         let next = self.items.get(idx + 1);
+        context_from_rows(
+            item.program.as_ref(),
+            next.and_then(|n| n.program.as_ref()),
+            (now - item.start).as_seconds_f64(),
+            (item.finish - now).as_seconds_f64(),
+            item.metadata.clone(),
+        )
+    }
+}
 
-        let cur = program_fields(item.program.as_ref());
-        let nxt = program_fields(next.and_then(|n| n.program.as_ref()));
-        let elapsed = (now - item.start).as_seconds_f64();
-        let remaining = (item.finish - now).as_seconds_f64();
+impl ProgramContext {
+    /// The context for an item whose playout `program` object is `now`,
+    /// followed by an item whose `program` is `next`, read exactly as
+    /// [`ProgramContextSource::current_at`] reads them out of a chunk file.
+    /// For a caller holding the programs in memory rather than on disk
+    /// (taste-lab's tune-in stills). A value that is not a `program` object
+    /// reads as no program at all.
+    pub fn from_playout_programs(
+        now: Option<&serde_json::Value>,
+        next: Option<&serde_json::Value>,
+        elapsed: f64,
+        remaining: f64,
+        metadata: Option<serde_json::Value>,
+    ) -> Self {
+        let row = |v: Option<&serde_json::Value>| v.and_then(|v| ProgramRow::deserialize(v).ok());
+        context_from_rows(
+            row(now).as_ref(),
+            row(next).as_ref(),
+            elapsed,
+            remaining,
+            metadata,
+        )
+    }
+}
 
-        ProgramContext {
-            title: cur.title,
-            sub_title: cur.sub_title,
-            description: item
-                .program
-                .as_ref()
-                .and_then(|p| p.description.clone())
-                .unwrap_or_default(),
-            season: cur.season,
-            episode: cur.episode,
-            year: cur.year,
-            next_title: nxt.title,
-            next_sub_title: nxt.sub_title,
-            next_season: nxt.season,
-            next_episode: nxt.episode,
-            next_year: nxt.year,
-            item_elapsed: elapsed,
-            item_remaining: remaining,
-            metadata: item.metadata.clone().unwrap_or(serde_json::Value::Null),
-        }
+fn context_from_rows(
+    now: Option<&ProgramRow>,
+    next: Option<&ProgramRow>,
+    elapsed: f64,
+    remaining: f64,
+    metadata: Option<serde_json::Value>,
+) -> ProgramContext {
+    let cur = program_fields(now);
+    let nxt = program_fields(next);
+    ProgramContext {
+        title: cur.title,
+        sub_title: cur.sub_title,
+        description: now.and_then(|p| p.description.clone()).unwrap_or_default(),
+        season: cur.season,
+        episode: cur.episode,
+        year: cur.year,
+        next_title: nxt.title,
+        next_sub_title: nxt.sub_title,
+        next_season: nxt.season,
+        next_episode: nxt.episode,
+        next_year: nxt.year,
+        item_elapsed: elapsed,
+        item_remaining: remaining,
+        metadata: metadata.unwrap_or(serde_json::Value::Null),
     }
 }
 

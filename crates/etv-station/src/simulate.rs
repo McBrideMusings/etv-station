@@ -25,6 +25,11 @@
 //! item keeps its own id), and a channel's `anchor` join on the first
 //! generation.
 //!
+//! Each airing keeps the program its playout item would carry: the resolver's
+//! defaults with the channel's `guide:` templates rendered over them by the
+//! daemon's own pass. Attribution lines are left off, there being no watch
+//! history to name anyone from.
+//!
 //! The first tick fills a whole `window_days`, as the daemon's startup catch-up
 //! does, so the schedule reaches `days + window_days` past `start`.
 
@@ -36,7 +41,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::catalog::Catalog;
 use crate::config::{ChannelConfig, ScoringConfig};
-use crate::daemon::{target_count, window_duration};
+use crate::daemon::{render_guide_and_attribution, target_count, window_duration};
 use crate::resolve::resolve_channel_with_resume;
 use crate::resume::{GenerationState, ResumeMap};
 use crate::score::ScoreInputs;
@@ -58,6 +63,9 @@ pub struct SimulatedAiring {
     /// The pool's per-airing record: the scorer's `audit` stages and the
     /// pattern engine's `select` stage.
     pub metadata: Option<Value>,
+    /// The playout item's `program` object as the chunk file would hold it,
+    /// `guide:` templates rendered.
+    pub program: Option<Value>,
 }
 
 /// One resolver run and what it scheduled.
@@ -164,7 +172,7 @@ pub fn simulate(
                 account_id,
                 ..Default::default()
             };
-            let (items, resume_out, _progress) = resolve_channel_with_resume(
+            let (mut items, resume_out, _progress) = resolve_channel_with_resume(
                 config,
                 config_path,
                 &[],
@@ -180,10 +188,24 @@ pub fn simulate(
             let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
             let show_ids = catalog.show_ids_for(&ids).map_err(|e| e.to_string())?;
 
+            let lengths: Vec<std::time::Duration> = items
+                .iter()
+                .map(|i| i.catalog_duration.unwrap_or(nominal))
+                .collect();
+            render_guide_and_attribution(
+                &mut items,
+                &lengths,
+                from,
+                config.name.trim(),
+                config.display_name.as_deref(),
+                false,
+                config.explains_why(),
+                &[],
+            );
+
             let mut airing_start = from;
             let mut airings = Vec::with_capacity(items.len());
-            for item in items {
-                let length = item.catalog_duration.unwrap_or(nominal);
+            for (item, length) in items.into_iter().zip(lengths) {
                 let duration = Duration::seconds_f64(length.as_secs_f64());
                 let show_id = show_ids.get(&item.id).cloned();
                 ledger.record(&item.id, show_id.as_deref());
@@ -194,6 +216,10 @@ pub fn simulate(
                     start: airing_start,
                     duration,
                     metadata: item.metadata,
+                    program: item
+                        .program
+                        .as_ref()
+                        .and_then(|p| serde_json::to_value(p).ok()),
                 });
                 airing_start += duration;
             }

@@ -1566,7 +1566,7 @@ pub(crate) const MAX_CATALOG_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
 /// The last two arms exist so an entry whose rows are *all* missing still
 /// yields a path: the caller is then patching or error-carding a playout file
 /// and wants to know what it used to point at, not `None`.
-pub(crate) fn pick_playback_source(sources: &[EntrySource]) -> Option<&EntrySource> {
+pub fn pick_playback_source(sources: &[EntrySource]) -> Option<&EntrySource> {
     let live = |s: &&EntrySource| s.missing_since.is_none();
     let local = |s: &&EntrySource| s.source == crate::catalog::Source::LocalFs;
     sources

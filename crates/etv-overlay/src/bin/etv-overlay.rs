@@ -12,7 +12,7 @@ use etv_overlay::overlay_spec::{OverlayKind, OverlaySpec};
 use etv_overlay::overlay_timeline::OverlayTimelineSource;
 use etv_overlay::phase_watchdog::{self, Phase, PhaseWatch};
 use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
-use etv_overlay::rhai_engine::{OverlayState, RhaiEngine};
+use etv_overlay::rhai_engine::RhaiEngine;
 use etv_overlay::vello_renderer::VelloRenderer;
 use time::OffsetDateTime;
 
@@ -371,9 +371,7 @@ fn render_still(
     program: PreviewProgram,
 ) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&config)?;
-    let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
-    let state = evaluate_state(&spec, time, 0, &program_context_for(program))?;
-    let frame = renderer.render_frame(&state)?;
+    let frame = etv_overlay::still::render_rgba(&spec, time, &program_context_for(program))?;
     write_png(&output, spec.width, spec.height, &frame)?;
     tracing::info!(path = %output.display(), "wrote still frame");
     Ok(())
@@ -382,7 +380,7 @@ fn render_still(
 /// Kills the wrapped ffmpeg child on drop. `run_with_ffmpeg` and `watch` both
 /// spawn ffmpeg, then still have fallible setup between the spawn and their
 /// own explicit `child.kill()`/`wait()` at the end (`fifo.open_for_writing`,
-/// `VelloRenderer::new`, `build_engine`) — an early `?`-propagated return
+/// `VelloRenderer::new`, `RhaiEngine::for_spec`) — an early `?`-propagated return
 /// through any of those, or a shutdown signal arriving while
 /// `open_for_writing` is still waiting for a reader, would otherwise skip
 /// the explicit cleanup and leak the child. Wrapping it means every exit
@@ -481,7 +479,7 @@ fn run_with_ffmpeg(
         return Ok(());
     }
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
-    let engine = build_engine(&spec)?;
+    let engine = RhaiEngine::for_spec(&spec)?;
 
     let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
     let mut frame_index: u64 = 0;
@@ -615,7 +613,7 @@ fn watch(
         return Ok(());
     }
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
-    let mut engine = build_engine(&spec)?;
+    let mut engine = RhaiEngine::for_spec(&spec)?;
     let program = program_context_for(preview);
     let mut last_mtime = fs_mtime(&config);
 
@@ -649,7 +647,7 @@ fn watch(
                 last_mtime = mtime;
                 match OverlaySpec::from_path(&config) {
                     Ok(new_spec) if new_spec.geometry() == base_geometry => {
-                        match build_engine(&new_spec) {
+                        match RhaiEngine::for_spec(&new_spec) {
                             Ok(new_engine) => {
                                 spec = new_spec;
                                 engine = new_engine;
@@ -1002,32 +1000,14 @@ fn touch(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn build_engine(spec: &OverlaySpec) -> anyhow::Result<RhaiEngine> {
-    let mut engine = RhaiEngine::with_config(spec.layers.clone(), spec.config.as_ref());
-    if let Some(script) = &spec.script {
-        engine.load_script(script)?;
-    }
-    Ok(engine)
-}
-
-/// As [`build_engine`], for the resolved-overlay cascade's `Option<&OverlaySpec>`
+/// As [`RhaiEngine::for_spec`], for the resolved-overlay cascade's `Option<&OverlaySpec>`
 /// (#48): `None` — a block that declared `overlay: clear` — is an engine with
 /// no layers and no script, which renders nothing, same as an empty spec would.
 fn build_engine_for(spec: Option<&OverlaySpec>) -> anyhow::Result<RhaiEngine> {
     match spec {
-        Some(spec) => build_engine(spec),
+        Some(spec) => RhaiEngine::for_spec(spec),
         None => Ok(RhaiEngine::new(vec![])),
     }
-}
-
-fn evaluate_state(
-    spec: &OverlaySpec,
-    time: f64,
-    frame_index: u64,
-    program: &ProgramContext,
-) -> anyhow::Result<OverlayState> {
-    let engine = build_engine(spec)?;
-    Ok(engine.evaluate(time, frame_index, program))
 }
 
 fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
@@ -1108,7 +1088,7 @@ fn collect_texts(
     duration: f64,
     samples: u32,
 ) -> anyhow::Result<Vec<TextSpan>> {
-    let engine = build_engine(spec)?;
+    let engine = RhaiEngine::for_spec(spec)?;
     let base_ctx = program_context_for_dump_text(program);
     let sample_count = samples.max(1);
 

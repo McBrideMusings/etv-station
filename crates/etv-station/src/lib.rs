@@ -34,5 +34,6 @@ pub mod tautulli;
 #[cfg(test)]
 pub(crate) mod test_tracing;
 pub mod tracks;
+pub mod tune_in_still;
 pub mod tz;
 pub mod value_fmt;

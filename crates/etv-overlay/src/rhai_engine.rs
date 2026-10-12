@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rhai::{AST, Dynamic, Engine, Scope};
 
-use crate::overlay_spec::{Corner, OverlayKind};
+use crate::overlay_spec::{Corner, OverlayKind, OverlaySpec};
 use crate::program_context::ProgramContext;
 
 /// Cap for per-frame text content overrides set by Rhai scripts. A runaway
@@ -100,6 +100,16 @@ impl RhaiEngine {
             base_layers,
             config,
         }
+    }
+
+    /// The engine for one loaded spec: its layers, its `config`, and its
+    /// script compiled.
+    pub fn for_spec(spec: &OverlaySpec) -> anyhow::Result<Self> {
+        let mut engine = Self::with_config(spec.layers.clone(), spec.config.as_ref());
+        if let Some(script) = &spec.script {
+            engine.load_script(script)?;
+        }
+        Ok(engine)
     }
 
     pub fn load_script(&mut self, path: &Path) -> anyhow::Result<()> {

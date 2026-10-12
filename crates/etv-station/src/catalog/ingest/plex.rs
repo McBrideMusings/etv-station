@@ -1100,6 +1100,20 @@ fn has_more_pages(next_start: i64, page_len: i64, total_size: Option<i64>) -> bo
     page_len > 0 && next_start < total_size.unwrap_or(next_start)
 }
 
+/// Rewrite a path Plex reports so it starts with `to` instead of `from`
+/// (`MEDIA_PATH_FROM` / `MEDIA_PATH_TO`). Only at a path boundary: `/media`
+/// maps `/media/x`, never `/mediabackup/x`. An empty `from` leaves every path
+/// alone.
+pub fn translate_path(p: &str, from: &str, to: &str) -> String {
+    if !from.is_empty()
+        && let Some(rest) = p.strip_prefix(from)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("{to}{rest}");
+    }
+    p.to_string()
+}
+
 // ---- HTTP client (thin outer layer) --------------------------------------
 
 struct PlexClient {
@@ -1122,15 +1136,7 @@ impl PlexClient {
     }
 
     fn translate(&self, p: &str) -> String {
-        // Only remap at a path boundary: `/media` must map `/media/x`, never
-        // `/mediabackup/x`.
-        if !self.path_from.is_empty()
-            && let Some(rest) = p.strip_prefix(&self.path_from)
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            return format!("{}{}", self.path_to, rest);
-        }
-        p.to_string()
+        translate_path(p, &self.path_from, &self.path_to)
     }
 
     /// The shared request builder behind [`Self::get`] and [`Self::get_paged`]

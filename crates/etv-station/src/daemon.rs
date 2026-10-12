@@ -3840,7 +3840,7 @@ fn explain_line_for(metadata: Option<&serde_json::Value>) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_guide_and_attribution(
+pub(crate) fn render_guide_and_attribution(
     items: &mut [crate::resolve::ResolvedItem],
     durations: &[Duration],
     from: OffsetDateTime,

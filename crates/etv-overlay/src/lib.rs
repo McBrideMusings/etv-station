@@ -6,6 +6,7 @@ pub mod overlay_timeline;
 pub mod phase_watchdog;
 pub mod program_context;
 pub mod rhai_engine;
+pub mod still;
 pub mod vello_renderer;
 
 pub use error_card::render_error_card_png;

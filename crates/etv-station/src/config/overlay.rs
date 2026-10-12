@@ -328,6 +328,17 @@ impl ChannelOverlays {
     pub fn varies_by_block(&self) -> bool {
         self.blocks.iter().any(|b| b.as_ref() != self.base.as_ref())
     }
+
+    /// What the channel's overlay process draws while `rule.blocks[block]`
+    /// is on the air: nothing on a channel with no overlay process, the spawn
+    /// config on one that never swaps, else that block's own resolution.
+    pub fn for_block(&self, block: usize) -> Option<&OverlaySpec> {
+        self.base.as_ref()?;
+        if !self.varies_by_block() {
+            return self.base.as_ref();
+        }
+        self.blocks.get(block).and_then(Option::as_ref)
+    }
 }
 
 /// Resolve one channel's whole overlay cascade, loading each winning

@@ -76,7 +76,12 @@
   .old { color: var(--muted); }
   .changed .new { font-weight: 650; }
 
-  .samples { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .samples { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+  .sample .still, .sample .still-missing { display: block; width: 100%; aspect-ratio: 16 / 9; border-radius: 4px;
+    background: var(--track); margin-bottom: 8px; }
+  .sample .still { object-fit: contain; background: #000; border: 1px solid var(--line); }
+  .sample .still-missing { display: flex; align-items: center; justify-content: center; text-align: center;
+    padding: 8px; color: var(--muted); font-size: 12.5px; }
   .sample { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   .sample .when { font-size: 12.5px; color: var(--muted); }
   .sample .what { font-weight: 600; margin: 4px 0 6px; }
@@ -259,7 +264,11 @@ function render(d) {
     const a = d.airings[s.index];
     const next = s.next.map((i) => d.airings[i]).map((n) => `<li>${esc(timeOf(n.start, tz))} ${esc(n.label)}</li>`).join('');
     const pct = s.minutes_total ? Math.min(100, (s.minutes_in / s.minutes_total) * 100) : 0;
-    return `<div class="sample"><div class="when"><span class="pin">${s.n}</span>${esc(dayOf(s.at, tz))} ${esc(timeOf(s.at, tz))}</div>
+    const still = s.still && s.still.url
+      ? `<a href="${esc(s.still.url)}" target="_blank"><img class="still" src="${esc(s.still.url)}" alt="Sample ${s.n}: ${esc(a.label)}"
+          onerror="this.parentNode.outerHTML='<div class=&quot;still-missing&quot;>Still failed to render</div>'"></a>`
+      : `<div class="still-missing" title="${esc((s.still && s.still.path) || '')}">${esc((s.still && s.still.unavailable) || 'No still')}</div>`;
+    return `<div class="sample">${still}<div class="when"><span class="pin">${s.n}</span>${esc(dayOf(s.at, tz))} ${esc(timeOf(s.at, tz))}</div>
       <div class="what">${esc(a.label)}</div>
       <div class="prog"><span style="width:${pct}%"></span></div>
       <div class="muted">${s.minutes_in} of ${s.minutes_total} min in · ${esc(a.pool)}</div>
@@ -267,7 +276,7 @@ function render(d) {
   }).join('');
   html.push(`<div class="grid2">
     <section class="card"><h2>Tune-in samples</h2>
-      <p class="muted">${d.samples.length} moments drawn from seed ${esc(d.seed ?? 0)}: what is on, how far in, and the next two.</p>
+      <p class="muted">${d.samples.length} moments drawn from seed ${esc(d.seed ?? 0)}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
       <div class="samples">${samples}</div></section>
     <section class="card"><h2>Since last run</h2>${since}</section>
   </div>`);

@@ -85,10 +85,10 @@ pub async fn append(
             .map(|span| OverlaySpan {
                 start: span.start,
                 finish: span.finish,
-                // A block index with no entry is not reachable from a loaded
-                // config — `resolve_channel` fills one per `rule.blocks` — so
-                // the flattened `None` here can only mean "draws nothing".
-                spec: overlays.blocks.get(span.block).cloned().flatten(),
+                // `None` means the block draws nothing: `for_block` answers
+                // from the block's own resolution, the channel varying by
+                // block.
+                spec: overlays.for_block(span.block).cloned(),
             }),
     );
     spans.sort_by_key(|s| s.start);
