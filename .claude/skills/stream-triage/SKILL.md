@@ -391,10 +391,22 @@ with `CoreDeviceCLISupport.DiagnoseError error 0` on every device, a
 `sudo log collect --device-udid <UDID>` (or `--device-name`) is no fallback
 here either: run as root it fails with `failed to create archive: Device not
 configured (6)` against both the Apple TV and the iPhone, each of which
-`devicectl device info details` reports as `transportType: localNetwork`. Why is
-unknown; no source says log collection over the network is unsupported, and
-Apple publishes tvOS console-log instructions (sign-in required) under
-https://developer.apple.com/bug-reporting/profiles-and-logs/?platform=tvos
+`devicectl device info details` reports as `transportType: localNetwork`.
+Apple's "Console Logs: tvOS (4th generation)" instructions (sign-in required,
+under https://developer.apple.com/bug-reporting/profiles-and-logs/?platform=tvos)
+document only a USB-C cable for console logs, through Xcode or Apple
+Configurator 2; they describe no network route.
+
+**The route that works with no cable is on the device itself.** Apple's
+"CoreMedia: tvOS" instructions (same page): reproduce the freeze, then hold
+**Play/Pause + Volume Down for 6 seconds** on the remote, confirm the dialog on
+the TV, and AirDrop the sysdiagnose to the Mac. Take it right after the freeze —
+the unified log ages out.
+
+The CoreMedia logging profile (`StreamLoggingWithConsent.mobileconfig`) only
+raises `com.apple.coremedia` to Debug — Apple's own AVFoundation HLS stack.
+VLC plays HLS through libVLC's `adaptive` demux, not CoreMedia, so the profile
+adds nothing for a VLC freeze. It also installs only through Apple Configurator.
 Root comes from `SUDO_ASKPASS=<script running osascript display dialog with
 hidden answer> sudo -A …`; `! sudo -v` has no terminal to read a password from.
 With both routes down, test on the device by changing what the server sends
