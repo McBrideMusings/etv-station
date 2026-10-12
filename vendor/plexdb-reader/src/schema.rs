@@ -27,7 +27,7 @@ use crate::error::ReaderError;
 /// Shape 10 is the store as schema version 10 left it (ADR-0016):
 /// `enrichment` and `enrichment_cursor` carry `source` in their primary key,
 /// keywords live in the `keywords` namespace, and `keyword_forms` maps raw
-/// spellings to stemmed forms. Writers' fetch cursors live in
+/// spellings to normalized forms. Writers' fetch cursors live in
 /// `enrichment_cursor`, not `enrichment` (ADR-0013).
 ///
 /// `tests/test_schema.py` fails whenever this constant differs from
