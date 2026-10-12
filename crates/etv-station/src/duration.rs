@@ -10,6 +10,7 @@ use crate::config::SourceConfig;
 use crate::error_card::make_error_card;
 use crate::errors::StationError;
 use crate::resolve::ResolvedItem;
+use crate::tracks::{StreamInfo, StreamKind};
 
 const SIDECAR_NAME: &str = ".durations.json";
 
@@ -24,6 +25,12 @@ pub struct DurationCache {
 struct CacheEntry {
     mtime_secs: i64,
     duration_secs: f64,
+    /// The file's streams (#261), read by the same `ffprobe` call as the
+    /// duration. `None` is an entry written before streams were recorded; it
+    /// is probed again rather than trusted, since the track selector would
+    /// otherwise see a file with no streams at all.
+    #[serde(default)]
+    streams: Option<Vec<StreamInfo>>,
 }
 
 #[derive(Debug, Default)]
@@ -146,6 +153,13 @@ impl DurationCache {
         Ok((kept, durations, stats))
     }
 
+    /// The streams of a local file this cache has probed, for the track
+    /// selector. `None` for a path never probed (a lavfi or HTTP source, or a
+    /// file that could not be read).
+    pub fn streams_for(&self, path: &Path) -> Option<&[StreamInfo]> {
+        self.entries.get(path)?.streams.as_deref()
+    }
+
     /// Drop cache entries whose path is no longer referenced by any current
     /// `Local` item, so the per-channel sidecar doesn't accumulate stale paths
     /// as items are removed or their source paths change. Marks the cache dirty
@@ -197,18 +211,20 @@ impl DurationCache {
 
                 if let Some(entry) = self.entries.get(&local_path)
                     && entry.mtime_secs == mtime_secs
+                    && entry.streams.is_some()
                 {
                     stats.from_cache += 1;
                     let d = clamp_to_config(Duration::from_secs_f64(entry.duration_secs), item);
                     return Ok(d);
                 }
 
-                let probed = ffprobe_duration(&local_path).await?;
+                let (probed, streams) = ffprobe_media(&local_path).await?;
                 self.entries.insert(
                     local_path,
                     CacheEntry {
                         mtime_secs,
                         duration_secs: probed.as_secs_f64(),
+                        streams: Some(streams),
                     },
                 );
                 self.dirty = true;
@@ -254,9 +270,17 @@ fn clamp_to_config(probed: Duration, item: &ResolvedItem) -> Duration {
     }
 }
 
-async fn ffprobe_duration(path: &Path) -> Result<Duration, StationError> {
+async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), StationError> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-print_format", "json", "-show_format", "-i"])
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            "-i",
+        ])
         .arg(path)
         .output()
         .await
@@ -275,6 +299,8 @@ async fn ffprobe_duration(path: &Path) -> Result<Duration, StationError> {
     #[derive(Deserialize)]
     struct ProbeOut {
         format: ProbeFormat,
+        #[serde(default)]
+        streams: Vec<ProbeStream>,
     }
     #[derive(Deserialize)]
     struct ProbeFormat {
@@ -294,7 +320,82 @@ async fn ffprobe_duration(path: &Path) -> Result<Duration, StationError> {
         path: path.to_path_buf(),
         reason: format!("duration not a float: {e}"),
     })?;
-    Ok(Duration::from_secs_f64(secs))
+    let streams = probe.streams.iter().map(ProbeStream::to_info).collect();
+    Ok((Duration::from_secs_f64(secs), streams))
+}
+
+/// One entry of `ffprobe -show_streams`, as far as the track selector reads it.
+#[derive(Deserialize)]
+struct ProbeStream {
+    index: u32,
+    #[serde(default)]
+    codec_type: String,
+    #[serde(default)]
+    codec_name: String,
+    channels: Option<u32>,
+    #[serde(default)]
+    disposition: ProbeDisposition,
+    /// Tag keys arrive as the container wrote them (`language`, `TITLE`), so
+    /// they are looked up case-insensitively.
+    #[serde(default)]
+    tags: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ProbeDisposition {
+    #[serde(default)]
+    default: u8,
+    #[serde(default)]
+    forced: u8,
+}
+
+impl ProbeStream {
+    fn tag(&self, key: &str) -> Option<String> {
+        self.tags
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    fn to_info(&self) -> StreamInfo {
+        StreamInfo {
+            index: self.index,
+            kind: match self.codec_type.as_str() {
+                "audio" => StreamKind::Audio,
+                "video" => StreamKind::Video,
+                "subtitle" => StreamKind::Subtitle,
+                _ => StreamKind::Other,
+            },
+            codec: self.codec_name.clone(),
+            // `und` is the container's way of saying it does not know.
+            lang: self
+                .tag("language")
+                .filter(|l| !l.eq_ignore_ascii_case("und")),
+            title: self.tag("title"),
+            channels: self.channels,
+            default: self.disposition.default != 0,
+            forced: self.disposition.forced != 0,
+        }
+    }
+}
+
+impl DurationCache {
+    /// A cache that already holds `streams` for `path`, as if it had probed the
+    /// file, so selection can be tested without ffprobe or a media file.
+    #[cfg(test)]
+    pub(crate) fn with_streams(path: &str, streams: Vec<StreamInfo>) -> Self {
+        let mut cache = DurationCache::default();
+        cache.entries.insert(
+            PathBuf::from(path),
+            CacheEntry {
+                mtime_secs: 0,
+                duration_secs: 60.0,
+                streams: Some(streams),
+            },
+        );
+        cache
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +403,50 @@ mod tests {
     use super::*;
     use crate::config::SourceConfig;
     use crate::resolve::ResolvedItem;
+
+    /// What ffprobe prints for a Matroska file with an English text track and
+    /// a Japanese stereo track; tag keys keep the container's own case.
+    const FFPROBE_STREAMS: &str = r#"[
+      {"index":0,"codec_type":"video","codec_name":"h264","disposition":{"default":1,"forced":0}},
+      {"index":1,"codec_type":"audio","codec_name":"eac3","channels":6,
+       "disposition":{"default":0,"forced":0},"tags":{"language":"eng","title":"English 5.1"}},
+      {"index":2,"codec_type":"audio","codec_name":"aac","channels":2,
+       "disposition":{"default":1,"forced":0},"tags":{"LANGUAGE":"jpn","TITLE":"Japanese"}},
+      {"index":3,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle",
+       "disposition":{"default":0,"forced":1},"tags":{"language":"und"}}
+    ]"#;
+
+    #[test]
+    fn ffprobe_streams_map_to_the_fields_the_rules_match() {
+        let probed: Vec<ProbeStream> = serde_json::from_str(FFPROBE_STREAMS).unwrap();
+        let streams: Vec<StreamInfo> = probed.iter().map(ProbeStream::to_info).collect();
+
+        assert_eq!(streams[1].kind, StreamKind::Audio);
+        assert_eq!(streams[1].channels, Some(6));
+        assert_eq!(streams[1].lang.as_deref(), Some("eng"));
+        assert_eq!(streams[1].title.as_deref(), Some("English 5.1"));
+        assert!(!streams[1].default);
+
+        assert_eq!(
+            streams[2].lang.as_deref(),
+            Some("jpn"),
+            "tag keys are case-insensitive"
+        );
+        assert_eq!(streams[2].title.as_deref(), Some("Japanese"));
+        assert!(streams[2].default);
+
+        assert_eq!(streams[3].kind, StreamKind::Subtitle);
+        assert_eq!(streams[3].lang, None, "`und` is no language");
+        assert!(streams[3].forced);
+        assert!(streams[3].is_image());
+    }
+
+    #[test]
+    fn a_cached_entry_from_before_streams_were_recorded_is_probed_again() {
+        let old: HashMap<PathBuf, CacheEntry> =
+            serde_json::from_str(r#"{"/m/a.mkv":{"mtime_secs":5,"duration_secs":60.0}}"#).unwrap();
+        assert!(old[&PathBuf::from("/m/a.mkv")].streams.is_none());
+    }
 
     fn lavfi_item(id: &str, secs: u64) -> ResolvedItem {
         ResolvedItem {
@@ -318,6 +463,8 @@ mod tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         }
     }
 
@@ -348,6 +495,8 @@ mod tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -371,6 +520,8 @@ mod tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -390,6 +541,8 @@ mod tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         }
     }
 
@@ -467,6 +620,8 @@ mod tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         };
         let err = cache.resolve_all(vec![bad]).await.unwrap_err();
         assert!(matches!(err, StationError::MissingField { .. }));
@@ -476,6 +631,7 @@ mod tests {
         cache.entries.insert(
             PathBuf::from(path),
             CacheEntry {
+                streams: None,
                 mtime_secs: 1,
                 duration_secs: 10.0,
             },

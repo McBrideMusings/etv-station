@@ -41,6 +41,7 @@ fn add_movie(cat: &Catalog, id: &str, title: &str, duration_ms: Option<i64>) {
 
 fn pool(name: &str, expr: &str, config: Option<serde_json::Value>) -> Pool {
     Pool {
+        tracks: None,
         name: name.into(),
         expr: Some(expr.into()),
         plugin: None,

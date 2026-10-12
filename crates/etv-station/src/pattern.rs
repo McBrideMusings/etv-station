@@ -758,6 +758,9 @@ pub struct BlockBuild {
     pub metadata: HashMap<String, serde_json::Value>,
     /// This pool's own `guide:` per drawn `entry_id` (#289).
     pub guides: HashMap<String, GuideConfig>,
+    /// This pool's own `tracks:` per drawn `entry_id` (#261), the pool rung of
+    /// the track-selection cascade.
+    pub tracks: HashMap<String, crate::config::TrackRules>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -827,6 +830,8 @@ pub fn build(
     // `Pool::constraints` already documents as "blind across pools" — pools
     // that must stay apart have to be disjoint by construction.
     let mut guide_out: HashMap<String, GuideConfig> = HashMap::new();
+    // The same collision rule holds for the pool's `tracks:` rules.
+    let mut tracks_out: HashMap<String, crate::config::TrackRules> = HashMap::new();
     // Per-id audit blobs the walk builds as it draws, folded into the metadata
     // map at the end. `Option<Value>` rather than `Value` so it plugs straight
     // into `audit::push_stage`, which owns creating the blob.
@@ -892,6 +897,11 @@ pub fn build(
             if let Some(guide) = &runtimes[idx].cfg.guide {
                 for id in &drawn {
                     guide_out.insert(id.clone(), guide.clone());
+                }
+            }
+            if let Some(tracks) = &runtimes[idx].cfg.tracks {
+                for id in &drawn {
+                    tracks_out.insert(id.clone(), tracks.clone());
                 }
             }
             // Every drawn id gets a `select` stage — the draw, which is a
@@ -986,6 +996,7 @@ pub fn build(
         progress,
         metadata: metadata_out,
         guides: guide_out,
+        tracks: tracks_out,
     })
 }
 
@@ -1884,6 +1895,7 @@ mod tests {
 
     fn movies_pool() -> Pool {
         Pool {
+            tracks: None,
             name: "movies".into(),
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
@@ -1909,6 +1921,7 @@ mod tests {
 
     fn shows_pool() -> Pool {
         Pool {
+            tracks: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
@@ -1938,6 +1951,7 @@ mod tests {
     /// that check), so this leaves both unset.
     fn plugin_pool(script: &std::path::Path) -> Pool {
         Pool {
+            tracks: None,
             name: "movies".into(),
             expr: None,
             plugin: Some(script.to_path_buf()),
@@ -2030,6 +2044,7 @@ mod tests {
 
     fn episodes_pool(group_by: GroupBy) -> Pool {
         Pool {
+            tracks: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
@@ -2333,6 +2348,7 @@ mod tests {
 
     fn rupaul_pool() -> Pool {
         Pool {
+            tracks: None,
             name: "rupaul".into(),
             expr: None,
             plugin: None,

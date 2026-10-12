@@ -21,6 +21,8 @@ fn path() -> &'static Path {
 
 fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> ChannelConfig {
     ChannelConfig {
+        subtitle: None,
+        tracks: None,
         number: 1,
         name: "test".into(),
         display_name: None,
@@ -41,6 +43,7 @@ fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> Channe
 
 fn inline_block(entries: Vec<ConfigEntry>, guide: Option<GuideConfig>) -> BlockInclude {
     BlockInclude {
+        tracks: None,
         overlay: None,
         block: None,
         program: None,
@@ -108,6 +111,7 @@ fn pattern_block(
 /// (#289) — the rung between the block and the item.
 fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
     Pool {
+        tracks: None,
         name: name.into(),
         expr: Some(expr.into()),
         plugin: None,
@@ -288,6 +292,7 @@ fn guide_cascades_channel_block_item_field_by_field() {
     };
 
     let mut entry = ItemEntry {
+        tracks: None,
         source: SourceConfig::Local {
             path: "/media/inline.mkv".into(),
         },

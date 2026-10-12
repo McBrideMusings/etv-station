@@ -69,6 +69,10 @@ pub struct ItemEntry {
     /// cascade levels (channel → block → item).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<GuideConfig>,
+
+    /// Item-level track-selection rules (#261), the most specific level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<crate::config::TrackRules>,
 }
 
 /// A CEL query resolved against the catalog at generation time. Resolution is

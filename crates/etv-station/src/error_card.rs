@@ -131,6 +131,8 @@ pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration
         metadata: None,
         guide: None,
         guide_fields: crate::guide::GuideFields::default(),
+        tracks: None,
+        selected: None,
     }
 }
 

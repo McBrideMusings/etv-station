@@ -233,6 +233,9 @@ pub struct ChannelRender {
     /// playout item, where an item written before the channel had an overlay
     /// kept "no overlay" forever.
     pub overlay: Option<PlayoutOverlaySpec>,
+    /// The channel's own `subtitle.default_on` (#290). `None` leaves whatever
+    /// the station's `normalization.subtitle.default_on` says.
+    pub subtitle_default_on: Option<bool>,
 }
 
 /// Where [`render_with`] gets the tuner identity it publishes.
@@ -272,6 +275,7 @@ pub fn render_with(
             folder: ch.output_folder.clone(),
             display_name: ch.config.display_name.clone(),
             overlay: crate::daemon::load_overlay_playout_spec(ch),
+            subtitle_default_on: ch.config.subtitle.as_ref().and_then(|s| s.default_on),
         })
         .collect();
     // The station config is the only place the tuner identity can come from,
@@ -453,6 +457,23 @@ pub fn render_channels(
             );
         } else {
             channel.remove("overlay");
+        }
+
+        // A channel's own subtitle setting lands in the same `normalization.
+        // subtitle` object the station-wide one came from, after the merge, so
+        // the channel wins.
+        if let Some(default_on) = channel_render.subtitle_default_on {
+            let normalization = channel
+                .entry("normalization".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(normalization) = normalization.as_object_mut() {
+                let subtitle = normalization
+                    .entry("subtitle".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(subtitle) = subtitle.as_object_mut() {
+                    subtitle.insert("default_on".to_string(), Value::Bool(default_on));
+                }
+            }
         }
 
         let channel_path = opts.out_dir.join(format!("channel{number}.json"));
@@ -672,6 +693,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, folder)| ChannelRender {
+                subtitle_default_on: None,
                 number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name: None,
@@ -687,6 +709,7 @@ mod tests {
             .zip(names)
             .enumerate()
             .map(|(i, (folder, display_name))| ChannelRender {
+                subtitle_default_on: None,
                 number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name,
@@ -962,6 +985,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let channels = vec![
             ChannelRender {
+                subtitle_default_on: None,
                 number: 1,
                 folder: PathBuf::from("out/hbo"),
                 display_name: None,
@@ -976,6 +1000,7 @@ mod tests {
                 }),
             },
             ChannelRender {
+                subtitle_default_on: None,
                 number: 2,
                 folder: PathBuf::from("out/plain"),
                 display_name: None,
@@ -998,6 +1023,53 @@ mod tests {
             "a channel with no overlay must write no overlay key, got {:?}",
             without.get("overlay")
         );
+    }
+
+    /// `DEFAULT=YES` is an attribute of a channel's whole subtitle rendition,
+    /// so it is a per-channel setting (#290): a channel's own value beats the
+    /// station-wide one, and a channel that says nothing keeps the station's.
+    #[test]
+    fn a_channels_own_default_on_beats_the_station_wide_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_on: NormalizationConfig = serde_json::from_value(serde_json::json!({
+            "audio": {},
+            "video": {"width": 1280, "height": 720},
+            "subtitle": {"mode": "convert", "default_on": true},
+        }))
+        .unwrap();
+        let channel = |number: i64, subtitle_default_on: Option<bool>| ChannelRender {
+            number,
+            folder: PathBuf::from(format!("out/ch{number}")),
+            display_name: None,
+            overlay: None,
+            subtitle_default_on,
+        };
+        let channels = vec![channel(1, None), channel(2, Some(false))];
+        render_channels(&channels, &ffmpeg(), &station_on, &opts(dir.path()), "id").unwrap();
+
+        let inherits = read(&dir.path().join("channel1.json"));
+        assert_eq!(inherits["normalization"]["subtitle"]["default_on"], true);
+        let overrides = read(&dir.path().join("channel2.json"));
+        assert_eq!(overrides["normalization"]["subtitle"]["default_on"], false);
+        assert_eq!(
+            overrides["normalization"]["subtitle"]["mode"], "convert",
+            "the override changes one setting and leaves the rest of the block"
+        );
+    }
+
+    #[test]
+    fn default_on_is_off_unless_someone_sets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let channels = vec![ChannelRender {
+            number: 1,
+            folder: PathBuf::from("out/ch1"),
+            display_name: None,
+            overlay: None,
+            subtitle_default_on: None,
+        }];
+        render_with_defaults(&channels, &opts(dir.path()), "id").unwrap();
+        let channel = read(&dir.path().join("channel1.json"));
+        assert_eq!(channel["normalization"]["subtitle"]["default_on"], false);
     }
 
     // `a_defaults_overlay_never_leaks_into_a_channel` and `missing_defaults_is_an_error`

@@ -68,6 +68,7 @@ fn catalog() -> Catalog {
 
 fn discovery_pool() -> Pool {
     Pool {
+        tracks: None,
         name: "discovery".into(),
         expr: Some("item.type == \"movie\"".into()),
         plugin: None,
@@ -95,6 +96,7 @@ fn discovery_pool() -> Pool {
 
 fn spotlight_pool() -> Pool {
     Pool {
+        tracks: None,
         name: "spotlight".into(),
         expr: Some("item.type == \"episode\"".into()),
         plugin: None,
@@ -271,6 +273,7 @@ async fn assert_one_file_across_the_chunk(
 /// instead of a `pattern:` template.
 fn foryou_pool(plugin: &Path) -> Pool {
     Pool {
+        tracks: None,
         name: "foryou".into(),
         expr: None,
         plugin: Some(plugin.to_path_buf()),
@@ -302,6 +305,8 @@ fn foryou_pool(plugin: &Path) -> Pool {
 /// logic.
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
+        subtitle: None,
+        tracks: None,
         number: 1,
         name: "test".into(),
         display_name: None,
@@ -318,6 +323,7 @@ fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
+                tracks: None,
                 overlay: None,
                 block: None,
                 program: None,

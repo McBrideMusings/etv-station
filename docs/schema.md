@@ -502,6 +502,7 @@ seed: 1138                     # optional — every channel with no seed: of its
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
 | `overlay` | no | station-wide overlay default, the least specific level of the cascade every channel inherits from unless it says otherwise — see [Overlay cascade](#overlay-cascade) |
+| `tracks` | no | the station level of the [track-selection](#track-selection) rules: which audio and subtitle stream of each file plays |
 | `seed` | no — default unset | int — station-wide random seed. Every channel that sets no `seed:` of its own inherits it, **salted with that channel's `name`** — see [Seed cascade](#seed-cascade). Unset means every unseeded channel keeps drawing a fresh wall-clock seed on every generation. |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
@@ -542,6 +543,8 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `retention_days` | no — default `7` | int |
 | `seed` | no — inherited from the station `seed` when unset | int — seeds `random` order and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's `name`, then to a fresh wall-clock seed — see [Seed cascade](#seed-cascade). |
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
+| `tracks` | no | the channel level of the [track-selection](#track-selection) rules; blocks, pools and items refine it |
+| `subtitle` | no | `{ default_on: true \| false }` — announce this channel's subtitle track as `DEFAULT=YES`; unset leaves the station's `normalization.subtitle.default_on` |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
 
 ### Channel numbers
@@ -1957,6 +1960,144 @@ A block-level `constraints` on a pattern block stays legal and becomes the
 **default every pool that declares none inherits**. A pool declaring its own
 table **replaces** the block's wholesale rather than merging field by field, so a
 pool's table always reads as the complete rule for that pool.
+
+## Track selection
+
+`tracks:` says which audio stream and which subtitle stream of a file an item
+plays. The station probes each local file, applies the rules, and writes the
+winners into the playout item as `tracks.audio.stream_index` and
+`tracks.subtitle.stream_index`. ETV-next receives integers and holds no policy
+of its own. See [architecture](/architecture#subtitles-and-audio-tracks) for how
+the pieces fit.
+
+```yaml
+tracks:
+  audio:
+    exclude:
+      - { title: "commentary|director|isolated score" }
+    prefer:
+      - { lang: "^en", channels: 2 }     # English stereo first
+      - { lang: "^en" }                  # then any English
+  subtitle:
+    exclude:
+      - { title: "signs|songs only" }
+    prefer:
+      - { image: false, lang: "^en" }    # a text track: the viewer can switch it off
+      - { image: true, lang: "^en",      # a picture track: burned in, cannot be switched off
+          when: { audio_lang_not: "^en" } }   # ...only when the film's audio isn't English
+```
+
+`audio` and `subtitle` are separate lists. Each has:
+
+| Key | Meaning |
+|---|---|
+| `exclude` | Streams matching any entry are removed first. |
+| `prefer` | An ordered list. The first entry that matches a surviving stream wins; later entries are not read. Several streams matching the winning entry go to the one with the fewest channels, then the lowest index. |
+| `inherit` | Default `true`. `false` discards every rule from the levels above this one, for this list only. |
+
+An entry is a set of fields that must all hold. A field left out matches anything.
+
+| Field | Matches | Form |
+|---|---|---|
+| `id` | the stream's index in the file | `2`, or `">=3"`, `"<8"`, `"!=0"` |
+| `title` | the stream's title tag | regex, case-insensitive, unanchored |
+| `lang` | the stream's language tag as stored (`eng`, `jpn`, `chi`) | regex. A stream with no tag, or `und`, has no language and never matches. |
+| `codec` | the codec name (`ac3`, `subrip`, `hdmv_pgs_subtitle`) | regex |
+| `channels` | audio channel count (audio lists only) | `2`, or `">=6"` |
+| `default`, `forced` | the container's disposition flags | `true` / `false` |
+| `image` | subtitle lists only: a picture subtitle (PGS, VobSub) | `true` / `false` |
+| `when` | subtitle lists only: a condition on the audio stream that was selected | `audio_lang: <regex>`, `audio_lang_not: <regex>` |
+
+`audio_lang_not` needs the audio stream to carry a language: an unknown
+language is not foreign, so the entry does not match. The regex engine has no
+lookahead, so "not English" is written with `audio_lang_not`, not `(?!en)`.
+
+A bad regex or comparison fails config load, naming the level, the list, the
+entry and the pattern: `block #2: tracks.subtitle.prefer[0].lang: invalid regex "(" ...`.
+
+### What happens when nothing matches
+
+- **Audio** falls back to the file's default-flagged audio stream, or its first
+  one. If `prefer` entries exist and none matched, the station logs a
+  `tracks.audio_unmatched` warning naming the item and file. If every audio
+  stream matches an `exclude` entry, the station chooses among all of them and
+  logs `tracks.audio_all_excluded`, because an item with no sound is worse than
+  one with the wrong track.
+- **Subtitles** have no fallback: no match means no subtitle track. A picture
+  subtitle is never burned in because nothing else matched.
+
+With no `tracks:` anywhere, the only built-in rule is a subtitle `prefer` of
+`{ image: false }` at the bottom of the cascade: any text subtitle. A level can
+drop it with `subtitle: { inherit: false }`.
+
+### The cascade
+
+Rules are written at five levels, most general first: the **station file**, the
+**channel**, a **block**, a **pool** inside a pattern or sequencer block, and an
+inline **item**.
+
+```yaml
+# station.yaml, channel.yaml: top level
+tracks: { ... }
+
+# channel.yaml
+rule:
+  blocks:
+    - tracks: { ... }            # every item in this block
+      pools:
+        - name: anime
+          tracks: { ... }        # items drawn from this pool
+      entries:
+        - kind: item
+          tracks: { ... }        # this one item
+```
+
+A more specific level adds to the rules above it:
+
+- `exclude` entries from every level apply.
+- `prefer` entries from a more specific level come first, then the inherited ones.
+- `inherit: false` on a list drops every rule from the levels above it, for that list only.
+
+A catalog `query` or `collection` entry has no `tracks:` of its own; it takes its
+block's. A pool and an inline item are never both the source of one item, so the
+two levels do not stack on the same airing.
+
+### Burning a picture subtitle
+
+A picture subtitle is burned in only where a rule says `image: true`. The usual
+shape puts it on a block or pool that holds foreign-language films:
+
+```yaml
+rule:
+  blocks:
+    - tracks:
+        subtitle:
+          prefer:
+            - { image: false, lang: "^en" }                              # a text track wins when the file has one
+            - { image: true, lang: "^en", when: { audio_lang_not: "^en" } }
+      pools: [ { name: anime, ... } ]
+```
+
+List the `image: false` entry first. A block's entries go ahead of the inherited
+ones, so a block that lists only the `image: true` entry would burn a picture
+subtitle even in a file that also carries a text track the viewer could have
+switched off.
+
+### Subtitle `default_on`
+
+```yaml
+# station.yaml
+normalization:
+  subtitle: { mode: convert, default_on: false }
+
+# a channel.yaml
+subtitle:
+  default_on: true       # this channel announces its subtitle track as DEFAULT=YES
+```
+
+`DEFAULT=YES` tells a player to start with subtitles showing. The viewer can
+still turn them off. It is a setting of the channel, because HLS attaches it to
+the whole session's subtitle rendition and it cannot vary per item.
 
 ## Sample configs
 

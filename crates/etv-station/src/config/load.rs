@@ -1205,6 +1205,7 @@ mod tests {
 
     fn station_config() -> StationConfig {
         StationConfig {
+            tracks: None,
             overlay: None,
             seed: None,
             tz: "UTC".into(),

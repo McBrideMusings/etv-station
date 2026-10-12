@@ -115,6 +115,24 @@ pub struct ResolvedItem {
     /// beyond `program` (studio, edition, genres, cast, …). Empty for an
     /// inline item, which has no catalog row behind it.
     pub guide_fields: crate::guide::GuideFields,
+    /// The track-selection rules authored at the most specific level this item
+    /// has: its pool for an item drawn from one, its own `tracks:` for an
+    /// inline item (#261). The block, channel and station levels sit beneath
+    /// it and are applied by [`crate::daemon`] when it selects, because the
+    /// choice needs the file's probed streams, which do not exist yet here.
+    pub tracks: Option<crate::config::TrackRules>,
+    /// The stream indexes the track selector chose for this item, written into
+    /// the playout item's `tracks`. `None` until a probed file has been
+    /// through it, and for sources that cannot be probed.
+    pub selected: Option<SelectedTracks>,
+}
+
+/// The audio and subtitle streams chosen for one item, as indexes into the
+/// file ETV-next plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedTracks {
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
 }
 
 impl ResolvedItem {
@@ -1238,6 +1256,7 @@ fn resolve_pool_block_items(
         progress,
         metadata,
         guides: pool_guides,
+        tracks: pool_tracks,
     } = build;
     let (mut items, mut steps): (Vec<ResolvedItem>, Vec<Step>) = ids
         .iter()
@@ -1248,7 +1267,13 @@ fn resolve_pool_block_items(
             // inline item's own `guide:` would if a pool draw had one to
             // author.
             let effective_guide = GuideConfig::cascade(None, pool_guides.get(id), guide_defaults);
-            catalog_item(cat, id, defaults, effective_guide.as_ref())
+            catalog_item(cat, id, defaults, effective_guide.as_ref()).map(|item| {
+                item.map(|mut item| {
+                    // The pool rung of the track-selection cascade (#261).
+                    item.tracks = pool_tracks.get(id).cloned();
+                    item
+                })
+            })
         })
         .collect::<Result<Vec<_>, String>>()
         .map_err(|m: String| unsupported(format!("block #{idx}: {m}")))?
@@ -1742,6 +1767,10 @@ fn catalog_item(
         // block ∘ channel cascade `guide_defaults` already carries.
         guide: guide_defaults.cloned(),
         guide_fields,
+        // A catalog item carries no rules of its own; the pool rung is set by
+        // `resolve_pool_block_items`, and the levels above it by the daemon.
+        tracks: None,
+        selected: None,
     }))
 }
 
@@ -1771,6 +1800,8 @@ fn resolve_item(
         // An inline item has no catalog row, so nothing to fill these from —
         // its `program` above is the whole answer.
         guide_fields: GuideFields::default(),
+        tracks: item.tracks.clone(),
+        selected: None,
     }
 }
 
@@ -1850,6 +1881,7 @@ mod tests {
     /// so distinct `id`s stay distinct and equal ones collapse.
     fn item_entry(id: &str) -> ItemEntry {
         ItemEntry {
+            tracks: None,
             source: SourceConfig::Lavfi { params: id.into() },
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
@@ -1863,6 +1895,7 @@ mod tests {
     /// `out_point - in_point` as its most authoritative source.
     fn item_entry_secs(id: &str, secs: u64) -> ItemEntry {
         ItemEntry {
+            tracks: None,
             source: SourceConfig::Lavfi { params: id.into() },
             in_point: None,
             out_point: Some(Duration::from_secs(secs)),
@@ -1874,6 +1907,7 @@ mod tests {
     /// A local-file test item (no authored id — identity derives from the path).
     fn local_entry(path: &str) -> ItemEntry {
         ItemEntry {
+            tracks: None,
             source: SourceConfig::Local { path: path.into() },
             in_point: None,
             out_point: Some(Duration::from_secs(30)),
@@ -1884,6 +1918,7 @@ mod tests {
 
     fn include_with(entries: Vec<Entry>) -> BlockInclude {
         BlockInclude {
+            tracks: None,
             overlay: None,
             block: None,
             program: None,
@@ -1904,6 +1939,8 @@ mod tests {
 
     fn channel(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            subtitle: None,
+            tracks: None,
             number: 1,
             scoring: None,
             name: "test".into(),
@@ -2218,6 +2255,7 @@ mod tests {
     #[test]
     fn lavfi_and_http_ids_derive_from_their_defining_field() {
         let lavfi = ItemEntry {
+            tracks: None,
             source: SourceConfig::Lavfi {
                 params: "testsrc".into(),
             },
@@ -2227,6 +2265,7 @@ mod tests {
             guide: None,
         };
         let http = ItemEntry {
+            tracks: None,
             source: SourceConfig::Http {
                 uri: "https://ex/y.mkv".into(),
                 headers: None,
@@ -3034,6 +3073,7 @@ mod tests {
         let mut inc = include_with(vec![]);
         inc.pools = vec![
             Pool {
+                tracks: None,
                 name: "movies".into(),
                 expr: Some("item.type == \"movie\"".into()),
                 plugin: None,
@@ -3056,6 +3096,7 @@ mod tests {
                 guide: None,
             },
             Pool {
+                tracks: None,
                 name: "shows".into(),
                 expr: Some("item.type == \"episode\"".into()),
                 plugin: None,
@@ -3857,6 +3898,7 @@ mod tests {
         let cat = interleave_catalog();
         let mut inc = include_with(vec![]);
         inc.pools = vec![Pool {
+            tracks: None,
             name: "shows".into(),
             expr: None,
             plugin: None,

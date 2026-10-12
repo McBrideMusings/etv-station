@@ -231,6 +231,9 @@ struct StationContext<'a> {
     /// reads (`ctx.history`); this one is the play-history ledger every
     /// channel appends to and projects its resume cursor from.
     history_db: &'a HistoryDb,
+    /// The station-level `tracks:` rules (#261), the base of the track
+    /// selection cascade.
+    station_tracks: Option<&'a crate::config::TrackRules>,
 }
 
 /// The station's copy of "what has been watched lately" — one per distinct
@@ -1061,6 +1064,7 @@ async fn run_generation(
                     catalog: cat.as_deref(),
                     history: &hist,
                     history_db: &hdb,
+                    station_tracks: s.station.tracks.as_ref(),
                 };
                 let result = supervise_channel(ch, ctx, stop).await;
                 (ch.name.clone(), result)
@@ -1735,6 +1739,8 @@ mod supervisor_tests {
                 metadata: None,
                 guide: None,
                 guide_fields: crate::guide::GuideFields::default(),
+                tracks: None,
+                selected: None,
             })
             .collect();
         let durations = vec![slot; count];
@@ -2102,6 +2108,8 @@ mod regen_floor_tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         }
     }
 
@@ -3002,6 +3010,37 @@ async fn pattern_catch_up(
             );
         }
 
+        // Choose each probed file's audio and subtitle streams from the
+        // `tracks:` rules (#261). Needs the streams `resolve_all` just read, so
+        // it cannot happen at resolve time.
+        let tally = crate::tracks::assign(
+            &mut items,
+            &cache,
+            &crate::tracks::Levels {
+                station: ctx.station_tracks,
+                channel: channel.config.tracks.as_ref(),
+                blocks: channel
+                    .config
+                    .rule
+                    .blocks
+                    .iter()
+                    .map(|b| b.tracks())
+                    .collect(),
+            },
+            &channel.name,
+        );
+        if tally.items > 0 {
+            tracing::info!(
+                event = "tracks.assigned",
+                channel = %channel.name,
+                items = tally.items,
+                with_subtitle = tally.with_subtitle,
+                burned = tally.burned,
+                audio_unmatched = tally.audio_unmatched,
+                "selected audio and subtitle streams for this generation",
+            );
+        }
+
         // Render each item's `guide:` overrides (#158) and, on a channel that
         // opted into it, name who has been watching (#113) — both need the
         // schedule (this item's own start/finish, a one-item lookahead) and
@@ -3218,6 +3257,7 @@ mod resume_fingerprint_survives_generation_tests {
             catalog: None,
             history,
             history_db,
+            station_tracks: None,
         }
     }
 
@@ -3974,6 +4014,8 @@ mod render_guide_and_attribution_tests {
             metadata: None,
             guide,
             guide_fields: GuideFields::default(),
+            tracks: None,
+            selected: None,
         }
     }
 

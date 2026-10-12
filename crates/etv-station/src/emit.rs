@@ -171,6 +171,8 @@ mod tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         }
     }
 

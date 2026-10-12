@@ -72,6 +72,8 @@ fn write_plugin(dir: &tempfile::TempDir) -> PathBuf {
 
 fn channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
+        subtitle: None,
+        tracks: None,
         number: 1,
         name: "test".into(),
         display_name: None,
@@ -88,6 +90,7 @@ fn channel(plugin: &Path) -> ChannelConfig {
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
+                tracks: None,
                 overlay: None,
                 block: None,
                 program: None,
@@ -100,6 +103,7 @@ fn channel(plugin: &Path) -> ChannelConfig {
                 mode: Mode::All,
                 order: Default::default(),
                 pools: vec![Pool {
+                    tracks: None,
                     name: "movies".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),

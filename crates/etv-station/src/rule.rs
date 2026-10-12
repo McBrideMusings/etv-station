@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ersatztv_playout::playout::{PlayoutItem, ProgramMetadata};
+use ersatztv_playout::playout::{PlayoutItem, PlayoutItemTracks, ProgramMetadata, TrackSelection};
 use time::OffsetDateTime;
 
 use crate::resolve::ResolvedItem;
@@ -201,7 +201,31 @@ fn build_playout_item(
     // `ResolvedItem::metadata`. `PlayoutItem::scheduled` already defaults this
     // to `None`, so an item nothing attached to changes no output.
     playout_item.metadata = item.metadata.clone();
+    playout_item.tracks = item.selected.and_then(playout_tracks);
     playout_item
+}
+
+/// The `tracks` block for a selection: the audio stream and the subtitle
+/// stream the station chose, as the integers ETV-next reads. A subtitle
+/// selection is also what makes ETV-next offer the channel's subtitle track,
+/// so an item with no subtitle chosen writes none.
+fn playout_tracks(selected: crate::resolve::SelectedTracks) -> Option<PlayoutItemTracks> {
+    let pick = |stream_index: Option<u32>| {
+        stream_index.map(|i| TrackSelection {
+            source: None,
+            stream_index: Some(i),
+        })
+    };
+    let audio = pick(selected.audio);
+    let subtitle = pick(selected.subtitle);
+    if audio.is_none() && subtitle.is_none() {
+        return None;
+    }
+    Some(PlayoutItemTracks {
+        audio,
+        video: None,
+        subtitle,
+    })
 }
 
 fn clone_program(p: &ProgramMetadata) -> ProgramMetadata {
@@ -224,6 +248,43 @@ fn clone_program(p: &ProgramMetadata) -> ProgramMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_streams_become_the_items_tracks() {
+        let mut item = lavfi("a", 60);
+        item.selected = Some(crate::resolve::SelectedTracks {
+            audio: Some(2),
+            subtitle: Some(5),
+        });
+        let start = time::macros::datetime!(2026-04-13 00:00 UTC);
+        let playout = build_playout_item(&item, start, start + time::Duration::minutes(1));
+        let tracks = playout.tracks.expect("tracks written");
+        assert_eq!(tracks.audio.unwrap().stream_index, Some(2));
+        assert_eq!(tracks.subtitle.unwrap().stream_index, Some(5));
+        assert!(tracks.video.is_none());
+    }
+
+    #[test]
+    fn no_chosen_subtitle_leaves_the_item_out_of_the_subtitle_rendition() {
+        let mut item = lavfi("a", 60);
+        item.selected = Some(crate::resolve::SelectedTracks {
+            audio: Some(1),
+            subtitle: None,
+        });
+        let start = time::macros::datetime!(2026-04-13 00:00 UTC);
+        let playout = build_playout_item(&item, start, start + time::Duration::minutes(1));
+        assert!(!playout.requests_subtitle());
+        assert_eq!(playout.tracks.unwrap().audio.unwrap().stream_index, Some(1));
+    }
+
+    #[test]
+    fn an_unprobed_item_writes_no_tracks() {
+        let item = lavfi("a", 60);
+        let start = time::macros::datetime!(2026-04-13 00:00 UTC);
+        let playout = build_playout_item(&item, start, start + time::Duration::minutes(1));
+        assert!(playout.tracks.is_none());
+    }
+
     use crate::config::SourceConfig;
     use time::macros::datetime;
 
@@ -242,6 +303,8 @@ mod tests {
             metadata: None,
             guide: None,
             guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
         }
     }
 

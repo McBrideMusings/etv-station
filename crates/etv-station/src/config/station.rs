@@ -146,6 +146,12 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
 
+    /// Station-level track-selection rules (#261): the least specific level of
+    /// the station → channel → block → pool → item cascade. Unset means the
+    /// built-in floor alone — any text subtitle, and the file's default audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<crate::config::TrackRules>,
+
     /// ETV-next's `ffmpeg:` block, deserialized through its own type so a
     /// renamed field fails this build instead of being silently dropped.
     /// Every field defaults, so `ffmpeg:` can be omitted entirely.

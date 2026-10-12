@@ -13,6 +13,9 @@ ersatztv-channel = { workspace = true }
 ersatztv-core = { workspace = true }
 ersatztv-playout = { workspace = true }
 etv-overlay = { workspace = true }
+# The one list of picture-subtitle codecs, so the track selector and the
+# pipeline that burns them cannot disagree about which streams are pictures.
+ffpipeline = { workspace = true }
 glob = { workspace = true }
 humantime = { workspace = true }
 humantime-serde = { workspace = true }

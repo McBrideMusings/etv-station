@@ -35,6 +35,10 @@ pub struct BlockFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<GuideConfig>,
 
+    /// Block-level track-selection rules (#261).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<crate::config::TrackRules>,
+
     /// Block-level overlay (#48), the deepest of that cascade's three levels
     /// (station → channel → block). Unlike `guide:` above, this replaces the
     /// channel's config outright rather than merging field by field — see

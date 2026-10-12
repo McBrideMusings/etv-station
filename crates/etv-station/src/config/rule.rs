@@ -45,6 +45,11 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<GuideConfig>,
 
+    /// Block-level track-selection rules (#261). Path form: spliced in from the
+    /// referenced block file's own `tracks:` by [`Self::apply_body`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<crate::config::TrackRules>,
+
     /// Block-level overlay (#48), deepest level of the station → channel →
     /// block cascade. Path form: spliced in from the referenced block file's
     /// own `overlay:` by [`Self::apply_body`], same as `guide` above. Its
@@ -135,6 +140,11 @@ impl BlockInclude {
     /// The effective `guide:` defaults for this block (#158).
     pub fn guide(&self) -> Option<&GuideConfig> {
         self.guide.as_ref()
+    }
+
+    /// The effective track-selection rules for this block (#261).
+    pub fn tracks(&self) -> Option<&crate::config::TrackRules> {
+        self.tracks.as_ref()
     }
 
     /// The effective duplicate policy. An entries block defaults to `collapse`;
@@ -249,6 +259,7 @@ impl BlockInclude {
     pub(super) fn apply_body(&mut self, body: BlockFile) {
         self.program = body.program;
         self.guide = body.guide;
+        self.tracks = body.tracks;
         self.overlay = body.overlay;
         self.duplicates = body.duplicates;
         self.constraints = body.constraints;

@@ -762,6 +762,47 @@ Two safety properties worth not breaking:
 The pre-deploy run is stale-gated (`ETV_STATION_BACKUP_IF_STALE=1`), so a
 `--dry-run` cannot churn the retention window; `admin backup` always snapshots.
 
+## Verifying audio and subtitle track selection (#261)
+
+```bash
+admin verify-tracks        # or ./tools/verify-tracks.sh
+```
+
+It builds one Matroska file with a default-flagged commentary track listed first,
+a main track, and an English text subtitle; boots the daemon against it with no
+Plex; and asserts the first emitted item plays stream 2 (the main track) with
+subtitle stream 3, that `channel1.json` carries `subtitle.default_on`, and that
+`event="tracks.assigned"` was logged. Look for five `PASS` lines. It fails if the
+station config's commentary exclusion stops working, because the commentary is
+the one flagged default.
+
+Picture subtitles cannot be made with ffmpeg, so the burn rule is checked by
+`cargo test -p etv-station --lib tracks::`. To see it on real media, clip a disc
+rip and run the daemon against it:
+
+```bash
+ffmpeg -ss 00:30:00 -i "<rip>.mkv" -t 40 -map 0:v:0 -map 0:a -map 0:s \
+  -vf scale=640:360 -c:v libx264 -preset ultrafast -c:a aac -ac 2 -c:s copy clip.mkv
+```
+
+Give a block `tracks: { subtitle: { prefer: [ { image: true, lang: "^en", when: {
+audio_lang_not: "^en" } } ] } }` and look for `event="tracks.burned"` and a
+`tracks.subtitle.stream_index` in the playout JSON. Without the rule, the same
+file's item carries no `subtitle` key.
+
+To see what a player sees, start `etv-station` (with `env -u PLEX_URL -u
+PLEX_TOKEN`) and `ersatztv` from `--render-etv-next` output, then:
+
+```bash
+curl http://127.0.0.1:8409/channel/1.m3u8        # expect #EXT-X-MEDIA:TYPE=SUBTITLES ... DEFAULT=NO
+curl http://127.0.0.1:8409/session/1/live_sub.m3u8   # lists <run>/liveNNNNNN.vtt
+curl http://127.0.0.1:8409/session/1/<run>/live000025.vtt   # cue lines under WEBVTT
+```
+
+Fetch a `.vtt` by the path `live_sub.m3u8` lists, including its `<run>/` prefix; the
+bare file name returns an empty body. `./tools/dev-run.sh` sources `.env` and would
+contact the real Plex, so run the two binaries by hand for this check.
+
 ## Gotchas
 
 - The first Plex ingest reads the whole library and genuinely takes minutes

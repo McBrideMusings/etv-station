@@ -93,6 +93,8 @@ fn audit(ctx, picks, workspace) { #{} }
 
 fn plugin_channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
+        subtitle: None,
+        tracks: None,
         number: 1,
         name: "test".into(),
         display_name: None,
@@ -109,6 +111,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
+                tracks: None,
                 overlay: None,
                 block: None,
                 program: None,
@@ -121,6 +124,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                 mode: Mode::All,
                 order: Default::default(),
                 pools: vec![Pool {
+                    tracks: None,
                     name: "clockpool".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),

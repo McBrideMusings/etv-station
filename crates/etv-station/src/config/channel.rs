@@ -9,6 +9,16 @@ use super::rule::RuleConfig;
 use crate::guide::GuideConfig;
 use crate::tautulli::HistoryScope;
 
+/// The per-channel subtitle settings ETV-next reads from `channelN.json`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ChannelSubtitle {
+    /// Announce this channel's subtitle rendition as `DEFAULT=YES`, so players
+    /// start with subtitles showing. The viewer can still switch them off.
+    /// `None` leaves the station's `normalization.subtitle.default_on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_on: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChannelConfig {
     /// This channel's dial number (#263) — required, and no longer derived
@@ -56,6 +66,17 @@ pub struct ChannelConfig {
     /// free, with no config needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<GuideConfig>,
+
+    /// Channel-level track-selection rules (#261), under the station's and
+    /// over nothing: blocks, pools and items refine them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<crate::config::TrackRules>,
+
+    /// This channel's override of ETV-next's `normalization.subtitle`
+    /// settings, written into its `channelN.json` (#290). Only the settings
+    /// that belong to one channel appear here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<ChannelSubtitle>,
 
     /// How far ahead of live the schedule is materialized. This is also what
     /// bounds a single generation, whichever shape the channel is: a pattern

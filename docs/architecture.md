@@ -26,77 +26,72 @@ Quick reference. The full rationale lives in [PRD §Architecture](/PRD#architect
 - The directory layout is single-sourced from the station config: each channel's output folder is derived as `{output_base}/{identity}` (see [schema](/schema#station-file)), and `etv-station --render-etv-next <dir>` generates ETV-next's `lineup.json` + `channelN.json` from that same config — so ETV-next reads exactly where the station writes, with no folder path authored twice. The container entrypoint runs that render once at start, and the daemon re-runs the same render itself on every SIGHUP-triggered config generation (`ETV_NEXT_DIR` set), so a channel moving from failing-to-load to loading reaches the lineup on `admin reload`, not only on a full container restart.
 - A third contact point beyond playout JSON and the HLS working set (#187): the station writes cached Plex artwork under `artwork_cache_dir` (`ETV_STATION_ARTWORK_CACHE`, `/data/artwork` in the container), and ETV-next serves it back at `/artwork` — mounted from the `artwork.folder` key `etv-station --render-etv-next` writes into `lineup.json` when artwork caching is on. `<icon src>` in the generated `xmltv.xml` is always either this local path (resolved to an absolute URL against the request's own host) or absent — never a Plex URL, since a Plex artwork URL carries `X-Plex-Token` as a working credential and the guide is served over plain HTTP.
 
-## Subtitles
+## Subtitles and audio tracks
 
-Subtitles are entirely ETV-next's work — the station never opens a media file
-to look for them. What the station decides is *which of the two ways* ETV-next
-should do it, and it decides that for every channel at once.
+The station chooses which audio stream and which subtitle stream of each file
+plays. ETV-next turns the choice into pictures and sound: it receives two
+integers per item and holds no selection policy of its own.
 
-The switch is one field in the station config's `normalization:` block, the
-shared playback body `--render-etv-next` copies into every generated
-`channelN.json`:
-
-```json
-"subtitle": {
-  "mode": "convert"
-}
+```text
+rules in YAML             ffprobe streams            playout JSON            HLS
+station → channel →   +   index, codec, lang,   →   tracks.audio            #EXT-X-MEDIA:TYPE=SUBTITLES
+block → pool → item       title, channels,           .stream_index           (text: WebVTT per segment)
+                          default, forced            tracks.subtitle         picture: burned into video
+                                                     .stream_index
 ```
 
-- **`convert`** (what this station ships) has ETV-next pull the subtitle text
-  out of each file, write it as a WebVTT file beside every video segment, and
-  list those in a second playlist the top-level playlist points at. The viewer's
-  player shows a subtitle track it can switch on and off.
-- **`burn`** has ETV-next paint the words into the video picture instead. Every
-  viewer sees them and no player setting can turn them off, because by the time
-  the video arrives the words are part of the image.
+`crates/etv-station/src/duration.rs` reads each local file's streams in the same
+`ffprobe` call that reads its duration. `crates/etv-station/src/tracks.rs`
+applies the cascaded `tracks:` rules ([schema](/schema#track-selection)) and
+`rule.rs` writes the winners into the item's `tracks`.
 
-Two things this switch does *not* control, both worth knowing before reaching
-for it:
+**A text subtitle is a track the viewer switches on and off.** The station's
+`normalization.subtitle.mode` is `convert`: ETV-next writes the text as WebVTT
+beside every video segment, lists those in `live_sub.m3u8`, and the top-level
+playlist announces it:
 
-**It only governs text subtitles.** A Blu-ray or DVD rip usually carries its
-subtitles as pictures — `hdmv_pgs_subtitle` or `dvd_subtitle` — and a picture
-cannot be turned into WebVTT text. ETV-next composites those onto the video in
-either mode. So `convert` is not a promise that nothing gets painted in; it is a
-promise about the tracks that *can* be converted.
+```text
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,LANGUAGE="en",URI=".../session/1/live_sub.m3u8"
+```
 
-**Nothing is painted in unless a playout item asks for it.** The station writes
-items that name no subtitle track, and an item that names none plays without
-subtitles. That is the station's default and the reason the picture-subtitle path
-above stays cold: a channel of Blu-ray rips does not silently acquire a permanent,
-unselectable subtitle nobody chose. An item opts in by carrying
-`tracks.subtitle` — a `stream_index` to pick a track out of its own file, or a
-`source` to name a sidecar.
+With nothing configured, an item gets the first text subtitle stream its file
+lists. Audio is the file's default-flagged stream, or its first.
 
-`subtitle.mode` is a station-wide setting today, read from the station
-config's `normalization:` block alone. `presentation.json`, which used to carry a
-per-channel deep-merge override for it, was removed outright when the channel
-display name moved into the channel YAML (#158, decision 5) — no dual support,
-no replacement decided for the config-override half of what it did. A channel
-wanting `burn` while the rest of the station runs `convert` has no config path
-to say so right now.
+**A picture subtitle is burned in only when a rule names it.** Blu-ray and DVD
+rips carry subtitles as pictures (`hdmv_pgs_subtitle`, `dvd_subtitle`), which
+cannot become WebVTT. If a rule selects one, ETV-next paints it into the video and
+the viewer cannot turn it off. No default rule selects a picture subtitle, so a
+file whose only subtitles are pictures plays without subtitles until a block or
+pool says `image: true`, usually with `when: { audio_lang_not: ... }` so only
+foreign-language films get them.
 
-Two things are worth knowing about the mode itself:
+**The subtitle rendition appears only when a scheduled item selected a subtitle**
+(ETV-next's `schedule_requests_subtitle`, #286). Old VLC (3.0.4, in iPlayTV on
+tvOS) drops the video the first time it reads an empty cue file, so a channel
+whose playout selects no subtitle advertises no track. On a channel that mixes
+subtitled and unsubtitled items the track exists throughout, with empty cues
+during the unsubtitled ones.
 
-- `convert` produces a selectable WebVTT track only for text subtitle formats.
-  A Blu-ray or DVD rip carries its subtitles as pictures (PGS, VobSub), which
-  cannot become WebVTT — so for those items the pipeline paints them onto the
-  video instead, per item, the same as `burn` does. The viewer gets subtitles
-  either way; what changes is whether they can be switched off
-  ([#236](https://github.com/McBrideMusings/etv-station/issues/236)).
-- The announced subtitle language is a channel setting, not a fixed string:
-  `normalization.subtitle.language.{name,tag}` (defaulting to English / `en`)
-  is what goes into `NAME=` and `LANGUAGE=` in the playlist
-  ([#238](https://github.com/McBrideMusings/etv-station/issues/238)). HLS
-  allows one language per subtitle rendition for a whole session, so a channel
-  whose schedule mixes languages still declares the single value it advertises
-  — this cannot vary per programme. The tag describes the subtitle text, not
-  the audio, so Japanese audio with English subtitles is labelled correctly.
-- The stream picker honours that same declaration. When a file carries subtitle
-  streams in more than one language, `select_subtitle_stream()` prefers the
-  probed stream whose ISO 639-2 tag matches the channel's declared tag, and
-  falls back to the first non-image stream when nothing matches or the file
-  carries no language tags at all
-  ([#237](https://github.com/McBrideMusings/etv-station/issues/237)).
+**`DEFAULT=YES` is per channel.** `normalization.subtitle.default_on` in
+`station.yaml` sets it for every channel, and a channel's own `subtitle:
+{ default_on: true }` overrides it in that channel's `channelN.json`. HLS
+attaches `DEFAULT` to the rendition, which the whole session shares, so it cannot
+vary by item. The viewer can still switch the track off.
+
+The announced language is a channel setting too:
+`normalization.subtitle.language.{name,tag}` (English / `en` by default) is what
+goes into `NAME=` and `LANGUAGE=`. HLS allows one language per subtitle
+rendition for a session, so a channel whose schedule mixes languages declares
+the one it advertises. The tag describes the subtitle text, not the audio.
+
+Items the station cannot probe (lavfi, HTTP) carry no `tracks`, so ETV-next
+plays their first audio stream and no subtitles.
+
+`presentation.json`, which once carried a per-channel override of the whole
+`normalization` block, no longer exists. The per-channel settings that have a
+replacement are `subtitle.default_on` here and `display_name`; other
+`normalization` fields stay station-wide
+([#290](https://github.com/McBrideMusings/etv-station/issues/290)).
 
 ## Why ETV-next is vendored, not pinned
 

@@ -39,6 +39,8 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
         }
     }
 
+    validate_tracks(path, "station", station.tracks.as_ref())?;
+
     if station.output_base.as_os_str().is_empty() {
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
@@ -109,6 +111,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     validate_taste_scope(path, channel)?;
     validate_show_groups(path, &channel.groups)?;
     validate_guide(path, "channel", channel.guide.as_ref())?;
+    validate_tracks(path, "channel", channel.tracks.as_ref())?;
 
     // A `plugin:` path means what it means relative to the channel config
     // file (see `score::ScoreEnv::resolve_path`, which every generation-time
@@ -142,6 +145,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // way — an inherited nonsense value is still nonsense.
         validate_constraints(&include.constraints(), &bad)?;
         validate_guide(path, &format!("block #{idx}"), include.guide())?;
+        validate_tracks(path, &format!("block #{idx}"), include.tracks())?;
 
         if include.is_pattern() {
             validate_pattern_block(include, &mut pool_names, &channel.groups, base_dir, &bad)?;
@@ -170,11 +174,36 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
                     &format!("block #{idx}: item #{entry_idx}"),
                     item.guide.as_ref(),
                 )?;
+                validate_tracks(
+                    path,
+                    &format!("block #{idx}: item #{entry_idx}"),
+                    item.tracks.as_ref(),
+                )?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Validate one level's `tracks:` rules (#261): every regex must compile and
+/// every comparison must parse, so a bad pattern fails the load naming the
+/// level, the list, the entry and the pattern rather than a generation hours
+/// later. `label` identifies the cascade level.
+pub(crate) fn validate_tracks(
+    path: &Path,
+    label: &str,
+    tracks: Option<&crate::config::TrackRules>,
+) -> Result<(), ConfigError> {
+    let Some(tracks) = tracks else {
+        return Ok(());
+    };
+    tracks
+        .validate(label)
+        .map_err(|message| ConfigError::Validation {
+            path: path.to_path_buf(),
+            message,
+        })
 }
 
 /// Validate one level's `guide:` block (#158): every `{field}` (or `{a|b}`
@@ -755,6 +784,11 @@ fn validate_block_pools<'a>(
             let pool_bad = |m: String| bad(format!("pool {:?}: {m}", pool.name));
             validate_constraints(c, &pool_bad)?;
         }
+        if let Some(tracks) = &pool.tracks {
+            tracks
+                .validate(&format!("pool {:?}", pool.name))
+                .map_err(&bad)?;
+        }
         // This pool's own `guide:` (#289) — validated on the same terms as
         // every other cascade level, with the pool's name in the message
         // since that is the line the author has to go and fix.
@@ -1076,6 +1110,7 @@ mod tests {
 
     fn item_entry(id: &str) -> Entry {
         Entry::Item(Box::new(ItemEntry {
+            tracks: None,
             source: SourceConfig::Lavfi {
                 params: format!("src={id}"),
             },
@@ -1088,6 +1123,7 @@ mod tests {
 
     fn inline_block(entries: Vec<Entry>) -> BlockInclude {
         BlockInclude {
+            tracks: None,
             overlay: None,
             block: None,
             program: None,
@@ -1108,6 +1144,7 @@ mod tests {
 
     fn pool(name: &str) -> Pool {
         Pool {
+            tracks: None,
             name: name.into(),
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
@@ -1165,6 +1202,8 @@ mod tests {
 
     fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            subtitle: None,
+            tracks: None,
             number: 1,
             scoring: None,
             name: "test".into(),
@@ -1276,6 +1315,7 @@ mod tests {
     #[test]
     fn rejects_empty_channels() {
         let s = StationConfig {
+            tracks: None,
             overlay: None,
             seed: None,
             tz: "UTC".into(),
@@ -1299,6 +1339,7 @@ mod tests {
     #[test]
     fn rejects_empty_output_base() {
         let s = StationConfig {
+            tracks: None,
             overlay: None,
             seed: None,
             tz: "UTC".into(),
@@ -1323,6 +1364,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_tz() {
         let s = StationConfig {
+            tracks: None,
             overlay: None,
             seed: None,
             tz: "America/Atlantis".into(),
@@ -1345,6 +1387,7 @@ mod tests {
     #[test]
     fn rejects_empty_channel_entry() {
         let s = StationConfig {
+            tracks: None,
             overlay: None,
             seed: None,
             tz: "UTC".into(),
@@ -1777,6 +1820,7 @@ mod tests {
         let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
         b.fallback = Some(crate::config::Fallback::Item(Box::new(
             crate::config::ItemEntry {
+                tracks: None,
                 source: crate::config::SourceConfig::Lavfi {
                     params: "standby".into(),
                 },

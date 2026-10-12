@@ -32,5 +32,6 @@ pub mod simulate;
 pub mod tautulli;
 #[cfg(test)]
 pub(crate) mod test_tracing;
+pub mod tracks;
 pub mod tz;
 pub mod value_fmt;

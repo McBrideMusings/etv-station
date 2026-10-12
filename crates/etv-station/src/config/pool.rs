@@ -564,6 +564,13 @@ pub struct Pool {
     /// has no `pools` to author this on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<GuideConfig>,
+
+    /// This pool's own track-selection rules (#261) — the rung between the
+    /// block and the item, for the same reason `guide:` has one: a pattern
+    /// block that interleaves an anime pool with a bumpers pool can burn
+    /// picture subtitles for one without touching the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<crate::config::TrackRules>,
 }
 
 /// One named external datastore grant (#167) — see [`Pool::datastores`].

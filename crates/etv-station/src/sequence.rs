@@ -270,12 +270,22 @@ pub fn build(
         }
     }
 
+    let mut tracks_out: HashMap<String, crate::config::TrackRules> = HashMap::new();
+    for id in &arranged {
+        if let Some(&(pool_idx, _)) = item_location.get(id)
+            && let Some(tracks) = &pools[pool_idx].tracks
+        {
+            tracks_out.insert(id.clone(), tracks.clone());
+        }
+    }
+
     Ok(BlockBuild {
         ids: arranged,
         resume: resume_out,
         progress,
         metadata: metadata_out,
         guides: guide_out,
+        tracks: tracks_out,
     })
 }
 
@@ -502,6 +512,7 @@ mod tests {
 
     fn pool(name: &str, expr: &str) -> Pool {
         Pool {
+            tracks: None,
             name: name.into(),
             expr: Some(expr.into()),
             plugin: None,

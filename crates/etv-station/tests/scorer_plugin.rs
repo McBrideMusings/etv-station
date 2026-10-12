@@ -116,6 +116,8 @@ async fn assert_one_file_across_the_chunk(
 /// A one-pool, one-step pattern channel whose pool draws from `plugin`.
 fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
     ChannelConfig {
+        subtitle: None,
+        tracks: None,
         number: 1,
         name: "test".into(),
         display_name: None,
@@ -132,6 +134,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
+                tracks: None,
                 overlay: None,
                 block: None,
                 program: None,
@@ -144,6 +147,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                 mode: Mode::All,
                 order: Default::default(),
                 pools: vec![Pool {
+                    tracks: None,
                     name: "foryou".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),

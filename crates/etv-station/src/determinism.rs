@@ -300,6 +300,8 @@ mod tests {
 
     fn base_channel(rule: RuleConfig, scoring: Option<ScoringConfig>) -> ChannelConfig {
         ChannelConfig {
+            subtitle: None,
+            tracks: None,
             number: 1,
             scoring,
             name: "test".into(),
@@ -322,6 +324,7 @@ mod tests {
         Station {
             config_path: PathBuf::from("/tmp/station.toml"),
             station: crate::config::StationConfig {
+                tracks: None,
                 overlay: None,
                 seed: None,
                 tz: "UTC".into(),
@@ -352,6 +355,7 @@ mod tests {
 
     fn item_entry(id: &str) -> ItemEntry {
         ItemEntry {
+            tracks: None,
             source: SourceConfig::Lavfi { params: id.into() },
             in_point: None,
             out_point: Some(StdDuration::from_secs(30)),
@@ -362,6 +366,7 @@ mod tests {
 
     fn manual_block(ids: &[&str]) -> BlockInclude {
         BlockInclude {
+            tracks: None,
             overlay: None,
             block: None,
             program: None,
@@ -389,6 +394,7 @@ mod tests {
     /// stand-in length.
     fn item_entry_secs(id: &str, secs: u64) -> ItemEntry {
         ItemEntry {
+            tracks: None,
             source: SourceConfig::Lavfi { params: id.into() },
             in_point: None,
             out_point: Some(StdDuration::from_secs(secs)),
@@ -399,6 +405,7 @@ mod tests {
 
     fn manual_block_secs(ids: &[(&str, u64)]) -> BlockInclude {
         BlockInclude {
+            tracks: None,
             overlay: None,
             block: None,
             program: None,
@@ -461,6 +468,7 @@ mod tests {
 
     fn shuffled_block(ids: &[&str]) -> BlockInclude {
         BlockInclude {
+            tracks: None,
             overlay: None,
             block: None,
             program: None,
@@ -629,6 +637,7 @@ fn audit(ctx, picks, workspace) {
 
     fn plugin_pool(script: &Path) -> Pool {
         Pool {
+            tracks: None,
             name: "movies".into(),
             expr: None,
             plugin: Some(script.to_path_buf()),
@@ -659,6 +668,7 @@ fn audit(ctx, picks, workspace) {
 
     fn pattern_block(script: &Path, take: usize) -> BlockInclude {
         BlockInclude {
+            tracks: None,
             overlay: None,
             block: None,
             program: None,
