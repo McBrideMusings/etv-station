@@ -198,6 +198,15 @@ pub const MIGRATIONS: &[&str] = &[
 
     DELETE FROM catalog_meta WHERE key = 'last_plex_ingest';
     "#,
+    // v9 — index the show a query names. `item.show == "X"` translates to
+    // `COALESCE(entries.show, '') = ?` (`query::comparison`); without an index
+    // each such query reads every entry. An entries-only channel runs one per
+    // entry on every generation. SQLite uses an expression index only for the
+    // identical expression, so this indexes exactly what the translator
+    // emits — `==` and `in` on `item.show` both read it.
+    r#"
+    CREATE INDEX idx_entries_show ON entries(COALESCE(show, ''));
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

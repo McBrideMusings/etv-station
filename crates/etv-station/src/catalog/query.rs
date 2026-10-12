@@ -246,6 +246,8 @@ fn comparison(
             // NULL-as-default (#103): a NULL string column reads as "" so `!= x`
             // includes rows with no value (CEL "unset string field = default")
             // and `== ""` matches them. Applies to every promoted string field.
+            // `idx_entries_show` (schema v9) indexes this exact expression for
+            // `show`; reword it and show queries go back to reading every entry.
             Ok(format!("COALESCE(entries.{col}, '') {op} ?"))
         }
         FieldKind::Num(col) => {
@@ -912,5 +914,36 @@ mod tests {
         let mut all = c.resolve_query(r#"item.edition.contains("")"#).unwrap();
         all.sort();
         assert_eq!(all, vec!["m:ext".to_string(), "m:theat".to_string()]);
+    }
+
+    /// An entries-only channel resolves one `item.show` query per entry on
+    /// every generation, so each must search `idx_entries_show` rather than
+    /// read every entry. The expression index only applies while the
+    /// translator emits the exact expression it indexes, so this pins that.
+    #[test]
+    fn a_show_query_searches_the_show_index_instead_of_scanning() {
+        let c = seeded();
+        for cel in [
+            r#"item.show == "Atlanta""#,
+            r#"item.show == "Deadwood" && item.season == 1"#,
+            r#"item.show in ["Atlanta", "Chernobyl"]"#,
+        ] {
+            let wc = super::translate(cel).unwrap();
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT entry_id FROM entries WHERE ({}) \
+                 AND entries.missing_since IS NULL ORDER BY entry_id",
+                wc.sql
+            );
+            let mut stmt = c.conn.prepare(&sql).unwrap();
+            let plan: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(wc.params), |r| r.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|p| p.contains("idx_entries_show")),
+                "{cel} should search idx_entries_show, plan was {plan:?}",
+            );
+        }
     }
 }

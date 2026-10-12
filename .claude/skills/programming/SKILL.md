@@ -48,8 +48,12 @@ curl -s 'http://127.0.0.1:4747/api/review?channel=<folder>&days=14'
 it is the directory name, e.g. `034-syfy`. Under `examples/`, where channels are
 flat files sharing one folder, it is the path relative to the station file, e.g.
 `channels/a24.yaml` — pass it as is, unencoded. `days` defaults to 14, max 60.
-Measured 2026-10-12: the first request took ~30s while every channel's
-fingerprint resolved, later ones ~13s for SyFy over 14 days. taste-lab re-reads the station and
+Measured 2026-10-12 on a catalog at schema v9 (the `item.show` index): 14 days
+takes ~5s for SyFy and ~14s for 035-prestige, an entries-only channel that
+resolves 27 queries on each of its 331 hourly generations. Without the index,
+that 035 request takes over 9 minutes. taste-lab reads `taste-cache.sh`'s copy of the
+host's catalog, so it has the index only once a deployed daemon has migrated the
+host's file and the cache has refetched it. taste-lab re-reads the station and
 channel files on every request, so an edit needs no restart.
 
 ## After the edit
