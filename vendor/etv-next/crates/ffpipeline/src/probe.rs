@@ -25,6 +25,8 @@ static SUBTITLE_IMAGE_CODECS: &[&str] = &[
     "vobsub",
     "pgssub",
     "pgs",
+    "dvb_subtitle",
+    "xsub",
 ];
 
 /// Whether a subtitle codec carries pictures rather than text. A picture
