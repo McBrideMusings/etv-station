@@ -380,8 +380,11 @@ tvOS version.
 What is available:
 
 ```sh
-xcrun devicectl device sysdiagnose --device <UDID> --output <dir>
+xcrun devicectl device sysdiagnose --device <UDID> --destination <dir> --gather-full-logs --timeout 1200
 ```
+
+`--output` is rejected. Without `--gather-full-logs` the archive may not reach
+back to a freeze that happened minutes earlier.
 
 A sysdiagnose is the honest path to on-device logs; it is slow and large, so
 take one only when the access log has already ruled the server out. Console.app
