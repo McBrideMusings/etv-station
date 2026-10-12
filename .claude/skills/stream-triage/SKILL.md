@@ -384,7 +384,16 @@ xcrun devicectl device sysdiagnose --device <UDID> --destination <dir> --gather-
 ```
 
 `--output` is rejected. Without `--gather-full-logs` the archive may not reach
-back to a freeze that happened minutes earlier.
+back to a freeze that happened minutes earlier. On this Mac it can also fail
+with `CoreDeviceCLISupport.DiagnoseError error 0` on every device, a
+`--dry-run-only` included. When it does, the unified log alone comes from:
+
+```sh
+sudo log collect --device-udid <UDID> --start '<local YYYY-MM-DD HH:MM:SS>' --output <dir>/atv.logarchive
+```
+
+It refuses without root ("Must be root to collect logs from attached device"),
+so the user caches sudo first with `! sudo -v`.
 
 A sysdiagnose is the honest path to on-device logs; it is slow and large, so
 take one only when the access log has already ruled the server out. Console.app
