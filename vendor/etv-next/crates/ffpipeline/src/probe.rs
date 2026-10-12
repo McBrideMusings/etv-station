@@ -27,6 +27,12 @@ static SUBTITLE_IMAGE_CODECS: &[&str] = &[
     "pgs",
 ];
 
+/// Whether a subtitle codec carries pictures rather than text. A picture
+/// subtitle cannot become WebVTT, so it can only be burned into the video.
+pub fn is_image_subtitle_codec(codec: &str) -> bool {
+    SUBTITLE_IMAGE_CODECS.contains(&codec)
+}
+
 static STILL_IMAGE_CODECS: &[&str] = &["png", "mjpeg", "bmp", "tiff"];
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -116,8 +122,7 @@ impl ProbeResultVideoStream {
     }
 
     pub fn is_subtitle_image(&self) -> bool {
-        self.codec_type == CodecType::Subtitle
-            && SUBTITLE_IMAGE_CODECS.contains(&self.codec.as_str())
+        self.codec_type == CodecType::Subtitle && is_image_subtitle_codec(&self.codec)
     }
 
     pub fn is_still_image(&self) -> bool {
