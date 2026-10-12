@@ -237,7 +237,10 @@ impl TuneInStill {
                     .arg("-video_size")
                     .arg(format!("{}x{}", spec.width, spec.height))
                     .args(["-i", "pipe:0"]);
-                format!("{fit}[b];[b][1:v]overlay=x=0:y=0:format=auto[v]")
+                let (ow, oh) = contain((spec.width, spec.height), self.canvas);
+                format!(
+                    "{fit}[b];[1:v]scale={ow}:{oh}:flags=fast_bilinear,setsar=1[o];[b][o]overlay=x=0:y=0:format=auto[v]"
+                )
             }
             None => format!("{fit}[v]"),
         };
@@ -293,6 +296,18 @@ pub fn program_context(
         (now.duration - into).as_seconds_f64(),
         now.metadata.clone(),
     )
+}
+
+/// The size ETV-next scales a `size` overlay to on a `canvas` output: the
+/// largest aspect-preserving fit, each side rounded to even and capped at the
+/// canvas, then laid unpadded at the top-left. This is ffpipeline's
+/// `ScalingMode::ScaleAndPad` on the overlay input
+/// (`FrameSize::square_pixel_size_contain`).
+fn contain(size: (u32, u32), canvas: (u32, u32)) -> (u32, u32) {
+    let (sw, sh) = (f64::from(size.0), f64::from(size.1));
+    let k = f64::min(f64::from(canvas.0) / sw, f64::from(canvas.1) / sh);
+    let even = |v: f64| (v.round_ties_even() as u32).next_multiple_of(2);
+    (even(sw * k).min(canvas.0), even(sh * k).min(canvas.1))
 }
 
 #[cfg(test)]
@@ -603,6 +618,35 @@ mod tests {
         );
         let (rgb, width) = decode(&out);
         assert!(luma(&rgb, width, 6, 6) < 40, "no overlay, no box");
+    }
+
+    #[test]
+    fn a_smaller_overlay_is_scaled_up_to_the_canvas() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("still.jpg");
+        let still = still_of(black_fixture(dir.path()), (128, 72), Some(box_spec()));
+        still.render(Path::new("ffmpeg"), &out).unwrap();
+        let (rgb, width) = decode(&out);
+        assert_eq!(width, 128);
+        assert!(luma(&rgb, width, 24, 24) > 200, "inside the doubled box");
+        assert!(luma(&rgb, width, 40, 40) < 40, "outside the doubled box");
+
+        // A square canvas fits the 16:9 overlay by width and leaves it at the
+        // top, unpadded: the box spans 0..32 down from y=0, not from y=28.
+        let still = still_of(black_fixture(dir.path()), (128, 128), Some(box_spec()));
+        still.render(Path::new("ffmpeg"), &out).unwrap();
+        let (rgb, width) = decode(&out);
+        assert!(luma(&rgb, width, 10, 10) > 200, "box at the top");
+        assert!(luma(&rgb, width, 10, 50) < 40, "nothing below it");
+    }
+
+    #[test]
+    fn the_overlay_fit_matches_ffpipeline() {
+        assert_eq!(contain((1280, 720), (1280, 720)), (1280, 720));
+        assert_eq!(contain((64, 36), (128, 128)), (128, 72));
+        assert_eq!(contain((1920, 1080), (1280, 720)), (1280, 720));
+        assert_eq!(contain((64, 36), (100, 100)), (100, 56));
+        assert_eq!(contain((1280, 720), (1440, 1080)), (1440, 810));
     }
 
     #[test]
