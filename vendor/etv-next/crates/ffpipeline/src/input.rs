@@ -90,7 +90,7 @@ impl InputSettings {
     }
 
     pub fn select_audio_stream(&self) -> Result<&ProbeResultAudioStream, FFPipelineError> {
-        let mut all_audio_streams: Vec<&ProbeResultAudioStream> = self
+        let all_audio_streams: Vec<&ProbeResultAudioStream> = self
             .audio_input
             .probe_result
             .streams
@@ -119,16 +119,22 @@ impl InputSettings {
             }
         }
 
-        match all_audio_streams.len() {
-            0 => Err(FFPipelineError::AudioInputIsRequired),
-            1 => Ok(all_audio_streams[0]),
-            _ => {
-                log::warn!(
-                    "content contains more than one audio stream; selecting stream with greatest number of channels"
-                );
-                all_audio_streams.sort_by_key(|a| std::cmp::Reverse(a.channels));
-                Ok(all_audio_streams[0])
+        // No track was named, so this is the first audio stream the file
+        // lists, as `schema/playout.json` promises. Which of several streams
+        // is the right one (language, commentary, channel count) is the
+        // playout generator's decision, written as `tracks.audio.stream_index`;
+        // this process carries no policy of its own for it.
+        match all_audio_streams.first() {
+            Some(first) => {
+                if all_audio_streams.len() > 1 {
+                    log::warn!(
+                        "content contains more than one audio stream and the playout item names none; selecting stream {}",
+                        first.stream_index
+                    );
+                }
+                Ok(first)
             }
+            None => Err(FFPipelineError::AudioInputIsRequired),
         }
     }
 
@@ -660,6 +666,34 @@ mod tests {
             overlay_input: None,
             subtitle_language_tag: String::from(subtitle_language_tag),
         }
+    }
+
+    fn audio(stream_index: u32, channels: u32) -> ProbeResultStream {
+        ProbeResultStream::Audio(ProbeResultAudioStream {
+            stream_index,
+            codec: String::from("eac3"),
+            channels,
+        })
+    }
+
+    fn settings_with_audio(streams: Vec<ProbeResultStream>, named: Option<u32>) -> InputSettings {
+        let mut s = settings(None);
+        s.audio_input = probed(streams, named);
+        s
+    }
+
+    /// No policy lives here: a file with a stereo and a 5.1 track plays the
+    /// one listed first, not the one with more speakers.
+    #[test]
+    fn unnamed_audio_is_the_first_stream_not_the_widest() {
+        let input = settings_with_audio(vec![audio(1, 2), audio(2, 6)], None);
+        assert_eq!(input.select_audio_stream().unwrap().stream_index, 1);
+    }
+
+    #[test]
+    fn a_named_audio_stream_wins_over_listing_order() {
+        let input = settings_with_audio(vec![audio(1, 2), audio(2, 6)], Some(2));
+        assert_eq!(input.select_audio_stream().unwrap().stream_index, 2);
     }
 
     /// An ordinary media file: video, audio, and a subtitle track, with no

@@ -478,6 +478,13 @@ pub struct SubtitleNormalizationConfig {
     /// advertises rather than reading it off whichever item is playing.
     #[serde(default)]
     pub language: SubtitleLanguageConfig,
+    /// Whether the channel's converted subtitle track is announced as
+    /// `DEFAULT=YES`, so a player turns it on at tune-in. The viewer can
+    /// still switch it off. `DEFAULT` is an attribute of the rendition, which
+    /// the whole session shares, so this is a per-channel setting and never a
+    /// per-item one.
+    #[serde(default)]
+    pub default_on: bool,
     #[serde(default)]
     pub fonts_folder: Option<String>,
     #[serde(default)]

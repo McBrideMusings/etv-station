@@ -544,8 +544,13 @@ async fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> Strin
 
     if has_subtitle_track {
         result.push_str(&format!(
-            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"{}\",URI=\"{}/session/{}/live_sub.m3u8\"\n",
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",DEFAULT={},AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"{}\",URI=\"{}/session/{}/live_sub.m3u8\"\n",
             channel.subtitle_language_name(),
+            if channel.subtitle_default_on() {
+                "YES"
+            } else {
+                "NO"
+            },
             channel.subtitle_language_tag(),
             get_scheme_host(headers),
             channel.number()
@@ -813,11 +818,17 @@ mod get_multi_variant_tests {
     use super::*;
 
     async fn convert_mode_channel(dir: &std::path::Path) -> ChannelModel {
+        channel_with_subtitle(dir, r#"{"mode":"convert"}"#).await
+    }
+
+    async fn channel_with_subtitle(dir: &std::path::Path, subtitle_json: &str) -> ChannelModel {
         std::fs::create_dir(dir.join("playout")).unwrap();
         let cfg_path = dir.join("channel.json");
         std::fs::write(
             &cfg_path,
-            r#"{"playout":{"folder":"playout"},"normalization":{"subtitle":{"mode":"convert"}}}"#,
+            format!(
+                r#"{{"playout":{{"folder":"playout"}},"normalization":{{"subtitle":{subtitle_json}}}}}"#
+            ),
         )
         .unwrap();
         let cfg = ChannelConfig {
@@ -892,6 +903,35 @@ mod get_multi_variant_tests {
 
         assert!(result.contains("TYPE=SUBTITLES"), "{result}");
         assert!(result.contains("SUBTITLES=\"subs\""), "{result}");
+    }
+
+    #[tokio::test]
+    async fn the_rendition_is_not_the_default_unless_the_channel_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = convert_mode_channel(dir.path()).await;
+        write_playout_chunk(dir.path(), vec![item_wanting_subtitle(true)]);
+
+        let result = get_multi_variant(&channel, &HeaderMap::new()).await;
+
+        assert!(
+            result.contains("DEFAULT=NO,AUTOSELECT=YES"),
+            "a rendition left alone must stay off: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_on_announces_the_rendition_as_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel =
+            channel_with_subtitle(dir.path(), r#"{"mode":"convert","default_on":true}"#).await;
+        write_playout_chunk(dir.path(), vec![item_wanting_subtitle(true)]);
+
+        let result = get_multi_variant(&channel, &HeaderMap::new()).await;
+
+        assert!(
+            result.contains("DEFAULT=YES,AUTOSELECT=YES"),
+            "HLS requires AUTOSELECT=YES alongside DEFAULT=YES: {result}"
+        );
     }
 
     #[tokio::test]

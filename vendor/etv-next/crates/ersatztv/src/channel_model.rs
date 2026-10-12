@@ -34,6 +34,8 @@ struct SubtitleHint {
     mode: SubtitleModeHint,
     #[serde(default)]
     language: SubtitleLanguageHint,
+    #[serde(default)]
+    default_on: bool,
 }
 
 #[derive(Deserialize, Default, PartialEq)]
@@ -203,6 +205,11 @@ impl ChannelModel {
     /// announce and no subtitle playlist to serve.
     pub fn has_subtitle_track(&self) -> bool {
         self.subtitle.mode == SubtitleModeHint::Convert
+    }
+
+    /// Whether the subtitle rendition is announced as `DEFAULT=YES`.
+    pub fn subtitle_default_on(&self) -> bool {
+        self.subtitle.default_on
     }
 
     pub fn subtitle_language_tag(&self) -> &str {

@@ -48,7 +48,11 @@ http://host/session/1/live.m3u8
 ```
 
 `DEFAULT=NO` means the player does not switch subtitles on by itself. The
-viewer asks for them, or they stay off.
+viewer asks for them, or they stay off. A channel that sets
+`normalization.subtitle.default_on` announces the rendition as `DEFAULT=YES`
+instead: the player starts with subtitles showing, and the viewer can still
+switch them off. `DEFAULT` belongs to the rendition, which the whole session
+shares, so it is a setting of the channel and never of one item.
 
 A channel in `burn` mode gets none of that — no `.vtt` files, no
 `live_sub.m3u8`, and a plain `#EXT-X-STREAM-INF` line with no `SUBTITLES`
@@ -64,11 +68,11 @@ A playout item can name one, in its `tracks` block:
 }
 ```
 
-If it does, that stream is used. If it does not — which is the ordinary case,
-since a playout generator has to probe every file to fill that in — the first
-subtitle stream in the file is used, preferring a text one over a picture one.
-Text is preferred because text can go either way: it can be burned in *or*
-converted. A picture subtitle can only be burned.
+If it does, that stream is used. If it does not, the channel picks: a text
+stream whose language matches the channel's declared one, else the first text
+stream, else the first stream of any kind. Text is preferred because text can go
+either way: it can be burned in *or* converted. A picture subtitle can only be
+burned. A playout generator that knows better writes `stream_index`.
 
 ## Language
 
@@ -79,13 +83,14 @@ pick one label. That is what `language.tag` and `language.name` are: `tag` goes
 into `LANGUAGE=` and `name` into `NAME=`, which is the text a player shows in
 its subtitle menu. Both default to English.
 
-The picker does not yet match the source subtitle stream against that language —
-it takes the first suitable one regardless. See issue #31.
+When a playout item names no subtitle stream, the picker prefers the text stream
+whose probed language matches `language.tag`.
 
-## Known gap: disc rips lose their subtitles under convert
+## Disc rips: picture subtitles are burned in
 
 Blu-ray (PGS) and DVD (VobSub) subtitles are pictures, and a picture cannot be
-written into a WebVTT file. Under `convert` those items currently play with no
-subtitles at all rather than falling back to burning them in for that item. A
-channel mixing disc rips with other sources therefore shows subtitles for part
-of its schedule and none for the rest. See issue #30.
+written into a WebVTT file. Under `convert`, an item whose selected subtitle
+stream is a picture is painted onto the video, the same way `burn` mode does
+it. That item's subtitles therefore cannot be switched off by the viewer. A
+playout generator that wants every subtitle to stay switchable names a text
+stream, or none, for such files.

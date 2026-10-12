@@ -234,6 +234,7 @@
         "subtitle": {
           "$ref": "#/$defs/SubtitleNormalizationConfig",
           "default": {
+            "default_on": false,
             "fonts_folder": null,
             "force_style": null,
             "language": {
@@ -306,6 +307,11 @@
     "SubtitleNormalizationConfig": {
       "type": "object",
       "properties": {
+        "default_on": {
+          "description": "Whether the channel's converted subtitle track is announced as\n`DEFAULT=YES`, so a player turns it on at tune-in. The viewer can\nstill switch it off. `DEFAULT` is an attribute of the rendition, which\nthe whole session shares, so this is a per-channel setting and never a\nper-item one.",
+          "type": "boolean",
+          "default": false
+        },
         "fonts_folder": {
           "type": [
             "string",
