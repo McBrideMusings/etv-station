@@ -163,6 +163,13 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
                 message: format!("block #{idx} has no entries"),
             });
         }
+        if let Some(crate::config::Fallback::Item(item)) = include.fallback.as_ref() {
+            validate_tracks(
+                path,
+                &format!("block #{idx}: fallback item"),
+                item.tracks.as_ref(),
+            )?;
+        }
         // Item identity is derived from the source at resolution time, not
         // authored — so there is no id to validate here. Within-block duplicates
         // (two entries resolving to the same file) collapse in `resolve`, they
@@ -1834,6 +1841,32 @@ mod tests {
         assert!(
             format!("{err}").contains("conflicts with `pattern`"),
             "err = {err}"
+        );
+    }
+
+    /// A `tracks:` rule on a block's fallback item is checked at load like
+    /// every other level, so a bad pattern cannot slip through to generation.
+    #[test]
+    fn a_bad_pattern_in_a_fallback_items_tracks_fails_the_load() {
+        let mut b = inline_block(vec![item_entry("a")]);
+        let tracks: crate::config::TrackRules =
+            serde_norway::from_str("audio: { prefer: [ { title: '(' } ] }").unwrap();
+        b.fallback = Some(crate::config::Fallback::Item(Box::new(ItemEntry {
+            tracks: Some(tracks),
+            source: SourceConfig::Lavfi {
+                params: "standby".into(),
+            },
+            in_point: None,
+            out_point: Some(Duration::from_secs(30)),
+            program: None,
+            guide: None,
+        })));
+        let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("fallback item"), "err = {message}");
+        assert!(
+            message.contains("tracks.audio.prefer[0].title"),
+            "err = {message}"
         );
     }
 

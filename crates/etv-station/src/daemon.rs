@@ -2398,7 +2398,10 @@ mod regen_floor_tests {
 ///
 /// Returns `None` only if the config or overlay cannot be serialized, which
 /// regenerates rather than skipping on a guess.
-fn channel_config_fingerprint(channel: &LoadedChannel) -> Option<String> {
+fn channel_config_fingerprint(
+    channel: &LoadedChannel,
+    station_tracks: Option<&crate::config::TrackRules>,
+) -> Option<String> {
     let overlay_bytes = match serde_json::to_vec(&channel.overlays) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2424,9 +2427,27 @@ fn channel_config_fingerprint(channel: &LoadedChannel) -> Option<String> {
         }
     };
 
+    // The station's `tracks:` rules shape every item's stream indexes but live
+    // in the station file, not in `channel.config`, so they are hashed here:
+    // editing them must rewrite the unaired schedule like any channel edit.
+    let tracks_bytes = match serde_json::to_vec(&station_tracks) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                event = "resume.fingerprint_error",
+                channel = %channel.name,
+                %error,
+                "could not serialize the station track rules; regenerating as usual",
+            );
+            return None;
+        }
+    };
+
     let mut hasher = Sha256::new();
     hasher.update((config_bytes.len() as u64).to_le_bytes());
     hasher.update(&config_bytes);
+    hasher.update((tracks_bytes.len() as u64).to_le_bytes());
+    hasher.update(&tracks_bytes);
     hasher.update((overlay_bytes.len() as u64).to_le_bytes());
     hasher.update(&overlay_bytes);
     Some(format!("{:x}", hasher.finalize()))
@@ -2630,7 +2651,7 @@ async fn forward_channel_loop(
     // position — a possible seam glitch, never black, and the same bargain
     // `rewind_to` already documents.
     let now = OffsetDateTime::now_utc();
-    let config_id = channel_config_fingerprint(channel);
+    let config_id = channel_config_fingerprint(channel, ctx.station_tracks);
     let forced = take_refresh_request(&channel.output_folder).await?;
     let changed = config_id.is_some() && resume.config_id.as_deref() != config_id.as_deref();
     if forced || (changed && resume.config_id.is_some()) {
@@ -5217,6 +5238,21 @@ mod history_catalog_tests {
         ];
 
         assert!(history_catalog(&channels, Some(&some_catalog())).is_some());
+    }
+
+    /// The station-level `tracks:` rules shape every item's stream indexes but
+    /// are not part of the channel's own config, so the fingerprint that
+    /// decides whether the unaired schedule is rewritten has to hash them too.
+    #[test]
+    fn editing_the_station_track_rules_changes_the_channel_fingerprint() {
+        let ch = channel("movies", "expr: 'item.type == \"movie\"'");
+        let rules: crate::config::TrackRules =
+            serde_norway::from_str("audio: { exclude: [ { title: commentary } ] }").unwrap();
+        let none = channel_config_fingerprint(&ch, None);
+        let some = channel_config_fingerprint(&ch, Some(&rules));
+        assert!(none.is_some() && some.is_some());
+        assert_ne!(none, some);
+        assert_eq!(some, channel_config_fingerprint(&ch, Some(&rules)));
     }
 
     /// A station with no `catalog_path` is unchanged — there is nothing to join

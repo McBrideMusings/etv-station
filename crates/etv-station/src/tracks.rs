@@ -164,7 +164,7 @@ fn prefer(
         survivors
             .iter()
             .filter(|s| entry.matches(s, audio_lang))
-            .min_by_key(|s| (s.channels.unwrap_or(0), s.index))
+            .min_by_key(|s| (s.channels.unwrap_or(u32::MAX), s.index))
             .map(|s| Pick {
                 index: s.index,
                 why: Why::Prefer(i),
@@ -627,6 +627,22 @@ mod tests {
         let tally = assign(&mut items, &cache, &levels, "ch");
         assert!(items.iter().all(|i| i.selected.is_none()));
         assert_eq!(tally.items, 0);
+    }
+
+    #[test]
+    fn a_stream_with_an_unknown_channel_count_loses_the_tie_to_a_known_one() {
+        let mut unknown = audio(1, "eng", "", 2, false);
+        unknown.channels = None;
+        let streams = [unknown, audio(2, "eng", "", 6, false)];
+        let sel = run("audio: { prefer: [ { lang: '^en' } ] }", &streams);
+        assert_eq!(sel.audio.unwrap().index, 2);
+    }
+
+    #[test]
+    fn dvb_and_xsub_pictures_are_not_text_subtitles() {
+        let streams = [audio(1, "eng", "", 2, true), sub(2, "eng", "dvb_subtitle")];
+        assert_eq!(run("{}", &streams).subtitle, None);
+        assert!(sub(3, "eng", "xsub").is_image());
     }
 
     #[test]
