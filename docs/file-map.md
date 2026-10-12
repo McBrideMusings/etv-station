@@ -211,6 +211,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `.claude/skills/check-channels.md` | Skill: curl HLS endpoints and validate master/variant playlists for each channel. |
 | `.claude/skills/check-epg.md` | Skill: fetch `/xmltv.xml`, validate XMLTV structure, cross-check titles against playout JSON on disk. |
 | `.claude/skills/frame-grab.md` | Skill: `ffmpeg` frame capture from a live HLS stream; reads image inline so Claude can see the frame. |
+| `.claude/skills/programming/SKILL.md` | Skill: loaded before any `channel.yaml` schedule edit or channel review — points at `docs/programming.md` for the principles and runs taste-lab's Review view before and after to report the numbers that moved. |
 | `.claude/skills/read-logs.md` | Skill: locate and read the most recent `tmp/<cmd>.*.log` file from a dev run. |
 | `.claude/skills/upstream-sync/SKILL.md` | Skill: absorb upstream ErsatzTV/next into `vendor/etv-next` — the survey, the schema and ffmpeg-pin checks, and the conflict doctrine for the files this project rewrote. |
 
