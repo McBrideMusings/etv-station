@@ -123,3 +123,15 @@ One reference (a keyword, a catalog tag value, an `item:`, or a `set:`) and one 
 ## Favor / disfavor
 
 The two halves of a netted taste profile. Every entry's weight is summed per (namespace, value): pairs that net positive form the favor map, which adds to a score, and pairs that net negative form the disfavor map, which divides it. So a profile can lower a score but never make it negative.
+
+## Channel review
+
+One sitting with one channel: its simulated schedule, the numbers drawn from it and its on-screen graphics, judged against the programming principles in `docs/programming.md`. A review ends in keep, rework, merge (the channel's content becomes a block on another channel) or cut. Feedback is given in conversation, and the review is re-run after each edit.
+
+## Depth
+
+How long a channel runs, at its own pace, before something airs again. It is measured per pool and per show from a simulation, not computed from library size, because rotation, `advance: resume` and scorer suppression all change it.
+
+## Tune-in sample
+
+A random moment in a channel's simulated schedule: what is playing, how far in, the next two items, and the frame a viewer would see. It stands in for landing on the channel while flipping.
