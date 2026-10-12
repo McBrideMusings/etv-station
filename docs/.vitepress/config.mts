@@ -40,6 +40,7 @@ export default defineConfig({
           { text: 'Roadmap', link: '/roadmap' },
           { text: 'Architecture', link: '/architecture' },
           { text: 'Config schema', link: '/schema' },
+          { text: 'Programming principles', link: '/programming' },
           { text: 'File map', link: '/file-map' },
         ],
       },
