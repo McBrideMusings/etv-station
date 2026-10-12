@@ -146,6 +146,16 @@ pub struct PoolResume {
     /// first series of the freshly-resolved set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// How many pattern cycles this pool's block has walked before this point,
+    /// across every generation. The pattern walk keys its random rolls on it,
+    /// so a pinned `seed` draws a fresh sequence each generation instead of
+    /// replaying the first cycle's draws every time (etv-station-pwzv).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cycle: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 fn current_version() -> u32 {
@@ -331,6 +341,7 @@ mod tests {
         let mut map = ResumeMap::new();
         let shows = PoolResume {
             next: Some("show:invincible".into()),
+            cycle: 0,
         };
         map.pools.insert("shows".into(), shows);
         map
@@ -391,6 +402,7 @@ mod tests {
     fn pools_with(next_show: &str) -> BTreeMap<String, PoolResume> {
         let pool = PoolResume {
             next: Some(next_show.into()),
+            cycle: 0,
         };
         BTreeMap::from([("shows".to_string(), pool)])
     }

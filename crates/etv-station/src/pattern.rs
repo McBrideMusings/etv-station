@@ -644,12 +644,18 @@ impl PoolRuntime<'_> {
     }
 
     /// This pool's state to persist for the next window.
-    fn to_resume(&self) -> PoolResume {
+    fn to_resume(&self, cycle: u64) -> PoolResume {
         // Where each series left off is NOT recorded here — the play-history
         // ledger already holds it, and the cursor this pool resumed from was a
         // projection of that. Writing it a second time would be the duplicate
         // store #70 exists to remove.
         PoolResume {
+            // A `restart` pool ignores its resume state, so it records none.
+            cycle: if self.cfg.advance == Advance::Resume {
+                cycle
+            } else {
+                0
+            },
             // Only a round-robin pool has a meaningful "next": a random pool
             // draws afresh every visit.
             next: match self.cfg.select {
@@ -837,7 +843,20 @@ pub fn build(
     // into `audit::push_stage`, which owns creating the blob.
     let mut audit_out: HashMap<String, Option<serde_json::Value>> = HashMap::new();
     let mut laid = Duration::ZERO;
-    for cycle in 0..cycles {
+    // Where this block's cycle count stands, carried across generations so the
+    // rolls below keep moving. Restarting at 0 each generation replayed cycle
+    // 0's draws on every tick: under a pinned `seed`, a one-cycle generation
+    // drew the same random series every hour (etv-station-pwzv). Read only
+    // from `resume` pools, which keeps a `restart` block stateless.
+    let first_cycle = pools
+        .iter()
+        .filter(|p| p.advance == Advance::Resume)
+        .filter_map(|p| state.resume.pool(&p.name))
+        .map(|r| r.cycle)
+        .max()
+        .unwrap_or(0);
+    let mut walked = first_cycle;
+    for cycle in (first_cycle..).take(cycles) {
         // Checked between cycles, never inside one: a cycle is the unit the
         // pattern was written in ("1 movie, then 3 episodes"), and cutting one
         // in half would air a fragment of the shape and leave the pools parked
@@ -847,10 +866,11 @@ pub fn build(
         if budget.is_some_and(|fill| laid >= fill) {
             break;
         }
+        walked = cycle + 1;
         for (step_idx, step) in pattern.iter().enumerate() {
             let roll = RollKey {
                 seed,
-                cycle: cycle as u64,
+                cycle,
                 step: step_idx as u64,
             };
             // A skipped step contributes nothing and — because the skip is
@@ -888,7 +908,12 @@ pub fn build(
                     );
                 }
             }
-            let before = pools_resume(&runtimes);
+            // A rewind to here regenerates from the first step of the cycle
+            // this records. Mid-cycle, the rotation has already moved past
+            // this cycle's earlier steps, so it records the next cycle rather
+            // than replaying this one's rolls over an advanced rotation.
+            let resume_at = if step_idx == 0 { cycle } else { cycle + 1 };
+            let before = pools_resume(&runtimes, resume_at);
             let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
             progress.extend(std::iter::repeat_n(before, drawn.len()));
             if budget.is_some() {
@@ -970,7 +995,7 @@ pub fn build(
         }
     }
 
-    let resume_out = pools_resume(&runtimes);
+    let resume_out = pools_resume(&runtimes, walked);
     progress.push(resume_out.clone());
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
@@ -1000,11 +1025,12 @@ pub fn build(
     })
 }
 
-/// Every pool's resume state as the walk stands now.
-fn pools_resume(runtimes: &[PoolRuntime]) -> BTreeMap<String, PoolResume> {
+/// Every pool's resume state as the walk stands now, `cycle` being the cycle a
+/// generation resuming from here starts at.
+fn pools_resume(runtimes: &[PoolRuntime], cycle: u64) -> BTreeMap<String, PoolResume> {
     runtimes
         .iter()
-        .map(|rt| (rt.cfg.name.clone(), rt.to_resume()))
+        .map(|rt| (rt.cfg.name.clone(), rt.to_resume(cycle)))
         .collect()
 }
 
@@ -2738,6 +2764,7 @@ mod tests {
             "shows".into(),
             PoolResume {
                 next: Some("show:inv".into()),
+                cycle: 0,
             },
         );
         // The ledger remembers an airing whose entry has since left the
@@ -2931,6 +2958,32 @@ mod tests {
             "got must advance in order across both windows, never reset"
         );
         let _ = p;
+    }
+
+    /// A pinned seed must not pin the pick: each generation walks fresh cycles,
+    /// so consecutive one-visit generations draw different series rather than
+    /// re-rolling cycle 0's draw every time (etv-station-pwzv — 034 SyFy aired
+    /// Heroes on 306 of 324 series slots).
+    #[test]
+    fn select_random_moves_on_across_generations_under_a_pinned_seed() {
+        let pool = || {
+            let mut p = shows_pool();
+            p.select = Select::Random;
+            p.advance = Advance::Resume;
+            p
+        };
+        let mut state = GenerationState::empty();
+        let mut shows = Vec::new();
+        for _ in 0..8 {
+            let (ids, next) = build_with(vec![pool()], vec![step("shows", 1)], Some(1), &state, 34);
+            shows.push(ids[0].split('-').next().unwrap().to_string());
+            state = next;
+        }
+        assert!(
+            shows.iter().any(|s| s != &shows[0]),
+            "eight generations all drew {:?}",
+            shows[0]
+        );
     }
 
     /// A seeded random selection reproduces exactly.

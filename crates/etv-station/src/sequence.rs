@@ -236,7 +236,7 @@ pub fn build(
                 let next = last_series.get(&pool_idx).and_then(|&si| {
                     (!series.is_empty()).then(|| series[(si + 1) % series.len()].key.clone())
                 });
-                (name.clone(), PoolResume { next })
+                (name.clone(), PoolResume { next, cycle: 0 })
             })
             .collect()
     };
@@ -895,6 +895,7 @@ fn arrange(ctx) {
             "movies".into(),
             PoolResume {
                 next: Some("show:whatever".into()),
+                cycle: 0,
             },
         );
         let state = GenerationState {
