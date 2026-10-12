@@ -1,0 +1,352 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>taste-lab · Review</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #ffffff; --fg: #16181d; --muted: #6b7079; --line: #dfe2e7; --panel: #f6f7f9;
+    --accent: #3d4fd1; --bar: #3d4fd1; --bar-open: #9aa3b1; --track: #e9ebef;
+    --warn-bg: #fff6d8; --warn-fg: #6b4e00; --err-bg: #fde8e8; --err-fg: #8a1414;
+    --up: #1d7a3a; --down: #a2341c; --pin-bg: #16181d; --pin-fg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #121418; --fg: #e6e8ec; --muted: #9298a3; --line: #2c3038; --panel: #1b1e24;
+      --accent: #8e9cff; --bar: #8e9cff; --bar-open: #5c6370; --track: #262a32;
+      --warn-bg: #3a3014; --warn-fg: #f2d98a; --err-bg: #3d1c1c; --err-fg: #ffb4b4;
+      --up: #6fd38f; --down: #ff9b85; --pin-bg: #e6e8ec; --pin-fg: #121418;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 16px 20px 40px;
+    background: var(--bg); color: var(--fg); font-size: 14px; line-height: 1.4; }
+  a { color: var(--accent); }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-bottom: 14px; }
+  .toolbar .spacer { flex: 1; }
+  button, input { font: inherit; color: inherit; }
+  button { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
+  button:disabled { opacity: .45; cursor: default; }
+  input[type=number] { width: 64px; padding: 3px 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+  #state { min-height: 18px; }
+  .spinner { display: inline-block; width: 13px; height: 13px; margin-right: 6px; vertical-align: -2px;
+    border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #report { transition: opacity .15s ease; }
+  #report.loading { opacity: .35; pointer-events: none; }
+
+  header.head { margin-bottom: 14px; }
+  .head .sub { color: var(--muted); margin-top: 2px; }
+  .head .pattern { margin-top: 6px; }
+  .notice { background: var(--warn-bg); color: var(--warn-fg); border-radius: 6px; padding: 4px 10px; margin-top: 6px; font-size: 12.5px; }
+  .error { background: var(--err-bg); color: var(--err-fg); border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12.5px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .tile .k { color: var(--muted); font-size: 12px; }
+  .tile .v { font-size: 22px; font-weight: 650; margin: 2px 0; }
+  .tile .d { font-size: 12.5px; }
+
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+  section.card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 18px; min-width: 0; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.show td.name { padding-left: 22px; color: var(--fg); }
+  tr.pool td.name { font-weight: 600; }
+  .bar { position: relative; height: 10px; background: var(--track); border-radius: 5px; min-width: 80px; }
+  .bar span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; background: var(--bar); }
+  .bar span.open { background: var(--bar-open); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  .overlap-row { padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .overlap-row summary { cursor: pointer; }
+  .overlap-row .titles { margin: 6px 0 2px 18px; font-size: 12.5px; color: var(--muted); columns: 2 220px; }
+  .overlap-row .titles div { break-inside: avoid; }
+
+  .old { color: var(--muted); }
+  .changed .new { font-weight: 650; }
+
+  .samples { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .sample { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .sample .when { font-size: 12.5px; color: var(--muted); }
+  .sample .what { font-weight: 600; margin: 4px 0 6px; }
+  .sample .prog { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
+  .sample .prog span { display: block; height: 100%; background: var(--accent); }
+  .sample ol { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
+  .pin { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--pin-bg); color: var(--pin-fg); font-size: 11px; font-weight: 700; margin-right: 6px; }
+
+  .guide-wrap { max-height: 70vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+  .guide { min-width: 720px; position: relative; }
+  .guide .hours { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: 96px 1fr; background: var(--bg); border-bottom: 1px solid var(--line); }
+  .guide .hours .scale { position: relative; height: 20px; }
+  .guide .hours .scale span { position: absolute; top: 3px; font-size: 11px; color: var(--muted); transform: translateX(-50%); }
+  .guide .day { display: grid; grid-template-columns: 96px 1fr; border-bottom: 1px solid var(--line); }
+  .guide .day .label { font-size: 12px; padding: 8px 6px; color: var(--muted); }
+  .guide .track { position: relative; height: 38px; }
+  .guide .blk { position: absolute; top: 5px; bottom: 5px; border-radius: 3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    font-size: 11px; line-height: 28px; padding: 0 4px; color: #111; border: 1px solid rgba(0,0,0,.18); outline: none; }
+  .guide .blk:focus-visible, .guide .blk:hover { box-shadow: 0 0 0 2px var(--fg); z-index: 2; }
+  .guide .gpin { position: absolute; top: -2px; z-index: 2; transform: translateX(-50%); width: 16px; height: 16px; font-size: 10px; margin: 0; pointer-events: none; }
+  #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 5px; pointer-events: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <a href="/">← Tuning view</a>
+  <button id="prevBtn" type="button">← Previous channel</button>
+  <button id="nextBtn" type="button">Next channel →</button>
+  <span id="position" class="muted"></span>
+  <span class="spacer"></span>
+  <label for="days">Days shown</label>
+  <input type="number" id="days" min="1" max="60" value="14">
+  <button id="applyDays" type="button">Re-simulate</button>
+</div>
+<div id="state" class="muted"></div>
+<div id="report"></div>
+<div id="tip" hidden></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// One hue per pool, in first-airing order; light enough that dark text reads on it in both themes.
+const POOL_COLORS = ['#a9c4ff', '#ffc98f', '#a8e0b4', '#f4a9c8', '#d3b8ff', '#ffe08a', '#9fe3e0', '#e0c3a3'];
+
+let current = null;   // the last /api/review payload
+let lineup = { prev: null, next: null };
+
+function params() {
+  const p = new URLSearchParams(location.search);
+  return { channel: p.get('channel'), days: p.get('days') };
+}
+
+function fmt(ts, tz, opts) {
+  return new Date(ts * 1000).toLocaleString('en-US', { timeZone: tz, ...opts });
+}
+const timeOf = (ts, tz) => fmt(ts, tz, { hour: 'numeric', minute: '2-digit' });
+const dayOf = (ts, tz) => fmt(ts, tz, { weekday: 'short', month: 'short', day: 'numeric' });
+const days1 = (d) => (Math.round(d * 10) / 10).toFixed(1);
+
+async function load(channel, days, push) {
+  const q = new URLSearchParams();
+  if (channel) q.set('channel', channel);
+  if (days) q.set('days', days);
+  if (push) history.pushState(null, '', `/review?${q}`);
+  $('state').innerHTML = '<span class="spinner"></span>Simulating…';
+  $('report').classList.add('loading');
+  for (const b of [$('prevBtn'), $('nextBtn'), $('applyDays')]) b.disabled = true;
+  let data;
+  try {
+    const res = await fetch(`/api/review?${q}`);
+    data = await res.json();
+  } catch (e) {
+    data = { error: String(e) };
+  }
+  $('report').classList.remove('loading');
+  $('applyDays').disabled = false;
+  if (data.lineup) lineup = data.lineup;
+  $('prevBtn').disabled = !lineup.prev;
+  $('nextBtn').disabled = !lineup.next;
+  $('position').textContent = data.lineup ? `${data.lineup.position} of ${data.lineup.total} in station.yaml order` : '';
+  if (data.days) $('days').value = data.days;
+  $('state').textContent = '';
+  if (data.error) {
+    $('report').innerHTML = `<header class="head"><h1>${esc(channel || 'Review')}</h1></header>
+      <h2>The review could not be built</h2><div class="error">${esc(data.error)}</div>`;
+    return;
+  }
+  if (data.load_error) {
+    document.title = `taste-lab · ${data.channel}`;
+    $('report').innerHTML = `<header class="head"><h1>${esc(data.channel)}</h1>
+      <div class="sub">${esc(data.config_path)}</div></header>
+      <h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
+    return;
+  }
+  current = data;
+  render(data);
+}
+
+function poolColor(d) {
+  const map = {};
+  let i = 0;
+  for (const a of d.airings) if (!(a.pool in map)) map[a.pool] = POOL_COLORS[i++ % POOL_COLORS.length];
+  return map;
+}
+
+function render(d) {
+  document.title = `taste-lab · ${d.number} ${d.display_name || d.name}`;
+  const colors = poolColor(d);
+  const tz = d.tz;
+  const span = d.days;
+  const html = [];
+
+  // 1. Header
+  html.push(`<header class="head">
+    <h1>${esc(d.number)} · ${esc(d.display_name || d.name)}</h1>
+    <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${span} days simulated (${esc(tz)}) · seed ${esc(d.seed ?? 'none')} · ${esc(d.config_path)}</div>
+    <div class="pattern">${esc(d.pattern)}</div>
+    ${d.notices.map((n) => `<div class="notice">Simulator gap: ${esc(n)}</div>`).join('')}
+  </header>`);
+
+  // 2. Tiles
+  const fr = d.first_repeat;
+  const ov = d.overlap.channels;
+  const largest = ov[0];
+  html.push(`<div class="tiles">
+    <div class="tile"><div class="k">Days until the first repeat</div>
+      <div class="v">${fr ? days1(fr.days) + ' d' : '&gt;' + span + ' d'}</div>
+      <div class="d">${fr ? esc(fr.label) : 'Nothing repeated inside the span'}</div></div>
+    <div class="tile"><div class="k">Film / series share of airtime</div>
+      <div class="v">${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</div>
+      <div class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</div></div>
+    <div class="tile"><div class="k">Channels sharing content</div>
+      <div class="v">${d.overlap.this_channel_whole_library ? '—' : ov.length}</div>
+      <div class="d">${d.overlap.this_channel_whole_library ? 'This channel draws from the whole library'
+        : largest ? `Largest: ${esc(largest.channel)} (${largest.shared} items)` : 'No other channel shares an item'}</div></div>
+    <div class="tile"><div class="k">Items aired</div>
+      <div class="v">${d.items_aired}</div>
+      <div class="d">${d.distinct_items} distinct</div></div>
+  </div>`);
+
+  // 3. Depth  +  4. Overlap
+  const depthRows = d.depth.map((r) => {
+    const days = r.first_repeat_days;
+    const pct = days == null ? 100 : Math.min(100, (days / span) * 100);
+    const value = days == null ? `&gt;${span} d` : `${days1(days)} d`;
+    const swatch = r.kind === 'pool' ? `<span class="swatch" style="background:${colors[r.name] || '#ccc'}"></span>` : '';
+    const tip = r.first_repeat_label ? ` title="First repeat: ${esc(r.first_repeat_label)}"` : '';
+    return `<tr class="${r.kind}"${tip}><td class="name">${swatch}${esc(r.name)}</td>
+      <td class="num">${r.aired} / ${r.distinct}</td>
+      <td style="width:40%"><div class="bar"><span class="${days == null ? 'open' : ''}" style="width:${pct}%"></span></div></td>
+      <td class="num">${value}</td></tr>`;
+  }).join('');
+  const overlapRows = d.overlap.this_channel_whole_library
+    ? '<p class="muted">This channel\'s pools resolve to the whole library, so every other channel overlaps it; no list.</p>'
+    : ov.length === 0 ? '<p class="muted">No other channel shares an item.</p>'
+    : ov.map((c) => `<details class="overlap-row"><summary><strong>${esc(c.number)} ${esc(c.display_name || c.channel)}</strong>
+        — ${c.shared} shared</summary><div class="titles">${c.titles.map((t) => `<div>${esc(t)}</div>`).join('')}</div></details>`).join('');
+  const excluded = d.overlap.whole_library.length
+    ? `<p class="muted">Left out: ${d.overlap.whole_library.map(esc).join(', ')} — their pools resolve to the whole library.</p>` : '';
+  const errs = d.overlap.errors.map((e) => `<div class="notice">${esc(e.channel)}: ${esc(e.error)}</div>`).join('');
+  html.push(`<div class="grid2">
+    <section class="card"><h2>Depth</h2>
+      <p class="muted">Days from the start of the span until each pool or show first airs something a second time. Aired / distinct items.</p>
+      <table><thead><tr><th>Pool / show</th><th class="num">Aired</th><th></th><th class="num">First repeat</th></tr></thead>
+      <tbody>${depthRows}</tbody></table></section>
+    <section class="card"><h2>Overlap</h2>
+      <p class="muted">Channels whose configs resolve to some of the same items (${d.overlap.candidates} candidates here), largest first.</p>
+      ${overlapRows}${excluded}${errs}</section>
+  </div>`);
+
+  // 5. Since last run  +  6. Tune-in samples
+  const since = d.since_last == null
+    ? '<p class="muted">First run of this channel in this session.</p>'
+    : `<table><tbody>${d.since_last.map((r) => `<tr class="${r.changed ? 'changed' : ''}"><td>${esc(r.label)}</td>
+        <td class="num"><span class="old">${esc(r.old ?? '—')}</span> → <span class="new">${esc(r.new ?? '—')}</span></td></tr>`).join('')}</tbody></table>`;
+  const samples = d.samples.map((s) => {
+    const a = d.airings[s.index];
+    const next = s.next.map((i) => d.airings[i]).map((n) => `<li>${esc(timeOf(n.start, tz))} ${esc(n.label)}</li>`).join('');
+    const pct = s.minutes_total ? Math.min(100, (s.minutes_in / s.minutes_total) * 100) : 0;
+    return `<div class="sample"><div class="when"><span class="pin">${s.n}</span>${esc(dayOf(s.at, tz))} ${esc(timeOf(s.at, tz))}</div>
+      <div class="what">${esc(a.label)}</div>
+      <div class="prog"><span style="width:${pct}%"></span></div>
+      <div class="muted">${s.minutes_in} of ${s.minutes_total} min in · ${esc(a.pool)}</div>
+      <ol>${next}</ol></div>`;
+  }).join('');
+  html.push(`<div class="grid2">
+    <section class="card"><h2>Tune-in samples</h2>
+      <p class="muted">${d.samples.length} moments drawn from seed ${esc(d.seed ?? 0)}: what is on, how far in, and the next two.</p>
+      <div class="samples">${samples}</div></section>
+    <section class="card"><h2>Since last run</h2>${since}</section>
+  </div>`);
+
+  // 7. Guide
+  html.push(`<section class="card"><h2>Guide</h2>
+    <div class="legend">${Object.entries(colors).map(([p, c]) => `<span><span class="swatch" style="background:${c}"></span>${esc(p)}</span>`).join('')}</div>
+    <div class="guide-wrap"><div class="guide" id="guide"></div></div></section>`);
+
+  $('report').innerHTML = html.join('');
+  renderGuide(d, colors);
+}
+
+function renderGuide(d, colors) {
+  const tz = d.tz;
+  const g = $('guide');
+  const rows = [];
+  rows.push(`<div class="hours"><div></div><div class="scale">${[0, 3, 6, 9, 12, 15, 18, 21].map((h) =>
+    `<span style="left:${(h / 24) * 100}%">${h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p'}</span>`).join('')}</div></div>`);
+  for (let i = 0; i + 1 < d.day_starts.length; i++) {
+    const ds = d.day_starts[i];
+    const de = d.day_starts[i + 1];
+    const len = de - ds;
+    const blocks = [];
+    for (const a of d.airings) {
+      const s = Math.max(a.start, ds);
+      const e = Math.min(a.start + a.duration_secs, de);
+      if (e <= s) continue;
+      const left = ((s - ds) / len) * 100;
+      const width = ((e - s) / len) * 100;
+      const label = `${timeOf(a.start, tz)}–${timeOf(a.start + a.duration_secs, tz)} · ${a.label} · ${a.pool}`;
+      blocks.push(`<div class="blk" tabindex="0" data-tip="${esc(label)}" aria-label="${esc(label)}"
+        style="left:${left}%;width:${width}%;background:${colors[a.pool] || '#ccc'}">${esc(a.label)}</div>`);
+    }
+    for (const s of d.samples) {
+      if (s.at >= ds && s.at < de) {
+        blocks.push(`<span class="pin gpin" style="left:${((s.at - ds) / len) * 100}%">${s.n}</span>`);
+      }
+    }
+    rows.push(`<div class="day"><div class="label">${esc(dayOf(ds, tz))}</div><div class="track">${blocks.join('')}</div></div>`);
+  }
+  g.innerHTML = rows.join('');
+}
+
+// Full title on hover or keyboard focus, for blocks too narrow to show it.
+function showTip(el) {
+  const tip = $('tip');
+  tip.textContent = el.dataset.tip;
+  tip.hidden = false;
+  const r = el.getBoundingClientRect();
+  const left = Math.min(Math.max(8, r.left), window.innerWidth - tip.offsetWidth - 8);
+  const top = r.top - tip.offsetHeight - 6 > 0 ? r.top - tip.offsetHeight - 6 : r.bottom + 6;
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+}
+const hideTip = () => { $('tip').hidden = true; };
+document.addEventListener('mouseover', (e) => { const b = e.target.closest('.blk'); if (b) showTip(b); });
+document.addEventListener('mouseout', (e) => {
+  if (!e.target.closest('.blk')) return;
+  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.blk');
+  if (focused) showTip(focused); else hideTip();
+});
+document.addEventListener('focusin', (e) => { const b = e.target.closest('.blk'); if (b) showTip(b); else hideTip(); });
+document.addEventListener('focusout', (e) => { if (e.target.closest('.blk')) hideTip(); });
+// Focusing a block scrolls it into view; keep its tip attached instead of dropping it.
+document.addEventListener('scroll', () => {
+  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.blk');
+  if (focused) showTip(focused); else hideTip();
+}, true);
+
+$('prevBtn').addEventListener('click', () => lineup.prev && load(lineup.prev, $('days').value, true));
+$('nextBtn').addEventListener('click', () => lineup.next && load(lineup.next, $('days').value, true));
+$('applyDays').addEventListener('click', () => load(current ? current.channel : params().channel, $('days').value, true));
+$('days').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('applyDays').click(); });
+window.addEventListener('popstate', () => { const p = params(); load(p.channel, p.days, false); });
+
+const p = params();
+if (p.days) $('days').value = p.days;
+load(p.channel, p.days, false);
+</script>
+</body>
+</html>

@@ -20,6 +20,10 @@ pub struct Station {
     /// refuses on any, because a deploy that drops a channel is a deploy that
     /// takes it off the air.
     pub dropped: Vec<DroppedChannel>,
+    /// Every channel config path the `channels:` patterns found, loaded or
+    /// dropped, in `station.yaml` order (patterns in the order written, each
+    /// glob's matches sorted).
+    pub lineup: Vec<PathBuf>,
 }
 
 /// A channel config the loader found and left out of the lineup.
@@ -67,33 +71,46 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
     load_with_env(station_path, &process_env)
 }
 
-/// Load a station config for a read-only query that only cares about structure
-/// — today, `--dump-overlay`.
+/// Load a station config for a read-only tool off the deploy host — today,
+/// taste-lab's Review view, which steps through the lineup on a laptop.
 ///
 /// Unset `${VAR}` references resolve to a placeholder instead of failing the
 /// load. The daemon must never do this: an unset media root there would mean
-/// scheduling against paths that do not exist. But a caller asking "what does
-/// this channel's overlay resolve to" is asking about the cascade, and failing
-/// that question because a *pool's* snapshot path is unset would make the
-/// overlay preview depend on the deploy host's environment. The placeholder is
-/// deliberately not a valid path, so anything that tries to *use* one fails
-/// loudly rather than reading the wrong file.
+/// scheduling against paths that do not exist. But a tool reading the lineup
+/// is asking about the configs, and failing that question because one pool's
+/// snapshot path is unset here would make the answer depend on the deploy
+/// host's environment. The placeholder is deliberately not a valid path, so
+/// anything that tries to *use* one fails loudly rather than reading the
+/// wrong file.
+///
+/// The `ETV_STATION_*` overrides read the plain environment: an unset one
+/// leaves the station file's own value, never the placeholder.
 pub fn load_for_inspection(station_path: &Path) -> Result<Station, ConfigError> {
-    load_with_env(station_path, &|var| {
+    load_with(station_path, &process_env, &|var| {
         Some(process_env(var).unwrap_or_else(|| format!("/nonexistent/unset-env/{var}")))
     })
 }
 
 fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, ConfigError> {
+    load_with(station_path, env, env)
+}
+
+/// `overrides` answers the `ETV_STATION_*` variables that replace station
+/// fields; `refs` answers the `${VAR}` references inside channel configs.
+fn load_with(
+    station_path: &Path,
+    overrides: EnvLookup<'_>,
+    refs: EnvLookup<'_>,
+) -> Result<Station, ConfigError> {
     let mut station: StationConfig = read_config_file(station_path)?;
     apply_env_overrides(
         &mut station,
-        env("ETV_STATION_TZ"),
-        env("ETV_STATION_OUTPUT_BASE"),
-        env("ETV_STATION_CATALOG"),
-        env("ETV_STATION_SOURCE_ROOTS"),
-        env("ETV_STATION_IDENTITY_ROOTS"),
-        env("ETV_STATION_ARTWORK_CACHE"),
+        overrides("ETV_STATION_TZ"),
+        overrides("ETV_STATION_OUTPUT_BASE"),
+        overrides("ETV_STATION_CATALOG"),
+        overrides("ETV_STATION_SOURCE_ROOTS"),
+        overrides("ETV_STATION_IDENTITY_ROOTS"),
+        overrides("ETV_STATION_ARTWORK_CACHE"),
     );
     validate::validate_station(station_path, &station)?;
 
@@ -103,6 +120,7 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
         .unwrap_or_else(|| PathBuf::from("."));
 
     let channel_paths = expand_channel_patterns(station_path, &base, &station.channels)?;
+    let lineup = channel_paths.clone();
 
     // One bad channel config costs one channel, not the station (#263, #156):
     // a failure here is logged at ERROR and the channel is dropped from the
@@ -111,7 +129,7 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
     let mut channels = Vec::with_capacity(channel_paths.len());
     let mut dropped = Vec::new();
     for channel_path in channel_paths {
-        match load_one_channel(&station, &base, &channel_path, env) {
+        match load_one_channel(&station, &base, &channel_path, refs) {
             Ok(channel) => channels.push(channel),
             Err(e) => {
                 tracing::error!(
@@ -136,6 +154,7 @@ fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, Con
         station,
         channels,
         dropped,
+        lineup,
     })
 }
 
@@ -1616,6 +1635,21 @@ mod tests {
         }
         body.push_str("rule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n");
         body
+    }
+
+    /// The inspection loader's placeholder fills `${VAR}` references only; an
+    /// unset `ETV_STATION_TZ` leaves the station file's `tz` alone instead of
+    /// replacing it with a path that fails tz validation.
+    #[test]
+    fn an_unset_override_keeps_the_station_value_under_the_placeholder_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_path =
+            write_min_station(dir.path(), &[("a.yaml", &channel_body(Some(1), Some("a")))]);
+        let placeholder = |var: &str| Some(format!("/nonexistent/unset-env/{var}"));
+
+        let station = load_with(&station_path, &no_env, &placeholder).expect("station loads");
+        assert_eq!(station.station.tz, "UTC");
+        assert_eq!(station.channels.len(), 1);
     }
 
     /// #263 rule 1: a channel config with no `number:` fails to load and does

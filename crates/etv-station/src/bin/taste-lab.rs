@@ -55,8 +55,9 @@
 //! local catalog/plexdb cache
 //! `tools/taste-debug.sh` already uses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::Parser;
 use etv_station::catalog::{Catalog, Entry as CatalogEntry, TagNs, like_escape};
@@ -82,6 +83,11 @@ struct Cli {
     /// mapped onto by default (see module docs).
     #[arg(long, default_value = "examples/plugins")]
     examples_plugins_dir: PathBuf,
+
+    /// The station config whose lineup the Review view steps through
+    /// (`/review`), in its own order.
+    #[arg(long, default_value = "deploy/appdata/station.yaml")]
+    station: PathBuf,
 
     /// Where to listen.
     #[arg(long, default_value_t = 4747)]
@@ -241,6 +247,7 @@ struct AppState {
     examples_plugins_dir: PathBuf,
     cache: ScoreCache,
     session: Option<Session>,
+    review: ReviewState,
 }
 
 fn main() -> Result<(), String> {
@@ -262,6 +269,7 @@ fn main() -> Result<(), String> {
         examples_plugins_dir: cli.examples_plugins_dir,
         cache: ScoreCache::default(),
         session: None,
+        review: ReviewState::new(cli.station),
     };
 
     let server = tiny_http::Server::http(("127.0.0.1", cli.port))
@@ -292,6 +300,11 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
             respond_html(request, INDEX_HTML);
             return;
         }
+        (tiny_http::Method::Get, "/review") => {
+            respond_html(request, REVIEW_HTML);
+            return;
+        }
+        (tiny_http::Method::Get, "/api/review") => api_review(state, &query),
         (tiny_http::Method::Get, "/api/channels") => Ok((200, api_channels(state))),
         (tiny_http::Method::Post, "/api/select") => api_select(state, &body),
         (tiny_http::Method::Post, "/api/profile/add") => api_profile_add(state, &body),
@@ -491,21 +504,7 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
 
     let account_id = match req.account_id {
         Some(id) => Some(id),
-        None => match channel.history_scope() {
-            HistoryScope::AllUsers => None,
-            scope @ HistoryScope::User(_) => {
-                let (url, key) = tautulli::credentials_from_env().ok_or_else(|| {
-                    "scoring.taste_scope is single_user, but TAUTULLI_URL/TAUTULLI_API_KEY \
-                     aren't set (source .env), and no account_id was given"
-                        .to_string()
-                })?;
-                let rows = tautulli::fetch_rows(&url, &key, &scope);
-                Some(
-                    tautulli::resolve_account_id(&scope, &rows)?
-                        .ok_or_else(|| "single_user scope resolved to no account".to_string())?,
-                )
-            }
-        },
+        None => channel_account_id(&channel)?,
     };
 
     // A fresh cache, not a reused one: `ScoreCache::prepare_profile` only
@@ -565,6 +564,26 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
         (200, payload_with_error(state, message))
     };
     Ok(response)
+}
+
+/// The Plex account a channel's scorer reads history for: none for
+/// `taste_scope: all_users`, else the one Tautulli resolves its single user to.
+fn channel_account_id(channel: &config::ChannelConfig) -> Result<Option<i64>, String> {
+    match channel.history_scope() {
+        HistoryScope::AllUsers => Ok(None),
+        scope @ HistoryScope::User(_) => {
+            let (url, key) = tautulli::credentials_from_env().ok_or_else(|| {
+                "scoring.taste_scope is single_user, but TAUTULLI_URL/TAUTULLI_API_KEY \
+                 aren't set (source .env)"
+                    .to_string()
+            })?;
+            let rows = tautulli::fetch_rows(&url, &key, &scope);
+            Ok(Some(
+                tautulli::resolve_account_id(&scope, &rows)?
+                    .ok_or_else(|| "single_user scope resolved to no account".to_string())?,
+            ))
+        }
+    }
 }
 
 /// [`build_payload`] with an `"error"` field added — a failed score still
@@ -1216,4 +1235,703 @@ fn api_tautulli_users() -> Result<(u16, Value), String> {
     Ok((200, json!({ "results": results })))
 }
 
+// ---------------------------------------------------------------------------
+// Review view (`/review`, `/api/review`): one channel's simulated schedule as
+// a report — depth before repeats, film/series share, overlap with the rest of
+// the lineup, seeded tune-in samples and a day-by-day guide. It reads the
+// channel exactly as `channel.yaml` writes it (its own plugin scripts, no
+// working-copy profile), reloaded on every request so an edit to the file
+// shows on the next reload. The numbers are `etv_station::review`'s.
+// ---------------------------------------------------------------------------
+
+/// Days the Review view simulates when a request names none, and the most it
+/// may ask for.
+const DEFAULT_REVIEW_DAYS: u32 = 14;
+const MAX_REVIEW_DAYS: u32 = 60;
+
+/// How many seeded tune-in moments the view samples.
+const TUNE_IN_SAMPLES: usize = 5;
+
+/// What the Review view keeps between requests.
+struct ReviewState {
+    station_path: PathBuf,
+    /// Each channel's candidate entry-id set, keyed by config path and
+    /// recomputed when the file's mtime changes. A failure is not cached, so
+    /// the next review retries it.
+    fingerprints: HashMap<PathBuf, (std::time::SystemTime, Arc<HashSet<String>>)>,
+    /// Every movie id and every episode id in the catalog, for telling a
+    /// channel that draws from the whole library apart from one that doesn't.
+    library: Option<(HashSet<String>, HashSet<String>)>,
+    /// The last review's comparable numbers per channel, for "Since last run".
+    previous: HashMap<String, Vec<(String, Value)>>,
+    /// The Plex account each single-user channel resolved to, keyed by config
+    /// path and dropped when the file's mtime changes, so a review does not
+    /// ask Tautulli again on every request.
+    accounts: HashMap<PathBuf, (std::time::SystemTime, Option<i64>)>,
+}
+
+impl ReviewState {
+    fn new(station_path: PathBuf) -> Self {
+        Self {
+            station_path,
+            fingerprints: HashMap::new(),
+            library: None,
+            previous: HashMap::new(),
+            accounts: HashMap::new(),
+        }
+    }
+}
+
+/// A channel's folder name (`034-syfy`).
+fn channel_key(config_path: &Path) -> String {
+    config_path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Each lineup entry's key in the Review view's URLs: its folder name when
+/// every folder name in the lineup is distinct, else every entry's path as
+/// written relative to the station file, so two keys never name one channel.
+fn lineup_keys(lineup: &[PathBuf], base: &Path) -> Vec<String> {
+    let folders: Vec<String> = lineup.iter().map(|p| channel_key(p)).collect();
+    if folders.iter().collect::<HashSet<_>>().len() == folders.len() {
+        return folders;
+    }
+    lineup
+        .iter()
+        .map(|p| p.strip_prefix(base).unwrap_or(p).display().to_string())
+        .collect()
+}
+
+fn file_mtime(path: &Path) -> Result<std::time::SystemTime, String> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// [`channel_account_id`], cached per config file.
+fn review_account_id(
+    review: &mut ReviewState,
+    lc: &config::LoadedChannel,
+) -> Result<Option<i64>, String> {
+    let mtime = file_mtime(&lc.config_path)?;
+    if let Some((cached, id)) = review.accounts.get(&lc.config_path)
+        && *cached == mtime
+    {
+        return Ok(*id);
+    }
+    let id = channel_account_id(&lc.config)?;
+    review.accounts.insert(lc.config_path.clone(), (mtime, id));
+    Ok(id)
+}
+
+fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String> {
+    let began = std::time::Instant::now();
+    let params = parse_query(query);
+    let station = config::load_for_inspection(&state.review.station_path)
+        .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))?;
+
+    // Every channel file the station's `channels:` patterns found, loaded or
+    // not, in station.yaml order.
+    let base = state
+        .review
+        .station_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let keys = lineup_keys(&station.lineup, &base);
+    let key = match params.get("channel") {
+        Some(k) => k.clone(),
+        None => keys.first().cloned().ok_or("the station has no channels")?,
+    };
+    let position = keys.iter().position(|k| *k == key).ok_or_else(|| {
+        format!(
+            "no channel {key:?} in {}",
+            state.review.station_path.display()
+        )
+    })?;
+    let lineup_json = json!({
+        "position": position + 1,
+        "total": keys.len(),
+        "prev": position.checked_sub(1).map(|i| keys[i].clone()),
+        "next": keys.get(position + 1).cloned(),
+    });
+    let days = params
+        .get("days")
+        .and_then(|d| d.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_REVIEW_DAYS)
+        .clamp(1, MAX_REVIEW_DAYS);
+
+    let config_path = &station.lineup[position];
+    if let Some(dropped) = station
+        .dropped
+        .iter()
+        .find(|d| d.config_path == *config_path)
+    {
+        eprintln!("taste-lab review: {key} failed to load: {}", dropped.reason);
+        return Ok((
+            200,
+            json!({
+                "channel": key,
+                "config_path": dropped.config_path.display().to_string(),
+                "days": days,
+                "lineup": lineup_json,
+                "load_error": dropped.reason,
+            }),
+        ));
+    }
+    let lc = station
+        .channels
+        .iter()
+        .find(|c| c.config_path == *config_path)
+        .ok_or_else(|| format!("{key} is in the lineup but neither loaded nor dropped"))?;
+
+    let tz = etv_station::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
+    let start = etv_station::tz::local_midnight_at_or_before(time::OffsetDateTime::now_utc(), tz);
+    let mut day_starts = vec![start];
+    for _ in 0..days {
+        let last = *day_starts.last().expect("non-empty");
+        day_starts.push(etv_station::tz::add_chunk(last, 24, tz));
+    }
+    let end = *day_starts.last().expect("non-empty");
+
+    let account_id = review_account_id(&mut state.review, lc)?;
+    let sim = etv_station::simulate::simulate(
+        &lc.config,
+        &lc.config_path,
+        &state.catalog,
+        account_id,
+        days,
+        start,
+    )?;
+
+    let block_names: Vec<String> = lc
+        .config
+        .rule
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            b.program()
+                .and_then(|p| p.title.clone())
+                .unwrap_or_else(|| format!("block {i}"))
+        })
+        .collect();
+    let mut entries: HashMap<String, Option<CatalogEntry>> = HashMap::new();
+    let mut airings: Vec<etv_station::review::ReviewAiring> = Vec::new();
+    for a in sim.generations.iter().flat_map(|g| &g.airings) {
+        if a.start >= end {
+            continue;
+        }
+        let entry = entries
+            .entry(a.id.clone())
+            .or_insert_with(|| state.catalog.entry(&a.id).ok().flatten());
+        airings.push(etv_station::review::ReviewAiring {
+            id: a.id.clone(),
+            title: entry
+                .as_ref()
+                .map(airing_label)
+                .unwrap_or_else(|| a.id.clone()),
+            kind: entry
+                .as_ref()
+                .map(|e| e.kind.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            show: entry.as_ref().and_then(|e| e.show.clone()),
+            show_id: a.show_id.clone(),
+            pool: drawn_from_pool(a.metadata.as_ref())
+                .unwrap_or_else(|| block_names.get(a.block).cloned().unwrap_or_default()),
+            start: a.start,
+            duration: a.duration,
+        });
+    }
+
+    let review = build_review(state, &station, lc, &airings, start, end)?;
+    let summary = comparable_numbers(&review);
+    let since_last = state.review.previous.insert(key.clone(), summary.clone());
+    let since_last_json = since_last.map(|old| {
+        let old: HashMap<String, Value> = old.into_iter().collect();
+        summary
+            .iter()
+            .map(|(label, new)| {
+                let old = old.get(label).cloned().unwrap_or(Value::Null);
+                json!({ "label": label, "old": old, "new": new, "changed": old != *new })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let nominal_secs = lc
+        .config
+        .scoring
+        .as_ref()
+        .map(|s| s.nominal_item_secs)
+        .unwrap_or_else(|| config::ScoringConfig::default().nominal_item_secs);
+    let mut notices = Vec::new();
+    let station_is_utc = matches!(station.station.tz.as_str(), "UTC" | "Etc/UTC");
+    if !station_is_utc && lc.config.rule.blocks.iter().any(|b| b.is_sequencer()) {
+        notices.push(format!(
+            "A sequencer block reads UTC here, not {}, so its dayparts run shifted by the zone offset.",
+            station.station.tz
+        ));
+    }
+    let unprobed = airings
+        .iter()
+        .filter(|a| {
+            entries
+                .get(&a.id)
+                .and_then(|e| e.as_ref())
+                .and_then(|e| e.duration_ms)
+                .is_none()
+        })
+        .count();
+    if unprobed > 0 {
+        notices.push(format!(
+            "{unprobed} of {} airings have no catalog length and run at nominal_item_secs ({nominal_secs}s); \
+             the daemon would probe the file instead.",
+            airings.len()
+        ));
+    }
+    if lc.config.anchor.is_some() {
+        notices.push(
+            "This channel sets an anchor; the anchor join on its first generation is not modelled."
+                .to_string(),
+        );
+    }
+
+    let airings_json: Vec<Value> = airings
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let e = entries.get(&a.id).and_then(|e| e.as_ref());
+            json!({
+                "index": i,
+                "id": a.id,
+                "label": a.title,
+                "title": e.map(|e| e.title.clone()),
+                "show": a.show,
+                "season": e.and_then(|e| e.season),
+                "episode": e.and_then(|e| e.episode),
+                "year": e.and_then(|e| e.year),
+                "kind": a.kind,
+                "pool": a.pool,
+                "start": a.start.unix_timestamp(),
+                "offset_secs": (a.start - start).whole_seconds(),
+                "duration_secs": a.duration.whole_seconds(),
+            })
+        })
+        .collect();
+
+    eprintln!(
+        "taste-lab review: {key} days={days} generations={} airings={} overlap_channels={} {}ms",
+        sim.generations.len(),
+        airings.len(),
+        review["overlap"]["channels"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        began.elapsed().as_millis()
+    );
+
+    let mut out = review;
+    let obj = out.as_object_mut().expect("build_review returns an object");
+    obj.insert("channel".into(), json!(key));
+    obj.insert("lineup".into(), lineup_json);
+    obj.insert("since_last".into(), json!(since_last_json));
+    obj.insert("notices".into(), json!(notices));
+    obj.insert("airings".into(), json!(airings_json));
+    obj.insert(
+        "day_starts".into(),
+        json!(
+            day_starts
+                .iter()
+                .map(|d| d.unix_timestamp())
+                .collect::<Vec<_>>()
+        ),
+    );
+    Ok((200, out))
+}
+
+/// A movie as `Title (Year)`, an episode as `Show S01E02 · Title`.
+fn airing_label(e: &CatalogEntry) -> String {
+    match (&e.show, e.season, e.episode) {
+        (Some(show), Some(s), Some(ep)) => format!("{show} S{s:02}E{ep:02} · {}", e.title),
+        (Some(show), _, _) => format!("{show} · {}", e.title),
+        _ => match e.year {
+            Some(y) => format!("{} ({y})", e.title),
+            None => e.title.clone(),
+        },
+    }
+}
+
+/// The channel's `rule.blocks` written out in words, one clause per block.
+fn pattern_in_words(channel: &config::ChannelConfig) -> String {
+    channel
+        .rule
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let name = b
+                .program()
+                .and_then(|p| p.title.clone())
+                .unwrap_or_else(|| format!("block {i}"));
+            let body = if let Some(seq) = &b.sequencer {
+                format!(
+                    "daypart sequencer {}",
+                    seq.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )
+            } else if !b.pattern.is_empty() {
+                let steps: Vec<String> = b
+                    .pattern
+                    .iter()
+                    .map(|s| match s.take.count() {
+                        Some(1) => format!("1 from {}", s.pool),
+                        Some(n) => format!("{n} from {}", s.pool),
+                        None => format!("all of one {} pick", s.pool),
+                    })
+                    .collect();
+                format!("{}, repeating", steps.join(", then "))
+            } else if !b.pools.is_empty() {
+                let pools: Vec<&str> = b.pools.iter().map(|p| p.name.as_str()).collect();
+                format!("pools {}", pools.join(", "))
+            } else {
+                format!("{} fixed entries", b.entries().len())
+            };
+            format!("{name}: {body}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// One channel's candidate entry ids, resolved from its config with no
+/// scorer run, cached until the file changes.
+fn channel_fingerprint(
+    review: &mut ReviewState,
+    catalog: &Catalog,
+    lc: &config::LoadedChannel,
+) -> Result<Arc<HashSet<String>>, String> {
+    let mtime = file_mtime(&lc.config_path)?;
+    if let Some((cached_mtime, ids)) = review.fingerprints.get(&lc.config_path)
+        && *cached_mtime == mtime
+    {
+        return Ok(ids.clone());
+    }
+    let ids = etv_station::resolve::resolve_channel_fingerprint_ids(
+        &lc.config,
+        &lc.config_path,
+        &[],
+        None,
+        Some(catalog),
+    )
+    .map(|ids| Arc::new(ids.into_iter().collect::<HashSet<_>>()))
+    .map_err(|e| e.to_string())?;
+    review
+        .fingerprints
+        .insert(lc.config_path.clone(), (mtime, ids.clone()));
+    Ok(ids)
+}
+
+/// Whether a channel's candidates hold every movie or every episode in the
+/// catalog — a channel that can air anything shares everything, so listing
+/// its overlap says nothing.
+fn is_whole_library(library: &(HashSet<String>, HashSet<String>), ids: &HashSet<String>) -> bool {
+    let (movies, episodes) = library;
+    (!movies.is_empty() && movies.is_subset(ids))
+        || (!episodes.is_empty() && episodes.is_subset(ids))
+}
+
+/// Every other channel sharing candidates with `lc`, largest first, each with
+/// the shared titles (episodes rolled up to their show).
+fn overlap_json(
+    state: &mut AppState,
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+) -> Result<Value, String> {
+    if state.review.library.is_none() {
+        let movies = state
+            .catalog
+            .resolve_query(r#"item.type == "movie""#)
+            .map_err(|e| e.to_string())?;
+        let episodes = state
+            .catalog
+            .resolve_query(r#"item.type == "episode""#)
+            .map_err(|e| e.to_string())?;
+        state.review.library = Some((movies.into_iter().collect(), episodes.into_iter().collect()));
+    }
+    let own = channel_fingerprint(&mut state.review, &state.catalog, lc)?;
+    let library = state.review.library.as_ref().expect("filled above");
+    let own_whole = is_whole_library(library, &own);
+
+    let mut whole_library = Vec::new();
+    let mut errors = Vec::new();
+    let mut shared: Vec<(&config::LoadedChannel, Vec<String>)> = Vec::new();
+    let mut others = Vec::new();
+    for other in station
+        .channels
+        .iter()
+        .filter(|c| c.config_path != lc.config_path)
+    {
+        match channel_fingerprint(&mut state.review, &state.catalog, other) {
+            Ok(ids) => others.push((other, ids)),
+            Err(e) => {
+                errors.push(json!({ "channel": channel_key(&other.config_path), "error": e }))
+            }
+        }
+    }
+    let library = state.review.library.as_ref().expect("filled above");
+    for (other, ids) in others {
+        if is_whole_library(library, &ids) {
+            whole_library.push(channel_key(&other.config_path));
+            continue;
+        }
+        if own_whole {
+            continue;
+        }
+        let common: Vec<String> = own.intersection(&ids).cloned().collect();
+        if !common.is_empty() {
+            shared.push((other, common));
+        }
+    }
+    shared.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then(a.0.config.number.cmp(&b.0.config.number))
+    });
+
+    let channels: Vec<Value> = shared
+        .iter()
+        .map(|(other, ids)| {
+            json!({
+                "channel": channel_key(&other.config_path),
+                "number": other.config.number,
+                "display_name": other.config.display_name,
+                "shared": ids.len(),
+                "titles": shared_titles(&state.catalog, ids),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "this_channel_whole_library": own_whole,
+        "candidates": own.len(),
+        "channels": channels,
+        "whole_library": whole_library,
+        "errors": errors,
+    }))
+}
+
+/// Shared ids as titles: a film as `Title (Year)`, a show's episodes as one
+/// `Show (n episodes)` line. Most shared first.
+fn shared_titles(catalog: &Catalog, ids: &[String]) -> Vec<String> {
+    let mut shows: HashMap<String, usize> = HashMap::new();
+    let mut films: Vec<String> = Vec::new();
+    for id in ids {
+        match catalog.entry(id).ok().flatten() {
+            Some(e) => match &e.show {
+                Some(show) => *shows.entry(show.clone()).or_insert(0) += 1,
+                None => films.push(airing_label(&e)),
+            },
+            None => films.push(id.clone()),
+        }
+    }
+    let mut shows: Vec<(String, usize)> = shows.into_iter().collect();
+    shows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    films.sort();
+    shows
+        .into_iter()
+        .map(|(show, n)| {
+            if n == 1 {
+                format!("{show} (1 episode)")
+            } else {
+                format!("{show} ({n} episodes)")
+            }
+        })
+        .chain(films)
+        .collect()
+}
+
+/// The report itself: header, tiles, depth rows, overlap and tune-in samples.
+fn build_review(
+    state: &mut AppState,
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+    airings: &[etv_station::review::ReviewAiring],
+    start: time::OffsetDateTime,
+    end: time::OffsetDateTime,
+) -> Result<Value, String> {
+    use etv_station::review;
+
+    let days = (end - start).as_seconds_f64() / 86_400.0;
+    let first_repeat = review::first_repeat(airings, start, |_| true)
+        .map(|r| json!({ "days": r.days, "index": r.index, "label": airings[r.index].title }));
+
+    // The last airing can run past the span's end; only its share inside the
+    // span counts toward airtime.
+    let clipped: Vec<review::ReviewAiring> = airings
+        .iter()
+        .map(|a| review::ReviewAiring {
+            duration: a.duration.min(end - a.start),
+            ..a.clone()
+        })
+        .collect();
+    let by_kind = review::airtime_by_kind(&clipped);
+    let total: f64 = by_kind.values().sum();
+    let share = |kind: &str| {
+        if total > 0.0 {
+            by_kind.get(kind).copied().unwrap_or(0.0) / total
+        } else {
+            0.0
+        }
+    };
+
+    let depth: Vec<Value> = review::depth_rows(airings, start)
+        .into_iter()
+        .map(|row| {
+            json!({
+                "kind": row.kind,
+                "name": row.name,
+                "pool": row.pool,
+                "aired": row.aired,
+                "distinct": row.distinct,
+                "first_repeat_days": row.first_repeat.as_ref().map(|r| r.days),
+                "first_repeat_label": row.first_repeat.as_ref().map(|r| airings[r.index].title.clone()),
+            })
+        })
+        .collect();
+
+    let seed = lc.config.seed.unwrap_or(0);
+    let samples: Vec<Value> = review::tune_in_samples(airings, start, end, seed, TUNE_IN_SAMPLES)
+        .into_iter()
+        .enumerate()
+        .map(|(n, t)| {
+            let next: Vec<usize> = (t.index + 1..airings.len()).take(2).collect();
+            json!({
+                "n": n + 1,
+                "at": t.at.unix_timestamp(),
+                "index": t.index,
+                "minutes_in": t.into.whole_minutes(),
+                "minutes_total": airings[t.index].duration.whole_minutes(),
+                "next": next,
+            })
+        })
+        .collect();
+
+    let distinct = airings
+        .iter()
+        .map(|a| a.id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let overlap = overlap_json(state, station, lc)?;
+
+    Ok(json!({
+        "channel": channel_key(&lc.config_path),
+        "config_path": lc.config_path.display().to_string(),
+        "number": lc.config.number,
+        "name": lc.name,
+        "display_name": lc.config.display_name,
+        "seed": lc.config.seed,
+        "tz": station.station.tz,
+        "days": days.round() as u32,
+        "start": start.unix_timestamp(),
+        "end": end.unix_timestamp(),
+        "pattern": pattern_in_words(&lc.config),
+        "first_repeat": first_repeat,
+        "airtime": {
+            "total_secs": total,
+            "by_kind": by_kind,
+            "film_share": share("movie"),
+            "series_share": share("episode"),
+        },
+        "items_aired": airings.len(),
+        "distinct_items": distinct,
+        "depth": depth,
+        "overlap": overlap,
+        "samples": samples,
+    }))
+}
+
+/// The numbers "Since last run" compares, in display order.
+fn comparable_numbers(review: &Value) -> Vec<(String, Value)> {
+    let pct = |v: &Value| v.as_f64().map(|f| json!((f * 1000.0).round() / 10.0));
+    let mut out = vec![
+        ("Days shown".to_string(), review["days"].clone()),
+        (
+            "Days until first repeat".to_string(),
+            review["first_repeat"]["days"]
+                .as_f64()
+                .map(|d| json!((d * 10.0).round() / 10.0))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "Film share of airtime (%)".to_string(),
+            pct(&review["airtime"]["film_share"]).unwrap_or(Value::Null),
+        ),
+        (
+            "Series share of airtime (%)".to_string(),
+            pct(&review["airtime"]["series_share"]).unwrap_or(Value::Null),
+        ),
+        (
+            "Channels sharing content".to_string(),
+            json!(
+                review["overlap"]["channels"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            ),
+        ),
+        ("Items aired".to_string(), review["items_aired"].clone()),
+        (
+            "Distinct items".to_string(),
+            review["distinct_items"].clone(),
+        ),
+    ];
+    for row in review["depth"].as_array().into_iter().flatten() {
+        if row["kind"] != "pool" {
+            continue;
+        }
+        out.push((
+            format!(
+                "Pool {} — days until first repeat",
+                row["name"].as_str().unwrap_or("")
+            ),
+            row["first_repeat_days"]
+                .as_f64()
+                .map(|d| json!((d * 10.0).round() / 10.0))
+                .unwrap_or(Value::Null),
+        ));
+    }
+    out
+}
+
 const INDEX_HTML: &str = include_str!("taste_lab_ui.html");
+const REVIEW_HTML: &str = include_str!("taste_lab_review.html");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lineup_keys_are_folder_names_when_distinct() {
+        let base = Path::new("/st");
+        let lineup = [
+            PathBuf::from("/st/channels/034-syfy/channel.yaml"),
+            PathBuf::from("/st/channels/035-prestige/channel.yaml"),
+        ];
+        assert_eq!(lineup_keys(&lineup, base), ["034-syfy", "035-prestige"]);
+    }
+
+    #[test]
+    fn lineup_keys_fall_back_to_paths_when_folders_collide() {
+        let base = Path::new("/st");
+        let lineup = [
+            PathBuf::from("/st/channels/a.yaml"),
+            PathBuf::from("/st/channels/b.yaml"),
+        ];
+        assert_eq!(
+            lineup_keys(&lineup, base),
+            ["channels/a.yaml", "channels/b.yaml"]
+        );
+    }
+}

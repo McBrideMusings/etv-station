@@ -159,6 +159,7 @@
   <div class="row">
     <label>Channel</label>
     <select id="channelPicker"></select>
+    <a id="reviewLink" href="/review">Review this channel →</a>
   </div>
   <div class="row">
     <label>Use deployed plugin</label>
@@ -926,7 +927,14 @@ $('moreDaysBtn').addEventListener('click', () => {
   el.value = Math.min(max, (parseInt(el.value, 10) || 3) + 3);
   selectChannel();
 });
+// The Review view keys a channel by its folder name (`034-syfy`).
+function updateReviewLink() {
+  const parts = $('channelPicker').value.split('/');
+  const folder = parts.length > 1 ? parts[parts.length - 2] : '';
+  $('reviewLink').href = folder ? `/review?channel=${encodeURIComponent(folder)}` : '/review';
+}
 $('channelPicker').addEventListener('change', checkStale);
+$('channelPicker').addEventListener('change', updateReviewLink);
 $('useDeployed').addEventListener('change', checkStale);
 $('accountPicker').addEventListener('change', checkStale);
 $('days').addEventListener('input', checkStale);
@@ -936,7 +944,7 @@ document.addEventListener('click', (e) => {
   }
 });
 
-loadChannels();
+loadChannels().then(updateReviewLink);
 loadTautulliUsers();
 </script>
 </body>

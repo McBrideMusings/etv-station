@@ -348,6 +348,7 @@ mod tests {
                 config,
             }],
             dropped: Vec::new(),
+            lineup: vec![path().to_path_buf()],
         }
     }
 

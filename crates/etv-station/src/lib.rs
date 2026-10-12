@@ -24,6 +24,7 @@ pub mod profile;
 pub mod reconcile;
 pub mod resolve;
 pub mod resume;
+pub mod review;
 pub mod rule;
 pub mod scan;
 pub mod score;
