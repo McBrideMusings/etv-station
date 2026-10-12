@@ -2100,13 +2100,28 @@ pub(crate) fn pool_config_dynamic(
 /// `ctx.pools.<name>` item maps with the exact same marshalling a scorer's
 /// `ctx.sets.<name>` already uses (issue #169, decision 1) rather than a
 /// second, driftable implementation.
+///
+/// Reads in bulk — one entries query and one per tag namespace for each ~500
+/// ids — because a whole-library pool hands this ~86,000 ids every generation,
+/// and a query per id per field was ~690,000 statements a generation.
 pub(crate) fn load_items(catalog: &Catalog, ids: &[String]) -> Result<Array, String> {
+    let mut entries = catalog.entries_for(ids).map_err(|e| e.to_string())?;
+    let mut tags = Vec::with_capacity(EXPOSED_TAGS.len());
+    for (key, ns) in EXPOSED_TAGS {
+        let by_id = catalog.tags_for_many(ids, *ns).map_err(|e| e.to_string())?;
+        tags.push((*key, by_id));
+    }
     let mut out = Array::with_capacity(ids.len());
     for id in ids {
-        let entry = catalog
-            .entry(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("entry {id:?} vanished from the catalog mid-resolution"))?;
+        // A repeated id finds its row already taken; read it again rather
+        // than cloning every row up front for a case pools rarely produce.
+        let entry = match entries.remove(id) {
+            Some(e) => e,
+            None => catalog
+                .entry(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("entry {id:?} vanished from the catalog mid-resolution"))?,
+        };
 
         let mut m = Map::new();
         m.insert("entry_id".into(), entry.entry_id.into());
@@ -2126,11 +2141,11 @@ pub(crate) fn load_items(catalog: &Catalog, ids: &[String]) -> Result<Array, Str
         insert_opt_str(&mut m, "content_rating", entry.content_rating);
         insert_opt_str(&mut m, "library", entry.library);
 
-        for (key, ns) in EXPOSED_TAGS {
-            let values = catalog.tags_for(id, *ns).map_err(|e| e.to_string())?;
+        for (key, by_id) in &tags {
+            let values = by_id.get(id).map(Vec::as_slice).unwrap_or_default();
             m.insert(
                 (*key).into(),
-                Dynamic::from_array(values.into_iter().map(Dynamic::from).collect()),
+                Dynamic::from_array(values.iter().cloned().map(Dynamic::from).collect()),
             );
         }
 

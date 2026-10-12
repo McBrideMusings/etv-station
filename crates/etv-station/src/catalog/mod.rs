@@ -699,6 +699,66 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Every requested entry's full row, one statement per ~500 ids — the bulk
+    /// form of [`Self::entry`] for a caller loading a whole candidate set. Ids
+    /// absent from the catalog are missing from the returned map.
+    pub fn entries_for(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Entry>, CatalogError> {
+        let mut out = std::collections::HashMap::with_capacity(entry_ids.len());
+        for chunk in entry_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("SELECT {ENTRY_COLS} FROM entries WHERE entry_id IN ({placeholders})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), row_to_entry)?;
+            for row in rows {
+                let entry = row?;
+                out.insert(entry.entry_id.clone(), entry);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every requested entry's tag values in `namespace`, each list ascending
+    /// as [`Self::tags_for`] returns it — one statement per ~500 ids. An entry
+    /// with no tags in the namespace is missing from the returned map.
+    pub fn tags_for_many(
+        &self,
+        entry_ids: &[String],
+        namespace: TagNs,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, CatalogError> {
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        // A repeated id must be asked for once: two copies in different
+        // chunks would append its tags twice.
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<&String> = entry_ids.iter().filter(|id| seen.insert(*id)).collect();
+        for chunk in unique.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT entry_id, value FROM tags \
+                 WHERE namespace = ? AND entry_id IN ({placeholders}) ORDER BY entry_id, value"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params =
+                std::iter::once(namespace.as_str()).chain(chunk.iter().map(|s| s.as_str()));
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, value) = row?;
+                out.entry(id).or_default().push(value);
+            }
+        }
+        Ok(out)
+    }
+
     /// The season number of each requested entry, in one round trip.
     ///
     /// Read only by a pool that groups its items by season (#155), on the same
@@ -1587,6 +1647,39 @@ mod tests {
         let map = c.show_ids_for(&ids).unwrap();
         assert_eq!(map.len(), 1200);
         assert_eq!(map.get("ep1199").unwrap(), "show:2");
+    }
+
+    /// The bulk reads `score::load_items` uses must answer exactly what the
+    /// per-id `entry`/`tags_for` do, across the 500-id chunk boundary.
+    #[test]
+    fn bulk_entry_and_tag_reads_match_the_per_id_reads() {
+        let c = cat();
+        let mut ids = Vec::new();
+        for n in 0..1200 {
+            let id = format!("m{n}");
+            c.upsert_entry(&Entry::new(&id, "movie", format!("Film {n}"), Source::Plex))
+                .unwrap();
+            if n % 2 == 0 {
+                c.add_tag(&id, TagNs::Genre, "Drama").unwrap();
+                c.add_tag(&id, TagNs::Genre, "Action").unwrap();
+            }
+            ids.push(id);
+        }
+        ids.push("missing".into());
+        // A repeat more than one chunk away from its first copy.
+        ids.push("m0".into());
+
+        let entries = c.entries_for(&ids).unwrap();
+        let genres = c.tags_for_many(&ids, TagNs::Genre).unwrap();
+        assert_eq!(entries.len(), 1200, "an absent id is simply missing");
+        for id in &ids {
+            assert_eq!(entries.get(id), c.entry(id).unwrap().as_ref(), "{id}");
+            assert_eq!(
+                genres.get(id).cloned().unwrap_or_default(),
+                c.tags_for(id, TagNs::Genre).unwrap(),
+                "{id}"
+            );
+        }
     }
 
     #[test]
