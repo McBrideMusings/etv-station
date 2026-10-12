@@ -126,6 +126,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | `docs/roadmap.md` | Now / Next / Later / Deferred. Direction, not task tracking. |
 | `docs/architecture.md` | Distillation of PRD §Architecture for quick reference. |
 | `docs/schema.md` | Config schema reference — station / channel / block files, entry & source kinds, `ProgramMetadata`, order/mode/filter, with YAML examples. |
+| `docs/programming.md` | TV-programming principles a channel review judges against — each with its source, a network example, its `channel.yaml` form, and the bead tracking any gap. |
 | `docs/adr/` | Architecture Decision Records — what was decided, stated as true now (e.g. `0001-reload-generation-revert.md`). No rationale, no rejected options, no consequences — three sentences is the target, fifteen lines the ceiling. Git history carries the "why"; a decision that reverses an earlier one is rewritten in place. |
 | `docs/file-map.md` | This page. |
 | `docs/index.md` | VitePress landing. |
