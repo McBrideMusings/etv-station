@@ -10,11 +10,43 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use ersatztv_channel::config::VideoNormalizationConfig;
 use etv_overlay::{OverlayKind, OverlaySpec, ProgramContext};
 use sha2::{Digest, Sha256};
 use time::Duration;
 
+use crate::catalog::EntrySource;
+use crate::config::ChannelOverlays;
 use crate::simulate::SimulatedAiring;
+
+/// Why a tune-in sample has no still, as the Review page shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unavailable {
+    pub why: String,
+    /// The media path that was looked for, when the sample got that far.
+    pub path: Option<PathBuf>,
+}
+
+/// Where a channel's media paths land on this machine: the
+/// `MEDIA_PATH_FROM`/`MEDIA_PATH_TO` prefix remap the catalog ingester reads.
+#[derive(Debug, Clone, Default)]
+pub struct MediaRemap {
+    pub from: String,
+    pub to: String,
+}
+
+impl MediaRemap {
+    pub fn from_env() -> Self {
+        Self {
+            from: std::env::var("MEDIA_PATH_FROM").unwrap_or_default(),
+            to: std::env::var("MEDIA_PATH_TO").unwrap_or_default(),
+        }
+    }
+}
+
+/// Distinguishes the scratch files of two renders of one still running at
+/// once, so neither renames the other's half-written file into place.
+static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Everything that decides one tune-in still.
 #[derive(Debug, Clone)]
@@ -40,7 +72,93 @@ pub struct RenderedStill {
     pub shows_next: bool,
 }
 
+/// What [`TuneInStill::render_cached`] served.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StillJpeg {
+    /// An earlier request rendered it.
+    Cached(Vec<u8>),
+    /// This request rendered it.
+    Rendered(Vec<u8>, RenderedStill),
+}
+
 impl TuneInStill {
+    /// The still for `airing`, sampled `into` it with `next` airing after, or
+    /// why there is none. `sources` is what the catalog returned for the
+    /// airing; `video` is the station's normalization, whose size is the
+    /// channel's canvas when it names one.
+    pub fn offer<E: std::fmt::Display>(
+        sources: Result<Vec<EntrySource>, E>,
+        remap: &MediaRemap,
+        overlays: &ChannelOverlays,
+        video: &VideoNormalizationConfig,
+        airing: &SimulatedAiring,
+        next: Option<&SimulatedAiring>,
+        into: Duration,
+    ) -> Result<Self, Unavailable> {
+        let unavailable = |why: &str, path: Option<PathBuf>| Unavailable {
+            why: why.to_string(),
+            path,
+        };
+        let sources = sources.map_err(|e| unavailable(&format!("Catalog error: {e}"), None))?;
+        let source = crate::resolve::pick_playback_source(&sources)
+            .ok_or_else(|| unavailable("No media file in the catalog", None))?;
+        let media = PathBuf::from(crate::catalog::ingest::plex::translate_path(
+            &source.playback_path,
+            &remap.from,
+            &remap.to,
+        ));
+        if !media.exists() {
+            // With no remap there is no share to be unmounted, only a path
+            // that names nothing.
+            let unmounted = !remap.to.is_empty() && !Path::new(&remap.to).is_dir();
+            let why = if unmounted {
+                "Media not mounted"
+            } else {
+                "Media file not found"
+            };
+            return Err(unavailable(why, Some(media)));
+        }
+
+        let overlay = overlays.for_block(airing.block).cloned();
+        let canvas = match (video.width, video.height, &overlay) {
+            (Some(w), Some(h), _) => (w, h),
+            (_, _, Some(spec)) => (spec.width, spec.height),
+            _ => (1280, 720),
+        };
+        Ok(Self {
+            media,
+            at_secs: into.as_seconds_f64(),
+            canvas,
+            overlay,
+            program: program_context(airing, next, into),
+        })
+    }
+
+    /// The JPEG for this still, read from `dir/id` when an earlier call
+    /// rendered it, else rendered there with `ffmpeg`. A render goes to a
+    /// scratch file renamed into place, so a reader never sees a half-written
+    /// JPEG and a failed render leaves nothing behind.
+    pub fn render_cached(&self, ffmpeg: &Path, dir: &Path, id: &str) -> Result<StillJpeg, String> {
+        let path = dir.join(id);
+        if let Ok(jpeg) = std::fs::read(&path) {
+            return Ok(StillJpeg::Cached(jpeg));
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let n = RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("{n}.partial.jpg"));
+        let rendered = self
+            .render(ffmpeg, &tmp)
+            .and_then(|r| {
+                std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+                Ok(r)
+            })
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })?;
+        let jpeg = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(StillJpeg::Rendered(jpeg, rendered))
+    }
+
     /// A hex digest of every input above plus every file the overlay reads
     /// (its script and its image layers) and the media file's size and
     /// modification time, so a cache keyed on it is never stale: an edit to
@@ -209,6 +327,316 @@ mod tests {
         assert_eq!((ctx.next_season, ctx.next_year), (-1, 1979));
         assert_eq!((ctx.item_elapsed, ctx.item_remaining), (600.0, 1920.0));
         assert_eq!(ctx.metadata, json!({ "pool": "series" }));
+    }
+
+    /// A ProgramMetadata serialized the way `simulate` stores it reads back
+    /// through the overlay's own playout reader.
+    #[test]
+    fn the_context_reads_a_serialized_program_metadata() {
+        use ersatztv_playout::playout::ProgramMetadata;
+        let meta = |title: &str, season, episode| {
+            serde_json::to_value(ProgramMetadata {
+                title: Some(title.into()),
+                sub_title: Some("Pilot".into()),
+                season,
+                episode,
+                year: Some(2006),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let now = airing(meta("Heroes", Some(1), Some(1)));
+        let next = airing(meta("Eureka", Some(2), Some(5)));
+        let ctx = program_context(&now, Some(&next), Duration::minutes(1));
+        assert_eq!(
+            (ctx.title.as_str(), ctx.season, ctx.episode),
+            ("Heroes", 1, 1)
+        );
+        assert_eq!(
+            (ctx.next_title.as_str(), ctx.next_season, ctx.next_episode),
+            ("Eureka", 2, 5)
+        );
+        assert_eq!(ctx.year, 2006);
+    }
+
+    fn source(path: &str, missing: bool) -> EntrySource {
+        EntrySource {
+            source: crate::catalog::Source::LocalFs,
+            source_id: path.into(),
+            entry_id: "id".into(),
+            playback_path: path.into(),
+            last_seen: None,
+            missing_since: missing.then(|| "2026-01-01T00:00:00Z".into()),
+        }
+    }
+
+    fn video(size: Option<(u32, u32)>) -> VideoNormalizationConfig {
+        let json = match size {
+            Some((w, h)) => json!({ "width": w, "height": h }),
+            None => json!({}),
+        };
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A 64x36 overlay that draws a white 16px box in its top-left corner.
+    fn box_spec() -> OverlaySpec {
+        OverlaySpec::from_yaml_str(
+            "width: 64\nheight: 36\nframerate: 30\nlayers:\n  - type: watermark\n    corner: top_left\n    margin: 0\n    box_size: 16\n    color: [255, 255, 255, 255]\n",
+        )
+        .unwrap()
+    }
+
+    fn offer_with(
+        sources: Result<Vec<EntrySource>, &str>,
+        remap: &MediaRemap,
+        overlays: &ChannelOverlays,
+        size: Option<(u32, u32)>,
+    ) -> Result<TuneInStill, Unavailable> {
+        let now = airing(json!({ "title": "Heroes" }));
+        TuneInStill::offer(
+            sources,
+            remap,
+            overlays,
+            &video(size),
+            &now,
+            None,
+            Duration::minutes(3),
+        )
+    }
+
+    #[test]
+    fn a_catalog_error_is_named() {
+        let err = offer_with(
+            Err("disk I/O"),
+            &MediaRemap::default(),
+            &ChannelOverlays::default(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.why, "Catalog error: disk I/O");
+        assert_eq!(err.path, None);
+    }
+
+    #[test]
+    fn an_airing_with_no_catalog_source_has_no_still() {
+        let err = offer_with(
+            Ok(vec![]),
+            &MediaRemap::default(),
+            &ChannelOverlays::default(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.why, "No media file in the catalog");
+    }
+
+    #[test]
+    fn a_remap_onto_an_absent_share_reads_as_not_mounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join("media");
+        let remap = MediaRemap {
+            from: "/data".into(),
+            to: share.display().to_string(),
+        };
+        let err = offer_with(
+            Ok(vec![source("/data/film.mkv", false)]),
+            &remap,
+            &ChannelOverlays::default(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.why, "Media not mounted");
+        assert_eq!(err.path, Some(share.join("film.mkv")));
+    }
+
+    #[test]
+    fn a_missing_file_on_a_mounted_share_reads_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let remap = MediaRemap {
+            from: "/data".into(),
+            to: dir.path().display().to_string(),
+        };
+        let err = offer_with(
+            Ok(vec![source("/data/film.mkv", false)]),
+            &remap,
+            &ChannelOverlays::default(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.why, "Media file not found");
+        assert_eq!(err.path, Some(dir.path().join("film.mkv")));
+    }
+
+    #[test]
+    fn the_live_source_is_the_one_sampled() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.mkv");
+        std::fs::write(&live, b"x").unwrap();
+        let still = offer_with(
+            Ok(vec![
+                source(&dir.path().join("gone.mkv").display().to_string(), true),
+                source(&live.display().to_string(), false),
+            ]),
+            &MediaRemap::default(),
+            &ChannelOverlays::default(),
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        assert_eq!(still.media, live);
+        assert_eq!(still.at_secs, 180.0);
+        assert_eq!(still.canvas, (1920, 1080));
+        assert_eq!(still.overlay, None);
+        assert_eq!(still.program.title, "Heroes");
+    }
+
+    #[test]
+    fn the_canvas_falls_back_to_the_overlay_then_to_720p() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("a.mkv");
+        std::fs::write(&media, b"x").unwrap();
+        let sources = || Ok(vec![source(&media.display().to_string(), false)]);
+        let with_overlay = ChannelOverlays {
+            base: Some(box_spec()),
+            blocks: vec![],
+        };
+        let still = offer_with(sources(), &MediaRemap::default(), &with_overlay, None).unwrap();
+        assert_eq!(still.canvas, (64, 36));
+        assert_eq!(still.overlay, Some(box_spec()));
+        let still = offer_with(
+            sources(),
+            &MediaRemap::default(),
+            &ChannelOverlays::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(still.canvas, (1280, 720));
+    }
+
+    #[test]
+    fn a_block_that_draws_nothing_gets_no_overlay() {
+        let mut spec = box_spec();
+        spec.layers.clear();
+        let overlays = ChannelOverlays {
+            base: Some(box_spec()),
+            blocks: vec![Some(spec.clone()), None],
+        };
+        assert_eq!(overlays.for_block(0), Some(&spec));
+        assert_eq!(overlays.for_block(1), None);
+        assert_eq!(ChannelOverlays::default().for_block(0), None);
+    }
+
+    /// Two seconds of black at 320x180, the media a render test samples. The
+    /// render tests need ffmpeg and ffprobe on PATH and fail without them.
+    fn black_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("black.mkv");
+        let status = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=320x180:d=2:r=10")
+            .args(["-c:v", "mpeg4"])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg on PATH");
+        assert!(status.success());
+        path
+    }
+
+    /// `jpeg` decoded to RGB rows, with its width.
+    fn decode(jpeg: &Path) -> (Vec<u8>, usize) {
+        let out = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(jpeg)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+            .args(["stream=width", "-of", "csv=p=0"])
+            .arg(jpeg)
+            .output()
+            .expect("ffprobe on PATH");
+        assert!(probe.status.success());
+        let width = String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        (out.stdout, width)
+    }
+
+    fn luma(rgb: &[u8], width: usize, x: usize, y: usize) -> u8 {
+        rgb[(y * width + x) * 3 + 1]
+    }
+
+    fn still_of(media: PathBuf, canvas: (u32, u32), overlay: Option<OverlaySpec>) -> TuneInStill {
+        TuneInStill {
+            media,
+            at_secs: 1.0,
+            canvas,
+            overlay,
+            program: ProgramContext::unknown(),
+        }
+    }
+
+    #[test]
+    fn a_render_lays_the_overlay_over_the_fitted_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = black_fixture(dir.path());
+        let out = dir.path().join("still.jpg");
+
+        let still = still_of(media.clone(), (64, 36), Some(box_spec()));
+        let rendered = still.render(Path::new("ffmpeg"), &out).unwrap();
+        assert_eq!(
+            rendered,
+            RenderedStill {
+                overlay_time: Some(0.0),
+                shows_next: false
+            }
+        );
+        let (rgb, width) = decode(&out);
+        assert_eq!((width, rgb.len()), (64, 64 * 36 * 3));
+        assert!(luma(&rgb, width, 6, 6) > 200, "inside the box");
+        assert!(luma(&rgb, width, 50, 28) < 40, "outside the box");
+
+        let bare = still_of(media, (64, 36), None);
+        assert_eq!(
+            bare.render(Path::new("ffmpeg"), &out).unwrap().overlay_time,
+            None
+        );
+        let (rgb, width) = decode(&out);
+        assert!(luma(&rgb, width, 6, 6) < 40, "no overlay, no box");
+    }
+
+    #[test]
+    fn a_failed_render_names_ffmpeg_and_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let still = still_of(dir.path().join("absent.mkv"), (64, 36), None);
+        let err = still
+            .render_cached(Path::new("ffmpeg"), &dir.path().join("cache"), "x.jpg")
+            .unwrap_err();
+        assert!(err.starts_with("ffmpeg "), "{err}");
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("cache"))
+            .unwrap()
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_cached_still_is_read_back_without_rendering() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = black_fixture(dir.path());
+        let cache = dir.path().join("cache");
+        let still = still_of(media, (64, 36), None);
+
+        let StillJpeg::Rendered(first, _) = still
+            .render_cached(Path::new("ffmpeg"), &cache, "s.jpg")
+            .unwrap()
+        else {
+            panic!("the first request renders");
+        };
+        // A cache hit never runs ffmpeg, so a binary that cannot exist proves it.
+        let second = still
+            .render_cached(Path::new("/nonexistent/ffmpeg"), &cache, "s.jpg")
+            .unwrap();
+        assert_eq!(second, StillJpeg::Cached(first));
     }
 
     #[test]

@@ -65,7 +65,7 @@ use etv_station::config::{self, DatastoreGrant, Pool};
 use etv_station::profile::ProfileEntry;
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use etv_station::tautulli::{self, HistoryScope};
-use etv_station::tune_in_still::TuneInStill;
+use etv_station::tune_in_still::{MediaRemap, StillJpeg, TuneInStill, Unavailable};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
@@ -1912,45 +1912,21 @@ fn offer_still(
     into: time::Duration,
     n: usize,
 ) -> Value {
-    let sources = match state.catalog.sources_for(&airing.id) {
-        Ok(sources) => sources,
-        Err(e) => return json!({ "unavailable": format!("Catalog error: {e}") }),
-    };
-    let Some(source) = etv_station::resolve::pick_playback_source(&sources) else {
-        return json!({ "unavailable": "No media file in the catalog" });
-    };
-    let from = std::env::var("MEDIA_PATH_FROM").unwrap_or_default();
-    let to = std::env::var("MEDIA_PATH_TO").unwrap_or_default();
-    let media = PathBuf::from(etv_station::catalog::ingest::plex::translate_path(
-        &source.playback_path,
-        &from,
-        &to,
-    ));
-    if !media.exists() {
-        // With no remap there is no share to be unmounted, only a path
-        // that names nothing.
-        let unmounted = !to.is_empty() && !Path::new(&to).is_dir();
-        let why = if unmounted {
-            "Media not mounted"
-        } else {
-            "Media file not found"
-        };
-        return json!({ "unavailable": why, "path": media.display().to_string() });
-    }
-
-    let overlay = lc.overlays.for_block(airing.block).cloned();
-    let video = &station.station.normalization.video;
-    let canvas = match (video.width, video.height, &overlay) {
-        (Some(w), Some(h), _) => (w, h),
-        (_, _, Some(spec)) => (spec.width, spec.height),
-        _ => (1280, 720),
-    };
-    let still = TuneInStill {
-        media,
-        at_secs: into.as_seconds_f64(),
-        canvas,
-        overlay,
-        program: etv_station::tune_in_still::program_context(airing, next, into),
+    let still = match TuneInStill::offer(
+        state.catalog.sources_for(&airing.id),
+        &MediaRemap::from_env(),
+        &lc.overlays,
+        &station.station.normalization.video,
+        airing,
+        next,
+        into,
+    ) {
+        Ok(still) => still,
+        Err(Unavailable { why, path: None }) => return json!({ "unavailable": why }),
+        Err(Unavailable {
+            why,
+            path: Some(path),
+        }) => return json!({ "unavailable": why, "path": path.display().to_string() }),
     };
     let channel: String = channel_key(&lc.config_path)
         .chars()
@@ -1990,29 +1966,24 @@ fn serve_review_still(state: &AppState, request: tiny_http::Request, query: &str
     });
 }
 
-/// Distinguishes the scratch files of two renders of one still running at
-/// once, so neither renames the other's half-written file into place.
-static STILL_RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<u8>, String> {
-    let path = dir.join(id);
-    if let Ok(bytes) = std::fs::read(&path) {
-        eprintln!("taste-lab still: {id} cached");
-        return Ok(bytes);
-    }
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let began = std::time::Instant::now();
-    let n = STILL_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("{n}.partial.jpg"));
-    let rendered = still.render(Path::new("ffmpeg"), &tmp).inspect_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        eprintln!(
-            "taste-lab still: {id} FAILED media={} at={:.1}s: {e}",
-            still.media.display(),
-            still.at_secs
-        )
-    })?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let served = still
+        .render_cached(Path::new("ffmpeg"), dir, id)
+        .inspect_err(|e| {
+            eprintln!(
+                "taste-lab still: {id} FAILED media={} at={:.1}s: {e}",
+                still.media.display(),
+                still.at_secs
+            )
+        })?;
+    let (jpeg, rendered) = match served {
+        StillJpeg::Cached(jpeg) => {
+            eprintln!("taste-lab still: {id} cached");
+            return Ok(jpeg);
+        }
+        StillJpeg::Rendered(jpeg, rendered) => (jpeg, rendered),
+    };
     eprintln!(
         "taste-lab still: {id} media={} at={:.1}s title={:?} next_title={:?} overlay_time={:?} shows_next={} {}ms",
         still.media.display(),
@@ -2023,7 +1994,7 @@ fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<
         rendered.shows_next,
         began.elapsed().as_millis()
     );
-    std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+    Ok(jpeg)
 }
 
 /// The numbers "Since last run" compares, in display order.
