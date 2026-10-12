@@ -199,11 +199,14 @@ served.
 To force one without a config change:
 
 ```bash
-admin refresh-channel 2               # by channel number, as the guide shows it
-admin refresh-channel 002-for-pierce  # by declared name:
-admin refresh-channel all             # every channel
+admin refresh channel 002-for-pierce  # by directory name — prefer this
+admin refresh channel all             # every channel
 # expect: reason="forced" within one roll_interval, not instantly
 ```
+
+A bare number resolves by lineup position, not the declared `number:`
+(etv-station-421): with 62 channels, `admin refresh channel 85` fails with "no
+channel number 85". Use the directory name until that is fixed.
 
 The CLI writes a `.refresh-request` marker in the channel's playout folder and
 the daemon consumes it on its next tick — it does not rewrite playout itself,
