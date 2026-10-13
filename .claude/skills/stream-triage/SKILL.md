@@ -357,6 +357,13 @@ Read it for:
 - **requests continue, latency climbs** → buffering, not a freeze. Look at
   segment size and whether `fps` fell below realtime.
 - **`404`** on a segment the client wants → it fell behind the sliding window.
+- **`.ts` fetches stop but `live_sub.m3u8` / `.vtt` polls continue** from a
+  `VLC/3.0.4 LibVLC/3.0.4` client (iPlayTV) → the channel announced a subtitle
+  track whose cue files are empty, and libVLC 3.0.4 drops video on reading one
+  (#286). Check with `grep -l -- '-->' /config/data/hls/<N>/<run>/*.vtt` inside
+  the container; zero files means every cue file was empty. The track is
+  announced if *any* schedule file in the playout folder requests a subtitle,
+  not the item airing (etv-station-j4dw).
 
 ### On the Apple TV
 
