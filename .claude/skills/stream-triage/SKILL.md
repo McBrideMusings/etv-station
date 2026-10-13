@@ -403,6 +403,16 @@ Configurator 2; they describe no network route.
 the TV, and AirDrop the sysdiagnose to the Mac. Take it right after the freeze —
 the unified log ages out.
 
+What that sysdiagnose holds for a libVLC player: `ps.txt` names the real app —
+a `VLC/3.0.4 LibVLC/3.0.4` User-Agent has come from iPlayTV
+(`com.simpleiptv.client`), not VLC. libVLC inside it writes nothing to the
+unified log, so `log show --archive … --predicate 'process == "iPlayTV"'` shows
+only UIKit and MediaRemote noise. The Play/Pause half of the button combo lands
+as a `playerCommand:Pause`, which marks when the viewer reached for the remote.
+`spindump-nosymbols.txt` is the useful part: each thread's `last ran Ns ago`,
+subtracted from the spindump's `Date/Time`, dates when the player's threads went
+idle. The frames are unsymbolicated, so it says when, not where.
+
 The CoreMedia logging profile (`StreamLoggingWithConsent.mobileconfig`) only
 raises `com.apple.coremedia` to Debug — Apple's own AVFoundation HLS stack.
 VLC plays HLS through libVLC's `adaptive` demux, not CoreMedia, so the profile
