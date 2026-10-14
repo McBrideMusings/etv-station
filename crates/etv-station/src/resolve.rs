@@ -3219,6 +3219,8 @@ mod tests {
         inc.pools = vec![
             Pool {
                 tracks: None,
+                label: None,
+                advisory: None,
                 name: "movies".into(),
                 expr: Some("item.type == \"movie\"".into()),
                 plugin: None,
@@ -3242,6 +3244,8 @@ mod tests {
             },
             Pool {
                 tracks: None,
+                label: None,
+                advisory: None,
                 name: "shows".into(),
                 expr: Some("item.type == \"episode\"".into()),
                 plugin: None,
@@ -4044,6 +4048,8 @@ mod tests {
         let mut inc = include_with(vec![]);
         inc.pools = vec![Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: "shows".into(),
             expr: None,
             plugin: None,

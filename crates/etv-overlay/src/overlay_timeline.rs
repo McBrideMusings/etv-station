@@ -194,9 +194,7 @@ mod tests {
             height: 720,
             framerate,
             pixel_format: PixelFormat::Rgba8,
-            script: None,
-            config: None,
-            layers: vec![],
+            graphics: vec![],
         }
     }
 

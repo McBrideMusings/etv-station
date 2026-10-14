@@ -856,6 +856,9 @@ pub fn build(
     // map at the end. `Option<Value>` rather than `Value` so it plugs straight
     // into `audit::push_stage`, which owns creating the blob.
     let mut audit_out: HashMap<String, Option<serde_json::Value>> = HashMap::new();
+    // Which pool drew each id, for the pools that carry a `label:`. Two pools
+    // drawing one id collide here on the same terms as `guide_out` above.
+    let mut labelled_by: HashMap<String, usize> = HashMap::new();
     let mut laid = Duration::ZERO;
     // Where this block's cycle count stands, carried across generations so the
     // rolls below keep moving. Restarting at 0 each generation replayed cycle
@@ -941,6 +944,11 @@ pub fn build(
             if let Some(tracks) = &runtimes[idx].cfg.tracks {
                 for id in &drawn {
                     tracks_out.insert(id.clone(), tracks.clone());
+                }
+            }
+            if runtimes[idx].cfg.label.is_some() {
+                for id in &drawn {
+                    labelled_by.insert(id.clone(), idx);
                 }
             }
             // Every drawn id gets a `select` stage — the draw, which is a
@@ -1029,6 +1037,9 @@ pub fn build(
             }
         }
     }
+    for (id, idx) in labelled_by {
+        stamp_pool_display(&mut metadata_out, id, runtimes[idx].cfg);
+    }
     Ok(BlockBuild {
         ids: out,
         resume: resume_out,
@@ -1046,6 +1057,22 @@ fn pools_resume(runtimes: &[PoolRuntime], cycle: u64) -> BTreeMap<String, PoolRe
         .iter()
         .map(|rt| (rt.cfg.name.clone(), rt.to_resume(cycle)))
         .collect()
+}
+
+/// Write `pool`'s `label`/`advisory` into `id`'s metadata blob, creating the
+/// blob when the pool is not a plugin pool and attached none. Shared by the
+/// pattern walk and the sequencer build so the two cannot disagree about which
+/// keys an overlay script finds.
+pub(crate) fn stamp_pool_display(
+    metadata: &mut HashMap<String, serde_json::Value>,
+    id: String,
+    pool: &Pool,
+) {
+    let mut blob = metadata.remove(&id);
+    pool.stamp_display(&mut blob);
+    if let Some(blob) = blob {
+        metadata.insert(id, blob);
+    }
 }
 
 /// Append `staged`'s `audit` records onto `existing`'s, leaving every other
@@ -1940,6 +1967,8 @@ mod tests {
     fn movies_pool() -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: "movies".into(),
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
@@ -1966,6 +1995,8 @@ mod tests {
     fn shows_pool() -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
@@ -1996,6 +2027,8 @@ mod tests {
     fn plugin_pool(script: &std::path::Path) -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: "movies".into(),
             expr: None,
             plugin: Some(script.to_path_buf()),
@@ -2089,6 +2122,8 @@ mod tests {
     fn episodes_pool(group_by: GroupBy) -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
@@ -2393,6 +2428,8 @@ mod tests {
     fn rupaul_pool() -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: "rupaul".into(),
             expr: None,
             plugin: None,
@@ -2644,6 +2681,78 @@ mod tests {
                 tail,
             },
         )
+    }
+
+    /// A pool's `label:` and `advisory:` ride on every item it draws, under the
+    /// stable keys an overlay script reads, and only on that pool's items: the
+    /// interleaved unlabelled pool's draws carry neither key.
+    #[test]
+    fn a_labelled_pool_stamps_its_label_and_advisory_on_what_it_draws() {
+        let mut movies = movies_pool();
+        movies.label = Some("Kaiju".into());
+        movies.advisory = Some("Contains loud noises".into());
+        let mut shows = shows_pool();
+        shows.label = Some("Zombies".into());
+
+        let cat = catalog();
+        let built = build(
+            &cat,
+            &[movies, shows],
+            &[],
+            &[step("movies", 1), step("shows", 2)],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            0,
+            test_env(),
+            None,
+        )
+        .expect("pattern builds");
+
+        let movie = built.ids.iter().find(|i| i.starts_with("mov-")).unwrap();
+        assert_eq!(built.metadata[movie]["pool_label"], "Kaiju");
+        assert_eq!(
+            built.metadata[movie]["pool_advisory"],
+            "Contains loud noises"
+        );
+        // The audit trail the walk already writes is still there beside it.
+        assert!(built.metadata[movie]["audit"].is_array());
+
+        let episodes: Vec<_> = built
+            .ids
+            .iter()
+            .filter(|i| !i.starts_with("mov-"))
+            .collect();
+        assert_eq!(episodes.len(), 2);
+        for ep in episodes {
+            assert_eq!(built.metadata[ep]["pool_label"], "Zombies");
+            assert!(
+                built.metadata[ep].get("pool_advisory").is_none(),
+                "a pool with no advisory writes no advisory key",
+            );
+        }
+    }
+
+    /// A pool with no `label:` leaves its items' metadata exactly as it was.
+    #[test]
+    fn an_unlabelled_pool_adds_no_display_keys() {
+        let cat = catalog();
+        let built = build(
+            &cat,
+            &[movies_pool()],
+            &[],
+            &[step("movies", 1)],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            0,
+            test_env(),
+            None,
+        )
+        .expect("pattern builds");
+        let blob = &built.metadata[&built.ids[0]];
+        assert!(blob.get("pool_label").is_none());
+        assert!(blob.get("pool_advisory").is_none());
     }
 
     /// The headline acceptance criterion: `{movies take=1}, {shows take=3}`

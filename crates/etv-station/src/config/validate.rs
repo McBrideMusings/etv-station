@@ -672,6 +672,28 @@ fn validate_block_pools<'a>(
         if pool.name.trim().is_empty() {
             return Err(bad("a pool has an empty name".into()));
         }
+        if pool.label.as_ref().is_some_and(|l| l.trim().is_empty()) {
+            return Err(bad(format!(
+                "pool {:?} has a blank `label` — it would draw an empty block card; \
+                 name the block or drop the key",
+                pool.name
+            )));
+        }
+        if let Some(advisory) = &pool.advisory {
+            if advisory.trim().is_empty() {
+                return Err(bad(format!(
+                    "pool {:?} has a blank `advisory` — drop the key for no warning",
+                    pool.name
+                )));
+            }
+            if pool.label.is_none() {
+                return Err(bad(format!(
+                    "pool {:?} sets `advisory` without a `label` — the warning shows on the \
+                     block's card, so the block needs a name",
+                    pool.name
+                )));
+            }
+        }
         // A pool names exactly one source of items. Two is ambiguous about
         // which one wins; none leaves the pool with nothing to resolve.
         let source_count = [
@@ -1237,6 +1259,8 @@ mod tests {
     fn pool(name: &str) -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: name.into(),
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
@@ -1326,6 +1350,36 @@ mod tests {
             ..Default::default()
         });
         c
+    }
+
+    /// A pool's `label`/`advisory` are checked at load: a blank one would draw an
+    /// empty card, and a warning with no block named has no card to ride on.
+    #[test]
+    fn rejects_a_blank_label_a_blank_advisory_and_an_advisory_without_a_label() {
+        let check = |label: Option<&str>, advisory: Option<&str>| {
+            let mut p = pool("movies");
+            p.label = label.map(str::to_string);
+            p.advisory = advisory.map(str::to_string);
+            let c = channel_with(vec![pattern_block(vec![p], vec![step("movies", 1)])]);
+            validate_channel(&dummy_path(), &c).map_err(|e| format!("{e}"))
+        };
+        assert!(check(Some("Zombies"), Some("Gore")).is_ok());
+        assert!(check(None, None).is_ok());
+        assert!(
+            check(Some("  "), None)
+                .unwrap_err()
+                .contains("blank `label`")
+        );
+        assert!(
+            check(Some("Zombies"), Some(""))
+                .unwrap_err()
+                .contains("blank `advisory`")
+        );
+        assert!(
+            check(None, Some("Gore"))
+                .unwrap_err()
+                .contains("without a `label`")
+        );
     }
 
     /// The silent failure this rule exists to stop: `single_user` with nobody

@@ -628,7 +628,26 @@ pub struct Pool {
     /// picture subtitles for one without touching the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracks: Option<crate::config::TrackRules>,
+
+    /// Display text naming what this pool is on air ("Zombies"). Written into
+    /// the metadata of every item the pool draws under [`POOL_LABEL_KEY`], so an
+    /// overlay script can tell a viewer which block is on. Blank is refused at
+    /// load: a label that draws nothing is a typo, not a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    /// A short content warning shown with the label ("Contains flashing
+    /// lights"). Written under [`POOL_ADVISORY_KEY`]. Needs a [`Pool::label`]:
+    /// a warning with no block named has no card to ride on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<String>,
 }
+
+/// The metadata key a drawn item carries its pool's [`Pool::label`] under.
+pub const POOL_LABEL_KEY: &str = "pool_label";
+
+/// The metadata key a drawn item carries its pool's [`Pool::advisory`] under.
+pub const POOL_ADVISORY_KEY: &str = "pool_advisory";
 
 /// One named external datastore grant (#167) — see [`Pool::datastores`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -646,6 +665,25 @@ pub struct DatastoreGrant {
 }
 
 impl Pool {
+    /// Write this pool's `label` and `advisory` into an item's metadata blob.
+    /// A pool with neither leaves the blob untouched, so a channel that
+    /// declares none carries no new key.
+    ///
+    /// A blob that is not a JSON object is left alone for the same reason
+    /// `audit::push_stage` leaves it: a plugin returning something odd is
+    /// refused at pick time, and decoration must not panic the generator.
+    pub fn stamp_display(&self, metadata: &mut Option<serde_json::Value>) {
+        let Some(label) = &self.label else { return };
+        let blob = metadata.get_or_insert_with(|| serde_json::Value::Object(Default::default()));
+        let Some(obj) = blob.as_object_mut() else {
+            return;
+        };
+        obj.insert(POOL_LABEL_KEY.into(), label.clone().into());
+        if let Some(advisory) = &self.advisory {
+            obj.insert(POOL_ADVISORY_KEY.into(), advisory.clone().into());
+        }
+    }
+
     /// This pool's effective constraints: its own if it declares any, otherwise
     /// the block's, otherwise unconstrained.
     pub fn constraints(&self, block: Option<&Constraints>) -> Constraints {

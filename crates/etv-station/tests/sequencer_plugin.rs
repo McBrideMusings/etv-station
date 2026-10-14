@@ -69,6 +69,8 @@ fn catalog() -> Catalog {
 fn discovery_pool() -> Pool {
     Pool {
         tracks: None,
+        label: None,
+        advisory: None,
         name: "discovery".into(),
         expr: Some("item.type == \"movie\"".into()),
         plugin: None,
@@ -97,6 +99,8 @@ fn discovery_pool() -> Pool {
 fn spotlight_pool() -> Pool {
     Pool {
         tracks: None,
+        label: None,
+        advisory: None,
         name: "spotlight".into(),
         expr: Some("item.type == \"episode\"".into()),
         plugin: None,
@@ -274,6 +278,8 @@ async fn assert_one_file_across_the_chunk(
 fn foryou_pool(plugin: &Path) -> Pool {
     Pool {
         tracks: None,
+        label: None,
+        advisory: None,
         name: "foryou".into(),
         expr: None,
         plugin: Some(plugin.to_path_buf()),
@@ -421,6 +427,47 @@ fn a_records_metadata_reaches_the_resolved_item_on_a_sequencer_block() {
         b_meta.as_object().unwrap().keys().collect::<Vec<_>>(),
         ["audit"]
     );
+}
+
+/// A sequencer block's labelled pool stamps `pool_label`/`pool_advisory` on
+/// every item it supplied — both the record that carried plugin metadata and
+/// the bare id — without disturbing the plugin's own keys or its audit trail.
+#[test]
+fn a_labelled_pool_stamps_its_items_on_a_sequencer_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = write_plugin(&dir, "metadata.rhai", MIXED_SHAPES);
+    let arrange = write_plugin(&dir, "arrange.rhai", FORWARD_ARRANGE);
+    let mut pool = foryou_pool(&plugin);
+    pool.label = Some("Oscar Season".into());
+    pool.advisory = Some("Some scenes are intense".into());
+    let cfg = forwarding_sequencer_channel(&arrange, pool);
+
+    let (items, _, _) = resolve_channel_with_resume(
+        &cfg,
+        Path::new("foryou.yaml"),
+        &[],
+        None,
+        Some(&catalog()),
+        &GenerationState::default(),
+        &ScoreInputs::default(),
+        None,
+        CHUNK_BOUNDARY,
+    )
+    .unwrap();
+
+    let a = items.iter().find(|i| i.id == "mov-a").expect("mov-a airs");
+    let a_meta = a.metadata.as_ref().unwrap();
+    assert_eq!(a_meta["pool_label"], serde_json::json!("Oscar Season"));
+    assert_eq!(
+        a_meta["pool_advisory"],
+        serde_json::json!("Some scenes are intense")
+    );
+    assert_eq!(a_meta["reason"], serde_json::json!("won an Oscar"));
+
+    let b = items.iter().find(|i| i.id == "mov-b").expect("mov-b airs");
+    let b_meta = b.metadata.as_ref().unwrap();
+    assert_eq!(b_meta["pool_label"], serde_json::json!("Oscar Season"));
+    assert!(b_meta["audit"].is_array());
 }
 
 /// The acceptance criterion driven end to end through the real emission path

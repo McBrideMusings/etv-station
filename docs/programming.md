@@ -398,14 +398,19 @@ after each program, and the break's length varies with the next start time
   ```yaml
   overlay:
     extend:
-      layers:
-        - { type: image, path: logo.png, corner: bottom_right, height: 56 }
+      graphics:
+        - layers:
+            - { type: image, path: logo.png, corner: bottom_right, height: 56 }
   ```
 
 - **Lower third / snipe timing:** the station's Now/Next snipe
   (`deploy/appdata/shared/now-next-snipe.rhai`) reads its timing from the
   overlay's `config:`. `interval_secs` (default 300) sets how often it runs and
   `hold_secs` (default 4.5) how long each card stays.
+- **Naming a themed block on screen:** `label:` (and an optional `advisory:`)
+  on a pool. Every item the pool draws carries them, and the station's block
+  card (`deploy/appdata/shared/block-card.rhai`) shows them when the block
+  changes and on an interval. See `docs/schema.md` "Pool `label` / `advisory`".
 - **Bumpers between programs:** a pool of short files and a pattern step that
   draws one between programs.
 

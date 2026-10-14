@@ -65,7 +65,7 @@ use etv_station::config::{self, DatastoreGrant, Pool};
 use etv_station::profile::ProfileEntry;
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use etv_station::tautulli::{self, HistoryScope};
-use etv_station::tune_in_still::{MediaRemap, StillJpeg, TuneInStill, Unavailable};
+use etv_station::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
@@ -1928,8 +1928,11 @@ fn build_review(
             state,
             station,
             lc,
-            simulated[t.index],
-            simulated.get(t.index + 1).copied(),
+            Neighbours {
+                prev: t.index.checked_sub(1).map(|i| simulated[i]),
+                airing: simulated[t.index],
+                next: simulated.get(t.index + 1).copied(),
+            },
             t.into,
             n + 1,
         );
@@ -2025,18 +2028,16 @@ fn offer_still(
     state: &mut AppState,
     station: &config::Station,
     lc: &config::LoadedChannel,
-    airing: &etv_station::simulate::SimulatedAiring,
-    next: Option<&etv_station::simulate::SimulatedAiring>,
+    at: Neighbours<'_>,
     into: time::Duration,
     n: usize,
 ) -> Value {
     let still = match TuneInStill::offer(
-        state.catalog.sources_for(&airing.id),
+        state.catalog.sources_for(&at.airing.id),
         &MediaRemap::from_env(),
         &lc.overlays,
         &station.station.normalization.video,
-        airing,
-        next,
+        at,
         into,
     ) {
         Ok(still) => still,

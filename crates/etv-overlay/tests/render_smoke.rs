@@ -245,10 +245,10 @@ fn a_config_value_moves_the_rendered_watermark() {
         // Through the real load path, so what reaches the script is what an
         // authored overlay spec would put there.
         let spec = OverlaySpec::from_yaml_str(&format!(
-            "width: 320\nheight: 240\nframerate: 30\nconfig:\n  corner: {corner}\n"
+            "width: 320\nheight: 240\nframerate: 30\ngraphics:\n  - config:\n      corner: {corner}\n"
         ))
         .unwrap();
-        let mut engine = RhaiEngine::with_config(base.clone(), spec.config.as_ref());
+        let mut engine = RhaiEngine::with_config(base.clone(), spec.graphics[0].config.as_ref());
         engine.load_script(script.path()).unwrap();
         let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
         renderer.render_frame(&state).expect("render")
@@ -572,8 +572,7 @@ fn title_chyron_fixture_config_overrides_the_script_defaults() {
     let path =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/title_chyron.yaml");
     let spec = OverlaySpec::from_path(&path).unwrap();
-    let mut engine = RhaiEngine::with_config(spec.layers.clone(), spec.config.as_ref());
-    engine.load_script(spec.script.as_ref().unwrap()).unwrap();
+    let engine = RhaiEngine::for_spec(&spec).unwrap();
 
     let mut ctx = ProgramContext::unknown();
     ctx.title = "Die Hard".into();
@@ -745,4 +744,206 @@ fn an_unknown_program_draws_no_snipe_at_all() {
 
     let state = engine.evaluate(2.5, 0, &ProgramContext::unknown());
     assert!(state.layers.iter().all(|l| !l.visible));
+}
+
+/// The block card as it ships (`deploy/appdata/shared/block-card.rhai`), driving
+/// its own four layers: a scrim, then the eyebrow, label and advisory rows.
+fn block_card_layers() -> Vec<OverlayKind> {
+    let text = |size: f32| OverlayKind::Text {
+        content: String::new(),
+        font_family: "Helvetica".to_string(),
+        font_size: size,
+        letter_spacing: 0.0,
+        color: [255, 255, 255, 240],
+        corner: Corner::TopLeft,
+        margin: 40,
+    };
+    vec![
+        OverlayKind::Scrim {
+            edge: etv_overlay::overlay_spec::Edge::Top,
+            size: 150,
+            color: [0, 0, 0, 175],
+        },
+        text(14.0),
+        text(30.0),
+        text(16.0),
+    ]
+}
+
+fn block_card_script() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/appdata/shared/block-card.rhai")
+}
+
+fn block_card_engine() -> (RhaiEngine, std::path::PathBuf) {
+    (RhaiEngine::new(block_card_layers()), block_card_script())
+}
+
+/// An item in the Zombies block, after one in the Kaiju block, `elapsed`
+/// seconds into the item.
+fn zombies_after_kaiju(elapsed: f64, advisory: Option<&str>) -> ProgramContext {
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Dawn of the Dead".into();
+    ctx.item_elapsed = elapsed;
+    let mut meta = serde_json::json!({ "pool_label": "The Zombies Block" });
+    if let Some(advisory) = advisory {
+        meta["pool_advisory"] = advisory.into();
+    }
+    ctx.metadata = meta;
+    ctx.prev_metadata = serde_json::json!({ "pool_label": "The Kaiju Block" });
+    ctx
+}
+
+/// Time chosen so the interval trigger is nowhere near firing: the card's
+/// default interval starts at 150s into each 300s cycle.
+const OFF_INTERVAL: f64 = 1000.0;
+
+#[test]
+fn block_card_names_the_block_when_the_label_changes() {
+    let (mut engine, path) = block_card_engine();
+    engine.load_script(&path).unwrap();
+    let ctx = zombies_after_kaiju(3.0, Some("Contains graphic violence"));
+
+    let state = engine.evaluate(OFF_INTERVAL, 0, &ctx);
+    assert_eq!(content_of(&state.layers[1]), "THIS IS");
+    assert_eq!(content_of(&state.layers[2]), "The Zombies Block");
+    assert_eq!(content_of(&state.layers[3]), "Contains graphic violence");
+    assert!(state.layers.iter().all(|l| l.visible), "scrim and all rows");
+}
+
+/// Without an advisory the third row stays down, and the card is gone sooner:
+/// the hold is shorter when there is nothing extra to read.
+#[test]
+fn block_card_with_no_advisory_leaves_the_third_row_down_and_ends_sooner() {
+    let (mut engine, path) = block_card_engine();
+    engine.load_script(&path).unwrap();
+
+    let plain = engine.evaluate(OFF_INTERVAL, 0, &zombies_after_kaiju(3.0, None));
+    assert!(plain.layers[2].visible);
+    assert!(!plain.layers[3].visible, "no advisory, no third row");
+
+    // 0.45 rise + 5.0 hold + 0.35 fall + 0.24 stagger = 6.04s; 7s is past it.
+    let late = zombies_after_kaiju(7.0, None);
+    assert!(
+        engine
+            .evaluate(OFF_INTERVAL, 0, &late)
+            .layers
+            .iter()
+            .all(|l| !l.visible),
+        "a plain card is over by 7s",
+    );
+    let late_with_advisory = zombies_after_kaiju(7.0, Some("Flashing lights"));
+    assert!(
+        engine.evaluate(OFF_INTERVAL, 0, &late_with_advisory).layers[3].visible,
+        "the advisory holds the card for 8s of reading time",
+    );
+}
+
+/// A block that carries on across items shows no card at item start; only the
+/// interval brings it back.
+#[test]
+fn block_card_is_not_drawn_when_the_label_matches_the_previous_item() {
+    let (mut engine, path) = block_card_engine();
+    engine.load_script(&path).unwrap();
+    let mut ctx = zombies_after_kaiju(3.0, None);
+    ctx.prev_metadata = serde_json::json!({ "pool_label": "The Zombies Block" });
+
+    assert!(
+        engine
+            .evaluate(OFF_INTERVAL, 0, &ctx)
+            .layers
+            .iter()
+            .all(|l| !l.visible)
+    );
+}
+
+#[test]
+fn block_card_returns_on_the_interval_part_way_through_a_block() {
+    let (mut engine, path) = block_card_engine();
+    engine.load_script(&path).unwrap();
+    let mut ctx = zombies_after_kaiju(900.0, None);
+    ctx.prev_metadata = serde_json::json!({ "pool_label": "The Zombies Block" });
+
+    // interval 300, offset 150: the card is up from 150s to ~156s of each cycle.
+    let up = engine.evaluate(753.0, 0, &ctx);
+    assert_eq!(content_of(&up.layers[2]), "The Zombies Block");
+    assert!(up.layers[2].visible);
+    assert!(
+        engine
+            .evaluate(853.0, 0, &ctx)
+            .layers
+            .iter()
+            .all(|l| !l.visible)
+    );
+}
+
+/// An item from a pool with no label carries neither key, and the card does
+/// not draw for it however the clocks stand.
+#[test]
+fn block_card_is_not_drawn_for_an_item_with_no_label() {
+    let (mut engine, path) = block_card_engine();
+    engine.load_script(&path).unwrap();
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Anything".into();
+    ctx.item_elapsed = 2.0;
+
+    for t in [0.0, 2.0, 152.0, OFF_INTERVAL] {
+        assert!(
+            engine
+                .evaluate(t, 0, &ctx)
+                .layers
+                .iter()
+                .all(|l| !l.visible),
+            "no label, no card at t={t}",
+        );
+    }
+}
+
+/// The scrim leads the cascade and fades with it, like the snipe's.
+#[test]
+fn block_card_scrim_is_up_while_the_label_is_and_gone_after() {
+    let (mut engine, path) = block_card_engine();
+    engine.load_script(&path).unwrap();
+
+    let held = engine.evaluate(OFF_INTERVAL, 0, &zombies_after_kaiju(3.0, None));
+    assert!((held.layers[0].opacity - 1.0).abs() < 1e-3);
+    let gone = engine.evaluate(OFF_INTERVAL, 0, &zombies_after_kaiju(20.0, None));
+    assert!(!gone.layers[0].visible);
+}
+
+/// With `announce_after_unlabelled: false`, an item following an unlabelled one
+/// draws no change card (a bumper between films would otherwise announce every
+/// film), while a genuinely different label still does.
+#[test]
+fn block_card_can_ignore_an_unlabelled_previous_item() {
+    let build = |announce: bool| {
+        let mut engine = RhaiEngine::with_config(
+            block_card_layers(),
+            Some(&serde_json::json!({ "announce_after_unlabelled": announce })),
+        );
+        engine.load_script(&block_card_script()).unwrap();
+        engine
+    };
+    let mut after_bumper = zombies_after_kaiju(3.0, None);
+    after_bumper.prev_metadata = serde_json::Value::Null;
+
+    assert!(
+        build(true).evaluate(OFF_INTERVAL, 0, &after_bumper).layers[2].visible,
+        "by default an unlabelled neighbour counts as a change",
+    );
+    let quiet = build(false);
+    assert!(
+        quiet
+            .evaluate(OFF_INTERVAL, 0, &after_bumper)
+            .layers
+            .iter()
+            .all(|l| !l.visible)
+    );
+    assert!(
+        quiet
+            .evaluate(OFF_INTERVAL, 0, &zombies_after_kaiju(3.0, None))
+            .layers[2]
+            .visible,
+        "a different label still announces",
+    );
 }

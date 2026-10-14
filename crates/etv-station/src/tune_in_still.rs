@@ -81,20 +81,29 @@ pub enum StillJpeg {
     Rendered(Vec<u8>, RenderedStill),
 }
 
+/// The airing a still is taken from and the two beside it: the overlay reads
+/// the one before as `prev_metadata` and the one after as its lookahead.
+#[derive(Clone, Copy)]
+pub struct Neighbours<'a> {
+    pub prev: Option<&'a SimulatedAiring>,
+    pub airing: &'a SimulatedAiring,
+    pub next: Option<&'a SimulatedAiring>,
+}
+
 impl TuneInStill {
-    /// The still for `airing`, sampled `into` it with `next` airing after, or
-    /// why there is none. `sources` is what the catalog returned for the
-    /// airing; `video` is the station's normalization, whose size is the
-    /// channel's canvas when it names one.
+    /// The still for `at.airing`, sampled `into` it, or why there is none.
+    /// `sources` is what the catalog returned for the airing; `video` is the
+    /// station's normalization, whose size is the channel's canvas when it
+    /// names one.
     pub fn offer<E: std::fmt::Display>(
         sources: Result<Vec<EntrySource>, E>,
         remap: &MediaRemap,
         overlays: &ChannelOverlays,
         video: &VideoNormalizationConfig,
-        airing: &SimulatedAiring,
-        next: Option<&SimulatedAiring>,
+        at: Neighbours<'_>,
         into: Duration,
     ) -> Result<Self, Unavailable> {
+        let Neighbours { prev, airing, next } = at;
         let unavailable = |why: &str, path: Option<PathBuf>| Unavailable {
             why: why.to_string(),
             path,
@@ -130,7 +139,7 @@ impl TuneInStill {
             at_secs: into.as_seconds_f64(),
             canvas,
             overlay,
-            program: program_context(airing, next, into),
+            program: program_context(prev, airing, next, into),
         })
     }
 
@@ -183,11 +192,16 @@ impl TuneInStill {
         h.update(format!("{:?}", self.program));
         if let Some(spec) = &self.overlay {
             h.update(serde_json::to_vec(spec).unwrap_or_default());
-            let images = spec.layers.iter().filter_map(|l| match l {
-                OverlayKind::Image { path, .. } => Some(path),
-                _ => None,
-            });
-            for file in spec.script.iter().chain(images) {
+            let scripts = spec.graphics.iter().filter_map(|g| g.script.as_ref());
+            let images = spec
+                .graphics
+                .iter()
+                .flat_map(|g| &g.layers)
+                .filter_map(|l| match l {
+                    OverlayKind::Image { path, .. } => Some(path),
+                    _ => None,
+                });
+            for file in scripts.chain(images) {
                 h.update(std::fs::read(file).unwrap_or_default());
             }
         }
@@ -283,8 +297,10 @@ impl TuneInStill {
 /// The overlay's view of `now`, `into` it, with `next` airing after: the
 /// context the running overlay would read off the two playout items, built by
 /// the same reader ([`ProgramContext::from_playout_programs`]) from the
-/// programs the simulation rendered.
+/// programs the simulation rendered. `prev` is the airing before `now`, whose
+/// metadata the overlay reads as `prev_metadata`.
 pub fn program_context(
+    prev: Option<&SimulatedAiring>,
     now: &SimulatedAiring,
     next: Option<&SimulatedAiring>,
     into: Duration,
@@ -295,6 +311,7 @@ pub fn program_context(
         into.as_seconds_f64(),
         (now.duration - into).as_seconds_f64(),
         now.metadata.clone(),
+        prev.and_then(|p| p.metadata.clone()),
     )
 }
 
@@ -332,7 +349,7 @@ mod tests {
         let now =
             airing(json!({ "title": "Heroes", "sub_title": "Genesis", "season": 1, "episode": 2 }));
         let next = airing(json!({ "title": "SyFy Presents: Alien", "year": 1979 }));
-        let ctx = program_context(&now, Some(&next), Duration::minutes(10));
+        let ctx = program_context(None, &now, Some(&next), Duration::minutes(10));
         assert_eq!(
             (ctx.title.as_str(), ctx.sub_title.as_str()),
             ("Heroes", "Genesis")
@@ -362,7 +379,7 @@ mod tests {
         };
         let now = airing(meta("Heroes", Some(1), Some(1)));
         let next = airing(meta("Eureka", Some(2), Some(5)));
-        let ctx = program_context(&now, Some(&next), Duration::minutes(1));
+        let ctx = program_context(None, &now, Some(&next), Duration::minutes(1));
         assert_eq!(
             (ctx.title.as_str(), ctx.season, ctx.episode),
             ("Heroes", 1, 1)
@@ -396,7 +413,7 @@ mod tests {
     /// A 64x36 overlay that draws a white 16px box in its top-left corner.
     fn box_spec() -> OverlaySpec {
         OverlaySpec::from_yaml_str(
-            "width: 64\nheight: 36\nframerate: 30\nlayers:\n  - type: watermark\n    corner: top_left\n    margin: 0\n    box_size: 16\n    color: [255, 255, 255, 255]\n",
+            "width: 64\nheight: 36\nframerate: 30\ngraphics:\n  - layers:\n      - type: watermark\n        corner: top_left\n        margin: 0\n        box_size: 16\n        color: [255, 255, 255, 255]\n",
         )
         .unwrap()
     }
@@ -413,8 +430,11 @@ mod tests {
             remap,
             overlays,
             &video(size),
-            &now,
-            None,
+            Neighbours {
+                prev: None,
+                airing: &now,
+                next: None,
+            },
             Duration::minutes(3),
         )
     }
@@ -529,7 +549,7 @@ mod tests {
     #[test]
     fn a_block_that_draws_nothing_gets_no_overlay() {
         let mut spec = box_spec();
-        spec.layers.clear();
+        spec.graphics.clear();
         let overlays = ChannelOverlays {
             base: Some(box_spec()),
             blocks: vec![Some(spec.clone()), None],
@@ -689,7 +709,7 @@ mod tests {
         let logo = dir.path().join("logo.png");
         std::fs::write(&logo, b"one").unwrap();
         let spec = OverlaySpec::from_yaml_str(&format!(
-            "width: 64\nheight: 36\nframerate: 30\nlayers:\n  - type: image\n    path: {}\n    corner: bottom_right\n",
+            "width: 64\nheight: 36\nframerate: 30\ngraphics:\n  - layers:\n      - type: image\n        path: {}\n        corner: bottom_right\n",
             logo.display()
         ))
         .unwrap();

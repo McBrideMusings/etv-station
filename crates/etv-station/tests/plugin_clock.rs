@@ -125,6 +125,8 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                 order: Default::default(),
                 pools: vec![Pool {
                     tracks: None,
+                    label: None,
+                    advisory: None,
                     name: "clockpool".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),

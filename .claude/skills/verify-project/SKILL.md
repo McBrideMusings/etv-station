@@ -576,6 +576,54 @@ for f in sorted(glob.glob('deploy/appdata/channels/*/logo.png') + glob.glob('dep
 ffmpeg -y -i bad.png -pix_fmt rgba fixed.png   # the fix; alpha survives
 ```
 
+## Verifying the block card and pool labels
+
+A pool's `label:`/`advisory:` ride on every item it draws as
+`metadata.pool_label` / `metadata.pool_advisory`, and
+`deploy/appdata/shared/block-card.rhai` draws them. Three layers, cheapest first:
+
+```bash
+cargo test -p etv-station --lib -- pattern::tests::a_labelled pattern::tests::an_unlabelled config::validate
+cargo test -p etv-station --test sequencer_plugin a_labelled_pool
+cargo test -p etv-overlay --test render_smoke block_card
+```
+
+The first two prove the station stamps both keys on pattern and sequencer
+blocks (and refuses a blank label, a blank advisory, an advisory with no label).
+The third drives the shipped script through the real engine: change card, no
+card on an unchanged label, interval card, advisory row, no label no card.
+
+To see the card, render a still with the metadata a daemon would have written.
+The spec needs both graphics, the snipe's four layers and the card's four;
+`docs/schema.md` "Pool label / advisory" has the YAML:
+
+```bash
+etv-overlay render-still --config spec.yaml --output card.png --time 1000 \
+  --title "Dawn of the Dead" --item-elapsed 3 \
+  --metadata '{"pool_label":"The Zombies Block","pool_advisory":"Contains graphic violence"}' \
+  --prev-metadata '{"pool_label":"The Kaiju Block"}'
+```
+
+Drop `pool_advisory` for the no-advisory card. `--time 1000` keeps the interval
+trigger away (it fires 150-156s into each 300s cycle), so the card on screen is
+the change card. Composite the PNG over a test pattern with ffmpeg before
+judging legibility; on its own it is transparent.
+
+Live: a scratch station with `source_roots` pointing at four tiny `lavfi` files
+(`Kaiju A/B`, `Zombie C/D`), two labelled pools and a pattern `kaiju x2, zombies
+x2`, run with `env -u PLEX_URL -u PLEX_TOKEN ...` so no ingest blocks. Read the
+chunk files: items from `zombies` carry both keys, `kaiju` items carry only
+`pool_label`. Then run `etv-overlay pipe --fifo F --create-fifo
+--playout-folder <output>/<channel>` against that folder and read the fifo with
+ffmpeg (`-use_wallclock_as_timestamps 1 -copyts`, `crop=200:40:0:0,alphaextract,
+signalstats`): the top-left alpha is non-zero for the card's first seconds from
+the item that changes label and zero for an item that keeps it.
+
+A config change that moves a pool onto `graphics:` is proved by loading the
+whole deployed tree: copy `deploy/appdata/{channels,shared,station.yaml}` aside,
+run the migration, and `etv-station --config <copy>/station.yaml --dump-overlay
+<name>` for every channel `name:` (62 of 62 load).
+
 ## Three blockers you will hit, and how to get past them
 
 **1. `PLEXDB_SNAPSHOT_PATH` is not in `.env`.** `examples/samples/foryou.yaml` references

@@ -62,6 +62,14 @@ pub struct ProgramContext {
     /// code here reads a key inside it — it exists only to reach the overlay
     /// script's scope (ADR 0016). `Value::Null` when absent.
     pub metadata: serde_json::Value,
+    /// The item before the current one: its `metadata`, carried verbatim and
+    /// as opaque as [`Self::metadata`] (ADR 0016). A script compares the two to
+    /// notice a change between consecutive items — a new block starting — which
+    /// a single frame's current item cannot say. `Value::Null` when there is no
+    /// earlier item loaded (a channel's first item, or a playout pruned past it)
+    /// and when the earlier item carried no metadata, which a script cannot and
+    /// need not tell apart.
+    pub prev_metadata: serde_json::Value,
 }
 
 impl ProgramContext {
@@ -81,6 +89,7 @@ impl ProgramContext {
             item_elapsed: -1.0,
             item_remaining: -1.0,
             metadata: serde_json::Value::Null,
+            prev_metadata: serde_json::Value::Null,
         }
     }
 }
@@ -218,6 +227,10 @@ impl ProgramContextSource {
             }
         }
         items.sort_by_key(|i| i.start);
+        // An item straddling a chunk boundary is written whole into both
+        // chunks, so it loads twice with the same start. Left in, the "next"
+        // and "previous" neighbour of such an item would be its own twin.
+        items.dedup_by_key(|i| i.start);
         self.items = items;
         Ok(())
     }
@@ -240,12 +253,14 @@ impl ProgramContextSource {
             return ProgramContext::unknown();
         }
         let next = self.items.get(idx + 1);
+        let prev = idx.checked_sub(1).and_then(|i| self.items.get(i));
         context_from_rows(
             item.program.as_ref(),
             next.and_then(|n| n.program.as_ref()),
             (now - item.start).as_seconds_f64(),
             (item.finish - now).as_seconds_f64(),
             item.metadata.clone(),
+            prev.and_then(|p| p.metadata.clone()),
         )
     }
 }
@@ -263,6 +278,7 @@ impl ProgramContext {
         elapsed: f64,
         remaining: f64,
         metadata: Option<serde_json::Value>,
+        prev_metadata: Option<serde_json::Value>,
     ) -> Self {
         let row = |v: Option<&serde_json::Value>| v.and_then(|v| ProgramRow::deserialize(v).ok());
         context_from_rows(
@@ -271,6 +287,7 @@ impl ProgramContext {
             elapsed,
             remaining,
             metadata,
+            prev_metadata,
         )
     }
 }
@@ -281,6 +298,7 @@ fn context_from_rows(
     elapsed: f64,
     remaining: f64,
     metadata: Option<serde_json::Value>,
+    prev_metadata: Option<serde_json::Value>,
 ) -> ProgramContext {
     let cur = program_fields(now);
     let nxt = program_fields(next);
@@ -299,6 +317,7 @@ fn context_from_rows(
         item_elapsed: elapsed,
         item_remaining: remaining,
         metadata: metadata.unwrap_or(serde_json::Value::Null),
+        prev_metadata: prev_metadata.unwrap_or(serde_json::Value::Null),
     }
 }
 
@@ -628,6 +647,47 @@ mod tests {
 
         let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
         assert!(ctx.metadata.is_null());
+    }
+
+    /// Two consecutive items, the second airing after a block change: the
+    /// current item's `prev_metadata` is the one before it, and the first item
+    /// of a channel has none. The item straddling the chunk boundary is written
+    /// into both chunk files, and must not become its own predecessor.
+    #[test]
+    fn prev_metadata_is_the_item_before_not_its_chunk_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = |id: &str, start: &str, finish: &str, label: &str| {
+            format!(
+                r#"{{ "id": "{id}", "start": "{start}", "finish": "{finish}",
+                    "program": {{ "title": "{id}" }}, "metadata": {{ "pool_label": "{label}" }} }}"#
+            )
+        };
+        let a = item("a", "2026-04-13T00:00:00Z", "2026-04-13T00:10:00Z", "Kaiju");
+        let b = item(
+            "b",
+            "2026-04-13T00:10:00Z",
+            "2026-04-13T00:20:00Z",
+            "Zombies",
+        );
+        write_chunk(
+            dir.path(),
+            "1_2.json",
+            &format!(r#"{{ "version": "t", "items": [{a}, {b}] }}"#),
+        );
+        write_chunk(
+            dir.path(),
+            "2_3.json",
+            &format!(r#"{{ "version": "t", "items": [{b}] }}"#),
+        );
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let first = src.current_at(datetime!(2026-04-13 00:05 UTC));
+        assert!(first.prev_metadata.is_null());
+
+        let second = src.current_at(datetime!(2026-04-13 00:15 UTC));
+        assert_eq!(second.metadata["pool_label"], "Zombies");
+        assert_eq!(second.prev_metadata["pool_label"], "Kaiju");
     }
 
     #[test]

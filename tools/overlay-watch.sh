@@ -144,7 +144,7 @@ for EXTRA in deploy/appdata/station.yaml examples/station.yaml; do
 done
 while IFS= read -r SCRIPT_REF; do
   [ -n "$SCRIPT_REF" ] && [ -f "$SCRIPT_REF" ] && WATCH_FILES+=("$SCRIPT_REF")
-done < <(grep '^script:' "$SPEC_PATH" | sed 's/^script: *//')
+done < <(grep -E '^[[:space:]-]*script:' "$SPEC_PATH" | sed -E 's/^[[:space:]-]*script: *//')
 
 printf '%s watching %s file(s) for edits\n' "$(bold '==>')" "${#WATCH_FILES[@]}"
 (
@@ -160,6 +160,19 @@ printf '%s watching %s file(s) for edits\n' "$(bold '==>')" "${#WATCH_FILES[@]}"
   done
 ) &
 REEXTRACT_PID=$!
+
+# Optional item metadata for a graphic that reads a station-written key
+# (block-card.rhai reads `pool_label`). Unset leaves the preview's metadata
+# null, as before:
+#   METADATA='{"pool_label":"Zombies"}' PREV_METADATA='{"pool_label":"Kaiju"}' \
+#     ITEM_ELAPSED=2 admin overlay-watch 034-syfy
+# ITEM_ELAPSED is fixed for the whole preview, so a card keyed to the item's
+# first seconds holds one frame of its animation; leave it unset to watch the
+# interval cycle instead.
+PREVIEW_EXTRA=()
+[ -n "${METADATA-}" ] && PREVIEW_EXTRA+=(--metadata "$METADATA")
+[ -n "${PREV_METADATA-}" ] && PREVIEW_EXTRA+=(--prev-metadata "$PREV_METADATA")
+[ -n "${ITEM_ELAPSED-}" ] && PREVIEW_EXTRA+=(--item-elapsed "$ITEM_ELAPSED")
 
 printf '%s streaming (time_scale=%s, title=%s) into VLC — Ctrl-C to stop\n' "$(bold '==>')" "$TIME_SCALE" "$TITLE"
 # The built binary directly, not `cargo run` — one less process in the way of
@@ -181,4 +194,5 @@ printf '%s streaming (time_scale=%s, title=%s) into VLC — Ctrl-C to stop\n' "$
   --next-season "$NEXT_SEASON" \
   --next-episode "$NEXT_EPISODE" \
   --next-year "$NEXT_YEAR" \
+  ${PREVIEW_EXTRA[@]+"${PREVIEW_EXTRA[@]}"} \
   | "$VLC" -q -

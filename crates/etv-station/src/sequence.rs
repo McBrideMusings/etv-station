@@ -252,7 +252,14 @@ pub fn build(
     // with the record's `metadata` stashed on the side by `crate::score::pick`
     // and recovered here by id, through the same shared helper `pattern::build`
     // uses (#203) so this path can't drop a field the pattern path keeps.
-    let metadata_out = crate::pattern::flatten_picked_extras(score_cache.picked_extras);
+    let mut metadata_out = crate::pattern::flatten_picked_extras(score_cache.picked_extras);
+    // Each drawn item carries its pool's `label:`/`advisory:`, read from
+    // `item_location` like the `guide:` rung below.
+    for id in &arranged {
+        if let Some(&(pool_idx, _)) = item_location.get(id) {
+            crate::pattern::stamp_pool_display(&mut metadata_out, id.clone(), &pools[pool_idx]);
+        }
+    }
 
     // This pool's own `guide:` (#289), the same rung the pattern walk
     // records — read here from `item_location`, which already knows which
@@ -509,6 +516,8 @@ mod tests {
     fn pool(name: &str, expr: &str) -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: name.into(),
             expr: Some(expr.into()),
             plugin: None,

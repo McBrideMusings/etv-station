@@ -773,19 +773,21 @@ overlay:                             # or write the spec inline
   width: 1280
   height: 720
   framerate: 30
-  layers:
-    - type: image
-      path: logo.png
-      corner: bottom_right
-      height: 56
+  graphics:
+    - layers:
+        - type: image
+          path: logo.png
+          corner: bottom_right
+          height: 56
 
 overlay:                             # or add to what the level above resolved
   extend:
-    layers:
-      - type: image
-        path: logo.png               # relative to THIS file's directory
-        corner: bottom_right
-        height: 56
+    graphics:
+      - layers:
+          - type: image
+            path: logo.png           # relative to THIS file's directory
+            corner: bottom_right
+            height: 56
 ```
 
 **Resolution replaces by default and appends when asked; deepest declared
@@ -794,18 +796,19 @@ inherits its ancestor's resolved config unchanged; `clear` means *this level
 draws nothing*, discarding whatever an ancestor resolved; a `file:` reference
 or an inline spec is that whole config, in full, discarding whatever an
 ancestor resolved; and `extend:` keeps the ancestor's config and appends its
-layers to the end.
+graphics to the end.
 
-`extend` is the only composition there is — it may add layers, name a
-different `script:`, or replace `config:` wholesale, and that is all. It
-cannot reach inside an inherited layer and carries no geometry, so unlike
-`guide:`'s field-by-field cascade there is still no per-field override. It
+`extend` is the only composition there is — it adds whole graphics (see
+[Graphics](#graphics)) after the inherited ones, and that is all. It cannot
+reach inside an inherited graphic and carries no geometry, so unlike
+`guide:`'s field-by-field cascade there is no per-field override. It
 exists because the station has graphics every channel shares (a Now/Next
-snipe) plus one thing only the channel knows (its own logo, at its own size),
-and replacement alone forced all 60 channels to restate the shared half. Each
-level's paths resolve against its own file's directory before its layers are
-appended, so a station layer naming `shared/logo.png` and a channel layer
-naming `logo.png` are both correct in one resolved spec. See ADR 0008.
+snipe, a block card) plus one thing only the channel knows (its own logo, at
+its own size), and replacement alone forced all 60 channels to restate the
+shared half. Each level's paths resolve against its own file's directory
+before its graphics are appended, so a station graphic naming
+`shared/logo.png` and a channel graphic naming `logo.png` are both correct in
+one resolved spec. See ADR 0008.
 
 An `extend` with nothing above it to extend — no ancestor declared a complete
 config, or the nearest one said `clear` — fails at config load naming that,
@@ -818,9 +821,143 @@ the canvas and the fifo the `etv-overlay` process is spawned with, and its
 disagree with the channel's on those four fields — they are baked into the
 fifo's byte layout, so a block that wants different ones fails to load,
 naming the mismatch, rather than being silently ignored or attempting a live
-resize. Only the script and layers may differ per block; see
+resize. Only the graphics may differ per block; see
 `docs/architecture.md`'s Graphics overlay cascade section for how that swap
 reaches the already-running process without a respawn (ADR 0007).
+
+#### Graphics
+
+An overlay spec is its canvas (`width`, `height`, `framerate`,
+`pixel_format`) plus a `graphics:` list. A **graphic** is one script, the
+layers it drives, and the `config` it reads:
+
+```yaml
+width: 1280
+height: 720
+framerate: 30
+graphics:
+  - name: now-next               # optional; named in errors and logs
+    script: shared/now-next-snipe.rhai
+    config: { interval_secs: 300 }
+    layers:                      # the script addresses these by index, from 0
+      - { type: scrim, edge: bottom, size: 150, color: [0, 0, 0, 175] }
+      - { type: text, content: "", corner: bottom_left, margin: 40, font_size: 14.0 }
+  - layers:                      # no script: drawn as declared
+      - { type: image, path: logo.png, corner: bottom_right, height: 56 }
+```
+
+Graphics are independent. Each script sees only its own layers (index 0 is
+its own first layer) and its own `config`, so adding or removing a graphic
+cannot re-target another's. They draw in declaration order, a later graphic on
+top. A script that hides itself (`visible: false`) or throws affects only its
+own graphic: a failing script falls back to its graphic's declared layers and
+the others keep drawing. A graphic with no `script:` is static.
+
+Unknown keys are refused. A spec still written with top-level `script:`,
+`config:` or `layers:` fails to load rather than parsing as an overlay that
+draws nothing; move those three keys under a `graphics:` entry.
+
+**What a script can read.** `time`, `frame`, the current item's `title`,
+`sub_title`, `description`, `season`, `episode`, `year`, the `next_*`
+equivalents, `item_elapsed`, `item_remaining`, its own `config`, and the
+item's opaque blob as `metadata`. `prev_metadata` is the blob of the item that
+aired before it, so a script can notice a change between consecutive items;
+it is `()` for a channel's first item and when the earlier item carried none.
+Test for a map with `type_of(prev_metadata) == "map"` before reading a key
+from either.
+
+### Pool `label` / `advisory` — naming the block on screen
+
+A pool can say what it is called on air, and warn about what it contains:
+
+```yaml
+pools:
+  - name: zombies
+    expr: item.collections.contains("Zombies")
+    label: "The Zombies Block"
+    advisory: "Contains graphic violence"
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `label` | string | display text for the block. Blank is refused at load. |
+| `advisory` | string | a short content warning. Needs a `label`; blank is refused at load. |
+
+Every item the pool draws carries both in its playout `metadata`, under two
+fixed keys:
+
+```json
+"metadata": { "pool_label": "The Zombies Block", "pool_advisory": "Contains graphic violence" }
+```
+
+`pool_advisory` is absent when the pool sets none; both are absent on a pool
+with no `label`. They sit beside the `audit` array and any keys a scorer
+plugin attached — a plugin that returns its own `pool_label` loses it to the
+pool's. This works the same on `pattern:` and `sequencer:` blocks. It is
+display text for an overlay script, not part of the audit trail: nothing
+parses `audit` to find the block. Metadata is filed by `entry_id`, so two
+pools that draw the same entry share one label — including a labelled pool and
+an unlabelled one: every airing of that entry, whichever pool drew it, carries
+the labelled pool's label. The same limit `guide:` and `tracks:` have; keep
+pools that must stay apart disjoint. Editing a label
+rolls the schedule from the next item boundary, like any pool edit.
+
+**On screen.** `deploy/appdata/shared/block-card.rhai` reads the two keys and
+draws a card at the top-left of the frame:
+
+```
+THIS IS
+The Zombies Block
+Contains graphic violence
+```
+
+It shows in the first seconds of any item whose label differs from the
+previous item's (a block starting), and again every `interval_secs` so a viewer
+who tuned in mid-block still learns which one it is. The advisory row appears
+only when the pool has one, and the card holds longer to give it time to be
+read. It sits top-left so it can share the screen with the Now/Next snipe at
+the bottom-left; the two are separate graphics. Declare it once at the station
+level and every channel gets it, drawing nothing for items from an unlabelled
+pool:
+
+```yaml
+overlay:
+  width: 1280
+  height: 720
+  framerate: 30
+  pixel_format: rgba8
+  graphics:
+    - name: now-next
+      script: shared/now-next-snipe.rhai
+      layers: [...]              # scrim, label, value, sub
+    - name: block-card
+      script: shared/block-card.rhai
+      config:
+        interval_secs: 300       # seconds between interval cards
+        offset_secs: 150         # where in that interval the card starts
+      layers:
+        - { type: scrim, edge: top, size: 150, color: [0, 0, 0, 175] }
+        - { type: text, content: "", font_family: Helvetica, font_size: 14.0, letter_spacing: 1.3,
+            color: [255, 255, 255, 150], corner: top_left, margin: 40 }   # eyebrow
+        - { type: text, content: "", font_family: Helvetica, font_size: 30.0,
+            color: [255, 255, 255, 245], corner: top_left, margin: 40 }   # label
+        - { type: text, content: "", font_family: Helvetica, font_size: 16.0,
+            color: [255, 205, 90, 235], corner: top_left, margin: 40 }    # advisory
+```
+
+The script's `config` keys (all optional): `interval_secs` (300),
+`offset_secs` (150), `hold_secs` (5.0), `advisory_hold_secs` (8.0),
+`rise_secs`, `fall_secs`, `stagger_secs`, `slide_distance_px`, `overshoot`,
+`row_px`, `eyebrow` ("THIS IS"), `max_chars` (40), `announce_after_unlabelled`
+(true).
+
+An item from an unlabelled pool has an empty label, so by default it counts as
+a change from a labelled neighbour: in a pattern of `films x1, bumpers x1` where
+only `films` is labelled, every film follows a bumper and draws the card. Set
+`announce_after_unlabelled: false` to compare only against a labelled previous
+item; the card then does not land on a block that follows unlabelled
+programming, and the interval card is the only one there. Preview it with
+`METADATA='{"pool_label":"The Zombies Block"}' PREV_METADATA='{"pool_label":"The Kaiju Block"}' ITEM_ELAPSED=2 admin overlay-watch <channel>`.
 
 ### Pool `plugin` — items chosen by a scorer script
 
@@ -1642,12 +1779,13 @@ could.
 
 ```yaml
 # the overlay spec named by a channel's overlay: { file: ... }
-script: lower-third.rhai
-config:
-  corner: bottom-left
-  font:
-    family: Inter
-    size: 42
+graphics:
+  - script: lower-third.rhai
+    config:
+      corner: bottom-left
+      font:
+        family: Inter
+        size: 42
 ```
 
 The single thing in the bag that can fail: **a float that is not a finite

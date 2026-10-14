@@ -115,6 +115,8 @@ fn pattern_block(
 fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
     Pool {
         tracks: None,
+        label: None,
+        advisory: None,
         name: name.into(),
         expr: Some(expr.into()),
         plugin: None,

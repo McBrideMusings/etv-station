@@ -148,6 +148,8 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                 order: Default::default(),
                 pools: vec![Pool {
                     tracks: None,
+                    label: None,
+                    advisory: None,
                     name: "foryou".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),

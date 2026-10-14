@@ -643,6 +643,8 @@ fn audit(ctx, picks, workspace) {
     fn plugin_pool(script: &Path) -> Pool {
         Pool {
             tracks: None,
+            label: None,
+            advisory: None,
             name: "movies".into(),
             expr: None,
             plugin: Some(script.to_path_buf()),
