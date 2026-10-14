@@ -338,9 +338,9 @@ fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
                 pools: vec![pool],
                 pattern: Vec::new(),
                 cycles: None,
-                schedule: Vec::new(),
                 sequencer: Some(sequencer.to_path_buf()),
             }],
+            ..Default::default()
         },
     }
 }

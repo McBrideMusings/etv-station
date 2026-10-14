@@ -806,6 +806,42 @@ Fetch a `.vtt` by the path `live_sub.m3u8` lists, including its `<run>/` prefix;
 bare file name returns an empty body. `./tools/dev-run.sh` sources `.env` and would
 contact the real Plex, so run the two binaries by hand for this check.
 
+## Verifying schedules (`rule.schedules`, ADR 0004)
+
+A channel's `rule.schedules` decide, per generation, whether a `rule.slots`
+block or the any-time `rule.blocks` airs, and cut the generation where that
+changes. Every such generation logs one line:
+
+```
+INFO … event="calendar.select" window_start=… tz="America/Chicago" slot="late" schedule="nightly" cut=Some(…)
+```
+
+`slot=""` means the any-time blocks. To watch it with no media and no Plex,
+copy `examples/station-test.yaml` into a scratch dir with an absolute
+`output_base`, and give it one lavfi channel whose `schedules` place a slot a
+few minutes ahead of the current local time (one lavfi item per list is
+enough). Boot it with the `env -u` invocation above for ~40s, then:
+
+```bash
+grep calendar.select <log> | grep -oE 'window_start=[^ ]+ [^ ]+ [^ ]+ tz="[^"]+" slot="[^"]*" schedule="[^"]*" cut=[^ ]+( [^ ]+ [^ ]+\))?' | awk '{k=$5" "$6} k!=p{print; p=k}'
+```
+
+Look for one line per block change, each `window_start` a few seconds after
+the previous line's `cut` (the item airing at the boundary finished first),
+and the slot titles in the emitted JSON exactly inside those spans. Observed
+2026-10-14: a `01:30..02:00` slot took over at 06:30:22 UTC and handed back at
+07:00:22; a dated `03..03:15` slot ran 08:00:22-08:15:22.
+
+`--check-config` is the check for the load errors: an undeclared slot, an
+unplaced slot, two overlapping ranges in one schedule, `"02-30"`, a span
+mixing `MM-DD` and `YYYY-MM-DD`, and `cycles:` on any block of a channel with
+schedules each print `channel.load_failed` naming the schedule, slot or block.
+
+For a real channel, run taste-lab's Review (the `programming` skill) and
+count airings per local day and pool. Review always starts today and caps at
+50 days, so a date further out needs a scratch copy of the channel with its
+`dates:` moved into range.
+
 ## Gotchas
 
 - The first Plex ingest reads the whole library and genuinely takes minutes

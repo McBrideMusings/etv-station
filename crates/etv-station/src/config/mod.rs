@@ -9,7 +9,7 @@ mod order;
 mod overlay;
 mod pool;
 mod rule;
-pub(crate) mod schedule;
+mod schedule;
 mod source;
 pub(crate) mod station;
 pub mod tracks;
@@ -35,7 +35,7 @@ pub use pool::{
     TakeFrom,
 };
 pub use rule::{BlockInclude, RuleConfig};
-pub use schedule::{Day, HourRange, ScheduleEntry, active_entry, local_slot};
+pub use schedule::{ClockRange, DateSpan, DayName, Schedule};
 pub use source::SourceConfig;
 pub use station::{StationConfig, derive_channel_seed};
 pub use tracks::TrackRules;

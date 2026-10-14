@@ -152,7 +152,7 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         recent: Vec::new(),
         now: OffsetDateTime::now_utc().unix_timestamp(),
         // Same station tz a real generation hands a sequencer block — a
-        // script that reads `local_time()` is exactly the kind of
+        // clock-aware script that reads `local_time()` is exactly the kind of
         // wall-clock read this check exists to catch, so both passes need the
         // real zone rather than the UTC fallback.
         tz: Some(crate::tz::parse(&station.station.tz)?),
@@ -163,10 +163,10 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         account_id: None,
     };
     // Read once and handed to both passes, for the same reason `now` is: a
-    // sequencer block (#169) reads this as `ctx.window.from`, so a
-    // script asks what hour the generation starts at. Reading the clock
-    // separately per pass would straddle an hour boundary now and then and
-    // report a correct clock-reading script as non-reproducible.
+    // sequencer block (#169) reads this as `ctx.window.from`, and a channel's
+    // `rule.schedules` pick the block that airs from it. Reading the clock
+    // separately per pass would straddle a boundary now and then and report a
+    // correct channel as non-reproducible.
     let window_start = OffsetDateTime::now_utc();
 
     let a = generate_once(
@@ -383,7 +383,6 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
-            schedule: Vec::new(),
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
@@ -423,7 +422,6 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
-            schedule: Vec::new(),
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
@@ -439,6 +437,7 @@ mod tests {
         let cfg = base_channel(
             RuleConfig {
                 blocks: vec![manual_block(&["a", "b", "c"])],
+                ..Default::default()
             },
             None,
         );
@@ -459,6 +458,7 @@ mod tests {
         let cfg = base_channel(
             RuleConfig {
                 blocks: vec![manual_block(&["a"])],
+                ..Default::default()
             },
             None,
         );
@@ -487,7 +487,6 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
-            schedule: Vec::new(),
             mode: Mode::All,
             order: Some(Order::Random),
             filter: None,
@@ -512,6 +511,7 @@ mod tests {
         let cfg = base_channel(
             RuleConfig {
                 blocks: vec![shuffled_block(&ids)],
+                ..Default::default()
             },
             None,
         );
@@ -549,6 +549,7 @@ mod tests {
                     ("d", 40_000),
                     ("e", 40_000),
                 ])],
+                ..Default::default()
             },
             None,
         );
@@ -690,7 +691,6 @@ fn audit(ctx, picks, workspace) {
                 chance: 1.0,
             }],
             cycles: Some(1),
-            schedule: Vec::new(),
             mode: Mode::All,
             order: None,
             filter: None,
@@ -713,6 +713,7 @@ fn audit(ctx, picks, workspace) {
         let cfg = base_channel(
             RuleConfig {
                 blocks: vec![pattern_block(&script, ids.len())],
+                ..Default::default()
             },
             None,
         );
@@ -784,6 +785,7 @@ fn audit(ctx, picks, workspace) {
         let cfg = base_channel(
             RuleConfig {
                 blocks: vec![pattern_block(&workspace_audit_fixture(), ids.len())],
+                ..Default::default()
             },
             None,
         );
@@ -813,6 +815,7 @@ fn audit(ctx, picks, workspace) {
         let cfg = base_channel(
             RuleConfig {
                 blocks: vec![pattern_block(&workspace_audit_fixture(), ids.len())],
+                ..Default::default()
             },
             None,
         );
@@ -867,6 +870,7 @@ fn audit(ctx, picks, workspace) {
         let mut cfg = base_channel(
             RuleConfig {
                 blocks: vec![pattern_block(&workspace_audit_fixture(), ids.len())],
+                ..Default::default()
             },
             None,
         );

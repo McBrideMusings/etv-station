@@ -23,8 +23,9 @@ an industry standard. `crates/etv-station/src/review.rs` computes them.
 The keys named below are documented in the [config schema](/schema), except
 `chance` and `from` on a pattern step, which the schema page does not cover yet;
 `crates/etv-station/src/config/pool.rs` defines both.
-Every YAML example is a fragment. `pools:`, `pattern:`, `schedule:` and `sequencer:` sit
-inside one entry of `rule.blocks`, as the first example shows in full.
+Every YAML example is a fragment. `pools:`, `pattern:` and `sequencer:` sit
+inside one entry of `rule.blocks` or one `rule.slots` entry, and `slots:` and
+`schedules:` sit under `rule:`, as the first example shows in full.
 
 "Depth" on this page has the meaning in the [glossary](/CONTEXT#depth): how
 long a channel runs before something airs again. An episode count is called a
@@ -39,31 +40,32 @@ to whoever is watching at that hour
 **Network example.** Daytime shows aim at the audience that is home during the
 day; prime time aims at the whole household (same source).
 
-**In `channel.yaml` today.** One pattern block with a `schedule:`. Each entry
-names the local hours it claims and carries its own `pattern` over the block's
-pools; the entry with no `hours` fills every hour nobody claims. Hours are
-local to the station's `tz`.
+**In `channel.yaml` today.** Each daypart is a slot, and a schedule places it
+on its hours. `rule.blocks` fills every hour no schedule claims. Hours are local
+to the station's `tz`.
 
 ```yaml
 rule:
   blocks:
-    - pools:
-        - { name: films, expr: 'item.type == "movie"', rotate: visit, advance: resume }
-        - { name: cartoons, expr: 'item.show in ["Rick and Morty", "The Boondocks"]', order: "season:asc,episode:asc", rotate: visit, advance: resume }
-      schedule:
+    - pools: [{ name: films, expr: 'item.type == "movie"' }]
+      pattern: [{ pool: films, take: 1 }]
+  slots:
+    latenight:
+      pools:
         - name: latenight
-          hours: { start: 21, end: 6 }
-          pattern:
-            - { pool: cartoons, take: 3 }
-        - name: daytime
-          pattern:
-            - { pool: films, take: 1 }
+          expr: 'item.show in ["Rick and Morty", "The Boondocks"]'
+      pattern: [{ pool: latenight, take: 1 }]
+  schedules:
+    - name: nightly
+      hours: { "21..06": latenight }
 ```
 
-Each entry keeps its own place in its pattern, and each show its own episode,
-so a late-night run continues the next night where it stopped. A run that
-crosses a boundary airs whole, and the next entry starts late by the overrun
-([schema, Block `schedule`](/schema#block-schedule-—-a-different-pattern-by-the-hour-adr-0021)).
+A daypart boundary lands late by the overrun of whatever is airing across it,
+the item or the rest of its pattern cycle, rather than cutting it
+([schema, Schedules](/schema#schedules-rule-slots-and-rule-schedules)). A slot
+continues where it stopped the night before: its pool rotation and list
+position are kept while other blocks air. The sample is
+`examples/samples/adult-swim.yaml`.
 
 **Grade.** Applies to a channel with two or more pools. The measure is the
 largest swing in any one pool's share of airtime between the day's four
@@ -160,32 +162,27 @@ single-show channel against 20 weeks (140 days) stripped, about 45 times
 faster. Half-hour sitcoms (about 22 minutes) go about 65 a day, so the same
 100 episodes last about a day and a half.
 
-**In `channel.yaml` today.** A `schedule` entry restricted to weekday hours.
-Entries are whole hours, and the walker starts another visit whenever its clock
-is still inside the hour: with `take: 1`, a 44-minute drama airs at 18:00 and
-18:44 and runs to 19:28, and a 22-minute sitcom airs three.
+**In `channel.yaml` today.** A slot placed by a weekday schedule. The slot
+fills its range: an hour-long drama airs about one episode a weekday on
+`"18..19"`, and a half-hour sitcom on `"18:00..18:30"` airs one.
 
 ```yaml
-pools:
-  - name: strip
-    expr: 'item.show == "The X-Files"'
-    order: "season:asc,episode:asc"
-    rotate: visit
-    advance: resume
-  - name: films
-    expr: 'item.type == "movie"'
-schedule:
-  - name: strip
-    hours: { start: 18, end: 19 }
+slots:
+  strip:
+    pools:
+      - name: strip
+        expr: 'item.show == "The X-Files"'
+        order: "season:asc,episode:asc"
+        advance: resume
+    pattern: [{ pool: strip, take: 1 }]
+schedules:
+  - name: weeknights
     weekdays: [mon, tue, wed, thu, fri]
-    pattern:
-      - { pool: strip, take: 1 }
-  - name: rest
-    pattern:
-      - { pool: films, take: 1 }
+    hours: { "18..19": strip }
 ```
 
-The strip continues from the episode it last aired each weekday.
+`advance: resume` carries the strip on from the last episode aired, across
+generations and across the hours other blocks fill.
 
 **Not expressible today.** A show that strips on two channels keeps a separate
 place on each, so it restarts on every channel it appears on. Tracked in
@@ -304,15 +301,32 @@ the February sweeps
 - TCM's Star of the Month moves between weekdays from month to month
   ([TCM October 2026 schedule PDF](https://static.tcm.com/2026-09/NPN_OCT26_PrimetimeSchedule_Final2.pdf)).
 
-**In `channel.yaml` today.** A theme can only be a standing block: a pool
-whose `expr` selects the theme (`item.collections.contains("Christmas")`)
-airs all year, not for a date range. A `schedule` entry's `weekdays:` covers a
-weekly slot such as a Star of the Month night, but not a month.
+**In `channel.yaml` today.** A slot holding the theme, placed by a schedule
+with `dates:`. A yearly span repeats every year and may cross December 31st; a
+span with years is a one-off.
 
-**Not expressible today.** A block cannot declare the calendar dates it airs
-on. Tracked in `etv-station-162`.
+```yaml
+slots:
+  christmas:
+    pools:
+      - name: christmas
+        expr: 'item.collections.contains("Hallmark Christmas")'
+    pattern: [{ pool: christmas, take: 1 }]
+schedules:
+  - name: countdown
+    dates: ["12-01..12-25"]
+    hours: { "00..24": christmas }
+```
 
-**Grade.** Not scored until a block can declare its dates.
+A dated schedule outranks a weekday one, so the season replaces the regular
+weekly grid without reordering anything. A theme for part of the day keeps the
+rest: a schedule that claims only `"18..24"` leaves the daytime to the weekly
+schedules and the any-time rules. A Star of the Month night is a schedule with
+both `dates:` (the month) and `weekdays:` (the night). The sample is
+`examples/samples/seasonal.yaml`.
+
+**Grade.** Not scored: a seasonal run is a choice a channel makes, not a standard
+it meets.
 
 ## Marathons
 
@@ -337,8 +351,21 @@ pattern:
 
 `take: all` with `group_by: season` airs a whole season in one visit.
 
-**Not expressible today.** A marathon on a date (New Year's Day,
-Thanksgiving) needs dated blocks. Tracked in `etv-station-162`.
+A marathon on a date is a slot placed on that date. A date that moves each
+year, such as Thanksgiving, lists each year's span:
+
+```yaml
+schedules:
+  - name: new-year
+    dates: ["01-01"]
+    hours: { "00..24": twilight }
+  - name: thanksgiving
+    dates: ["2026-11-26..2026-11-29", "2027-11-25..2027-11-28"]
+    hours: { "00..24": marathon }
+```
+
+**Not expressible today.** A rule such as "the fourth Thursday of November";
+each year's dates are written out.
 
 **Grade.** Not scored: a marathon is a choice a channel makes, not a standard
 it meets. The Review view shows the longest run of one show.
@@ -436,8 +463,8 @@ because rotation, `advance: resume` and scorer suppression all change it.
   changes with the collection, which is the station's form of a monthly
   rotation.
 
-**Not expressible today.** Switching a pool's selection on a date, such as a
-new theme each month, needs dated blocks. Tracked in `etv-station-162`.
+A new theme each month is a slot per theme and a schedule per month whose
+`dates:` spans that month, such as `["04-01..04-30"]`.
 
 **Grade.** Applies once a program has aired. The measure is the days until
 any program (an airing of 5 minutes or more) airs a second time, or the whole

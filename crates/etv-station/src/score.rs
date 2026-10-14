@@ -184,10 +184,10 @@ pub struct ScoreInputs {
     /// Unix seconds at generation time. Passed in rather than read inside the
     /// script so a generation is reproducible from its inputs.
     pub now: i64,
-    /// The station's configured tz — the zone a `schedule` block reads its
-    /// hours in (ADR 0021), and how a `sequencer` block ([`crate::sequence`])
-    /// converts `ctx.window.from` and other unix-second instants into a local
-    /// weekday/hour/minute. Unused by a `pool_provider` scorer, which reads no
+    /// The station's configured tz (ADR 0004) — how a `sequencer` block
+    /// ([`crate::sequence`]) converts `ctx.window.from` and other unix-second
+    /// instants into the local weekday/hour/minute, and how `rule.schedules`
+    /// read the local date and clock ([`crate::calendar`]). Unused by a `pool_provider` scorer, which reads no
     /// clock. `None` at the stateless entry points
     /// ([`crate::resolve::resolve_channel`], [`crate::determinism`]'s own
     /// snapshot before this field existed) falls back to UTC inside

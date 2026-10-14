@@ -132,9 +132,9 @@ fn channel(plugin: &Path) -> ChannelConfig {
                     chance: 1.0,
                 }],
                 cycles: None,
-                schedule: Vec::new(),
                 sequencer: None,
             }],
+            ..Default::default()
         },
     }
 }

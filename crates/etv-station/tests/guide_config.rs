@@ -34,7 +34,10 @@ fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> Channe
         retention_days: 1,
         seed: None,
         anchor: None,
-        rule: RuleConfig { blocks },
+        rule: RuleConfig {
+            blocks,
+            ..Default::default()
+        },
         groups: Vec::new(),
         overlay: None,
         annotate: None,
@@ -55,7 +58,6 @@ fn inline_block(entries: Vec<ConfigEntry>, guide: Option<GuideConfig>) -> BlockI
         pools: Vec::new(),
         pattern: Vec::new(),
         cycles: None,
-        schedule: Vec::new(),
         sequencer: None,
         mode: Mode::All,
         order: Some(Order::Manual),

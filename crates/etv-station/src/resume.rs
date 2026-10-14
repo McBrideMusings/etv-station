@@ -43,12 +43,6 @@ pub struct ResumeMap {
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
 
-    /// Where each `schedule:` entry of a scheduled block stands in its own
-    /// pattern (ADR 0021), keyed by entry name — so an entry that goes off air
-    /// at 06:00 continues its pattern from the same step when it comes back.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub schedule: BTreeMap<String, ScheduleResume>,
-
     /// How far into a channel's entries list the next generation starts
     /// (#118). For a channel with no pattern block, that list is every block
     /// concatenated in config order. A channel that mixes a pattern block
@@ -72,6 +66,13 @@ pub struct ResumeMap {
     /// lives here — that is still the ledger's, exactly as the header says.
     #[serde(default, skip_serializing_if = "is_start")]
     pub position: usize,
+
+    /// The same position for each entries block in `rule.slots`, by slot
+    /// name (ADR 0004). A slot airs only while a schedule places it, so its
+    /// list continues from here the next time it comes on rather than
+    /// sharing the any-time list's `position`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_positions: BTreeMap<String, usize>,
 
     /// The scheduling state at each not-yet-aired item boundary, oldest first.
     ///
@@ -129,13 +130,13 @@ pub struct Checkpoint {
     pub start: OffsetDateTime,
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub schedule: BTreeMap<String, ScheduleResume>,
     /// Where the authored list stood entering that generation. Restored by the
     /// rewinds below, so a config edit re-emits the same items rather than
     /// jumping the cursor past a span it just threw away.
     #[serde(default, skip_serializing_if = "is_start")]
     pub position: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_positions: BTreeMap<String, usize>,
 }
 
 /// The scheduling state a generation would leave behind had it stopped after
@@ -144,18 +145,8 @@ pub struct Checkpoint {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Progress {
     pub pools: BTreeMap<String, PoolResume>,
-    pub schedule: BTreeMap<String, ScheduleResume>,
     pub position: usize,
-}
-
-/// One `schedule:` entry's place in its own pattern: the cycle it is on, and
-/// the step that runs next.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduleResume {
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub cycle: u64,
-    #[serde(default, skip_serializing_if = "is_start")]
-    pub step: usize,
+    pub slot_positions: BTreeMap<String, usize>,
 }
 
 /// One pool's resume state.
@@ -192,8 +183,8 @@ impl ResumeMap {
         Self {
             version: CURRENT_VERSION,
             pools: BTreeMap::new(),
-            schedule: BTreeMap::new(),
             position: 0,
+            slot_positions: BTreeMap::new(),
             checkpoints: Vec::new(),
             config_id: None,
         }
@@ -204,7 +195,7 @@ impl ResumeMap {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty() && self.schedule.is_empty() && self.position == 0
+        self.pools.is_empty() && self.position == 0 && self.slot_positions.is_empty()
     }
 
     /// Record the state entering a generation that begins at `start`, along
@@ -215,8 +206,8 @@ impl ResumeMap {
         self.checkpoints.push(Checkpoint {
             start,
             pools: self.pools.clone(),
-            schedule: self.schedule.clone(),
             position: self.position,
+            slot_positions: self.slot_positions.clone(),
         });
     }
 
@@ -228,16 +219,16 @@ impl ResumeMap {
         if let Some(last) = self.checkpoints.last()
             && (last.start >= start
                 || (last.pools == progress.pools
-                    && last.schedule == progress.schedule
-                    && last.position == progress.position))
+                    && last.position == progress.position
+                    && last.slot_positions == progress.slot_positions))
         {
             return;
         }
         self.checkpoints.push(Checkpoint {
             start,
             pools: progress.pools.clone(),
-            schedule: progress.schedule.clone(),
             position: progress.position,
+            slot_positions: progress.slot_positions.clone(),
         });
     }
 
@@ -261,8 +252,8 @@ impl ResumeMap {
         let idx = self.checkpoints.iter().rposition(|c| c.start <= instant)?;
         let cp = self.checkpoints[idx].clone();
         self.pools = cp.pools;
-        self.schedule = cp.schedule;
         self.position = cp.position;
+        self.slot_positions = cp.slot_positions;
         self.checkpoints.truncate(idx);
         Some(cp.start)
     }
@@ -476,8 +467,8 @@ mod tests {
         map.checkpoint(at(0));
         let step = |next: &str, position| Progress {
             pools: pools_with(next),
-            schedule: BTreeMap::new(),
             position,
+            slot_positions: BTreeMap::new(),
         };
         map.checkpoint_at(at(1), &step("e1", 1));
         map.checkpoint_at(at(2), &step("e1", 1));

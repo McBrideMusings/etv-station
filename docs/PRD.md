@@ -198,7 +198,7 @@ The station file also declares an optional `device_id` — how Plex tells this t
 
 The station file declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.
 
-The configured zone affects **chunk-boundary alignment** — a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC — **and daypart placement**: a pattern block's `schedule:` entries (#14, ADR 0021) claim local weekday/hour ranges on the same local-midnight grid, and a sequencer script reads the same clock through `local_time()`. Persisted timestamps in the sidecars stay in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
+The configured zone affects **chunk-boundary alignment** — a 24-hour chunk rolls at local midnight in the station tz, not at 00:00 UTC — **and schedule placement**: a channel's `rule.schedules` place its `rule.slots` blocks against local dates, weekdays and clock ranges, rolling on the same local-midnight grid (ADR 0004); a `sequencer:` script reads the same zone through `local_time()`. Persisted timestamps in the sidecars stay in UTC — tz is a presentation/scheduling concern, not a storage one. Emitted RFC3339 timestamps in the playout JSON itself can carry whatever offset is convenient (UTC is fine; ETV-next reads absolute instants).
 
 Per-channel `tz` override is **not** in v1 — single household, single zone. Adding it later is a strict superset (channel-level overrides station-level) so deferring is safe.
 

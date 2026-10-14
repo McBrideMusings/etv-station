@@ -637,6 +637,92 @@ copied into the include, so a reference and an equivalent inline block resolve
 identically. `mode`, `order`, and `filter` are **composition fields on the
 include** — they never live in the block file body.
 
+### Schedules — `rule.slots` and `rule.schedules`
+
+`rule.blocks` are the channel's **any-time rules**: they air in every minute
+nothing below claims. A channel can also declare **slots**, named blocks with
+the same shape as a `rule.blocks` entry, and **schedules** that place those
+slots over ranges of the local day, optionally only on some dates or weekdays
+(ADR 0004).
+
+```yaml
+rule:
+  blocks:                       # the any-time rules
+    - pools: [{ name: classics, expr: 'item.collections.contains("Comedy Classics")' }]
+      pattern: [{ pool: classics, take: 1 }]
+
+  slots:
+    halloween:
+      pools: [{ name: horror, expr: 'item.collections.contains("Elevated Horror")' }]
+      pattern: [{ pool: horror, take: 1 }]
+    prime:
+      pools: [{ name: prime, expr: 'item.type == "movie"' }]
+      pattern: [{ pool: prime, take: 1 }]
+    cartoons:
+      pools: [{ name: cartoons, expr: 'item.collections.contains("Saturday Morning Cartoons")' }]
+      pattern: [{ pool: cartoons, take: 1 }]
+
+  schedules:
+    - name: halloween
+      dates: ["10-25..10-31"]
+      hours: { "00..24": halloween }
+    - name: weekend
+      weekdays: [sat, sun]
+      hours: { "06..12": cartoons }
+    - name: every-day
+      hours: { "20:00..23:30": prime }
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | Required, unique among the channel's schedules. Logged with every generation it decides. |
+| `dates` | Optional list of calendar spans. `"MM-DD"` or `"MM-DD..MM-DD"` repeats every year, and an end before the start crosses December 31st (`"12-20..01-05"`). `"YYYY-MM-DD"` or `"YYYY-MM-DD..YYYY-MM-DD"` is a one-off, for a date that moves each year such as Thanksgiving. Both ends are inclusive. Empty means every day. |
+| `weekdays` | Optional list of `mon`..`sun`. Empty means every day. With `dates`, a day must match both. |
+| `hours` | Required map of clock range → slot name. `"HH..HH"` or `"HH:MM..HH:MM"`, 24-hour, local to the station's `tz`. The end is exclusive and may be `24`; `"21..02"` wraps past midnight and belongs to the day it starts on, so a Friday-only `"21..02"` covers Saturday 01:00. `"00..24"` is the whole day. |
+
+**What airs at an instant.** The station walks the schedules from highest to
+lowest and airs the slot of the first one whose day matches and whose range
+covers that instant. A schedule with `dates` is highest, then one with
+`weekdays`, then one with neither; written order breaks ties. An hour the top
+schedule leaves open falls to the next one down — a holiday that claims only
+20:00-23:00 keeps the weekend's morning cartoons — and when no schedule claims
+the instant, the any-time `rule.blocks` air.
+
+**Where a generation stops.** A generation airs one answer: one slot, or the
+any-time blocks. It stops laying items at the next minute a different block
+would be on, and what is airing then finishes before the next block starts,
+never cut short and never followed by dead air. For an entries block that is
+the one item airing at the boundary. A pattern block finishes the pattern cycle
+in progress, so its boundary can land later by the rest of that cycle: up to
+three episodes for "1 movie, then 3 episodes", a whole season for `take: all`.
+A slot meant to start on time is written with short cycles, typically one
+`take: 1` step.
+
+**State.** Each slot continues where it stopped the last time a schedule
+placed it: pool rotation is keyed by pool name, which must be unique across
+`rule.blocks` and `rule.slots` together, and an entries slot keeps its own list
+position in the `.resume` sidecar's `slot_positions`.
+
+**Load errors.** A schedule with no name, a repeated name, no `hours`, a range
+that is not a time (`"25..26"`, `"20..20"`), two ranges in one schedule that
+overlap, a date no calendar has (`"02-30"`), a span that mixes the yearly and
+dated forms, a slot name `rule.slots` does not declare, a slot no schedule
+places, and a `cycles:` on any block of a channel with schedules (an authored
+count would run past the boundary) all fail the channel's load, naming the
+schedule, slot or block. `rule.blocks`
+must still hold at least one block, which is what airs when no schedule
+claims an instant.
+
+**Observing it.** Every generation of a channel with schedules logs
+`event="calendar.select"` with the window start, the station `tz`, the slot and
+schedule that won (empty for the any-time blocks), and `cut`, the instant the
+generation stopped. Each airing's `block` index counts `rule.blocks` first,
+then `rule.slots` in name order; taste-lab's Review names a slot block by its
+slot name when it has no `program.title`.
+
+Worked samples: `examples/samples/seasonal.yaml` (dated slots) and
+`examples/samples/adult-swim.yaml` (nightly and Saturday slots).
+
 ### Seed cascade
 
 A channel's seed resolves in this order, first hit wins:
@@ -1777,64 +1863,6 @@ Reaching for `ctx.sets` or `ctx.history` without the grant fails the `pick()`
 call the moment the script reads the field, naming the capability — that one
 can only be caught at run time, because the reach is a script call.
 
-### Block `schedule` — a different pattern by the hour (ADR 0021)
-
-A pattern block can replace its one `pattern:` with a `schedule:`: named
-entries, each with its own `pattern` over the block's pools and the local
-hours it claims. The walker runs whichever entry claims the hour its clock has
-reached, so a channel says "06:00–21:00 rotates these pools, 21:00–06:00 those"
-and each entry still has everything a pattern has — `take` runs, `rotate`,
-`advance`, `chance`.
-
-```yaml
-rule:
-  blocks:
-    - pools:
-        - { name: kaiju-films, expr: 'item.type == "movie" && item.genres.contains("Kaiju")', rotate: visit, advance: resume }
-        - { name: kaiju-shows, expr: 'item.show in ["Ultraman"]', order: "season:asc,episode:asc", rotate: visit, advance: resume }
-        - { name: zombie-films, expr: 'item.type == "movie" && item.genres.contains("Zombie")', rotate: visit, advance: resume }
-        - { name: zombie-shows, expr: 'item.show in ["The Walking Dead"]', order: "season:asc,episode:asc", rotate: visit, advance: resume }
-      schedule:
-        - name: day
-          hours: { start: 6, end: 21 }
-          pattern:
-            - { pool: kaiju-films, take: 1 }
-            - { pool: kaiju-shows, take: 3 }
-        - name: night
-          hours: { start: 21, end: 6 }
-          pattern:
-            - { pool: zombie-films, take: 1 }
-            - { pool: zombie-shows, take: 3 }
-```
-
-| Entry field | Meaning |
-|---|---|
-| `name` | Required, unique in the block. Keys the entry's place in its pattern in the `.resume` sidecar, and is written into each airing's `select` audit stage as `detail.schedule`. |
-| `hours` | `{ start, end }` in local whole hours of the station `tz`: `start` 0–23, `end` 1–24, exclusive. `end < start` wraps past midnight. |
-| `weekdays` | Optional list of `mon`..`sun`, naming the day an hour range *starts* on — a `sat` 21–6 entry still owns Sunday 02:00. With no `hours`, the entry claims those whole days. Unset means every day. |
-| `pattern` | Required. The same steps a block's `pattern` takes. |
-
-- **One entry with neither `hours` nor `weekdays` is the default** and fills
-  every hour nothing else claims. Without one, every hour of the week must be
-  claimed; an unclaimed hour fails at load, naming it.
-- **Two entries claiming the same hour fail at load**, naming both and the hour.
-- **The entry switches between visits, never inside one.** The walker checks
-  the clock before each step; a three-episode run that starts at 20:30 airs all
-  three, and the night entry starts at 22:00. That overrun is accepted drift
-  (ADR 0021): no item is cut short and no slot is left dark.
-- **Each entry resumes its own pattern.** The `.resume` sidecar records
-  `schedule.<name>: { cycle, step }`, so a day entry that went off air after its
-  films step opens the next morning on its shows step. Pools resume exactly as
-  in a plain pattern block: the rotation from `.resume`, each show's episode
-  from the play-history ledger. A pool may appear in more than one entry and
-  keeps one place across all of them.
-- **A scheduled block is its channel's only block** — its clock starts at the
-  generation's first airing, which another block would sit in front of.
-- `schedule` and `pattern` are mutually exclusive, and `cycles` is refused on
-  a scheduled block: it walks until the window is laid.
-
-Worked sample: `examples/samples/adult-swim.yaml`.
-
 ### Block `sequencer` — a plugin arranges the block itself
 
 A pattern block interleaves its pools by walking the authored `pattern`. A
@@ -1864,9 +1892,9 @@ pool's `expr` or `plugin`, then its `order`, `bucket_order`, and `constraints`
 
 | `ctx` field | What it holds |
 |---|---|
-| `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a script fitting items against the clock needs their durations. |
+| `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a script that arranges against the clock has to know how long each item runs. |
 | `ctx.pool_config.<name>` | that pool's own `config:` block, passed through unread — the same generic carrier a scorer's `ctx.config` reaches (ADR 0002), not a new schema field. Empty map when the pool declares no `config:`. |
-| `ctx.window.from` | the instant this generation begins airing — the hour a script asks about, not the hour the daemon happens to be computing in |
+| `ctx.window.from` | the instant this generation begins airing, not the instant the daemon happens to be computing in |
 | `ctx.resume.<pool>.next` | the series whose turn is next in that pool's rotation |
 | `ctx.cursor` | the per-show cursors from the play-history db |
 

@@ -230,7 +230,7 @@ pub fn grade_principles(g: &GradeInputs) -> Vec<PrincipleGrade> {
         ),
         not_scored(
             "Themed and seasonal periods",
-            "a block cannot declare the dates it airs on yet (etv-station-162)",
+            "a seasonal run is a choice a channel makes, not a standard it meets",
         ),
         marathons(g),
         interstitials(g),

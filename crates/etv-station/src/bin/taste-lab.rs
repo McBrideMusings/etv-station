@@ -145,7 +145,7 @@ struct DiscoveredChannel {
 /// Every `pattern:` step across `channel`'s blocks, in block-then-pattern order.
 fn pattern_plan(channel: &config::ChannelConfig) -> Vec<PlanStep> {
     let mut out = Vec::new();
-    for (block_index, block) in channel.rule.blocks.iter().enumerate() {
+    for (block_index, block) in channel.rule.all_blocks().enumerate() {
         if !block.is_pattern() {
             continue;
         }
@@ -534,8 +534,8 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
         }
         let pool = channel
             .rule
-            .blocks
-            .get(step.block_index)
+            .all_blocks()
+            .nth(step.block_index)
             .and_then(|b| b.pools.iter().find(|p| p.name == step.pool_name))
             .ok_or_else(|| format!("pool {:?} vanished from its own block", step.pool_name))?;
         let working = build_pool_working(state, &channel_dir, pool, req.use_deployed_plugin)?;
@@ -919,9 +919,11 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
         .session
         .as_ref()
         .ok_or_else(|| "no channel selected".to_string())?;
-    let tz = config::read_station(&state.review.station_path)
-        .ok()
-        .and_then(|station| etv_station::tz::parse(&station.tz).ok());
+    // The station's zone, so `rule.schedules` place slots on the local clock
+    // here as they do on air.
+    let tz = config::load_for_inspection(&state.review.station_path)
+        .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))
+        .and_then(|st| etv_station::tz::parse(&st.station.tz).map_err(|e| e.to_string()))?;
     let result = simulate_schedule(&state.catalog, session, tz);
     let session = state.session.as_mut().expect("checked above");
     match result {
@@ -950,11 +952,11 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
 fn simulate_schedule(
     catalog: &Catalog,
     session: &Session,
-    tz: Option<&'static time_tz::Tz>,
+    tz: &'static time_tz::Tz,
 ) -> Result<Vec<Value>, String> {
     let mut config: config::ChannelConfig = serde_json::from_value(session.config_json.clone())
         .map_err(|e| format!("channel config: {e}"))?;
-    for block in &mut config.rule.blocks {
+    for block in config.rule.all_blocks_mut() {
         for pool in &mut block.pools {
             let Some(pw) = session.pools.get(&pool.name) else {
                 continue;
@@ -972,12 +974,12 @@ fn simulate_schedule(
     }
     let block_names: Vec<String> = config
         .rule
-        .blocks
-        .iter()
+        .all_blocks()
         .enumerate()
         .map(|(i, b)| {
             b.program()
                 .and_then(|p| p.title.clone())
+                .or_else(|| config.rule.slot_name(i).map(str::to_string))
                 .unwrap_or_else(|| format!("block {i}"))
         })
         .collect();
@@ -990,7 +992,7 @@ fn simulate_schedule(
         session.account_id,
         session.days,
         start,
-        tz,
+        Some(tz),
     )?;
 
     let mut out = Vec::new();
@@ -1450,12 +1452,12 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
     let block_names: Vec<String> = lc
         .config
         .rule
-        .blocks
-        .iter()
+        .all_blocks()
         .enumerate()
         .map(|(i, b)| {
             b.program()
                 .and_then(|p| p.title.clone())
+                .or_else(|| lc.config.rule.slot_name(i).map(str::to_string))
                 .unwrap_or_else(|| format!("block {i}"))
         })
         .collect();
@@ -1658,40 +1660,56 @@ fn airing_label(e: &CatalogEntry) -> String {
 fn blocks_json(channel: &config::ChannelConfig) -> Value {
     let blocks: Vec<Value> = channel
         .rule
-        .blocks
-        .iter()
+        .all_blocks()
         .enumerate()
         .map(|(i, b)| {
             let name = b
                 .program()
                 .and_then(|p| p.title.clone())
+                .or_else(|| channel.rule.slot_name(i).map(str::to_string))
                 .unwrap_or_else(|| format!("block {i}"));
-            let schedule: Vec<Value> = b
-                .schedule
-                .iter()
-                .map(|e| {
-                    json!({
-                        "name": e.name,
-                        "hours": e.hours.map(|h| [h.start, h.end]),
-                        "weekdays": e.weekdays,
-                        "default": e.is_default(),
-                        "steps": steps_json(&e.pattern),
-                    })
-                })
-                .collect();
             json!({
                 "name": name,
                 "sequencer": b.sequencer.as_ref()
                     .and_then(|s| s.file_name())
                     .map(|n| n.to_string_lossy().into_owned()),
                 "steps": steps_json(&b.pattern),
-                "schedule": schedule,
                 "pools": b.pools.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
                 "entries": b.entries().len(),
+                "placed": placements(&channel.rule, i),
             })
         })
         .collect();
     json!(blocks)
+}
+
+/// Where `rule.schedules` place block `idx`, one line per range: the
+/// schedule's name, its days, and the clock range. Empty for an any-time block.
+fn placements(rule: &config::RuleConfig, idx: usize) -> Vec<String> {
+    let Some(slot) = rule.slot_name(idx) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for schedule in &rule.schedules {
+        let mut days: Vec<String> = schedule.dates.iter().map(|d| String::from(*d)).collect();
+        days.extend(
+            schedule
+                .weekdays
+                .iter()
+                .map(|w| format!("{w:?}").to_lowercase()),
+        );
+        let days = if days.is_empty() {
+            "every day".to_string()
+        } else {
+            days.join(", ")
+        };
+        for (range, placed) in &schedule.hours {
+            if placed == slot {
+                out.push(format!("{}: {days}, {range}", schedule.name));
+            }
+        }
+    }
+    out
 }
 
 /// One pattern's steps: pool, `take` as `[min, max]` (`null` for `all`), and

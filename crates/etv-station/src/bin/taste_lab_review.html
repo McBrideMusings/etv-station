@@ -393,17 +393,15 @@ function render(d) {
 // A step's take: `[min, max]`, null for `take: all`.
 const takeText = (t) => (t == null ? 'all' : t[0] === t[1] ? String(t[0]) : `${t[0]}-${t[1]}`);
 const stepsWords = (steps) => steps.map((s) => (s.take == null ? `all of one ${s.pool} pick` : `${takeText(s.take)} from ${s.pool}`)).join(', then ');
-const hoursText = (e) => (e.hours ? `${String(e.hours[0]).padStart(2, '0')}–${String(e.hours[1]).padStart(2, '0')}` : e.default ? 'otherwise' : 'all day')
   + (e.weekdays && e.weekdays.length ? ` ${e.weekdays.join(' ')}` : '');
 
 function patternWords(blocks) {
   return blocks.map((b) => {
-    const body = b.sequencer ? `daypart sequencer ${b.sequencer}`
+    const body = b.sequencer ? `sequencer ${b.sequencer}`
       : b.steps.length ? `${stepsWords(b.steps)}, repeating`
-      : b.schedule.length ? `schedule — ${b.schedule.map((e) => `${e.name} (${hoursText(e)}): ${stepsWords(e.steps)}`).join('; ')}`
       : b.pools.length ? `pools ${b.pools.join(', ')}`
       : `${b.entries} fixed entries`;
-    return `${b.name}: ${body}`;
+    return `${b.name}: ${body}${b.placed.length ? ` — airs ${b.placed.join('; ')}` : ''}`;
   }).join('; ');
 }
 
@@ -426,11 +424,12 @@ function patternPanel(d, colors) {
     </tbody></table><p class="muted">Repeats from step 1 after step ${steps.length}. A pool on two steps counts its airings once.</p>`;
   const blocks = d.blocks.map((b) => {
     let rows;
-    if (b.sequencer) rows = `<p class="muted">Daypart sequencer ${esc(b.sequencer)} over pools ${esc(b.pools.join(', '))}.</p>`;
+    if (b.sequencer) rows = `<p class="muted">Sequencer ${esc(b.sequencer)} over pools ${esc(b.pools.join(', '))}.</p>`;
     else if (b.steps.length) rows = stepsTable(b.steps);
-    else if (b.schedule.length) rows = b.schedule.map((e) => `<p><b>${esc(e.name)}</b> <span class="muted">${esc(hoursText(e))}</span></p>${stepsTable(e.steps)}`).join(''); else if (b.pools.length) rows = `<table class="steps"><tbody>${b.pools.map((p) => `<tr>${poolCells(p)}</tr>`).join('')}</tbody></table>`;
+    else if (b.pools.length) rows = `<table class="steps"><tbody>${b.pools.map((p) => `<tr>${poolCells(p)}</tr>`).join('')}</tbody></table>`;
     else rows = `<p class="muted">${b.entries} fixed entries.</p>`;
-    return `<h4>${esc(b.name)}</h4>${rows}`;
+    const placed = b.placed.length ? `<p class="muted">Airs ${esc(b.placed.join('; '))}.</p>` : '';
+    return `<h4>${esc(b.name)}</h4>${placed}${rows}`;
   }).join('');
   return `<button class="x" type="button" aria-label="Close">×</button><h3>Pattern</h3>${blocks}`;
 }

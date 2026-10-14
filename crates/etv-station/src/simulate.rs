@@ -115,9 +115,7 @@ impl Ledger {
 /// `start`, and return every generation it laid down.
 ///
 /// `config_path` is the channel file's path: relative `plugin:` paths resolve
-/// against its directory, as they do in the daemon. `tz` is the station's
-/// zone, which a `schedule` block and a sequencer's `local_time()` read the
-/// hour in; `None` reads UTC.
+/// against its directory, as they do in the daemon.
 pub fn simulate(
     config: &ChannelConfig,
     config_path: &Path,

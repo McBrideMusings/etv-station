@@ -362,11 +362,12 @@ pub fn resolve_channel(
 
     let base = load_chain(&resolve_decl(station_level, channel_level, None))?;
 
-    let mut blocks = Vec::with_capacity(channel.rule.blocks.len());
-    for (idx, include) in channel.rule.blocks.iter().enumerate() {
+    let mut blocks = Vec::new();
+    for (idx, include) in channel.rule.all_blocks().enumerate() {
+        let label = channel.rule.block_label(idx);
         let block_level = include.overlay.as_ref().map(|d| (d, channel_dir));
         let resolved = load_chain(&resolve_decl(station_level, channel_level, block_level))
-            .map_err(|e| format!("block #{idx}: overlay: {e}"))?;
+            .map_err(|e| format!("{label}: overlay: {e}"))?;
 
         if let Some(spec) = resolved.as_ref() {
             let Some(base) = base.as_ref() else {
@@ -375,7 +376,7 @@ pub fn resolve_channel(
                 // sensible geometry to invent for a channel that never asked
                 // for an overlay.
                 return Err(format!(
-                    "block #{idx} declares an `overlay:` but the channel resolves to none. \
+                    "{label} declares an `overlay:` but the channel resolves to none. \
                      A block-level overlay swaps the config of the channel's running overlay \
                      process, so the channel (or the station) has to declare one for it to \
                      swap into — declare the base config there, or drop this key."
@@ -383,7 +384,7 @@ pub fn resolve_channel(
             };
             if spec.geometry() != base.geometry() {
                 return Err(format!(
-                    "block #{idx}'s overlay is {}, but the channel's is {}. A block-level \
+                    "{label}'s overlay is {}, but the channel's is {}. A block-level \
                      overlay is loaded into the channel's already-running overlay process, \
                      whose canvas, fifo and ffmpeg arguments were all sized at spawn — so \
                      width, height, framerate and pixel_format have to match the channel's. \

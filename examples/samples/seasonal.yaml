@@ -1,0 +1,108 @@
+# Sample — Seasonal: a channel whose programming follows the calendar.
+#
+# rule.blocks: the any-time rules — comedy classics, airing every day and hour
+# no schedule claims.
+#
+# rule.schedules: every schedule here names dates, so they all share the top
+# rank and written order decides between them.
+#   halloween — Oct 25-31, all day: elevated horror.
+#   christmas — Dec 1-25, all day: Hallmark Christmas films.
+#   new-year  — Jan 1, all day: a Twilight Zone marathon. Written above
+#               `winter`, so it wins on Jan 1 although `winter` matches too.
+#   winter    — Dec 26 to Feb 29, evenings 18:00-24:00: snowbound films. The
+#               range crosses December 31st. Its daytime hours fall through to
+#               the any-time rules.
+# Outside every range — most of the year — only the any-time rules air.
+#
+# Every boundary is local midnight or 18:00 in the station's `tz`; the item
+# airing at a boundary finishes before the next block starts.
+#
+# Registered in examples/station.yaml via the `samples/*.yaml` glob. Resolves
+# to nothing unless the station's `catalog_path` points at a populated catalog
+# holding these collections.
+number: 12
+name: seasonal
+display_name: "Seasonal"
+window_days: 1
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - program:
+        title: "Seasonal"
+      pools:
+        - name: classics
+          expr: 'item.type == "movie" && item.collections.contains("Comedy Classics")'
+          order: "random"
+          constraints:
+            no_repeat_within: "14d"
+      pattern:
+        - pool: classics
+          take: 1
+
+  slots:
+    halloween:
+      program:
+        title: "Halloween on Seasonal"
+      pools:
+        - name: horror
+          expr: 'item.type == "movie" && item.collections.contains("Elevated Horror")'
+          order: "random"
+          constraints:
+            no_repeat_within: "7d"
+      pattern:
+        - pool: horror
+          take: 1
+
+    christmas:
+      program:
+        title: "Christmas on Seasonal"
+      pools:
+        - name: christmas
+          expr: 'item.type == "movie" && item.collections.contains("Hallmark Christmas")'
+          order: "random"
+          constraints:
+            no_repeat_within: "7d"
+      pattern:
+        - pool: christmas
+          take: 1
+
+    marathon:
+      program:
+        title: "New Year's Twilight Zone Marathon"
+      pools:
+        - name: twilight
+          expr: 'item.type == "episode" && item.show == "The Twilight Zone (2019)"'
+          order: "season:asc,episode:asc"
+          advance: resume
+      pattern:
+        - pool: twilight
+          take: 1
+
+    winter:
+      program:
+        title: "Winter Nights"
+      pools:
+        - name: snowbound
+          expr: 'item.type == "movie" && item.collections.contains("Snowbound")'
+          order: "random"
+          constraints:
+            no_repeat_within: "7d"
+      pattern:
+        - pool: snowbound
+          take: 1
+
+  schedules:
+    - name: halloween
+      dates: ["10-25..10-31"]
+      hours: { "00..24": halloween }
+    - name: christmas
+      dates: ["12-01..12-25"]
+      hours: { "00..24": christmas }
+    - name: new-year
+      dates: ["01-01"]
+      hours: { "00..24": marathon }
+    - name: winter
+      dates: ["12-26..02-29"]
+      hours: { "18..24": winter }

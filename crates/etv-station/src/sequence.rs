@@ -8,8 +8,9 @@
 //!
 //! See ADR 0002 for why a pool's items cross the boundary as full item maps
 //! rather than bare ids (the same marshalling a scorer's `ctx.sets` already
-//! uses — [`crate::score::load_items`]). Switching patterns by the hour is not
-//! a sequencer's job: a pattern block's `schedule:` does it (ADR 0021).
+//! uses — [`crate::score::load_items`]). Placing blocks on the calendar and
+//! the clock is not this hook's job: `rule.schedules` do that in the core
+//! (ADR 0004, [`crate::calendar`]).
 //!
 //! # The contract
 //!
@@ -39,9 +40,10 @@
 //!     // ctx.now                — unix seconds at generation time
 //!
 //!     // local_time(unix_secs) -> #{ weekday, hour, minute } — the station's
-//!     // configured tz applied to any unix-second instant, not just
-//!     // ctx.window.from: a script can walk its own cursor forward by each
-//!     // item's duration and re-read the clock at the new instant. `weekday` is one of "mon".."sun"; `hour` is
+//!     // configured tz (ADR 0004) applied to any unix-second instant, not
+//!     // just ctx.window.from: a clock-aware script walks its own cursor forward
+//!     // by each item's duration and re-reads the clock at the new instant to
+//!     // find the next boundary. `weekday` is one of "mon".."sun"; `hour` is
 //!     // 0-23; both roll on the same local-midnight grid `chunk_hours` does.
 //!     // Global function, not a ctx field — registered on the engine this
 //!     // script runs under, nowhere else.
@@ -85,7 +87,7 @@ use crate::guide::GuideConfig;
 pub use crate::pattern::BlockBuild;
 use crate::resume::{GenerationState, PoolResume};
 
-/// The window bounds a sequencer script sees.
+/// The window bounds a sequencer script sees (ADR 0004).
 #[derive(Debug, Clone, Copy)]
 pub struct Window {
     /// Unix seconds this generation begins airing at — the same `from` the
@@ -172,9 +174,7 @@ pub fn build(
 
         // This pool's own `config:` block, passed through unread exactly as a
         // scorer's `ctx.config` is — the existing generic pool carrier (ADR
-        // 0002), now doubling as where a daypart script's hour/weekday table
-        // lives, so #14 needs no new schema field to say what hours a pool
-        // claims.
+        // 0002).
         let config = crate::score::pool_config_dynamic(
             cfg.config.as_ref(),
             "sequencer",
@@ -238,18 +238,14 @@ pub fn build(
     };
     let mut last_series: HashMap<usize, usize> = HashMap::new();
     let mut progress = Vec::with_capacity(arranged.len() + 1);
-    let state_after = |last_series: &HashMap<usize, usize>| crate::pattern::BlockState {
-        pools: resume_after(last_series),
-        schedule: BTreeMap::new(),
-    };
     for id in &arranged {
-        progress.push(state_after(&last_series));
+        progress.push(resume_after(&last_series));
         if let Some(&(pool_idx, si)) = item_location.get(id) {
             last_series.insert(pool_idx, si);
         }
     }
     let resume_out = resume_after(&last_series);
-    progress.push(state_after(&last_series));
+    progress.push(resume_out.clone());
 
     // The metadata half of what plugin pools picked (#166) — `arrange()` sees
     // a pool's `pick()` record only as the bare `entry_id`s in `ctx.pools`,
@@ -282,7 +278,6 @@ pub fn build(
     Ok(BlockBuild {
         ids: arranged,
         resume: resume_out,
-        schedule: BTreeMap::new(),
         progress,
         metadata: metadata_out,
         guides: guide_out,
@@ -305,7 +300,7 @@ fn call_arrange(
 ) -> Result<Vec<String>, String> {
     let source = std::fs::read_to_string(sequencer)
         .map_err(|e| format!("read sequencer plugin {}: {e}", sequencer.display()))?;
-    // The station's configured tz, or UTC at the stateless entry
+    // The station's configured tz (ADR 0004), or UTC at the stateless entry
     // points that carry no station config — see the doc note on
     // `ScoreInputs::tz`. Baked into `local_time` via closure rather than
     // threaded through `ctx`, so a script reads the clock at any instant it
@@ -379,8 +374,8 @@ fn call_arrange(
 }
 
 /// `local_time(unix_secs)` — the Rhai global function registered onto the
-/// engine every `arrange()` call runs under. Converts any
-/// unix-second instant to the station's configured tz, so a script
+/// engine every `arrange()` call runs under (ADR 0004). Converts any
+/// unix-second instant to the station's configured tz, so a clock-aware script
 /// can re-read the clock at a cursor it has advanced by summed item
 /// durations, not only at `ctx.window.from`.
 ///
@@ -591,9 +586,9 @@ fn arrange(ctx) {
         assert_eq!(ids, vec!["mov-2", "mov-1"]);
     }
 
-    /// The item maps carry duration — what a script needs to fit items
-    /// against a clock boundary, and #169 decision 1's whole reason bare ids
-    /// were rejected.
+    /// The item maps carry duration — what a clock-aware sequencer needs to
+    /// fit items against a boundary, and #169 decision 1's
+    /// whole reason bare ids were rejected.
     #[test]
     fn item_maps_carry_duration_and_window_carries_the_clock() {
         let dir = tempfile::tempdir().unwrap();
@@ -997,8 +992,8 @@ fn arrange(ctx) {
     }
 
     /// `local_time()` resolves against the station's configured tz
-    /// (`ScoreInputs::tz`), not UTC — so a script reads the local clock
-    /// rather than whatever zone the generation happened to run in.
+    /// (`ScoreInputs::tz`), not UTC — so a clock-aware script reads the local
+    /// clock rather than whatever zone the generation happened to run in.
     #[test]
     fn local_time_resolves_in_the_stations_configured_tz() {
         let dir = tempfile::tempdir().unwrap();

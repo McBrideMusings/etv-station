@@ -132,29 +132,11 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     // reordered without a block index in the key.
     let mut pool_names: HashSet<&str> = HashSet::new();
 
-    // A scheduled block reads the clock from where the generation starts, and
-    // every other block is laid in the same generation ahead of or behind it,
-    // so it would read the wrong hour.
-    if channel.rule.blocks.len() > 1
-        && let Some(idx) = channel
-            .rule
-            .blocks
-            .iter()
-            .position(|b| !b.schedule.is_empty())
-    {
-        return Err(ConfigError::Validation {
-            path: path.to_path_buf(),
-            message: format!(
-                "block #{idx} declares a `schedule`, so it must be the channel's only block — \
-                 put the other blocks' pools into its schedule entries instead"
-            ),
-        });
-    }
-
-    for (idx, include) in channel.rule.blocks.iter().enumerate() {
+    for (idx, include) in channel.rule.all_blocks().enumerate() {
+        let label = channel.rule.block_label(idx);
         let bad = |message: String| ConfigError::Validation {
             path: path.to_path_buf(),
-            message: format!("block #{idx}: {message}"),
+            message: format!("{label}: {message}"),
         };
 
         // Checked before the pattern/entries split: `[constraints]` applies to
@@ -163,8 +145,8 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // rule over the block's own list, but it has to be a legal table either
         // way — an inherited nonsense value is still nonsense.
         validate_constraints(&include.constraints(), &bad)?;
-        validate_guide(path, &format!("block #{idx}"), include.guide())?;
-        validate_tracks(path, &format!("block #{idx}"), include.tracks())?;
+        validate_guide(path, &label, include.guide())?;
+        validate_tracks(path, &label, include.tracks())?;
 
         if include.is_pattern() {
             validate_pattern_block(include, &mut pool_names, &channel.groups, base_dir, &bad)?;
@@ -179,13 +161,13 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         if include.entries().is_empty() {
             return Err(ConfigError::Validation {
                 path: path.to_path_buf(),
-                message: format!("block #{idx} has no entries"),
+                message: format!("{label} has no entries"),
             });
         }
         if let Some(crate::config::Fallback::Item(item)) = include.fallback.as_ref() {
             validate_tracks(
                 path,
-                &format!("block #{idx}: fallback item"),
+                &format!("{label}: fallback item"),
                 item.tracks.as_ref(),
             )?;
         }
@@ -197,17 +179,19 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
             if let Entry::Item(item) = entry {
                 validate_guide(
                     path,
-                    &format!("block #{idx}: item #{entry_idx}"),
+                    &format!("{label}: item #{entry_idx}"),
                     item.guide.as_ref(),
                 )?;
                 validate_tracks(
                     path,
-                    &format!("block #{idx}: item #{entry_idx}"),
+                    &format!("{label}: item #{entry_idx}"),
                     item.tracks.as_ref(),
                 )?;
             }
         }
     }
+
+    validate_schedules(path, &channel.rule)?;
 
     Ok(())
 }
@@ -438,24 +422,8 @@ fn validate_pattern_block<'a>(
     if include.pools.is_empty() {
         return Err(bad("`pattern` needs at least one `pools` entry".into()));
     }
-    if include.pattern.is_empty() && include.schedule.is_empty() {
-        return Err(bad(
-            "`pools` needs a `pattern` or a `schedule` to draw from them".into(),
-        ));
-    }
-    if !include.pattern.is_empty() && !include.schedule.is_empty() {
-        return Err(bad(
-            "a block declares either `pattern` or `schedule`, not both — a `schedule` \
-             entry carries its own `pattern`"
-                .into(),
-        ));
-    }
-    if !include.schedule.is_empty() && include.cycles.is_some() {
-        return Err(bad(
-            "cycles conflicts with `schedule` — a scheduled block walks until the window \
-             is laid, switching patterns by the hour, so there is no one pattern to count"
-                .into(),
-        ));
+    if include.pattern.is_empty() {
+        return Err(bad("`pools` needs a `pattern` to draw from them".into()));
     }
     if let Some(order) = &include.order
         && *order != Order::Manual
@@ -501,48 +469,7 @@ fn validate_pattern_block<'a>(
 
     let local = validate_block_pools(&include.pools, pool_names, channel_groups, base_dir, &bad)?;
 
-    let mut entry_names: HashSet<&str> = HashSet::new();
-    for entry in &include.schedule {
-        if entry.name.trim().is_empty() {
-            return Err(bad("a schedule entry needs a `name`".into()));
-        }
-        if !entry_names.insert(entry.name.as_str()) {
-            return Err(bad(format!(
-                "schedule entry name {:?} is used twice — it keys the entry's place in the \
-                 `.resume` sidecar",
-                entry.name
-            )));
-        }
-        if entry.pattern.is_empty() {
-            return Err(bad(format!(
-                "schedule entry {:?} has no `pattern`",
-                entry.name
-            )));
-        }
-    }
-    if !include.schedule.is_empty()
-        && let Some(message) = crate::config::schedule::claims_error(&include.schedule)
-    {
-        return Err(bad(message));
-    }
-
-    let labelled: Vec<(String, &[PatternStep])> = if include.schedule.is_empty() {
-        vec![("pattern".to_string(), include.pattern.as_slice())]
-    } else {
-        include
-            .schedule
-            .iter()
-            .map(|e| {
-                (
-                    format!("schedule entry {:?}: pattern", e.name),
-                    e.pattern.as_slice(),
-                )
-            })
-            .collect()
-    };
-    for (label, steps) in &labelled {
-        validate_steps(label, steps, include, &local, bad)?;
-    }
+    validate_steps("pattern", &include.pattern, include, &local, &bad)?;
 
     // A take-all step and adjacency constraints cannot share a block.
     //
@@ -556,10 +483,7 @@ fn validate_pattern_block<'a>(
     // repeat would cross a generation boundary with nothing logged. Refusing
     // the pair keeps the seam honest; sizing one across a take-all step is its
     // own piece of work.
-    if include
-        .step_lists()
-        .any(|steps| steps.iter().any(|s| s.take == Take::All))
-    {
+    if include.pattern.iter().any(|s| s.take == Take::All) {
         let constrained = include
             .constraints
             .is_some()
@@ -584,9 +508,8 @@ fn validate_pattern_block<'a>(
     Ok(())
 }
 
-/// The per-step checks every pattern gets, whether it is the block's one
-/// `pattern` or a `schedule` entry's. `label` names which, so the error says
-/// where to look.
+/// The per-step checks every `pattern` gets. `label` names the pattern, so the
+/// error says where to look.
 fn validate_steps(
     label: &str,
     steps: &[PatternStep],
@@ -675,13 +598,6 @@ fn validate_sequencer_block<'a>(
     if !include.pattern.is_empty() {
         return Err(bad(
             "a block declares either `pattern` or `sequencer`, not both (issue #169 decision 3)"
-                .into(),
-        ));
-    }
-    if !include.schedule.is_empty() {
-        return Err(bad(
-            "a block declares either `schedule` or `sequencer`, not both — a `schedule` block \
-             is walked by the station, a `sequencer` block by its script"
                 .into(),
         ));
     }
@@ -1202,6 +1118,74 @@ fn validate_pool_groups(
     Ok(())
 }
 
+/// `rule.schedules` and `rule.slots` (ADR 0004): every schedule names
+/// itself uniquely, places at least one range, places only slots that exist,
+/// and never places two slots over the same minute; every slot is placed by
+/// some schedule, since an unplaced one would never air. No block on such a
+/// channel authors `cycles`: an authored count overrides `fill`, which is
+/// where a generation stops at the next schedule boundary.
+fn validate_schedules(path: &Path, rule: &super::RuleConfig) -> Result<(), ConfigError> {
+    let bad = |message: String| ConfigError::Validation {
+        path: path.to_path_buf(),
+        message,
+    };
+    if !rule.schedules.is_empty()
+        && let Some(idx) = rule.all_blocks().position(|b| b.cycles.is_some())
+    {
+        return Err(bad(format!(
+            "{} sets `cycles`, which would run it past the next schedule boundary; \
+             a channel with `rule.schedules` bounds every block by the schedule instead",
+            rule.block_label(idx)
+        )));
+    }
+    let mut names: HashSet<&str> = HashSet::new();
+    let mut placed: HashSet<&str> = HashSet::new();
+    for (idx, schedule) in rule.schedules.iter().enumerate() {
+        if schedule.name.trim().is_empty() {
+            return Err(bad(format!("schedule #{idx} has no name")));
+        }
+        let label = format!("schedule {:?}", schedule.name);
+        if !names.insert(schedule.name.as_str()) {
+            return Err(bad(format!("{label} is declared twice")));
+        }
+        if schedule.hours.is_empty() {
+            return Err(bad(format!(
+                "{label} places no hours; give it `hours: {{\"20..23\": <slot>}}`"
+            )));
+        }
+        for slot in schedule.hours.values() {
+            if !rule.slots.contains_key(slot) {
+                return Err(bad(format!(
+                    "{label} places slot {slot:?}, which `rule.slots` does not declare"
+                )));
+            }
+            placed.insert(slot.as_str());
+        }
+        let ranges: Vec<_> = schedule.hours.keys().collect();
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                let overlap = a
+                    .spans()
+                    .iter()
+                    .any(|&(s1, e1)| b.spans().iter().any(|&(s2, e2)| s1 < e2 && s2 < e1));
+                if overlap {
+                    return Err(bad(format!(
+                        "{label} places {a} and {b}, which overlap; a minute airs one slot"
+                    )));
+                }
+            }
+        }
+    }
+    for name in rule.slots.keys() {
+        if !placed.contains(name.as_str()) {
+            return Err(bad(format!(
+                "slot {name:?} is placed by no schedule, so it would never air"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,7 +1227,6 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
-            schedule: Vec::new(),
             sequencer: None,
             mode: Mode::All,
             order: Some(Order::Manual),
@@ -1324,7 +1307,10 @@ mod tests {
             retention_days: 1,
             seed: None,
             anchor: None,
-            rule: RuleConfig { blocks },
+            rule: RuleConfig {
+                blocks,
+                ..Default::default()
+            },
             groups: Vec::new(),
             overlay: None,
             annotate: None,

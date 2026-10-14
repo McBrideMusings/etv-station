@@ -2954,8 +2954,8 @@ async fn pattern_catch_up(
             history: Arc::clone(&history),
             recent: ctx.history_db.tail(&channel.name, recent_depth)?,
             now: now.unix_timestamp(),
-            // The station's configured tz — a `schedule` block reads the hour
-            // in it (ADR 0021), and a sequencer script's `local_time()` too.
+            // The station's configured tz — a sequencer block (#169) reads
+            // this to place its pools against the local clock (ADR 0004).
             tz: Some(ctx.tz),
             account_id,
         };
@@ -2988,10 +2988,10 @@ async fn pattern_catch_up(
                 // condition guarantees this is positive.
                 Some((target - from).unsigned_abs()),
                 // The absolute instant this generation begins airing at — a
-                // `schedule` block starts its clock here (ADR 0021) and a
-                // sequencer reads it as `ctx.window.from`, so both ask "what
-                // hour does this generation start" rather than "what hour is
-                // it while the daemon happens to be computing this".
+                // sequencer block (#169) reads it as `ctx.window.from`, so a
+                // sequencer script asks "what hour does this generation start"
+                // rather than "what hour is it while the daemon happens to be
+                // computing this".
                 from,
             )?;
             // The ledger needs each airing's show, and only the catalog knows
@@ -3043,8 +3043,7 @@ async fn pattern_catch_up(
                 blocks: channel
                     .config
                     .rule
-                    .blocks
-                    .iter()
+                    .all_blocks()
                     .map(|b| b.tracks())
                     .collect(),
             },
