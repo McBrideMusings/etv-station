@@ -1890,6 +1890,35 @@ Error cases:
 
 Worked sample: `examples/plugins/foryou-sequencer.rhai`.
 
+### Pattern step `take` — how many items one visit draws
+
+A step in a block's `pattern:` is `{pool, take, from, chance}`. `take` has
+three forms:
+
+| Form | Example | One visit draws |
+| --- | --- | --- |
+| count | `take: 3` | exactly 3 items |
+| range | `take: "2-4"` or `take: {min: 2, max: 4}` | a whole number from `min` to `max`, rolled per visit |
+| `all` | `take: all` | every remaining item of the series the visit picked |
+
+A range is rolled when the visit starts, from the channel seed, the pattern
+cycle and the step's position. Each number from `min` to `max` is equally
+likely, and a pinned `seed:` reproduces every visit's size. Two steps with the
+same range roll independently, because the step's position is part of the roll.
+A range is not `chance`: the visit always airs, only its length varies.
+
+A range follows the same rules as a count wherever a count is checked:
+
+- `min` must be at least 1 and `max` at most the engine's per-visit maximum
+  (`MAX_TAKE`); `min` above `max` fails at load.
+- `min` equal to `max` is a count (`"3-3"` loads as `take: 3`).
+- Under `rotate: slot` the rolled number is how many slots the visit fills.
+- A plugin's per-entry `take` override replaces the rolled number for that
+  series, the same way it replaces a count.
+- Adjacency `constraints` size their seam for the widest cycle the range can
+  produce: every range counted at `max` for the cycle length and at `min` for
+  how often the pool is drawn.
+
 ### Pool `constraints` — spacing counted in a pool's own draw order
 
 `constraints` (`no_repeat_within`, `separate_by`, `separate_min_gap`) is the same

@@ -97,8 +97,22 @@ on the same pool with `chance: 0.5` does not lengthen the visit, though: under
 `rotate: visit` each step is a new visit, so it adds three episodes of the
 next show in the rotation half the time.
 
-**Not expressible today.** `take` is a fixed count; there is no random range
-such as "2 to 4" episodes of one show. Tracked in `etv-station-cyq9`.
+**A random range.** `take` also accepts a range, so the visit length varies
+the way real blocks do:
+
+```yaml
+pattern:
+  - pool: shows
+    take: "2-4"        # or { min: 2, max: 4 }
+```
+
+Each visit is asked for 2, 3 or 4 episodes of one show, every size equally
+likely. The size is rolled per visit from the channel `seed`, so a pinned seed
+asks for the same sequence of sizes every time. A series that runs short follows
+`on_short`, as it does for a fixed count. Unlike a second step with `chance`,
+the visit always happens and the next show in the rotation is not pulled in;
+only the length changes. Field rules are in the
+[schema](./schema.md#pattern-step-take-how-many-items-one-visit-draws).
 
 ## Stripping, and how deep a show must be to strip
 

@@ -1654,8 +1654,9 @@ fn pattern_in_words(channel: &config::ChannelConfig) -> String {
 fn steps_in_words(steps: &[config::PatternStep]) -> String {
     steps
         .iter()
-        .map(|s| match s.take.count() {
-            Some(n) => format!("{n} from {}", s.pool),
+        .map(|s| match s.take.bounds() {
+            Some((n, m)) if n == m => format!("{n} from {}", s.pool),
+            Some((n, m)) => format!("{n}-{m} from {}", s.pool),
             None => format!("all of one {} pick", s.pool),
         })
         .collect::<Vec<_>>()

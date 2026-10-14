@@ -120,6 +120,10 @@ const REROLL_STRIDE: u64 = 1 << 32;
 /// uses and the reroll band above it, so one decision never doubles as another.
 const FROM_STRIDE: u64 = 1 << 48;
 
+/// Keeps a `take` range's size roll clear of every nonce above, for the same
+/// reason: the visit's size is its own decision, not a reuse of another's.
+const TAKE_STRIDE: u64 = 1 << 56;
+
 /// One series inside a pool: a show's episodes, one season of them, or a single
 /// movie.
 ///
@@ -470,6 +474,15 @@ impl PoolRuntime<'_> {
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
     fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Result<Vec<String>, String> {
+        // A range is decided once per visit, here, so a `rotate = "slot"` visit
+        // sizes its slots from the same roll a `rotate = "visit"` draw does.
+        let take = match take {
+            Take::Range { min, max } => {
+                let spread = (max.saturating_sub(min) + 1) as u64;
+                Take::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
+            }
+            fixed => fixed,
+        };
         if take == Take::Count(0) || self.is_dry() {
             return Ok(Vec::new());
         }
@@ -483,7 +496,7 @@ impl PoolRuntime<'_> {
             // so the one item each slot asks for was never the step's own
             // `take`.
             Rotate::Slot => {
-                let n = take.count().unwrap_or(1);
+                let n = take.bounds().map_or(1, |(n, _)| n);
                 if n > MAX_TAKE {
                     return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
                 }
@@ -531,6 +544,7 @@ impl PoolRuntime<'_> {
         let take = match (override_take, want, first) {
             (Some(n), _, _) => n,
             (None, Take::Count(n), _) => n,
+            (None, Take::Range { .. }, _) => unreachable!("visit resolves a range to a count"),
             (None, Take::All, Some(si)) => self.series[si].remaining(),
             (None, Take::All, None) => return Ok(Vec::new()),
         };
@@ -1379,6 +1393,7 @@ fn pool_source(cfg: &Pool) -> String {
 fn describe_take(take: Take) -> String {
     match take {
         Take::Count(n) => n.to_string(),
+        Take::Range { min, max } => format!("{min}-{max}"),
         Take::All => "all".into(),
     }
 }
@@ -1760,6 +1775,9 @@ fn derive_cycles(
         if let Some(&i) = by_name.get(step.pool.as_str()) {
             match step.take {
                 Take::Count(n) => per_cycle[i] += n,
+                // The fewest a cycle can draw, so the ceiling on cycles holds
+                // however low every visit rolls.
+                Take::Range { min, .. } => per_cycle[i] += min,
                 Take::All => all_steps[i] += 1,
             }
         }
@@ -3352,6 +3370,49 @@ mod tests {
         // movies pool alone, and the episodes that did air are a prefix of the
         // show order — a skip consumed no cursor.
         assert_eq!(a.iter().filter(|id| id.starts_with("mov-")).count(), 10);
+    }
+
+    /// A `take` range rolls its size per visit: every size in the range shows
+    /// up, none outside it does, and a pinned seed reproduces the sequence.
+    #[test]
+    fn take_range_varies_per_visit_and_a_pinned_seed_reproduces_it() {
+        let pattern = || {
+            vec![
+                step("movies", 1),
+                PatternStep {
+                    pool: "shows".into(),
+                    take: Take::Range { min: 2, max: 4 },
+                    from: TakeFrom::Start,
+                    chance: 1.0,
+                },
+            ]
+        };
+        let run = |seed| {
+            build_with(
+                vec![movies_pool(), shows_pool()],
+                pattern(),
+                Some(24),
+                &GenerationState::empty(),
+                seed,
+            )
+            .0
+        };
+        let a = run(7);
+        assert_eq!(a, run(7), "a pinned seed must reproduce the visit sizes");
+        // Episodes between two movies are one visit.
+        let mut sizes: Vec<usize> = Vec::new();
+        for id in &a {
+            if id.starts_with("mov-") {
+                sizes.push(0);
+            } else if let Some(last) = sizes.last_mut() {
+                *last += 1;
+            }
+        }
+        let mut seen: Vec<usize> = sizes.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, vec![2, 3, 4], "visit sizes were {sizes:?}");
+        assert_ne!(a, run(8), "a different seed should roll different sizes");
     }
 
     #[test]

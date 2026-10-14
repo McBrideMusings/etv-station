@@ -72,24 +72,29 @@ pub enum GroupBy {
 
 /// How many items one visit to a pattern step draws.
 ///
-/// Written in the channel file as either a number (`take: 3`) or the word
-/// `all` (`take: "all"`). `All` empties the bucket the visit picked, which is
-/// how a whole season — or a whole show, under `group_by = "show"` — airs
-/// without the author having to know how many episodes are in it.
+/// Written in the channel file as a number (`take: 3`), a range (`take: "2-4"`
+/// or `take: {min: 2, max: 4}`), or the word `all` (`take: "all"`). `All`
+/// empties the bucket the visit picked, which is how a whole season — or a
+/// whole show, under `group_by = "show"` — airs without the author having to
+/// know how many episodes are in it. `Range` draws a whole number between its
+/// bounds, inclusive, afresh on every visit from the channel seed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Take {
     Count(usize),
+    Range { min: usize, max: usize },
     All,
 }
 
 impl Take {
-    /// The authored number, or `None` for `all`. Callers that must size a step
-    /// before anything has touched the catalog use this and say what they do
-    /// with the `None` — the count `all` stands for is not knowable until a
-    /// bucket has been picked.
-    pub fn count(self) -> Option<usize> {
+    /// The fewest and most items one visit can draw, or `None` for `all`.
+    /// Callers that must size a step before anything has touched the catalog
+    /// use this and say what they do with the `None` — the count `all` stands
+    /// for is not knowable until a bucket has been picked. A fixed count is
+    /// its own bounds.
+    pub fn bounds(self) -> Option<(usize, usize)> {
         match self {
-            Take::Count(n) => Some(n),
+            Take::Count(n) => Some((n, n)),
+            Take::Range { min, max } => Some((min, max)),
             Take::All => None,
         }
     }
@@ -99,9 +104,32 @@ impl Serialize for Take {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Take::Count(n) => serializer.serialize_u64(*n as u64),
+            Take::Range { min, max } => serializer.serialize_str(&format!("{min}-{max}")),
             Take::All => serializer.serialize_str("all"),
         }
     }
+}
+
+/// A range's bounds, checked once wherever they come from. `min = max` is a
+/// fixed count under another spelling, so it collapses to `Count`.
+fn range_take<E: de::Error>(min: i64, max: i64) -> Result<Take, E> {
+    if min < 0 || max < 0 {
+        return Err(E::custom(format!(
+            "take range {min}-{max} has a negative bound"
+        )));
+    }
+    if min > max {
+        return Err(E::custom(format!(
+            "take range {min}-{max} has min above max"
+        )));
+    }
+    if min == max {
+        return Ok(Take::Count(min as usize));
+    }
+    Ok(Take::Range {
+        min: min as usize,
+        max: max as usize,
+    })
 }
 
 impl<'de> Deserialize<'de> for Take {
@@ -111,11 +139,33 @@ impl<'de> Deserialize<'de> for Take {
         // YAML front ends do not agree on for a bare scalar.
         struct TakeVisitor;
 
-        impl Visitor<'_> for TakeVisitor {
+        impl<'de> Visitor<'de> for TakeVisitor {
             type Value = Take;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a positive integer or the string \"all\"")
+                f.write_str(
+                    "a positive integer, a range such as \"2-4\" or {min: 2, max: 4}, \
+                     or the string \"all\"",
+                )
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Take, A::Error> {
+                let (mut min, mut max) = (None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "min" => min = Some(map.next_value::<i64>()?),
+                        "max" => max = Some(map.next_value::<i64>()?),
+                        other => {
+                            return Err(de::Error::custom(format!(
+                                "unknown take field {other:?} (want min and max)"
+                            )));
+                        }
+                    }
+                }
+                match (min, max) {
+                    (Some(min), Some(max)) => range_take(min, max),
+                    _ => Err(de::Error::custom("a take range needs both min and max")),
+                }
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Take, E> {
@@ -134,9 +184,18 @@ impl<'de> Deserialize<'de> for Take {
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Take, E> {
                 match v {
                     "all" => Ok(Take::All),
-                    other => Err(E::custom(format!(
-                        "invalid take {other:?} (want a positive integer or \"all\")"
-                    ))),
+                    other => {
+                        let bad = || {
+                            E::custom(format!(
+                                "invalid take {other:?} (want a positive integer, a range \
+                                 such as \"2-4\", or \"all\")"
+                            ))
+                        };
+                        let (lo, hi) = other.split_once('-').ok_or_else(bad)?;
+                        let lo = lo.trim().parse::<i64>().map_err(|_| bad())?;
+                        let hi = hi.trim().parse::<i64>().map_err(|_| bad())?;
+                        range_take(lo, hi)
+                    }
                 }
             }
         }
@@ -726,6 +785,33 @@ on_short: short
         assert_eq!(toml_all.take, Take::All);
         let toml_count: PatternStep = toml::from_str("pool = \"shows\"\ntake = 5\n").unwrap();
         assert_eq!(toml_count.take, Take::Count(5));
+    }
+
+    /// A range parses from the string and the map spelling in both formats,
+    /// and a reversed one is refused at load.
+    #[test]
+    fn take_parses_a_range_and_rejects_min_above_max() {
+        let range = Take::Range { min: 2, max: 4 };
+        let s: PatternStep = serde_norway::from_str("pool: shows\ntake: \"2-4\"\n").unwrap();
+        assert_eq!(s.take, range);
+        let m: PatternStep =
+            serde_norway::from_str("pool: shows\ntake: {min: 2, max: 4}\n").unwrap();
+        assert_eq!(m.take, range);
+        let t: PatternStep = toml::from_str("pool = \"shows\"\ntake = \"2-4\"\n").unwrap();
+        assert_eq!(t.take, range);
+        let tm: PatternStep =
+            toml::from_str("pool = \"shows\"\ntake = { min = 2, max = 4 }\n").unwrap();
+        assert_eq!(tm.take, range);
+        let same: PatternStep = serde_norway::from_str("pool: shows\ntake: \"3-3\"\n").unwrap();
+        assert_eq!(same.take, Take::Count(3));
+        let err = serde_norway::from_str::<PatternStep>("pool: shows\ntake: \"4-2\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("min above max"), "{err}");
+        assert!(
+            serde_norway::from_str::<PatternStep>("pool: shows\ntake: {min: 5, max: 1}\n").is_err()
+        );
+        assert_eq!(serde_json::to_string(&range).unwrap(), "\"2-4\"");
     }
 
     #[test]
