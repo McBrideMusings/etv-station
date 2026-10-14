@@ -211,10 +211,15 @@ impl BlockInclude {
         // so validation refuses a block that mixes `take: "all"` with any
         // `constraints` instead. Every pool here therefore has `reach() == 0`
         // whenever a take-all step is present, and both sums go unread.
+        //
+        // A `take` range is sized pessimistically for the seam: the cycle at
+        // its longest (every range at its max) with the pool drawn at its
+        // least (every range at its min) is the widest tail a repeat can cross.
         let cycle_total: usize = self
             .pattern
             .iter()
-            .filter_map(|s| s.take.count())
+            .filter_map(|s| s.take.bounds())
+            .map(|(_, max)| max)
             .sum::<usize>();
         self.pools
             .iter()
@@ -223,7 +228,8 @@ impl BlockInclude {
                     .pattern
                     .iter()
                     .filter(|s| s.pool == pool.name)
-                    .filter_map(|s| s.take.count())
+                    .filter_map(|s| s.take.bounds())
+                    .map(|(min, _)| min)
                     .sum();
                 let reach = pool.constraints(block).reach();
                 // A pool no step draws from never reaches the seam at all.

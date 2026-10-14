@@ -1624,9 +1624,10 @@ fn pattern_in_words(channel: &config::ChannelConfig) -> String {
                 let steps: Vec<String> = b
                     .pattern
                     .iter()
-                    .map(|s| match s.take.count() {
-                        Some(1) => format!("1 from {}", s.pool),
-                        Some(n) => format!("{n} from {}", s.pool),
+                    .map(|s| match s.take.bounds() {
+                        Some((1, 1)) => format!("1 from {}", s.pool),
+                        Some((n, m)) if n == m => format!("{n} from {}", s.pool),
+                        Some((n, m)) => format!("{n}-{m} from {}", s.pool),
                         None => format!("all of one {} pick", s.pool),
                     })
                     .collect();

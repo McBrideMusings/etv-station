@@ -473,13 +473,13 @@ fn validate_pattern_block<'a>(
                 step.pool
             )));
         }
-        if let Take::Count(n) = step.take {
-            if n == 0 {
+        if let Some((min, max)) = step.take.bounds() {
+            if min == 0 {
                 return Err(bad(format!("pattern step #{step_idx} has take = 0")));
             }
-            if n > MAX_TAKE {
+            if max > MAX_TAKE {
                 return Err(bad(format!(
-                    "pattern step #{step_idx} has take = {n}, which exceeds the maximum of \
+                    "pattern step #{step_idx} has take = {max}, which exceeds the maximum of \
                      {MAX_TAKE}"
                 )));
             }
@@ -1548,6 +1548,26 @@ mod tests {
         assert_eq!(channel_with(vec![block]).adjacency_reach(), 15);
     }
 
+    /// A range sizes the seam for the widest cycle: the cycle at its longest
+    /// (2 movies + up to 4 shows = 6) times the cycles the constrained pool
+    /// needs at its fewest draws (5 reach / 2 movies = 3 cycles) is 18.
+    #[test]
+    fn adjacency_reach_sizes_a_take_range_at_its_widest() {
+        let mut movies = pool("movies");
+        movies.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(NoRepeatWithin::Positions(5)),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        let mut shows_step = step("shows", 3);
+        shows_step.take = Take::Range { min: 2, max: 4 };
+        let block = pattern_block(
+            vec![movies, pool("shows")],
+            vec![step("movies", 2), shows_step],
+        );
+        assert_eq!(channel_with(vec![block]).adjacency_reach(), 18);
+    }
+
     /// A pattern block's own `[constraints]` is the default its pools inherit,
     /// so it reaches the seam through them — and is converted the same way.
     #[test]
@@ -1945,6 +1965,23 @@ mod tests {
         let b = pattern_block(vec![pool("movies")], vec![step("movies", MAX_TAKE + 1)]);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("maximum"), "err = {err}");
+    }
+
+    /// A range is held to the same bounds as a count: its top may not pass the
+    /// maximum and its bottom may not be zero.
+    #[test]
+    fn rejects_a_take_range_with_a_zero_floor_or_a_top_past_the_maximum() {
+        let ranged = |min, max| {
+            let mut s = step("movies", 1);
+            s.take = Take::Range { min, max };
+            pattern_block(vec![pool("movies")], vec![s])
+        };
+        let err = validate_channel(&dummy_path(), &channel_with(vec![ranged(0, 3)])).unwrap_err();
+        assert!(format!("{err}").contains("take = 0"), "err = {err}");
+        let err = validate_channel(&dummy_path(), &channel_with(vec![ranged(2, MAX_TAKE + 1)]))
+            .unwrap_err();
+        assert!(format!("{err}").contains("maximum"), "err = {err}");
+        assert!(validate_channel(&dummy_path(), &channel_with(vec![ranged(2, 4)])).is_ok());
     }
 
     /// `all` empties the series a visit picked; `rotate = "slot"` picks a new
