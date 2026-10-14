@@ -66,8 +66,10 @@ row per number. Report these three in chat, before → after:
 - `Film share of airtime (%)`
 - `Channels sharing content` (overlap)
 
-Add any other row whose `changed` is `true`. The numbers are questions plus
-data, never a pass/fail verdict: say what moved and which principle in
-`docs/programming.md` the move answers to. A restarted taste-lab has no "before"
+Add any other row whose `changed` is `true`, and the `principles` array's grades
+before → after. A grade is a 0–3 reading of one measured number against the
+thresholds under that principle's **Grade.** in `docs/programming.md`, most of
+them unsourced: say what moved and which principle the move answers to, and
+read a grade as a question about the channel, not a verdict on it. A restarted taste-lab has no "before"
 — `since_last` is `null` on its first request for a channel — so keep the
 process running across the edit.

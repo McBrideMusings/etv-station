@@ -10,7 +10,9 @@
     --bg: #ffffff; --fg: #16181d; --muted: #6b7079; --line: #dfe2e7; --panel: #f6f7f9;
     --accent: #3d4fd1; --bar: #3d4fd1; --bar-open: #9aa3b1; --track: #e9ebef;
     --warn-bg: #fff6d8; --warn-fg: #6b4e00; --err-bg: #fde8e8; --err-fg: #8a1414;
-    --up: #1d7a3a; --down: #a2341c; --pin-bg: #16181d; --pin-fg: #ffffff;
+    --ink-bg: #16181d; --ink-fg: #ffffff;
+    --ppm: 1.15px;   /* guide height per minute of airtime */
+    --col: 138px;    /* guide width per day */
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -18,93 +20,146 @@
       --bg: #121418; --fg: #e6e8ec; --muted: #9298a3; --line: #2c3038; --panel: #1b1e24;
       --accent: #8e9cff; --bar: #8e9cff; --bar-open: #5c6370; --track: #262a32;
       --warn-bg: #3a3014; --warn-fg: #f2d98a; --err-bg: #3d1c1c; --err-fg: #ffb4b4;
-      --up: #6fd38f; --down: #ff9b85; --pin-bg: #e6e8ec; --pin-fg: #121418;
+      --ink-bg: #e6e8ec; --ink-fg: #121418;
     }
   }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 16px 20px 40px;
-    background: var(--bg); color: var(--fg); font-size: 14px; line-height: 1.4; }
+  /* The page itself never scrolls: toolbar and masthead stay put, and only the guide and the rail scroll inside it. */
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 12px 20px;
+    background: var(--bg); color: var(--fg); font-size: 14px; line-height: 1.4;
+    height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
   a { color: var(--accent); }
-  h1 { font-size: 22px; margin: 0; }
-  h2 { font-size: 15px; margin: 0 0 8px; }
+  h2 { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 6px; }
   .muted { color: var(--muted); font-size: 12.5px; }
-  .toolbar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-bottom: 14px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; font-size: 13px; margin-bottom: 10px; }
   .toolbar .spacer { flex: 1; }
   button, input { font: inherit; color: inherit; }
-  button { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
+  button { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 3px 9px; }
   button:disabled { opacity: .45; cursor: default; }
-  input[type=number] { width: 64px; padding: 3px 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+  input[type=number] { width: 58px; padding: 2px 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; }
   #state { min-height: 18px; }
   .spinner { display: inline-block; width: 13px; height: 13px; margin-right: 6px; vertical-align: -2px;
     border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  #report { transition: opacity .15s ease; }
+  #report { transition: opacity .15s ease; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
   #report.loading { opacity: .35; pointer-events: none; }
+  .notice { background: var(--warn-bg); color: var(--warn-fg); border-radius: 3px; padding: 4px 10px; margin-top: 6px; font-size: 12.5px; }
+  .error { background: var(--err-bg); color: var(--err-fg); border-radius: 3px; padding: 10px 12px; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12.5px; }
 
-  header.head { margin-bottom: 14px; }
-  .head .sub { color: var(--muted); margin-top: 2px; }
-  .head .pattern { margin-top: 6px; }
-  .notice { background: var(--warn-bg); color: var(--warn-fg); border-radius: 6px; padding: 4px 10px; margin-top: 6px; font-size: 12.5px; }
-  .error { background: var(--err-bg); color: var(--err-fg); border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12.5px; }
+  /* Masthead: channel number, name, span and pattern, and the four numbers in one row. */
+  .mast { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 14px; align-items: center;
+    padding-bottom: 10px; border-bottom: 2px solid var(--fg); margin-bottom: 10px; }
+  .mast .bug { font-weight: 800; font-size: 22px; font-variant-numeric: tabular-nums; border: 2px solid var(--fg); border-radius: 3px; padding: 2px 8px; }
+  .mast h1 { font-size: 22px; margin: 0; }
+  .mast .sub { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+  .mast .pattern { font-size: 13px; display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+  .mast .pstub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; color: var(--muted); }
+  .linkish { background: none; border: 0; padding: 0; color: var(--accent); text-decoration: underline; font-size: 13px; flex: none; }
+  .mast .notes { grid-column: 1 / -1; }
+  .facts { display: flex; flex-wrap: wrap; gap: 4px 22px; margin: 0; }
+  .facts dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .facts dd { margin: 0; font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .facts dd.d { font-size: 11.5px; font-weight: 400; color: var(--muted); max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 900px) { .mast { grid-template-columns: auto minmax(0, 1fr); } .facts { grid-column: 1 / -1; } }
 
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 18px; }
-  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
-  .tile .k { color: var(--muted); font-size: 12px; }
-  .tile .v { font-size: 22px; font-weight: 650; margin: 2px 0; }
-  .tile .d { font-size: 12.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; margin: 0 0 8px; align-items: center; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 1px; margin-right: 5px; vertical-align: -1px; }
+  .pin { display: inline-flex; align-items: center; justify-content: center; width: 17px; height: 17px; border-radius: 50%;
+    background: var(--ink-bg); color: var(--ink-fg); font-size: 10.5px; font-weight: 700; margin-right: 5px; flex: none; }
+  .rbadge { display: inline-flex; align-items: center; justify-content: center; min-width: 15px; height: 15px; border-radius: 2px;
+    background: var(--ink-bg); color: var(--ink-fg); font-size: 10px; font-weight: 800; margin-right: 5px; padding: 0 2px; }
+  .hatch { background-image: repeating-linear-gradient(135deg, rgba(0,0,0,.13) 0 4px, transparent 4px 8px); }
 
-  .grid2 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; }
-  @media (max-width: 900px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
-  section.card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 18px; min-width: 0; }
+  /* Guide first: a column per day, time running down, block height = running time. Side rail holds the numbers. */
+  .layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 16px; }
+  .gwrap { overflow: auto; min-height: 0; border: 1px solid var(--line); }
+  /* max-content, so the sticky hour gutter's containing block spans every day column, not just the viewport. */
+  .wk { display: grid; grid-template-columns: 44px repeat(var(--n), var(--col)); width: max-content; }
+  .colhead { position: sticky; top: 0; z-index: 3; background: var(--bg); border-bottom: 2px solid var(--fg); border-left: 1px solid var(--line);
+    font-weight: 700; font-size: 12px; padding: 4px 6px; white-space: nowrap; }
+  .corner { position: sticky; top: 0; left: 0; z-index: 4; background: var(--bg); border-bottom: 2px solid var(--fg); }
+  .gutter { position: sticky; left: 0; z-index: 2; background: var(--bg); height: calc(1440 * var(--ppm)); }
+  .gutter span { position: absolute; right: 4px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; transform: translateY(-50%); }
+  .col { position: relative; height: calc(1440 * var(--ppm)); border-left: 1px solid var(--line);
+    background-image: repeating-linear-gradient(to bottom, var(--line) 0 1px, transparent 1px calc(60 * var(--ppm))); }
+  .blk { position: absolute; left: 2px; right: 2px; border-radius: 2px; overflow: hidden; color: #111; font-size: 11px; line-height: 1.2;
+    padding: 2px 4px; border: 1px solid rgba(0,0,0,.2); outline: none; }
+  /* An inset outline, never box-shadow or z-index: changing a block's stacking repaints the whole grid on every hover. */
+  .blk:focus-visible, .blk:hover { outline: 2px solid var(--fg); outline-offset: -2px; }
+  .blk.tiny { padding: 0; border-width: 0 0 1px; }
+  .blk .tm { font-variant-numeric: tabular-nums; opacity: .7; font-size: 10px; }
+  .blk > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .blk b { font-weight: 700; }
+  .blk .pin, .blk .rbadge { width: 14px; height: 14px; min-width: 14px; font-size: 9px; margin-right: 3px; vertical-align: 1px; }
+  .blk .rbadge { background: #16181d; color: #fff; }
 
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  tr.show td.name { padding-left: 22px; color: var(--fg); }
+  .rail { min-height: 0; overflow: auto; overscroll-behavior: contain; }
+  .rail section { border-top: 1px solid var(--fg); padding: 6px 0 14px; min-width: 0; }
+  .samples { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .sample { min-width: 0; font-size: 11.5px; }
+  .sample .still, .sample .still-missing { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; border: 1px solid var(--line); margin-bottom: 4px; }
+  .sample .still { object-fit: contain; }
+  .sample .still-missing { display: flex; align-items: center; justify-content: center; text-align: center; padding: 6px;
+    color: var(--muted); background: var(--track); font-size: 11.5px; }
+  .sample .when { color: var(--muted); display: flex; align-items: center; }
+  .sample .what { font-weight: 600; margin: 2px 0 3px; }
+  .sample .prog { height: 4px; background: var(--track); overflow: hidden; }
+  .sample .prog span { display: block; height: 100%; background: var(--accent); }
+  .sample ol { margin: 3px 0 0; padding: 0; list-style: none; color: var(--muted); }
+
+  /* The selected-item panel at the top of the rail: an airing's selection trail, or the channel's pattern. */
+  .blk { cursor: pointer; }
+  .blk.sel { outline: 3px solid var(--fg); outline-offset: -3px; }
+  .rail section.insp { border-top: 2px solid var(--fg); background: var(--panel); padding: 8px 10px 12px; margin-bottom: 4px; }
+  .insp h3 { font-size: 15px; margin: 0; }
+  .insp .ep { color: var(--muted); font-size: 12.5px; }
+  .insp .meta { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; margin: 4px 0 8px; font-variant-numeric: tabular-nums; }
+  .insp h4 { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 10px 0 4px; }
+  .insp .stage { border-left: 2px solid var(--fg); padding: 2px 0 4px 8px; margin-bottom: 6px; font-size: 12px; }
+  .insp .stage .hd { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+  .insp .chip { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 2px; }
+  .insp dl.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1px 8px; margin: 3px 0 0; font-size: 11.5px; }
+  .insp dl.kv dt { color: var(--muted); }
+  .insp dl.kv dd { margin: 0; font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }
+  .insp ol.hist { margin: 0; padding: 0; list-style: none; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .insp ol.hist li.me { font-weight: 700; }
+  .insp .sum { font-size: 12px; color: var(--muted); }
+  .insp .x { float: right; border: 0; background: none; font-size: 16px; line-height: 1; padding: 0 2px; }
+  .insp table.steps td { font-size: 12px; }
+
+  .ptotal { display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; }
+  .ptotal .big { font-size: 20px; font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.principles td { vertical-align: top; padding: 3px 4px; }
+  table.principles .pname { font-weight: 600; width: 34%; }
+  table.principles .dots { white-space: nowrap; letter-spacing: 1px; font-size: 11px; }
+  table.principles .pmeasure { font-size: 11.5px; }
+  table.principles tr.unscored .pname { color: var(--muted); font-weight: 500; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { text-align: left; padding: 2px 5px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.show td.name { padding-left: 20px; }
   tr.pool td.name { font-weight: 600; }
-  .bar { position: relative; height: 10px; background: var(--track); border-radius: 5px; min-width: 80px; }
-  .bar span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; background: var(--bar); }
+  .bar { position: relative; height: 8px; background: var(--track); min-width: 40px; }
+  .bar span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--bar); }
   .bar span.open { background: var(--bar-open); }
-  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
-
-  .overlap-row { padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .overlap-row { padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
   .overlap-row summary { cursor: pointer; }
-  .overlap-row .titles { margin: 6px 0 2px 18px; font-size: 12.5px; color: var(--muted); columns: 2 220px; }
-  .overlap-row .titles div { break-inside: avoid; }
-
+  .overlap-row .titles { margin: 4px 0 2px 16px; font-size: 12px; color: var(--muted); }
   .old { color: var(--muted); }
   .changed .new { font-weight: 650; }
 
-  .samples { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
-  .sample .still, .sample .still-missing { display: block; width: 100%; aspect-ratio: 16 / 9; border-radius: 4px;
-    background: var(--track); margin-bottom: 8px; }
-  .sample .still { object-fit: contain; background: #000; border: 1px solid var(--line); }
-  .sample .still-missing { display: flex; align-items: center; justify-content: center; text-align: center;
-    padding: 8px; color: var(--muted); font-size: 12.5px; }
-  .sample { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
-  .sample .when { font-size: 12.5px; color: var(--muted); }
-  .sample .what { font-weight: 600; margin: 4px 0 6px; }
-  .sample .prog { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
-  .sample .prog span { display: block; height: 100%; background: var(--accent); }
-  .sample ol { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
-  .pin { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%;
-    background: var(--pin-bg); color: var(--pin-fg); font-size: 11px; font-weight: 700; margin-right: 6px; }
-
-  .guide-wrap { max-height: 70vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
-  .guide { min-width: 720px; position: relative; }
-  .guide .hours { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: 96px 1fr; background: var(--bg); border-bottom: 1px solid var(--line); }
-  .guide .hours .scale { position: relative; height: 20px; }
-  .guide .hours .scale span { position: absolute; top: 3px; font-size: 11px; color: var(--muted); transform: translateX(-50%); }
-  .guide .day { display: grid; grid-template-columns: 96px 1fr; border-bottom: 1px solid var(--line); }
-  .guide .day .label { font-size: 12px; padding: 8px 6px; color: var(--muted); }
-  .guide .track { position: relative; height: 38px; }
-  .guide .blk { position: absolute; top: 5px; bottom: 5px; border-radius: 3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
-    font-size: 11px; line-height: 28px; padding: 0 4px; color: #111; border: 1px solid rgba(0,0,0,.18); outline: none; }
-  .guide .blk:focus-visible, .guide .blk:hover { box-shadow: 0 0 0 2px var(--fg); z-index: 2; }
-  .guide .gpin { position: absolute; top: -2px; z-index: 2; transform: translateX(-50%); width: 16px; height: 16px; font-size: 10px; margin: 0; pointer-events: none; }
-  #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 5px; pointer-events: none; }
-  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; margin-bottom: 8px; }
+  @media (max-width: 900px) {
+    :root { --col: 120px; }
+    /* Too narrow to lock: the page scrolls, the guide keeps its own scroll box above the rail. */
+    body { height: auto; overflow: visible; display: block; }
+    #report { display: block; overflow: visible; }
+    .layout { grid-template-columns: minmax(0, 1fr); }
+    .gwrap { height: 70vh; }
+    .rail { overflow: visible; }
+  }
+  #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -128,6 +183,8 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 
 // One hue per pool, in first-airing order; light enough that dark text reads on it in both themes.
 const POOL_COLORS = ['#a9c4ff', '#ffc98f', '#a8e0b4', '#f4a9c8', '#d3b8ff', '#ffe08a', '#9fe3e0', '#e0c3a3'];
+// The guide opens scrolled to this hour, so the afternoon and evening fill the first screen.
+const GUIDE_OPEN_HOUR = 12;
 
 let current = null;   // the last /api/review payload
 let lineup = { prev: null, next: null };
@@ -143,6 +200,7 @@ function fmt(ts, tz, opts) {
 const timeOf = (ts, tz) => fmt(ts, tz, { hour: 'numeric', minute: '2-digit' });
 const dayOf = (ts, tz) => fmt(ts, tz, { weekday: 'short', month: 'short', day: 'numeric' });
 const days1 = (d) => (Math.round(d * 10) / 10).toFixed(1);
+const hourLabel = (h) => (h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p');
 
 async function load(channel, days, push) {
   const q = new URLSearchParams();
@@ -168,14 +226,14 @@ async function load(channel, days, push) {
   if (data.days) $('days').value = data.days;
   $('state').textContent = '';
   if (data.error) {
-    $('report').innerHTML = `<header class="head"><h1>${esc(channel || 'Review')}</h1></header>
+    $('report').innerHTML = `<header class="mast"><h1>${esc(channel || 'Review')}</h1></header>
       <h2>The review could not be built</h2><div class="error">${esc(data.error)}</div>`;
     return;
   }
   if (data.load_error) {
     document.title = `taste-lab · ${data.channel}`;
-    $('report').innerHTML = `<header class="head"><h1>${esc(data.channel)}</h1>
-      <div class="sub">${esc(data.config_path)}</div></header>
+    $('report').innerHTML = `<header class="mast"><div><h1>${esc(data.channel)}</h1>
+      <div class="sub">${esc(data.config_path)}</div></div></header>
       <h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
     return;
   }
@@ -186,80 +244,73 @@ async function load(channel, days, push) {
 function poolColor(d) {
   const map = {};
   let i = 0;
-  for (const a of d.airings) if (!(a.pool in map)) map[a.pool] = POOL_COLORS[i++ % POOL_COLORS.length];
+  // Past the palette, step round the hue wheel by the golden angle so no two pools share a colour.
+  for (const a of d.airings) {
+    if (a.pool in map) continue;
+    map[a.pool] = i < POOL_COLORS.length ? POOL_COLORS[i] : `hsl(${Math.round((i * 137.5) % 360)} 70% 78%)`;
+    i++;
+  }
   return map;
+}
+
+// An airing whose item already aired earlier in the span is a repeat; `repeat_of` is the first airing's index.
+function markRepeats(d) {
+  const first = {};
+  for (const a of d.airings) {
+    if (a.id in first) a.repeat_of = first[a.id];
+    else first[a.id] = a.index;
+  }
+}
+
+// The block's headline and second line: a series by its show, a film by its title and year.
+function headline(a) { return a.kind === 'episode' ? (a.show || a.label) : (a.title || a.label); }
+function subline(a) {
+  if (a.kind !== 'episode') return a.year ? String(a.year) : '';
+  const se = a.season != null && a.episode != null
+    ? `S${String(a.season).padStart(2, '0')}E${String(a.episode).padStart(2, '0')}` : '';
+  return [se, a.title].filter(Boolean).join(' · ');
 }
 
 function render(d) {
   document.title = `taste-lab · ${d.number} ${d.display_name || d.name}`;
   const colors = poolColor(d);
+  markRepeats(d);
   const tz = d.tz;
   const span = d.days;
   const html = [];
 
-  // 1. Header
-  html.push(`<header class="head">
-    <h1>${esc(d.number)} · ${esc(d.display_name || d.name)}</h1>
-    <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${span} days simulated (${esc(tz)}) · seed ${esc(d.seed ?? 'none')} · ${esc(d.config_path)}</div>
-    <div class="pattern">${esc(d.pattern)}</div>
-    ${d.notices.map((n) => `<div class="notice">Simulator gap: ${esc(n)}</div>`).join('')}
-  </header>`);
-
-  // 2. Tiles
+  // 1. Masthead
   const fr = d.first_repeat;
   const ov = d.overlap.channels;
   const largest = ov[0];
-  html.push(`<div class="tiles">
-    <div class="tile"><div class="k">Days until the first repeat</div>
-      <div class="v">${fr ? days1(fr.days) + ' d' : '&gt;' + span + ' d'}</div>
-      <div class="d">${fr ? esc(fr.label) : 'Nothing repeated inside the span'}</div></div>
-    <div class="tile"><div class="k">Film / series share of airtime</div>
-      <div class="v">${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</div>
-      <div class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</div></div>
-    <div class="tile"><div class="k">Channels sharing content</div>
-      <div class="v">${d.overlap.this_channel_whole_library ? '—' : ov.length}</div>
-      <div class="d">${d.overlap.this_channel_whole_library ? 'This channel draws from the whole library'
-        : largest ? `Largest: ${esc(largest.channel)} (${largest.shared} items)` : 'No other channel shares an item'}</div></div>
-    <div class="tile"><div class="k">Items aired</div>
-      <div class="v">${d.items_aired}</div>
-      <div class="d">${d.distinct_items} distinct</div></div>
-  </div>`);
+  html.push(`<header class="mast">
+    <div class="bug">${esc(d.number)}</div>
+    <div>
+      <h1>${esc(d.display_name || d.name)}</h1>
+      <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${span} days simulated (${esc(tz)}) · seed ${esc(d.seed ?? 'none')} · ${esc(d.config_path)}</div>
+      <div class="pattern"><button type="button" class="linkish" id="patternBtn">Pattern</button><span class="pstub" title="${esc(patternWords(d.blocks))}">${esc(patternWords(d.blocks))}</span></div>
+    </div>
+    <dl class="facts">
+      <div><dt>First repeat</dt><dd>${fr ? days1(fr.days) + ' d' : '&gt;' + span + ' d'}</dd>
+        <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : 'Nothing repeated inside the span'}</dd></div>
+      <div><dt>Film / series airtime</dt><dd>${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</dd>
+        <dd class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</dd></div>
+      <div><dt>Channels sharing content</dt><dd>${d.overlap.this_channel_whole_library ? '—' : ov.length}</dd>
+        <dd class="d" title="${esc(largest ? `${largest.number} ${largest.display_name || largest.channel} (${largest.shared})` : '')}">${d.overlap.this_channel_whole_library ? 'Draws from the whole library'
+          : largest ? `Largest: ${esc(largest.number)} ${esc(largest.display_name || largest.channel)} (${largest.shared})` : 'None share an item'}</dd></div>
+      <div><dt>Items aired</dt><dd>${d.items_aired}</dd><dd class="d">${d.distinct_items} distinct</dd></div>
+    </dl>
+    ${d.notices.length ? `<div class="notes">${d.notices.map((n) => `<div class="notice">Simulator gap: ${esc(n)}</div>`).join('')}</div>` : ''}
+  </header>`);
 
-  // 3. Depth  +  4. Overlap
-  const depthRows = d.depth.map((r) => {
-    const days = r.first_repeat_days;
-    const pct = days == null ? 100 : Math.min(100, (days / span) * 100);
-    const value = days == null ? `&gt;${span} d` : `${days1(days)} d`;
-    const swatch = r.kind === 'pool' ? `<span class="swatch" style="background:${colors[r.name] || '#ccc'}"></span>` : '';
-    const tip = r.first_repeat_label ? ` title="First repeat: ${esc(r.first_repeat_label)}"` : '';
-    return `<tr class="${r.kind}"${tip}><td class="name">${swatch}${esc(r.name)}</td>
-      <td class="num">${r.aired} / ${r.distinct}</td>
-      <td style="width:40%"><div class="bar"><span class="${days == null ? 'open' : ''}" style="width:${pct}%"></span></div></td>
-      <td class="num">${value}</td></tr>`;
-  }).join('');
-  const overlapRows = d.overlap.this_channel_whole_library
-    ? '<p class="muted">This channel\'s pools resolve to the whole library, so every other channel overlaps it; no list.</p>'
-    : ov.length === 0 ? '<p class="muted">No other channel shares an item.</p>'
-    : ov.map((c) => `<details class="overlap-row"><summary><strong>${esc(c.number)} ${esc(c.display_name || c.channel)}</strong>
-        — ${c.shared} shared</summary><div class="titles">${c.titles.map((t) => `<div>${esc(t)}</div>`).join('')}</div></details>`).join('');
-  const excluded = d.overlap.whole_library.length
-    ? `<p class="muted">Left out: ${d.overlap.whole_library.map(esc).join(', ')} — their pools resolve to the whole library.</p>` : '';
-  const errs = d.overlap.errors.map((e) => `<div class="notice">${esc(e.channel)}: ${esc(e.error)}</div>`).join('');
-  html.push(`<div class="grid2">
-    <section class="card"><h2>Depth</h2>
-      <p class="muted">Days from the start of the span until each pool or show first airs something a second time. Aired / distinct items.</p>
-      <table><thead><tr><th>Pool / show</th><th class="num">Aired</th><th></th><th class="num">First repeat</th></tr></thead>
-      <tbody>${depthRows}</tbody></table></section>
-    <section class="card"><h2>Overlap</h2>
-      <p class="muted">Channels whose configs resolve to some of the same items (${d.overlap.candidates} candidates here), largest first.</p>
-      ${overlapRows}${excluded}${errs}</section>
-  </div>`);
+  html.push(`<div class="legend">${Object.entries(colors).map(([p, c]) => `<span><span class="swatch" style="background:${c}"></span>${esc(p)}</span>`).join('')}
+    <span><span class="rbadge">R</span>already aired earlier in the span</span>
+    <span><span class="pin">1</span>tune-in sample</span></div>`);
 
-  // 5. Since last run  +  6. Tune-in samples
-  const since = d.since_last == null
-    ? '<p class="muted">First run of this channel in this session.</p>'
-    : `<table><tbody>${d.since_last.map((r) => `<tr class="${r.changed ? 'changed' : ''}"><td>${esc(r.label)}</td>
-        <td class="num"><span class="old">${esc(r.old ?? '—')}</span> → <span class="new">${esc(r.new ?? '—')}</span></td></tr>`).join('')}</tbody></table>`;
+  // 2. Guide, with the rail beside it
+  html.push(`<div class="layout"><div class="gwrap" id="gwrap"><div class="wk" id="guide" style="--n:${d.day_starts.length - 1}"></div></div><aside class="rail" id="rail"><section class="insp" id="insp" hidden></section>`);
+
+  // Tune-in samples, built here and placed last in the rail (7).
   const samples = d.samples.map((s) => {
     const a = d.airings[s.index];
     const next = s.next.map((i) => d.airings[i]).map((n) => `<li>${esc(timeOf(n.start, tz))} ${esc(n.label)}</li>`).join('');
@@ -274,54 +325,231 @@ function render(d) {
       <div class="muted">${s.minutes_in} of ${s.minutes_total} min in · ${esc(a.pool)}</div>
       <ol>${next}</ol></div>`;
   }).join('');
-  html.push(`<div class="grid2">
-    <section class="card"><h2>Tune-in samples</h2>
-      <p class="muted">${d.samples.length} moments drawn from seed ${esc(d.seed ?? 0)}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
-      <div class="samples">${samples}</div></section>
-    <section class="card"><h2>Since last run</h2>${since}</section>
-  </div>`);
+  const samplesSection = `<section><h2>Tune-in samples</h2>
+    <p class="muted">${d.samples.length} moments drawn from seed ${esc(d.seed ?? 0)}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
+    <div class="samples">${samples}</div></section>`;
 
-  // 7. Guide
-  html.push(`<section class="card"><h2>Guide</h2>
-    <div class="legend">${Object.entries(colors).map(([p, c]) => `<span><span class="swatch" style="background:${c}"></span>${esc(p)}</span>`).join('')}</div>
-    <div class="guide-wrap"><div class="guide" id="guide"></div></div></section>`);
+  // 3. Principles: graded where the schedule measures them, listed with the reason where it cannot.
+  const scored = d.principles.filter((p) => p.grade != null);
+  const points = scored.reduce((t, p) => t + p.grade, 0);
+  const principleRows = d.principles.map((p) => p.grade != null
+    ? `<tr><td class="pname">${esc(p.name)}</td><td class="dots" aria-label="${p.grade} of 3">${'●'.repeat(p.grade)}${'○'.repeat(3 - p.grade)}</td>
+        <td class="pmeasure">${esc(p.measure)}</td></tr>`
+    : `<tr class="unscored"><td class="pname">${esc(p.name)}</td><td class="dots">—</td>
+        <td class="pmeasure">${p.measure ? esc(p.measure) + '<br>' : ''}<span class="muted">Not scored: ${esc(p.not_scored)}</span></td></tr>`).join('');
+  html.push(`<section><h2>Programming principles</h2>
+    <div class="ptotal"><span class="big">${points} / ${scored.length * 3}</span>
+      <span class="muted">${scored.length} of ${d.principles.length} principles measured. Thresholds are in docs/programming.md under each principle's Grade.</span></div>
+    <table class="principles"><tbody>${principleRows}</tbody></table></section>`);
+
+  // 4. Depth
+  const depthRows = d.depth.map((r) => {
+    const days = r.first_repeat_days;
+    const pct = days == null ? 100 : Math.min(100, (days / span) * 100);
+    const value = days == null ? `&gt;${span} d` : `${days1(days)} d`;
+    const swatch = r.kind === 'pool' ? `<span class="swatch" style="background:${colors[r.name] || '#ccc'}"></span>` : '';
+    const tip = r.first_repeat_label ? ` title="First repeat: ${esc(r.first_repeat_label)}"` : '';
+    return `<tr class="${r.kind}"${tip}><td class="name">${swatch}${esc(r.name)}</td>
+      <td class="num">${r.aired} / ${r.distinct}</td>
+      <td style="width:30%"><div class="bar"><span class="${days == null ? 'open' : ''}" style="width:${pct}%"></span></div></td>
+      <td class="num">${value}</td></tr>`;
+  }).join('');
+  html.push(`<section><h2>Depth</h2>
+    <p class="muted">Days from the start of the span until each pool or show first airs something a second time. Aired / distinct items.</p>
+    <table><thead><tr><th>Pool / show</th><th class="num">Aired</th><th></th><th class="num">First repeat</th></tr></thead>
+    <tbody>${depthRows}</tbody></table></section>`);
+
+  // 5. Overlap
+  const overlapRows = d.overlap.this_channel_whole_library
+    ? '<p class="muted">This channel\'s pools resolve to the whole library, so every other channel overlaps it; no list.</p>'
+    : ov.length === 0 ? '<p class="muted">No other channel shares an item.</p>'
+    : ov.map((c) => `<details class="overlap-row"><summary><strong>${esc(c.number)} ${esc(c.display_name || c.channel)}</strong>
+        — ${c.shared} shared</summary><div class="titles">${c.titles.map((t) => `<div>${esc(t)}</div>`).join('')}</div></details>`).join('');
+  const excluded = d.overlap.whole_library.length
+    ? `<p class="muted">Left out: ${d.overlap.whole_library.map(esc).join(', ')} — their pools resolve to the whole library.</p>` : '';
+  const errs = d.overlap.errors.map((e) => `<div class="notice">${esc(e.channel)}: ${esc(e.error)}</div>`).join('');
+  html.push(`<section><h2>Overlap</h2>
+    <p class="muted">Channels whose configs resolve to some of the same items (${d.overlap.candidates} candidates here), largest first.</p>
+    ${overlapRows}${excluded}${errs}</section>`);
+
+  // 6. Since last run
+  const since = d.since_last == null
+    ? '<p class="muted">First run of this channel in this session.</p>'
+    : `<table><tbody>${d.since_last.map((r) => `<tr class="${r.changed ? 'changed' : ''}"><td>${esc(r.label)}</td>
+        <td class="num"><span class="old">${esc(r.old ?? '—')}</span> → <span class="new">${esc(r.new ?? '—')}</span></td></tr>`).join('')}</tbody></table>`;
+  html.push(`<section><h2>Since last run</h2>${since}</section>`);
+
+  // 7. Tune-in samples, last: the rail reads numbers first, stills after.
+  html.push(`${samplesSection}</aside></div>`);
 
   $('report').innerHTML = html.join('');
   renderGuide(d, colors);
+  $('patternBtn').addEventListener('click', () => showPanel(patternPanel(d, colors)));
+  const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
+  $('gwrap').scrollTop = GUIDE_OPEN_HOUR * 60 * ppm;
 }
+
+// The channel's blocks in one line: what the masthead stub shows, in full on hover.
+function patternWords(blocks) {
+  return blocks.map((b) => {
+    const body = b.sequencer ? `daypart sequencer ${b.sequencer}`
+      : b.steps.length ? `${b.steps.map((s) => (s.take == null ? `all of one ${s.pool} pick` : `${s.take} from ${s.pool}`)).join(', then ')}, repeating`
+      : b.pools.length ? `pools ${b.pools.join(', ')}`
+      : `${b.entries} fixed entries`;
+    return `${b.name}: ${body}`;
+  }).join('; ');
+}
+
+// The pattern, step by step, with what each pool actually aired in the span.
+function patternPanel(d, colors) {
+  const aired = {};
+  for (const a of d.airings) {
+    const t = (aired[a.pool] ||= { n: 0, secs: 0 });
+    t.n++;
+    t.secs += a.duration_secs;
+  }
+  const total = d.airings.reduce((s, a) => s + a.duration_secs, 0) || 1;
+  const poolCells = (pool) => {
+    const t = aired[pool] || { n: 0, secs: 0 };
+    return `<td><span class="swatch" style="background:${colors[pool] || '#ccc'}"></span>${esc(pool)}</td>
+      <td class="num">${t.n}</td><td class="num">${Math.round((t.secs / total) * 100)}%</td>`;
+  };
+  const blocks = d.blocks.map((b) => {
+    let rows;
+    if (b.sequencer) rows = `<p class="muted">Daypart sequencer ${esc(b.sequencer)} over pools ${esc(b.pools.join(', '))}.</p>`;
+    else if (b.steps.length) {
+      rows = `<table class="steps"><thead><tr><th class="num">#</th><th class="num">Take</th><th>Pool</th><th class="num">Aired</th><th class="num">Airtime</th></tr></thead><tbody>
+        ${b.steps.map((s, i) => `<tr><td class="num">${i + 1}</td><td class="num">${s.take == null ? 'all' : s.take}${s.chance < 1 ? ` · ${Math.round(s.chance * 100)}%` : ''}</td>${poolCells(s.pool)}</tr>`).join('')}
+        </tbody></table><p class="muted">Repeats from step 1 after step ${b.steps.length}. A pool on two steps counts its airings once.</p>`;
+    } else if (b.pools.length) rows = `<table class="steps"><tbody>${b.pools.map((p) => `<tr>${poolCells(p)}</tr>`).join('')}</tbody></table>`;
+    else rows = `<p class="muted">${b.entries} fixed entries.</p>`;
+    return `<h4>${esc(b.name)}</h4>${rows}`;
+  }).join('');
+  return `<button class="x" type="button" aria-label="Close">×</button><h3>Pattern</h3>${blocks}`;
+}
+
+const num = (v) => (typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(2) : String(v));
+
+// One audit-trail stage: the producer's own sentence and verdict, the facts a reader asks first, then every field raw.
+function stageHTML(d, s) {
+  const det = (s.detail && typeof s.detail === 'object') ? s.detail : {};
+  const label = (id) => d.titles[id] || (d.airings.find((x) => x.id === id) || {}).label || id;
+  const facts = [];
+  if (det.rank != null && det.candidate_count != null) facts.push(['rank', `#${det.rank} of ${det.candidate_count}`]);
+  if (det.score != null) facts.push(['score', num(det.score)]);
+  if (det.draw) facts.push(['draw', det.draw]);
+  if (Array.isArray(det.favor_matches) && det.favor_matches.length) facts.push(['matched', det.favor_matches.join(' · ')]);
+  if (Array.isArray(det.disfavor_matches) && det.disfavor_matches.length) facts.push(['penalised', det.disfavor_matches.join(' · ')]);
+  if (Array.isArray(det.near_misses) && det.near_misses.length) {
+    facts.push(['passed over', det.near_misses.map((m) => `${label(m.id)} (${num(m.score)})`).join(' · ')]);
+    facts.push(['because', [...new Set(det.near_misses.map((m) => m.reason))].join(' · ')]);
+  }
+  for (const k of ['source', 'take', 'from', 'expr']) {
+    if (det[k] != null) facts.push([k, typeof det[k] === 'object' ? JSON.stringify(det[k]) : det[k]]);
+  }
+  const raw = Object.entries(det).filter(([, v]) => v != null && !(Array.isArray(v) && !v.length))
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === 'object' ? JSON.stringify(v) : num(v))}</dd>`).join('');
+  return `<div class="stage"><div class="hd"><span class="chip">${esc(s.stage)}</span><span class="chip">${esc(s.by)}</span></div>
+    ${s.guide ? `<div><b>${esc(s.guide)}</b></div>` : ''}<div class="muted">${esc(s.verdict)}</div>
+    <dl class="kv">${facts.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
+    ${raw ? `<details><summary class="muted">all ${Object.keys(det).length} fields</summary><dl class="kv">${raw}</dl></details>` : ''}</div>`;
+}
+
+// Why one airing is on the schedule: its selection trail, every airing of the same item, and its catalog record.
+function airingPanel(d, a, colors) {
+  const tz = d.tz;
+  const all = d.airings.filter((x) => x.id === a.id);
+  const sample = d.samples.find((s) => s.index === a.index);
+  const trail = Array.isArray(a.audit) ? a.audit : [];
+  const hist = all.map((x) => `<li class="${x.index === a.index ? 'me' : ''}">${esc(dayOf(x.start, tz))} ${esc(timeOf(x.start, tz))}${x.repeat_of != null ? ' · repeat' : ' · first airing'}${x.index === a.index ? ' ← this one' : ''}</li>`).join('');
+  const cat = [
+    a.genres && a.genres.length ? `genres: ${a.genres.join(', ')}` : null,
+    a.collections && a.collections.length ? `collections: ${a.collections.join(', ')}` : null,
+    a.directors && a.directors.length ? `dir. ${a.directors.join(', ')}` : null,
+  ].filter(Boolean).join(' · ');
+  return `<button class="x" type="button" aria-label="Close">×</button>
+    <h3>${esc(headline(a))}</h3><div class="ep">${esc(subline(a))}</div>
+    <div class="meta"><span>${esc(dayOf(a.start, tz))} ${esc(timeOf(a.start, tz))}–${esc(timeOf(a.start + a.duration_secs, tz))}</span>
+      <span>${Math.round(a.duration_secs / 60)} min</span><span><span class="swatch" style="background:${colors[a.pool] || '#ccc'}"></span>${esc(a.pool)}</span>
+      ${a.content_rating ? `<span>rated ${esc(a.content_rating)}</span>` : ''}${sample ? `<span><span class="pin">${sample.n}</span>tune-in sample</span>` : ''}</div>
+    <h4>Why it's here: ${trail.length} stage${trail.length === 1 ? '' : 's'}</h4>
+    ${trail.length ? trail.map((s) => stageHTML(d, s)).join('') : '<div class="muted">No selection trail was recorded for this airing.</div>'}
+    <h4>Airings in the ${d.days} days (${all.length})</h4><ol class="hist">${hist}</ol>
+    <h4>Catalog</h4><div class="sum">${esc(a.id)}${cat ? ' · ' + esc(cat) : ''}${a.summary ? `<br>${esc(a.summary)}` : ''}</div>`;
+}
+
+function closePanel() {
+  const p = $('insp');
+  if (p) { p.hidden = true; p.innerHTML = ''; }
+  document.querySelectorAll('.blk.sel').forEach((b) => b.classList.remove('sel'));
+}
+
+function showPanel(html) {
+  closePanel();
+  const p = $('insp');
+  p.innerHTML = html;
+  p.hidden = false;
+  p.querySelector('.x').addEventListener('click', closePanel);
+  // Wide, this scrolls the rail to its top; narrow, where the rail sits below the guide, it scrolls the page to the panel.
+  p.scrollIntoView({ block: 'start' });
+}
+
+function selectBlock(b) {
+  if (!current || !b || b.dataset.index == null) return;
+  const a = current.airings[Number(b.dataset.index)];
+  showPanel(airingPanel(current, a, poolColor(current)));
+  document.querySelectorAll(`.blk[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
+}
+document.addEventListener('click', (e) => { const b = e.target.closest('.blk'); if (b) selectBlock(b); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closePanel();
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.blk')) { e.preventDefault(); selectBlock(e.target.closest('.blk')); }
+});
 
 function renderGuide(d, colors) {
   const tz = d.tz;
-  const g = $('guide');
-  const rows = [];
-  rows.push(`<div class="hours"><div></div><div class="scale">${[0, 3, 6, 9, 12, 15, 18, 21].map((h) =>
-    `<span style="left:${(h / 24) * 100}%">${h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p'}</span>`).join('')}</div></div>`);
+  const cells = ['<div class="corner"></div>'];
+  for (let i = 0; i + 1 < d.day_starts.length; i++) cells.push(`<div class="colhead">${esc(dayOf(d.day_starts[i], tz))}</div>`);
+  cells.push(`<div class="gutter">${Array.from({ length: 24 }, (_, h) =>
+    `<span style="top:calc(${h * 60} * var(--ppm))${h === 0 ? ';transform:none' : ''}">${hourLabel(h)}</span>`).join('')}</div>`);
+  // A block shows only the lines its height holds (a line is about 13px, plus 6px of padding and
+  // border); a block too short for one line shows nothing and names itself in its tooltip.
+  const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
   for (let i = 0; i + 1 < d.day_starts.length; i++) {
     const ds = d.day_starts[i];
     const de = d.day_starts[i + 1];
-    const len = de - ds;
+    // Minutes on the column's scale, so a 23- or 25-hour DST day still fills its column.
+    const scale = 1440 / ((de - ds) / 60);
     const blocks = [];
     for (const a of d.airings) {
       const s = Math.max(a.start, ds);
       const e = Math.min(a.start + a.duration_secs, de);
       if (e <= s) continue;
-      const left = ((s - ds) / len) * 100;
-      const width = ((e - s) / len) * 100;
-      const label = `${timeOf(a.start, tz)}–${timeOf(a.start + a.duration_secs, tz)} · ${a.label} · ${a.pool}`;
-      blocks.push(`<div class="blk" tabindex="0" data-tip="${esc(label)}" aria-label="${esc(label)}"
-        style="left:${left}%;width:${width}%;background:${colors[a.pool] || '#ccc'}">${esc(a.label)}</div>`);
+      const top = ((s - ds) / 60) * scale;
+      const h = ((e - s) / 60) * scale;
+      const rep = a.repeat_of != null;
+      // An airing crossing midnight is drawn in both columns; the second copy is marked as the
+      // continuation and carries no R badge or tab stop of its own. A pin goes in the column holding its moment.
+      const cont = a.start < ds;
+      const sample = d.samples.find((x) => x.index === a.index && x.at >= ds && x.at < de);
+      const label = `${timeOf(a.start, tz)}–${timeOf(a.start + a.duration_secs, tz)} · ${a.label} · ${a.pool}`
+        + (rep ? ` · repeat, first aired ${dayOf(d.airings[a.repeat_of].start, tz)} ${timeOf(d.airings[a.repeat_of].start, tz)}` : '');
+      const px = h * ppm;
+      const time = `<span class="tm">${cont ? `cont. from ${esc(timeOf(a.start, tz))}` : esc(timeOf(a.start, tz))}</span> ${sample ? `<span class="pin">${sample.n}</span>` : ''}${rep && !cont ? '<span class="rbadge">R</span>' : ''}`;
+      const title = `<b>${esc(headline(a))}</b>`;
+      const body = px >= 45 ? `<div>${time}</div><div>${title}</div><div>${esc(subline(a))}</div>`
+        : px >= 32 ? `<div>${time}</div><div>${title}</div>`
+        : px >= 19 ? `<div>${time} ${title}</div>`
+        : '';
+      blocks.push(`<div class="blk${rep ? ' hatch' : ''}${body ? '' : ' tiny'}" data-index="${a.index}"${cont ? '' : ' tabindex="0"'} data-tip="${esc(label)}" aria-label="${esc(label)}"
+        style="top:calc(${top} * var(--ppm));height:calc(${h} * var(--ppm));background-color:${colors[a.pool] || '#ccc'}">${body}</div>`);
     }
-    for (const s of d.samples) {
-      if (s.at >= ds && s.at < de) {
-        blocks.push(`<span class="pin gpin" style="left:${((s.at - ds) / len) * 100}%">${s.n}</span>`);
-      }
-    }
-    rows.push(`<div class="day"><div class="label">${esc(dayOf(ds, tz))}</div><div class="track">${blocks.join('')}</div></div>`);
+    cells.push(`<div class="col">${blocks.join('')}</div>`);
   }
-  g.innerHTML = rows.join('');
+  $('guide').innerHTML = cells.join('');
 }
 
-// Full title on hover or keyboard focus, for blocks too narrow to show it.
+// Full title on hover or keyboard focus, for blocks too short to show it.
 function showTip(el) {
   const tip = $('tip');
   tip.textContent = el.dataset.tip;

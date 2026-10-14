@@ -212,7 +212,8 @@ fn rfc3339(t: OffsetDateTime) -> String {
 }
 
 /// Split `metadata` into its `audit` value and the rest of the blob with the
-/// `audit` key removed. `None` metadata, and metadata that is not an object,
+/// `audit` key removed — the one reader of an item's audit trail, shared by
+/// this report's JSON and taste-lab's Review view. `None` metadata, and metadata that is not an object,
 /// render as an empty audit array and a `null` metadata object — the JSON
 /// equivalent of [`render_audit_trail`]'s "unexplained" line.
 ///
@@ -222,7 +223,7 @@ fn rfc3339(t: OffsetDateTime) -> String {
 /// unreachable; if one ever arrives it is data corruption, and a reader
 /// seeing the wrong shape is more use than this function silently emptying it.
 /// A consumer iterating `audit` therefore checks it is a list first.
-fn split_audit(metadata: Option<&serde_json::Value>) -> (serde_json::Value, serde_json::Value) {
+pub fn split_audit(metadata: Option<&serde_json::Value>) -> (serde_json::Value, serde_json::Value) {
     let Some(serde_json::Value::Object(map)) = metadata else {
         return (
             serde_json::Value::Array(Vec::new()),

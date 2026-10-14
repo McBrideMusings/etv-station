@@ -6,12 +6,19 @@ channel against. Each principle has four parts:
 - what it means, with the source it comes from;
 - one real network that does it;
 - how a `channel.yaml` says it today, with the key and a short example;
-- where today's schema cannot say it, the bead that tracks the gap.
+- where today's schema cannot say it, the bead that tracks the gap;
+- how the Review view grades it, when a schedule yields a number for it.
 
 A number marked **unsourced** or **inference** is reasoning written for this
 page. No source states it. Treat it as a starting question for a review, not
-as a rule. A review asks each question and shows the numbers. Nothing on this
-page is a pass/fail threshold.
+as a rule.
+
+The Review view grades a principle 0 to 3 only when the simulated schedule
+measures it; the channel's total counts those principles alone. A principle
+with no number to measure, or one that does not apply to the channel, is
+listed with the reason and left out of the total. Every grade threshold below
+is **unsourced** unless it cites a source: it is the line this page draws, not
+an industry standard. `crates/etv-station/src/review.rs` computes them.
 
 The keys named below are documented in the [config schema](/schema), except
 `chance` and `from` on a pattern step, which the schema page does not cover yet;
@@ -57,6 +64,11 @@ boundaries drift by the overrun of the last item rather than cutting it
 off: every generation restarts it at the top of its list. Tracked in
 `etv-station-199`.
 
+**Grade.** Applies to a channel with two or more pools. The measure is the
+largest swing in any one pool's share of airtime between the day's four
+6-hour quarters (midnight, 6 AM, noon, 6 PM, local time). 30 points or more
+is 3, 20 is 2, 10 is 1, under 10 is 0 (**unsourced**).
+
 ## Block programming and episodes per block
 
 **What it is.** Complementary programs air together under one name, grouped by
@@ -98,6 +110,11 @@ next show in the rotation half the time.
 
 **Not expressible today.** `take` is a fixed count; there is no random range
 such as "2 to 4" episodes of one show. Tracked in `etv-station-cyq9`.
+
+**Grade.** Applies when a series airs. The measure is the mean number of
+episodes of one show per visit, ignoring interstitials between them. 2 to 4
+is 3 (the unsourced range above), over 4 up to 6 is 2, over 6 or 1.5 to 2 is
+1, under 1.5 is 0.
 
 ## Stripping, and how deep a show must be to strip
 
@@ -151,6 +168,12 @@ sequencer: "../plugins/daypart-sequencer.rhai"
   restarts on every channel it appears on. Tracked in `etv-station-160`
   (`cursor_scope: global`).
 
+**Grade.** Applies when a show that aired has 75 or more episodes in the
+catalog (three seasons, per Strip programming above). The measure is the
+share of the span's weekdays on which that show starts an episode in its
+most-used weekday hour, taking the best such show. 80% or more is 3, 60% is
+2, 40% is 1, under 40% is 0 (**unsourced**).
+
 ## Episode order
 
 **What it is.** Stations air self-contained shows out of order. Order is more
@@ -182,6 +205,12 @@ it at load.
 
 **Not expressible today.** No key switches a show from in-order to shuffled
 once it has aired through once. Tracked in `etv-station-vc98`.
+
+**Grade.** Applies when a show airs twice from a pool whose `order` is not
+`random`; a random pool shuffles on purpose. The measure is the share of
+steps between consecutive airings of one show that do not go to the next
+episode, or to episode 1 of the next season. 0% is 3, up to 5% is 2, up to
+15% is 1, more is 0 (**unsourced**).
 
 ## Movie slot length and cheap repeats
 
@@ -226,6 +255,9 @@ channel's airtime goes to films versus series cannot be stated directly
 either; it falls out of `take` counts and runtimes. Tracked in
 `etv-station-wi81`.
 
+**Grade.** Not scored: padding a film to its slot is the principle, and the
+station cannot express it yet.
+
 ## Themed and seasonal periods
 
 **What it is.** A network gives part or all of its schedule to a theme for a
@@ -256,6 +288,8 @@ weekly slot such as a Star of the Month night, but not a month.
 **Not expressible today.** A block cannot declare the calendar dates it airs
 on. Tracked in `etv-station-162`.
 
+**Grade.** Not scored until a block can declare its dates.
+
 ## Marathons
 
 **What it is.** A continuous run devoted to one program or franchise
@@ -281,6 +315,9 @@ pattern:
 
 **Not expressible today.** A marathon on a date (New Year's Day,
 Thanksgiving) needs dated blocks. Tracked in `etv-station-162`.
+
+**Grade.** Not scored: a marathon is a choice a channel makes, not a standard
+it meets. The Review view shows the longest run of one show.
 
 ## Interstitials and bumpers
 
@@ -335,6 +372,12 @@ after each program, and the break's length varies with the next start time
 bumpers, rather than airing a fixed count of them, is pad/fallback filler.
 Tracked in `etv-station-85`.
 
+**Grade.** Applies once two programs have aired. An airing under 5 minutes
+counts as an interstitial. The measure is the share of changes from one program to the
+next that have at least one interstitial between them. 90% or more is 3, 50%
+is 2, anything above 0 is 1, none is 0 (**unsourced**). The bug is not
+graded: a schedule does not show it.
+
 ## Rest periods and freshness
 
 **What it is.** A title rests before it airs again. Repeats shown 40 or 100
@@ -371,3 +414,8 @@ because rotation, `advance: resume` and scorer suppression all change it.
 
 **Not expressible today.** Switching a pool's selection on a date, such as a
 new theme each month, needs dated blocks. Tracked in `etv-station-162`.
+
+**Grade.** Applies once a program has aired. The measure is the days until
+any program (an airing of 5 minutes or more) airs a second time, or the whole
+span when nothing repeats; a repeating bumper does not count. 14 days or more
+is 3, 7 is 2 (FAST guidance to refresh weekly, above), 3 is 1, under 3 is 0.

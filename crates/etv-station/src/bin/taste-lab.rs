@@ -1477,6 +1477,8 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
                 .unwrap_or_else(|| "unknown".to_string()),
             show: entry.as_ref().and_then(|e| e.show.clone()),
             show_id: a.show_id.clone(),
+            season: entry.as_ref().and_then(|e| e.season),
+            episode: entry.as_ref().and_then(|e| e.episode),
             pool: drawn_from_pool(a.metadata.as_ref())
                 .unwrap_or_else(|| block_names.get(a.block).cloned().unwrap_or_default()),
             start: a.start,
@@ -1536,6 +1538,45 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         );
     }
 
+    // What the airing inspector shows beside each airing's audit trail: the
+    // catalog fields a pool reads, and a label for every item a trail names
+    // as passed over that never airs in the span (an aired one is labelled
+    // in `airings`), so the page never prints a bare entry id.
+    let ids: Vec<String> = airings.iter().map(|a| a.id.clone()).collect();
+    let genres = state
+        .catalog
+        .tags_for_many(&ids, TagNs::Genre)
+        .map_err(|e| e.to_string())?;
+    let directors = state
+        .catalog
+        .tags_for_many(&ids, TagNs::Director)
+        .map_err(|e| e.to_string())?;
+    let collections = state
+        .catalog
+        .collections_for_many(&ids)
+        .map_err(|e| e.to_string())?;
+    let audits: Vec<Value> = (0..airings.len())
+        .map(|i| etv_station::audit_report::split_audit(simulated[i].metadata.as_ref()).0)
+        .collect();
+    let passed_over: Vec<String> = audits
+        .iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|stage| stage["detail"]["near_misses"].as_array())
+        .flatten()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .filter(|id| !entries.contains_key(id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let titles: HashMap<String, String> = state
+        .catalog
+        .entries_for(&passed_over)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|(id, e)| (id.clone(), airing_label(e)))
+        .collect();
+
     let airings_json: Vec<Value> = airings
         .iter()
         .enumerate()
@@ -1555,6 +1596,12 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
                 "start": a.start.unix_timestamp(),
                 "offset_secs": (a.start - start).whole_seconds(),
                 "duration_secs": a.duration.whole_seconds(),
+                "audit": audits[i],
+                "genres": genres.get(&a.id),
+                "collections": collections.get(&a.id),
+                "directors": directors.get(&a.id),
+                "content_rating": e.and_then(|e| e.content_rating.clone()),
+                "summary": e.and_then(|e| e.summary.clone()),
             })
         })
         .collect();
@@ -1577,6 +1624,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
     obj.insert("since_last".into(), json!(since_last_json));
     obj.insert("notices".into(), json!(notices));
     obj.insert("airings".into(), json!(airings_json));
+    obj.insert("titles".into(), json!(titles));
     obj.insert(
         "day_starts".into(),
         json!(
@@ -1601,9 +1649,11 @@ fn airing_label(e: &CatalogEntry) -> String {
     }
 }
 
-/// The channel's `rule.blocks` written out in words, one clause per block.
-fn pattern_in_words(channel: &config::ChannelConfig) -> String {
-    channel
+/// The channel's `rule.blocks` as the Review page lays them out: per block,
+/// its title and whichever of a daypart sequencer, pattern steps (`take`
+/// null for `take: all`), a plain pool list or a fixed entry count drives it.
+fn blocks_json(channel: &config::ChannelConfig) -> Value {
+    let blocks: Vec<Value> = channel
         .rule
         .blocks
         .iter()
@@ -1613,34 +1663,23 @@ fn pattern_in_words(channel: &config::ChannelConfig) -> String {
                 .program()
                 .and_then(|p| p.title.clone())
                 .unwrap_or_else(|| format!("block {i}"));
-            let body = if let Some(seq) = &b.sequencer {
-                format!(
-                    "daypart sequencer {}",
-                    seq.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                )
-            } else if !b.pattern.is_empty() {
-                let steps: Vec<String> = b
-                    .pattern
-                    .iter()
-                    .map(|s| match s.take.count() {
-                        Some(1) => format!("1 from {}", s.pool),
-                        Some(n) => format!("{n} from {}", s.pool),
-                        None => format!("all of one {} pick", s.pool),
-                    })
-                    .collect();
-                format!("{}, repeating", steps.join(", then "))
-            } else if !b.pools.is_empty() {
-                let pools: Vec<&str> = b.pools.iter().map(|p| p.name.as_str()).collect();
-                format!("pools {}", pools.join(", "))
-            } else {
-                format!("{} fixed entries", b.entries().len())
-            };
-            format!("{name}: {body}")
+            let steps: Vec<Value> = b
+                .pattern
+                .iter()
+                .map(|s| json!({ "pool": s.pool, "take": s.take.count(), "chance": s.chance }))
+                .collect();
+            json!({
+                "name": name,
+                "sequencer": b.sequencer.as_ref()
+                    .and_then(|s| s.file_name())
+                    .map(|n| n.to_string_lossy().into_owned()),
+                "steps": steps,
+                "pools": b.pools.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                "entries": b.entries().len(),
+            })
         })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .collect();
+    json!(blocks)
 }
 
 /// One channel's candidate entry ids, resolved from its config with no
@@ -1873,6 +1912,45 @@ fn build_review(
         .len();
     let overlap = overlap_json(state, station, lc)?;
 
+    let random_order_pools: HashSet<String> = lc
+        .config
+        .rule
+        .blocks
+        .iter()
+        .flat_map(|b| &b.pools)
+        .filter(|p| matches!(p.order, Some(config::Order::Random)))
+        .map(|p| p.name.clone())
+        .collect();
+    let show_ids: Vec<String> = airings
+        .iter()
+        .filter_map(|a| a.show_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let episode_counts = state
+        .catalog
+        .episode_counts_for(&show_ids)
+        .map_err(|e| e.to_string())?;
+    let principles: Vec<Value> = review::grade_principles(&review::GradeInputs {
+        airings,
+        start,
+        end,
+        tz: etv_station::tz::parse(&station.station.tz).map_err(|e| e.to_string())?,
+        random_order_pools: &random_order_pools,
+        episode_counts: &episode_counts,
+    })
+    .into_iter()
+    .map(|p| {
+        json!({
+            "name": p.name,
+            "grade": p.grade,
+            "value": p.value,
+            "measure": p.measure,
+            "not_scored": p.not_scored,
+        })
+    })
+    .collect();
+
     Ok(json!({
         "channel": channel_key(&lc.config_path),
         "config_path": lc.config_path.display().to_string(),
@@ -1884,7 +1962,7 @@ fn build_review(
         "days": days.round() as u32,
         "start": start.unix_timestamp(),
         "end": end.unix_timestamp(),
-        "pattern": pattern_in_words(&lc.config),
+        "blocks": blocks_json(&lc.config),
         "first_repeat": first_repeat,
         "airtime": {
             "total_secs": total,
@@ -1895,6 +1973,7 @@ fn build_review(
         "items_aired": airings.len(),
         "distinct_items": distinct,
         "depth": depth,
+        "principles": principles,
         "overlap": overlap,
         "samples": samples,
     }))
