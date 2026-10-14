@@ -1,0 +1,59 @@
+# Every bead carries at least one of these: the part of the repo the work edits.
+required = ["scheduler", "catalog", "plugins", "overlay", "streaming", "daemon", "channels", "tooling", "ops", "docs"]
+
+[labels.scheduler]
+about = "What airs when: pattern/sequence/resolve/resume/simulate in crates/etv-station, seeds, rotation, dayparts, dated blocks."
+
+[labels.catalog]
+about = "catalog.db and what fills it: Plex and local-fs ingest, schema migrations, reconcile sweep, artwork."
+
+[labels.plugins]
+about = "The Rhai plugin engine, its host functions and ctx, plugin scripts (taste-cosine, endless, sequencers), the vendored plexdb-reader."
+
+[labels.overlay]
+about = "crates/etv-overlay and overlay scripts: Vello rendering, the now/next snipe, logos, block cards, the fifo to ffmpeg."
+
+[labels.streaming]
+about = "vendor/etv-next and what reaches a player: ffmpeg, HLS, transcoding, hardware encode, tracks, subtitles, channel health."
+
+[labels.daemon]
+about = "The etv-station daemon's lifecycle: config load and reload, history.db, .resume sidecars, lineup and XMLTV render."
+
+[labels.channels]
+about = "Channel configs under deploy/appdata/channels and examples/channels, and the programming review of them."
+
+[labels.tooling]
+about = "Developer tools: taste-lab, taste-debug, admin.toml tasks, tools/ scripts, tests, verify-project."
+
+[labels.ops]
+about = "Deploying and running it: Dockerfile, the Unraid container, backups, host config, remote diagnostics."
+
+[labels.docs]
+about = "docs/ (PRD, architecture, schema, programming, ADRs, CONTEXT.md), CLAUDE.md, the VitePress site."
+
+[labels.reliability]
+about = "Something stalls, crashes, goes black or loses state."
+
+[labels.perf]
+about = "The complaint is a number: seconds per generation, memory, CPU, encode speed."
+
+[labels.data]
+about = "A value in a database or playout file is wrong or inconsistent."
+
+[labels.api]
+about = "An HTTP endpoint or a CLI/plugin contract other code depends on."
+
+[labels.ui]
+about = "How a screen looks: taste-lab pages, the EPG TUI, overlay visuals."
+
+[labels.ux]
+about = "How a person moves through a tool or the channel lineup to get something done."
+
+[labels.security]
+about = "What a plugin, page or request can reach; secrets; permissions."
+
+[labels.v2]
+about = "Out of scope for the v1 acceptance bar in docs/PRD.md."
+
+[labels.human]
+about = "Needs a person: a decision, a look at a real screen or device, an account, a manual check."
