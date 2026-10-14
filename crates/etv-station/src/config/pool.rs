@@ -469,9 +469,7 @@ pub struct Pool {
     ///
     /// On a `sequencer` block (#169) this pool's `config:` also reaches the
     /// block's own script, as `ctx.pool_config.<name>` — whether or not this
-    /// pool names a `plugin` of its own. A daypart sequencer's "which hours
-    /// and weekdays does this pool claim" table lives here (#14, ADR 0004),
-    /// reusing this carrier rather than adding a schema field for it.
+    /// pool names a `plugin` of its own.
     ///
     /// **The station never reads it.** It is converted and passed through, and
     /// that is the whole of the contract: nothing here is validated, no key is

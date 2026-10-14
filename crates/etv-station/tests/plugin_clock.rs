@@ -153,6 +153,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                     chance: 1.0,
                 }],
                 cycles: Some(1),
+                schedule: Vec::new(),
                 sequencer: None,
             }],
         },

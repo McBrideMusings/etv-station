@@ -63,7 +63,8 @@ use crate::config::{
 use crate::constrain::{ItemKeys, Limits, RepeatGap};
 use crate::errors::ConfigError;
 use crate::guide::{GuideConfig, GuideFields};
-use crate::resume::{GenerationState, PoolResume, Progress, ResumeMap};
+use crate::pattern::BlockState;
+use crate::resume::{GenerationState, Progress, ResumeMap};
 
 /// A concrete, ordered item ready for duration probing and sequencing. Produced
 /// by [`resolve_channel`] — the post-resolution counterpart to the on-disk
@@ -200,9 +201,10 @@ pub fn resolve_channel(
 /// channel naturally runs" — the stateless callers and the tests.
 ///
 /// `window_start` is the absolute wall-clock instant this generation begins
-/// airing at — the daemon's own `from`, not the tick's "now". A sequencer
-/// block (#169, [`crate::sequence`]) reads it as `ctx.window.from`, which is
-/// what lets a daypart script ask "what hour does this generation start at"
+/// airing at — the daemon's own `from`, not the tick's "now". A `schedule`
+/// block (ADR 0021) starts its clock here, and a sequencer block (#169,
+/// [`crate::sequence`]) reads it as `ctx.window.from`; both ask "what hour
+/// does this generation start at"
 /// rather than "what hour is it while the daemon happens to be computing
 /// this". It also seeds a plugin's `timestamp()`/`elapsed()` clock (see
 /// below) — that is the only other place in the resolve pipeline any clock
@@ -272,7 +274,7 @@ pub fn resolve_channel_with_resume(
     let mut steps: Vec<Step> = Vec::new();
     // Per block: a pool block's `BlockBuild::progress`, empty for an entries
     // block, whose progress is its list position instead.
-    let mut pool_progress: Vec<Vec<BTreeMap<String, PoolResume>>> = Vec::new();
+    let mut pool_progress: Vec<Vec<BlockState>> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
         let BlockItems {
             items: block_items,
@@ -293,6 +295,7 @@ pub fn resolve_channel_with_resume(
             window_start,
             &mut resume_out,
             config.guide.as_ref(),
+            nominal_item_runtime(config),
         )?;
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished
@@ -524,7 +527,7 @@ struct BlockItems {
     steps: Vec<Step>,
     /// A pool block's [`crate::pattern::BlockBuild::progress`]; empty for an
     /// entries block.
-    pool_progress: Vec<BTreeMap<String, PoolResume>>,
+    pool_progress: Vec<BlockState>,
 }
 
 /// Where [`cut_entries_window`] seated the entries list: `start` into a list
@@ -554,7 +557,7 @@ impl EntriesSeat {
 /// side to err on.
 fn progress_per_item(
     steps: &[Step],
-    pool_progress: &[Vec<BTreeMap<String, PoolResume>>],
+    pool_progress: &[Vec<BlockState>],
     seat: Option<EntriesSeat>,
     position_without_entries: usize,
 ) -> Vec<Progress> {
@@ -563,13 +566,16 @@ fn progress_per_item(
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
         let mut pools = BTreeMap::new();
+        let mut schedule = BTreeMap::new();
         for (block, progress) in pool_progress.iter().enumerate() {
             if let Some(at) = progress.get(pool_aired[block]) {
-                pools.extend(at.iter().map(|(k, v)| (k.clone(), v.clone())));
+                pools.extend(at.pools.iter().map(|(k, v)| (k.clone(), v.clone())));
+                schedule.extend(at.schedule.iter().map(|(k, v)| (k.clone(), *v)));
             }
         }
         out.push(Progress {
             pools,
+            schedule,
             position: seat.map_or(position_without_entries, |s| s.position(entries_aired)),
         });
         match *step {
@@ -998,6 +1004,7 @@ fn resolve_block(
     window_start: OffsetDateTime,
     resume_out: &mut ResumeMap,
     channel_guide: Option<&GuideConfig>,
+    nominal: Duration,
 ) -> Result<BlockItems, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
@@ -1030,20 +1037,37 @@ fn resolve_block(
             inputs: scoring,
             base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
         };
-        let build = crate::pattern::build(
-            cat,
-            &include.pools,
-            groups,
-            &include.pattern,
-            include.cycles,
-            include.constraints.as_ref(),
-            state,
-            seed,
-            score_env,
-            fill,
-        )
+        let build = if include.schedule.is_empty() {
+            crate::pattern::build(
+                cat,
+                &include.pools,
+                groups,
+                &include.pattern,
+                include.cycles,
+                include.constraints.as_ref(),
+                state,
+                seed,
+                score_env,
+                fill,
+            )
+        } else {
+            crate::pattern::build_scheduled(
+                cat,
+                &include.pools,
+                groups,
+                &include.schedule,
+                window_start.unix_timestamp(),
+                nominal,
+                include.constraints.as_ref(),
+                state,
+                seed,
+                score_env,
+                fill,
+            )
+        }
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(build.resume.clone());
+        resume_out.schedule.extend(build.schedule.clone());
 
         return resolve_pool_block_items(
             cat,
@@ -1253,6 +1277,7 @@ fn resolve_pool_block_items(
     let crate::pattern::BlockBuild {
         ids,
         resume: _,
+        schedule: _,
         progress,
         metadata,
         guides: pool_guides,
@@ -1930,6 +1955,7 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
+            schedule: Vec::new(),
             sequencer: None,
             mode: Mode::All,
             order: Some(Order::Manual),

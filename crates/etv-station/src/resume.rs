@@ -43,6 +43,12 @@ pub struct ResumeMap {
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
 
+    /// Where each `schedule:` entry of a scheduled block stands in its own
+    /// pattern (ADR 0021), keyed by entry name — so an entry that goes off air
+    /// at 06:00 continues its pattern from the same step when it comes back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schedule: BTreeMap<String, ScheduleResume>,
+
     /// How far into a channel's entries list the next generation starts
     /// (#118). For a channel with no pattern block, that list is every block
     /// concatenated in config order. A channel that mixes a pattern block
@@ -123,6 +129,8 @@ pub struct Checkpoint {
     pub start: OffsetDateTime,
     #[serde(default)]
     pub pools: BTreeMap<String, PoolResume>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schedule: BTreeMap<String, ScheduleResume>,
     /// Where the authored list stood entering that generation. Restored by the
     /// rewinds below, so a config edit re-emits the same items rather than
     /// jumping the cursor past a span it just threw away.
@@ -136,7 +144,18 @@ pub struct Checkpoint {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Progress {
     pub pools: BTreeMap<String, PoolResume>,
+    pub schedule: BTreeMap<String, ScheduleResume>,
     pub position: usize,
+}
+
+/// One `schedule:` entry's place in its own pattern: the cycle it is on, and
+/// the step that runs next.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleResume {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cycle: u64,
+    #[serde(default, skip_serializing_if = "is_start")]
+    pub step: usize,
 }
 
 /// One pool's resume state.
@@ -173,6 +192,7 @@ impl ResumeMap {
         Self {
             version: CURRENT_VERSION,
             pools: BTreeMap::new(),
+            schedule: BTreeMap::new(),
             position: 0,
             checkpoints: Vec::new(),
             config_id: None,
@@ -184,7 +204,7 @@ impl ResumeMap {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty() && self.position == 0
+        self.pools.is_empty() && self.schedule.is_empty() && self.position == 0
     }
 
     /// Record the state entering a generation that begins at `start`, along
@@ -195,6 +215,7 @@ impl ResumeMap {
         self.checkpoints.push(Checkpoint {
             start,
             pools: self.pools.clone(),
+            schedule: self.schedule.clone(),
             position: self.position,
         });
     }
@@ -206,13 +227,16 @@ impl ResumeMap {
     pub fn checkpoint_at(&mut self, start: OffsetDateTime, progress: &Progress) {
         if let Some(last) = self.checkpoints.last()
             && (last.start >= start
-                || (last.pools == progress.pools && last.position == progress.position))
+                || (last.pools == progress.pools
+                    && last.schedule == progress.schedule
+                    && last.position == progress.position))
         {
             return;
         }
         self.checkpoints.push(Checkpoint {
             start,
             pools: progress.pools.clone(),
+            schedule: progress.schedule.clone(),
             position: progress.position,
         });
     }
@@ -237,6 +261,7 @@ impl ResumeMap {
         let idx = self.checkpoints.iter().rposition(|c| c.start <= instant)?;
         let cp = self.checkpoints[idx].clone();
         self.pools = cp.pools;
+        self.schedule = cp.schedule;
         self.position = cp.position;
         self.checkpoints.truncate(idx);
         Some(cp.start)
@@ -451,6 +476,7 @@ mod tests {
         map.checkpoint(at(0));
         let step = |next: &str, position| Progress {
             pools: pools_with(next),
+            schedule: BTreeMap::new(),
             position,
         };
         map.checkpoint_at(at(1), &step("e1", 1));

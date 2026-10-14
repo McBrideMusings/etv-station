@@ -16,7 +16,7 @@ page is a pass/fail threshold.
 The keys named below are documented in the [config schema](/schema), except
 `chance` and `from` on a pattern step, which the schema page does not cover yet;
 `crates/etv-station/src/config/pool.rs` defines both.
-Every YAML example is a fragment. `pools:`, `pattern:` and `sequencer:` sit
+Every YAML example is a fragment. `pools:`, `pattern:`, `schedule:` and `sequencer:` sit
 inside one entry of `rule.blocks`, as the first example shows in full.
 
 "Depth" on this page has the meaning in the [glossary](/CONTEXT#depth): how
@@ -32,30 +32,31 @@ to whoever is watching at that hour
 **Network example.** Daytime shows aim at the audience that is home during the
 day; prime time aims at the whole household (same source).
 
-**In `channel.yaml` today.** One block whose pools are the dayparts, arranged
-by the daypart sequencer. Each pool claims its hours in its own `config:`; the
-pool with no hours fills every hour nobody claims. Hours are local to the
-station's `tz`.
+**In `channel.yaml` today.** One pattern block with a `schedule:`. Each entry
+names the local hours it claims and carries its own `pattern` over the block's
+pools; the entry with no `hours` fills every hour nobody claims. Hours are
+local to the station's `tz`.
 
 ```yaml
 rule:
   blocks:
     - pools:
+        - { name: films, expr: 'item.type == "movie"', rotate: visit, advance: resume }
+        - { name: cartoons, expr: 'item.show in ["Rick and Morty", "The Boondocks"]', order: "season:asc,episode:asc", rotate: visit, advance: resume }
+      schedule:
         - name: latenight
-          expr: 'item.show in ["Rick and Morty", "The Boondocks"]'
-          config: { hour_start: 21, hour_end: 6 }
-        - name: default
-          expr: 'item.type == "movie"'
-      sequencer: "../plugins/daypart-sequencer.rhai"
+          hours: { start: 21, end: 6 }
+          pattern:
+            - { pool: cartoons, take: 3 }
+        - name: daytime
+          pattern:
+            - { pool: films, take: 1 }
 ```
 
-The sample script is `examples/plugins/daypart-sequencer.rhai`. Daypart
-boundaries drift by the overrun of the last item rather than cutting it
-([schema, Dayparting](/schema#dayparting-14)).
-
-**Not expressible today.** A daypart pool cannot resume a show where it left
-off: every generation restarts it at the top of its list. Tracked in
-`etv-station-199`.
+Each entry keeps its own place in its pattern, and each show its own episode,
+so a late-night run continues the next night where it stopped. A run that
+crosses a boundary airs whole, and the next entry starts late by the overrun
+([schema, Block `schedule`](/schema#block-schedule-—-a-different-pattern-by-the-hour-adr-0021)).
 
 ## Block programming and episodes per block
 
@@ -128,28 +129,36 @@ single-show channel against 20 weeks (140 days) stripped, about 45 times
 faster. Half-hour sitcoms (about 22 minutes) go about 65 a day, so the same
 100 episodes last about a day and a half.
 
-**In `channel.yaml` today.** A daypart pool restricted to weekday hours.
-Dayparts are whole hours, and the pool fills its hour: an hour-long drama airs
-about one episode a weekday, and a half-hour sitcom would air two or three.
+**In `channel.yaml` today.** A `schedule` entry restricted to weekday hours.
+Entries are whole hours, and the walker starts another visit whenever its clock
+is still inside the hour: with `take: 1`, a 44-minute drama airs at 18:00 and
+18:44 and runs to 19:28, and a 22-minute sitcom airs three.
 
 ```yaml
 pools:
   - name: strip
     expr: 'item.show == "The X-Files"'
     order: "season:asc,episode:asc"
-    config: { hour_start: 18, hour_end: 19, weekdays: [mon, tue, wed, thu, fri] }
-  - name: default
+    rotate: visit
+    advance: resume
+  - name: films
     expr: 'item.type == "movie"'
-sequencer: "../plugins/daypart-sequencer.rhai"
+schedule:
+  - name: strip
+    hours: { start: 18, end: 19 }
+    weekdays: [mon, tue, wed, thu, fri]
+    pattern:
+      - { pool: strip, take: 1 }
+  - name: rest
+    pattern:
+      - { pool: films, take: 1 }
 ```
 
-**Not expressible today.**
+The strip continues from the episode it last aired each weekday.
 
-- The strip does not resume across generations: each generation starts the
-  show again from its first episode. Tracked in `etv-station-199`.
-- A show that strips on two channels keeps a separate place on each, so it
-  restarts on every channel it appears on. Tracked in `etv-station-160`
-  (`cursor_scope: global`).
+**Not expressible today.** A show that strips on two channels keeps a separate
+place on each, so it restarts on every channel it appears on. Tracked in
+`etv-station-160` (`cursor_scope: global`).
 
 ## Episode order
 
@@ -251,7 +260,7 @@ the February sweeps
 
 **In `channel.yaml` today.** A theme can only be a standing block: a pool
 whose `expr` selects the theme (`item.collections.contains("Christmas")`)
-airs all year, not for a date range. A daypart pool's `weekdays:` covers a
+airs all year, not for a date range. A `schedule` entry's `weekdays:` covers a
 weekly slot such as a Star of the Month night, but not a month.
 
 **Not expressible today.** A block cannot declare the calendar dates it airs

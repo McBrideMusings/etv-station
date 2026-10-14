@@ -8,8 +8,8 @@
 //!
 //! See ADR 0002 for why a pool's items cross the boundary as full item maps
 //! rather than bare ids (the same marshalling a scorer's `ctx.sets` already
-//! uses — [`crate::score::load_items`]), and ADR 0004 for why wall-clock
-//! dayparting lives here rather than at channel composition.
+//! uses — [`crate::score::load_items`]). Switching patterns by the hour is not
+//! a sequencer's job: a pattern block's `schedule:` does it (ADR 0021).
 //!
 //! # The contract
 //!
@@ -27,10 +27,7 @@
 //!     //                          title, duration_ms, show, season, tags, …)
 //!     // ctx.pool_config.<name> — that pool's own `config:` block, passed
 //!     //                          through unread, same as a scorer's
-//!     //                          `ctx.config` (empty map when unset) — a
-//!     //                          daypart script's "which hours/weekdays does
-//!     //                          this pool claim" table lives here, not in
-//!     //                          the schema (#14, ADR 0004)
+//!     //                          `ctx.config` (empty map when unset)
 //!     // ctx.window.from        — unix seconds this generation begins airing
 //!     // ctx.window.fill_secs   — how many seconds of airtime this
 //!     //                          generation should cover, or () when
@@ -42,10 +39,9 @@
 //!     // ctx.now                — unix seconds at generation time
 //!
 //!     // local_time(unix_secs) -> #{ weekday, hour, minute } — the station's
-//!     // configured tz (ADR 0004) applied to any unix-second instant, not
-//!     // just ctx.window.from: a daypart script walks its own cursor forward
-//!     // by each item's duration and re-reads the clock at the new instant to
-//!     // find the next boundary. `weekday` is one of "mon".."sun"; `hour` is
+//!     // configured tz applied to any unix-second instant, not just
+//!     // ctx.window.from: a script can walk its own cursor forward by each
+//!     // item's duration and re-read the clock at the new instant. `weekday` is one of "mon".."sun"; `hour` is
 //!     // 0-23; both roll on the same local-midnight grid `chunk_hours` does.
 //!     // Global function, not a ctx field — registered on the engine this
 //!     // script runs under, nowhere else.
@@ -89,7 +85,7 @@ use crate::guide::GuideConfig;
 pub use crate::pattern::BlockBuild;
 use crate::resume::{GenerationState, PoolResume};
 
-/// The window bounds a sequencer script sees (ADR 0004).
+/// The window bounds a sequencer script sees.
 #[derive(Debug, Clone, Copy)]
 pub struct Window {
     /// Unix seconds this generation begins airing at — the same `from` the
@@ -242,14 +238,18 @@ pub fn build(
     };
     let mut last_series: HashMap<usize, usize> = HashMap::new();
     let mut progress = Vec::with_capacity(arranged.len() + 1);
+    let state_after = |last_series: &HashMap<usize, usize>| crate::pattern::BlockState {
+        pools: resume_after(last_series),
+        schedule: BTreeMap::new(),
+    };
     for id in &arranged {
-        progress.push(resume_after(&last_series));
+        progress.push(state_after(&last_series));
         if let Some(&(pool_idx, si)) = item_location.get(id) {
             last_series.insert(pool_idx, si);
         }
     }
     let resume_out = resume_after(&last_series);
-    progress.push(resume_out.clone());
+    progress.push(state_after(&last_series));
 
     // The metadata half of what plugin pools picked (#166) — `arrange()` sees
     // a pool's `pick()` record only as the bare `entry_id`s in `ctx.pools`,
@@ -282,6 +282,7 @@ pub fn build(
     Ok(BlockBuild {
         ids: arranged,
         resume: resume_out,
+        schedule: BTreeMap::new(),
         progress,
         metadata: metadata_out,
         guides: guide_out,
@@ -304,7 +305,7 @@ fn call_arrange(
 ) -> Result<Vec<String>, String> {
     let source = std::fs::read_to_string(sequencer)
         .map_err(|e| format!("read sequencer plugin {}: {e}", sequencer.display()))?;
-    // The station's configured tz (ADR 0004), or UTC at the stateless entry
+    // The station's configured tz, or UTC at the stateless entry
     // points that carry no station config — see the doc note on
     // `ScoreInputs::tz`. Baked into `local_time` via closure rather than
     // threaded through `ctx`, so a script reads the clock at any instant it
@@ -378,8 +379,8 @@ fn call_arrange(
 }
 
 /// `local_time(unix_secs)` — the Rhai global function registered onto the
-/// engine every `arrange()` call runs under (ADR 0004). Converts any
-/// unix-second instant to the station's configured tz, so a daypart script
+/// engine every `arrange()` call runs under. Converts any
+/// unix-second instant to the station's configured tz, so a script
 /// can re-read the clock at a cursor it has advanced by summed item
 /// durations, not only at `ctx.window.from`.
 ///
@@ -590,9 +591,9 @@ fn arrange(ctx) {
         assert_eq!(ids, vec!["mov-2", "mov-1"]);
     }
 
-    /// The item maps carry duration — the ADR 0004 fact a daypart sequencer
-    /// needs to fit items against a clock boundary, and #169 decision 1's
-    /// whole reason bare ids were rejected.
+    /// The item maps carry duration — what a script needs to fit items
+    /// against a clock boundary, and #169 decision 1's whole reason bare ids
+    /// were rejected.
     #[test]
     fn item_maps_carry_duration_and_window_carries_the_clock() {
         let dir = tempfile::tempdir().unwrap();
@@ -923,8 +924,7 @@ fn arrange(ctx) {
 
     /// A pool's `config:` block reaches the script as `ctx.pool_config.<name>`
     /// — the existing generic pool carrier (ADR 0002), not a new schema
-    /// field, doubling as where a daypart script's hour/weekday table lives
-    /// (#14, ADR 0004).
+    /// field.
     #[test]
     fn pool_config_reaches_arrange_as_ctx_pool_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -997,9 +997,8 @@ fn arrange(ctx) {
     }
 
     /// `local_time()` resolves against the station's configured tz
-    /// (`ScoreInputs::tz`), not UTC — the fact a daypart script depends on to
-    /// place its pools against the local clock rather than whatever zone the
-    /// generation happened to run in (#14, ADR 0004).
+    /// (`ScoreInputs::tz`), not UTC — so a script reads the local clock
+    /// rather than whatever zone the generation happened to run in.
     #[test]
     fn local_time_resolves_in_the_stations_configured_tz() {
         let dir = tempfile::tempdir().unwrap();

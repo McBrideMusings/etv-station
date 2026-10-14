@@ -132,6 +132,7 @@ fn channel(plugin: &Path) -> ChannelConfig {
                     chance: 1.0,
                 }],
                 cycles: None,
+                schedule: Vec::new(),
                 sequencer: None,
             }],
         },
@@ -151,6 +152,7 @@ fn history_carries_forward_so_no_title_repeats_before_every_title_has_aired() {
         None,
         4,
         datetime!(2026-01-01 00:00 UTC),
+        None,
     )
     .unwrap();
 
@@ -193,6 +195,7 @@ fn each_generation_is_asked_for_a_chunks_worth_of_items() {
         None,
         1,
         datetime!(2026-01-01 00:00 UTC),
+        None,
     )
     .unwrap();
 

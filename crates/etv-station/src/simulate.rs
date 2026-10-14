@@ -20,8 +20,7 @@
 //! drained-pool refill all run as they do on air. What is not modelled: file
 //! probing (an item's length is the catalog's `duration_ms`, or the channel's
 //! `nominal_item_secs` when the catalog has none), error cards, the Tautulli
-//! feed behind `ctx.history`, the station time zone (a `sequencer` block reads
-//! UTC here), the station's identity roots and path index (a manual `local`
+//! feed behind `ctx.history`, the station's identity roots and path index (a manual `local`
 //! item keeps its own id), and a channel's `anchor` join on the first
 //! generation.
 //!
@@ -116,7 +115,9 @@ impl Ledger {
 /// `start`, and return every generation it laid down.
 ///
 /// `config_path` is the channel file's path: relative `plugin:` paths resolve
-/// against its directory, as they do in the daemon.
+/// against its directory, as they do in the daemon. `tz` is the station's
+/// zone, which a `schedule` block and a sequencer's `local_time()` read the
+/// hour in; `None` reads UTC.
 pub fn simulate(
     config: &ChannelConfig,
     config_path: &Path,
@@ -124,6 +125,7 @@ pub fn simulate(
     account_id: Option<i64>,
     days: u32,
     start: OffsetDateTime,
+    tz: Option<&'static time_tz::Tz>,
 ) -> Result<Simulation, String> {
     let recent_depth = config
         .scoring
@@ -170,6 +172,7 @@ pub fn simulate(
                 recent: ledger.tail(recent_depth),
                 now: now.unix_timestamp(),
                 account_id,
+                tz,
                 ..Default::default()
             };
             let (mut items, resume_out, _progress) = resolve_channel_with_resume(

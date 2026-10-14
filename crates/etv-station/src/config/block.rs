@@ -5,6 +5,7 @@ use super::constraints::Constraints;
 use super::entry::{Entry, Fallback};
 use super::overlay::OverlayDecl;
 use super::pool::{PatternStep, Pool};
+use super::schedule::ScheduleEntry;
 use crate::guide::GuideConfig;
 
 /// Within-block duplicate policy (#46 locked decision). Block-scoped:
@@ -76,6 +77,11 @@ pub struct BlockFile {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycles: Option<usize>,
+
+    /// Clock form (ADR 0021): one pattern per named stretch of local hours,
+    /// in place of `pattern`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule: Vec<ScheduleEntry>,
 
     /// Sequencer form (#169): a plugin script that draws this block's
     /// timeline from `pools` itself, instead of walking `pattern`. Path is

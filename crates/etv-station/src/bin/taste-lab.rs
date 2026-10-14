@@ -919,7 +919,10 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
         .session
         .as_ref()
         .ok_or_else(|| "no channel selected".to_string())?;
-    let result = simulate_schedule(&state.catalog, session);
+    let tz = config::read_station(&state.review.station_path)
+        .ok()
+        .and_then(|station| etv_station::tz::parse(&station.tz).ok());
+    let result = simulate_schedule(&state.catalog, session, tz);
     let session = state.session.as_mut().expect("checked above");
     match result {
         Ok(schedule) => {
@@ -944,7 +947,11 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
 /// block, a film is a "single". Pool and block come from the airing's own
 /// `select` audit stage and `block` index, not from a second reading of the
 /// pattern.
-fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>, String> {
+fn simulate_schedule(
+    catalog: &Catalog,
+    session: &Session,
+    tz: Option<&'static time_tz::Tz>,
+) -> Result<Vec<Value>, String> {
     let mut config: config::ChannelConfig = serde_json::from_value(session.config_json.clone())
         .map_err(|e| format!("channel config: {e}"))?;
     for block in &mut config.rule.blocks {
@@ -983,6 +990,7 @@ fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>,
         session.account_id,
         session.days,
         start,
+        tz,
     )?;
 
     let mut out = Vec::new();
@@ -1436,6 +1444,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         account_id,
         days,
         start,
+        Some(tz),
     )?;
 
     let block_names: Vec<String> = lc
@@ -1505,13 +1514,6 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .map(|s| s.nominal_item_secs)
         .unwrap_or_else(|| config::ScoringConfig::default().nominal_item_secs);
     let mut notices = Vec::new();
-    let station_is_utc = matches!(station.station.tz.as_str(), "UTC" | "Etc/UTC");
-    if !station_is_utc && lc.config.rule.blocks.iter().any(|b| b.is_sequencer()) {
-        notices.push(format!(
-            "A sequencer block reads UTC here, not {}, so its dayparts run shifted by the zone offset.",
-            station.station.tz
-        ));
-    }
     let unprobed = airings
         .iter()
         .filter(|a| {
@@ -1615,22 +1617,27 @@ fn pattern_in_words(channel: &config::ChannelConfig) -> String {
                 .unwrap_or_else(|| format!("block {i}"));
             let body = if let Some(seq) = &b.sequencer {
                 format!(
-                    "daypart sequencer {}",
+                    "sequencer {}",
                     seq.file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default()
                 )
             } else if !b.pattern.is_empty() {
-                let steps: Vec<String> = b
-                    .pattern
+                format!("{}, repeating", steps_in_words(&b.pattern))
+            } else if !b.schedule.is_empty() {
+                let entries: Vec<String> = b
+                    .schedule
                     .iter()
-                    .map(|s| match s.take.count() {
-                        Some(1) => format!("1 from {}", s.pool),
-                        Some(n) => format!("{n} from {}", s.pool),
-                        None => format!("all of one {} pick", s.pool),
+                    .map(|e| {
+                        let when = match e.hours {
+                            Some(h) => format!("{:02}–{:02}", h.start, h.end),
+                            None if e.is_default() => "otherwise".to_string(),
+                            None => "all day".to_string(),
+                        };
+                        format!("{} ({when}): {}", e.name, steps_in_words(&e.pattern))
                     })
                     .collect();
-                format!("{}, repeating", steps.join(", then "))
+                format!("schedule — {}", entries.join("; "))
             } else if !b.pools.is_empty() {
                 let pools: Vec<&str> = b.pools.iter().map(|p| p.name.as_str()).collect();
                 format!("pools {}", pools.join(", "))
@@ -1641,6 +1648,18 @@ fn pattern_in_words(channel: &config::ChannelConfig) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// One pattern's steps in words: "1 from movies, then 3 from shows".
+fn steps_in_words(steps: &[config::PatternStep]) -> String {
+    steps
+        .iter()
+        .map(|s| match s.take.count() {
+            Some(n) => format!("{n} from {}", s.pool),
+            None => format!("all of one {} pick", s.pool),
+        })
+        .collect::<Vec<_>>()
+        .join(", then ")
 }
 
 /// One channel's candidate entry ids, resolved from its config with no

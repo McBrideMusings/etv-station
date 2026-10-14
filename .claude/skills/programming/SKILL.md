@@ -1,6 +1,6 @@
 ---
 name: programming
-description: "Load before editing any channel.yaml under deploy/appdata/channels/ or examples/channels/ (pools, blocks, pattern, sequencer, dayparts, rest periods), and before reviewing or judging a channel's schedule. Points at docs/programming.md for the principles and runs the taste-lab Review view before and after the edit."
+description: "Load before editing any channel.yaml under deploy/appdata/channels/ or examples/channels/ (pools, blocks, pattern, schedule, sequencer, dayparts, rest periods), and before reviewing or judging a channel's schedule. Points at docs/programming.md for the principles and runs the taste-lab Review view before and after the edit."
 user_invocable: true
 ---
 
