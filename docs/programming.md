@@ -180,8 +180,9 @@ pattern step. A subcycle: a narrower `expr` on the pool
 does the same on an entries block only; a pattern or sequencer block rejects
 it at load.
 
-**Not expressible today.** No key switches a show from in-order to shuffled
-once it has aired through once. Tracked in `etv-station-vc98`.
+**Review question.** Is each show on the channel self-contained (a sitcom, a
+procedural, a format show), which can air in any order, or narrative (a
+serialized drama), which needs broadcast order?
 
 ## Movie slot length and cheap repeats
 
