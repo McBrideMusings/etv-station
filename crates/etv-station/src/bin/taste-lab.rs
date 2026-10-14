@@ -919,7 +919,10 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
         .session
         .as_ref()
         .ok_or_else(|| "no channel selected".to_string())?;
-    let result = simulate_schedule(&state.catalog, session);
+    let tz = config::read_station(&state.review.station_path)
+        .ok()
+        .and_then(|station| etv_station::tz::parse(&station.tz).ok());
+    let result = simulate_schedule(&state.catalog, session, tz);
     let session = state.session.as_mut().expect("checked above");
     match result {
         Ok(schedule) => {
@@ -944,7 +947,11 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
 /// block, a film is a "single". Pool and block come from the airing's own
 /// `select` audit stage and `block` index, not from a second reading of the
 /// pattern.
-fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>, String> {
+fn simulate_schedule(
+    catalog: &Catalog,
+    session: &Session,
+    tz: Option<&'static time_tz::Tz>,
+) -> Result<Vec<Value>, String> {
     let mut config: config::ChannelConfig = serde_json::from_value(session.config_json.clone())
         .map_err(|e| format!("channel config: {e}"))?;
     for block in &mut config.rule.blocks {
@@ -983,6 +990,7 @@ fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>,
         session.account_id,
         session.days,
         start,
+        tz,
     )?;
 
     let mut out = Vec::new();
@@ -1436,6 +1444,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         account_id,
         days,
         start,
+        Some(tz),
     )?;
 
     let block_names: Vec<String> = lc
@@ -1507,13 +1516,6 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .map(|s| s.nominal_item_secs)
         .unwrap_or_else(|| config::ScoringConfig::default().nominal_item_secs);
     let mut notices = Vec::new();
-    let station_is_utc = matches!(station.station.tz.as_str(), "UTC" | "Etc/UTC");
-    if !station_is_utc && lc.config.rule.blocks.iter().any(|b| b.is_sequencer()) {
-        notices.push(format!(
-            "A sequencer block reads UTC here, not {}, so its dayparts run shifted by the zone offset.",
-            station.station.tz
-        ));
-    }
     let unprobed = airings
         .iter()
         .filter(|a| {
@@ -1650,8 +1652,9 @@ fn airing_label(e: &CatalogEntry) -> String {
 }
 
 /// The channel's `rule.blocks` as the Review page lays them out: per block,
-/// its title and whichever of a daypart sequencer, pattern steps (`take`
-/// null for `take: all`), a plain pool list or a fixed entry count drives it.
+/// its title and whichever of a daypart sequencer, pattern steps, an
+/// hour-switched schedule of patterns, a plain pool list or a fixed entry
+/// count drives it. A step's `take` is `[min, max]`, `null` for `take: all`.
 fn blocks_json(channel: &config::ChannelConfig) -> Value {
     let blocks: Vec<Value> = channel
         .rule
@@ -1663,23 +1666,41 @@ fn blocks_json(channel: &config::ChannelConfig) -> Value {
                 .program()
                 .and_then(|p| p.title.clone())
                 .unwrap_or_else(|| format!("block {i}"));
-            let steps: Vec<Value> = b
-                .pattern
+            let schedule: Vec<Value> = b
+                .schedule
                 .iter()
-                .map(|s| json!({ "pool": s.pool, "take": s.take.count(), "chance": s.chance }))
+                .map(|e| {
+                    json!({
+                        "name": e.name,
+                        "hours": e.hours.map(|h| [h.start, h.end]),
+                        "weekdays": e.weekdays,
+                        "default": e.is_default(),
+                        "steps": steps_json(&e.pattern),
+                    })
+                })
                 .collect();
             json!({
                 "name": name,
                 "sequencer": b.sequencer.as_ref()
                     .and_then(|s| s.file_name())
                     .map(|n| n.to_string_lossy().into_owned()),
-                "steps": steps,
+                "steps": steps_json(&b.pattern),
+                "schedule": schedule,
                 "pools": b.pools.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
                 "entries": b.entries().len(),
             })
         })
         .collect();
     json!(blocks)
+}
+
+/// One pattern's steps: pool, `take` as `[min, max]` (`null` for `all`), and
+/// the step's `chance`.
+fn steps_json(steps: &[config::PatternStep]) -> Vec<Value> {
+    steps
+        .iter()
+        .map(|s| json!({ "pool": s.pool, "take": s.take.bounds(), "chance": s.chance }))
+        .collect()
 }
 
 /// One channel's candidate entry ids, resolved from its config with no

@@ -152,7 +152,7 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         recent: Vec::new(),
         now: OffsetDateTime::now_utc().unix_timestamp(),
         // Same station tz a real generation hands a sequencer block — a
-        // daypart script that reads `local_time()` is exactly the kind of
+        // script that reads `local_time()` is exactly the kind of
         // wall-clock read this check exists to catch, so both passes need the
         // real zone rather than the UTC fallback.
         tz: Some(crate::tz::parse(&station.station.tz)?),
@@ -163,10 +163,10 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         account_id: None,
     };
     // Read once and handed to both passes, for the same reason `now` is: a
-    // sequencer block (#169) reads this as `ctx.window.from`, so a daypart
+    // sequencer block (#169) reads this as `ctx.window.from`, so a
     // script asks what hour the generation starts at. Reading the clock
     // separately per pass would straddle an hour boundary now and then and
-    // report a correct daypart script as non-reproducible.
+    // report a correct clock-reading script as non-reproducible.
     let window_start = OffsetDateTime::now_utc();
 
     let a = generate_once(
@@ -383,6 +383,7 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
+            schedule: Vec::new(),
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
@@ -422,6 +423,7 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
+            schedule: Vec::new(),
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
@@ -485,6 +487,7 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
+            schedule: Vec::new(),
             mode: Mode::All,
             order: Some(Order::Random),
             filter: None,
@@ -687,6 +690,7 @@ fn audit(ctx, picks, workspace) {
                 chance: 1.0,
             }],
             cycles: Some(1),
+            schedule: Vec::new(),
             mode: Mode::All,
             order: None,
             filter: None,

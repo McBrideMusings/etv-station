@@ -390,10 +390,17 @@ function render(d) {
 }
 
 // The channel's blocks in one line: what the masthead stub shows, in full on hover.
+// A step's take: `[min, max]`, null for `take: all`.
+const takeText = (t) => (t == null ? 'all' : t[0] === t[1] ? String(t[0]) : `${t[0]}-${t[1]}`);
+const stepsWords = (steps) => steps.map((s) => (s.take == null ? `all of one ${s.pool} pick` : `${takeText(s.take)} from ${s.pool}`)).join(', then ');
+const hoursText = (e) => (e.hours ? `${String(e.hours[0]).padStart(2, '0')}–${String(e.hours[1]).padStart(2, '0')}` : e.default ? 'otherwise' : 'all day')
+  + (e.weekdays && e.weekdays.length ? ` ${e.weekdays.join(' ')}` : '');
+
 function patternWords(blocks) {
   return blocks.map((b) => {
     const body = b.sequencer ? `daypart sequencer ${b.sequencer}`
-      : b.steps.length ? `${b.steps.map((s) => (s.take == null ? `all of one ${s.pool} pick` : `${s.take} from ${s.pool}`)).join(', then ')}, repeating`
+      : b.steps.length ? `${stepsWords(b.steps)}, repeating`
+      : b.schedule.length ? `schedule — ${b.schedule.map((e) => `${e.name} (${hoursText(e)}): ${stepsWords(e.steps)}`).join('; ')}`
       : b.pools.length ? `pools ${b.pools.join(', ')}`
       : `${b.entries} fixed entries`;
     return `${b.name}: ${body}`;
@@ -414,14 +421,14 @@ function patternPanel(d, colors) {
     return `<td><span class="swatch" style="background:${colors[pool] || '#ccc'}"></span>${esc(pool)}</td>
       <td class="num">${t.n}</td><td class="num">${Math.round((t.secs / total) * 100)}%</td>`;
   };
+  const stepsTable = (steps) => `<table class="steps"><thead><tr><th class="num">#</th><th class="num">Take</th><th>Pool</th><th class="num">Aired</th><th class="num">Airtime</th></tr></thead><tbody>
+    ${steps.map((s, i) => `<tr><td class="num">${i + 1}</td><td class="num">${takeText(s.take)}${s.chance < 1 ? ` · ${Math.round(s.chance * 100)}%` : ''}</td>${poolCells(s.pool)}</tr>`).join('')}
+    </tbody></table><p class="muted">Repeats from step 1 after step ${steps.length}. A pool on two steps counts its airings once.</p>`;
   const blocks = d.blocks.map((b) => {
     let rows;
     if (b.sequencer) rows = `<p class="muted">Daypart sequencer ${esc(b.sequencer)} over pools ${esc(b.pools.join(', '))}.</p>`;
-    else if (b.steps.length) {
-      rows = `<table class="steps"><thead><tr><th class="num">#</th><th class="num">Take</th><th>Pool</th><th class="num">Aired</th><th class="num">Airtime</th></tr></thead><tbody>
-        ${b.steps.map((s, i) => `<tr><td class="num">${i + 1}</td><td class="num">${s.take == null ? 'all' : s.take}${s.chance < 1 ? ` · ${Math.round(s.chance * 100)}%` : ''}</td>${poolCells(s.pool)}</tr>`).join('')}
-        </tbody></table><p class="muted">Repeats from step 1 after step ${b.steps.length}. A pool on two steps counts its airings once.</p>`;
-    } else if (b.pools.length) rows = `<table class="steps"><tbody>${b.pools.map((p) => `<tr>${poolCells(p)}</tr>`).join('')}</tbody></table>`;
+    else if (b.steps.length) rows = stepsTable(b.steps);
+    else if (b.schedule.length) rows = b.schedule.map((e) => `<p><b>${esc(e.name)}</b> <span class="muted">${esc(hoursText(e))}</span></p>${stepsTable(e.steps)}`).join(''); else if (b.pools.length) rows = `<table class="steps"><tbody>${b.pools.map((p) => `<tr>${poolCells(p)}</tr>`).join('')}</tbody></table>`;
     else rows = `<p class="muted">${b.entries} fixed entries.</p>`;
     return `<h4>${esc(b.name)}</h4>${rows}`;
   }).join('');

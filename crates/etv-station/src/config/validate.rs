@@ -7,7 +7,7 @@ use super::channel::{ChannelConfig, TasteScope};
 use super::constraints::{Constraints, NoRepeatWithin};
 use super::entry::Entry;
 use super::order::Order;
-use super::pool::{DatastoreGrant, Pool, Rotate, ShowGroup, Take, TakeFrom};
+use super::pool::{DatastoreGrant, PatternStep, Pool, Rotate, ShowGroup, Take, TakeFrom};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
@@ -131,6 +131,25 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     // whole channel — that is what lets the sidecar survive blocks being
     // reordered without a block index in the key.
     let mut pool_names: HashSet<&str> = HashSet::new();
+
+    // A scheduled block reads the clock from where the generation starts, and
+    // every other block is laid in the same generation ahead of or behind it,
+    // so it would read the wrong hour.
+    if channel.rule.blocks.len() > 1
+        && let Some(idx) = channel
+            .rule
+            .blocks
+            .iter()
+            .position(|b| !b.schedule.is_empty())
+    {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!(
+                "block #{idx} declares a `schedule`, so it must be the channel's only block — \
+                 put the other blocks' pools into its schedule entries instead"
+            ),
+        });
+    }
 
     for (idx, include) in channel.rule.blocks.iter().enumerate() {
         let bad = |message: String| ConfigError::Validation {
@@ -419,8 +438,24 @@ fn validate_pattern_block<'a>(
     if include.pools.is_empty() {
         return Err(bad("`pattern` needs at least one `pools` entry".into()));
     }
-    if include.pattern.is_empty() {
-        return Err(bad("`pools` needs a `pattern` to draw from them".into()));
+    if include.pattern.is_empty() && include.schedule.is_empty() {
+        return Err(bad(
+            "`pools` needs a `pattern` or a `schedule` to draw from them".into(),
+        ));
+    }
+    if !include.pattern.is_empty() && !include.schedule.is_empty() {
+        return Err(bad(
+            "a block declares either `pattern` or `schedule`, not both — a `schedule` \
+             entry carries its own `pattern`"
+                .into(),
+        ));
+    }
+    if !include.schedule.is_empty() && include.cycles.is_some() {
+        return Err(bad(
+            "cycles conflicts with `schedule` — a scheduled block walks until the window \
+             is laid, switching patterns by the hour, so there is no one pattern to count"
+                .into(),
+        ));
     }
     if let Some(order) = &include.order
         && *order != Order::Manual
@@ -466,55 +501,47 @@ fn validate_pattern_block<'a>(
 
     let local = validate_block_pools(&include.pools, pool_names, channel_groups, base_dir, &bad)?;
 
-    for (step_idx, step) in include.pattern.iter().enumerate() {
-        if !local.contains(step.pool.as_str()) {
+    let mut entry_names: HashSet<&str> = HashSet::new();
+    for entry in &include.schedule {
+        if entry.name.trim().is_empty() {
+            return Err(bad("a schedule entry needs a `name`".into()));
+        }
+        if !entry_names.insert(entry.name.as_str()) {
             return Err(bad(format!(
-                "pattern step #{step_idx} names pool {:?}, which this block does not declare",
-                step.pool
+                "schedule entry name {:?} is used twice — it keys the entry's place in the \
+                 `.resume` sidecar",
+                entry.name
             )));
         }
-        if let Take::Count(n) = step.take {
-            if n == 0 {
-                return Err(bad(format!("pattern step #{step_idx} has take = 0")));
-            }
-            if n > MAX_TAKE {
-                return Err(bad(format!(
-                    "pattern step #{step_idx} has take = {n}, which exceeds the maximum of \
-                     {MAX_TAKE}"
-                )));
-            }
-        }
-        // `all` empties the bucket the visit picked, and `rotate = "slot"` picks
-        // a new bucket for every single item — so there is no one bucket for
-        // `all` to mean. Refuse the pair rather than pick a reading.
-        if step.take == Take::All
-            && let Some(pool) = include.pools.iter().find(|p| p.name == step.pool)
-            && pool.rotate == Rotate::Slot
-        {
+        if entry.pattern.is_empty() {
             return Err(bad(format!(
-                "pattern step #{step_idx} has take = \"all\" but pool {:?} sets \
-                 rotate = \"slot\", which changes series every item — \"all\" has \
-                 no single series to empty. Use rotate = \"visit\", or an explicit count",
-                step.pool
+                "schedule entry {:?} has no `pattern`",
+                entry.name
             )));
         }
-        // `all` empties the series whatever the cut position, so a `from` beside
-        // it is a line the author wrote that does nothing. Refused on the same
-        // grounds as a constraint that would not constrain.
-        if step.take == Take::All && step.from != TakeFrom::Start {
-            return Err(bad(format!(
-                "pattern step #{step_idx} has take = \"all\" and from = {:?} — \
-                 \"all\" empties the series, so there is no slice to move. Drop \
-                 one of the two",
-                step.from
-            )));
-        }
-        if !(0.0..=1.0).contains(&step.chance) {
-            return Err(bad(format!(
-                "pattern step #{step_idx} has chance = {}, outside 0.0–1.0",
-                step.chance
-            )));
-        }
+    }
+    if !include.schedule.is_empty()
+        && let Some(message) = crate::config::schedule::claims_error(&include.schedule)
+    {
+        return Err(bad(message));
+    }
+
+    let labelled: Vec<(String, &[PatternStep])> = if include.schedule.is_empty() {
+        vec![("pattern".to_string(), include.pattern.as_slice())]
+    } else {
+        include
+            .schedule
+            .iter()
+            .map(|e| {
+                (
+                    format!("schedule entry {:?}: pattern", e.name),
+                    e.pattern.as_slice(),
+                )
+            })
+            .collect()
+    };
+    for (label, steps) in &labelled {
+        validate_steps(label, steps, include, &local, bad)?;
     }
 
     // A take-all step and adjacency constraints cannot share a block.
@@ -529,7 +556,10 @@ fn validate_pattern_block<'a>(
     // repeat would cross a generation boundary with nothing logged. Refusing
     // the pair keeps the seam honest; sizing one across a take-all step is its
     // own piece of work.
-    if include.pattern.iter().any(|s| s.take == Take::All) {
+    if include
+        .step_lists()
+        .any(|steps| steps.iter().any(|s| s.take == Take::All))
+    {
         let constrained = include
             .constraints
             .is_some()
@@ -547,6 +577,70 @@ fn validate_pattern_block<'a>(
                  `constraints` — how much airtime a take-all step lays is not known \
                  until its pool is resolved, so the generation seam cannot be sized \
                  for it. Drop the constraints, or give every step an explicit count",
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// The per-step checks every pattern gets, whether it is the block's one
+/// `pattern` or a `schedule` entry's. `label` names which, so the error says
+/// where to look.
+fn validate_steps(
+    label: &str,
+    steps: &[PatternStep],
+    include: &BlockInclude,
+    local: &HashSet<&str>,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    for (step_idx, step) in steps.iter().enumerate() {
+        if !local.contains(step.pool.as_str()) {
+            return Err(bad(format!(
+                "{label} step #{step_idx} names pool {:?}, which this block does not declare",
+                step.pool
+            )));
+        }
+        if let Some((min, max)) = step.take.bounds() {
+            if min == 0 {
+                return Err(bad(format!("{label} step #{step_idx} has take = 0")));
+            }
+            if max > MAX_TAKE {
+                return Err(bad(format!(
+                    "{label} step #{step_idx} has take = {max}, which exceeds the maximum of \
+                     {MAX_TAKE}"
+                )));
+            }
+        }
+        // `all` empties the bucket the visit picked, and `rotate = "slot"` picks
+        // a new bucket for every single item — so there is no one bucket for
+        // `all` to mean. Refuse the pair rather than pick a reading.
+        if step.take == Take::All
+            && let Some(pool) = include.pools.iter().find(|p| p.name == step.pool)
+            && pool.rotate == Rotate::Slot
+        {
+            return Err(bad(format!(
+                "{label} step #{step_idx} has take = \"all\" but pool {:?} sets \
+                 rotate = \"slot\", which changes series every item — \"all\" has \
+                 no single series to empty. Use rotate = \"visit\", or an explicit count",
+                step.pool
+            )));
+        }
+        // `all` empties the series whatever the cut position, so a `from` beside
+        // it is a line the author wrote that does nothing. Refused on the same
+        // grounds as a constraint that would not constrain.
+        if step.take == Take::All && step.from != TakeFrom::Start {
+            return Err(bad(format!(
+                "{label} step #{step_idx} has take = \"all\" and from = {:?} — \
+                 \"all\" empties the series, so there is no slice to move. Drop \
+                 one of the two",
+                step.from
+            )));
+        }
+        if !(0.0..=1.0).contains(&step.chance) {
+            return Err(bad(format!(
+                "{label} step #{step_idx} has chance = {}, outside 0.0–1.0",
+                step.chance
             )));
         }
     }
@@ -581,6 +675,13 @@ fn validate_sequencer_block<'a>(
     if !include.pattern.is_empty() {
         return Err(bad(
             "a block declares either `pattern` or `sequencer`, not both (issue #169 decision 3)"
+                .into(),
+        ));
+    }
+    if !include.schedule.is_empty() {
+        return Err(bad(
+            "a block declares either `schedule` or `sequencer`, not both — a `schedule` block \
+             is walked by the station, a `sequencer` block by its script"
                 .into(),
         ));
     }
@@ -1142,6 +1243,7 @@ mod tests {
             pools: Vec::new(),
             pattern: Vec::new(),
             cycles: None,
+            schedule: Vec::new(),
             sequencer: None,
             mode: Mode::All,
             order: Some(Order::Manual),
@@ -1548,6 +1650,26 @@ mod tests {
         assert_eq!(channel_with(vec![block]).adjacency_reach(), 15);
     }
 
+    /// A range sizes the seam for the widest cycle: the cycle at its longest
+    /// (2 movies + up to 4 shows = 6) times the cycles the constrained pool
+    /// needs at its fewest draws (5 reach / 2 movies = 3 cycles) is 18.
+    #[test]
+    fn adjacency_reach_sizes_a_take_range_at_its_widest() {
+        let mut movies = pool("movies");
+        movies.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(NoRepeatWithin::Positions(5)),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        let mut shows_step = step("shows", 3);
+        shows_step.take = Take::Range { min: 2, max: 4 };
+        let block = pattern_block(
+            vec![movies, pool("shows")],
+            vec![step("movies", 2), shows_step],
+        );
+        assert_eq!(channel_with(vec![block]).adjacency_reach(), 18);
+    }
+
     /// A pattern block's own `[constraints]` is the default its pools inherit,
     /// so it reaches the seam through them — and is converted the same way.
     #[test]
@@ -1945,6 +2067,23 @@ mod tests {
         let b = pattern_block(vec![pool("movies")], vec![step("movies", MAX_TAKE + 1)]);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("maximum"), "err = {err}");
+    }
+
+    /// A range is held to the same bounds as a count: its top may not pass the
+    /// maximum and its bottom may not be zero.
+    #[test]
+    fn rejects_a_take_range_with_a_zero_floor_or_a_top_past_the_maximum() {
+        let ranged = |min, max| {
+            let mut s = step("movies", 1);
+            s.take = Take::Range { min, max };
+            pattern_block(vec![pool("movies")], vec![s])
+        };
+        let err = validate_channel(&dummy_path(), &channel_with(vec![ranged(0, 3)])).unwrap_err();
+        assert!(format!("{err}").contains("take = 0"), "err = {err}");
+        let err = validate_channel(&dummy_path(), &channel_with(vec![ranged(2, MAX_TAKE + 1)]))
+            .unwrap_err();
+        assert!(format!("{err}").contains("maximum"), "err = {err}");
+        assert!(validate_channel(&dummy_path(), &channel_with(vec![ranged(2, 4)])).is_ok());
     }
 
     /// `all` empties the series a visit picked; `rotate = "slot"` picks a new

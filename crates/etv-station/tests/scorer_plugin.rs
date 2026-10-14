@@ -179,6 +179,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     chance: 1.0,
                 }],
                 cycles: Some(cycles),
+                schedule: Vec::new(),
                 sequencer: None,
             }],
         },

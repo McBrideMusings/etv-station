@@ -1777,6 +1777,64 @@ Reaching for `ctx.sets` or `ctx.history` without the grant fails the `pick()`
 call the moment the script reads the field, naming the capability — that one
 can only be caught at run time, because the reach is a script call.
 
+### Block `schedule` — a different pattern by the hour (ADR 0021)
+
+A pattern block can replace its one `pattern:` with a `schedule:`: named
+entries, each with its own `pattern` over the block's pools and the local
+hours it claims. The walker runs whichever entry claims the hour its clock has
+reached, so a channel says "06:00–21:00 rotates these pools, 21:00–06:00 those"
+and each entry still has everything a pattern has — `take` runs, `rotate`,
+`advance`, `chance`.
+
+```yaml
+rule:
+  blocks:
+    - pools:
+        - { name: kaiju-films, expr: 'item.type == "movie" && item.genres.contains("Kaiju")', rotate: visit, advance: resume }
+        - { name: kaiju-shows, expr: 'item.show in ["Ultraman"]', order: "season:asc,episode:asc", rotate: visit, advance: resume }
+        - { name: zombie-films, expr: 'item.type == "movie" && item.genres.contains("Zombie")', rotate: visit, advance: resume }
+        - { name: zombie-shows, expr: 'item.show in ["The Walking Dead"]', order: "season:asc,episode:asc", rotate: visit, advance: resume }
+      schedule:
+        - name: day
+          hours: { start: 6, end: 21 }
+          pattern:
+            - { pool: kaiju-films, take: 1 }
+            - { pool: kaiju-shows, take: 3 }
+        - name: night
+          hours: { start: 21, end: 6 }
+          pattern:
+            - { pool: zombie-films, take: 1 }
+            - { pool: zombie-shows, take: 3 }
+```
+
+| Entry field | Meaning |
+|---|---|
+| `name` | Required, unique in the block. Keys the entry's place in its pattern in the `.resume` sidecar, and is written into each airing's `select` audit stage as `detail.schedule`. |
+| `hours` | `{ start, end }` in local whole hours of the station `tz`: `start` 0–23, `end` 1–24, exclusive. `end < start` wraps past midnight. |
+| `weekdays` | Optional list of `mon`..`sun`, naming the day an hour range *starts* on — a `sat` 21–6 entry still owns Sunday 02:00. With no `hours`, the entry claims those whole days. Unset means every day. |
+| `pattern` | Required. The same steps a block's `pattern` takes. |
+
+- **One entry with neither `hours` nor `weekdays` is the default** and fills
+  every hour nothing else claims. Without one, every hour of the week must be
+  claimed; an unclaimed hour fails at load, naming it.
+- **Two entries claiming the same hour fail at load**, naming both and the hour.
+- **The entry switches between visits, never inside one.** The walker checks
+  the clock before each step; a three-episode run that starts at 20:30 airs all
+  three, and the night entry starts at 22:00. That overrun is accepted drift
+  (ADR 0021): no item is cut short and no slot is left dark.
+- **Each entry resumes its own pattern.** The `.resume` sidecar records
+  `schedule.<name>: { cycle, step }`, so a day entry that went off air after its
+  films step opens the next morning on its shows step. Pools resume exactly as
+  in a plain pattern block: the rotation from `.resume`, each show's episode
+  from the play-history ledger. A pool may appear in more than one entry and
+  keeps one place across all of them.
+- **A scheduled block is its channel's only block** — its clock starts at the
+  generation's first airing, which another block would sit in front of.
+- `schedule` and `pattern` are mutually exclusive, and `cycles` is refused on
+  a scheduled block: it walks until the window is laid.
+
+Worked sample: `examples/samples/adult-swim.yaml`.
+
 ### Block `sequencer` — a plugin arranges the block itself
 
 A pattern block interleaves its pools by walking the authored `pattern`. A
@@ -1806,9 +1864,9 @@ pool's `expr` or `plugin`, then its `order`, `bucket_order`, and `constraints`
 
 | `ctx` field | What it holds |
 |---|---|
-| `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a daypart script has to prefer items that fit the time left before its next boundary, and ids carry no durations. |
-| `ctx.pool_config.<name>` | that pool's own `config:` block, passed through unread — the same generic carrier a scorer's `ctx.config` reaches (ADR 0002), not a new schema field. A daypart script's "which hours/weekdays does this pool claim" table lives here (#14, ADR 0004). Empty map when the pool declares no `config:`. |
-| `ctx.window.from` | the instant this generation begins airing — the hour a daypart script asks about, not the hour the daemon happens to be computing in |
+| `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a script fitting items against the clock needs their durations. |
+| `ctx.pool_config.<name>` | that pool's own `config:` block, passed through unread — the same generic carrier a scorer's `ctx.config` reaches (ADR 0002), not a new schema field. Empty map when the pool declares no `config:`. |
+| `ctx.window.from` | the instant this generation begins airing — the hour a script asks about, not the hour the daemon happens to be computing in |
 | `ctx.resume.<pool>.next` | the series whose turn is next in that pool's rotation |
 | `ctx.cursor` | the per-show cursors from the play-history db |
 
@@ -1832,38 +1890,34 @@ Error cases:
 
 Worked sample: `examples/plugins/foryou-sequencer.rhai`.
 
-#### Dayparting (#14)
+### Pattern step `take` — how many items one visit draws
 
-`examples/plugins/daypart-sequencer.rhai` is the reusable dayparting
-sequencer — a network-mirror channel is **one block** whose pools are its
-dayparts plus a default pool, all pointing `sequencer:` at this one script.
-Nothing about which hours a pool claims lives in the schema; it is authored
-entirely in that pool's `config:`:
+A step in a block's `pattern:` is `{pool, take, from, chance}`. `take` has
+three forms:
 
-```yaml
-rule:
-  blocks:
-    - pools:
-        - name: latenight
-          expr: 'item.show in ["Rick and Morty", "The Boondocks"]'
-          config:
-            hour_start: 21   # local hour, 0-23
-            hour_end: 6      # < hour_start wraps past local midnight
-            weekdays: [sun, mon, tue, wed, thu, fri, sat]  # default: every day
-        - name: default
-          expr: 'item.type == "movie"'
-          # No hour_start/hour_end: this is the pool that fills every hour
-          # no daypart claims. Exactly one pool in the block must be it.
-      sequencer: "../plugins/daypart-sequencer.rhai"
-```
+| Form | Example | One visit draws |
+| --- | --- | --- |
+| count | `take: 3` | exactly 3 items |
+| range | `take: "2-4"` or `take: {min: 2, max: 4}` | a whole number from `min` to `max`, rolled per visit |
+| `all` | `take: all` | every remaining item of the series the visit picked |
 
-Boundaries drift rather than truncating an item or leaving a gap (#14
-decision 3, ADR 0004): the script prefers, from the active daypart's own
-pool, whichever item fits the time left before the next boundary; when
-nothing fits, the next item plays anyway and the following daypart starts
-late by that overrun. The exact grid is not the goal — see ADR 0004 for why
-holding it exactly would need filler the library does not have. Two pools
-whose declared hours and weekdays overlap fail `arrange()`, naming both.
+A range is rolled when the visit starts, from the channel seed, the pattern
+cycle and the step's position. Each number from `min` to `max` is equally
+likely, and a pinned `seed:` reproduces every visit's size. Two steps with the
+same range roll independently, because the step's position is part of the roll.
+A range is not `chance`: the visit always airs, only its length varies.
+
+A range follows the same rules as a count wherever a count is checked:
+
+- `min` must be at least 1 and `max` at most the engine's per-visit maximum
+  (`MAX_TAKE`); `min` above `max` fails at load.
+- `min` equal to `max` is a count (`"3-3"` loads as `take: 3`).
+- Under `rotate: slot` the rolled number is how many slots the visit fills.
+- A plugin's per-entry `take` override replaces the rolled number for that
+  series, the same way it replaces a count.
+- Adjacency `constraints` size their seam for the widest cycle the range can
+  produce: every range counted at `max` for the cycle length and at `min` for
+  how often the pool is drawn.
 
 ### Pool `constraints` — spacing counted in a pool's own draw order
 

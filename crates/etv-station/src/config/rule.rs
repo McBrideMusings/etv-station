@@ -11,6 +11,7 @@ use super::mode::Mode;
 use super::order::Order;
 use super::overlay::OverlayDecl;
 use super::pool::{PatternStep, Pool};
+use super::schedule::ScheduleEntry;
 use crate::guide::GuideConfig;
 
 /// A channel's sequencing rule: an ordered list of block-includes that compose
@@ -95,6 +96,13 @@ pub struct BlockInclude {
     /// [`crate::pattern`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycles: Option<usize>,
+
+    /// Clock form (ADR 0021): the patterns this block walks, each active over
+    /// its own local hours, in place of a single `pattern`. Mutually exclusive
+    /// with `pattern` and `cycles`, enforced in validation. See
+    /// [`crate::config::ScheduleEntry`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule: Vec<ScheduleEntry>,
 
     /// Sequencer form (#169): a plugin script that draws this block's
     /// timeline from `pools` itself, instead of interleaving them via
@@ -211,29 +219,44 @@ impl BlockInclude {
         // so validation refuses a block that mixes `take: "all"` with any
         // `constraints` instead. Every pool here therefore has `reach() == 0`
         // whenever a take-all step is present, and both sums go unread.
-        let cycle_total: usize = self
-            .pattern
-            .iter()
-            .filter_map(|s| s.take.count())
-            .sum::<usize>();
-        self.pools
-            .iter()
-            .map(|pool| {
-                let per_cycle: usize = self
-                    .pattern
+        //
+        // A `take` range is sized pessimistically for the seam: the cycle at
+        // its longest (every range at its max) with the pool drawn at its
+        // least (every range at its min) is the widest tail a repeat can cross.
+        // A scheduled block walks a different pattern by the hour, and the seam
+        // can fall inside any of them, so it reports the widest.
+        self.step_lists()
+            .flat_map(|pattern| {
+                let cycle_total: usize = pattern
                     .iter()
-                    .filter(|s| s.pool == pool.name)
-                    .filter_map(|s| s.take.count())
+                    .filter_map(|s| s.take.bounds())
+                    .map(|(_, max)| max)
                     .sum();
-                let reach = pool.constraints(block).reach();
-                // A pool no step draws from never reaches the seam at all.
-                if reach == 0 || per_cycle == 0 {
-                    return 0;
-                }
-                reach.div_ceil(per_cycle).saturating_mul(cycle_total)
+                self.pools.iter().map(move |pool| {
+                    let per_cycle: usize = pattern
+                        .iter()
+                        .filter(|s| s.pool == pool.name)
+                        .filter_map(|s| s.take.bounds())
+                        .map(|(min, _)| min)
+                        .sum();
+                    let reach = pool.constraints(block).reach();
+                    // A pool no step draws from never reaches the seam at all.
+                    if reach == 0 || per_cycle == 0 {
+                        return 0;
+                    }
+                    reach.div_ceil(per_cycle).saturating_mul(cycle_total)
+                })
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// Every pattern this block walks: its one `pattern`, or each `schedule`
+    /// entry's.
+    pub fn step_lists(&self) -> impl Iterator<Item = &[PatternStep]> {
+        std::iter::once(self.pattern.as_slice())
+            .filter(|p| !p.is_empty())
+            .chain(self.schedule.iter().map(|e| e.pattern.as_slice()))
     }
 
     /// Whether this block interleaves pools via a pattern rather than playing a
@@ -244,7 +267,8 @@ impl BlockInclude {
     /// reaches validation and gets a clear error instead of being read as an
     /// empty entries block.
     pub fn is_pattern(&self) -> bool {
-        (!self.pools.is_empty() || !self.pattern.is_empty()) && self.sequencer.is_none()
+        (!self.pools.is_empty() || !self.pattern.is_empty() || !self.schedule.is_empty())
+            && self.sequencer.is_none()
     }
 
     /// Whether this block draws its timeline from a `sequencer` plugin rather
@@ -269,6 +293,7 @@ impl BlockInclude {
         self.sequencer = body.sequencer;
         self.pattern = body.pattern;
         self.cycles = body.cycles;
+        self.schedule = body.schedule;
         self.block = None;
     }
 }

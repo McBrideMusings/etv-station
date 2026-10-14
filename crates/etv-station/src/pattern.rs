@@ -85,12 +85,12 @@ use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{
-    Advance, Constraints, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate, Select,
-    ShowGroup, Take, TakeFrom,
+    Advance, Constraints, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate,
+    ScheduleEntry, Select, ShowGroup, Take, TakeFrom,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
 use crate::guide::GuideConfig;
-use crate::resume::{GenerationState, PoolResume};
+use crate::resume::{GenerationState, PoolResume, ScheduleResume};
 
 /// Upper bound on an explicitly-authored `cycles`. A derived count needs no cap
 /// — it is bounded by the pools' own sizes.
@@ -119,6 +119,10 @@ const REROLL_STRIDE: u64 = 1 << 32;
 /// Keeps a `from = "random"` offset roll clear of both the small nonces the walk
 /// uses and the reroll band above it, so one decision never doubles as another.
 const FROM_STRIDE: u64 = 1 << 48;
+
+/// Keeps a `take` range's size roll clear of every nonce above, for the same
+/// reason: the visit's size is its own decision, not a reuse of another's.
+const TAKE_STRIDE: u64 = 1 << 56;
 
 /// One series inside a pool: a show's episodes, one season of them, or a single
 /// movie.
@@ -470,6 +474,15 @@ impl PoolRuntime<'_> {
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
     fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Result<Vec<String>, String> {
+        // A range is decided once per visit, here, so a `rotate = "slot"` visit
+        // sizes its slots from the same roll a `rotate = "visit"` draw does.
+        let take = match take {
+            Take::Range { min, max } => {
+                let spread = (max.saturating_sub(min) + 1) as u64;
+                Take::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
+            }
+            fixed => fixed,
+        };
         if take == Take::Count(0) || self.is_dry() {
             return Ok(Vec::new());
         }
@@ -483,7 +496,7 @@ impl PoolRuntime<'_> {
             // so the one item each slot asks for was never the step's own
             // `take`.
             Rotate::Slot => {
-                let n = take.count().unwrap_or(1);
+                let n = take.bounds().map_or(1, |(n, _)| n);
                 if n > MAX_TAKE {
                     return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
                 }
@@ -531,6 +544,7 @@ impl PoolRuntime<'_> {
         let take = match (override_take, want, first) {
             (Some(n), _, _) => n,
             (None, Take::Count(n), _) => n,
+            (None, Take::Range { .. }, _) => unreachable!("visit resolves a range to a count"),
             (None, Take::All, Some(si)) => self.series[si].remaining(),
             (None, Take::All, None) => return Ok(Vec::new()),
         };
@@ -755,11 +769,15 @@ pub struct BlockBuild {
     pub ids: Vec<String>,
     /// Per-pool resume state for the `.resume` sidecar.
     pub resume: BTreeMap<String, PoolResume>,
-    /// `progress[k]` is what `resume` would be had only `ids[..k]` aired — one
-    /// longer than `ids`, ending on `resume` itself. The daemon checkpoints
-    /// every item boundary from it, so a wipe that spares part of a
-    /// generation rewinds the rotation only past what it removed (#378).
-    pub progress: Vec<BTreeMap<String, PoolResume>>,
+    /// Per-`schedule`-entry place in its own pattern (ADR 0021); empty for a
+    /// plain pattern block and a sequencer block.
+    pub schedule: BTreeMap<String, ScheduleResume>,
+    /// `progress[k]` is what `resume` and `schedule` would be had only
+    /// `ids[..k]` aired — one longer than `ids`, ending on the two of them.
+    /// The daemon checkpoints every item boundary from it, so a wipe that
+    /// spares part of a generation rewinds the rotation only past what it
+    /// removed (#378).
+    pub progress: Vec<BlockState>,
     /// Flattened `entry_id -> metadata` from `ScoreCache::picked_extras`.
     pub metadata: HashMap<String, serde_json::Value>,
     /// This pool's own `guide:` per drawn `entry_id` (#289).
@@ -767,6 +785,14 @@ pub struct BlockBuild {
     /// This pool's own `tracks:` per drawn `entry_id` (#261), the pool rung of
     /// the track-selection cascade.
     pub tracks: HashMap<String, crate::config::TrackRules>,
+}
+
+/// A block's resume state at one item boundary: its pools' rotation, and
+/// where each of its `schedule` entries stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockState {
+    pub pools: BTreeMap<String, PoolResume>,
+    pub schedule: BTreeMap<String, ScheduleResume>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -782,9 +808,141 @@ pub fn build(
     score_env: crate::score::ScoreEnv<'_>,
     fill: Option<Duration>,
 ) -> Result<BlockBuild, String> {
+    walk(
+        catalog,
+        pools,
+        groups,
+        Shape::Pattern { pattern, cycles },
+        block_constraints,
+        state,
+        seed,
+        score_env,
+        fill,
+    )
+}
+
+/// [`build`] for a block whose pattern depends on the hour (ADR 0021): walk
+/// whichever `schedule` entry is active at the running clock — `window_start`
+/// plus the runtime laid so far, read in the station `tz` — one visit at a
+/// time, until `fill` is laid (24 hours when unbounded). An item the catalog
+/// has no length for, in a pool where it has none at all, moves the clock by
+/// `nominal` — the channel's `nominal_item_secs`, the same length the daemon's
+/// simulation charges it — so the clock always advances.
+///
+/// The entry is chosen before each visit and a visit always finishes, so a
+/// three-episode run crossing 21:00 airs whole and the next entry starts late.
+/// Each entry keeps its own `(cycle, step)` in the `.resume` sidecar, so one
+/// that goes off air mid-pattern picks up at the same step when its hours come
+/// back. The pools keep their rotation and series cursors exactly as under
+/// `build` — the walk only decides which step runs next.
+#[allow(clippy::too_many_arguments)]
+pub fn build_scheduled(
+    catalog: &Catalog,
+    pools: &[Pool],
+    groups: &[ShowGroup],
+    schedule: &[ScheduleEntry],
+    window_start: i64,
+    nominal: Duration,
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    seed: u64,
+    score_env: crate::score::ScoreEnv<'_>,
+    fill: Option<Duration>,
+) -> Result<BlockBuild, String> {
+    walk(
+        catalog,
+        pools,
+        groups,
+        Shape::Schedule {
+            schedule,
+            window_start,
+            nominal,
+        },
+        block_constraints,
+        state,
+        seed,
+        score_env,
+        fill,
+    )
+}
+
+/// How a block chooses its next step: one pattern looped by cycle, or a
+/// schedule of patterns chosen by the clock.
+enum Shape<'a> {
+    Pattern {
+        pattern: &'a [PatternStep],
+        cycles: Option<usize>,
+    },
+    Schedule {
+        schedule: &'a [ScheduleEntry],
+        window_start: i64,
+        nominal: Duration,
+    },
+}
+
+/// What the walk has laid so far — everything [`draw_step`] appends to.
+#[derive(Default)]
+struct Laid {
+    ids: Vec<String>,
+    /// State entering each drawn id — the state before that id's visit. A
+    /// visit is the unit the rotation moves in, so every id of one visit
+    /// shares the snapshot taken before it: regenerating from mid-visit redoes
+    /// the visit, and the ledger's cursor skips whatever of it already aired.
+    progress: Vec<BlockState>,
+    /// This pool's own `guide:` (#289), the rung between the block and the
+    /// item — recorded per drawn id as the pattern walks, so a caller left
+    /// with only a flat id list (`resolve::resolve_pool_block_items`) can
+    /// still tell a bumper's draw from a film's. Only pools that declare
+    /// `guide:` add anything here, same as the metadata map. Two pools
+    /// drawing the same `entry_id` collide here on the same terms
+    /// `Pool::constraints` already documents as "blind across pools" — pools
+    /// that must stay apart have to be disjoint by construction.
+    guides: HashMap<String, GuideConfig>,
+    /// The same collision rule holds for the pool's `tracks:` rules.
+    tracks: HashMap<String, crate::config::TrackRules>,
+    /// Per-id audit blobs the walk builds as it draws, folded into the metadata
+    /// map at the end. `Option<Value>` rather than `Value` so it plugs straight
+    /// into `audit::push_stage`, which owns creating the blob.
+    audit: HashMap<String, Option<serde_json::Value>>,
+    /// Airtime laid, by the catalog's runtimes. Zero throughout when the walk
+    /// loaded none — an unbounded plain pattern never reads it.
+    time: Duration,
+}
+
+/// Everything a step's draw reads besides the step and the walk's own state.
+struct DrawEnv<'a> {
+    catalog: &'a Catalog,
+    pools: &'a [Pool],
+    block_constraints: Option<&'a Constraints>,
+    state: &'a GenerationState,
+    seed: u64,
+    score_env: crate::score::ScoreEnv<'a>,
+    load_runtimes: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    catalog: &Catalog,
+    pools: &[Pool],
+    groups: &[ShowGroup],
+    shape: Shape<'_>,
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    seed: u64,
+    score_env: crate::score::ScoreEnv<'_>,
+    fill: Option<Duration>,
+) -> Result<BlockBuild, String> {
     // An authored `cycles` is the author saying how long a pass runs, and the
     // window does not get to argue with it. Only a derived count is bounded.
-    let budget = fill.filter(|_| cycles.is_none());
+    // A schedule always runs to its window: it reads the clock from what it
+    // has laid, so it needs every runtime whether the caller bounded it or not.
+    let (budget, load_runtimes) = match &shape {
+        Shape::Pattern { cycles, .. } => {
+            let budget = fill.filter(|_| cycles.is_none());
+            (budget, budget.is_some())
+        }
+        Shape::Schedule { .. } => (fill, true),
+    };
 
     // Two passes, split by whether they read the database — see
     // [`resolve_pool_sources`], which does both.
@@ -801,7 +959,7 @@ pub fn build(
             ids,
             block_constraints,
             state,
-            budget.is_some(),
+            load_runtimes,
             &score_cache.picked_extras,
         )?);
     }
@@ -810,174 +968,197 @@ pub fn build(
     for (i, rt) in runtimes.iter().enumerate() {
         by_name.insert(rt.cfg.name.as_str(), i);
     }
-
-    let cycles = match cycles {
-        Some(n) => {
-            if n > MAX_CYCLES {
-                return Err(format!("cycles = {n} exceeds the maximum of {MAX_CYCLES}"));
-            }
-            n
-        }
-        None => derive_cycles(&runtimes, pattern, &by_name),
+    let pool_index = |name: &str| {
+        by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("pattern step names unknown pool {name:?}"))
     };
 
-    let mut out = Vec::new();
-    // Pool state entering each drawn id — the state before that id's visit.
-    // A visit is the unit the rotation moves in, so every id of one visit
-    // shares the snapshot taken before it: regenerating from mid-visit redoes
-    // the visit, and the ledger's cursor skips whatever of it already aired.
-    let mut progress: Vec<BTreeMap<String, PoolResume>> = Vec::new();
-    // This pool's own `guide:` (#289), the rung between the block and the
-    // item — recorded per drawn id as the pattern walks, so a caller left
-    // with only a flat id list (`resolve::resolve_pool_block_items`) can
-    // still tell a bumper's draw from a film's. Only pools that declare
-    // `guide:` add anything here, same as `metadata_out` below. Two pools
-    // drawing the same `entry_id` collide here on the same terms
-    // `Pool::constraints` already documents as "blind across pools" — pools
-    // that must stay apart have to be disjoint by construction.
-    let mut guide_out: HashMap<String, GuideConfig> = HashMap::new();
-    // The same collision rule holds for the pool's `tracks:` rules.
-    let mut tracks_out: HashMap<String, crate::config::TrackRules> = HashMap::new();
-    // Per-id audit blobs the walk builds as it draws, folded into the metadata
-    // map at the end. `Option<Value>` rather than `Value` so it plugs straight
-    // into `audit::push_stage`, which owns creating the blob.
-    let mut audit_out: HashMap<String, Option<serde_json::Value>> = HashMap::new();
-    let mut laid = Duration::ZERO;
-    // Where this block's cycle count stands, carried across generations so the
-    // rolls below keep moving. Restarting at 0 each generation replayed cycle
-    // 0's draws on every tick: under a pinned `seed`, a one-cycle generation
-    // drew the same random series every hour (etv-station-pwzv). Read only
-    // from `resume` pools, which keeps a `restart` block stateless.
-    let first_cycle = pools
-        .iter()
-        .filter(|p| p.advance == Advance::Resume)
-        .filter_map(|p| state.resume.pool(&p.name))
-        .map(|r| r.cycle)
-        .max()
-        .unwrap_or(0);
-    let mut walked = first_cycle;
-    for cycle in (first_cycle..).take(cycles) {
-        // Checked between cycles, never inside one: a cycle is the unit the
-        // pattern was written in ("1 movie, then 3 episodes"), and cutting one
-        // in half would air a fragment of the shape and leave the pools parked
-        // mid-pattern. So the last cycle is allowed to finish and overrun the
-        // window by its own length — the same bargain `pattern_catch_up`
-        // already strikes when it emits a whole generation past the target.
-        if budget.is_some_and(|fill| laid >= fill) {
-            break;
-        }
-        walked = cycle + 1;
-        for (step_idx, step) in pattern.iter().enumerate() {
-            let roll = RollKey {
-                seed,
-                cycle,
-                step: step_idx as u64,
+    let env = DrawEnv {
+        catalog,
+        pools,
+        block_constraints,
+        state,
+        seed,
+        score_env,
+        load_runtimes,
+    };
+    let mut laid = Laid::default();
+
+    let (resume_out, schedule_out) = match shape {
+        Shape::Pattern { pattern, cycles } => {
+            let cycles = match cycles {
+                Some(n) => {
+                    if n > MAX_CYCLES {
+                        return Err(format!("cycles = {n} exceeds the maximum of {MAX_CYCLES}"));
+                    }
+                    n
+                }
+                None => derive_cycles(&runtimes, pattern, &by_name),
             };
-            // A skipped step contributes nothing and — because the skip is
-            // decided before any draw — does not consume the pool's cursor.
-            if step.chance < 1.0 && roll.unit_at(u64::MAX) >= step.chance {
-                continue;
-            }
-            let idx = *by_name
-                .get(step.pool.as_str())
-                .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
-            // Everything this pool holds has aired already, so this visit would
-            // repeat. Ask the source for more before drawing rather than after,
-            // and only wrap once it says it has nothing (#382).
-            if runtimes[idx].is_drained() && !runtimes[idx].exhausted {
-                let added = refill_pool(
-                    catalog,
-                    &pools[idx],
-                    &mut runtimes[idx],
-                    block_constraints,
-                    state,
-                    &mut score_cache,
-                    seed,
-                    score_env,
-                    budget.is_some(),
-                )?;
-                if added == 0 {
-                    // Not a failure. The source is genuinely out, so the
-                    // rotation wraps from here on and nothing asks again.
-                    runtimes[idx].exhausted = true;
-                    tracing::debug!(
-                        event = "pool.exhausted",
-                        pool = %pools[idx].name,
-                        held = runtimes[idx].total_ids(),
-                        "pool has aired everything its source can supply; repeating from the top",
-                    );
+            // Where this block's cycle count stands, carried across generations
+            // so the rolls below keep moving. Restarting at 0 each generation
+            // replayed cycle 0's draws on every tick: under a pinned `seed`, a
+            // one-cycle generation drew the same random series every hour
+            // (etv-station-pwzv). Read only from `resume` pools, which keeps a
+            // `restart` block stateless.
+            let first_cycle = pools
+                .iter()
+                .filter(|p| p.advance == Advance::Resume)
+                .filter_map(|p| state.resume.pool(&p.name))
+                .map(|r| r.cycle)
+                .max()
+                .unwrap_or(0);
+            let mut walked = first_cycle;
+            for cycle in (first_cycle..).take(cycles) {
+                // Checked between cycles, never inside one: a cycle is the unit
+                // the pattern was written in ("1 movie, then 3 episodes"), and
+                // cutting one in half would air a fragment of the shape and
+                // leave the pools parked mid-pattern. So the last cycle is
+                // allowed to finish and overrun the window by its own length —
+                // the same bargain `pattern_catch_up` already strikes when it
+                // emits a whole generation past the target.
+                if budget.is_some_and(|fill| laid.time >= fill) {
+                    break;
+                }
+                walked = cycle + 1;
+                for (step_idx, step) in pattern.iter().enumerate() {
+                    let roll = RollKey {
+                        seed,
+                        cycle,
+                        step: step_idx as u64,
+                    };
+                    // A skipped step contributes nothing and — because the skip
+                    // is decided before any draw — does not consume the pool's
+                    // cursor.
+                    if step.chance < 1.0 && roll.unit_at(u64::MAX) >= step.chance {
+                        continue;
+                    }
+                    let idx = pool_index(step.pool.as_str())?;
+                    refill_if_drained(&env, &mut runtimes, &mut score_cache, idx)?;
+                    // A rewind to here regenerates from the first step of the
+                    // cycle this records. Mid-cycle, the rotation has already
+                    // moved past this cycle's earlier steps, so it records the
+                    // next cycle rather than replaying this one's rolls over an
+                    // advanced rotation.
+                    let resume_at = if step_idx == 0 { cycle } else { cycle + 1 };
+                    let before = BlockState {
+                        pools: pools_resume(&runtimes, resume_at),
+                        schedule: BTreeMap::new(),
+                    };
+                    draw_step(&mut runtimes, &mut laid, idx, step, &roll, before, None)?;
                 }
             }
-            // A rewind to here regenerates from the first step of the cycle
-            // this records. Mid-cycle, the rotation has already moved past
-            // this cycle's earlier steps, so it records the next cycle rather
-            // than replaying this one's rolls over an advanced rotation.
-            let resume_at = if step_idx == 0 { cycle } else { cycle + 1 };
-            let before = pools_resume(&runtimes, resume_at);
-            let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
-            progress.extend(std::iter::repeat_n(before, drawn.len()));
-            if budget.is_some() {
-                laid += runtimes[idx].runtime_of(&drawn);
-            }
-            if let Some(guide) = &runtimes[idx].cfg.guide {
-                for id in &drawn {
-                    guide_out.insert(id.clone(), guide.clone());
-                }
-            }
-            if let Some(tracks) = &runtimes[idx].cfg.tracks {
-                for id in &drawn {
-                    tracks_out.insert(id.clone(), tracks.clone());
-                }
-            }
-            // Every drawn id gets a `select` stage — the draw, which is a
-            // different fact from the ranking a plugin's own `audit()` records
-            // as `pool`. ADR 0011 names them separately for exactly this
-            // reason: "a pool ranked it, a draw took it, a constraint kept or
-            // moved it, the pattern's `take` placed it".
-            //
-            // Emitting it as a second `pool` stage was the first shape and was
-            // wrong twice over: an item from a plugin pool then carried two
-            // records both claiming `by: plugin:<name>`, which reads as a
-            // duplicate rather than as two facts, and it left `select` an
-            // unexercised guess (#404) while the thing it names was already
-            // happening.
-            //
-            // The 60 channels with no `plugin:` pool have no ranking stage at
-            // all, so this is their whole trail — which is why the pool's
-            // source lands in `detail` here rather than being assumed known
-            // from a `pool` record that never gets written for them.
-            if !drawn.is_empty() {
-                let cfg = &runtimes[idx].cfg;
-                let by = format!("pool:{}", cfg.name);
-                let verdict = format!("drawn from pool {:?}", cfg.name);
-                let mut detail = serde_json::Map::new();
-                detail.insert("pool".into(), serde_json::Value::String(cfg.name.clone()));
-                detail.insert("source".into(), serde_json::Value::String(pool_source(cfg)));
-                detail.insert(
-                    "take".into(),
-                    serde_json::Value::String(describe_take(step.take)),
-                );
-                detail.insert(
-                    "from".into(),
-                    serde_json::Value::String(describe_take_from(step.from)),
-                );
-                if let Some(expr) = &cfg.expr {
-                    detail.insert("expr".into(), serde_json::Value::String(expr.clone()));
-                }
-                for id in &drawn {
-                    let entry = audit_out.entry(id.clone()).or_insert(None);
-                    crate::audit::push_stage(
-                        entry,
-                        "select",
-                        by.clone(),
-                        verdict.clone(),
-                        Some(serde_json::Value::Object(detail.clone())),
-                    );
-                }
-            }
-            out.extend(drawn);
+            (pools_resume(&runtimes, walked), BTreeMap::new())
         }
-    }
+        Shape::Schedule {
+            schedule,
+            window_start,
+            nominal,
+        } => {
+            // The clock is the runtime laid, so a pool with no measured item
+            // would never move it.
+            for rt in &mut runtimes {
+                if rt.mean_runtime.is_zero() {
+                    rt.mean_runtime = nominal;
+                }
+            }
+            let span = budget.unwrap_or(Duration::from_secs(86_400));
+            let tz = score_env.inputs.tz.unwrap_or(time_tz::timezones::db::UTC);
+            let mut at: BTreeMap<String, ScheduleResume> = schedule
+                .iter()
+                .map(|e| {
+                    let pos = state.resume.schedule.get(&e.name).copied();
+                    (e.name.clone(), pos.unwrap_or_default())
+                })
+                .collect();
+            // Every step of every entry skipped or drawn nothing, several times
+            // over: the pools are dry, and the clock will never move.
+            let idle_limit = schedule.iter().map(|e| e.pattern.len()).sum::<usize>() * 8;
+            let mut idle = 0usize;
+            let mut active: Option<usize> = None;
+            while laid.time < span {
+                let clock = window_start.saturating_add(laid.time.as_secs() as i64);
+                let (day, hour) = crate::config::local_slot(clock, tz);
+                let ei = crate::config::active_entry(schedule, day, hour).ok_or_else(|| {
+                    format!("no schedule entry claims {day:?} {hour:02}:00 local")
+                })?;
+                let entry = &schedule[ei];
+                if active != Some(ei) {
+                    tracing::info!(
+                        event = "schedule.switch",
+                        entry = %entry.name,
+                        previous = active.map(|i| schedule[i].name.as_str()).unwrap_or(""),
+                        at = clock,
+                        local_day = ?day,
+                        local_hour = hour,
+                        "schedule entry takes over",
+                    );
+                    active = Some(ei);
+                }
+                let pos = at.get(&entry.name).copied().unwrap_or_default();
+                // An edit can shorten a pattern under a stored step; the step
+                // still names a place in the cycle, so it wraps into it.
+                let step_idx = pos.step % entry.pattern.len();
+                let step = &entry.pattern[step_idx];
+                let roll = RollKey {
+                    seed,
+                    cycle: pos.cycle,
+                    // Keyed by the entry's name, like its resume state, so
+                    // reordering entries in the file leaves every roll alone.
+                    step: crate::catalog::identity::fnv1a_64(&entry.name)
+                        .wrapping_add(step_idx as u64),
+                };
+                let skipped = step.chance < 1.0 && roll.unit_at(u64::MAX) >= step.chance;
+                let idx = pool_index(step.pool.as_str())?;
+                if !skipped {
+                    refill_if_drained(&env, &mut runtimes, &mut score_cache, idx)?;
+                }
+                let before = BlockState {
+                    pools: pools_resume(&runtimes, 0),
+                    schedule: at.clone(),
+                };
+                let next = if step_idx + 1 == entry.pattern.len() {
+                    ScheduleResume {
+                        cycle: pos.cycle + 1,
+                        step: 0,
+                    }
+                } else {
+                    ScheduleResume {
+                        cycle: pos.cycle,
+                        step: step_idx + 1,
+                    }
+                };
+                at.insert(entry.name.clone(), next);
+
+                let drawn = if skipped {
+                    0
+                } else {
+                    draw_step(
+                        &mut runtimes,
+                        &mut laid,
+                        idx,
+                        step,
+                        &roll,
+                        before,
+                        Some(entry.name.as_str()),
+                    )?
+                };
+                idle = if drawn == 0 { idle + 1 } else { 0 };
+                if idle > idle_limit {
+                    tracing::warn!(
+                        event = "schedule.stalled",
+                        entry = %entry.name,
+                        laid_secs = laid.time.as_secs(),
+                        "schedule entries drew nothing for {idle} steps running; stopping this generation short",
+                    );
+                    break;
+                }
+            }
+            (pools_resume(&runtimes, 0), at)
+        }
+    };
 
     for rt in &runtimes {
         if rt.forced > 0 {
@@ -995,8 +1176,10 @@ pub fn build(
         }
     }
 
-    let resume_out = pools_resume(&runtimes, walked);
-    progress.push(resume_out.clone());
+    laid.progress.push(BlockState {
+        pools: resume_out.clone(),
+        schedule: schedule_out.clone(),
+    });
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
     // #173 to read. See [`flatten_picked_extras`] (#203) for why the pool
@@ -1006,7 +1189,7 @@ pub fn build(
     // lands in, so one item carries one `audit` array whatever produced it.
     // A plugin pool's ranking record was written first, in `score`, so
     // appending here keeps the array in the order the stages actually acted.
-    for (id, staged) in audit_out {
+    for (id, staged) in laid.audit {
         let Some(staged) = staged else { continue };
         match metadata_out.get_mut(&id) {
             Some(existing) => merge_audit_into(existing, staged),
@@ -1016,13 +1199,139 @@ pub fn build(
         }
     }
     Ok(BlockBuild {
-        ids: out,
+        ids: laid.ids,
         resume: resume_out,
-        progress,
+        schedule: schedule_out,
+        progress: laid.progress,
         metadata: metadata_out,
-        guides: guide_out,
-        tracks: tracks_out,
+        guides: laid.guides,
+        tracks: laid.tracks,
     })
+}
+
+/// Everything pool `idx` holds has aired already, so its next visit would
+/// repeat: ask the source for more, and only wrap once it says it has nothing
+/// (#382). Runs before the visit's checkpoint is taken, because a refill moves
+/// the rotation onto the new arrivals and a rewind must resume there, not on
+/// the series that already aired.
+fn refill_if_drained(
+    env: &DrawEnv<'_>,
+    runtimes: &mut [PoolRuntime],
+    score_cache: &mut crate::score::ScoreCache,
+    idx: usize,
+) -> Result<(), String> {
+    if !runtimes[idx].is_drained() || runtimes[idx].exhausted {
+        return Ok(());
+    }
+    let added = refill_pool(
+        env.catalog,
+        &env.pools[idx],
+        &mut runtimes[idx],
+        env.block_constraints,
+        env.state,
+        score_cache,
+        env.seed,
+        env.score_env,
+        env.load_runtimes,
+    )?;
+    if added == 0 {
+        // Not a failure. The source is genuinely out, so the rotation wraps
+        // from here on and nothing asks again.
+        runtimes[idx].exhausted = true;
+        tracing::debug!(
+            event = "pool.exhausted",
+            pool = %env.pools[idx].name,
+            held = runtimes[idx].total_ids(),
+            "pool has aired everything its source can supply; repeating from the top",
+        );
+    }
+    Ok(())
+}
+
+/// One visit to `step` on pool `idx`, appended to `laid`. Returns how many
+/// ids it drew. `schedule_entry` names the schedule entry that ran the step,
+/// for the audit trail; `None` on a plain pattern.
+#[allow(clippy::too_many_arguments)]
+fn draw_step(
+    runtimes: &mut [PoolRuntime],
+    laid: &mut Laid,
+    idx: usize,
+    step: &PatternStep,
+    roll: &RollKey,
+    before: BlockState,
+    schedule_entry: Option<&str>,
+) -> Result<usize, String> {
+    let drawn = runtimes[idx].visit(step.take, step.from, roll)?;
+    laid.progress
+        .extend(std::iter::repeat_n(before, drawn.len()));
+    laid.time += runtimes[idx].runtime_of(&drawn);
+    if let Some(guide) = &runtimes[idx].cfg.guide {
+        for id in &drawn {
+            laid.guides.insert(id.clone(), guide.clone());
+        }
+    }
+    if let Some(tracks) = &runtimes[idx].cfg.tracks {
+        for id in &drawn {
+            laid.tracks.insert(id.clone(), tracks.clone());
+        }
+    }
+    // Every drawn id gets a `select` stage — the draw, which is a different
+    // fact from the ranking a plugin's own `audit()` records as `pool`. ADR
+    // 0011 names them separately for exactly this reason: "a pool ranked it, a
+    // draw took it, a constraint kept or moved it, the pattern's `take` placed
+    // it".
+    //
+    // Emitting it as a second `pool` stage was the first shape and was wrong
+    // twice over: an item from a plugin pool then carried two records both
+    // claiming `by: plugin:<name>`, which reads as a duplicate rather than as
+    // two facts, and it left `select` an unexercised guess (#404) while the
+    // thing it names was already happening.
+    //
+    // The 60 channels with no `plugin:` pool have no ranking stage at all, so
+    // this is their whole trail — which is why the pool's source lands in
+    // `detail` here rather than being assumed known from a `pool` record that
+    // never gets written for them.
+    if !drawn.is_empty() {
+        let cfg = &runtimes[idx].cfg;
+        let by = format!("pool:{}", cfg.name);
+        let verdict = match schedule_entry {
+            Some(entry) => format!("drawn from pool {:?} in schedule entry {entry:?}", cfg.name),
+            None => format!("drawn from pool {:?}", cfg.name),
+        };
+        let mut detail = serde_json::Map::new();
+        detail.insert("pool".into(), serde_json::Value::String(cfg.name.clone()));
+        detail.insert("source".into(), serde_json::Value::String(pool_source(cfg)));
+        detail.insert(
+            "take".into(),
+            serde_json::Value::String(describe_take(step.take)),
+        );
+        detail.insert(
+            "from".into(),
+            serde_json::Value::String(describe_take_from(step.from)),
+        );
+        if let Some(expr) = &cfg.expr {
+            detail.insert("expr".into(), serde_json::Value::String(expr.clone()));
+        }
+        if let Some(entry) = schedule_entry {
+            detail.insert(
+                "schedule".into(),
+                serde_json::Value::String(entry.to_string()),
+            );
+        }
+        for id in &drawn {
+            let entry = laid.audit.entry(id.clone()).or_insert(None);
+            crate::audit::push_stage(
+                entry,
+                "select",
+                by.clone(),
+                verdict.clone(),
+                Some(serde_json::Value::Object(detail.clone())),
+            );
+        }
+    }
+    let n = drawn.len();
+    laid.ids.extend(drawn);
+    Ok(n)
 }
 
 /// Every pool's resume state as the walk stands now, `cycle` being the cycle a
@@ -1084,6 +1393,7 @@ fn pool_source(cfg: &Pool) -> String {
 fn describe_take(take: Take) -> String {
     match take {
         Take::Count(n) => n.to_string(),
+        Take::Range { min, max } => format!("{min}-{max}"),
         Take::All => "all".into(),
     }
 }
@@ -1465,6 +1775,9 @@ fn derive_cycles(
         if let Some(&i) = by_name.get(step.pool.as_str()) {
             match step.take {
                 Take::Count(n) => per_cycle[i] += n,
+                // The fewest a cycle can draw, so the ceiling on cycles holds
+                // however low every visit rolls.
+                Take::Range { min, .. } => per_cycle[i] += min,
                 Take::All => all_steps[i] += 1,
             }
         }
@@ -3057,6 +3370,49 @@ mod tests {
         // movies pool alone, and the episodes that did air are a prefix of the
         // show order — a skip consumed no cursor.
         assert_eq!(a.iter().filter(|id| id.starts_with("mov-")).count(), 10);
+    }
+
+    /// A `take` range rolls its size per visit: every size in the range shows
+    /// up, none outside it does, and a pinned seed reproduces the sequence.
+    #[test]
+    fn take_range_varies_per_visit_and_a_pinned_seed_reproduces_it() {
+        let pattern = || {
+            vec![
+                step("movies", 1),
+                PatternStep {
+                    pool: "shows".into(),
+                    take: Take::Range { min: 2, max: 4 },
+                    from: TakeFrom::Start,
+                    chance: 1.0,
+                },
+            ]
+        };
+        let run = |seed| {
+            build_with(
+                vec![movies_pool(), shows_pool()],
+                pattern(),
+                Some(24),
+                &GenerationState::empty(),
+                seed,
+            )
+            .0
+        };
+        let a = run(7);
+        assert_eq!(a, run(7), "a pinned seed must reproduce the visit sizes");
+        // Episodes between two movies are one visit.
+        let mut sizes: Vec<usize> = Vec::new();
+        for id in &a {
+            if id.starts_with("mov-") {
+                sizes.push(0);
+            } else if let Some(last) = sizes.last_mut() {
+                *last += 1;
+            }
+        }
+        let mut seen: Vec<usize> = sizes.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, vec![2, 3, 4], "visit sizes were {sizes:?}");
+        assert_ne!(a, run(8), "a different seed should roll different sizes");
     }
 
     #[test]

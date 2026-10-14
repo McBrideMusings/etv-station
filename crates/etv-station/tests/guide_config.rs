@@ -55,6 +55,7 @@ fn inline_block(entries: Vec<ConfigEntry>, guide: Option<GuideConfig>) -> BlockI
         pools: Vec::new(),
         pattern: Vec::new(),
         cycles: None,
+        schedule: Vec::new(),
         sequencer: None,
         mode: Mode::All,
         order: Some(Order::Manual),
