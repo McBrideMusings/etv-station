@@ -128,23 +128,27 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<OverlayDecl>,
 
-    /// The station-wide random seed — the station level of the same
-    /// station → channel cascade `overlay` uses. Every channel that sets no
-    /// `seed:` of its own inherits it at load time, so a config with this set
-    /// has no channel left drawing wall-clock entropy (#324).
+    /// The station-wide seed — the station level of the station → channel →
+    /// pool cascade, fixed or rotating (see [`crate::config::variety`]).
+    /// Every channel that sets no `seed:` of its own inherits it at load time.
     ///
-    /// **Channels do not receive this value verbatim.** Nothing in the
+    /// **Channels do not receive a number verbatim.** Nothing in the
     /// SplitMix64 chain mixes in anything channel-specific — `seeded_shuffle`
     /// consumes the seed as raw state, and `RollKey::u64_at` mixes only
     /// `(seed, cycle, step, nonce)` — so handing two channels the same number
     /// would make any two with the same candidate multiset shuffle
-    /// *identically*. [`derive_channel_seed`] salts it with the channel's
-    /// declared `name` first.
+    /// *identically*. [`derive_channel_seed`] salts each number (a fixed seed,
+    /// or every entry of a `cycle`) with the channel's declared `name` first;
+    /// a derived rotation is salted when it is drawn.
     ///
-    /// Unset means channels fall back to a fresh per-generation seed, which is
-    /// what every station config meant before this key existed.
+    /// Unset means [`crate::variety::default_seed`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u64>,
+    pub seed: Option<crate::config::SeedSpec>,
+
+    /// The station-wide `temperature:`, inherited by every channel that sets
+    /// none. Unset means 0: every plugin draws its own ranking in order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<crate::config::TemperatureSpec>,
 
     /// Station-level track-selection rules (#261): the least specific level of
     /// the station → channel → block → pool → item cascade. Unset means the

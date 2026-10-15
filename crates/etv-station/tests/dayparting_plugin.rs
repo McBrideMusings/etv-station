@@ -41,6 +41,8 @@ fn add_movie(cat: &Catalog, id: &str, title: &str, duration_ms: Option<i64>) {
 
 fn pool(name: &str, expr: &str, config: Option<serde_json::Value>) -> Pool {
     Pool {
+        seed: None,
+        temperature: None,
         tracks: None,
         name: name.into(),
         expr: Some(expr.into()),
@@ -99,7 +101,7 @@ fn run(
         None,
         &script,
         &GenerationState::empty(),
-        0,
+        &etv_station::variety::Variety::fixed(0),
         ScoreEnv {
             inputs: &inputs,
             base_dir: Path::new("."),

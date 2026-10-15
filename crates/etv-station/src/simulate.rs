@@ -116,7 +116,8 @@ impl Ledger {
 /// `start`, and return every generation it laid down.
 ///
 /// `config_path` is the channel file's path: relative `plugin:` paths resolve
-/// against its directory, as they do in the daemon.
+/// against its directory, as they do in the daemon. `tz` is the station's
+/// zone.
 pub fn simulate(
     config: &ChannelConfig,
     config_path: &Path,
@@ -124,6 +125,7 @@ pub fn simulate(
     account_id: Option<i64>,
     days: u32,
     start: OffsetDateTime,
+    tz: &'static time_tz::Tz,
 ) -> Result<Simulation, String> {
     let recent_depth = config
         .scoring
@@ -170,6 +172,10 @@ pub fn simulate(
                 recent: ledger.tail(recent_depth),
                 now: now.unix_timestamp(),
                 account_id,
+                // The station's zone, as the daemon passes it: a rotating
+                // seed's periods and a sequencer's dayparts both fall on the
+                // local clock.
+                tz: Some(tz),
                 ..Default::default()
             };
             let (mut items, resume_out, _progress) = resolve_channel_with_resume(

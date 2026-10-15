@@ -96,12 +96,21 @@ pub struct ChannelConfig {
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
 
-    /// Channel-level random seed. Only meaningful when a block uses
-    /// `order = "random"`; unset means a fresh (non-reproducible) shuffle per
-    /// generation, set means a pinned shuffle (#46 locked decision). Omit on
-    /// channels with no random ordering.
+    /// The seed every random choice on this channel is computed from — a
+    /// fixed number, or one that rotates on a cadence (see
+    /// [`crate::config::variety`]). Unset inherits the station's, salted with
+    /// this channel's `name`; unset at both means
+    /// [`crate::variety::default_seed`]. `config::load` writes the effective
+    /// value back here, so after load this is the only field to read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u64>,
+    pub seed: Option<crate::config::SeedSpec>,
+
+    /// How far a plugin's draw may stray from its own ranking, handed to the
+    /// script as `ctx.temperature` — fixed, or rotating like `seed`. Unset
+    /// inherits the station's; unset at both is 0. `config::load` writes the
+    /// effective value back here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<crate::config::TemperatureSpec>,
 
     /// An instant this channel is treated as having been broadcasting since.
     /// Only affects the **first** generation of a channel with nothing written

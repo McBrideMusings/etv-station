@@ -805,6 +805,12 @@ struct ScoreCtx {
     /// sandbox. Not gated: a `pool_provider` script always receives it, the
     /// same as `now` or `target_count`.
     seed: i64,
+    /// How far this pool's draw may stray from the script's own ranking —
+    /// the pool's resolved `temperature:` for this period, 0 when nothing set
+    /// one. Not gated, the same as `seed`. The station gives it no meaning of
+    /// its own: what "loosen the ranking" means is the script's to decide
+    /// (taste-cosine reads it as a softmax temperature over its scores).
+    temperature: f64,
     /// The account id a `single_user`-scoped channel resolved (#278), or
     /// `None` on a pooled channel. Not gated, the same as `seed`: it is a
     /// value the station already holds and the sandbox provably cannot
@@ -863,6 +869,10 @@ impl ScoreCtx {
 
     fn get_seed(&mut self) -> i64 {
         self.seed
+    }
+
+    fn get_temperature(&mut self) -> f64 {
+        self.temperature
     }
 
     fn get_profile(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
@@ -1209,6 +1219,7 @@ pub(crate) fn engine() -> Engine {
         .register_get("history", ScoreCtx::get_history)
         .register_get("recent", ScoreCtx::get_recent)
         .register_get("seed", ScoreCtx::get_seed)
+        .register_get("temperature", ScoreCtx::get_temperature)
         .register_get("account_id", ScoreCtx::get_account_id)
         .register_get("profile", ScoreCtx::get_profile)
         .register_get("exclude_keywords", ScoreCtx::get_exclude_keywords)
@@ -1361,6 +1372,21 @@ impl ScoreCache {
     /// untouched. `pool_name` is part of the key, not just the id, so a
     /// second pool resolving the same id from an overlapping query cannot
     /// overwrite the first pool's record.
+    /// [`Self::record_picked`] for a list ranked earlier in its period and
+    /// read back from the `.resume` sidecar: the same metadata and take
+    /// overrides `pick()` attached when it ranked the list.
+    pub(crate) fn record_frozen(&mut self, pool_name: &str, list: &crate::resume::FrozenList) {
+        for (id, extra) in &list.extras {
+            self.picked_extras.insert(
+                (pool_name.to_string(), id.clone()),
+                PickedExtra {
+                    metadata: extra.metadata.clone(),
+                    take_override: extra.take,
+                },
+            );
+        }
+    }
+
     pub(crate) fn record_picked(&mut self, pool_name: &str, picked: &[PickedItem]) {
         for item in picked {
             if item.metadata.is_some() || item.take_override.is_some() {
@@ -1429,19 +1455,20 @@ fn mixed_seed(seed: u64, pool_name: &str) -> i64 {
 /// so this only decides what `ctx.sets` / `ctx.history` / `ctx.datastore(name)`
 /// (#181) resolve to for *this* call; it never re-reads `capabilities()`.
 ///
-/// `seed` is the channel's resolved generation seed — the same value
+/// `dice` is this pool's seed and temperature for the period being ranked
+/// ([`crate::variety`]) — the seed is the same value
 /// [`crate::pattern::RollKey`] mixes into the pattern walk's own draws.
 /// [`ctx.seed`](ScoreCtx) mixes it with `pool_name` via
 /// [`crate::pattern::mix_seed`] (#255, ADR 0005), so two pools naming the same
 /// script never draw the same sequence, while one pool's value stays fixed
-/// across two generations of the same seed.
+/// for as long as its seed does.
 #[allow(clippy::too_many_arguments)]
 pub fn pick(
     cache: &ScoreCache,
     script_path: &Path,
     sources: Option<&PoolSources>,
     inputs: &ScoreInputs,
-    seed: u64,
+    dice: crate::variety::Dice,
     pool_name: &str,
     pool_config: Option<&serde_json::Value>,
     granted: GrantedCapabilities,
@@ -1518,7 +1545,8 @@ pub fn pick(
         // — `ScoreCtx::get_datastore` fails a lookup of any name absent here,
         // whether the pool never declared it or `validate` never granted it.
         datastores: granted.datastores,
-        seed: mixed_seed(seed, pool_name),
+        seed: mixed_seed(dice.seed, pool_name),
+        temperature: dice.temperature,
         account_id: inputs.account_id,
         profile: granted.catalog_read.then(|| {
             Dynamic::from_array(
@@ -2226,7 +2254,7 @@ mod tests {
             script_path,
             None,
             inputs,
-            0,
+            crate::variety::Dice::fixed(0),
             pool_name,
             pool_config,
             GrantedCapabilities {
@@ -2610,7 +2638,7 @@ profile:
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "movies",
             None,
             GrantedCapabilities::default(),
@@ -3296,7 +3324,7 @@ fn pick(ctx) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3329,7 +3357,7 @@ fn pick(ctx) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3375,7 +3403,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &p,
             None,
             &inputs,
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             Some(&cfg),
             GrantedCapabilities::default(),
@@ -3411,7 +3439,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &p,
             None,
             &ScoreInputs::default(),
-            seed,
+            crate::variety::Dice::fixed(seed),
             pool_name,
             None,
             GrantedCapabilities::default(),
@@ -3484,7 +3512,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &p,
             None,
             &inputs,
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3533,7 +3561,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3580,7 +3608,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3614,7 +3642,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3649,7 +3677,7 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3681,7 +3709,7 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
                 &p,
                 None,
                 &ScoreInputs::default(),
-                0,
+                crate::variety::Dice::fixed(0),
                 "test",
                 None,
                 GrantedCapabilities::default(),
@@ -3714,7 +3742,7 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3741,7 +3769,7 @@ fn pick(ctx) { #{ picks: [#{ entry_id: "m1", metadata: #{ weight: 1.0 / 0.0 } }]
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3772,7 +3800,7 @@ fn pick(ctx) { #{ picks: ["m1", #{ entry_id: "m1" }], workspace: () } }
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3799,7 +3827,7 @@ fn pick(ctx) { #{ picks: ["m1", #{ entry_id: "m1" }], workspace: () } }
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3830,7 +3858,7 @@ fn pick(ctx) { #{ picks: ["m1", #{ entry_id: "m1" }], workspace: () } }
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3869,7 +3897,7 @@ fn audit(ctx, picks, workspace) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3907,7 +3935,7 @@ fn audit(ctx, picks, workspace) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3946,7 +3974,7 @@ fn audit(ctx, picks, workspace) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -3984,7 +4012,7 @@ fn audit(ctx, picks, workspace) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -4018,7 +4046,7 @@ fn audit(ctx, picks, workspace) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -4054,7 +4082,7 @@ fn audit(ctx, picks, workspace) {{
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -4091,7 +4119,7 @@ fn audit(ctx, picks, workspace) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -4125,7 +4153,7 @@ fn audit(ctx, picks, workspace) {
             &p,
             None,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             "test",
             None,
             GrantedCapabilities::default(),
@@ -4189,7 +4217,7 @@ fn audit(ctx, picks, workspace) { #{} }
             path,
             src,
             &ScoreInputs::default(),
-            0,
+            crate::variety::Dice::fixed(0),
             pool_name,
             None,
             GrantedCapabilities {

@@ -68,6 +68,8 @@ fn catalog() -> Catalog {
 
 fn discovery_pool() -> Pool {
     Pool {
+        seed: None,
+        temperature: None,
         tracks: None,
         name: "discovery".into(),
         expr: Some("item.type == \"movie\"".into()),
@@ -96,6 +98,8 @@ fn discovery_pool() -> Pool {
 
 fn spotlight_pool() -> Pool {
     Pool {
+        seed: None,
+        temperature: None,
         tracks: None,
         name: "spotlight".into(),
         expr: Some("item.type == \"episode\"".into()),
@@ -156,7 +160,7 @@ fn the_committed_example_interleaves_a_resuming_and_a_restarting_pool() {
         None,
         &script_path(),
         &state,
-        0,
+        &etv_station::variety::Variety::fixed(0),
         test_env(&inputs),
         Window {
             from: 0,
@@ -194,7 +198,7 @@ fn the_committed_example_starts_spotlight_at_the_top_with_no_cursor() {
         None,
         &script_path(),
         &GenerationState::empty(),
-        0,
+        &etv_station::variety::Variety::fixed(0),
         test_env(&inputs),
         Window {
             from: 0,
@@ -273,6 +277,8 @@ async fn assert_one_file_across_the_chunk(
 /// instead of a `pattern:` template.
 fn foryou_pool(plugin: &Path) -> Pool {
     Pool {
+        seed: None,
+        temperature: None,
         tracks: None,
         name: "foryou".into(),
         expr: None,
@@ -305,6 +311,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
 /// logic.
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
+        temperature: None,
         subtitle: None,
         tracks: None,
         number: 1,
@@ -317,7 +324,7 @@ fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
         chunk_hours: 6,
         roll_interval: std::time::Duration::from_secs(60),
         retention_days: 1,
-        seed: Some(7),
+        seed: Some(etv_station::config::SeedSpec::Fixed(7)),
         overlay: None,
         annotate: None,
         groups: Vec::new(),

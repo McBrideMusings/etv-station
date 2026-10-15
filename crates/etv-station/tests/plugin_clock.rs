@@ -93,6 +93,7 @@ fn audit(ctx, picks, workspace) { #{} }
 
 fn plugin_channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
+        temperature: None,
         subtitle: None,
         tracks: None,
         number: 1,
@@ -105,7 +106,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
         chunk_hours: 6,
         roll_interval: std::time::Duration::from_secs(60),
         retention_days: 1,
-        seed: Some(7),
+        seed: Some(etv_station::config::SeedSpec::Fixed(7)),
         overlay: None,
         annotate: None,
         groups: Vec::new(),
@@ -124,6 +125,8 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                 mode: Mode::All,
                 order: Default::default(),
                 pools: vec![Pool {
+                    seed: None,
+                    temperature: None,
                     tracks: None,
                     name: "clockpool".into(),
                     expr: None,

@@ -197,7 +197,7 @@ fn sample_path() -> std::path::PathBuf {
 /// way; this is that pin, held fixed across every test in this file.
 fn config() -> ChannelConfig {
     let mut cfg = read_channel(&sample_path()).expect("load the For You sample");
-    cfg.seed = Some(20260812);
+    cfg.seed = Some(etv_station::config::SeedSpec::Fixed(20260812));
     movies_pool(&mut cfg).datastores[0].path = taste_store_path().to_str().unwrap().to_string();
     cfg
 }

@@ -8,16 +8,19 @@
 // score. What #254 did not cover is that the cosine is a pure function of
 // (catalog, taste vector), and both are near-constant between generations —
 // so the ranking came out identical every run and the head of it aired on a
-// loop. The seeded exploration slot below does not help: its permutation and
-// its coin flips are seeded off `ctx.seed` alone, which is also constant, so
-// it varies picks WITHIN one returned list and never BETWEEN two of them.
+// loop. Two inputs move it, and they move it on different clocks:
 //
-// The recency factor is therefore the only input to this script that moves
-// as the channel plays, and it is what makes a later generation reach
-// further down the ranking instead of replaying the top of it. It damps
-// rather than excludes: a title in the tail can still win if its cosine is
-// far enough ahead, which is the judgement a hard cooldown window cannot
-// express.
+// - The recency factor moves as the channel plays: it is what makes a later
+//   generation reach further down the ranking instead of replaying the top of
+//   it. It damps rather than excludes: a title in the tail can still win if
+//   its cosine is far enough ahead, which is the judgement a hard cooldown
+//   window cannot express.
+// - `ctx.seed` and `ctx.temperature` move when the channel's `seed:` or
+//   `temperature:` rotates (etv-station-tflc). The seed reseeds the
+//   exploration slot's permutation and coin flips; the temperature loosens the
+//   ranking itself — see the TEMPERATURE note in pick(). The station ranks a
+//   rotating pool once per period and walks that list, so these change the
+//   list at a rollover and nowhere else.
 //
 // Five functions make up the contract:
 //   hooks()               -> [hook_name, …]                    which hooks this script implements
@@ -70,6 +73,9 @@
 //   ctx.pool             the name of the pool asking
 //   ctx.target_count     how many items this generation needs
 //   ctx.config           this pool's `config:` block, or an empty map
+//   ctx.temperature      how far the order may stray from the score ranking
+//                        this period: 0 is the ranking exactly; see the
+//                        TEMPERATURE note in pick()
 //   ctx.seed             the channel's resolved seed, already mixed with
 //                        this pool's name (#255, ADR 0005) — the one source
 //                        of reproducible entropy inside the sandbox
@@ -628,6 +634,7 @@ fn pick(ctx) {
     }
 
     let seed = ctx.seed;
+    let temperature = ctx.temperature;
 
     let half_life = recency_half_life(ctx);
 
@@ -873,6 +880,18 @@ fn pick(ctx) {
             // reaches it — computed once here, not per slot, since a
             // candidate's own id and the seed are all it depends on.
             explore_key: unit_at(seed, hash_str(id)),
+            temper_key: if temperature > 0.0 {
+                // The candidate's log-score scaled by 1/T, plus Gumbel noise
+                // from its own seeded draw — see TEMPERATURE below. A score of
+                // zero (no keyword the pool weights) has no log, so it sits at
+                // a floor far below every scored title rather than at -inf.
+                let u = unit_at(seed, hash_str("t:" + id));
+                if u <= 0.0 { u = 1.0e-12; }
+                let floor = if score > 1.0e-9 { score } else { 1.0e-9 };
+                floor.ln() / temperature - (-(u.ln())).ln()
+            } else {
+                0.0
+            },
         });
     }
 
@@ -892,6 +911,30 @@ fn pick(ctx) {
     // when that copy is taken. One inline pass over `scored`, not a second
     // id -> rank map (#172's rule: no per-candidate helper taking a
     // library-sized collection by value).
+    // TEMPERATURE (etv-station-tflc). At 0 the walk order IS the score
+    // ranking above. Above 0, the order is redrawn: each candidate's key is
+    // ln(score)/T plus Gumbel noise drawn from the seed, and sorting by that
+    // key is a draw without replacement where each next pick's chance is
+    // proportional to score^(1/T) — the Gumbel-top-k trick. At T = 1 a
+    // title's chance is proportional to its score; as T falls toward 0 the
+    // order converges back on the ranking; as T rises it approaches a
+    // uniform shuffle. The noise comes from `ctx.seed`, so one period's order
+    // reproduces and the next period's differs.
+    //
+    // `score_rank` keeps where each candidate stood by score alone, so an
+    // audit line can show how far the temperature moved a pick.
+    for i in 0..scored.len {
+        scored[i].score_rank = i + 1;
+    }
+    if temperature > 0.0 {
+        scored.sort(|a, b| {
+            if a.temper_key > b.temper_key { -1 }
+            else if a.temper_key < b.temper_key { 1 }
+            else if a.id < b.id { -1 }
+            else if a.id > b.id { 1 }
+            else { 0 }
+        });
+    }
     for i in 0..scored.len {
         scored[i].rank = i + 1;
     }
@@ -1058,6 +1101,10 @@ fn pick(ctx) {
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
+            // Where it stood by score alone, and the temperature that moved
+            // it to `rank` — equal to `rank` at temperature 0.
+            score_rank: row.score_rank,
+            temperature: temperature,
             // Which series was ranked, on a shows pool — unit on a movies
             // pool, where the entry and the unit are the same thing. Without
             // it an audit line reads as though the episode itself scored 7.7,
@@ -1273,6 +1320,10 @@ fn audit(ctx, picks, workspace) {
                 // Unit on a movies pool, where the entry IS the unit.
                 unit: r.unit,
                 rank: r.rank,
+                // Where it stood by score alone, and the temperature that
+                // moved it to `rank`; the two ranks match at temperature 0.
+                score_rank: r.score_rank,
+                temperature: r.temperature,
                 candidate_count: workspace.candidate_count,
                 draw: r.draw,
                 near_misses: r.near_misses,
@@ -1303,6 +1354,11 @@ fn audit(ctx, picks, workspace) {
         }
         if r != () && r.disfavor_score > 0.0 {
             verdict = verdict + ", held back by the taste profile's disfavor";
+        }
+        // A temperature above 0 redraws the order; say so on a pick it moved,
+        // or a #9 by score airing ahead of the #1 reads as a broken ranking.
+        if r != () && r.draw != "exploration" && r.rank != r.score_rank {
+            verdict = verdict + ", drawn at temperature " + r.temperature + " from #" + r.score_rank + " by score";
         }
         // Which half of the library the pool drew from, named on every pick
         // that came from a partitioned pool. Not conditional on the pick

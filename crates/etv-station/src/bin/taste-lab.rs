@@ -835,7 +835,7 @@ fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
         &plugin_path,
         pw.pool.sources.as_ref(),
         &inputs,
-        0,
+        etv_station::variety::Dice::fixed(0),
         pool_name,
         Some(&full_config),
         grant,
@@ -983,6 +983,7 @@ fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>,
         session.account_id,
         session.days,
         start,
+        time_tz::timezones::db::UTC,
     )?;
 
     let mut out = Vec::new();
@@ -1436,6 +1437,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         account_id,
         days,
         start,
+        tz,
     )?;
 
     let block_names: Vec<String> = lc
@@ -1505,13 +1507,6 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .map(|s| s.nominal_item_secs)
         .unwrap_or_else(|| config::ScoringConfig::default().nominal_item_secs);
     let mut notices = Vec::new();
-    let station_is_utc = matches!(station.station.tz.as_str(), "UTC" | "Etc/UTC");
-    if !station_is_utc && lc.config.rule.blocks.iter().any(|b| b.is_sequencer()) {
-        notices.push(format!(
-            "A sequencer block reads UTC here, not {}, so its dayparts run shifted by the zone offset.",
-            station.station.tz
-        ));
-    }
     let unprobed = airings
         .iter()
         .filter(|a| {
@@ -1839,7 +1834,7 @@ fn build_review(
         })
         .collect();
 
-    let seed = lc.config.seed.unwrap_or(0);
+    let seed = review_seed(station, lc, start);
     let mut samples: Vec<Value> = Vec::new();
     for (n, t) in review::tune_in_samples(airings, start, end, seed, TUNE_IN_SAMPLES)
         .into_iter()
@@ -1903,6 +1898,19 @@ fn build_review(
 /// One tune-in sample's still, as the page reads it: `{url}` when there is a
 /// media file to grab a frame from, else `{unavailable, path?}` naming why
 /// not. Registers the still so its URL renders it on first request.
+/// The channel's seed at `at` — what the review's seeded tune-in samples and
+/// still names key on, so a rerun of the same span picks the same moments.
+fn review_seed(
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+    at: time::OffsetDateTime,
+) -> u64 {
+    let tz = etv_station::tz::parse(&station.station.tz).unwrap_or(time_tz::timezones::db::UTC);
+    etv_station::variety::Variety::new(&lc.config, tz)
+        .dice(at, None)
+        .seed
+}
+
 fn offer_still(
     state: &mut AppState,
     station: &config::Station,
@@ -1934,7 +1942,7 @@ fn offer_still(
         .collect();
     let id = format!(
         "{channel}-s{}-n{n}-{}.jpg",
-        lc.config.seed.unwrap_or(0),
+        review_seed(station, lc, airing.start),
         still.digest()
     );
     state.review.stills.insert(id.clone(), still);

@@ -40,6 +40,8 @@
 //!     // ctx.cursor.<series>    — the last entry_id the play-history ledger
 //!     //                          recorded for that series, or absent
 //!     // ctx.now                — unix seconds at generation time
+//!     // ctx.seed               — the channel's seed for this window's period
+//!     // ctx.temperature        — the channel's temperature for that period
 //!
 //!     // local_time(unix_secs) -> #{ weekday, hour, minute } — the station's
 //!     // configured tz (ADR 0004) applied to any unix-second instant, not
@@ -112,11 +114,13 @@ pub struct Window {
 /// pool that declares none inherits — the same rule a pattern block's pools
 /// follow.
 ///
-/// `seed` is the channel's resolved generation seed — the same value a
-/// `pattern` block's `RollKey` mixes into its own draws. A pool inside a
+/// `variety` answers each pool's seed and temperature at the window's start
+/// — the same dice a `pattern` block's walk draws with. A pool inside a
 /// sequencer block is resolved through the same [`crate::pattern::resolve_pool_sources`]
-/// a pattern block uses, so a `plugin:` pool here gets `ctx.seed` exactly as
-/// one under `pattern:` does (#255).
+/// a pattern block uses, so a `plugin:` pool here gets `ctx.seed` and
+/// `ctx.temperature` exactly as one under `pattern:` does (#255). One
+/// generation of a sequencer block never spans a rollover: the resolver cuts
+/// its window at the next one ([`crate::variety::Variety::next_rollover`]).
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     catalog: &Catalog,
@@ -125,18 +129,24 @@ pub fn build(
     block_constraints: Option<&Constraints>,
     sequencer: &Path,
     state: &GenerationState,
-    seed: u64,
+    variety: &crate::variety::Variety,
     score_env: crate::score::ScoreEnv<'_>,
     window: Window,
 ) -> Result<BlockBuild, String> {
+    let opens = OffsetDateTime::from_unix_timestamp(window.from)
+        .map_err(|e| format!("window start {}: {e}", window.from))?;
+    let dice: Vec<crate::variety::Dice> =
+        pools.iter().map(|p| variety.dice(opens, Some(p))).collect();
+    let mut lists = state.resume.lists.clone();
     let mut score_cache = crate::score::ScoreCache::default();
     let pool_id_lists = crate::pattern::resolve_pool_sources(
         catalog,
         pools,
         groups,
         &mut score_cache,
-        seed,
+        &dice,
         score_env,
+        &mut lists,
     )?;
 
     // Per pool: its bucket_order-sequenced series (kept for the resume
@@ -152,7 +162,7 @@ pub fn build(
     let mut pools_ctx = Map::new();
     let mut pool_config_ctx = Map::new();
 
-    for (cfg, ids) in pools.iter().zip(pool_id_lists) {
+    for ((cfg, ids), pool_dice) in pools.iter().zip(pool_id_lists).zip(&dice) {
         let own: HashSet<&str> = ids.iter().map(String::as_str).collect();
         let seam: Vec<String> = state
             .tail
@@ -167,6 +177,7 @@ pub fn build(
             block_constraints,
             &seam,
             false,
+            pool_dice.seed,
         )?;
 
         let flat: Vec<String> = series.iter().flat_map(|s| s.ids.iter().cloned()).collect();
@@ -205,6 +216,7 @@ pub fn build(
         state,
         score_env,
         window,
+        variety.dice(opens, None),
     )?;
 
     for id in &arranged_raw {
@@ -236,7 +248,13 @@ pub fn build(
                 let next = last_series.get(&pool_idx).and_then(|&si| {
                     (!series.is_empty()).then(|| series[(si + 1) % series.len()].key.clone())
                 });
-                (name.clone(), PoolResume { next, cycle: 0 })
+                (
+                    name.clone(),
+                    PoolResume {
+                        next,
+                        ..Default::default()
+                    },
+                )
             })
             .collect()
     };
@@ -286,6 +304,7 @@ pub fn build(
         metadata: metadata_out,
         guides: guide_out,
         tracks: tracks_out,
+        lists,
     })
 }
 
@@ -293,6 +312,7 @@ pub fn build(
 /// entry_id list it picked — unvalidated against the block's pools and
 /// untruncated to the window, both of which [`build`] does once this
 /// returns.
+#[allow(clippy::too_many_arguments)]
 fn call_arrange(
     sequencer: &Path,
     pools_ctx: &Map,
@@ -301,6 +321,7 @@ fn call_arrange(
     state: &GenerationState,
     score_env: crate::score::ScoreEnv<'_>,
     window: Window,
+    dice: crate::variety::Dice,
 ) -> Result<Vec<String>, String> {
     let source = std::fs::read_to_string(sequencer)
         .map_err(|e| format!("read sequencer plugin {}: {e}", sequencer.display()))?;
@@ -358,6 +379,15 @@ fn call_arrange(
     ctx.insert("resume".into(), Dynamic::from_map(resume_map));
     ctx.insert("cursor".into(), Dynamic::from_map(cursor_map));
     ctx.insert("now".into(), score_env.inputs.now.into());
+    // The channel's seed and temperature for this window's period — the
+    // script's own source of reproducible entropy, as `ctx.seed` is a
+    // scorer's. Not mixed with any pool name: the script arranges the whole
+    // block.
+    ctx.insert(
+        "seed".into(),
+        ((dice.seed & (i64::MAX as u64)) as i64).into(),
+    );
+    ctx.insert("temperature".into(), dice.temperature.into());
 
     let mut scope = Scope::new();
     let picked: Array = engine
@@ -512,6 +542,8 @@ mod tests {
 
     fn pool(name: &str, expr: &str) -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: name.into(),
             expr: Some(expr.into()),
@@ -579,7 +611,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -618,7 +650,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 12345,
@@ -673,7 +705,7 @@ fn arrange(ctx) {
             None,
             &script,
             &state,
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -706,7 +738,7 @@ fn arrange(ctx) { ["nonexistent-id"] }
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -739,7 +771,7 @@ fn arrange(ctx) { ["mov-1"] }
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -781,7 +813,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -822,7 +854,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -862,7 +894,7 @@ fn arrange(ctx) { ["mov-1"] }
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -894,6 +926,8 @@ fn arrange(ctx) {
         resume_map.pools.insert(
             "movies".into(),
             PoolResume {
+                list: None,
+                lap: Vec::new(),
                 next: Some("show:whatever".into()),
                 cycle: 0,
             },
@@ -910,7 +944,7 @@ fn arrange(ctx) {
             None,
             &script,
             &state,
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -948,7 +982,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -985,7 +1019,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             test_env(),
             Window {
                 from: 0,
@@ -1037,7 +1071,7 @@ fn arrange(ctx) {
             None,
             &script,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
             env,
             Window { from, fill: None },
         )

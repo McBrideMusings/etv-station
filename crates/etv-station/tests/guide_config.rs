@@ -21,6 +21,7 @@ fn path() -> &'static Path {
 
 fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> ChannelConfig {
     ChannelConfig {
+        temperature: None,
         subtitle: None,
         tracks: None,
         number: 1,
@@ -111,6 +112,8 @@ fn pattern_block(
 /// (#289) — the rung between the block and the item.
 fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
     Pool {
+        seed: None,
+        temperature: None,
         tracks: None,
         name: name.into(),
         expr: Some(expr.into()),

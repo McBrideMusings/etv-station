@@ -127,7 +127,7 @@ fn run_full(
         &script,
         None,
         &inputs,
-        seed,
+        etv_station::variety::Dice::fixed(seed),
         "endless",
         config.as_ref(),
         granted,

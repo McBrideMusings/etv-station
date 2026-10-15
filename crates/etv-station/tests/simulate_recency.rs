@@ -72,6 +72,7 @@ fn write_plugin(dir: &tempfile::TempDir) -> PathBuf {
 
 fn channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
+        temperature: None,
         subtitle: None,
         tracks: None,
         number: 1,
@@ -84,7 +85,7 @@ fn channel(plugin: &Path) -> ChannelConfig {
         chunk_hours: 6,
         roll_interval: std::time::Duration::from_secs(3600),
         retention_days: 1,
-        seed: Some(7),
+        seed: Some(etv_station::config::SeedSpec::Fixed(7)),
         overlay: None,
         annotate: None,
         groups: Vec::new(),
@@ -103,6 +104,8 @@ fn channel(plugin: &Path) -> ChannelConfig {
                 mode: Mode::All,
                 order: Default::default(),
                 pools: vec![Pool {
+                    seed: None,
+                    temperature: None,
                     tracks: None,
                     name: "movies".into(),
                     expr: None,
@@ -151,6 +154,7 @@ fn history_carries_forward_so_no_title_repeats_before_every_title_has_aired() {
         None,
         4,
         datetime!(2026-01-01 00:00 UTC),
+        time_tz::timezones::db::UTC,
     )
     .unwrap();
 
@@ -193,6 +197,7 @@ fn each_generation_is_asked_for_a_chunks_worth_of_items() {
         None,
         1,
         datetime!(2026-01-01 00:00 UTC),
+        time_tz::timezones::db::UTC,
     )
     .unwrap();
 

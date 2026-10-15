@@ -79,14 +79,10 @@ impl DeterminismReport {
 /// - **Catalog snapshot** — one read-only handle, opened once and reused for
 ///   both passes, so both see the exact same bytes on disk. Nothing here
 ///   ingests or writes to it.
-/// - **Seed** — an authored `seed` is already the same for both passes (it is
-///   read once, from the loaded config). An unset seed is intentionally
-///   fresh-per-generation (#46: "unset = fresh per generation") —
-///   [`resolve_channel_with_resume`] draws a new one from wall-clock nanos on
-///   every call, which would make *every* unseeded channel read as
-///   non-reproducible for a reason that has nothing to do with a plugin. So
-///   an unset seed is pinned here, once, to one freshly-drawn value, and that
-///   one value is used for both passes exactly as an authored seed would be.
+/// - **Seed and temperature** — both are a pure function of the loaded config
+///   and the instant asked about ([`crate::variety`]), and both passes share
+///   one `window_start`, so they draw the same dice whether the values are
+///   fixed, rotating, or left at the default.
 /// - **Resume state** — [`GenerationState::empty`] for both passes: the same
 ///   stateless shape [`crate::resolve::resolve_channel`] itself uses, not the
 ///   channel's live `.resume` sidecar or play-history ledger. Nothing is read
@@ -135,11 +131,6 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         .ok_or_else(|| StationError::UnknownChannel {
             name: channel_name.to_string(),
         })?;
-
-    // Pin the seed once, before either pass — see the doc comment above.
-    if station.channels[idx].config.seed.is_none() {
-        station.channels[idx].config.seed = Some(fresh_seed());
-    }
 
     let channel = &station.channels[idx];
     let catalog = open_catalog(station.station.catalog_path.as_deref())?;
@@ -271,17 +262,6 @@ fn open_catalog(path: Option<&str>) -> Result<Option<Catalog>, StationError> {
     }
 }
 
-/// A seed drawn once, for a channel whose `seed` is unset (#46). Same shape
-/// as `resolve::fresh_seed` (wall-clock nanos) but kept local rather than
-/// shared: drawing one is this check's own need, not something the
-/// resolver's other callers use.
-fn fresh_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +280,7 @@ mod tests {
 
     fn base_channel(rule: RuleConfig, scoring: Option<ScoringConfig>) -> ChannelConfig {
         ChannelConfig {
+            temperature: None,
             subtitle: None,
             tracks: None,
             number: 1,
@@ -324,6 +305,7 @@ mod tests {
         Station {
             config_path: PathBuf::from("/tmp/station.toml"),
             station: crate::config::StationConfig {
+                temperature: None,
                 tracks: None,
                 overlay: None,
                 seed: None,
@@ -491,16 +473,15 @@ mod tests {
         }
     }
 
-    /// An unseeded `order = "random"` channel intentionally reshuffles every
-    /// generation (#46) — that must not read as a plugin breaking
-    /// determinism. `check` pins one seed for both passes, so the two
-    /// schedules match even though the config itself never set one.
+    /// An unseeded `order = "random"` channel draws the default daily seed
+    /// rotation, which is a function of the window's date and nothing else —
+    /// so it reproduces without anything pinning a seed for it.
     ///
     /// `order = "random"` on an entries block resolves through the catalog
     /// (the order engine's seeded shuffle), so this fixture needs one —
     /// unlike the plain `manual_block` tests above, which stay catalog-free.
     #[test]
-    fn an_unseeded_random_channel_still_passes_because_the_check_pins_one_seed() {
+    fn an_unseeded_random_channel_reproduces() {
         let dir = tempfile::tempdir().unwrap();
         let ids = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
         let catalog_path = dir.path().join("catalog.db");
@@ -521,7 +502,7 @@ mod tests {
         let report = check(&mut station, "shuffled").unwrap();
         assert!(
             report.is_identical(),
-            "an unseeded channel must still be reproducible once the check pins a seed: {report:?}"
+            "an unseeded channel must reproduce under the default rotation: {report:?}"
         );
     }
 
@@ -638,6 +619,8 @@ fn audit(ctx, picks, workspace) {
 
     fn plugin_pool(script: &Path) -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: "movies".into(),
             expr: None,
@@ -870,7 +853,7 @@ fn audit(ctx, picks, workspace) {
         // one would still be workspace-leak-free, but a differing seed would
         // also (correctly) change the ranking, which would be a second,
         // unrelated source of divergence muddying what this test checks.
-        cfg.seed = Some(4242);
+        cfg.seed = Some(crate::config::SeedSpec::Fixed(4242));
         let mut station = station_with(
             "workspace-leak",
             cfg,

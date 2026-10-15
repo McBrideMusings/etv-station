@@ -40,6 +40,12 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
     }
 
     validate_tracks(path, "station", station.tracks.as_ref())?;
+    validate_variety(
+        path,
+        "station",
+        station.seed.as_ref(),
+        station.temperature.as_ref(),
+    )?;
 
     if station.output_base.as_os_str().is_empty() {
         return Err(ConfigError::Validation {
@@ -66,6 +72,27 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
     }
 
     Ok(())
+}
+
+/// A `seed:` or `temperature:` that parsed but cannot be used — a rotation
+/// shorter than [`super::variety::MIN_ROTATE`], an empty `cycle`, a negative
+/// temperature — fails the load naming the level it was set at.
+fn validate_variety(
+    path: &Path,
+    level: &str,
+    seed: Option<&super::SeedSpec>,
+    temperature: Option<&super::TemperatureSpec>,
+) -> Result<(), ConfigError> {
+    let problem = seed
+        .and_then(|s| s.problem())
+        .or_else(|| temperature.and_then(|t| t.problem()));
+    match problem {
+        Some(problem) => Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{level}: {problem}"),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Validate a channel after [`super::load`] has resolved every block-include
@@ -112,6 +139,12 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     validate_show_groups(path, &channel.groups)?;
     validate_guide(path, "channel", channel.guide.as_ref())?;
     validate_tracks(path, "channel", channel.tracks.as_ref())?;
+    validate_variety(
+        path,
+        "channel",
+        channel.seed.as_ref(),
+        channel.temperature.as_ref(),
+    )?;
 
     // A `plugin:` path means what it means relative to the channel config
     // file (see `score::ScoreEnv::resolve_path`, which every generation-time
@@ -146,6 +179,14 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         validate_constraints(&include.constraints(), &bad)?;
         validate_guide(path, &format!("block #{idx}"), include.guide())?;
         validate_tracks(path, &format!("block #{idx}"), include.tracks())?;
+        for pool in &include.pools {
+            validate_variety(
+                path,
+                &format!("block #{idx}: pool {:?}", pool.name),
+                pool.seed.as_ref(),
+                pool.temperature.as_ref(),
+            )?;
+        }
 
         if include.is_pattern() {
             validate_pattern_block(include, &mut pool_names, &channel.groups, base_dir, &bad)?;
@@ -1151,6 +1192,8 @@ mod tests {
 
     fn pool(name: &str) -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: name.into(),
             expr: Some(format!("item.type == \"{name}\"")),
@@ -1209,6 +1252,7 @@ mod tests {
 
     fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            temperature: None,
             subtitle: None,
             tracks: None,
             number: 1,
@@ -1322,6 +1366,7 @@ mod tests {
     #[test]
     fn rejects_empty_channels() {
         let s = StationConfig {
+            temperature: None,
             tracks: None,
             overlay: None,
             seed: None,
@@ -1346,6 +1391,7 @@ mod tests {
     #[test]
     fn rejects_empty_output_base() {
         let s = StationConfig {
+            temperature: None,
             tracks: None,
             overlay: None,
             seed: None,
@@ -1371,6 +1417,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_tz() {
         let s = StationConfig {
+            temperature: None,
             tracks: None,
             overlay: None,
             seed: None,
@@ -1394,6 +1441,7 @@ mod tests {
     #[test]
     fn rejects_empty_channel_entry() {
         let s = StationConfig {
+            temperature: None,
             tracks: None,
             overlay: None,
             seed: None,

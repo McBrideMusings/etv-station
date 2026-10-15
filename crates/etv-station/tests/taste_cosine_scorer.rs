@@ -318,7 +318,7 @@ impl Scorer {
             &self.script,
             self.sources.as_ref(),
             &inputs,
-            seed,
+            etv_station::variety::Dice::fixed(seed),
             pool,
             config.as_ref(),
             grant(&self.db),
@@ -837,7 +837,7 @@ fn near_miss_limit_is_overridable_via_pool_config() {
         &scorer.script,
         None,
         &inputs,
-        42,
+        etv_station::variety::Dice::fixed(42),
         "movies",
         Some(&config),
         grant(&scorer.db),
@@ -1215,7 +1215,7 @@ impl Scorer {
             &self.script,
             None,
             &inputs,
-            0,
+            etv_station::variety::Dice::fixed(0),
             "shows",
             Some(&config),
             grant(&self.db),
@@ -1349,7 +1349,7 @@ impl Scorer {
             &self.script,
             None,
             &inputs,
-            0,
+            etv_station::variety::Dice::fixed(0),
             "shows",
             Some(&config),
             grant(&self.db),
@@ -2073,4 +2073,111 @@ fn a_negative_taste_weight_is_refused() {
     .pick_profiled(-1.0)
     .unwrap_err();
     assert!(err.contains("taste_weight"), "err = {err}");
+}
+
+// ---- ctx.temperature (etv-station-tflc) -----------------------------------
+
+/// Sixteen candidates on one profile keyword, `temp-NN` padded with NN
+/// off-profile keywords, so each scores 1/sqrt(NN + 1) and the ranking is
+/// exactly `temp-00`, `temp-01`, … with every gap known. `seed-a`, the one
+/// play, defines the pooled weight and is not a candidate.
+fn temperature_scorer() -> Scorer {
+    let ids: Vec<String> = (0..16).map(|n| format!("temp-{n:02}")).collect();
+    let cat = catalog_of(ids.iter().map(String::as_str));
+    Scorer::new(&cat, |db| {
+        let conn = empty_store(db);
+        let fact = "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
+                    VALUES (?1, 'keywords', 'keyword', ?2, 't')";
+        conn.execute(
+            "INSERT INTO items (item_id, type) VALUES ('seed-a', 'movie')",
+            [],
+        )
+        .unwrap();
+        conn.execute(fact, ["seed-a", "hit"]).unwrap();
+        conn.execute(
+            "INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) \
+             VALUES ('h1', 'seed-a', 42, 1700000000)",
+            [],
+        )
+        .unwrap();
+        for (n, id) in ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO items (item_id, type) VALUES (?1, 'movie')",
+                [id],
+            )
+            .unwrap();
+            conn.execute(fact, [id.as_str(), "hit"]).unwrap();
+            for pad in 0..n {
+                conn.execute(fact, [id.clone(), format!("pad-{n}-{pad}")])
+                    .unwrap();
+            }
+        }
+    })
+}
+
+fn pick_at(scorer: &Scorer, seed: u64, temperature: f64) -> Vec<PickedItem> {
+    let inputs = ScoreInputs {
+        target_count: 6,
+        ..Default::default()
+    };
+    pick(
+        &scorer.cache,
+        &scorer.script,
+        scorer.sources.as_ref(),
+        &inputs,
+        etv_station::variety::Dice {
+            temperature,
+            ..etv_station::variety::Dice::fixed(seed)
+        },
+        "movies",
+        tunables(Some(0.0)).as_ref(),
+        grant(&scorer.db),
+    )
+    .unwrap()
+}
+
+/// Temperature 0 is the ranking exactly; a cold temperature keeps the head
+/// of it; temperature 1 redraws the order from the seed — the same seed
+/// reproducing it, another seed drawing another — and every pick's audit says
+/// where it stood by score and what temperature moved it.
+#[test]
+fn temperature_loosens_the_ranking_by_seed_and_zero_keeps_it() {
+    let scorer = temperature_scorer();
+    let ranking: Vec<String> = (0..16).map(|n| format!("temp-{n:02}")).collect();
+
+    let cold = pick_at(&scorer, 7, 0.0);
+    assert_eq!(
+        order_of(&cold),
+        ranking[..16].iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    for p in &cold {
+        assert_eq!(detail_f64(p, "rank"), detail_f64(p, "score_rank"));
+    }
+
+    // At 0.01 the head's log-score gaps (0.35, 0.20, 0.14) are 14-35 units
+    // of Gumbel noise apart: the top three cannot move.
+    let chilly = pick_at(&scorer, 7, 0.01);
+    assert_eq!(order_of(&chilly)[..3], ["temp-00", "temp-01", "temp-02"]);
+
+    let warm = pick_at(&scorer, 7, 1.0);
+    assert_ne!(
+        order_of(&warm),
+        order_of(&cold),
+        "temperature 1 redraws the order"
+    );
+    assert_eq!(
+        order_of(&warm),
+        order_of(&pick_at(&scorer, 7, 1.0)),
+        "the same seed reproduces"
+    );
+    assert_ne!(
+        order_of(&warm),
+        order_of(&pick_at(&scorer, 8, 1.0)),
+        "another seed draws another order"
+    );
+    let moved = warm
+        .iter()
+        .find(|p| detail_f64(p, "rank") != detail_f64(p, "score_rank"))
+        .expect("some pick moved");
+    assert_eq!(detail_f64(moved, "temperature"), 1.0);
 }

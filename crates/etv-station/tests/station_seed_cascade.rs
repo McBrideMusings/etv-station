@@ -64,6 +64,11 @@ fn seed_of(station: &config::Station, name: &str) -> Option<u64> {
         .unwrap_or_else(|| panic!("channel {name} not loaded"))
         .config
         .seed
+        .as_ref()
+        .map(|spec| match spec {
+            config::SeedSpec::Fixed(n) => *n,
+            other => panic!("expected a fixed seed, got {other:?}"),
+        })
 }
 
 #[test]
@@ -106,7 +111,7 @@ fn with_no_station_seed_an_unseeded_channel_stays_unseeded() {
     let station_path = write_station(dir.path(), None, None);
 
     let station = config::load(&station_path).unwrap();
-    // Unchanged behavior: `resolve.rs` falls through to `fresh_seed()`.
+    // Unset: `etv_station::variety` draws its default daily rotation.
     assert_eq!(seed_of(&station, "001-for-you"), None);
     assert_eq!(seed_of(&station, "002-for-pierce"), None);
 }

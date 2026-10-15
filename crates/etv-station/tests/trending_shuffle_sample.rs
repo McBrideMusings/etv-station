@@ -86,7 +86,7 @@ fn trending_shuffle_sample_plays_every_member_and_excludes_non_members() {
 #[test]
 fn trending_shuffle_sample_is_reproducible_with_a_pinned_seed() {
     let mut config: ChannelConfig = read_channel(&sample_path()).unwrap();
-    config.seed = Some(42);
+    config.seed = Some(etv_station::config::SeedSpec::Fixed(42));
     let cat = trending_catalog();
 
     let first = resolve_channel(&config, &sample_path(), &[], None, Some(&cat)).unwrap();

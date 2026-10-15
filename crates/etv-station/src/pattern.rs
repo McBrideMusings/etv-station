@@ -79,7 +79,7 @@
 //! seed reproduces the whole schedule, and the roll for one step never shifts
 //! because another step was added or skipped.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -229,6 +229,14 @@ struct PoolRuntime<'a> {
     /// source that keeps answering without ever supplying anything new cannot
     /// spin the walk.
     refills: usize,
+
+    /// [`crate::variety::Dice::list_key`] of the list this runtime holds, or
+    /// `None` when nothing about the pool rotates. The walk compares it with
+    /// the dice at each visit; a different key is a rollover.
+    list_key: Option<String>,
+    /// Series visited since the walk last covered every series — the lap that
+    /// decides where a rollover opens (see [`PoolResume::lap`]).
+    lap: BTreeSet<String>,
 }
 
 impl PoolRuntime<'_> {
@@ -611,6 +619,14 @@ impl PoolRuntime<'_> {
             };
         }
 
+        for &si in contributed.keys() {
+            self.lap.insert(self.series[si].key.clone());
+        }
+        if self.series.iter().all(|s| self.lap.contains(&s.key)) {
+            // Every series has had its turn: the next lap starts empty.
+            self.lap.clear();
+        }
+
         // Park the rotation. A series that served the whole visit alone has had
         // its turn, so the next visit starts after it; one that only partly
         // served keeps its place so the next visit continues it.
@@ -664,7 +680,72 @@ impl PoolRuntime<'_> {
                     .map(|i| self.series[i].key.clone()),
                 Select::Random => None,
             },
+            list: self.list_key.clone(),
+            // Only a resuming pool reads its lap back; a `restart` pool opens
+            // on its top every generation whatever it visited.
+            lap: if self.cfg.advance == Advance::Resume {
+                self.lap.iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    /// Seat a resuming pool on a list ranked for a new period.
+    ///
+    /// The walk opens on the first series of the new list that this lap has
+    /// not visited. A list that changed completely opens on its top, which is
+    /// the point of a new list; a list that barely changed — a shows pool at
+    /// temperature 0, whose ranking only moves where the new seed changes an
+    /// exploration pick — carries on past what it already aired, instead of
+    /// replaying its top every period and never reaching its tail.
+    fn open_after_rollover(&mut self, prev: &PoolResume) {
+        let held: HashSet<&str> = self.series.iter().map(|s| s.key.as_str()).collect();
+        self.lap = prev
+            .lap
+            .iter()
+            .filter(|k| held.contains(k.as_str()))
+            .cloned()
+            .collect();
+        if self.series.iter().all(|s| self.lap.contains(&s.key)) {
+            self.lap.clear();
+        }
+        self.rotation = self
+            .series
+            .iter()
+            .position(|s| !self.lap.contains(&s.key))
+            .unwrap_or(0);
+    }
+
+    /// Carry what the walk has already done into `fresh`, a runtime rebuilt
+    /// from a newly ranked list at a rollover partway through a generation:
+    /// the constraint window, every series' cursor, what has aired, the clash
+    /// count. Only the list and the rotation are new.
+    fn carry_into(self, fresh: &mut PoolRuntime<'_>) {
+        let cursors: HashMap<&str, usize> = self
+            .series
+            .iter()
+            .map(|s| (s.key.as_str(), s.cursor))
+            .collect();
+        for s in &mut fresh.series {
+            if let Some(&c) = cursors.get(s.key.as_str()) {
+                s.cursor = c;
+            }
+        }
+        fresh.recent = self.recent;
+        fresh.forced += self.forced;
+        // Only what the new list still holds: `drawn` is counted against the
+        // list's size to decide when the pool is drained.
+        let held: HashSet<&str> = fresh
+            .series
+            .iter()
+            .flat_map(|s| s.ids.iter().map(String::as_str))
+            .collect();
+        fresh.drawn = self
+            .drawn
+            .into_iter()
+            .filter(|id| held.contains(id.as_str()))
+            .collect();
     }
 }
 
@@ -767,6 +848,9 @@ pub struct BlockBuild {
     /// This pool's own `tracks:` per drawn `entry_id` (#261), the pool rung of
     /// the track-selection cascade.
     pub tracks: HashMap<String, crate::config::TrackRules>,
+    /// Every rotating plugin pool's list for its current period, for
+    /// [`crate::resume::ResumeMap::lists`].
+    pub lists: BTreeMap<String, Vec<crate::resume::FrozenList>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -778,7 +862,8 @@ pub fn build(
     cycles: Option<usize>,
     block_constraints: Option<&Constraints>,
     state: &GenerationState,
-    seed: u64,
+    variety: &crate::variety::Variety,
+    window_start: time::OffsetDateTime,
     score_env: crate::score::ScoreEnv<'_>,
     fill: Option<Duration>,
 ) -> Result<BlockBuild, String> {
@@ -786,22 +871,46 @@ pub fn build(
     // window does not get to argue with it. Only a derived count is bounded.
     let budget = fill.filter(|_| cycles.is_none());
 
+    // Each pool's seed and temperature as the generation opens. A pool whose
+    // dice rotate is re-checked at every visit below, which needs the walk to
+    // know what time each visit airs at — so a rotating block always measures
+    // airtime, bounded or not.
+    let opening: Vec<crate::variety::Dice> = pools
+        .iter()
+        .map(|p| variety.dice(window_start, Some(p)))
+        .collect();
+    let rotating = opening.iter().any(|d| d.rotates());
+    let measure = budget.is_some() || rotating;
+
+    // Every rotating plugin pool's list for its period, as the sidecar holds
+    // it; updated in place as pools are ranked, and handed back out whole.
+    let mut lists = state.resume.lists.clone();
+
     // Two passes, split by whether they read the database — see
     // [`resolve_pool_sources`], which does both.
     let mut score_cache = crate::score::ScoreCache::default();
-    let pool_id_lists =
-        resolve_pool_sources(catalog, pools, groups, &mut score_cache, seed, score_env)?;
+    let pool_id_lists = resolve_pool_sources(
+        catalog,
+        pools,
+        groups,
+        &mut score_cache,
+        &opening,
+        score_env,
+        &mut lists,
+    )?;
 
     // Pass 3, reads the catalog again: turn each pool's ids into its runtime.
     let mut runtimes: Vec<PoolRuntime> = Vec::with_capacity(pools.len());
-    for (cfg, ids) in pools.iter().zip(pool_id_lists) {
+    for ((cfg, ids), dice) in pools.iter().zip(pool_id_lists).zip(&opening) {
         runtimes.push(pool_runtime(
             catalog,
             cfg,
             ids,
             block_constraints,
             state,
-            budget.is_some(),
+            state.resume.pool(&cfg.name),
+            *dice,
+            measure,
             &score_cache.picked_extras,
         )?);
     }
@@ -868,8 +977,33 @@ pub fn build(
         }
         walked = cycle + 1;
         for (step_idx, step) in pattern.iter().enumerate() {
+            let idx = *by_name
+                .get(step.pool.as_str())
+                .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
+            // The dice this visit draws with are the ones in force when it
+            // airs, not when the generation began: a generation can run for
+            // days, and a rollover lands on the first visit after it.
+            let airs_at = window_start + time::Duration::seconds_f64(laid.as_secs_f64());
+            let dice = variety.dice(airs_at, Some(&pools[idx]));
+            let key = dice.list_key(&pools[idx]);
+            if key != runtimes[idx].list_key {
+                rollover(
+                    catalog,
+                    &pools[idx],
+                    &mut runtimes[idx],
+                    groups,
+                    block_constraints,
+                    state,
+                    &mut score_cache,
+                    dice,
+                    score_env,
+                    measure,
+                    &mut lists,
+                    airs_at,
+                )?;
+            }
             let roll = RollKey {
-                seed,
+                seed: dice.seed,
                 cycle,
                 step: step_idx as u64,
             };
@@ -878,9 +1012,6 @@ pub fn build(
             if step.chance < 1.0 && roll.unit_at(u64::MAX) >= step.chance {
                 continue;
             }
-            let idx = *by_name
-                .get(step.pool.as_str())
-                .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
             // Everything this pool holds has aired already, so this visit would
             // repeat. Ask the source for more before drawing rather than after,
             // and only wrap once it says it has nothing (#382).
@@ -892,9 +1023,10 @@ pub fn build(
                     block_constraints,
                     state,
                     &mut score_cache,
-                    seed,
+                    dice,
                     score_env,
-                    budget.is_some(),
+                    measure,
+                    &mut lists,
                 )?;
                 if added == 0 {
                     // Not a failure. The source is genuinely out, so the
@@ -916,7 +1048,7 @@ pub fn build(
             let before = pools_resume(&runtimes, resume_at);
             let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
             progress.extend(std::iter::repeat_n(before, drawn.len()));
-            if budget.is_some() {
+            if measure {
                 laid += runtimes[idx].runtime_of(&drawn);
             }
             if let Some(guide) = &runtimes[idx].cfg.guide {
@@ -1022,7 +1154,73 @@ pub fn build(
         metadata: metadata_out,
         guides: guide_out,
         tracks: tracks_out,
+        lists,
     })
+}
+
+/// A pool's dice changed partway through the walk: rank its list again under
+/// the new ones and carry on from the rebuilt list (5A's rollover, landing on
+/// the first visit that airs after the boundary).
+///
+/// The rebuilt runtime opens where [`pool_runtime`] opens any rolled-over
+/// pool — the first series of the new list this lap has not visited — while
+/// everything the walk already did this generation (cursors, the constraint
+/// window, what has aired) carries across.
+#[allow(clippy::too_many_arguments)]
+fn rollover<'a>(
+    catalog: &Catalog,
+    cfg: &'a Pool,
+    rt: &mut PoolRuntime<'a>,
+    groups: &[ShowGroup],
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    score_cache: &mut crate::score::ScoreCache,
+    dice: crate::variety::Dice,
+    score_env: crate::score::ScoreEnv<'_>,
+    measure: bool,
+    lists: &mut BTreeMap<String, Vec<crate::resume::FrozenList>>,
+    airs_at: time::OffsetDateTime,
+) -> Result<(), String> {
+    let ids = resolve_pool_sources(
+        catalog,
+        std::slice::from_ref(cfg),
+        groups,
+        score_cache,
+        &[dice],
+        score_env,
+        lists,
+    )?
+    .pop()
+    .unwrap_or_default();
+    // The resume state this runtime would write right now — its list key,
+    // rotation and lap — is exactly the "previous" a rolled-over pool opens
+    // from, so the same seat rule serves a rollover between generations and
+    // one inside a generation.
+    let prev = rt.to_resume(0);
+    let fresh = pool_runtime(
+        catalog,
+        cfg,
+        ids,
+        block_constraints,
+        state,
+        Some(&prev),
+        dice,
+        measure,
+        &score_cache.picked_extras,
+    )?;
+    tracing::info!(
+        event = "variety.rollover",
+        pool = %cfg.name,
+        at = %airs_at,
+        seed = dice.seed,
+        temperature = dice.temperature,
+        list = fresh.list_key.as_deref().unwrap_or("-"),
+        opens_on = fresh.series_at(fresh.rotation).map(|i| fresh.series[i].key.as_str()).unwrap_or("-"),
+        "pool's seed or temperature rolled over mid-generation; walking a newly ranked list",
+    );
+    let old = std::mem::replace(rt, fresh);
+    old.carry_into(rt);
+    Ok(())
 }
 
 /// Every pool's resume state as the walk stands now, `cycle` being the cycle a
@@ -1135,26 +1333,36 @@ pub(crate) fn flatten_picked_extras(
 /// another gets a cache hit rather than a second compile.
 ///
 /// Returns one id list per pool, in `pools` order.
+///
+/// `dice[i]` is `pools[i]`'s seed and temperature for this resolution. A
+/// plugin pool whose dice rotate is ranked once per period: `lists` holds the
+/// list ranked when the period began, and a pool whose key matches one reads
+/// it back instead of calling `pick()` again. A freshly ranked list is written
+/// into `lists` for the rest of the period to read.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_pool_sources(
     catalog: &Catalog,
     pools: &[Pool],
     groups: &[ShowGroup],
     score_cache: &mut crate::score::ScoreCache,
-    seed: u64,
+    dice: &[crate::variety::Dice],
     score_env: crate::score::ScoreEnv<'_>,
+    lists: &mut BTreeMap<String, Vec<crate::resume::FrozenList>>,
 ) -> Result<Vec<Vec<String>>, String> {
     // Pass 1, reads the catalog: resolve every expression pool's ids, and
     // compile + materialize every plugin pool's declared sources.
     let mut pool_ids: Vec<Option<Vec<String>>> = Vec::with_capacity(pools.len());
-    for cfg in pools {
+    for (cfg, dice) in pools.iter().zip(dice) {
         match (&cfg.expr, &cfg.plugin, !cfg.groups.is_empty()) {
             (Some(expr), None, false) => {
                 let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
                 if let Some(order) = &cfg.order {
-                    // Seed 0: a pool's internal `order` is its own stable sort.
-                    // A shuffled pool is `select = "random"`, seeded per visit.
+                    // The pool's own seed: a field sort ignores it, and an
+                    // `order: random` shuffle is one arrangement per seed —
+                    // so it holds still for a period and reshuffles at a
+                    // rollover.
                     ids = catalog
-                        .resolve_order(&ids, order, 0)
+                        .resolve_order(&ids, order, dice.seed)
                         .map_err(|e| e.to_string())?;
                 }
                 pool_ids.push(Some(ids));
@@ -1184,7 +1392,7 @@ pub(crate) fn resolve_pool_sources(
                 let mut ids = resolve_group_pool(catalog, cfg, groups)?;
                 if let Some(order) = &cfg.order {
                     ids = catalog
-                        .resolve_order(&ids, order, 0)
+                        .resolve_order(&ids, order, dice.seed)
                         .map_err(|e| e.to_string())?;
                 }
                 pool_ids.push(Some(ids));
@@ -1205,8 +1413,16 @@ pub(crate) fn resolve_pool_sources(
     // 1 took. A plugin returns its set already ranked — gathering and ranking are
     // the same judgment for a taste algorithm — so the `order` step above applies
     // only to the expression case (ADR 0002).
-    for (slot, cfg) in pool_ids.iter_mut().zip(pools) {
+    for ((slot, cfg), dice) in pool_ids.iter_mut().zip(pools).zip(dice) {
         if slot.is_none() {
+            let key = dice.list_key(cfg);
+            if let Some(frozen) = key.as_ref().and_then(|k| frozen_list(lists, &cfg.name, k)) {
+                // Ranked when this period began: walk that list, not a fresh
+                // ranking that has moved under the walk since.
+                score_cache.record_frozen(&cfg.name, frozen);
+                *slot = Some(frozen.ids.clone());
+                continue;
+            }
             let plugin = cfg
                 .plugin
                 .as_ref()
@@ -1224,7 +1440,7 @@ pub(crate) fn resolve_pool_sources(
                 &path,
                 cfg.sources.as_ref(),
                 score_env.inputs,
-                seed,
+                *dice,
                 &cfg.name,
                 cfg.config.as_ref(),
                 granted,
@@ -1236,6 +1452,18 @@ pub(crate) fn resolve_pool_sources(
             // of widening this function's return type. `pattern::build` reads it
             // back once resolution finishes.
             score_cache.record_picked(&cfg.name, &picked);
+            if let Some(key) = key {
+                tracing::info!(
+                    event = "variety.ranked",
+                    pool = %cfg.name,
+                    seed = dice.seed,
+                    temperature = dice.temperature,
+                    list = %key,
+                    picks = picked.len(),
+                    "ranked this pool's list for a new period",
+                );
+                store_frozen_list(lists, &cfg.name, key, &picked);
+            }
             *slot = Some(picked.into_iter().map(|p| p.id).collect());
         }
     }
@@ -1244,6 +1472,50 @@ pub(crate) fn resolve_pool_sources(
         .into_iter()
         .map(|ids| ids.expect("pass 2 fills every hole pass 1 left"))
         .collect())
+}
+
+/// The list `pool` ranked under `key`, if the sidecar still holds it.
+fn frozen_list<'l>(
+    lists: &'l BTreeMap<String, Vec<crate::resume::FrozenList>>,
+    pool: &str,
+    key: &str,
+) -> Option<&'l crate::resume::FrozenList> {
+    lists.get(pool)?.iter().find(|l| l.key == key)
+}
+
+/// How many periods' lists the sidecar keeps per pool: the current one, and
+/// the one before it for a rewind that lands just before a rollover.
+const KEPT_LISTS: usize = 2;
+
+/// Record a freshly ranked list as `pool`'s list under `key`, newest last,
+/// keeping [`KEPT_LISTS`].
+fn store_frozen_list(
+    lists: &mut BTreeMap<String, Vec<crate::resume::FrozenList>>,
+    pool: &str,
+    key: String,
+    picked: &[crate::score::PickedItem],
+) {
+    let kept = lists.entry(pool.to_string()).or_default();
+    kept.retain(|l| l.key != key);
+    kept.push(crate::resume::FrozenList {
+        key,
+        ids: picked.iter().map(|p| p.id.clone()).collect(),
+        extras: picked
+            .iter()
+            .filter(|p| p.metadata.is_some() || p.take_override.is_some())
+            .map(|p| {
+                (
+                    p.id.clone(),
+                    crate::resume::FrozenExtra {
+                        metadata: p.metadata.clone(),
+                        take: p.take_override,
+                    },
+                )
+            })
+            .collect(),
+    });
+    let excess = kept.len().saturating_sub(KEPT_LISTS);
+    kept.drain(..excess);
 }
 
 /// Every pool's *candidate* entry-id list, for the generation fingerprint
@@ -1378,9 +1650,10 @@ fn refill_pool(
     block_constraints: Option<&Constraints>,
     state: &GenerationState,
     score_cache: &mut crate::score::ScoreCache,
-    seed: u64,
+    dice: crate::variety::Dice,
     score_env: crate::score::ScoreEnv<'_>,
     want_runtimes: bool,
+    lists: &mut BTreeMap<String, Vec<crate::resume::FrozenList>>,
 ) -> Result<usize, String> {
     let Some(plugin) = cfg.plugin.as_ref() else {
         return Ok(0);
@@ -1407,7 +1680,7 @@ fn refill_pool(
         &path,
         cfg.sources.as_ref(),
         &inputs,
-        seed,
+        dice,
         &cfg.name,
         cfg.config.as_ref(),
         granted,
@@ -1421,12 +1694,27 @@ fn refill_pool(
         .flat_map(|s| s.ids.iter().map(String::as_str))
         .collect();
     let fresh: Vec<String> = picked
-        .into_iter()
-        .map(|p| p.id)
+        .iter()
+        .map(|p| p.id.clone())
         .filter(|id| !have.contains(id.as_str()))
         .collect();
     if fresh.is_empty() {
         return Ok(0);
+    }
+
+    // The period's list grows by what the refill brought, so a later
+    // generation in the same period walks into the same arrivals rather than
+    // asking again.
+    if let Some(list) = rt
+        .list_key
+        .as_deref()
+        .and_then(|key| lists.get_mut(&cfg.name)?.iter_mut().find(|l| l.key == key))
+    {
+        let arrived: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+        for p in picked_extras_for(&picked, &arrived) {
+            list.extras.insert(p.0, p.1);
+        }
+        list.ids.extend(fresh.iter().cloned());
     }
 
     // Same seam projection the first resolution used, narrowed to the arrivals.
@@ -1437,9 +1725,37 @@ fn refill_pool(
         .filter(|id| own.contains(id.as_str()))
         .cloned()
         .collect();
-    let (series, _limits, keys, runtimes, _mean) =
-        resolve_pool_series(catalog, cfg, fresh, block_constraints, &seam, want_runtimes)?;
+    let (series, _limits, keys, runtimes, _mean) = resolve_pool_series(
+        catalog,
+        cfg,
+        fresh,
+        block_constraints,
+        &seam,
+        want_runtimes,
+        dice.seed,
+    )?;
     Ok(rt.extend_with(series, keys, runtimes))
+}
+
+/// The sidecar form of every extra `picked` attached to an id in `ids`.
+fn picked_extras_for(
+    picked: &[crate::score::PickedItem],
+    ids: &HashSet<&str>,
+) -> Vec<(String, crate::resume::FrozenExtra)> {
+    picked
+        .iter()
+        .filter(|p| ids.contains(p.id.as_str()))
+        .filter(|p| p.metadata.is_some() || p.take_override.is_some())
+        .map(|p| {
+            (
+                p.id.clone(),
+                crate::resume::FrozenExtra {
+                    metadata: p.metadata.clone(),
+                    take: p.take_override,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Enough cycles for the largest pool to drain once. Each pool needs
@@ -1514,6 +1830,7 @@ pub(crate) fn resolve_pool_series(
     block_constraints: Option<&Constraints>,
     seam: &[String],
     want_runtimes: bool,
+    seed: u64,
 ) -> Result<
     (
         Vec<Series>,
@@ -1605,13 +1922,14 @@ pub(crate) fn resolve_pool_series(
     // another way there — and the series sequence is then read off the result:
     // each series takes the position of whichever of its items comes first.
     //
-    // Seed 0 for the same reason `order` uses it: this is a stable arrangement
-    // of the pool, not a per-visit draw. Drawing at random per visit is
-    // `select = "random"`, which is a different question and already answered.
+    // The pool's own seed, for the same reason `order` takes it: a
+    // `bucket_order: random` is one arrangement of the pool per seed — still
+    // for a period, reshuffled at a rollover — not a per-visit draw. Drawing
+    // at random per visit is `select = "random"`, a different question.
     if let Some(bucket_order) = &cfg.bucket_order {
         let flat: Vec<String> = series.iter().flat_map(|s| s.ids.iter().cloned()).collect();
         let ordered = catalog
-            .resolve_order(&flat, bucket_order, 0)
+            .resolve_order(&flat, bucket_order, seed)
             .map_err(|e| format!("pool {:?}: bucket_order: {e}", cfg.name))?;
         let mut placed = vec![false; series.len()];
         let mut sequence: Vec<usize> = Vec::with_capacity(series.len());
@@ -1656,6 +1974,12 @@ pub(crate) fn resolve_pool_series(
 /// (#166), keyed by `(pool name, entry_id)` — narrowed here to `cfg`'s own
 /// entries, so a second pool that happens to resolve the same id from an
 /// overlapping query can never leak its take override into this pool's draw.
+///
+/// `prev` is where this pool stood — the sidecar's record between
+/// generations, or the runtime being replaced at a rollover inside one — and
+/// `dice` the seed and temperature its new list was ranked under. When the
+/// two name different lists the pool has rolled over, and a resuming pool
+/// opens on the first series of the new list its lap has not visited.
 #[allow(clippy::too_many_arguments)]
 fn pool_runtime<'a>(
     catalog: &Catalog,
@@ -1663,6 +1987,8 @@ fn pool_runtime<'a>(
     ids: Vec<String>,
     block_constraints: Option<&Constraints>,
     state: &GenerationState,
+    prev: Option<&PoolResume>,
+    dice: crate::variety::Dice,
     want_runtimes: bool,
     picked_extras: &HashMap<(String, String), crate::score::PickedExtra>,
 ) -> Result<PoolRuntime<'a>, String> {
@@ -1687,8 +2013,15 @@ fn pool_runtime<'a>(
         })
         .collect();
 
-    let (series, limits, keys, pool_durations, mean_duration) =
-        resolve_pool_series(catalog, cfg, ids, block_constraints, &seam, want_runtimes)?;
+    let (series, limits, keys, pool_durations, mean_duration) = resolve_pool_series(
+        catalog,
+        cfg,
+        ids,
+        block_constraints,
+        &seam,
+        want_runtimes,
+        dice.seed,
+    )?;
 
     let mut rt = PoolRuntime {
         cfg,
@@ -1704,13 +2037,14 @@ fn pool_runtime<'a>(
         drawn: HashSet::new(),
         exhausted: false,
         refills: 0,
+        list_key: dice.list_key(cfg),
+        lap: BTreeSet::new(),
     };
     // Seeded through the same path a draw takes, so the window is trimmed to
     // `reach` by one rule rather than two.
     rt.remember(&seam);
 
     if cfg.advance == Advance::Resume {
-        let prev = state.resume.pool(&cfg.name);
         for s in &mut rt.series {
             // Continue *after* the last-played id, read from the play-history
             // ledger's projection (#70) rather than a cursor of our own. An id
@@ -1732,10 +2066,20 @@ fn pool_runtime<'a>(
                 }
             }
         }
-        if let Some(next) = prev.and_then(|p| p.next.as_ref())
-            && let Some(pos) = rt.series.iter().position(|s| &s.key == next)
-        {
-            rt.rotation = pos;
+        match prev {
+            // A list key that differs from the one `next` was recorded under
+            // is a rollover; anything else (the same period, or nothing that
+            // rotates) continues from `next` exactly as it always did.
+            Some(p) if p.list != rt.list_key && rt.list_key.is_some() => rt.open_after_rollover(p),
+            Some(p) => {
+                rt.lap = p.lap.iter().cloned().collect();
+                if let Some(next) = p.next.as_ref()
+                    && let Some(pos) = rt.series.iter().position(|s| &s.key == next)
+                {
+                    rt.rotation = pos;
+                }
+            }
+            None => {}
         }
     }
 
@@ -1921,6 +2265,8 @@ mod tests {
 
     fn movies_pool() -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: "movies".into(),
             expr: Some("item.type == \"movie\"".into()),
@@ -1947,6 +2293,8 @@ mod tests {
 
     fn shows_pool() -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
@@ -1977,6 +2325,8 @@ mod tests {
     /// that check), so this leaves both unset.
     fn plugin_pool(script: &std::path::Path) -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: "movies".into(),
             expr: None,
@@ -2070,6 +2420,8 @@ mod tests {
 
     fn episodes_pool(group_by: GroupBy) -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
@@ -2109,7 +2461,8 @@ mod tests {
             cycles,
             None,
             state,
-            7,
+            &crate::variety::Variety::fixed(7),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -2374,6 +2727,8 @@ mod tests {
 
     fn rupaul_pool() -> Pool {
         Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: "rupaul".into(),
             expr: None,
@@ -2422,7 +2777,8 @@ mod tests {
             cycles,
             None,
             state_in,
-            seed,
+            &crate::variety::Variety::fixed(seed),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -2538,7 +2894,8 @@ mod tests {
             Some(1),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -2568,7 +2925,8 @@ mod tests {
             Some(1),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -2600,7 +2958,8 @@ mod tests {
             cycles,
             None,
             state_in,
-            seed,
+            &crate::variety::Variety::fixed(seed),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -2763,6 +3122,8 @@ mod tests {
         resume.pools.insert(
             "shows".into(),
             PoolResume {
+                list: None,
+                lap: Vec::new(),
                 next: Some("show:inv".into()),
                 cycle: 0,
             },
@@ -3070,7 +3431,8 @@ mod tests {
             Some(1),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3089,7 +3451,8 @@ mod tests {
             Some(MAX_CYCLES + 1),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3110,7 +3473,8 @@ mod tests {
             Some(1),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3133,7 +3497,8 @@ mod tests {
             Some(1),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3155,7 +3520,8 @@ mod tests {
             Some(1),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3181,7 +3547,8 @@ mod tests {
             None,
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3235,7 +3602,8 @@ mod tests {
             cycles,
             None,
             state,
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             fill,
         )
@@ -3385,7 +3753,8 @@ mod tests {
             cycles,
             block,
             state,
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3485,7 +3854,8 @@ mod tests {
             Some(3),
             None,
             &aired(&["mov-1"]),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
         )
@@ -3703,7 +4073,8 @@ fn audit(ctx, picks, workspace) { #{} }
             Some(3),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             env,
             None,
         )
@@ -3751,7 +4122,8 @@ fn audit(ctx, picks, workspace) { #{} }
             Some(4),
             None,
             &GenerationState::empty(),
-            0,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
             env,
             None,
         )
@@ -3919,8 +4291,9 @@ fn audit(ctx, picks, workspace) { #{} }
             std::slice::from_ref(&pool),
             &[],
             &mut score_cache,
-            0,
+            &[crate::variety::Dice::fixed(0)],
             test_env(),
+            &mut BTreeMap::new(),
         )
         .unwrap();
 
@@ -3930,6 +4303,8 @@ fn audit(ctx, picks, workspace) { #{} }
             pool_id_lists.into_iter().next().unwrap(),
             None,
             &GenerationState::empty(),
+            None,
+            crate::variety::Dice::fixed(0),
             false,
             &score_cache.picked_extras,
         )
@@ -3978,8 +4353,16 @@ fn audit(ctx, picks, workspace) { #{} }
         let pools = [pool_a, pool_b];
 
         let mut score_cache = crate::score::ScoreCache::default();
-        let pool_id_lists =
-            resolve_pool_sources(&cat, &pools, &[], &mut score_cache, 0, test_env()).unwrap();
+        let pool_id_lists = resolve_pool_sources(
+            &cat,
+            &pools,
+            &[],
+            &mut score_cache,
+            &[crate::variety::Dice::fixed(0); 2],
+            test_env(),
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
 
         let mut runtimes = Vec::new();
         for (cfg, ids) in pools.iter().zip(pool_id_lists) {
@@ -3990,6 +4373,8 @@ fn audit(ctx, picks, workspace) { #{} }
                     ids,
                     None,
                     &GenerationState::empty(),
+                    None,
+                    crate::variety::Dice::fixed(0),
                     false,
                     &score_cache.picked_extras,
                 )
@@ -4241,5 +4626,226 @@ fn audit(ctx, picks, workspace) { #{} }
             0,
         );
         assert_eq!(ids, vec!["got-e1", "inv-e1", "got-e2", "inv-e2"]);
+    }
+
+    // ---- rotating seed and temperature (etv-station-tflc) -------------------
+
+    /// Twelve one-hour films, so a pool can walk part of its list in one
+    /// period and leave the rest for the next.
+    fn film_catalog() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        for n in 1..=12 {
+            let id = format!("film-{n:02}");
+            let mut e = CatEntry::new(&id, "movie", format!("Film {n}"), Source::Plex);
+            e.duration_ms = Some(3_600_000);
+            c.upsert_entry(&e).unwrap();
+            c.add_source(&EntrySource {
+                source: Source::LocalFs,
+                source_id: format!("fs-{id}"),
+                entry_id: id.clone(),
+                playback_path: format!("/media/{id}.mkv"),
+                last_seen: None,
+                missing_since: None,
+            })
+            .unwrap();
+        }
+        c
+    }
+
+    /// A plugin whose ranking reshuffles on every call that sees a different
+    /// `ctx.recent` — the input a real scorer's recency damping reads — and
+    /// on every new `ctx.seed`. A walk resumed by position in a list ranked
+    /// afresh each generation would wander; only a list held for the period
+    /// walks in order.
+    fn restless_script(dir: &Path) -> std::path::PathBuf {
+        let script = dir.join("restless.rhai");
+        std::fs::write(
+            &script,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let salt = (ctx.seed % 9973) + ctx.recent.len * 7919 + 1;
+    let keyed = [];
+    for n in 1..=12 {
+        let id = if n < 10 { "film-0" + n } else { "film-" + n };
+        keyed.push([(salt * (n * 31 + 7)) % 1009, id]);
+    }
+    keyed.sort(|a, b| if a[0] < b[0] { -1 } else if a[0] > b[0] { 1 } else if a[1] < b[1] { -1 } else { 1 });
+    let out = [];
+    for k in keyed { out.push(k[1]); }
+    #{ picks: out, workspace: () }
+}
+fn audit(ctx, picks, workspace) { #{} }
+"#,
+        )
+        .unwrap();
+        script
+    }
+
+    /// Run `generations` one-film generations six hours apart from
+    /// 2026-01-01 00:00 UTC, the way the daemon threads state between them,
+    /// and return what aired plus the state after each generation.
+    fn walk_generations(
+        pool: &Pool,
+        variety: &crate::variety::Variety,
+        generations: usize,
+    ) -> (Vec<String>, Vec<GenerationState>) {
+        let cat = film_catalog();
+        let mut state = GenerationState::empty();
+        let mut aired: Vec<String> = Vec::new();
+        let mut states = Vec::new();
+        let start = time::macros::datetime!(2026-01-01 00:00 UTC);
+        for g in 0..generations {
+            let inputs = crate::score::ScoreInputs {
+                recent: aired.clone(),
+                ..Default::default()
+            };
+            let env = crate::score::ScoreEnv {
+                inputs: &inputs,
+                base_dir: Path::new("."),
+            };
+            let built = build(
+                &cat,
+                std::slice::from_ref(pool),
+                &[],
+                &[step(&pool.name, 1)],
+                Some(1),
+                None,
+                &state,
+                variety,
+                start + time::Duration::hours(6 * g as i64),
+                env,
+                None,
+            )
+            .expect("pattern builds");
+            aired.extend(built.ids.iter().cloned());
+            let mut resume = ResumeMap::new();
+            resume.pools = built.resume;
+            resume.lists = built.lists;
+            state = GenerationState {
+                resume,
+                cursor: aired.iter().map(|id| (id.clone(), id.clone())).collect(),
+                tail: aired.clone(),
+            };
+            states.push(state.clone());
+        }
+        (aired, states)
+    }
+
+    fn restless_pool(dir: &Path) -> Pool {
+        let mut pool = plugin_pool(&restless_script(dir));
+        pool.advance = Advance::Resume;
+        pool
+    }
+
+    fn every(days: u64) -> crate::config::SeedSpec {
+        crate::config::SeedSpec::Rotate(crate::config::variety::SeedRotate {
+            rotate: Duration::from_secs(days * 86_400),
+            cycle: None,
+        })
+    }
+
+    /// 5A: inside one period every generation walks the one list ranked when
+    /// the period began, in order, even though the plugin would rank
+    /// differently on every call; at the rollover the pool walks a newly
+    /// ranked list, opening on its first title this lap has not aired.
+    #[test]
+    fn a_rotating_pool_walks_one_list_per_period_then_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = restless_pool(dir.path());
+        let variety = crate::variety::Variety::for_test(Some(every(2)), None);
+        // 16 generations, 6h apart: 2026-01-01 and -02 are one 2-day period
+        // (epoch day 20454 is even), -03 and -04 the next.
+        let (aired, states) = walk_generations(&pool, &variety, 16);
+
+        let first = &states[0].resume.lists["movies"];
+        assert_eq!(first.len(), 1, "one list ranked in the first period");
+        let list1 = &first[0];
+        assert_eq!(
+            aired[..8],
+            list1.ids[..8],
+            "the first period walks its list in order"
+        );
+        assert_eq!(
+            states[7].resume.lists["movies"].last().unwrap(),
+            list1,
+            "no re-rank inside the period: the list held still"
+        );
+
+        let list2 = states[8].resume.lists["movies"].last().unwrap();
+        assert_ne!(list2.key, list1.key, "a new period ranks a new list");
+        assert_ne!(list2.ids, list1.ids);
+        let lap: HashSet<&String> = aired[..8].iter().collect();
+        let open = list2.ids.iter().position(|id| !lap.contains(id)).unwrap();
+        assert_eq!(
+            aired[8], list2.ids[open],
+            "the new list opens on its first title this lap has not aired"
+        );
+        assert_eq!(
+            aired[9],
+            list2.ids[(open + 1) % list2.ids.len()],
+            "and walks on down it"
+        );
+
+        let (again, _) = walk_generations(&pool, &variety, 16);
+        assert_eq!(aired, again, "a rerun of the same dates reproduces");
+    }
+
+    /// The same pool under a fixed seed never rolls over: it re-ranks every
+    /// generation as it always has, holds no list, and records no list key.
+    #[test]
+    fn a_fixed_seed_keeps_re_ranking_every_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = restless_pool(dir.path());
+        let variety = crate::variety::Variety::fixed(1988);
+        let (_, states) = walk_generations(&pool, &variety, 4);
+        for s in &states {
+            assert!(s.resume.lists.is_empty());
+            assert_eq!(s.resume.pools["movies"].list, None);
+        }
+    }
+
+    /// 2A: a generation that runs across a period boundary rolls the pool
+    /// over at the first visit that airs after it, not at the next
+    /// generation. One 30-hour generation from 2026-01-02 00:00 crosses the
+    /// 2026-01-03 boundary six visits before its end.
+    #[test]
+    fn a_rollover_lands_on_the_first_visit_after_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = restless_pool(dir.path());
+        let variety = crate::variety::Variety::for_test(Some(every(1)), None);
+        let cat = film_catalog();
+        let inputs = crate::score::ScoreInputs::default();
+        let env = crate::score::ScoreEnv {
+            inputs: &inputs,
+            base_dir: Path::new("."),
+        };
+        let start = time::macros::datetime!(2026-01-02 00:00 UTC);
+        let built = build(
+            &cat,
+            std::slice::from_ref(&pool),
+            &[],
+            &[step("movies", 1)],
+            Some(30),
+            None,
+            &GenerationState::empty(),
+            &variety,
+            start,
+            env,
+            None,
+        )
+        .unwrap();
+        let lists = &built.lists["movies"];
+        assert_eq!(lists.len(), 2, "ranked once per period it aired in");
+        let (day1, day2) = (&lists[0], &lists[1]);
+        // 12 films in a 12-film list: the first day's 24 one-hour visits walk
+        // it twice; the 25th airs at 2026-01-03 00:00 from the new list.
+        assert_eq!(built.ids[..12], day1.ids[..]);
+        assert_eq!(built.ids[12..24], day1.ids[..]);
+        assert_eq!(
+            built.ids[24], day2.ids[0],
+            "a full lap clears, so the new day opens on its top"
+        );
+        assert_eq!(built.ids[25], day2.ids[1]);
     }
 }

@@ -113,6 +113,44 @@ pub struct ResumeMap {
     /// than guessing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_id: Option<String>,
+
+    /// Each rotating plugin pool's ranked list for its current period, keyed
+    /// by pool name — the list the pool walks for the whole period, ranked
+    /// once when the period began (see [`FrozenList`]). At most the current
+    /// and the previous period's list per pool: the previous one is what a
+    /// rewind landing just before a rollover regenerates from.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lists: BTreeMap<String, Vec<FrozenList>>,
+}
+
+/// A plugin pool's ranked list for one period: what `pick()` returned when
+/// the period began, held so every later generation in the period walks the
+/// same list instead of a re-ranking that has moved under it.
+///
+/// It has to be stored rather than recomputed. A plugin's ranking reads inputs
+/// that move as the channel plays — `ctx.recent`, the watch history — so asking
+/// again mid-period returns a different list, and a walk resumed by position in
+/// a list that reordered itself skips titles and replays others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenList {
+    /// [`crate::variety::Dice::list_key`] — the seed, temperature, both
+    /// periods and the pool's own config this list was ranked under.
+    pub key: String,
+    /// The entry ids `pick()` returned, in its order, plus anything a refill
+    /// appended later in the period.
+    pub ids: Vec<String>,
+    /// Each id's `metadata` / take override, as `pick()` attached them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extras: BTreeMap<String, FrozenExtra>,
+}
+
+/// One id's [`crate::score::PickedExtra`], in a shape the sidecar can hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenExtra {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub take: Option<usize>,
 }
 
 /// The scheduling state at the item boundary `start` — the pool rotation, and
@@ -152,6 +190,18 @@ pub struct PoolResume {
     /// replaying the first cycle's draws every time (etv-station-pwzv).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cycle: u64,
+    /// [`crate::variety::Dice::list_key`] of the list `next` points into, or
+    /// `None` when nothing about this pool rotates. A different key next time
+    /// means a rollover: `next` belongs to a list that no longer exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
+    /// The series this pool has visited since its walk last covered every
+    /// series in its list — the current lap. At a rollover the walk opens on
+    /// the first series of the new list that is not in here, so a list that
+    /// barely changed carries on where it was instead of replaying its top,
+    /// and a list that changed completely opens on its top.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lap: Vec<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -176,6 +226,7 @@ impl ResumeMap {
             position: 0,
             checkpoints: Vec::new(),
             config_id: None,
+            lists: BTreeMap::new(),
         }
     }
 
@@ -341,7 +392,7 @@ mod tests {
         let mut map = ResumeMap::new();
         let shows = PoolResume {
             next: Some("show:invincible".into()),
-            cycle: 0,
+            ..Default::default()
         };
         map.pools.insert("shows".into(), shows);
         map
@@ -402,7 +453,7 @@ mod tests {
     fn pools_with(next_show: &str) -> BTreeMap<String, PoolResume> {
         let pool = PoolResume {
             next: Some(next_show.into()),
-            cycle: 0,
+            ..Default::default()
         };
         BTreeMap::from([("shows".to_string(), pool)])
     }

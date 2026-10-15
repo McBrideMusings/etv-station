@@ -425,6 +425,18 @@ pub struct Pool {
     #[serde(default)]
     pub on_short: OnShort,
 
+    /// This pool's own `seed:`, replacing the channel's for this pool alone —
+    /// its plugin's `ctx.seed`, its `order: random` shuffle, its
+    /// `select`/`from: random` draws and the `chance:` of steps naming it.
+    /// Same shapes as the channel field; see [`crate::config::variety`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<crate::config::SeedSpec>,
+
+    /// This pool's own `temperature:`, replacing the channel's. Reaches only
+    /// this pool's plugin, as `ctx.temperature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<crate::config::TemperatureSpec>,
+
     /// Adjacency constraints applied to *this pool's* ordered list, before the
     /// pattern interleaves it (#115). Unset inherits the block's `constraints`;
     /// set, it **replaces** them wholesale rather than merging field by field,

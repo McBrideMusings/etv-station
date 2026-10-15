@@ -8,6 +8,9 @@ use super::overlay::{self, ChannelOverlays};
 use super::source::SourceConfig;
 use super::station::{self, StationConfig};
 use super::validate;
+#[cfg(test)]
+use super::variety::TemperatureSpec;
+use super::variety::{SeedRotate, SeedSpec};
 use crate::errors::ConfigError;
 
 #[derive(Debug)]
@@ -172,7 +175,7 @@ fn load_one_channel(
     resolve_blocks(&mut config, channel_path, env)?;
     validate::validate_channel(channel_path, &config)?;
     let name = resolve_identity(channel_path, &config)?;
-    apply_station_seed(&mut config, station.seed, &name);
+    apply_station_variety(&mut config, station, &name);
     // After `resolve_blocks`, so a block-file body's own `overlay:` has
     // already been spliced onto the include and takes part in the cascade.
     let channel_dir = channel_path
@@ -441,33 +444,39 @@ fn dedup_key(path: &Path) -> PathBuf {
         .collect()
 }
 
-/// Cascade the station `seed` onto one channel that declared none (#324), the
-/// same station → channel shape `overlay` already uses: merge it into the
-/// `ChannelConfig` here at load time, so `resolve.rs`'s
-/// `config.seed.unwrap_or_else(fresh_seed)` keeps reading exactly one field and
-/// there is no second place to look for a seed.
+/// Cascade the station `seed:` and `temperature:` onto one channel that
+/// declared none (#324), the same station → channel shape `overlay` already
+/// uses: merge them into the `ChannelConfig` here at load time, so
+/// [`crate::variety::Variety`] reads exactly one field for each and there is no
+/// second place to look.
 ///
-/// The inherited value is salted with `name` — the channel's declared identity,
+/// An inherited number is salted with `name` — the channel's declared identity,
 /// the leaf its output folder is derived from — because the SplitMix64 chain mixes
 /// in nothing channel-specific on its own. Without the salt, every channel
 /// under one station seed with the same candidate multiset would produce the
-/// *same* shuffle. See [`derive_channel_seed`].
+/// *same* shuffle. See [`derive_channel_seed`]. A fixed seed is salted, and so
+/// is every entry of a `cycle`; a derived rotation (`{ rotate: 2d }` alone) is
+/// salted with the channel name when [`crate::variety`] draws it, so it is
+/// copied as written.
 ///
-/// A channel that set its own `seed:` is left alone. With neither set, this
-/// logs at INFO naming the channel, so a channel still drawing a wall-clock
-/// seed on every generation is visible in the startup log rather than silent.
-fn apply_station_seed(config: &mut ChannelConfig, station_seed: Option<u64>, name: &str) {
-    if config.seed.is_some() {
-        return;
+/// A channel that set its own field keeps it. With neither level setting
+/// `seed:`, the channel stays unset and draws [`crate::variety::default_seed`].
+fn apply_station_variety(config: &mut ChannelConfig, station: &StationConfig, name: &str) {
+    if config.seed.is_none() {
+        config.seed = station.seed.as_ref().map(|spec| match spec {
+            SeedSpec::Fixed(n) => SeedSpec::Fixed(station::derive_channel_seed(*n, name)),
+            SeedSpec::Rotate(r) => SeedSpec::Rotate(SeedRotate {
+                rotate: r.rotate,
+                cycle: r.cycle.as_ref().map(|c| {
+                    c.iter()
+                        .map(|n| station::derive_channel_seed(*n, name))
+                        .collect()
+                }),
+            }),
+        });
     }
-    match station_seed {
-        Some(station_seed) => {
-            config.seed = Some(station::derive_channel_seed(station_seed, name));
-        }
-        None => tracing::info!(
-            channel = %name,
-            "no channel seed and no station seed: this channel reshuffles on every generation"
-        ),
+    if config.temperature.is_none() {
+        config.temperature = station.temperature.clone();
     }
 }
 
@@ -1178,52 +1187,75 @@ mod tests {
         assert!(format!("{err}").contains("empty"), "err = {err}");
     }
 
-    /// A channel that said nothing inherits the station seed (#324) — the
-    /// whole point: 37 production channels had no `seed:` and drew a fresh
-    /// wall-clock one on every regeneration.
+    fn station_with(seed: &str, temperature: Option<&str>) -> StationConfig {
+        let mut st = station_config();
+        st.seed = Some(serde_norway::from_str(seed).unwrap());
+        st.temperature = temperature.map(|t| serde_norway::from_str(t).unwrap());
+        st
+    }
+
+    /// A channel that said nothing inherits the station seed (#324), salted
+    /// with its name — the whole point: 37 production channels had no `seed:`
+    /// and drew a fresh wall-clock one on every regeneration.
     #[test]
     fn a_channel_with_no_seed_inherits_the_station_seed() {
         let mut cfg = parse_channel(MINIMAL_RULE);
-        apply_station_seed(&mut cfg, Some(42), "001-for-you");
+        apply_station_variety(&mut cfg, &station_with("42", None), "001-for-you");
         assert_eq!(
             cfg.seed,
-            Some(station::derive_channel_seed(42, "001-for-you"))
+            Some(SeedSpec::Fixed(station::derive_channel_seed(
+                42,
+                "001-for-you"
+            )))
         );
     }
 
     /// The salt is the reason this is not a one-liner. Two channels with the
     /// same pools under one station seed must not receive the same number, or
-    /// `seeded_shuffle` hands them the identical permutation.
+    /// `seeded_shuffle` hands them the identical permutation — and the same
+    /// holds for every seed of a station `cycle`.
     #[test]
     fn two_channels_inheriting_one_station_seed_get_different_seeds() {
-        let mut a = parse_channel(MINIMAL_RULE);
-        let mut b = parse_channel(MINIMAL_RULE);
-        apply_station_seed(&mut a, Some(42), "001-for-you");
-        apply_station_seed(&mut b, Some(42), "002-for-pierce");
-        assert!(a.seed.is_some());
-        assert_ne!(a.seed, b.seed);
+        for station_seed in ["42", "{ rotate: 2d, cycle: [1, 2, 3] }"] {
+            let st = station_with(station_seed, None);
+            let mut a = parse_channel(MINIMAL_RULE);
+            let mut b = parse_channel(MINIMAL_RULE);
+            apply_station_variety(&mut a, &st, "001-for-you");
+            apply_station_variety(&mut b, &st, "002-for-pierce");
+            assert!(a.seed.is_some());
+            assert_ne!(a.seed, b.seed, "station seed {station_seed}");
+        }
     }
 
-    /// A channel that pinned its own seed is untouched by the station value.
+    /// A channel that pinned its own seed or temperature is untouched by the
+    /// station's; one that set neither inherits the station temperature as
+    /// written.
     #[test]
-    fn an_explicit_channel_seed_beats_the_station_seed() {
-        let mut cfg = parse_channel(&format!("seed: 7\n{MINIMAL_RULE}"));
-        apply_station_seed(&mut cfg, Some(42), "001-for-you");
-        assert_eq!(cfg.seed, Some(7));
+    fn an_explicit_channel_value_beats_the_station_value() {
+        let st = station_with("42", Some("0.5"));
+        let mut cfg = parse_channel(&format!("seed: 7\ntemperature: 0.25\n{MINIMAL_RULE}"));
+        apply_station_variety(&mut cfg, &st, "001-for-you");
+        assert_eq!(cfg.seed, Some(SeedSpec::Fixed(7)));
+        assert_eq!(cfg.temperature, Some(TemperatureSpec::Fixed(0.25)));
+
+        let mut bare = parse_channel(MINIMAL_RULE);
+        apply_station_variety(&mut bare, &st, "001-for-you");
+        assert_eq!(bare.temperature, Some(TemperatureSpec::Fixed(0.5)));
     }
 
-    /// Neither set leaves the field alone, so `resolve.rs` still falls through
-    /// to `fresh_seed()` — behavior unchanged for a station that never adopts
-    /// this key.
+    /// Neither level setting `seed:` leaves the field unset, which
+    /// `crate::variety` reads as its documented default rotation.
     #[test]
     fn no_station_seed_leaves_an_unseeded_channel_unseeded() {
         let mut cfg = parse_channel(MINIMAL_RULE);
-        apply_station_seed(&mut cfg, None, "001-for-you");
+        apply_station_variety(&mut cfg, &station_config(), "001-for-you");
         assert_eq!(cfg.seed, None);
+        assert_eq!(cfg.temperature, None);
     }
 
     fn station_config() -> StationConfig {
         StationConfig {
+            temperature: None,
             tracks: None,
             overlay: None,
             seed: None,

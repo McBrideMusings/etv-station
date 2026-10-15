@@ -232,10 +232,32 @@ pub fn resolve_channel_with_resume(
         crate::score::PLUGIN_CLOCK_STEP,
     );
 
-    // One seed per generation: a pinned `seed` reproduces the shuffle; an unset
-    // one draws fresh entropy so an unseeded `random` block reshuffles each
-    // generation (#46 "unset = fresh per generation").
-    let seed = config.seed.unwrap_or_else(fresh_seed);
+    // The channel's seed and temperature, answered per pool and per instant
+    // ([`crate::variety`]). An entries block draws with the channel's dice at
+    // the window's start; a pattern walk re-asks at every visit.
+    let tz = scoring.tz.unwrap_or(time_tz::timezones::db::UTC);
+    let variety = crate::variety::Variety::new(config, tz);
+    let seed = variety.dice(window_start, None).seed;
+
+    // A block that lays a seeded list in one pass — a shuffled entries block,
+    // a sequencer — cannot re-draw partway through, so a generation holding
+    // one stops at the next rollover and the next generation opens in the new
+    // period. A pattern walk re-checks its dice at every visit, and a block
+    // with nothing random in it does not care what period it is, so neither
+    // cuts anything.
+    let fill = match fill {
+        Some(span) if config.rule.blocks.iter().any(lays_seeded_list) => {
+            let pools = config.rule.blocks.iter().flat_map(|b| b.pools.iter());
+            match variety.next_rollover(window_start, pools) {
+                Some(boundary) => {
+                    let until = (boundary - window_start).unsigned_abs();
+                    Some(span.min(until))
+                }
+                None => Some(span),
+            }
+        }
+        other => other,
+    };
 
     // Named show groups (#165) are declared once on the channel and can sit
     // unreferenced by any pool, so this checks every declared member against
@@ -287,6 +309,7 @@ pub fn resolve_channel_with_resume(
             catalog,
             &config.groups,
             seed,
+            &variety,
             state,
             scoring,
             fill,
@@ -507,6 +530,26 @@ pub fn resolve_channel_with_resume(
 
     let progress = progress_per_item(&steps, &pool_progress, seat, resume_out.position);
     Ok((out, resume_out, progress))
+}
+
+/// Whether `include` lays a list the channel's seed shapes, all in one pass:
+/// a sequencer (its pools and its script both read the dice), or an entries
+/// block with an `order: random` anywhere — its own, a query entry's, or its
+/// fallback's. A pattern block is not one: it re-reads its dice per visit.
+fn lays_seeded_list(include: &BlockInclude) -> bool {
+    if include.is_pattern() {
+        return false;
+    }
+    if include.is_sequencer() {
+        return true;
+    }
+    let random = |order: &Option<Order>| matches!(order, Some(Order::Random));
+    random(&include.order)
+        || include
+            .entries()
+            .iter()
+            .any(|e| matches!(e, Entry::Query(q) if random(&q.order)))
+        || matches!(&include.fallback, Some(Fallback::Query(q)) if random(&q.order))
 }
 
 /// Where one item sits in the progress of the block that produced it.
@@ -992,6 +1035,7 @@ fn resolve_block(
     catalog: Option<&Catalog>,
     groups: &[ShowGroup],
     seed: u64,
+    variety: &crate::variety::Variety,
     state: &GenerationState,
     scoring: &crate::score::ScoreInputs,
     fill: Option<Duration>,
@@ -1038,12 +1082,14 @@ fn resolve_block(
             include.cycles,
             include.constraints.as_ref(),
             state,
-            seed,
+            variety,
+            window_start,
             score_env,
             fill,
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(build.resume.clone());
+        resume_out.lists.extend(build.lists.clone());
 
         return resolve_pool_block_items(
             cat,
@@ -1082,7 +1128,7 @@ fn resolve_block(
             include.constraints.as_ref(),
             &script_path,
             state,
-            seed,
+            variety,
             score_env,
             crate::sequence::Window {
                 from: window_start.unix_timestamp(),
@@ -1091,6 +1137,7 @@ fn resolve_block(
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(build.resume.clone());
+        resume_out.lists.extend(build.lists.clone());
 
         return resolve_pool_block_items(
             cat,
@@ -1257,6 +1304,7 @@ fn resolve_pool_block_items(
         metadata,
         guides: pool_guides,
         tracks: pool_tracks,
+        lists: _,
     } = build;
     let (mut items, mut steps): (Vec<ResolvedItem>, Vec<Step>) = ids
         .iter()
@@ -1491,15 +1539,6 @@ fn apply_order(
         .resolve_order(&ids, order, seed)
         .map_err(|e| e.to_string())?;
     Ok(reorder_to(items, &ordered))
-}
-
-/// A fresh, non-reproducible seed for an unseeded `random` order — derived from
-/// the wall clock so each generation shuffles differently (#46).
-fn fresh_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// Reorder `items` to follow `ordered_ids`, then append any items the ordering
@@ -1939,6 +1978,7 @@ mod tests {
 
     fn channel(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            temperature: None,
             subtitle: None,
             tracks: None,
             number: 1,
@@ -2989,7 +3029,7 @@ mod tests {
         inc.order = Some(Order::Random);
         let cat = seeded_catalog();
         let mut cfg = channel(vec![inc]);
-        cfg.seed = Some(7);
+        cfg.seed = Some(crate::config::SeedSpec::Fixed(7));
         let first = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
         let second = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
         let ids1: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
@@ -3073,6 +3113,8 @@ mod tests {
         let mut inc = include_with(vec![]);
         inc.pools = vec![
             Pool {
+                seed: None,
+                temperature: None,
                 tracks: None,
                 name: "movies".into(),
                 expr: Some("item.type == \"movie\"".into()),
@@ -3096,6 +3138,8 @@ mod tests {
                 guide: None,
             },
             Pool {
+                seed: None,
+                temperature: None,
                 tracks: None,
                 name: "shows".into(),
                 expr: Some("item.type == \"episode\"".into()),
@@ -3898,6 +3942,8 @@ mod tests {
         let cat = interleave_catalog();
         let mut inc = include_with(vec![]);
         inc.pools = vec![Pool {
+            seed: None,
+            temperature: None,
             tracks: None,
             name: "shows".into(),
             expr: None,

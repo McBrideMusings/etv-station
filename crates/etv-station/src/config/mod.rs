@@ -13,6 +13,7 @@ mod source;
 pub(crate) mod station;
 pub mod tracks;
 mod validate;
+pub mod variety;
 
 pub use crate::guide::GuideConfig;
 pub use block::{BlockFile, Duplicates};
@@ -37,3 +38,4 @@ pub use rule::{BlockInclude, RuleConfig};
 pub use source::SourceConfig;
 pub use station::{StationConfig, derive_channel_seed};
 pub use tracks::TrackRules;
+pub use variety::{SeedSpec, TemperatureSpec};
