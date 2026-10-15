@@ -369,6 +369,58 @@ because rotation, `advance: resume` and scorer suppression all change it.
 - A pool whose `expr` reads a Plex collection (`item.collections.contains(...)`)
   changes with the collection, which is the station's form of a monthly
   rotation.
+- `seed: { rotate: 2d }` and `temperature:` rotate what a ranked pool hands
+  back. See the section below.
+
+## Rotating the list: seed and temperature
+
+**What it is.** A ranked pool, such as a taste-scored films pool, returns
+nearly the same ranking every time. Two programming habits keep the head of a
+ranking from airing on a loop: walk down the list instead of reopening it at
+the top, and refresh the list itself on a schedule. FAST guidance to refresh
+weekly and rotate monthly (above) is the second habit at a longer cadence.
+
+**In `channel.yaml`.**
+
+```yaml
+seed: { rotate: 2d }        # a new list every two local days
+temperature: 0.25           # how far each list strays from the pure ranking
+rule:
+  blocks:
+    - pools:
+        - name: kaiju-films
+          plugin: "../../plugins/taste-cosine.rhai"
+          advance: resume   # walk down the period's list, don't reopen it
+        - name: kaiju-shows
+          plugin: "../../plugins/taste-cosine.rhai"
+          advance: resume
+          temperature: 0    # keep the same shows; only the films vary
+```
+
+- `advance: resume` is what walks. Each period's list is ranked once, and
+  every generation in that period continues down it. `advance: restart`
+  reopens the top every generation, so slot 1 airs again whenever the pool
+  comes up.
+- The seed decides which titles fill a list's exploration slots and, with a
+  temperature above 0, the order of the whole list. At temperature 0 a new
+  seed changes only the exploration picks.
+- Temperature is measured, not guessed. On 034 SyFy's films pools, a 14-day
+  taste-lab review put the median pick at score rank 7 at `0.1`, 15 at
+  `0.25`, and 21 at `0.5`. At `0.5`, 15 of 91 films came from below rank 100.
+  Run the Review view at two or three values and read the titles.
+- A shows pool usually wants `temperature: 0`. A new list there swaps which
+  shows the rotation visits, and a show half-way through a season should not
+  leave the rotation because a period ended. The walk opens each new list on
+  the first show it has not visited this lap, so the tail of a stable list
+  still gets its turn.
+- `temperature: { rotate: 3d, cycle: [0.5, 0.5, 0.2] }` alternates looser and
+  tighter periods. Each field runs its own clock.
+
+**Sizing the cadence** (**inference**). A pool comes up once per pattern pass.
+On 034, a pass of 7 films and 21 episodes ran about 27 hours in the review simulation, so a 2-day
+period airs about 2 films per films pool. A period shorter than one pass
+changes the list before the walk reaches slot 2, and the pool behaves like
+`advance: restart` on a new list each time.
 
 **Not expressible today.** Switching a pool's selection on a date, such as a
 new theme each month, needs dated blocks. Tracked in `etv-station-162`.

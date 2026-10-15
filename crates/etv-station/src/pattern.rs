@@ -951,6 +951,10 @@ pub fn build(
     // map at the end. `Option<Value>` rather than `Value` so it plugs straight
     // into `audit::push_stage`, which owns creating the blob.
     let mut audit_out: HashMap<String, Option<serde_json::Value>> = HashMap::new();
+    // Which pool drew each id — so an id two plugin pools both ranked carries
+    // the record of the pool it actually aired from, not whichever of the two
+    // a hash map happens to yield first.
+    let mut drawn_by: HashMap<String, usize> = HashMap::new();
     let mut laid = Duration::ZERO;
     // Where this block's cycle count stands, carried across generations so the
     // rolls below keep moving. Restarting at 0 each generation replayed cycle
@@ -1096,16 +1100,58 @@ pub fn build(
                 if let Some(expr) = &cfg.expr {
                     detail.insert("expr".into(), serde_json::Value::String(expr.clone()));
                 }
+                // The dice this visit drew with, and — on a pool whose list
+                // rotates — where in that period's list each id sat. That is
+                // the walk made visible: positions climb through one period
+                // and start over at a rollover (etv-station-tflc).
+                detail.insert("seed".into(), dice.seed.into());
+                detail.insert("temperature".into(), dice.temperature.into());
+                if let Some(p) = dice.seed_period {
+                    detail.insert("seed_period".into(), p.into());
+                }
+                if let Some(p) = dice.temperature_period {
+                    detail.insert("temperature_period".into(), p.into());
+                }
+                // A plugin pool's position is read from the list as ranked
+                // for the period: a pool's own constraints reorder what it
+                // holds before each draw (a `no_repeat_within` moves what
+                // just aired to the back), so a position in the reordered
+                // runtime would read 1 on every visit.
+                let rt = &runtimes[idx];
+                let ranked = rt.list_key.as_deref().and_then(|key| {
+                    lists
+                        .get(&rt.cfg.name)?
+                        .iter()
+                        .find(|l| l.key == key)
+                        .map(|l| &l.ids)
+                });
                 for id in &drawn {
+                    let mut detail = detail.clone();
+                    let place = match ranked {
+                        Some(ids) => ids.iter().position(|x| x == id).map(|i| (i, ids.len())),
+                        None if rt.list_key.is_some() => rt
+                            .series
+                            .iter()
+                            .position(|s| s.ids.contains(id))
+                            .map(|i| (i, rt.series.len())),
+                        None => None,
+                    };
+                    if let Some((i, len)) = place {
+                        detail.insert("list_position".into(), (i + 1).into());
+                        detail.insert("list_length".into(), len.into());
+                    }
                     let entry = audit_out.entry(id.clone()).or_insert(None);
                     crate::audit::push_stage(
                         entry,
                         "select",
                         by.clone(),
                         verdict.clone(),
-                        Some(serde_json::Value::Object(detail.clone())),
+                        Some(serde_json::Value::Object(detail)),
                     );
                 }
+            }
+            for id in &drawn {
+                drawn_by.insert(id.clone(), idx);
             }
             out.extend(drawn);
         }
@@ -1131,9 +1177,18 @@ pub fn build(
     progress.push(resume_out.clone());
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
-    // #173 to read. See [`flatten_picked_extras`] (#203) for why the pool
-    // half of the key is dropped here.
-    let mut metadata_out = flatten_picked_extras(score_cache.picked_extras);
+    // #173 to read — keyed by the drawing pool, so an id two pools ranked
+    // carries the drawing pool's record.
+    let mut metadata_out: HashMap<String, serde_json::Value> = drawn_by
+        .iter()
+        .filter_map(|(id, &idx)| {
+            score_cache
+                .picked_extras
+                .get(&(pools[idx].name.clone(), id.clone()))
+                .and_then(|extra| extra.metadata.clone())
+                .map(|m| (id.clone(), m))
+        })
+        .collect();
     // Fold each id's `pool` stage into the same blob a plugin pick's metadata
     // lands in, so one item carries one `audit` array whatever produced it.
     // A plugin pool's ranking record was written first, in `score`, so

@@ -1037,6 +1037,49 @@ fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>,
 
 /// The pool an airing was drawn from, read off the pattern engine's `select`
 /// audit stage (`detail.pool`).
+/// Where a plugin pool's pick stood in the list it walked: its `rank` (the
+/// walk position, after any temperature), its `score_rank` (by score alone),
+/// the `temperature` that separated the two, and whether the slot was an
+/// exploration `draw` — read off the plugin's own `pool` audit stage, `null`
+/// for an airing no plugin ranked. Under a rotating seed this is what shows
+/// the walk: ranks climb 1, 2, 3 through one period's list and start over at
+/// a rollover.
+///
+/// The `select` stage (the core's own record of the draw) adds the seed and
+/// temperature the visit drew with, the period index each was in, and where
+/// in that period's list the pick sat — `null` fields on a pool nothing
+/// rotates.
+fn ranking_of(metadata: Option<&Value>) -> Value {
+    let stage = |name: &str| {
+        metadata
+            .and_then(|m| m.get("audit"))
+            .and_then(Value::as_array)
+            .and_then(|stages| {
+                stages
+                    .iter()
+                    .find(|stage| stage.get("stage").and_then(Value::as_str) == Some(name))
+            })
+            .and_then(|stage| stage.get("detail"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let (pool, select) = (stage("pool"), stage("select"));
+    if pool.is_null() && select.is_null() {
+        return Value::Null;
+    }
+    json!({
+        "rank": pool.get("rank"),
+        "score_rank": pool.get("score_rank"),
+        "draw": pool.get("draw"),
+        "seed": select.get("seed"),
+        "temperature": select.get("temperature"),
+        "seed_period": select.get("seed_period"),
+        "temperature_period": select.get("temperature_period"),
+        "list_position": select.get("list_position"),
+        "list_length": select.get("list_length"),
+    })
+}
+
 fn drawn_from_pool(metadata: Option<&Value>) -> Option<String> {
     metadata?
         .get("audit")?
@@ -1550,6 +1593,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
                 "start": a.start.unix_timestamp(),
                 "offset_secs": (a.start - start).whole_seconds(),
                 "duration_secs": a.duration.whole_seconds(),
+                "ranking": ranking_of(simulated[i].metadata.as_ref()),
             })
         })
         .collect();

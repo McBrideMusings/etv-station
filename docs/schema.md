@@ -491,6 +491,7 @@ catalog_path: /var/lib/etv-station/catalog.db   # optional — enables query cha
 catalog_refresh_secs: 900      # optional — trust the catalog this long without asking Plex
 full_sweep_after_secs: 86400   # optional — force a full (deletion-catching) re-read this often
 seed: 1138                     # optional — every channel with no seed: of its own inherits this, salted per channel
+temperature: 0                 # optional — every channel with no temperature: of its own inherits this
 ```
 
 | Field | Required | Type / default |
@@ -503,7 +504,8 @@ seed: 1138                     # optional — every channel with no seed: of its
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
 | `overlay` | no | station-wide overlay default, the least specific level of the cascade every channel inherits from unless it says otherwise — see [Overlay cascade](#overlay-cascade) |
 | `tracks` | no | the station level of the [track-selection](#track-selection) rules: which audio and subtitle stream of each file plays |
-| `seed` | no — default unset | int — station-wide random seed. Every channel that sets no `seed:` of its own inherits it, **salted with that channel's `name`** — see [Seed cascade](#seed-cascade). Unset means every unseeded channel keeps drawing a fresh wall-clock seed on every generation. |
+| `seed` | no — default unset | a number, or a rotation — see [Seed and temperature](#seed-and-temperature). Every channel that sets no `seed:` of its own inherits it, **each number salted with that channel's `name`**. Unset means every unseeded channel draws a new seed each local day from a fixed base. |
+| `temperature` | no — default `0` | a number ≥ 0, or a rotation — see [Seed and temperature](#seed-and-temperature). Every channel that sets no `temperature:` of its own inherits it. |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
 
@@ -541,7 +543,8 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `chunk_hours` | no — default `6` | int — playout file size only; it does not bound a generation |
 | `roll_interval` | no — default `"3600s"` | duration |
 | `retention_days` | no — default `7` | int |
-| `seed` | no — inherited from the station `seed` when unset | int — seeds `random` order and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's `name`, then to a fresh wall-clock seed — see [Seed cascade](#seed-cascade). |
+| `seed` | no — inherited from the station `seed` when unset | a number, or a rotation — seeds `random` order, a plugin's `ctx.seed` and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's `name`, then to a new seed each local day — see [Seed and temperature](#seed-and-temperature). |
+| `temperature` | no — inherited from the station when unset, else `0` | a number ≥ 0, or a rotation — how far a plugin's draw may stray from its own ranking, handed to scripts as `ctx.temperature`. See [Seed and temperature](#seed-and-temperature). |
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `tracks` | no | the channel level of the [track-selection](#track-selection) rules; blocks, pools and items refine it |
 | `subtitle` | no | `{ default_on: true \| false }` — announce this channel's subtitle track as `DEFAULT=YES`; unset leaves the station's `normalization.subtitle.default_on` |
@@ -637,32 +640,107 @@ copied into the include, so a reference and an equivalent inline block resolve
 identically. `mode`, `order`, and `filter` are **composition fields on the
 include** — they never live in the block file body.
 
-### Seed cascade
+### Seed and temperature
 
-A channel's seed resolves in this order, first hit wins:
+Every random choice on a channel is computed from its **seed**, which is why a
+pinned config and date reproduce the same schedule. **Temperature** says how
+far a plugin's draw may stray from its own ranking. Each can be fixed, or
+**rotate**: change value on a cadence, so the same channel airs a different
+set of answers each period while every period still reproduces.
 
-1. **The channel's own `seed:`.** Pinned by hand, unaffected by anything the
-   station says.
-2. **The station `seed:`, salted with the channel's `name`.** Applied at
-   config-load time, so everything downstream still reads one field.
-3. **A fresh wall-clock seed** — only when neither is set. The channel
-   reshuffles on every generation, and the daemon logs this at INFO naming the
-   channel, so an unseeded channel is visible in the startup log rather than
-   silent.
+Both fields take the same three shapes:
 
-Step 2 is what makes the determinism guarantee (`determinism.rs`) true in the
-daemon and not only in `--check-determinism`: without a pinned seed, every
-catalog refresh that changes a channel's candidate set reshuffles its whole
-future window, because the regen draws a new seed from the clock.
+```yaml
+seed: 34                                   # fixed — one seed, for ever
+seed: { rotate: 2d }                       # a new seed every 2 days
+seed: { rotate: 3d, cycle: [34, 99, 7] }   # 34, then 99, then 7, 3 days each, repeating
 
-**Why the inherited seed is salted.** Nothing in the seeded draw mixes in
+temperature: 0.5                                     # fixed
+temperature: { rotate: 2d, cycle: [0.7, 0.7, 0.25] } # one value per period, repeating
+temperature: { rotate: 2d, between: [0.25, 0.7] }    # a seeded draw from the range each period
+```
+
+| Form | `seed` | `temperature` |
+|---|---|---|
+| a number | that seed, for ever | that temperature, for ever (≥ 0) |
+| `{ rotate: <span> }` | a new seed each period, drawn from a fixed base and salted with the channel name (and the pool name, at pool level) — reproducible, nothing to pick | refused: nothing says which value a period gets |
+| `{ rotate, cycle: [...] }` | walks the list, one entry per period, wrapping | walks the list, one entry per period, wrapping |
+| `{ rotate, between: [low, high] }` | refused | a value drawn uniformly from the range, seeded by the period, so a rerun draws it again |
+
+**Cadence.** `rotate` is a duration (`4h`, `2d`, `1w`; at least `1h`).
+Periods count from 1970-01-01 00:00 in the station's local time, so a
+whole-day cadence rolls over at local midnight — and a `7d` one on a Thursday,
+the epoch's weekday. `seed` and `temperature` each run on their own clock; a
+pool's list turns over whenever either one rolls over.
+
+**Levels.** Station → channel → pool, the lowest level that sets a field
+winning outright — a pool's `seed:` or `temperature:` replaces the channel's
+for that pool alone (its plugin, its `order: random` shuffle, its
+`select`/`from: random` draws, and the `chance:` of steps naming it). Nothing
+set at any level means a new seed each local day and temperature `0`: a
+channel nobody tuned still varies its exploration picks and shuffles daily,
+reproducibly, and ranks exactly as its plugin does.
+
+**What reads which.** Temperature reaches only scripts — nothing in the core
+ranks, so nothing in the core has an order to loosen:
+
+| Where | Rotating seed | Temperature |
+|---|---|---|
+| plugin pool ranking (`ctx.seed`, `ctx.temperature`) | yes | yes — the script decides what it means; `taste-cosine.rhai` reads it as a softmax temperature over its scores |
+| sequencer script (`ctx.seed`, `ctx.temperature`) | yes | yes — the script's to interpret |
+| `order: random` (block, pool, query entry, fallback), `bucket_order: random` | yes — a new shuffle each period | no: a shuffle is already as random as it gets |
+| `select: random`, `from: random`, a step's `chance:` | yes | no, same reason |
+| field sorts (`year:asc`, `season:asc,episode:asc`), `manual`, a collection's order, CEL filters, rotation/take/constraints | no | no — chronological stays chronological |
+
+**A rotating plugin pool walks one list per period.** The first generation of
+a period ranks the pool's list and stores it in the `.resume` sidecar
+(`lists`); every later generation in that period walks the same list instead of
+re-ranking — a re-ranking would have moved under the walk, since a plugin's
+inputs (`ctx.recent`, the watch history) change as the channel plays. With
+`advance: resume` the walk continues down that list generation after
+generation; with `advance: restart` every generation reopens at its top. A list
+that runs out mid-period is extended by the plugin (the same refill a drained
+pool always gets) and the extension is stored with it.
+
+**At a rollover** the pool's list is ranked again under the new seed and
+temperature, and a resuming pool opens on **the first series of the new list
+that its current lap has not aired** — a lap being the series visited since
+the walk last covered every series in its list. A list that changed completely
+therefore opens on its top; a list that barely changed (a shows pool at
+temperature `0`, where only the exploration pick moves) carries on past what it
+already aired instead of replaying its top every period and never reaching its
+tail. A rollover lands on **the first visit that airs after the boundary**,
+inside a generation if need be: a pattern walk re-checks its dice at every
+visit. A block that lays a seeded list in one pass — an entries block with an
+`order: random`, or a sequencer — cannot re-draw partway, so a generation
+holding one is cut at the next rollover and the next generation opens in the
+new period.
+
+A fixed seed and a fixed temperature never roll over: such a pool is ranked
+afresh every generation, holds no stored list, and resumes at the series it
+was up to — exactly as before rotation existed.
+
+**Reading it back.** Every drawn item's `select` audit stage records the
+`seed` and `temperature` its visit drew with, the `seed_period` /
+`temperature_period` when either rotates, and — on a pool whose list rotates —
+its `list_position` of `list_length` in that period's ranked list: positions
+climb through one period and start over at a rollover. `taste-cosine.rhai`'s
+own stage adds `score_rank` (where the pick stood by score alone) beside `rank`
+(where the temperature put it). The daemon logs `variety.ranked` each time a
+pool ranks a period's list and `variety.rollover` when one rolls over
+mid-generation. taste-lab's review API carries all of it per airing as
+`ranking`.
+
+**Why an inherited number is salted.** Nothing in the seeded draw mixes in
 anything channel-specific — the shuffle consumes the seed as raw PRNG state,
 and a pattern roll mixes only `(seed, cycle, step, nonce)`. Handing every
 channel the same station number verbatim would make any two channels with the
-same candidate multiset produce the *identical* order. The salt is the
-channel's declared **`name`** — its identity — and deliberately not its channel
-number, which is a presentation detail, nor its folder name; renumbering a
-channel or renaming its folder must not reshuffle it.
+same candidate multiset produce the *identical* order. So a station `seed:`
+reaches each channel salted with the channel's declared **`name`** — its
+identity — and deliberately not its channel number, which is a presentation
+detail, nor its folder name; renumbering a channel or renaming its folder must
+not reshuffle it. A fixed seed is salted, and so is every entry of a station
+`cycle`; a derived rotation is salted when it is drawn.
 
 The derivation is a fixed algorithm (FNV-1a over the name, then the SplitMix64
 finalizer), not `DefaultHasher`, so one pinned station seed reproduces the same
@@ -1343,14 +1421,15 @@ items the generation needs), `ctx.history` (recent server-wide watch events,
 channel aired most recently, oldest first), `ctx.now` (unix seconds at
 generation time), `ctx.config` (this pool's `config:` block — see below),
 `ctx.seed` (the channel's resolved seed mixed with this pool's name — see
+below), `ctx.temperature` (this pool's temperature for the period — see
 below), and `ctx.account_id` (the numeric account id a `single_user`-scoped
 channel resolved, or unit `()` on a pooled channel — see below).
 
 #### `ctx.seed` — reproducible randomness (ADR 0005)
 
-`ctx.seed` is an integer: the channel's resolved `seed` (authored, or a fresh
-value drawn once per generation when unset — #46) mixed with the asking pool's
-name. It is the source of entropy meant for a script to shuffle with. Rhai's
+`ctx.seed` is an integer: the pool's resolved `seed` for the period being
+ranked (see [Seed and temperature](#seed-and-temperature)) mixed with the
+asking pool's name. It is the source of entropy meant for a script to shuffle with. Rhai's
 own `timestamp()`/`elapsed()` are legal to read too — they answer a clock
 fixed for this generation (seeded from `window_start`, never the real wall
 clock, #357), not a source of nondeterminism — but they carry no seed of their
@@ -1360,14 +1439,33 @@ own, so a script wanting reproducible randomness should still derive it from
 Two pools of one channel naming the same script get different `ctx.seed`
 values — mixing the pool's own name into the channel's seed is what keeps two
 such pools from drawing the same sequence, which would put their exploration
-slots in lockstep on air, forever. The same channel and the same authored seed
-produce the identical `ctx.seed` across two generations, which is what lets a
-script pick randomly from it and still pass `--check-determinism`.
+slots in lockstep on air, forever. The same channel, seed and period produce
+the identical `ctx.seed` across two generations, which is what lets a script
+pick randomly from it and still pass `--check-determinism`; a rotating seed
+hands the script a new value at each rollover.
 
 `ctx.seed` is a plain integer, not a PRNG object — a script derives its own
 pick from it with ordinary arithmetic (mix it further, take it modulo a
 candidate count, and so on), the same way `examples/plugins/taste-cosine.rhai`
 (#254) derives a seeded coin flip per output slot for its exploration draw.
+
+#### `ctx.temperature` — how far the draw may stray from the ranking
+
+`ctx.temperature` is a float ≥ 0: the pool's resolved `temperature` for the
+period being ranked, `0` when nothing set one. The station gives it no meaning
+of its own — loosening a ranking is ranking logic, so it is the script's.
+`taste-cosine.rhai` reads it as a softmax temperature: each candidate's key is
+`ln(score) / T` plus Gumbel noise drawn from `ctx.seed`, and the walk order is
+those keys sorted — a draw without replacement where each next pick's chance is
+proportional to `score^(1/T)`. At `0` that order is the score ranking exactly;
+at `1` a title's chance is proportional to its score; higher still approaches a
+uniform shuffle. Because the noise comes from `ctx.seed`, one period's order
+reproduces and the next period's differs.
+
+How much a given number moves depends on how scores spread in the pool. On
+034 SyFy's films pools, whose candidate sets run to hundreds of titles, a
+14-day taste-lab review put the median pick at score rank 7 at `0.1`, 15 at
+`0.25`, and 21 at `0.5`.
 
 #### `ctx.account_id` — the account a personal channel ranks against (#278, ADR 0005)
 
@@ -1811,6 +1909,8 @@ pool's `expr` or `plugin`, then its `order`, `bucket_order`, and `constraints`
 | `ctx.window.from` | the instant this generation begins airing — the hour a daypart script asks about, not the hour the daemon happens to be computing in |
 | `ctx.resume.<pool>.next` | the series whose turn is next in that pool's rotation |
 | `ctx.cursor` | the per-show cursors from the play-history db |
+| `ctx.seed` | the channel's seed for this window's period, a non-negative integer — the script's source of reproducible randomness |
+| `ctx.temperature` | the channel's temperature for that period — the script's to interpret |
 
 `local_time(unix_secs)` is a **global function**, not a `ctx` field — registered on the engine every `arrange()` call runs under, so a script can re-read the clock at any instant it computes (a running cursor advanced by summed item durations), not only at `ctx.window.from`. It resolves against the station's configured `tz` (`UTC` at the stateless entry point, which carries no station config) and returns `#{ weekday, hour, minute }`, where `weekday` is one of `"mon"`.."sun"` and `hour` is `0`-`23` — both rolling on the same local-midnight grid `chunk_hours` does.
 

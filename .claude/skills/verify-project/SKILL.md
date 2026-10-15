@@ -298,31 +298,56 @@ Artifacts live under `examples/output/test/`: `.resume`, `.history`, and
 `<start>_<end>.json` files. `examples/output/` is gitignored, so nothing here needs
 cleanup before a commit.
 
-## Verifying the seed cascade
+## Verifying the seed cascade and seed/temperature rotation
 
 A channel with no `seed:` inherits the station `seed:`, salted with the
-channel's declared `name:` (#324, #414). Two surfaces prove it:
+channel's declared `name:` (#324, #414); nothing set anywhere is a new seed
+each local day. `seed:` and `temperature:` rotate on a cadence
+(etv-station-tflc, `docs/schema.md` § Seed and temperature). The unit proof:
 
 ```bash
-cargo test -p etv-station --test station_seed_cascade   # load() → derived, salted, stable seeds
+cargo test -p etv-station --test station_seed_cascade        # load() → derived, salted, stable seeds
+cargo test -p etv-station --lib variety::                     # periods, cycles, default, rollover instant
+cargo test -p etv-station --lib pattern::tests::a_rotating    # one list per period, then a new one
+cargo test -p etv-station --lib pattern::tests::a_rollover    # lands on the first visit after the boundary
+cargo test -p etv-station --test taste_cosine_scorer temperature
 ```
 
-At the daemon, boot the same config twice — once with `seed:` on the station
-file, once without — and read the startup log:
+**The surface is taste-lab's review**, which carries per airing a `ranking`
+object: the `seed`/`temperature` the visit drew with, `seed_period`, and
+`list_position` of `list_length` in that period's ranked list. Copy the real
+appdata to scratch (never edit `deploy/appdata` from a worktree), set the
+channel rotating, and run taste-lab on it:
 
+```bash
+SIM=$(~/.claude/tools/repo-slug --path)/sim && mkdir -p "$SIM"
+rsync -a /Users/pierce/Projects/etv-station/deploy/appdata/ "$SIM/appdata/"
+cp examples/plugins/taste-cosine.rhai "$SIM/appdata/plugins/"
+# in $SIM/appdata/channels/034-syfy/channel.yaml: seed: { rotate: 2d },
+# temperature: 0.5, films pools advance: resume, shows pools temperature: 0
+set -a; . /Users/pierce/Projects/etv-station/.env; set +a
+export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/plexdb.snapshot.db
+cargo run --release --bin taste-lab -- \
+  --catalog /Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/catalog.db \
+  --station "$SIM/appdata/station.yaml" --port <PORT>
+curl -s 'http://127.0.0.1:<PORT>/api/review?channel=034-syfy&days=14' > a.json   # twice: a.json, b.json
 ```
-# station seed set: nothing about seeds in the log, channels just load
-INFO etv_station: loaded channel event="channel.load" channel=alpha …
 
-# station seed absent: one INFO line per unseeded channel, naming it
-INFO etv_station::config::load: no channel seed and no station seed:
-     this channel reshuffles on every generation channel=alpha
-```
+Look for, per films pool: `list_position` 1, 2, … inside one `seed_period`
+and back near 1 at the next, a different title opening every period, and
+`a.json`'s `airings` equal to `b.json`'s. Observed 2026-10-15 on 034 (2d, T 0.5):
+7/7 films pools opened every one of their 7-8 periods on a different film,
+positions climbed inside every period, and both runs' 361 airings matched. A
+position that skips (1 then 3) is the pool's `no_repeat_within` passing over a
+film aired in an earlier period, not a broken walk.
 
-That second line is the pass condition for "an unseeded channel is visible
-rather than silent". Seeing it in a production log means that channel still
-redraws a wall-clock seed on every regeneration and reshuffles its whole future
-window whenever a catalog refresh changes its candidate set.
+**Prod's 034 `channel.yaml` overlay block does not parse on this code** (as of
+2026-10-15: "`overlay:` must be `clear`, a `{file: <path>}` reference…"), so a
+taste-lab run of the real file reports a `load_error`. Delete the `overlay:`
+block from the scratch copy; the schedule does not read it.
+
+At the daemon, `event="variety.ranked" pool=… list=…` logs once per pool per
+period and `event="variety.rollover"` when a period turns over mid-generation.
 
 ## Verifying a folder rename keeps a channel's history (#414)
 
