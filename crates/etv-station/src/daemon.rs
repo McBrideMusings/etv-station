@@ -3219,6 +3219,7 @@ async fn pattern_catch_up(
         resume = resume_out;
         resume.checkpoints = checkpoints;
         resume.prune_elapsed(now);
+        resume.prune_lists();
         crate::resume::save(output, &resume).await?;
         from += span;
         generations += 1;

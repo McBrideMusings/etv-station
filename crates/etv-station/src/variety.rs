@@ -250,8 +250,20 @@ impl Variety {
             .into_iter()
             .map(|c| {
                 let secs = c.as_secs().max(1) as i64;
-                let boundary_local = (local.div_euclid(secs) + 1) * secs;
-                local_to_utc(boundary_local, after, self.tz)
+                let current = local.div_euclid(secs);
+                let mut at = local_to_utc((current + 1) * secs, after, self.tz);
+                // A boundary inside a DST gap names a wall-clock time that
+                // never happens, and converting it can land before `after`.
+                // The period really changes at the first instant past the
+                // gap: step forward an hour at a time (every gap is whole
+                // hours) until the local clock has left `current`.
+                for _ in 0..48 {
+                    if at > after && period(local_secs(at, self.tz), c) != current {
+                        break;
+                    }
+                    at += time::Duration::hours(1);
+                }
+                at
             })
             .min()
     }
@@ -368,6 +380,23 @@ mod tests {
         let b = variety(Some(&spec), Some(&temp)).dice(at, None);
         assert_eq!(a, b);
         assert!((0.25..0.7).contains(&a.temperature), "{}", a.temperature);
+    }
+
+    /// A 2-hour boundary at 02:00 on the night Chicago springs forward names
+    /// a time that never happens; the rollover lands at 03:00 local, after
+    /// the instant asked from, never before it.
+    #[test]
+    fn a_boundary_inside_a_dst_gap_lands_after_the_gap() {
+        let spec = SeedSpec::Rotate(SeedRotate {
+            rotate: Duration::from_secs(2 * 3600),
+            cycle: None,
+        });
+        let v = variety(Some(&spec), None);
+        let after = datetime!(2026-03-08 07:10 UTC); // 01:10 CST
+        let at = v.next_rollover(after, []).unwrap();
+        assert!(at > after, "{at} must be after {after}");
+        assert_eq!(at, datetime!(2026-03-08 08:00 UTC), "03:00 CDT");
+        assert_ne!(v.dice(at, None).seed, v.dice(after, None).seed);
     }
 
     /// Nothing set anywhere is the documented default: a new seed each local

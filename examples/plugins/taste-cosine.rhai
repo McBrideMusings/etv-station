@@ -905,12 +905,6 @@ fn pick(ctx) {
         else { 0 }
     });
 
-    // Stamp each row's ranked position before anything copies the list —
-    // `explorable` below is built by `.filter()`, which copies rows, so an
-    // exploration draw only knows its own rank if it is already stamped on
-    // when that copy is taken. One inline pass over `scored`, not a second
-    // id -> rank map (#172's rule: no per-candidate helper taking a
-    // library-sized collection by value).
     // TEMPERATURE (etv-station-tflc). At 0 the walk order IS the score
     // ranking above. Above 0, the order is redrawn: each candidate's key is
     // ln(score)/T plus Gumbel noise drawn from the seed, and sorting by that
@@ -935,6 +929,13 @@ fn pick(ctx) {
             else { 0 }
         });
     }
+
+    // Stamp each row's ranked position before anything copies the list —
+    // `explorable` below is built by `.filter()`, which copies rows, so an
+    // exploration draw only knows its own rank if it is already stamped on
+    // when that copy is taken. One inline pass over `scored`, not a second
+    // id -> rank map (#172's rule: no per-candidate helper taking a
+    // library-sized collection by value).
     for i in 0..scored.len {
         scored[i].rank = i + 1;
     }

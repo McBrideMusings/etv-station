@@ -296,6 +296,17 @@ pub fn resolve_channel_with_resume(
     // block, whose progress is its list position instead.
     let mut pool_progress: Vec<Vec<BTreeMap<String, PoolResume>>> = Vec::new();
     for (idx, include) in config.rule.blocks.iter().enumerate() {
+        // A block airs after the blocks before it, so its own clock — what a
+        // rollover inside its walk, or a sequencer's dayparts, are measured
+        // against — starts where their estimated airtime ends.
+        let block_start = if out.is_empty() {
+            window_start
+        } else {
+            let laid: Duration = estimated_runtimes(&out, catalog, nominal_item_runtime(config))
+                .into_iter()
+                .sum();
+            window_start + time::Duration::seconds_f64(laid.as_secs_f64())
+        };
         let BlockItems {
             items: block_items,
             steps: block_steps,
@@ -313,7 +324,7 @@ pub fn resolve_channel_with_resume(
             state,
             scoring,
             fill,
-            window_start,
+            block_start,
             &mut resume_out,
             config.guide.as_ref(),
         )?;

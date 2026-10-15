@@ -1366,12 +1366,6 @@ impl ScoreCache {
             .unwrap_or_default()
     }
 
-    /// Stash the metadata/take-override half of what a plugin pool's `pick()`
-    /// just returned (#166) — see [`Self::picked_extras`]. Ids that attached
-    /// neither are skipped, so a plugin returning only bare ids leaves this
-    /// untouched. `pool_name` is part of the key, not just the id, so a
-    /// second pool resolving the same id from an overlapping query cannot
-    /// overwrite the first pool's record.
     /// [`Self::record_picked`] for a list ranked earlier in its period and
     /// read back from the `.resume` sidecar: the same metadata and take
     /// overrides `pick()` attached when it ranked the list.
@@ -1387,6 +1381,12 @@ impl ScoreCache {
         }
     }
 
+    /// Stash the metadata/take-override half of what a plugin pool's `pick()`
+    /// just returned (#166) — see [`Self::picked_extras`]. Ids that attached
+    /// neither are skipped, so a plugin returning only bare ids leaves this
+    /// untouched. `pool_name` is part of the key, not just the id, so a
+    /// second pool resolving the same id from an overlapping query cannot
+    /// overwrite the first pool's record.
     pub(crate) fn record_picked(&mut self, pool_name: &str, picked: &[PickedItem]) {
         for item in picked {
             if item.metadata.is_some() || item.take_override.is_some() {

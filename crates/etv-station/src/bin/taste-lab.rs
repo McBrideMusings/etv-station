@@ -919,7 +919,8 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
         .session
         .as_ref()
         .ok_or_else(|| "no channel selected".to_string())?;
-    let result = simulate_schedule(&state.catalog, session);
+    let tz = station_tz(&state.review.station_path);
+    let result = simulate_schedule(&state.catalog, session, tz);
     let session = state.session.as_mut().expect("checked above");
     match result {
         Ok(schedule) => {
@@ -944,7 +945,20 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
 /// block, a film is a "single". Pool and block come from the airing's own
 /// `select` audit stage and `block` index, not from a second reading of the
 /// pattern.
-fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>, String> {
+/// The station's zone, so a rotating seed's periods fall where the daemon's
+/// do; UTC when the station file cannot be read or names no zone it knows.
+fn station_tz(station_path: &Path) -> &'static time_tz::Tz {
+    config::read_station(station_path)
+        .ok()
+        .and_then(|st| etv_station::tz::parse(&st.tz).ok())
+        .unwrap_or(time_tz::timezones::db::UTC)
+}
+
+fn simulate_schedule(
+    catalog: &Catalog,
+    session: &Session,
+    tz: &'static time_tz::Tz,
+) -> Result<Vec<Value>, String> {
     let mut config: config::ChannelConfig = serde_json::from_value(session.config_json.clone())
         .map_err(|e| format!("channel config: {e}"))?;
     for block in &mut config.rule.blocks {
@@ -983,7 +997,7 @@ fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>,
         session.account_id,
         session.days,
         start,
-        time_tz::timezones::db::UTC,
+        tz,
     )?;
 
     let mut out = Vec::new();
@@ -1035,8 +1049,6 @@ fn simulate_schedule(catalog: &Catalog, session: &Session) -> Result<Vec<Value>,
     Ok(out)
 }
 
-/// The pool an airing was drawn from, read off the pattern engine's `select`
-/// audit stage (`detail.pool`).
 /// Where a plugin pool's pick stood in the list it walked: its `rank` (the
 /// walk position, after any temperature), its `score_rank` (by score alone),
 /// the `temperature` that separated the two, and whether the slot was an
@@ -1080,6 +1092,8 @@ fn ranking_of(metadata: Option<&Value>) -> Value {
     })
 }
 
+/// The pool an airing was drawn from, read off the pattern engine's `select`
+/// audit stage (`detail.pool`).
 fn drawn_from_pool(metadata: Option<&Value>) -> Option<String> {
     metadata?
         .get("audit")?
@@ -1939,9 +1953,6 @@ fn build_review(
     }))
 }
 
-/// One tune-in sample's still, as the page reads it: `{url}` when there is a
-/// media file to grab a frame from, else `{unavailable, path?}` naming why
-/// not. Registers the still so its URL renders it on first request.
 /// The channel's seed at `at` — what the review's seeded tune-in samples and
 /// still names key on, so a rerun of the same span picks the same moments.
 fn review_seed(
@@ -1955,6 +1966,9 @@ fn review_seed(
         .seed
 }
 
+/// One tune-in sample's still, as the page reads it: `{url}` when there is a
+/// media file to grab a frame from, else `{unavailable, path?}` naming why
+/// not. Registers the still so its URL renders it on first request.
 fn offer_still(
     state: &mut AppState,
     station: &config::Station,

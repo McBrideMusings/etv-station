@@ -268,6 +268,30 @@ impl ResumeMap {
         });
     }
 
+    /// Drop every stored list nothing can walk again: keep a pool's list only
+    /// while the current pool state or a surviving checkpoint names its key.
+    /// Run after [`Self::prune_elapsed`], so a list lives exactly as long as a
+    /// rewind could land on it.
+    pub fn prune_lists(&mut self) {
+        let mut wanted: std::collections::BTreeSet<(&str, &str)> = Default::default();
+        let states = std::iter::once(&self.pools).chain(self.checkpoints.iter().map(|c| &c.pools));
+        for pools in states {
+            for (name, pool) in pools {
+                if let Some(key) = &pool.list {
+                    wanted.insert((name.as_str(), key.as_str()));
+                }
+            }
+        }
+        let wanted: std::collections::BTreeSet<(String, String)> = wanted
+            .into_iter()
+            .map(|(n, k)| (n.to_string(), k.to_string()))
+            .collect();
+        for (name, kept) in &mut self.lists {
+            kept.retain(|l| wanted.contains(&(name.clone(), l.key.clone())));
+        }
+        self.lists.retain(|_, kept| !kept.is_empty());
+    }
+
     /// Drop checkpoints for item boundaries that have already aired — their
     /// content is a record now, not something to regenerate.
     pub fn prune_elapsed(&mut self, now: OffsetDateTime) {
@@ -541,6 +565,46 @@ mod tests {
         let (loaded, _) = load(dir.path()).await.unwrap();
         assert_eq!(loaded, map);
         assert_eq!(loaded.checkpoints[0].start, at(12));
+    }
+
+    /// A stored list lives exactly as long as something can walk it again:
+    /// the current pool state or a surviving checkpoint naming its key.
+    #[test]
+    fn prune_lists_keeps_only_lists_a_rewind_can_reach() {
+        let list = |key: &str| FrozenList {
+            key: key.into(),
+            ids: vec![],
+            extras: BTreeMap::new(),
+        };
+        let on = |key: &str| {
+            BTreeMap::from([(
+                "films".to_string(),
+                PoolResume {
+                    list: Some(key.into()),
+                    ..Default::default()
+                },
+            )])
+        };
+        let mut map = ResumeMap::new();
+        map.lists.insert(
+            "films".into(),
+            vec![list("p1"), list("p2"), list("p3"), list("p4")],
+        );
+        map.lists.insert("gone".into(), vec![list("p1")]);
+        map.pools = on("p2");
+        map.checkpoint(at(6));
+        map.pools = on("p4");
+        map.prune_lists();
+        let kept: Vec<&str> = map.lists["films"].iter().map(|l| l.key.as_str()).collect();
+        assert_eq!(
+            kept,
+            ["p2", "p4"],
+            "the checkpoint's list and the current one"
+        );
+        assert!(
+            !map.lists.contains_key("gone"),
+            "a pool nothing names is dropped"
+        );
     }
 
     // ---- a flat channel's list position (#118) -----------------------------

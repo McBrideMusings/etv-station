@@ -244,6 +244,7 @@ pub fn simulate(
                 airings,
             });
             resume = resume_out;
+            resume.prune_lists();
             from += span;
         }
         now += roll;

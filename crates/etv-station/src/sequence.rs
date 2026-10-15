@@ -304,7 +304,11 @@ pub fn build(
         metadata: metadata_out,
         guides: guide_out,
         tracks: tracks_out,
-        lists,
+        // Only this block's pools — see the same line in `pattern::build`.
+        lists: lists
+            .into_iter()
+            .filter(|(name, _)| pools.iter().any(|p| &p.name == name))
+            .collect(),
     })
 }
 

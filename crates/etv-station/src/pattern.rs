@@ -722,14 +722,20 @@ impl PoolRuntime<'_> {
     /// the constraint window, every series' cursor, what has aired, the clash
     /// count. Only the list and the rotation are new.
     fn carry_into(self, fresh: &mut PoolRuntime<'_>) {
-        let cursors: HashMap<&str, usize> = self
+        // Each series continues after the last item it aired, found by id in
+        // the new list — never by carrying an index, which points somewhere
+        // else (or past the end) once the list holds a different set of ids.
+        let last_aired: HashMap<&str, &str> = self
             .series
             .iter()
-            .map(|s| (s.key.as_str(), s.cursor))
+            .filter(|s| s.cursor > 0)
+            .map(|s| (s.key.as_str(), s.ids[s.cursor - 1].as_str()))
             .collect();
         for s in &mut fresh.series {
-            if let Some(&c) = cursors.get(s.key.as_str()) {
-                s.cursor = c;
+            if let Some(last) = last_aired.get(s.key.as_str())
+                && let Some(pos) = s.ids.iter().position(|id| id == last)
+            {
+                s.cursor = (pos + 1) % s.ids.len();
             }
         }
         fresh.recent = self.recent;
@@ -1004,6 +1010,7 @@ pub fn build(
                     measure,
                     &mut lists,
                     airs_at,
+                    &out,
                 )?;
             }
             let roll = RollKey {
@@ -1202,6 +1209,10 @@ pub fn build(
             }
         }
     }
+    // Only this block's pools: the caller merges every block's lists by pool
+    // name, and a copy of another block's entry here would overwrite what
+    // that block just ranked.
+    lists.retain(|name, _| pools.iter().any(|p| &p.name == name));
     Ok(BlockBuild {
         ids: out,
         resume: resume_out,
@@ -1235,14 +1246,25 @@ fn rollover<'a>(
     measure: bool,
     lists: &mut BTreeMap<String, Vec<crate::resume::FrozenList>>,
     airs_at: time::OffsetDateTime,
+    aired: &[String],
 ) -> Result<(), String> {
+    // What this generation has already laid is as aired as the channel's own
+    // tail by the time the rollover's visit plays, so the plugin ranks with
+    // it — otherwise the same rollover would rank differently depending on
+    // where a generation boundary happened to fall.
+    let mut inputs = score_env.inputs.clone();
+    inputs.recent.extend(aired.iter().cloned());
+    let env = crate::score::ScoreEnv {
+        inputs: &inputs,
+        base_dir: score_env.base_dir,
+    };
     let ids = resolve_pool_sources(
         catalog,
         std::slice::from_ref(cfg),
         groups,
         score_cache,
         &[dice],
-        score_env,
+        env,
         lists,
     )?
     .pop()
@@ -1538,12 +1560,10 @@ fn frozen_list<'l>(
     lists.get(pool)?.iter().find(|l| l.key == key)
 }
 
-/// How many periods' lists the sidecar keeps per pool: the current one, and
-/// the one before it for a rewind that lands just before a rollover.
-const KEPT_LISTS: usize = 2;
-
-/// Record a freshly ranked list as `pool`'s list under `key`, newest last,
-/// keeping [`KEPT_LISTS`].
+/// Record a freshly ranked list as `pool`'s list under `key`, newest last.
+/// Nothing is dropped here: a generation can cross several rollovers, and
+/// each list stays for as long as a checkpoint can rewind to it — see
+/// [`crate::resume::ResumeMap::prune_lists`].
 fn store_frozen_list(
     lists: &mut BTreeMap<String, Vec<crate::resume::FrozenList>>,
     pool: &str,
@@ -1569,8 +1589,6 @@ fn store_frozen_list(
             })
             .collect(),
     });
-    let excess = kept.len().saturating_sub(KEPT_LISTS);
-    kept.drain(..excess);
 }
 
 /// Every pool's *candidate* entry-id list, for the generation fingerprint
@@ -2125,7 +2143,12 @@ fn pool_runtime<'a>(
             // A list key that differs from the one `next` was recorded under
             // is a rollover; anything else (the same period, or nothing that
             // rotates) continues from `next` exactly as it always did.
-            Some(p) if p.list != rt.list_key && rt.list_key.is_some() => rt.open_after_rollover(p),
+            // A record with no key was written while nothing rotated (or
+            // before rotation existed): `next` still names a place in the
+            // same ranking, so it is continued, not treated as a new list.
+            Some(p) if p.list.is_some() && p.list != rt.list_key && rt.list_key.is_some() => {
+                rt.open_after_rollover(p)
+            }
             Some(p) => {
                 rt.lap = p.lap.iter().cloned().collect();
                 if let Some(next) = p.next.as_ref()
@@ -4902,5 +4925,73 @@ fn audit(ctx, picks, workspace) { #{} }
             "a full lap clears, so the new day opens on its top"
         );
         assert_eq!(built.ids[25], day2.ids[1]);
+    }
+
+    /// A sidecar written before rotation existed (or while nothing rotated)
+    /// carries no list key. Its `next` still names a place in the same
+    /// ranking, so the first rotating generation continues there rather than
+    /// reading the missing key as a rollover and reopening at the top.
+    #[test]
+    fn a_record_with_no_list_key_continues_at_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = restless_pool(dir.path());
+        let variety = crate::variety::Variety::for_test(Some(every(2)), None);
+        let mut state = GenerationState::empty();
+        state.resume.pools.insert(
+            "movies".into(),
+            PoolResume {
+                next: Some("film-07".into()),
+                ..Default::default()
+            },
+        );
+        let built = build(
+            &film_catalog(),
+            std::slice::from_ref(&pool),
+            &[],
+            &[step("movies", 1)],
+            Some(1),
+            None,
+            &state,
+            &variety,
+            time::macros::datetime!(2026-01-01 00:00 UTC),
+            test_env(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(built.ids, vec!["film-07"]);
+    }
+
+    /// A block hands back only its own pools' lists: the resolver merges
+    /// every block's by pool name, so a stale copy of another block's entry
+    /// would overwrite what that block just ranked.
+    #[test]
+    fn a_block_returns_only_its_own_pools_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = restless_pool(dir.path());
+        let variety = crate::variety::Variety::for_test(Some(every(2)), None);
+        let mut state = GenerationState::empty();
+        state.resume.lists.insert(
+            "another-blocks-pool".into(),
+            vec![crate::resume::FrozenList {
+                key: "stale".into(),
+                ids: vec!["film-01".into()],
+                extras: BTreeMap::new(),
+            }],
+        );
+        let built = build(
+            &film_catalog(),
+            std::slice::from_ref(&pool),
+            &[],
+            &[step("movies", 1)],
+            Some(1),
+            None,
+            &state,
+            &variety,
+            time::macros::datetime!(2026-01-01 00:00 UTC),
+            test_env(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(built.lists.keys().collect::<Vec<_>>(), vec!["movies"]);
     }
 }
