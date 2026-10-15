@@ -947,3 +947,128 @@ fn block_card_can_ignore_an_unlabelled_previous_item() {
         "a different label still announces",
     );
 }
+
+/// The rating badge as it ships: eleven layers, one per rating, in the order the
+/// script addresses them. Placeholder boxes stand in for the PNGs; what is under
+/// test is which one the script shows and when.
+fn rating_badge_engine() -> RhaiEngine {
+    let mut engine = RhaiEngine::new(
+        (0..11)
+            .map(|_| OverlayKind::Watermark {
+                corner: Corner::TopRight,
+                margin: 32,
+                box_size: 56,
+                color: [255, 255, 255, 255],
+            })
+            .collect(),
+    );
+    engine
+        .load_script(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/appdata/shared/rating-badge.rhai"),
+        )
+        .unwrap();
+    engine
+}
+
+fn rated(rating: &str, elapsed: f64) -> ProgramContext {
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Anything".into();
+    ctx.content_rating = rating.into();
+    ctx.item_elapsed = elapsed;
+    ctx
+}
+
+/// Which layer is up, by index, or `None`.
+fn badge_shown(engine: &RhaiEngine, ctx: &ProgramContext) -> Option<usize> {
+    let up: Vec<usize> = engine
+        .evaluate(0.0, 0, ctx)
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.visible)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(up.len() <= 1, "at most one badge at a time, got {up:?}");
+    up.first().copied()
+}
+
+#[test]
+fn rating_badge_shows_the_layer_for_the_items_rating() {
+    let engine = rating_badge_engine();
+    for (rating, index) in [
+        ("TV-Y", 0),
+        ("TV-14", 4),
+        ("TV-MA", 5),
+        ("G", 6),
+        ("PG-13", 8),
+        ("R", 9),
+        ("NC-17", 10),
+    ] {
+        assert_eq!(
+            badge_shown(&engine, &rated(rating, 5.0)),
+            Some(index),
+            "{rating}"
+        );
+    }
+}
+
+/// A rating we have no art for draws nothing rather than a wrong badge, and a
+/// country prefix is stripped before comparing.
+#[test]
+fn rating_badge_ignores_ratings_it_has_no_art_for() {
+    let engine = rating_badge_engine();
+    for rating in ["", "Not Rated", "Approved", "16+", "gb/15", "TV-Z"] {
+        assert_eq!(
+            badge_shown(&engine, &rated(rating, 5.0)),
+            None,
+            "{rating:?}"
+        );
+    }
+    assert_eq!(badge_shown(&engine, &rated("us/tv-ma", 5.0)), Some(5));
+    assert_eq!(badge_shown(&engine, &rated(" R ", 5.0)), Some(9));
+}
+
+/// Fade in over 0.5s, hold 15s, fade out over 0.8s from the item's start, then
+/// gone until the item ends; an unknown elapsed time draws nothing.
+#[test]
+fn rating_badge_fades_in_holds_and_leaves_at_the_start_of_the_item() {
+    let engine = rating_badge_engine();
+    let opacity = |t: f64| {
+        let state = engine.evaluate(0.0, 0, &rated("R", t));
+        (state.layers[9].visible, state.layers[9].opacity)
+    };
+    assert!(!opacity(-1.0).0);
+    let (_, half) = opacity(0.25);
+    assert!(half > 0.4 && half < 0.6, "mid fade-in, got {half}");
+    assert_eq!(opacity(8.0), (true, 1.0));
+    let (_, out) = opacity(15.9);
+    assert!(out > 0.0 && out < 1.0, "mid fade-out, got {out}");
+    assert!(!opacity(17.0).0);
+    assert!(!opacity(600.0).0, "no repeat unless asked for");
+}
+
+#[test]
+fn rating_badge_repeats_when_asked_to() {
+    let mut engine = RhaiEngine::with_config(
+        (0..11)
+            .map(|_| OverlayKind::Watermark {
+                corner: Corner::TopRight,
+                margin: 32,
+                box_size: 56,
+                color: [255, 255, 255, 255],
+            })
+            .collect(),
+        Some(&serde_json::json!({ "repeat_secs": 600.0 })),
+    );
+    engine
+        .load_script(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/appdata/shared/rating-badge.rhai"),
+        )
+        .unwrap();
+    let up = |t: f64| engine.evaluate(0.0, 0, &rated("R", t)).layers[9].visible;
+    assert!(up(5.0));
+    assert!(!up(300.0));
+    assert!(up(605.0), "back 600s later");
+}

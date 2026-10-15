@@ -264,6 +264,8 @@ impl RhaiEngine {
         scope.push_constant("season", program.season);
         scope.push_constant("episode", program.episode);
         scope.push_constant("year", program.year);
+        // The item's catalog rating, verbatim ("TV-MA", "PG-13"), "" when none.
+        scope.push_constant("content_rating", program.content_rating.clone());
         scope.push_constant("next_title", program.next_title.clone());
         scope.push_constant("next_sub_title", program.next_sub_title.clone());
         scope.push_constant("next_season", program.next_season);

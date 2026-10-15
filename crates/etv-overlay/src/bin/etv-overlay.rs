@@ -118,6 +118,9 @@ struct PreviewProgram {
     episode: i64,
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     year: i64,
+    /// The `content_rating` constant, e.g. `TV-MA` or `PG-13`.
+    #[arg(long, default_value = "")]
+    content_rating: String,
     #[arg(long, default_value = "")]
     next_title: String,
     #[arg(long, default_value = "")]
@@ -170,6 +173,9 @@ struct DumpTextProgram {
     episode: i64,
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     year: i64,
+    /// The `content_rating` constant, e.g. `TV-MA` or `PG-13`.
+    #[arg(long, default_value = "")]
+    content_rating: String,
     #[arg(long, default_value = "")]
     next_title: String,
     #[arg(long, default_value = "")]
@@ -373,6 +379,7 @@ fn program_context_for(p: PreviewProgram) -> ProgramContext {
         season: p.season,
         episode: p.episode,
         year: p.year,
+        content_rating: p.content_rating,
         next_title: p.next_title,
         next_sub_title: p.next_sub_title,
         next_season: p.next_season,
@@ -1039,6 +1046,7 @@ fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
         season: p.season,
         episode: p.episode,
         year: p.year,
+        content_rating: p.content_rating.clone(),
         next_title: p.next_title.clone(),
         next_sub_title: p.next_sub_title.clone(),
         next_season: p.next_season,
@@ -1268,6 +1276,7 @@ mod tests {
             season: -1,
             episode: -1,
             year: -1,
+            content_rating: String::new(),
             next_title: String::new(),
             next_sub_title: String::new(),
             next_season: -1,

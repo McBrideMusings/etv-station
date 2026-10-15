@@ -45,6 +45,12 @@ pub struct ProgramContext {
     /// Release / air year, or `-1` when absent. Present on films and episodes
     /// alike.
     pub year: i64,
+    /// The current item's content rating as the catalog holds it — an MPAA
+    /// code on a film (`R`, `PG-13`), a TV Parental Guideline on an episode
+    /// (`TV-MA`, `TV-14`) — or an empty string when the item has none. Passed
+    /// through as written: normalising it is the script's concern, since the
+    /// catalog also holds ratings from other schemes (`Approved`, `16+`).
+    pub content_rating: String,
     pub next_title: String,
     pub next_sub_title: String,
     /// The one-item lookahead's counterparts to [`Self::season`],
@@ -81,6 +87,7 @@ impl ProgramContext {
             season: -1,
             episode: -1,
             year: -1,
+            content_rating: String::new(),
             next_title: String::new(),
             next_sub_title: String::new(),
             next_season: -1,
@@ -139,6 +146,11 @@ struct ProgramRow {
     episode: Option<i64>,
     #[serde(default)]
     year: Option<i64>,
+    /// The catalog's rating for the item (`PlayoutItem::program`'s
+    /// `content_rating`), read here for the same reason `description` is:
+    /// the overlay parses the chunk files itself.
+    #[serde(default)]
+    content_rating: Option<String>,
 }
 
 /// Loads and caches the channel's chunked playout JSON. Call
@@ -309,6 +321,9 @@ fn context_from_rows(
         season: cur.season,
         episode: cur.episode,
         year: cur.year,
+        content_rating: now
+            .and_then(|p| p.content_rating.clone())
+            .unwrap_or_default(),
         next_title: nxt.title,
         next_sub_title: nxt.sub_title,
         next_season: nxt.season,
@@ -647,6 +662,36 @@ mod tests {
 
         let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
         assert!(ctx.metadata.is_null());
+    }
+
+    /// The catalog's rating rides in the item's `program` object and reaches
+    /// the script as written; an item without one reads as the empty string.
+    #[test]
+    fn content_rating_reaches_the_context_and_defaults_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(
+            dir.path(),
+            "1_2.json",
+            r#"{ "version": "t", "items": [
+                { "id": "a", "start": "2026-04-13T00:00:00Z", "finish": "2026-04-13T00:10:00Z",
+                  "program": { "title": "Rated", "content_rating": "TV-MA" } },
+                { "id": "b", "start": "2026-04-13T00:10:00Z", "finish": "2026-04-13T00:20:00Z",
+                  "program": { "title": "Unrated" } }
+            ] }"#,
+        );
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 00:05 UTC))
+                .content_rating,
+            "TV-MA"
+        );
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 00:15 UTC))
+                .content_rating,
+            ""
+        );
     }
 
     /// Two consecutive items, the second airing after a block change: the

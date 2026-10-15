@@ -858,7 +858,8 @@ Unknown keys are refused. A spec still written with top-level `script:`,
 draws nothing; move those three keys under a `graphics:` entry.
 
 **What a script can read.** `time`, `frame`, the current item's `title`,
-`sub_title`, `description`, `season`, `episode`, `year`, the `next_*`
+`sub_title`, `description`, `season`, `episode`, `year`, `content_rating`
+(the catalog's rating for the item, `""` when it has none), the `next_*`
 equivalents, `item_elapsed`, `item_remaining`, its own `config`, and the
 item's opaque blob as `metadata`. `prev_metadata` is the blob of the item that
 aired before it, so a script can notice a change between consecutive items;
@@ -958,6 +959,52 @@ only `films` is labelled, every film follows a bumper and draws the card. Set
 item; the card then does not land on a block that follows unlabelled
 programming, and the interval card is the only one there. Preview it with
 `METADATA='{"pool_label":"The Zombies Block"}' PREV_METADATA='{"pool_label":"The Kaiju Block"}' ITEM_ELAPSED=2 admin overlay-watch <channel>`.
+
+### Rating badge
+
+`deploy/appdata/shared/rating-badge.rhai` is a graphic on its own: it draws the
+airing item's content rating — the MPAA code on a film, the TV Parental
+Guideline on an episode — as the small boxed icon a broadcaster puts in a
+corner when a programme starts. It reads one thing, the `content_rating` the
+catalog took from Plex (already in each playout item's `program`), and knows
+nothing about any other graphic, so it layers with the snipe, the block card or
+a channel logo like any other entry in `graphics:`.
+
+It shows for the first 15s of each item (0.5s fade in, 0.8s out), and again
+every `repeat_secs` of a long item when that is set. It draws a badge for the
+eleven ratings it has art for and nothing for anything else — `Not Rated`,
+`Approved`, `16+`, or no rating at all. A country prefix (`us/TV-MA`) is
+ignored.
+
+```yaml
+graphics:
+  - name: rating-badge
+    script: shared/rating-badge.rhai
+    config:
+      hold_secs: 15          # all optional: hold_secs, fade_in_secs, fade_out_secs, repeat_secs
+    layers:                  # one image per rating, in exactly this order
+      - { type: image, path: shared/ratings/tv-y.png,  corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-y7.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-g.png,  corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-pg.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-14.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-ma.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/g.png,     corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/pg.png,    corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/pg-13.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/r.png,     corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/nc-17.png, corner: top_right, margin: 32, height: 56 }
+```
+
+The script addresses the eleven layers by index, so the order above is a
+contract. Move the badge by changing `corner` and `margin` on every layer; it
+sits top-right by default so it does not share a corner with the block card
+(top-left) or the snipe (bottom-left). The art is `deploy/appdata/shared/ratings/*.png`,
+drawn by `tools/make-rating-icons.sh` and committed; restyle it by editing that
+script and running it, or replace a PNG with any 8-bit RGBA image of the same
+name. The plates are plain boxes in the shape of the on-screen US icons, not the
+MPA's or the TV Parental Guidelines board's own artwork. Preview one with
+`etv-overlay render-still --content-rating TV-MA --item-elapsed 3`.
 
 ### Pool `plugin` — items chosen by a scorer script
 
