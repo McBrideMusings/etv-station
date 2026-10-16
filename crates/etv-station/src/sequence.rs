@@ -252,6 +252,11 @@ pub fn build(
                     name.clone(),
                     PoolResume {
                         next,
+                        // The key of the list this pool walked, so the stored
+                        // list survives `ResumeMap::prune_lists` and the next
+                        // generation in the period reads it instead of
+                        // re-ranking.
+                        list: dice[pool_idx].list_key(&pools[pool_idx]),
                         ..Default::default()
                     },
                 )

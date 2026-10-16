@@ -114,11 +114,11 @@ pub struct ResumeMap {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_id: Option<String>,
 
-    /// Each rotating plugin pool's ranked list for its current period, keyed
-    /// by pool name — the list the pool walks for the whole period, ranked
-    /// once when the period began (see [`FrozenList`]). At most the current
-    /// and the previous period's list per pool: the previous one is what a
-    /// rewind landing just before a rollover regenerates from.
+    /// Each rotating plugin pool's ranked lists, keyed by pool name — the
+    /// list a pool walks for a whole period, ranked once when the period
+    /// began (see [`FrozenList`]). A list stays while the current pool state
+    /// or any surviving checkpoint names its key, so a rewind regenerates
+    /// from the list it walked; [`Self::prune_lists`] drops the rest.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lists: BTreeMap<String, Vec<FrozenList>>,
 }
