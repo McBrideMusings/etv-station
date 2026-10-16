@@ -523,7 +523,10 @@ fn resolve_blocks(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    for (idx, include) in config.rule.blocks.iter_mut().enumerate() {
+    let labels: Vec<String> = (0..config.rule.all_blocks().count())
+        .map(|idx| config.rule.block_label(idx))
+        .collect();
+    for (label, include) in labels.iter().zip(config.rule.all_blocks_mut()) {
         // Exactly one of: a `block = "path"` reference, or an inline body.
         // Enforced here, before splicing clears the path reference.
         let has_path = include.block.is_some();
@@ -537,7 +540,7 @@ fn resolve_blocks(
                 return Err(ConfigError::Validation {
                     path: channel_path.to_path_buf(),
                     message: format!(
-                        "block #{idx} sets both a `block` path and inline fields; use exactly one"
+                        "{label} sets both a `block` path and inline fields; use exactly one"
                     ),
                 });
             }
@@ -545,7 +548,7 @@ fn resolve_blocks(
                 return Err(ConfigError::Validation {
                     path: channel_path.to_path_buf(),
                     message: format!(
-                        "block #{idx} has none of: a `block` path, `entries`, or `pools` + `pattern`"
+                        "{label} has none of: a `block` path, `entries`, or `pools` + `pattern`"
                     ),
                 });
             }

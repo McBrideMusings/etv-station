@@ -186,8 +186,8 @@ pub struct ScoreInputs {
     pub now: i64,
     /// The station's configured tz (ADR 0004) — how a `sequencer` block
     /// ([`crate::sequence`]) converts `ctx.window.from` and other unix-second
-    /// instants into the local weekday/hour/minute a daypart script places its
-    /// pools against. Unused by a `pool_provider` scorer, which reads no
+    /// instants into the local weekday/hour/minute, and how `rule.schedules`
+    /// read the local date and clock ([`crate::calendar`]). Unused by a `pool_provider` scorer, which reads no
     /// clock. `None` at the stateless entry points
     /// ([`crate::resolve::resolve_channel`], [`crate::determinism`]'s own
     /// snapshot before this field existed) falls back to UTC inside

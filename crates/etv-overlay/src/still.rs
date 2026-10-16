@@ -92,10 +92,10 @@ mod tests {
         let path = dir.join("s.rhai");
         std::fs::write(&path, script).unwrap();
         let mut spec = OverlaySpec::from_yaml_str(
-            "width: 64\nheight: 36\nframerate: 30\nlayers:\n  - type: text\n    content: \"\"\n",
+            "width: 64\nheight: 36\nframerate: 30\ngraphics:\n  - layers:\n      - type: text\n        content: \"\"\n",
         )
         .unwrap();
-        spec.script = Some(path);
+        spec.graphics[0].script = Some(path);
         spec
     }
 

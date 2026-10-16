@@ -7,7 +7,7 @@ use super::channel::{ChannelConfig, TasteScope};
 use super::constraints::{Constraints, NoRepeatWithin};
 use super::entry::Entry;
 use super::order::Order;
-use super::pool::{DatastoreGrant, Pool, Rotate, ShowGroup, Take, TakeFrom};
+use super::pool::{DatastoreGrant, PatternStep, Pool, Rotate, ShowGroup, Take, TakeFrom};
 use super::rule::BlockInclude;
 use super::station::StationConfig;
 use crate::errors::ConfigError;
@@ -165,10 +165,11 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     // reordered without a block index in the key.
     let mut pool_names: HashSet<&str> = HashSet::new();
 
-    for (idx, include) in channel.rule.blocks.iter().enumerate() {
+    for (idx, include) in channel.rule.all_blocks().enumerate() {
+        let label = channel.rule.block_label(idx);
         let bad = |message: String| ConfigError::Validation {
             path: path.to_path_buf(),
-            message: format!("block #{idx}: {message}"),
+            message: format!("{label}: {message}"),
         };
 
         // Checked before the pattern/entries split: `[constraints]` applies to
@@ -177,12 +178,12 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         // rule over the block's own list, but it has to be a legal table either
         // way — an inherited nonsense value is still nonsense.
         validate_constraints(&include.constraints(), &bad)?;
-        validate_guide(path, &format!("block #{idx}"), include.guide())?;
-        validate_tracks(path, &format!("block #{idx}"), include.tracks())?;
+        validate_guide(path, &label, include.guide())?;
+        validate_tracks(path, &label, include.tracks())?;
         for pool in &include.pools {
             validate_variety(
                 path,
-                &format!("block #{idx}: pool {:?}", pool.name),
+                &format!("{label}: pool {:?}", pool.name),
                 pool.seed.as_ref(),
                 pool.temperature.as_ref(),
             )?;
@@ -201,13 +202,13 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         if include.entries().is_empty() {
             return Err(ConfigError::Validation {
                 path: path.to_path_buf(),
-                message: format!("block #{idx} has no entries"),
+                message: format!("{label} has no entries"),
             });
         }
         if let Some(crate::config::Fallback::Item(item)) = include.fallback.as_ref() {
             validate_tracks(
                 path,
-                &format!("block #{idx}: fallback item"),
+                &format!("{label}: fallback item"),
                 item.tracks.as_ref(),
             )?;
         }
@@ -219,17 +220,19 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
             if let Entry::Item(item) = entry {
                 validate_guide(
                     path,
-                    &format!("block #{idx}: item #{entry_idx}"),
+                    &format!("{label}: item #{entry_idx}"),
                     item.guide.as_ref(),
                 )?;
                 validate_tracks(
                     path,
-                    &format!("block #{idx}: item #{entry_idx}"),
+                    &format!("{label}: item #{entry_idx}"),
                     item.tracks.as_ref(),
                 )?;
             }
         }
     }
+
+    validate_schedules(path, &channel.rule)?;
 
     Ok(())
 }
@@ -507,56 +510,7 @@ fn validate_pattern_block<'a>(
 
     let local = validate_block_pools(&include.pools, pool_names, channel_groups, base_dir, &bad)?;
 
-    for (step_idx, step) in include.pattern.iter().enumerate() {
-        if !local.contains(step.pool.as_str()) {
-            return Err(bad(format!(
-                "pattern step #{step_idx} names pool {:?}, which this block does not declare",
-                step.pool
-            )));
-        }
-        if let Take::Count(n) = step.take {
-            if n == 0 {
-                return Err(bad(format!("pattern step #{step_idx} has take = 0")));
-            }
-            if n > MAX_TAKE {
-                return Err(bad(format!(
-                    "pattern step #{step_idx} has take = {n}, which exceeds the maximum of \
-                     {MAX_TAKE}"
-                )));
-            }
-        }
-        // `all` empties the bucket the visit picked, and `rotate = "slot"` picks
-        // a new bucket for every single item — so there is no one bucket for
-        // `all` to mean. Refuse the pair rather than pick a reading.
-        if step.take == Take::All
-            && let Some(pool) = include.pools.iter().find(|p| p.name == step.pool)
-            && pool.rotate == Rotate::Slot
-        {
-            return Err(bad(format!(
-                "pattern step #{step_idx} has take = \"all\" but pool {:?} sets \
-                 rotate = \"slot\", which changes series every item — \"all\" has \
-                 no single series to empty. Use rotate = \"visit\", or an explicit count",
-                step.pool
-            )));
-        }
-        // `all` empties the series whatever the cut position, so a `from` beside
-        // it is a line the author wrote that does nothing. Refused on the same
-        // grounds as a constraint that would not constrain.
-        if step.take == Take::All && step.from != TakeFrom::Start {
-            return Err(bad(format!(
-                "pattern step #{step_idx} has take = \"all\" and from = {:?} — \
-                 \"all\" empties the series, so there is no slice to move. Drop \
-                 one of the two",
-                step.from
-            )));
-        }
-        if !(0.0..=1.0).contains(&step.chance) {
-            return Err(bad(format!(
-                "pattern step #{step_idx} has chance = {}, outside 0.0–1.0",
-                step.chance
-            )));
-        }
-    }
+    validate_steps("pattern", &include.pattern, include, &local, &bad)?;
 
     // A take-all step and adjacency constraints cannot share a block.
     //
@@ -588,6 +542,69 @@ fn validate_pattern_block<'a>(
                  `constraints` — how much airtime a take-all step lays is not known \
                  until its pool is resolved, so the generation seam cannot be sized \
                  for it. Drop the constraints, or give every step an explicit count",
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// The per-step checks every `pattern` gets. `label` names the pattern, so the
+/// error says where to look.
+fn validate_steps(
+    label: &str,
+    steps: &[PatternStep],
+    include: &BlockInclude,
+    local: &HashSet<&str>,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    for (step_idx, step) in steps.iter().enumerate() {
+        if !local.contains(step.pool.as_str()) {
+            return Err(bad(format!(
+                "{label} step #{step_idx} names pool {:?}, which this block does not declare",
+                step.pool
+            )));
+        }
+        if let Some((min, max)) = step.take.bounds() {
+            if min == 0 {
+                return Err(bad(format!("{label} step #{step_idx} has take = 0")));
+            }
+            if max > MAX_TAKE {
+                return Err(bad(format!(
+                    "{label} step #{step_idx} has take = {max}, which exceeds the maximum of \
+                     {MAX_TAKE}"
+                )));
+            }
+        }
+        // `all` empties the bucket the visit picked, and `rotate = "slot"` picks
+        // a new bucket for every single item — so there is no one bucket for
+        // `all` to mean. Refuse the pair rather than pick a reading.
+        if step.take == Take::All
+            && let Some(pool) = include.pools.iter().find(|p| p.name == step.pool)
+            && pool.rotate == Rotate::Slot
+        {
+            return Err(bad(format!(
+                "{label} step #{step_idx} has take = \"all\" but pool {:?} sets \
+                 rotate = \"slot\", which changes series every item — \"all\" has \
+                 no single series to empty. Use rotate = \"visit\", or an explicit count",
+                step.pool
+            )));
+        }
+        // `all` empties the series whatever the cut position, so a `from` beside
+        // it is a line the author wrote that does nothing. Refused on the same
+        // grounds as a constraint that would not constrain.
+        if step.take == Take::All && step.from != TakeFrom::Start {
+            return Err(bad(format!(
+                "{label} step #{step_idx} has take = \"all\" and from = {:?} — \
+                 \"all\" empties the series, so there is no slice to move. Drop \
+                 one of the two",
+                step.from
+            )));
+        }
+        if !(0.0..=1.0).contains(&step.chance) {
+            return Err(bad(format!(
+                "{label} step #{step_idx} has chance = {}, outside 0.0–1.0",
+                step.chance
             )));
         }
     }
@@ -695,6 +712,28 @@ fn validate_block_pools<'a>(
     for pool in pools {
         if pool.name.trim().is_empty() {
             return Err(bad("a pool has an empty name".into()));
+        }
+        if pool.label.as_ref().is_some_and(|l| l.trim().is_empty()) {
+            return Err(bad(format!(
+                "pool {:?} has a blank `label` — it would draw an empty block card; \
+                 name the block or drop the key",
+                pool.name
+            )));
+        }
+        if let Some(advisory) = &pool.advisory {
+            if advisory.trim().is_empty() {
+                return Err(bad(format!(
+                    "pool {:?} has a blank `advisory` — drop the key for no warning",
+                    pool.name
+                )));
+            }
+            if pool.label.is_none() {
+                return Err(bad(format!(
+                    "pool {:?} sets `advisory` without a `label` — the warning shows on the \
+                     block's card, so the block needs a name",
+                    pool.name
+                )));
+            }
         }
         // A pool names exactly one source of items. Two is ambiguous about
         // which one wins; none leaves the pool with nothing to resolve.
@@ -1142,6 +1181,74 @@ fn validate_pool_groups(
     Ok(())
 }
 
+/// `rule.schedules` and `rule.slots` (ADR 0004): every schedule names
+/// itself uniquely, places at least one range, places only slots that exist,
+/// and never places two slots over the same minute; every slot is placed by
+/// some schedule, since an unplaced one would never air. No block on such a
+/// channel authors `cycles`: an authored count overrides `fill`, which is
+/// where a generation stops at the next schedule boundary.
+fn validate_schedules(path: &Path, rule: &super::RuleConfig) -> Result<(), ConfigError> {
+    let bad = |message: String| ConfigError::Validation {
+        path: path.to_path_buf(),
+        message,
+    };
+    if !rule.schedules.is_empty()
+        && let Some(idx) = rule.all_blocks().position(|b| b.cycles.is_some())
+    {
+        return Err(bad(format!(
+            "{} sets `cycles`, which would run it past the next schedule boundary; \
+             a channel with `rule.schedules` bounds every block by the schedule instead",
+            rule.block_label(idx)
+        )));
+    }
+    let mut names: HashSet<&str> = HashSet::new();
+    let mut placed: HashSet<&str> = HashSet::new();
+    for (idx, schedule) in rule.schedules.iter().enumerate() {
+        if schedule.name.trim().is_empty() {
+            return Err(bad(format!("schedule #{idx} has no name")));
+        }
+        let label = format!("schedule {:?}", schedule.name);
+        if !names.insert(schedule.name.as_str()) {
+            return Err(bad(format!("{label} is declared twice")));
+        }
+        if schedule.hours.is_empty() {
+            return Err(bad(format!(
+                "{label} places no hours; give it `hours: {{\"20..23\": <slot>}}`"
+            )));
+        }
+        for slot in schedule.hours.values() {
+            if !rule.slots.contains_key(slot) {
+                return Err(bad(format!(
+                    "{label} places slot {slot:?}, which `rule.slots` does not declare"
+                )));
+            }
+            placed.insert(slot.as_str());
+        }
+        let ranges: Vec<_> = schedule.hours.keys().collect();
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                let overlap = a
+                    .spans()
+                    .iter()
+                    .any(|&(s1, e1)| b.spans().iter().any(|&(s2, e2)| s1 < e2 && s2 < e1));
+                if overlap {
+                    return Err(bad(format!(
+                        "{label} places {a} and {b}, which overlap; a minute airs one slot"
+                    )));
+                }
+            }
+        }
+    }
+    for name in rule.slots.keys() {
+        if !placed.contains(name.as_str()) {
+            return Err(bad(format!(
+                "slot {name:?} is placed by no schedule, so it would never air"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,6 +1302,8 @@ mod tests {
             seed: None,
             temperature: None,
             tracks: None,
+            label: None,
+            advisory: None,
             name: name.into(),
             expr: Some(format!("item.type == \"{name}\"")),
             plugin: None,
@@ -1266,7 +1375,10 @@ mod tests {
             retention_days: 1,
             seed: None,
             anchor: None,
-            rule: RuleConfig { blocks },
+            rule: RuleConfig {
+                blocks,
+                ..Default::default()
+            },
             groups: Vec::new(),
             overlay: None,
             annotate: None,
@@ -1282,6 +1394,36 @@ mod tests {
             ..Default::default()
         });
         c
+    }
+
+    /// A pool's `label`/`advisory` are checked at load: a blank one would draw an
+    /// empty card, and a warning with no block named has no card to ride on.
+    #[test]
+    fn rejects_a_blank_label_a_blank_advisory_and_an_advisory_without_a_label() {
+        let check = |label: Option<&str>, advisory: Option<&str>| {
+            let mut p = pool("movies");
+            p.label = label.map(str::to_string);
+            p.advisory = advisory.map(str::to_string);
+            let c = channel_with(vec![pattern_block(vec![p], vec![step("movies", 1)])]);
+            validate_channel(&dummy_path(), &c).map_err(|e| format!("{e}"))
+        };
+        assert!(check(Some("Zombies"), Some("Gore")).is_ok());
+        assert!(check(None, None).is_ok());
+        assert!(
+            check(Some("  "), None)
+                .unwrap_err()
+                .contains("blank `label`")
+        );
+        assert!(
+            check(Some("Zombies"), Some(""))
+                .unwrap_err()
+                .contains("blank `advisory`")
+        );
+        assert!(
+            check(None, Some("Gore"))
+                .unwrap_err()
+                .contains("without a `label`")
+        );
     }
 
     /// The silent failure this rule exists to stop: `single_user` with nobody
@@ -1594,6 +1736,26 @@ mod tests {
             vec![step("movies", 2), step("shows", 3)],
         );
         assert_eq!(channel_with(vec![block]).adjacency_reach(), 15);
+    }
+
+    /// A range sizes the seam for the widest cycle: the cycle at its longest
+    /// (2 movies + up to 4 shows = 6) times the cycles the constrained pool
+    /// needs at its fewest draws (5 reach / 2 movies = 3 cycles) is 18.
+    #[test]
+    fn adjacency_reach_sizes_a_take_range_at_its_widest() {
+        let mut movies = pool("movies");
+        movies.constraints = Some(crate::config::Constraints {
+            no_repeat_within: Some(NoRepeatWithin::Positions(5)),
+            separate_by: None,
+            separate_min_gap: None,
+        });
+        let mut shows_step = step("shows", 3);
+        shows_step.take = Take::Range { min: 2, max: 4 };
+        let block = pattern_block(
+            vec![movies, pool("shows")],
+            vec![step("movies", 2), shows_step],
+        );
+        assert_eq!(channel_with(vec![block]).adjacency_reach(), 18);
     }
 
     /// A pattern block's own `[constraints]` is the default its pools inherit,
@@ -1993,6 +2155,23 @@ mod tests {
         let b = pattern_block(vec![pool("movies")], vec![step("movies", MAX_TAKE + 1)]);
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(format!("{err}").contains("maximum"), "err = {err}");
+    }
+
+    /// A range is held to the same bounds as a count: its top may not pass the
+    /// maximum and its bottom may not be zero.
+    #[test]
+    fn rejects_a_take_range_with_a_zero_floor_or_a_top_past_the_maximum() {
+        let ranged = |min, max| {
+            let mut s = step("movies", 1);
+            s.take = Take::Range { min, max };
+            pattern_block(vec![pool("movies")], vec![s])
+        };
+        let err = validate_channel(&dummy_path(), &channel_with(vec![ranged(0, 3)])).unwrap_err();
+        assert!(format!("{err}").contains("take = 0"), "err = {err}");
+        let err = validate_channel(&dummy_path(), &channel_with(vec![ranged(2, MAX_TAKE + 1)]))
+            .unwrap_err();
+        assert!(format!("{err}").contains("maximum"), "err = {err}");
+        assert!(validate_channel(&dummy_path(), &channel_with(vec![ranged(2, 4)])).is_ok());
     }
 
     /// `all` empties the series a visit picked; `rotate = "slot"` picks a new

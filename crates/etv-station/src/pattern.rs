@@ -120,6 +120,10 @@ const REROLL_STRIDE: u64 = 1 << 32;
 /// uses and the reroll band above it, so one decision never doubles as another.
 const FROM_STRIDE: u64 = 1 << 48;
 
+/// Keeps a `take` range's size roll clear of every nonce above, for the same
+/// reason: the visit's size is its own decision, not a reuse of another's.
+const TAKE_STRIDE: u64 = 1 << 56;
+
 /// One series inside a pool: a show's episodes, one season of them, or a single
 /// movie.
 ///
@@ -478,6 +482,15 @@ impl PoolRuntime<'_> {
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
     fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Result<Vec<String>, String> {
+        // A range is decided once per visit, here, so a `rotate = "slot"` visit
+        // sizes its slots from the same roll a `rotate = "visit"` draw does.
+        let take = match take {
+            Take::Range { min, max } => {
+                let spread = (max.saturating_sub(min) + 1) as u64;
+                Take::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
+            }
+            fixed => fixed,
+        };
         if take == Take::Count(0) || self.is_dry() {
             return Ok(Vec::new());
         }
@@ -491,7 +504,7 @@ impl PoolRuntime<'_> {
             // so the one item each slot asks for was never the step's own
             // `take`.
             Rotate::Slot => {
-                let n = take.count().unwrap_or(1);
+                let n = take.bounds().map_or(1, |(n, _)| n);
                 if n > MAX_TAKE {
                     return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
                 }
@@ -539,6 +552,7 @@ impl PoolRuntime<'_> {
         let take = match (override_take, want, first) {
             (Some(n), _, _) => n,
             (None, Take::Count(n), _) => n,
+            (None, Take::Range { .. }, _) => unreachable!("visit resolves a range to a count"),
             (None, Take::All, Some(si)) => self.series[si].remaining(),
             (None, Take::All, None) => return Ok(Vec::new()),
         };
@@ -961,6 +975,9 @@ pub fn build(
     // the record of the pool it actually aired from, not whichever of the two
     // a hash map happens to yield first.
     let mut drawn_by: HashMap<String, usize> = HashMap::new();
+    // Which pool drew each id, for the pools that carry a `label:`. Two pools
+    // drawing one id collide here on the same terms as `guide_out` above.
+    let mut labelled_by: HashMap<String, usize> = HashMap::new();
     let mut laid = Duration::ZERO;
     // Where this block's cycle count stands, carried across generations so the
     // rolls below keep moving. Restarting at 0 each generation replayed cycle
@@ -1070,6 +1087,11 @@ pub fn build(
             if let Some(tracks) = &runtimes[idx].cfg.tracks {
                 for id in &drawn {
                     tracks_out.insert(id.clone(), tracks.clone());
+                }
+            }
+            if runtimes[idx].cfg.label.is_some() {
+                for id in &drawn {
+                    labelled_by.insert(id.clone(), idx);
                 }
             }
             // Every drawn id gets a `select` stage — the draw, which is a
@@ -1209,6 +1231,9 @@ pub fn build(
             }
         }
     }
+    for (id, idx) in labelled_by {
+        stamp_pool_display(&mut metadata_out, id, runtimes[idx].cfg);
+    }
     // Only this block's pools: the caller merges every block's lists by pool
     // name, and a copy of another block's entry here would overwrite what
     // that block just ranked.
@@ -1309,6 +1334,22 @@ fn pools_resume(runtimes: &[PoolRuntime], cycle: u64) -> BTreeMap<String, PoolRe
         .collect()
 }
 
+/// Write `pool`'s `label`/`advisory` into `id`'s metadata blob, creating the
+/// blob when the pool is not a plugin pool and attached none. Shared by the
+/// pattern walk and the sequencer build so the two cannot disagree about which
+/// keys an overlay script finds.
+pub(crate) fn stamp_pool_display(
+    metadata: &mut HashMap<String, serde_json::Value>,
+    id: String,
+    pool: &Pool,
+) {
+    let mut blob = metadata.remove(&id);
+    pool.stamp_display(&mut blob);
+    if let Some(blob) = blob {
+        metadata.insert(id, blob);
+    }
+}
+
 /// Append `staged`'s `audit` records onto `existing`'s, leaving every other
 /// key of both blobs alone.
 ///
@@ -1359,6 +1400,7 @@ fn pool_source(cfg: &Pool) -> String {
 fn describe_take(take: Take) -> String {
     match take {
         Take::Count(n) => n.to_string(),
+        Take::Range { min, max } => format!("{min}-{max}"),
         Take::All => "all".into(),
     }
 }
@@ -1854,6 +1896,9 @@ fn derive_cycles(
         if let Some(&i) = by_name.get(step.pool.as_str()) {
             match step.take {
                 Take::Count(n) => per_cycle[i] += n,
+                // The fewest a cycle can draw, so the ceiling on cycles holds
+                // however low every visit rolls.
+                Take::Range { min, .. } => per_cycle[i] += min,
                 Take::All => all_steps[i] += 1,
             }
         }
@@ -2346,6 +2391,8 @@ mod tests {
             seed: None,
             temperature: None,
             tracks: None,
+            label: None,
+            advisory: None,
             name: "movies".into(),
             expr: Some("item.type == \"movie\"".into()),
             plugin: None,
@@ -2374,6 +2421,8 @@ mod tests {
             seed: None,
             temperature: None,
             tracks: None,
+            label: None,
+            advisory: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
@@ -2406,6 +2455,8 @@ mod tests {
             seed: None,
             temperature: None,
             tracks: None,
+            label: None,
+            advisory: None,
             name: "movies".into(),
             expr: None,
             plugin: Some(script.to_path_buf()),
@@ -2501,6 +2552,8 @@ mod tests {
             seed: None,
             temperature: None,
             tracks: None,
+            label: None,
+            advisory: None,
             name: "shows".into(),
             expr: Some("item.type == \"episode\"".into()),
             plugin: None,
@@ -2808,6 +2861,8 @@ mod tests {
             seed: None,
             temperature: None,
             tracks: None,
+            label: None,
+            advisory: None,
             name: "rupaul".into(),
             expr: None,
             plugin: None,
@@ -3063,6 +3118,80 @@ mod tests {
                 tail,
             },
         )
+    }
+
+    /// A pool's `label:` and `advisory:` ride on every item it draws, under the
+    /// stable keys an overlay script reads, and only on that pool's items: the
+    /// interleaved unlabelled pool's draws carry neither key.
+    #[test]
+    fn a_labelled_pool_stamps_its_label_and_advisory_on_what_it_draws() {
+        let mut movies = movies_pool();
+        movies.label = Some("Kaiju".into());
+        movies.advisory = Some("Contains loud noises".into());
+        let mut shows = shows_pool();
+        shows.label = Some("Zombies".into());
+
+        let cat = catalog();
+        let built = build(
+            &cat,
+            &[movies, shows],
+            &[],
+            &[step("movies", 1), step("shows", 2)],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
+            test_env(),
+            None,
+        )
+        .expect("pattern builds");
+
+        let movie = built.ids.iter().find(|i| i.starts_with("mov-")).unwrap();
+        assert_eq!(built.metadata[movie]["pool_label"], "Kaiju");
+        assert_eq!(
+            built.metadata[movie]["pool_advisory"],
+            "Contains loud noises"
+        );
+        // The audit trail the walk already writes is still there beside it.
+        assert!(built.metadata[movie]["audit"].is_array());
+
+        let episodes: Vec<_> = built
+            .ids
+            .iter()
+            .filter(|i| !i.starts_with("mov-"))
+            .collect();
+        assert_eq!(episodes.len(), 2);
+        for ep in episodes {
+            assert_eq!(built.metadata[ep]["pool_label"], "Zombies");
+            assert!(
+                built.metadata[ep].get("pool_advisory").is_none(),
+                "a pool with no advisory writes no advisory key",
+            );
+        }
+    }
+
+    /// A pool with no `label:` leaves its items' metadata exactly as it was.
+    #[test]
+    fn an_unlabelled_pool_adds_no_display_keys() {
+        let cat = catalog();
+        let built = build(
+            &cat,
+            &[movies_pool()],
+            &[],
+            &[step("movies", 1)],
+            Some(1),
+            None,
+            &GenerationState::empty(),
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
+            test_env(),
+            None,
+        )
+        .expect("pattern builds");
+        let blob = &built.metadata[&built.ids[0]];
+        assert!(blob.get("pool_label").is_none());
+        assert!(blob.get("pool_advisory").is_none());
     }
 
     /// The headline acceptance criterion: `{movies take=1}, {shows take=3}`
@@ -3496,6 +3625,49 @@ mod tests {
         // movies pool alone, and the episodes that did air are a prefix of the
         // show order — a skip consumed no cursor.
         assert_eq!(a.iter().filter(|id| id.starts_with("mov-")).count(), 10);
+    }
+
+    /// A `take` range rolls its size per visit: every size in the range shows
+    /// up, none outside it does, and a pinned seed reproduces the sequence.
+    #[test]
+    fn take_range_varies_per_visit_and_a_pinned_seed_reproduces_it() {
+        let pattern = || {
+            vec![
+                step("movies", 1),
+                PatternStep {
+                    pool: "shows".into(),
+                    take: Take::Range { min: 2, max: 4 },
+                    from: TakeFrom::Start,
+                    chance: 1.0,
+                },
+            ]
+        };
+        let run = |seed| {
+            build_with(
+                vec![movies_pool(), shows_pool()],
+                pattern(),
+                Some(24),
+                &GenerationState::empty(),
+                seed,
+            )
+            .0
+        };
+        let a = run(7);
+        assert_eq!(a, run(7), "a pinned seed must reproduce the visit sizes");
+        // Episodes between two movies are one visit.
+        let mut sizes: Vec<usize> = Vec::new();
+        for id in &a {
+            if id.starts_with("mov-") {
+                sizes.push(0);
+            } else if let Some(last) = sizes.last_mut() {
+                *last += 1;
+            }
+        }
+        let mut seen: Vec<usize> = sizes.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, vec![2, 3, 4], "visit sizes were {sizes:?}");
+        assert_ne!(a, run(8), "a different seed should roll different sizes");
     }
 
     #[test]

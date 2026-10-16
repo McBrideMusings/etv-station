@@ -58,35 +58,44 @@ impl OverlayState {
             layers: states,
         }
     }
+
+    /// One frame from every graphic's resolved state, in declaration order.
+    /// Each graphic's own global `visible`/`opacity` (what a script returns
+    /// outside its `layers`) is folded into its layers first, so one graphic
+    /// blanking itself or fading cannot touch another's. Nothing graphics-wide
+    /// remains, so the combined `opacity` is 1.0.
+    pub fn combine(states: impl IntoIterator<Item = OverlayState>) -> Self {
+        let mut layers = Vec::new();
+        for state in states {
+            for mut layer in state.layers {
+                layer.visible &= state.visible;
+                layer.opacity *= state.opacity;
+                layers.push(layer);
+            }
+        }
+        Self {
+            visible: layers.iter().any(|l| l.visible),
+            opacity: 1.0,
+            layers,
+        }
+    }
 }
 
-pub struct RhaiEngine {
-    engine: Engine,
+/// One graphic at run time: its compiled script, the layers it drives, and the
+/// `config` its script reads.
+struct Graphic {
+    /// `None` for a static graphic, whose layers draw as declared.
     ast: Option<AST>,
     base_layers: Vec<OverlayKind>,
-    /// The spec's `config`, already converted. Held as a `Dynamic` rather than
-    /// as the carrier value because [`RhaiEngine::evaluate`] runs once per frame:
-    /// converting there would re-walk the whole table 30 times a second to
-    /// produce the same result. Cloning a `Dynamic` map is a refcount.
+    /// The graphic's `config`, already converted. Held as a `Dynamic` rather
+    /// than as the carrier value because [`RhaiEngine::evaluate`] runs once per
+    /// frame: converting there would re-walk the whole table 30 times a second
+    /// to produce the same result. Cloning a `Dynamic` map is a refcount.
     config: Dynamic,
 }
 
-impl RhaiEngine {
-    pub fn new(base_layers: Vec<OverlayKind>) -> Self {
-        Self::with_config(base_layers, None)
-    }
-
-    /// As [`RhaiEngine::new`], with the spec's opaque `config` table. Anything
-    /// that fails to convert is dropped to an empty map and warned about rather
-    /// than failing the render — an overlay is decoration over a channel that is
-    /// already on the air, so a bad config costs the decoration, not the stream.
-    pub fn with_config(base_layers: Vec<OverlayKind>, config: Option<&serde_json::Value>) -> Self {
-        let mut engine = Engine::new();
-        // Bound script complexity so a runaway script can't stall the per-frame
-        // render loop. 64 nesting / 50k ops is plenty for fade and blink curves
-        // but stops infinite loops at evaluation time.
-        engine.set_max_expr_depths(64, 64);
-        engine.set_max_operations(50_000);
+impl Graphic {
+    fn new(base_layers: Vec<OverlayKind>, config: Option<&serde_json::Value>) -> Self {
         let config = match config {
             Some(value) => rhai::serde::to_dynamic(value).unwrap_or_else(|e| {
                 tracing::warn!("overlay config is not representable in Rhai: {e}");
@@ -95,54 +104,112 @@ impl RhaiEngine {
             None => Dynamic::from_map(rhai::Map::new()),
         };
         Self {
-            engine,
             ast: None,
             base_layers,
             config,
         }
     }
+}
 
-    /// The engine for one loaded spec: its layers, its `config`, and its
+/// Every graphic of one overlay spec, evaluated against one shared Rhai engine.
+/// A graphic's script sees its own layers by index and its own `config`; the
+/// frame is the graphics' layers concatenated in declaration order.
+pub struct RhaiEngine {
+    engine: Engine,
+    graphics: Vec<Graphic>,
+}
+
+impl RhaiEngine {
+    /// An engine with one static graphic of `base_layers` — the shape a test or
+    /// a `clear`ed block wants. Spec-driven callers use [`Self::for_spec`].
+    pub fn new(base_layers: Vec<OverlayKind>) -> Self {
+        Self::with_config(base_layers, None)
+    }
+
+    /// As [`RhaiEngine::new`], with the graphic's opaque `config` table.
+    /// Anything that fails to convert is dropped to an empty map and warned
+    /// about rather than failing the render — an overlay is decoration over a
+    /// channel that is already on the air, so a bad config costs the
+    /// decoration, not the stream.
+    pub fn with_config(base_layers: Vec<OverlayKind>, config: Option<&serde_json::Value>) -> Self {
+        let mut engine = Self::bare();
+        engine.graphics.push(Graphic::new(base_layers, config));
+        engine
+    }
+
+    fn bare() -> Self {
+        let mut engine = Engine::new();
+        // Bound script complexity so a runaway script can't stall the per-frame
+        // render loop. 64 nesting / 50k ops is plenty for fade and blink curves
+        // but stops infinite loops at evaluation time. The budget is per
+        // script evaluation, so each graphic gets the whole of it.
+        engine.set_max_expr_depths(64, 64);
+        engine.set_max_operations(50_000);
+        Self {
+            engine,
+            graphics: Vec::new(),
+        }
+    }
+
+    /// The engine for one loaded spec: each graphic's layers, `config` and
     /// script compiled.
     pub fn for_spec(spec: &OverlaySpec) -> anyhow::Result<Self> {
-        let mut engine = Self::with_config(spec.layers.clone(), spec.config.as_ref());
-        if let Some(script) = &spec.script {
-            engine.load_script(script)?;
+        let mut engine = Self::bare();
+        for (i, graphic) in spec.graphics.iter().enumerate() {
+            engine.graphics.push(Graphic::new(
+                graphic.layers.clone(),
+                graphic.config.as_ref(),
+            ));
+            if let Some(script) = &graphic.script {
+                engine
+                    .load_script(script)
+                    .map_err(|e| match &graphic.name {
+                        Some(name) => anyhow::anyhow!("graphic {name:?}: {e}"),
+                        None => anyhow::anyhow!("graphic {i}: {e}"),
+                    })?;
+            }
         }
         Ok(engine)
     }
 
+    /// Compile `path` as the script of the most recently added graphic.
     pub fn load_script(&mut self, path: &Path) -> anyhow::Result<()> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read rhai script {}: {e}", path.display()))?;
         let ast = self
             .engine
             .compile(&source)
-            .map_err(|e| anyhow::anyhow!("compile rhai script: {e}"))?;
-        self.ast = Some(ast);
+            .map_err(|e| anyhow::anyhow!("compile rhai script {}: {e}", path.display()))?;
+        let graphic = self
+            .graphics
+            .last_mut()
+            .ok_or_else(|| anyhow::anyhow!("no graphic to attach a script to"))?;
+        graphic.ast = Some(ast);
         Ok(())
     }
 
-    /// Evaluate the script (if any) against the given frame time and program
+    /// Evaluate every graphic against the given frame time and program
     /// context. Returns the resolved per-frame state ready for the renderer.
     ///
-    /// A script error is warned and swallowed, falling back to the base
-    /// state — an overlay is decoration over a channel already on the air, so
-    /// a bad script must cost the decoration, not the stream. Use
-    /// [`Self::try_evaluate`] where a caller needs to see the error instead.
+    /// A script error is warned and swallowed, and that graphic falls back to
+    /// its base layers while the others still draw — an overlay is decoration
+    /// over a channel already on the air, so a bad script must cost the
+    /// decoration, not the stream. Use [`Self::try_evaluate`] where a caller
+    /// needs to see the error instead.
     pub fn evaluate(
         &self,
         time_seconds: f64,
         frame_index: u64,
         program: &ProgramContext,
     ) -> OverlayState {
-        match self.try_evaluate(time_seconds, frame_index, program) {
-            Ok(state) => state,
-            Err(e) => {
-                tracing::warn!("rhai script eval failed: {e}");
-                OverlayState::from_layers(self.base_layers.clone())
-            }
-        }
+        let states = self.graphics.iter().map(|graphic| {
+            self.evaluate_graphic(graphic, time_seconds, frame_index, program)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("rhai script eval failed: {e}");
+                    OverlayState::from_layers(graphic.base_layers.clone())
+                })
+        });
+        OverlayState::combine(states)
     }
 
     /// As [`Self::evaluate`], but surfaces a script evaluation error instead
@@ -155,8 +222,23 @@ impl RhaiEngine {
         frame_index: u64,
         program: &ProgramContext,
     ) -> Result<OverlayState, Box<rhai::EvalAltResult>> {
-        let mut state = OverlayState::from_layers(self.base_layers.clone());
-        let Some(ast) = self.ast.as_ref() else {
+        let states = self
+            .graphics
+            .iter()
+            .map(|graphic| self.evaluate_graphic(graphic, time_seconds, frame_index, program))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(OverlayState::combine(states))
+    }
+
+    fn evaluate_graphic(
+        &self,
+        graphic: &Graphic,
+        time_seconds: f64,
+        frame_index: u64,
+        program: &ProgramContext,
+    ) -> Result<OverlayState, Box<rhai::EvalAltResult>> {
+        let mut state = OverlayState::from_layers(graphic.base_layers.clone());
+        let Some(ast) = graphic.ast.as_ref() else {
             return Ok(state);
         };
 
@@ -165,7 +247,7 @@ impl RhaiEngine {
         // map rather than a missing constant, so a script can read
         // `config.whatever` unconditionally and get unit for anything unset —
         // which is also why a mistyped key is silent.
-        scope.push_constant("config", self.config.clone());
+        scope.push_constant("config", graphic.config.clone());
         scope.push_constant("time", time_seconds);
         scope.push_constant("frame", frame_index as i64);
         scope.push_constant("title", program.title.clone());
@@ -182,6 +264,8 @@ impl RhaiEngine {
         scope.push_constant("season", program.season);
         scope.push_constant("episode", program.episode);
         scope.push_constant("year", program.year);
+        // The item's catalog rating, verbatim ("TV-MA", "PG-13"), "" when none.
+        scope.push_constant("content_rating", program.content_rating.clone());
         scope.push_constant("next_title", program.next_title.clone());
         scope.push_constant("next_sub_title", program.next_sub_title.clone());
         scope.push_constant("next_season", program.next_season);
@@ -198,6 +282,15 @@ impl RhaiEngine {
             "metadata",
             rhai::serde::to_dynamic(&program.metadata).unwrap_or_else(|e| {
                 tracing::warn!("item metadata is not representable in Rhai: {e}");
+                Dynamic::UNIT
+            }),
+        );
+        // The item before the current one, for a script comparing two
+        // consecutive items. Same conversion and same opacity as `metadata`.
+        scope.push_constant(
+            "prev_metadata",
+            rhai::serde::to_dynamic(&program.prev_metadata).unwrap_or_else(|e| {
+                tracing::warn!("previous item metadata is not representable in Rhai: {e}");
                 Dynamic::UNIT
             }),
         );
@@ -408,9 +501,9 @@ fade:
         let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
         assert!(state.visible);
         assert!(
-            (state.opacity - 0.4).abs() < 1e-6,
+            (state.layers[0].opacity - 0.4).abs() < 1e-6,
             "the config value should reach the resolved state, got {}",
-            state.opacity
+            state.layers[0].opacity
         );
     }
 
@@ -422,7 +515,7 @@ fade:
             let cfg = yaml_config(&format!("opacity: {opacity}\n"));
             let mut engine = RhaiEngine::with_config(vec![watermark()], Some(&cfg));
             engine.load_script(script.path()).unwrap();
-            engine.evaluate(0.0, 0, &ProgramContext::unknown()).opacity
+            engine.evaluate(0.0, 0, &ProgramContext::unknown()).layers[0].opacity
         };
         assert!((render("0.25") - 0.25).abs() < 1e-6);
         assert!((render("0.75") - 0.75).abs() < 1e-6);
@@ -466,7 +559,7 @@ fade:
 
         let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
         assert!(
-            (state.opacity - 1.0).abs() < 1e-6,
+            (state.layers[0].opacity - 1.0).abs() < 1e-6,
             "the typo should read as unset and take the script's fallback"
         );
     }
@@ -485,13 +578,13 @@ fade:
 
         let s0 = engine.evaluate(0.0, 0, &ProgramContext::unknown());
         assert!(s0.visible);
-        assert!(s0.opacity.abs() < 1e-4);
+        assert!(s0.layers[0].opacity.abs() < 1e-4);
 
         let s5 = engine.evaluate(5.0, 150, &ProgramContext::unknown());
-        assert!((s5.opacity - 0.5).abs() < 1e-4);
+        assert!((s5.layers[0].opacity - 0.5).abs() < 1e-4);
 
         let s10 = engine.evaluate(10.0, 300, &ProgramContext::unknown());
-        assert!((s10.opacity - 1.0).abs() < 1e-4);
+        assert!((s10.layers[0].opacity - 1.0).abs() < 1e-4);
     }
 
     #[test]
@@ -652,5 +745,93 @@ fade:
         let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
         assert_eq!(state.layers.len(), 1);
         assert!(!state.layers[0].visible);
+    }
+
+    /// Two graphics in one spec: each script sees its own `config`, drives its
+    /// own layers by index from zero, and draws in declaration order, so adding
+    /// the second cannot re-target the first.
+    #[test]
+    fn graphics_are_independent_and_draw_in_declaration_order() {
+        let first = write_script(r#"#{ layers: [ #{ content: "first " + config.tag } ] }"#);
+        let second = write_script(r#"#{ layers: [ #{ content: "second " + config.tag } ] }"#);
+        let spec = |script: &tempfile::NamedTempFile, tag: &str| crate::overlay_spec::GraphicSpec {
+            script: Some(script.path().to_path_buf()),
+            config: Some(serde_json::json!({ "tag": tag })),
+            layers: vec![text("placeholder")],
+            ..Default::default()
+        };
+        let overlay = OverlaySpec {
+            width: 64,
+            height: 36,
+            framerate: 30,
+            pixel_format: Default::default(),
+            graphics: vec![spec(&first, "a"), spec(&second, "b")],
+        };
+        let engine = RhaiEngine::for_spec(&overlay).unwrap();
+        let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
+        let texts: Vec<_> = state
+            .layers
+            .iter()
+            .map(|l| match &l.kind {
+                OverlayKind::Text { content, .. } => content.clone(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(texts, ["first a", "second b"]);
+    }
+
+    /// One graphic hiding itself, or failing, leaves the others drawing: a
+    /// script's global `visible: false` is folded into its own layers only.
+    #[test]
+    fn one_graphic_blanking_or_failing_leaves_the_other_drawing() {
+        let hide = write_script(r#"#{ visible: false }"#);
+        let boom = write_script(r#"throw "boom";"#);
+        let graphic = |script: Option<&tempfile::NamedTempFile>| crate::overlay_spec::GraphicSpec {
+            script: script.map(|s| s.path().to_path_buf()),
+            layers: vec![watermark()],
+            ..Default::default()
+        };
+        let overlay = OverlaySpec {
+            width: 64,
+            height: 36,
+            framerate: 30,
+            pixel_format: Default::default(),
+            graphics: vec![graphic(Some(&hide)), graphic(Some(&boom)), graphic(None)],
+        };
+        let engine = RhaiEngine::for_spec(&overlay).unwrap();
+        let state = engine.evaluate(0.0, 0, &ProgramContext::unknown());
+        let visible: Vec<bool> = state.layers.iter().map(|l| l.visible).collect();
+        // Blanked; fell back to its base layers after the error; static.
+        assert_eq!(visible, [false, true, true]);
+        // `try_evaluate` still reports the failing script.
+        assert!(
+            engine
+                .try_evaluate(0.0, 0, &ProgramContext::unknown())
+                .is_err()
+        );
+    }
+
+    /// `prev_metadata` reaches the script as the previous item's blob, and as
+    /// unit when there is none — which `type_of` can tell from a map.
+    #[test]
+    fn script_reads_the_previous_items_metadata() {
+        let script = write_script(
+            r#"
+            let prev = if type_of(prev_metadata) == "map" { prev_metadata.pool_label } else { "none" };
+            #{ layers: [ #{ content: metadata.pool_label + " after " + prev } ] }
+            "#,
+        );
+        let mut engine = RhaiEngine::new(vec![text("placeholder")]);
+        engine.load_script(script.path()).unwrap();
+        let content = |ctx: &ProgramContext| match &engine.evaluate(0.0, 0, ctx).layers[0].kind {
+            OverlayKind::Text { content, .. } => content.clone(),
+            _ => panic!("expected text layer"),
+        };
+
+        let mut ctx = ProgramContext::unknown();
+        ctx.metadata = serde_json::json!({ "pool_label": "Zombies" });
+        assert_eq!(content(&ctx), "Zombies after none");
+        ctx.prev_metadata = serde_json::json!({ "pool_label": "Kaiju" });
+        assert_eq!(content(&ctx), "Zombies after Kaiju");
     }
 }

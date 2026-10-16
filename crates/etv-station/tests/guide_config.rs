@@ -35,7 +35,10 @@ fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> Channe
         retention_days: 1,
         seed: None,
         anchor: None,
-        rule: RuleConfig { blocks },
+        rule: RuleConfig {
+            blocks,
+            ..Default::default()
+        },
         groups: Vec::new(),
         overlay: None,
         annotate: None,
@@ -115,6 +118,8 @@ fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
         seed: None,
         temperature: None,
         tracks: None,
+        label: None,
+        advisory: None,
         name: name.into(),
         expr: Some(expr.into()),
         plugin: None,

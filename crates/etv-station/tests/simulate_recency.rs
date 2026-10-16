@@ -107,6 +107,8 @@ fn channel(plugin: &Path) -> ChannelConfig {
                     seed: None,
                     temperature: None,
                     tracks: None,
+                    label: None,
+                    advisory: None,
                     name: "movies".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),
@@ -137,6 +139,7 @@ fn channel(plugin: &Path) -> ChannelConfig {
                 cycles: None,
                 sequencer: None,
             }],
+            ..Default::default()
         },
     }
 }
@@ -154,7 +157,7 @@ fn history_carries_forward_so_no_title_repeats_before_every_title_has_aired() {
         None,
         4,
         datetime!(2026-01-01 00:00 UTC),
-        time_tz::timezones::db::UTC,
+        None,
     )
     .unwrap();
 
@@ -197,7 +200,7 @@ fn each_generation_is_asked_for_a_chunks_worth_of_items() {
         None,
         1,
         datetime!(2026-01-01 00:00 UTC),
-        time_tz::timezones::db::UTC,
+        None,
     )
     .unwrap();
 

@@ -65,7 +65,7 @@ use etv_station::config::{self, DatastoreGrant, Pool};
 use etv_station::profile::ProfileEntry;
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use etv_station::tautulli::{self, HistoryScope};
-use etv_station::tune_in_still::{MediaRemap, StillJpeg, TuneInStill, Unavailable};
+use etv_station::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
@@ -145,7 +145,7 @@ struct DiscoveredChannel {
 /// Every `pattern:` step across `channel`'s blocks, in block-then-pattern order.
 fn pattern_plan(channel: &config::ChannelConfig) -> Vec<PlanStep> {
     let mut out = Vec::new();
-    for (block_index, block) in channel.rule.blocks.iter().enumerate() {
+    for (block_index, block) in channel.rule.all_blocks().enumerate() {
         if !block.is_pattern() {
             continue;
         }
@@ -534,8 +534,8 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
         }
         let pool = channel
             .rule
-            .blocks
-            .get(step.block_index)
+            .all_blocks()
+            .nth(step.block_index)
             .and_then(|b| b.pools.iter().find(|p| p.name == step.pool_name))
             .ok_or_else(|| format!("pool {:?} vanished from its own block", step.pool_name))?;
         let working = build_pool_working(state, &channel_dir, pool, req.use_deployed_plugin)?;
@@ -919,7 +919,11 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
         .session
         .as_ref()
         .ok_or_else(|| "no channel selected".to_string())?;
-    let tz = station_tz(&state.review.station_path);
+    // The station's zone, so `rule.schedules` place slots on the local clock
+    // here as they do on air.
+    let tz = config::load_for_inspection(&state.review.station_path)
+        .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))
+        .and_then(|st| etv_station::tz::parse(&st.station.tz).map_err(|e| e.to_string()))?;
     let result = simulate_schedule(&state.catalog, session, tz);
     let session = state.session.as_mut().expect("checked above");
     match result {
@@ -945,15 +949,6 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
 /// block, a film is a "single". Pool and block come from the airing's own
 /// `select` audit stage and `block` index, not from a second reading of the
 /// pattern.
-/// The station's zone, so a rotating seed's periods fall where the daemon's
-/// do; UTC when the station file cannot be read or names no zone it knows.
-fn station_tz(station_path: &Path) -> &'static time_tz::Tz {
-    config::read_station(station_path)
-        .ok()
-        .and_then(|st| etv_station::tz::parse(&st.tz).ok())
-        .unwrap_or(time_tz::timezones::db::UTC)
-}
-
 fn simulate_schedule(
     catalog: &Catalog,
     session: &Session,
@@ -961,7 +956,7 @@ fn simulate_schedule(
 ) -> Result<Vec<Value>, String> {
     let mut config: config::ChannelConfig = serde_json::from_value(session.config_json.clone())
         .map_err(|e| format!("channel config: {e}"))?;
-    for block in &mut config.rule.blocks {
+    for block in config.rule.all_blocks_mut() {
         for pool in &mut block.pools {
             let Some(pw) = session.pools.get(&pool.name) else {
                 continue;
@@ -979,12 +974,12 @@ fn simulate_schedule(
     }
     let block_names: Vec<String> = config
         .rule
-        .blocks
-        .iter()
+        .all_blocks()
         .enumerate()
         .map(|(i, b)| {
             b.program()
                 .and_then(|p| p.title.clone())
+                .or_else(|| config.rule.slot_name(i).map(str::to_string))
                 .unwrap_or_else(|| format!("block {i}"))
         })
         .collect();
@@ -997,7 +992,7 @@ fn simulate_schedule(
         session.account_id,
         session.days,
         start,
-        tz,
+        Some(tz),
     )?;
 
     let mut out = Vec::new();
@@ -1494,18 +1489,18 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         account_id,
         days,
         start,
-        tz,
+        Some(tz),
     )?;
 
     let block_names: Vec<String> = lc
         .config
         .rule
-        .blocks
-        .iter()
+        .all_blocks()
         .enumerate()
         .map(|(i, b)| {
             b.program()
                 .and_then(|p| p.title.clone())
+                .or_else(|| lc.config.rule.slot_name(i).map(str::to_string))
                 .unwrap_or_else(|| format!("block {i}"))
         })
         .collect();
@@ -1536,6 +1531,8 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
                 .unwrap_or_else(|| "unknown".to_string()),
             show: entry.as_ref().and_then(|e| e.show.clone()),
             show_id: a.show_id.clone(),
+            season: entry.as_ref().and_then(|e| e.season),
+            episode: entry.as_ref().and_then(|e| e.episode),
             pool: drawn_from_pool(a.metadata.as_ref())
                 .unwrap_or_else(|| block_names.get(a.block).cloned().unwrap_or_default()),
             start: a.start,
@@ -1588,6 +1585,45 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         );
     }
 
+    // What the airing inspector shows beside each airing's audit trail: the
+    // catalog fields a pool reads, and a label for every item a trail names
+    // as passed over that never airs in the span (an aired one is labelled
+    // in `airings`), so the page never prints a bare entry id.
+    let ids: Vec<String> = airings.iter().map(|a| a.id.clone()).collect();
+    let genres = state
+        .catalog
+        .tags_for_many(&ids, TagNs::Genre)
+        .map_err(|e| e.to_string())?;
+    let directors = state
+        .catalog
+        .tags_for_many(&ids, TagNs::Director)
+        .map_err(|e| e.to_string())?;
+    let collections = state
+        .catalog
+        .collections_for_many(&ids)
+        .map_err(|e| e.to_string())?;
+    let audits: Vec<Value> = (0..airings.len())
+        .map(|i| etv_station::audit_report::split_audit(simulated[i].metadata.as_ref()).0)
+        .collect();
+    let passed_over: Vec<String> = audits
+        .iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|stage| stage["detail"]["near_misses"].as_array())
+        .flatten()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .filter(|id| !entries.contains_key(id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let titles: HashMap<String, String> = state
+        .catalog
+        .entries_for(&passed_over)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|(id, e)| (id.clone(), airing_label(e)))
+        .collect();
+
     let airings_json: Vec<Value> = airings
         .iter()
         .enumerate()
@@ -1608,6 +1644,12 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
                 "offset_secs": (a.start - start).whole_seconds(),
                 "duration_secs": a.duration.whole_seconds(),
                 "ranking": ranking_of(simulated[i].metadata.as_ref()),
+                "audit": audits[i],
+                "genres": genres.get(&a.id),
+                "collections": collections.get(&a.id),
+                "directors": directors.get(&a.id),
+                "content_rating": e.and_then(|e| e.content_rating.clone()),
+                "summary": e.and_then(|e| e.summary.clone()),
             })
         })
         .collect();
@@ -1630,6 +1672,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
     obj.insert("since_last".into(), json!(since_last_json));
     obj.insert("notices".into(), json!(notices));
     obj.insert("airings".into(), json!(airings_json));
+    obj.insert("titles".into(), json!(titles));
     obj.insert(
         "day_starts".into(),
         json!(
@@ -1654,46 +1697,72 @@ fn airing_label(e: &CatalogEntry) -> String {
     }
 }
 
-/// The channel's `rule.blocks` written out in words, one clause per block.
-fn pattern_in_words(channel: &config::ChannelConfig) -> String {
-    channel
+/// The channel's `rule.blocks` as the Review page lays them out: per block,
+/// its title and whichever of a daypart sequencer, pattern steps, an
+/// hour-switched schedule of patterns, a plain pool list or a fixed entry
+/// count drives it. A step's `take` is `[min, max]`, `null` for `take: all`.
+fn blocks_json(channel: &config::ChannelConfig) -> Value {
+    let blocks: Vec<Value> = channel
         .rule
-        .blocks
-        .iter()
+        .all_blocks()
         .enumerate()
         .map(|(i, b)| {
             let name = b
                 .program()
                 .and_then(|p| p.title.clone())
+                .or_else(|| channel.rule.slot_name(i).map(str::to_string))
                 .unwrap_or_else(|| format!("block {i}"));
-            let body = if let Some(seq) = &b.sequencer {
-                format!(
-                    "daypart sequencer {}",
-                    seq.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                )
-            } else if !b.pattern.is_empty() {
-                let steps: Vec<String> = b
-                    .pattern
-                    .iter()
-                    .map(|s| match s.take.count() {
-                        Some(1) => format!("1 from {}", s.pool),
-                        Some(n) => format!("{n} from {}", s.pool),
-                        None => format!("all of one {} pick", s.pool),
-                    })
-                    .collect();
-                format!("{}, repeating", steps.join(", then "))
-            } else if !b.pools.is_empty() {
-                let pools: Vec<&str> = b.pools.iter().map(|p| p.name.as_str()).collect();
-                format!("pools {}", pools.join(", "))
-            } else {
-                format!("{} fixed entries", b.entries().len())
-            };
-            format!("{name}: {body}")
+            json!({
+                "name": name,
+                "sequencer": b.sequencer.as_ref()
+                    .and_then(|s| s.file_name())
+                    .map(|n| n.to_string_lossy().into_owned()),
+                "steps": steps_json(&b.pattern),
+                "pools": b.pools.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                "entries": b.entries().len(),
+                "placed": placements(&channel.rule, i),
+            })
         })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .collect();
+    json!(blocks)
+}
+
+/// Where `rule.schedules` place block `idx`, one line per range: the
+/// schedule's name, its days, and the clock range. Empty for an any-time block.
+fn placements(rule: &config::RuleConfig, idx: usize) -> Vec<String> {
+    let Some(slot) = rule.slot_name(idx) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for schedule in &rule.schedules {
+        let mut days: Vec<String> = schedule.dates.iter().map(|d| String::from(*d)).collect();
+        days.extend(
+            schedule
+                .weekdays
+                .iter()
+                .map(|w| format!("{w:?}").to_lowercase()),
+        );
+        let days = if days.is_empty() {
+            "every day".to_string()
+        } else {
+            days.join(", ")
+        };
+        for (range, placed) in &schedule.hours {
+            if placed == slot {
+                out.push(format!("{}: {days}, {range}", schedule.name));
+            }
+        }
+    }
+    out
+}
+
+/// One pattern's steps: pool, `take` as `[min, max]` (`null` for `all`), and
+/// the step's `chance`.
+fn steps_json(steps: &[config::PatternStep]) -> Vec<Value> {
+    steps
+        .iter()
+        .map(|s| json!({ "pool": s.pool, "take": s.take.bounds(), "chance": s.chance }))
+        .collect()
 }
 
 /// One channel's candidate entry ids, resolved from its config with no
@@ -1903,8 +1972,11 @@ fn build_review(
             state,
             station,
             lc,
-            simulated[t.index],
-            simulated.get(t.index + 1).copied(),
+            Neighbours {
+                prev: t.index.checked_sub(1).map(|i| simulated[i]),
+                airing: simulated[t.index],
+                next: simulated.get(t.index + 1).copied(),
+            },
             t.into,
             n + 1,
         );
@@ -1926,6 +1998,45 @@ fn build_review(
         .len();
     let overlap = overlap_json(state, station, lc)?;
 
+    let random_order_pools: HashSet<String> = lc
+        .config
+        .rule
+        .blocks
+        .iter()
+        .flat_map(|b| &b.pools)
+        .filter(|p| matches!(p.order, Some(config::Order::Random)))
+        .map(|p| p.name.clone())
+        .collect();
+    let show_ids: Vec<String> = airings
+        .iter()
+        .filter_map(|a| a.show_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let episode_counts = state
+        .catalog
+        .episode_counts_for(&show_ids)
+        .map_err(|e| e.to_string())?;
+    let principles: Vec<Value> = review::grade_principles(&review::GradeInputs {
+        airings,
+        start,
+        end,
+        tz: etv_station::tz::parse(&station.station.tz).map_err(|e| e.to_string())?,
+        random_order_pools: &random_order_pools,
+        episode_counts: &episode_counts,
+    })
+    .into_iter()
+    .map(|p| {
+        json!({
+            "name": p.name,
+            "grade": p.grade,
+            "value": p.value,
+            "measure": p.measure,
+            "not_scored": p.not_scored,
+        })
+    })
+    .collect();
+
     Ok(json!({
         "channel": channel_key(&lc.config_path),
         "config_path": lc.config_path.display().to_string(),
@@ -1937,7 +2048,7 @@ fn build_review(
         "days": days.round() as u32,
         "start": start.unix_timestamp(),
         "end": end.unix_timestamp(),
-        "pattern": pattern_in_words(&lc.config),
+        "blocks": blocks_json(&lc.config),
         "first_repeat": first_repeat,
         "airtime": {
             "total_secs": total,
@@ -1948,6 +2059,7 @@ fn build_review(
         "items_aired": airings.len(),
         "distinct_items": distinct,
         "depth": depth,
+        "principles": principles,
         "overlap": overlap,
         "samples": samples,
     }))
@@ -1973,18 +2085,16 @@ fn offer_still(
     state: &mut AppState,
     station: &config::Station,
     lc: &config::LoadedChannel,
-    airing: &etv_station::simulate::SimulatedAiring,
-    next: Option<&etv_station::simulate::SimulatedAiring>,
+    at: Neighbours<'_>,
     into: time::Duration,
     n: usize,
 ) -> Value {
     let still = match TuneInStill::offer(
-        state.catalog.sources_for(&airing.id),
+        state.catalog.sources_for(&at.airing.id),
         &MediaRemap::from_env(),
         &lc.overlays,
         &station.station.normalization.video,
-        airing,
-        next,
+        at,
         into,
     ) {
         Ok(still) => still,
@@ -2000,7 +2110,7 @@ fn offer_still(
         .collect();
     let id = format!(
         "{channel}-s{}-n{n}-{}.jpg",
-        review_seed(station, lc, airing.start),
+        review_seed(station, lc, at.airing.start),
         still.digest()
     );
     state.review.stills.insert(id.clone(), still);

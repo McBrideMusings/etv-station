@@ -118,6 +118,9 @@ struct PreviewProgram {
     episode: i64,
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     year: i64,
+    /// The `content_rating` constant, e.g. `TV-MA` or `PG-13`.
+    #[arg(long, default_value = "")]
+    content_rating: String,
     #[arg(long, default_value = "")]
     next_title: String,
     #[arg(long, default_value = "")]
@@ -135,6 +138,18 @@ struct PreviewProgram {
     /// Seconds until the current item ends. See `--item-elapsed`.
     #[arg(long, default_value_t = -1.0, allow_negative_numbers = true)]
     item_remaining: f64,
+    /// The current item's `metadata` blob, as JSON — what a script reads as
+    /// `metadata`. For previewing a script that reads a station-written key
+    /// such as `pool_label`.
+    #[arg(long, value_parser = parse_json)]
+    metadata: Option<serde_json::Value>,
+    /// The previous item's `metadata`, as JSON — the script's `prev_metadata`.
+    #[arg(long, value_parser = parse_json)]
+    prev_metadata: Option<serde_json::Value>,
+}
+
+fn parse_json(raw: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(raw).map_err(|e| format!("not valid JSON: {e}"))
 }
 
 /// Program-context flags for `dump-text`. A near-twin of [`PreviewProgram`],
@@ -158,6 +173,9 @@ struct DumpTextProgram {
     episode: i64,
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     year: i64,
+    /// The `content_rating` constant, e.g. `TV-MA` or `PG-13`.
+    #[arg(long, default_value = "")]
+    content_rating: String,
     #[arg(long, default_value = "")]
     next_title: String,
     #[arg(long, default_value = "")]
@@ -168,6 +186,14 @@ struct DumpTextProgram {
     next_episode: i64,
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     next_year: i64,
+    /// The current item's `metadata` blob, as JSON — what a script reads as
+    /// `metadata`. For previewing a script that reads a station-written key
+    /// such as `pool_label`.
+    #[arg(long, value_parser = parse_json)]
+    metadata: Option<serde_json::Value>,
+    /// The previous item's `metadata`, as JSON — the script's `prev_metadata`.
+    #[arg(long, value_parser = parse_json)]
+    prev_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Subcommand)]
@@ -353,6 +379,7 @@ fn program_context_for(p: PreviewProgram) -> ProgramContext {
         season: p.season,
         episode: p.episode,
         year: p.year,
+        content_rating: p.content_rating,
         next_title: p.next_title,
         next_sub_title: p.next_sub_title,
         next_season: p.next_season,
@@ -360,7 +387,8 @@ fn program_context_for(p: PreviewProgram) -> ProgramContext {
         next_year: p.next_year,
         item_elapsed: p.item_elapsed,
         item_remaining: p.item_remaining,
-        metadata: serde_json::Value::Null,
+        metadata: p.metadata.unwrap_or(serde_json::Value::Null),
+        prev_metadata: p.prev_metadata.unwrap_or(serde_json::Value::Null),
     }
 }
 
@@ -1018,6 +1046,7 @@ fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
         season: p.season,
         episode: p.episode,
         year: p.year,
+        content_rating: p.content_rating.clone(),
         next_title: p.next_title.clone(),
         next_sub_title: p.next_sub_title.clone(),
         next_season: p.next_season,
@@ -1026,7 +1055,8 @@ fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
         // Overwritten per-sample in `collect_texts`.
         item_elapsed: -1.0,
         item_remaining: -1.0,
-        metadata: serde_json::Value::Null,
+        metadata: p.metadata.clone().unwrap_or(serde_json::Value::Null),
+        prev_metadata: p.prev_metadata.clone().unwrap_or(serde_json::Value::Null),
     }
 }
 
@@ -1246,11 +1276,14 @@ mod tests {
             season: -1,
             episode: -1,
             year: -1,
+            content_rating: String::new(),
             next_title: String::new(),
             next_sub_title: String::new(),
             next_season: -1,
             next_episode: -1,
             next_year: -1,
+            metadata: None,
+            prev_metadata: None,
         }
     }
 
@@ -1322,12 +1355,13 @@ width: 320
 height: 180
 framerate: 30
 pixel_format: rgba8
-layers:
-  - type: watermark
-    corner: top_right
-    margin: 16
-    box_size: 64
-    color: [220, 60, 60, 220]
+graphics:
+  - layers:
+      - type: watermark
+        corner: top_right
+        margin: 16
+        box_size: 64
+        color: [220, 60, 60, 220]
 "#,
         )
         .unwrap();
@@ -1351,11 +1385,12 @@ width: 320
 height: 180
 framerate: 30
 pixel_format: rgba8
-layers: []
+graphics:
+  - layers: []
 "#,
         )
         .unwrap();
-        spec.script = Some(file.path().to_path_buf());
+        spec.graphics[0].script = Some(file.path().to_path_buf());
 
         let err = collect_texts(&spec, &dump_program(), 10.0, 4).unwrap_err();
         let msg = format!("{err}");

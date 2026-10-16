@@ -2989,7 +2989,7 @@ async fn pattern_catch_up(
                 Some((target - from).unsigned_abs()),
                 // The absolute instant this generation begins airing at — a
                 // sequencer block (#169) reads it as `ctx.window.from`, so a
-                // daypart script asks "what hour does this generation start"
+                // sequencer script asks "what hour does this generation start"
                 // rather than "what hour is it while the daemon happens to be
                 // computing this".
                 from,
@@ -3043,8 +3043,7 @@ async fn pattern_catch_up(
                 blocks: channel
                     .config
                     .rule
-                    .blocks
-                    .iter()
+                    .all_blocks()
                     .map(|b| b.tracks())
                     .collect(),
             },

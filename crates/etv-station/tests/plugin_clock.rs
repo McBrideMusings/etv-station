@@ -128,6 +128,8 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                     seed: None,
                     temperature: None,
                     tracks: None,
+                    label: None,
+                    advisory: None,
                     name: "clockpool".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),
@@ -158,6 +160,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                 cycles: Some(1),
                 sequencer: None,
             }],
+            ..Default::default()
         },
     }
 }

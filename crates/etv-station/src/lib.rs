@@ -3,6 +3,7 @@ pub mod attribution;
 pub mod audit;
 pub mod audit_report;
 pub mod backfill;
+pub mod calendar;
 pub mod catalog;
 pub mod channel_card;
 pub mod config;

@@ -640,6 +640,92 @@ copied into the include, so a reference and an equivalent inline block resolve
 identically. `mode`, `order`, and `filter` are **composition fields on the
 include** — they never live in the block file body.
 
+### Schedules — `rule.slots` and `rule.schedules`
+
+`rule.blocks` are the channel's **any-time rules**: they air in every minute
+nothing below claims. A channel can also declare **slots**, named blocks with
+the same shape as a `rule.blocks` entry, and **schedules** that place those
+slots over ranges of the local day, optionally only on some dates or weekdays
+(ADR 0004).
+
+```yaml
+rule:
+  blocks:                       # the any-time rules
+    - pools: [{ name: classics, expr: 'item.collections.contains("Comedy Classics")' }]
+      pattern: [{ pool: classics, take: 1 }]
+
+  slots:
+    halloween:
+      pools: [{ name: horror, expr: 'item.collections.contains("Elevated Horror")' }]
+      pattern: [{ pool: horror, take: 1 }]
+    prime:
+      pools: [{ name: prime, expr: 'item.type == "movie"' }]
+      pattern: [{ pool: prime, take: 1 }]
+    cartoons:
+      pools: [{ name: cartoons, expr: 'item.collections.contains("Saturday Morning Cartoons")' }]
+      pattern: [{ pool: cartoons, take: 1 }]
+
+  schedules:
+    - name: halloween
+      dates: ["10-25..10-31"]
+      hours: { "00..24": halloween }
+    - name: weekend
+      weekdays: [sat, sun]
+      hours: { "06..12": cartoons }
+    - name: every-day
+      hours: { "20:00..23:30": prime }
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | Required, unique among the channel's schedules. Logged with every generation it decides. |
+| `dates` | Optional list of calendar spans. `"MM-DD"` or `"MM-DD..MM-DD"` repeats every year, and an end before the start crosses December 31st (`"12-20..01-05"`). `"YYYY-MM-DD"` or `"YYYY-MM-DD..YYYY-MM-DD"` is a one-off, for a date that moves each year such as Thanksgiving. Both ends are inclusive. Empty means every day. |
+| `weekdays` | Optional list of `mon`..`sun`. Empty means every day. With `dates`, a day must match both. |
+| `hours` | Required map of clock range → slot name. `"HH..HH"` or `"HH:MM..HH:MM"`, 24-hour, local to the station's `tz`. The end is exclusive and may be `24`; `"21..02"` wraps past midnight and belongs to the day it starts on, so a Friday-only `"21..02"` covers Saturday 01:00. `"00..24"` is the whole day. |
+
+**What airs at an instant.** The station walks the schedules from highest to
+lowest and airs the slot of the first one whose day matches and whose range
+covers that instant. A schedule with `dates` is highest, then one with
+`weekdays`, then one with neither; written order breaks ties. An hour the top
+schedule leaves open falls to the next one down — a holiday that claims only
+20:00-23:00 keeps the weekend's morning cartoons — and when no schedule claims
+the instant, the any-time `rule.blocks` air.
+
+**Where a generation stops.** A generation airs one answer: one slot, or the
+any-time blocks. It stops laying items at the next minute a different block
+would be on, and what is airing then finishes before the next block starts,
+never cut short and never followed by dead air. For an entries block that is
+the one item airing at the boundary. A pattern block finishes the pattern cycle
+in progress, so its boundary can land later by the rest of that cycle: up to
+three episodes for "1 movie, then 3 episodes", a whole season for `take: all`.
+A slot meant to start on time is written with short cycles, typically one
+`take: 1` step.
+
+**State.** Each slot continues where it stopped the last time a schedule
+placed it: pool rotation is keyed by pool name, which must be unique across
+`rule.blocks` and `rule.slots` together, and an entries slot keeps its own list
+position in the `.resume` sidecar's `slot_positions`.
+
+**Load errors.** A schedule with no name, a repeated name, no `hours`, a range
+that is not a time (`"25..26"`, `"20..20"`), two ranges in one schedule that
+overlap, a date no calendar has (`"02-30"`), a span that mixes the yearly and
+dated forms, a slot name `rule.slots` does not declare, a slot no schedule
+places, and a `cycles:` on any block of a channel with schedules (an authored
+count would run past the boundary) all fail the channel's load, naming the
+schedule, slot or block. `rule.blocks`
+must still hold at least one block, which is what airs when no schedule
+claims an instant.
+
+**Observing it.** Every generation of a channel with schedules logs
+`event="calendar.select"` with the window start, the station `tz`, the slot and
+schedule that won (empty for the any-time blocks), and `cut`, the instant the
+generation stopped. Each airing's `block` index counts `rule.blocks` first,
+then `rule.slots` in name order; taste-lab's Review names a slot block by its
+slot name when it has no `program.title`.
+
+Worked samples: `examples/samples/seasonal.yaml` (dated slots) and
+`examples/samples/adult-swim.yaml` (nightly and Saturday slots).
+
 ### Seed and temperature
 
 Every random choice on a channel is computed from its **seed**, which is why a
@@ -765,19 +851,21 @@ overlay:                             # or write the spec inline
   width: 1280
   height: 720
   framerate: 30
-  layers:
-    - type: image
-      path: logo.png
-      corner: bottom_right
-      height: 56
+  graphics:
+    - layers:
+        - type: image
+          path: logo.png
+          corner: bottom_right
+          height: 56
 
 overlay:                             # or add to what the level above resolved
   extend:
-    layers:
-      - type: image
-        path: logo.png               # relative to THIS file's directory
-        corner: bottom_right
-        height: 56
+    graphics:
+      - layers:
+          - type: image
+            path: logo.png           # relative to THIS file's directory
+            corner: bottom_right
+            height: 56
 ```
 
 **Resolution replaces by default and appends when asked; deepest declared
@@ -786,18 +874,19 @@ inherits its ancestor's resolved config unchanged; `clear` means *this level
 draws nothing*, discarding whatever an ancestor resolved; a `file:` reference
 or an inline spec is that whole config, in full, discarding whatever an
 ancestor resolved; and `extend:` keeps the ancestor's config and appends its
-layers to the end.
+graphics to the end.
 
-`extend` is the only composition there is — it may add layers, name a
-different `script:`, or replace `config:` wholesale, and that is all. It
-cannot reach inside an inherited layer and carries no geometry, so unlike
-`guide:`'s field-by-field cascade there is still no per-field override. It
+`extend` is the only composition there is — it adds whole graphics (see
+[Graphics](#graphics)) after the inherited ones, and that is all. It cannot
+reach inside an inherited graphic and carries no geometry, so unlike
+`guide:`'s field-by-field cascade there is no per-field override. It
 exists because the station has graphics every channel shares (a Now/Next
-snipe) plus one thing only the channel knows (its own logo, at its own size),
-and replacement alone forced all 60 channels to restate the shared half. Each
-level's paths resolve against its own file's directory before its layers are
-appended, so a station layer naming `shared/logo.png` and a channel layer
-naming `logo.png` are both correct in one resolved spec. See ADR 0008.
+snipe, a block card) plus one thing only the channel knows (its own logo, at
+its own size), and replacement alone forced all 60 channels to restate the
+shared half. Each level's paths resolve against its own file's directory
+before its graphics are appended, so a station graphic naming
+`shared/logo.png` and a channel graphic naming `logo.png` are both correct in
+one resolved spec. See ADR 0008.
 
 An `extend` with nothing above it to extend — no ancestor declared a complete
 config, or the nearest one said `clear` — fails at config load naming that,
@@ -810,9 +899,190 @@ the canvas and the fifo the `etv-overlay` process is spawned with, and its
 disagree with the channel's on those four fields — they are baked into the
 fifo's byte layout, so a block that wants different ones fails to load,
 naming the mismatch, rather than being silently ignored or attempting a live
-resize. Only the script and layers may differ per block; see
+resize. Only the graphics may differ per block; see
 `docs/architecture.md`'s Graphics overlay cascade section for how that swap
 reaches the already-running process without a respawn (ADR 0007).
+
+#### Graphics
+
+An overlay spec is its canvas (`width`, `height`, `framerate`,
+`pixel_format`) plus a `graphics:` list. A **graphic** is one script, the
+layers it drives, and the `config` it reads:
+
+```yaml
+width: 1280
+height: 720
+framerate: 30
+graphics:
+  - name: now-next               # optional; named in errors and logs
+    script: shared/now-next-snipe.rhai
+    config: { interval_secs: 300 }
+    layers:                      # the script addresses these by index, from 0
+      - { type: scrim, edge: bottom, size: 150, color: [0, 0, 0, 175] }
+      - { type: text, content: "", corner: bottom_left, margin: 40, font_size: 14.0 }
+  - layers:                      # no script: drawn as declared
+      - { type: image, path: logo.png, corner: bottom_right, height: 56 }
+```
+
+Graphics are independent. Each script sees only its own layers (index 0 is
+its own first layer) and its own `config`, so adding or removing a graphic
+cannot re-target another's. They draw in declaration order, a later graphic on
+top. A script that hides itself (`visible: false`) or throws affects only its
+own graphic: a failing script falls back to its graphic's declared layers and
+the others keep drawing. A graphic with no `script:` is static.
+
+Unknown keys are refused. A spec still written with top-level `script:`,
+`config:` or `layers:` fails to load rather than parsing as an overlay that
+draws nothing; move those three keys under a `graphics:` entry.
+
+**What a script can read.** `time`, `frame`, the current item's `title`,
+`sub_title`, `description`, `season`, `episode`, `year`, `content_rating`
+(the catalog's rating for the item, `""` when it has none), the `next_*`
+equivalents, `item_elapsed`, `item_remaining`, its own `config`, and the
+item's opaque blob as `metadata`. `prev_metadata` is the blob of the item that
+aired before it, so a script can notice a change between consecutive items;
+it is `()` for a channel's first item and when the earlier item carried none.
+Test for a map with `type_of(prev_metadata) == "map"` before reading a key
+from either.
+
+### Pool `label` / `advisory` — naming the block on screen
+
+A pool can say what it is called on air, and warn about what it contains:
+
+```yaml
+pools:
+  - name: zombies
+    expr: item.collections.contains("Zombies")
+    label: "The Zombies Block"
+    advisory: "Contains graphic violence"
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `label` | string | display text for the block. Blank is refused at load. |
+| `advisory` | string | a short content warning. Needs a `label`; blank is refused at load. |
+
+Every item the pool draws carries both in its playout `metadata`, under two
+fixed keys:
+
+```json
+"metadata": { "pool_label": "The Zombies Block", "pool_advisory": "Contains graphic violence" }
+```
+
+`pool_advisory` is absent when the pool sets none; both are absent on a pool
+with no `label`. They sit beside the `audit` array and any keys a scorer
+plugin attached — a plugin that returns its own `pool_label` loses it to the
+pool's. This works the same on `pattern:` and `sequencer:` blocks. It is
+display text for an overlay script, not part of the audit trail: nothing
+parses `audit` to find the block. Metadata is filed by `entry_id`, so two
+pools that draw the same entry share one label — including a labelled pool and
+an unlabelled one: every airing of that entry, whichever pool drew it, carries
+the labelled pool's label. The same limit `guide:` and `tracks:` have; keep
+pools that must stay apart disjoint. Editing a label
+rolls the schedule from the next item boundary, like any pool edit.
+
+**On screen.** `deploy/appdata/shared/block-card.rhai` reads the two keys and
+draws a card at the top-left of the frame:
+
+```
+THIS IS
+The Zombies Block
+Contains graphic violence
+```
+
+It shows in the first seconds of any item whose label differs from the
+previous item's (a block starting), and again every `interval_secs` so a viewer
+who tuned in mid-block still learns which one it is. The advisory row appears
+only when the pool has one, and the card holds longer to give it time to be
+read. It sits top-left so it can share the screen with the Now/Next snipe at
+the bottom-left; the two are separate graphics. Declare it once at the station
+level and every channel gets it, drawing nothing for items from an unlabelled
+pool:
+
+```yaml
+overlay:
+  width: 1280
+  height: 720
+  framerate: 30
+  pixel_format: rgba8
+  graphics:
+    - name: now-next
+      script: shared/now-next-snipe.rhai
+      layers: [...]              # scrim, label, value, sub
+    - name: block-card
+      script: shared/block-card.rhai
+      config:
+        interval_secs: 300       # seconds between interval cards
+        offset_secs: 150         # where in that interval the card starts
+      layers:
+        - { type: scrim, edge: top, size: 150, color: [0, 0, 0, 175] }
+        - { type: text, content: "", font_family: Helvetica, font_size: 14.0, letter_spacing: 1.3,
+            color: [255, 255, 255, 150], corner: top_left, margin: 40 }   # eyebrow
+        - { type: text, content: "", font_family: Helvetica, font_size: 30.0,
+            color: [255, 255, 255, 245], corner: top_left, margin: 40 }   # label
+        - { type: text, content: "", font_family: Helvetica, font_size: 16.0,
+            color: [255, 205, 90, 235], corner: top_left, margin: 40 }    # advisory
+```
+
+The script's `config` keys (all optional): `interval_secs` (300),
+`offset_secs` (150), `hold_secs` (5.0), `advisory_hold_secs` (8.0),
+`rise_secs`, `fall_secs`, `stagger_secs`, `slide_distance_px`, `overshoot`,
+`row_px`, `eyebrow` ("THIS IS"), `max_chars` (40), `announce_after_unlabelled`
+(true).
+
+An item from an unlabelled pool has an empty label, so by default it counts as
+a change from a labelled neighbour: in a pattern of `films x1, bumpers x1` where
+only `films` is labelled, every film follows a bumper and draws the card. Set
+`announce_after_unlabelled: false` to compare only against a labelled previous
+item; the card then does not land on a block that follows unlabelled
+programming, and the interval card is the only one there. Preview it with
+`METADATA='{"pool_label":"The Zombies Block"}' PREV_METADATA='{"pool_label":"The Kaiju Block"}' ITEM_ELAPSED=2 admin overlay-watch <channel>`.
+
+### Rating badge
+
+`deploy/appdata/shared/rating-badge.rhai` is a graphic on its own: it draws the
+airing item's content rating — the MPAA code on a film, the TV Parental
+Guideline on an episode — as the small boxed icon a broadcaster puts in a
+corner when a programme starts. It reads one thing, the `content_rating` the
+catalog took from Plex (already in each playout item's `program`), and knows
+nothing about any other graphic, so it layers with the snipe, the block card or
+a channel logo like any other entry in `graphics:`.
+
+It shows for the first 15s of each item (0.5s fade in, 0.8s out), and again
+every `repeat_secs` of a long item when that is set. It draws a badge for the
+eleven ratings it has art for and nothing for anything else — `Not Rated`,
+`Approved`, `16+`, or no rating at all. A country prefix (`us/TV-MA`) is
+ignored.
+
+```yaml
+graphics:
+  - name: rating-badge
+    script: shared/rating-badge.rhai
+    config:
+      hold_secs: 15          # all optional: hold_secs, fade_in_secs, fade_out_secs, repeat_secs
+    layers:                  # one image per rating, in exactly this order
+      - { type: image, path: shared/ratings/tv-y.png,  corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-y7.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-g.png,  corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-pg.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-14.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/tv-ma.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/g.png,     corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/pg.png,    corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/pg-13.png, corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/r.png,     corner: top_right, margin: 32, height: 56 }
+      - { type: image, path: shared/ratings/nc-17.png, corner: top_right, margin: 32, height: 56 }
+```
+
+The script addresses the eleven layers by index, so the order above is a
+contract. Move the badge by changing `corner` and `margin` on every layer; it
+sits top-right by default so it does not share a corner with the block card
+(top-left) or the snipe (bottom-left). The art is `deploy/appdata/shared/ratings/*.png`,
+drawn by `tools/make-rating-icons.sh` and committed; restyle it by editing that
+script and running it, or replace a PNG with any 8-bit RGBA image of the same
+name. The plates are plain boxes in the shape of the on-screen US icons, not the
+MPA's or the TV Parental Guidelines board's own artwork. Preview one with
+`etv-overlay render-still --content-rating TV-MA --item-elapsed 3`.
 
 ### Pool `plugin` — items chosen by a scorer script
 
@@ -1654,12 +1924,13 @@ could.
 
 ```yaml
 # the overlay spec named by a channel's overlay: { file: ... }
-script: lower-third.rhai
-config:
-  corner: bottom-left
-  font:
-    family: Inter
-    size: 42
+graphics:
+  - script: lower-third.rhai
+    config:
+      corner: bottom-left
+      font:
+        family: Inter
+        size: 42
 ```
 
 The single thing in the bag that can fail: **a float that is not a finite
@@ -1904,9 +2175,9 @@ pool's `expr` or `plugin`, then its `order`, `bucket_order`, and `constraints`
 
 | `ctx` field | What it holds |
 |---|---|
-| `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a daypart script has to prefer items that fit the time left before its next boundary, and ids carry no durations. |
-| `ctx.pool_config.<name>` | that pool's own `config:` block, passed through unread — the same generic carrier a scorer's `ctx.config` reaches (ADR 0002), not a new schema field. A daypart script's "which hours/weekdays does this pool claim" table lives here (#14, ADR 0004). Empty map when the pool declares no `config:`. |
-| `ctx.window.from` | the instant this generation begins airing — the hour a daypart script asks about, not the hour the daemon happens to be computing in |
+| `ctx.pools.<name>` | that pool's resolved items, in order, as full item maps — `entry_id`, title, duration, show, season, tags. Not bare ids: a script that arranges against the clock has to know how long each item runs. |
+| `ctx.pool_config.<name>` | that pool's own `config:` block, passed through unread — the same generic carrier a scorer's `ctx.config` reaches (ADR 0002), not a new schema field. Empty map when the pool declares no `config:`. |
+| `ctx.window.from` | the instant this generation begins airing, not the instant the daemon happens to be computing in |
 | `ctx.resume.<pool>.next` | the series whose turn is next in that pool's rotation |
 | `ctx.cursor` | the per-show cursors from the play-history db |
 | `ctx.seed` | the channel's seed for this window's period, a non-negative integer — the script's source of reproducible randomness |
@@ -1932,38 +2203,34 @@ Error cases:
 
 Worked sample: `examples/plugins/foryou-sequencer.rhai`.
 
-#### Dayparting (#14)
+### Pattern step `take` — how many items one visit draws
 
-`examples/plugins/daypart-sequencer.rhai` is the reusable dayparting
-sequencer — a network-mirror channel is **one block** whose pools are its
-dayparts plus a default pool, all pointing `sequencer:` at this one script.
-Nothing about which hours a pool claims lives in the schema; it is authored
-entirely in that pool's `config:`:
+A step in a block's `pattern:` is `{pool, take, from, chance}`. `take` has
+three forms:
 
-```yaml
-rule:
-  blocks:
-    - pools:
-        - name: latenight
-          expr: 'item.show in ["Rick and Morty", "The Boondocks"]'
-          config:
-            hour_start: 21   # local hour, 0-23
-            hour_end: 6      # < hour_start wraps past local midnight
-            weekdays: [sun, mon, tue, wed, thu, fri, sat]  # default: every day
-        - name: default
-          expr: 'item.type == "movie"'
-          # No hour_start/hour_end: this is the pool that fills every hour
-          # no daypart claims. Exactly one pool in the block must be it.
-      sequencer: "../plugins/daypart-sequencer.rhai"
-```
+| Form | Example | One visit draws |
+| --- | --- | --- |
+| count | `take: 3` | exactly 3 items |
+| range | `take: "2-4"` or `take: {min: 2, max: 4}` | a whole number from `min` to `max`, rolled per visit |
+| `all` | `take: all` | every remaining item of the series the visit picked |
 
-Boundaries drift rather than truncating an item or leaving a gap (#14
-decision 3, ADR 0004): the script prefers, from the active daypart's own
-pool, whichever item fits the time left before the next boundary; when
-nothing fits, the next item plays anyway and the following daypart starts
-late by that overrun. The exact grid is not the goal — see ADR 0004 for why
-holding it exactly would need filler the library does not have. Two pools
-whose declared hours and weekdays overlap fail `arrange()`, naming both.
+A range is rolled when the visit starts, from the channel seed, the pattern
+cycle and the step's position. Each number from `min` to `max` is equally
+likely, and a pinned `seed:` reproduces every visit's size. Two steps with the
+same range roll independently, because the step's position is part of the roll.
+A range is not `chance`: the visit always airs, only its length varies.
+
+A range follows the same rules as a count wherever a count is checked:
+
+- `min` must be at least 1 and `max` at most the engine's per-visit maximum
+  (`MAX_TAKE`); `min` above `max` fails at load.
+- `min` equal to `max` is a count (`"3-3"` loads as `take: 3`).
+- Under `rotate: slot` the rolled number is how many slots the visit fills.
+- A plugin's per-entry `take` override replaces the rolled number for that
+  series, the same way it replaces a count.
+- Adjacency `constraints` size their seam for the widest cycle the range can
+  produce: every range counted at `max` for the cycle length and at `min` for
+  how often the pool is drawn.
 
 ### Pool `constraints` — spacing counted in a pool's own draw order
 

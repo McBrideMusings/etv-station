@@ -67,6 +67,13 @@ pub struct ResumeMap {
     #[serde(default, skip_serializing_if = "is_start")]
     pub position: usize,
 
+    /// The same position for each entries block in `rule.slots`, by slot
+    /// name (ADR 0004). A slot airs only while a schedule places it, so its
+    /// list continues from here the next time it comes on rather than
+    /// sharing the any-time list's `position`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_positions: BTreeMap<String, usize>,
+
     /// The scheduling state at each not-yet-aired item boundary, oldest first.
     ///
     /// Forward materialization otherwise makes a pattern channel's emitted
@@ -166,6 +173,8 @@ pub struct Checkpoint {
     /// jumping the cursor past a span it just threw away.
     #[serde(default, skip_serializing_if = "is_start")]
     pub position: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_positions: BTreeMap<String, usize>,
 }
 
 /// The scheduling state a generation would leave behind had it stopped after
@@ -175,6 +184,7 @@ pub struct Checkpoint {
 pub struct Progress {
     pub pools: BTreeMap<String, PoolResume>,
     pub position: usize,
+    pub slot_positions: BTreeMap<String, usize>,
 }
 
 /// One pool's resume state.
@@ -224,6 +234,7 @@ impl ResumeMap {
             version: CURRENT_VERSION,
             pools: BTreeMap::new(),
             position: 0,
+            slot_positions: BTreeMap::new(),
             checkpoints: Vec::new(),
             config_id: None,
             lists: BTreeMap::new(),
@@ -235,7 +246,7 @@ impl ResumeMap {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty() && self.position == 0
+        self.pools.is_empty() && self.position == 0 && self.slot_positions.is_empty()
     }
 
     /// Record the state entering a generation that begins at `start`, along
@@ -247,6 +258,7 @@ impl ResumeMap {
             start,
             pools: self.pools.clone(),
             position: self.position,
+            slot_positions: self.slot_positions.clone(),
         });
     }
 
@@ -257,7 +269,9 @@ impl ResumeMap {
     pub fn checkpoint_at(&mut self, start: OffsetDateTime, progress: &Progress) {
         if let Some(last) = self.checkpoints.last()
             && (last.start >= start
-                || (last.pools == progress.pools && last.position == progress.position))
+                || (last.pools == progress.pools
+                    && last.position == progress.position
+                    && last.slot_positions == progress.slot_positions))
         {
             return;
         }
@@ -265,6 +279,7 @@ impl ResumeMap {
             start,
             pools: progress.pools.clone(),
             position: progress.position,
+            slot_positions: progress.slot_positions.clone(),
         });
     }
 
@@ -313,6 +328,7 @@ impl ResumeMap {
         let cp = self.checkpoints[idx].clone();
         self.pools = cp.pools;
         self.position = cp.position;
+        self.slot_positions = cp.slot_positions;
         self.checkpoints.truncate(idx);
         Some(cp.start)
     }
@@ -527,6 +543,7 @@ mod tests {
         let step = |next: &str, position| Progress {
             pools: pools_with(next),
             position,
+            slot_positions: BTreeMap::new(),
         };
         map.checkpoint_at(at(1), &step("e1", 1));
         map.checkpoint_at(at(2), &step("e1", 1));

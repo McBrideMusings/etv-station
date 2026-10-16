@@ -151,6 +151,8 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     seed: None,
                     temperature: None,
                     tracks: None,
+                    label: None,
+                    advisory: None,
                     name: "foryou".into(),
                     expr: None,
                     plugin: Some(plugin.to_path_buf()),
@@ -184,6 +186,7 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                 cycles: Some(cycles),
                 sequencer: None,
             }],
+            ..Default::default()
         },
     }
 }

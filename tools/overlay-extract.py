@@ -7,7 +7,7 @@
 `etv-overlay run`/`watch`/`render-still` can load with `--config`.
 
 The resolution itself is done by `etv-station --dump-overlay`, not here. Since
-ADR 0008 a channel may declare only `overlay: {extend: {layers: [...]}}`, which
+ADR 0008 a channel may declare only `overlay: {extend: {graphics: [...]}}`, which
 carries no geometry and means nothing without the station-level spec above it —
 so reading the channel file alone can no longer produce a spec. Rather than
 teach this script the station -> channel -> block cascade (the drift this
@@ -84,22 +84,25 @@ def dump_spec(name: str, station: Path) -> dict:
 
 
 def override_config(spec: dict, assignments: list[str]) -> dict:
-    """Merge `KEY=VALUE` assignments into the spec's free-form `config:` map.
+    """Merge `KEY=VALUE` assignments into every scripted graphic's `config:` map.
 
     The map is handed to the Rhai script unread, so this needs no knowledge of
     which keys any script accepts. VALUE goes through the YAML loader, so `12`
     arrives as an int and `false` as a bool — a script comparing against a
-    number would silently take its default if this passed strings through.
+    number would silently take its default if this passed strings through. A
+    graphic with no script has no use for a config and is left alone.
     """
     if not assignments:
         return spec
-    config = dict(spec.get("config") or {})
+    parsed = {}
     for pair in assignments:
         if "=" not in pair:
             sys.exit(f"--set-config expects KEY=VALUE, got {pair!r}")
         key, _, raw = pair.partition("=")
-        config[key.strip()] = yaml.safe_load(raw)
-    spec["config"] = config
+        parsed[key.strip()] = yaml.safe_load(raw)
+    for graphic in spec.get("graphics") or []:
+        if graphic.get("script"):
+            graphic["config"] = {**(graphic.get("config") or {}), **parsed}
     return spec
 
 
@@ -142,7 +145,7 @@ def main() -> None:
         default=[],
         metavar="KEY=VALUE",
         help=(
-            "override one key in the spec's `config:` map, repeatable. Preview-only "
+            "override one key in every scripted graphic's `config:` map, repeatable. Preview-only "
             "retiming: a script's on-air interval is minutes long, which is not "
             "watchable. VALUE is parsed as YAML, so numbers stay numbers."
         ),

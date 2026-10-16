@@ -2,15 +2,40 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// One overlay: the canvas geometry baked into the fifo, and the graphics
+/// drawn on it.
+///
+/// A graphic is a script together with the layers it drives and the `config` it
+/// reads. Graphics are independent — each script sees only its own layers and
+/// its own `config`, so adding one cannot re-target another's layer indices —
+/// and they draw in declaration order, a later graphic on top of an earlier one.
+///
+/// Unknown keys are refused: a spec still written with top-level `script:`,
+/// `config:` or `layers:` would otherwise parse as an overlay with no graphics
+/// and draw nothing, with no error to say why.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OverlaySpec {
     pub width: u32,
     pub height: u32,
     pub framerate: u32,
     #[serde(default)]
     pub pixel_format: PixelFormat,
+    #[serde(default)]
+    pub graphics: Vec<GraphicSpec>,
+}
+
+/// A script and the layers it drives. A graphic with no `script` is static: its
+/// layers draw as declared (a channel logo).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GraphicSpec {
+    /// A name for logs and error messages. Nothing reads it for behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<PathBuf>,
-    /// Arbitrary configuration handed to `script` verbatim, reaching it as the
+    /// Arbitrary configuration handed to this graphic's `script` verbatim, reaching it as the
     /// `config` constant. Any YAML shape is accepted — mappings, sequences,
     /// strings, numbers, booleans, nested to any depth — and no key is
     /// reserved.
@@ -52,9 +77,8 @@ pub struct OverlaySpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub config: Option<serde_json::Value>,
-    /// Layers are rendered bottom-up in declaration order. A single Rhai script
-    /// (if `script` is set) controls visibility/opacity uniformly across all
-    /// layers — per-layer scripts are a future extension.
+    /// Layers are rendered bottom-up in declaration order. The graphic's script
+    /// (if `script` is set) addresses them by index within this list.
     #[serde(default, alias = "kind", deserialize_with = "deserialize_layers")]
     pub layers: Vec<OverlayKind>,
 }
@@ -286,18 +310,13 @@ impl OverlaySpec {
         Ok(spec.with_paths_relative_to(path.parent()))
     }
 
-    /// Re-root this spec's `script` and every `image` path against `base`, the
-    /// directory the spec was authored in. Split out from [`Self::from_path`]
+    /// Re-root every graphic's `script` and every `image` path against `base`,
+    /// the directory the spec was authored in. Split out from [`Self::from_path`]
     /// because a spec can also arrive inline in a channel YAML, where the same
     /// base-relative rule has to hold against a different file's directory.
     pub fn with_paths_relative_to(mut self, base: Option<&std::path::Path>) -> Self {
-        if let Some(script) = self.script.take() {
-            self.script = Some(resolve_relative(&script, base));
-        }
-        for layer in &mut self.layers {
-            if let OverlayKind::Image { path: image, .. } = layer {
-                *image = resolve_relative(image, base);
-            }
+        for graphic in &mut self.graphics {
+            *graphic = std::mem::take(graphic).with_paths_relative_to(base);
         }
         self
     }
@@ -313,6 +332,21 @@ impl OverlaySpec {
 
     pub fn frame_byte_len(&self) -> usize {
         (self.width * self.height * self.pixel_format.bytes_per_pixel()) as usize
+    }
+}
+
+impl GraphicSpec {
+    /// The paths this graphic names, made absolute against `base`.
+    pub fn with_paths_relative_to(mut self, base: Option<&std::path::Path>) -> Self {
+        if let Some(script) = self.script.take() {
+            self.script = Some(resolve_relative(&script, base));
+        }
+        for layer in &mut self.layers {
+            if let OverlayKind::Image { path: image, .. } = layer {
+                *image = resolve_relative(image, base);
+            }
+        }
+        self
     }
 }
 
@@ -338,20 +372,22 @@ width: 1920
 height: 1080
 framerate: 30
 pixel_format: rgba8
-kind:
-  type: watermark
-  corner: top_right
-  margin: 48
-  box_size: 200
-  color: [255, 100, 100, 200]
+graphics:
+  - kind:
+      type: watermark
+      corner: top_right
+      margin: 48
+      box_size: 200
+      color: [255, 100, 100, 200]
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.width, 1920);
         assert_eq!(spec.height, 1080);
         assert_eq!(spec.framerate, 30);
         assert_eq!(spec.pixel_format, PixelFormat::Rgba8);
-        assert_eq!(spec.layers.len(), 1);
-        match &spec.layers[0] {
+        let layers = &spec.graphics[0].layers;
+        assert_eq!(layers.len(), 1);
+        match &layers[0] {
             OverlayKind::Watermark {
                 corner,
                 margin,
@@ -373,24 +409,26 @@ kind:
 width: 1280
 height: 720
 framerate: 30
-layers:
-  - type: image
-    path: logo.png
-    corner: bottom_right
-    margin: 24
-    height: 96
-  - type: text
-    content: PIERCE
-    font_family: Helvetica
-    font_size: 36.0
-    color: [255, 255, 255, 230]
-    corner: bottom_right
-    margin: 132
+graphics:
+  - layers:
+      - type: image
+        path: logo.png
+        corner: bottom_right
+        margin: 24
+        height: 96
+      - type: text
+        content: PIERCE
+        font_family: Helvetica
+        font_size: 36.0
+        color: [255, 255, 255, 230]
+        corner: bottom_right
+        margin: 132
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
-        assert_eq!(spec.layers.len(), 2);
-        assert!(matches!(spec.layers[0], OverlayKind::Image { .. }));
-        assert!(matches!(spec.layers[1], OverlayKind::Text { .. }));
+        let layers = &spec.graphics[0].layers;
+        assert_eq!(layers.len(), 2);
+        assert!(matches!(layers[0], OverlayKind::Image { .. }));
+        assert!(matches!(layers[1], OverlayKind::Text { .. }));
     }
 
     #[test]
@@ -399,19 +437,21 @@ layers:
 width: 1280
 height: 720
 framerate: 30
-kind:
-  type: text
-  content: ETV STATION
-  font_family: Helvetica
-  font_size: 64.0
-  letter_spacing: 1.5
-  color: [255, 255, 255, 230]
-  corner: bottom_left
-  margin: 40
+graphics:
+  - kind:
+      type: text
+      content: ETV STATION
+      font_family: Helvetica
+      font_size: 64.0
+      letter_spacing: 1.5
+      color: [255, 255, 255, 230]
+      corner: bottom_left
+      margin: 40
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
-        assert_eq!(spec.layers.len(), 1);
-        match &spec.layers[0] {
+        let layers = &spec.graphics[0].layers;
+        assert_eq!(layers.len(), 1);
+        match &layers[0] {
             OverlayKind::Text {
                 content,
                 font_family,
@@ -439,13 +479,15 @@ kind:
 width: 640
 height: 360
 framerate: 25
-kind:
-  type: text
-  content: hi
+graphics:
+  - kind:
+      type: text
+      content: hi
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
-        assert_eq!(spec.layers.len(), 1);
-        match &spec.layers[0] {
+        let layers = &spec.graphics[0].layers;
+        assert_eq!(layers.len(), 1);
+        match &layers[0] {
             OverlayKind::Text {
                 content,
                 font_family,
@@ -478,7 +520,7 @@ framerate: 24
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
         assert_eq!(spec.pixel_format, PixelFormat::Rgba8);
-        assert!(spec.layers.is_empty());
+        assert!(spec.graphics.is_empty());
     }
 
     /// A `config:` mapping parses into the carrier type with its nesting and
@@ -489,16 +531,17 @@ framerate: 24
 width: 320
 height: 240
 framerate: 30
-config:
-  name: lower-third
-  fade:
-    seconds: 0.4
-    steps: 3
-    enabled: true
-    labels: [a, b]
+graphics:
+  - config:
+      name: lower-third
+      fade:
+        seconds: 0.4
+        steps: 3
+        enabled: true
+        labels: [a, b]
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
-        let config = spec.config.as_ref().unwrap();
+        let config = spec.graphics[0].config.as_ref().unwrap();
         assert_eq!(config["name"], serde_json::json!("lower-third"));
         assert_eq!(config["fade"]["seconds"], serde_json::json!(0.4));
         assert_eq!(config["fade"]["steps"], serde_json::json!(3));
@@ -511,13 +554,15 @@ config:
     /// script as unit with nothing said (#130).
     #[test]
     fn a_non_finite_float_in_config_fails_the_load_and_names_the_key() {
-        let spec = |bag: &str| format!("width: 320\nheight: 240\nframerate: 30\nconfig:\n{bag}");
+        let spec = |bag: &str| {
+            format!("width: 320\nheight: 240\nframerate: 30\ngraphics:\n  - config:\n{bag}")
+        };
         for (bag, key) in [
-            ("  weight: .inf\n", "config.weight"),
-            ("  weight: .nan\n", "config.weight"),
-            ("  weight: -.inf\n", "config.weight"),
-            ("  steps: [1.0, .inf]\n", "config.steps[1]"),
-            ("  fade:\n    weight: .nan\n", "config.fade.weight"),
+            ("      weight: .inf\n", "config.weight"),
+            ("      weight: .nan\n", "config.weight"),
+            ("      weight: -.inf\n", "config.weight"),
+            ("      steps: [1.0, .inf]\n", "config.steps[1]"),
+            ("      fade:\n        weight: .nan\n", "config.fade.weight"),
         ] {
             let err = OverlaySpec::from_yaml_str(&spec(bag))
                 .expect_err("a non-finite float must fail the load")
@@ -542,17 +587,18 @@ config:
 width: 320
 height: 240
 framerate: 30
-config:
-  date: 2026-07-28
-  offset: 2026-07-28T10:32:00Z
-  local: 2026-07-28T10:32:00
-  clock: "10:32:00"
-  window: [2026-07-28, 2026-07-29]
-  nested:
-    since: 2026-07-28
+graphics:
+  - config:
+      date: 2026-07-28
+      offset: 2026-07-28T10:32:00Z
+      local: 2026-07-28T10:32:00
+      clock: "10:32:00"
+      window: [2026-07-28, 2026-07-29]
+      nested:
+        since: 2026-07-28
 "#;
         let spec = OverlaySpec::from_yaml_str(yaml).unwrap();
-        let config = spec.config.as_ref().unwrap();
+        let config = spec.graphics[0].config.as_ref().unwrap();
         assert_eq!(config["date"], serde_json::json!("2026-07-28"));
         assert_eq!(config["offset"], serde_json::json!("2026-07-28T10:32:00Z"));
         assert_eq!(config["local"], serde_json::json!("2026-07-28T10:32:00"));
@@ -565,8 +611,51 @@ config:
     /// the engine, not injected into the spec.
     #[test]
     fn an_absent_config_stays_absent() {
-        let spec = OverlaySpec::from_yaml_str("width: 1\nheight: 1\nframerate: 1\n").unwrap();
-        assert!(spec.config.is_none());
+        let spec =
+            OverlaySpec::from_yaml_str("width: 1\nheight: 1\nframerate: 1\ngraphics:\n  - {}\n")
+                .unwrap();
+        assert!(spec.graphics[0].config.is_none());
+    }
+
+    /// A spec still written with the pre-`graphics:` top-level keys fails the
+    /// load instead of parsing as an overlay that draws nothing.
+    #[test]
+    fn top_level_script_config_and_layers_are_refused() {
+        for key in ["script: a.rhai", "config: {}", "layers: []"] {
+            let yaml = format!("width: 1\nheight: 1\nframerate: 1\n{key}\n");
+            let err = OverlaySpec::from_yaml_str(&yaml)
+                .expect_err("a top-level overlay key must fail the load")
+                .to_string();
+            assert!(err.contains("unknown field"), "{key}: {err}");
+        }
+    }
+
+    /// Each graphic's script and image paths re-root against the directory the
+    /// spec was authored in.
+    #[test]
+    fn every_graphics_paths_reroot() {
+        let yaml = r#"
+width: 1
+height: 1
+framerate: 1
+graphics:
+  - script: a.rhai
+  - layers:
+      - { type: image, path: logo.png, corner: bottom_right }
+"#;
+        let spec = OverlaySpec::from_yaml_str(yaml)
+            .unwrap()
+            .with_paths_relative_to(Some(std::path::Path::new("/base")));
+        assert_eq!(
+            spec.graphics[0].script.as_deref(),
+            Some(std::path::Path::new("/base/a.rhai"))
+        );
+        match &spec.graphics[1].layers[0] {
+            OverlayKind::Image { path, .. } => {
+                assert_eq!(path, std::path::Path::new("/base/logo.png"))
+            }
+            other => panic!("expected image, got {other:?}"),
+        }
     }
 
     #[test]
@@ -576,9 +665,7 @@ config:
             height: 100,
             framerate: 30,
             pixel_format: PixelFormat::Rgba8,
-            script: None,
-            config: None,
-            layers: vec![],
+            graphics: vec![],
         };
         assert_eq!(spec.frame_byte_len(), 40_000);
     }

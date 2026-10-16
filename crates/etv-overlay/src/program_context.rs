@@ -45,6 +45,12 @@ pub struct ProgramContext {
     /// Release / air year, or `-1` when absent. Present on films and episodes
     /// alike.
     pub year: i64,
+    /// The current item's content rating as the catalog holds it — an MPAA
+    /// code on a film (`R`, `PG-13`), a TV Parental Guideline on an episode
+    /// (`TV-MA`, `TV-14`) — or an empty string when the item has none. Passed
+    /// through as written: normalising it is the script's concern, since the
+    /// catalog also holds ratings from other schemes (`Approved`, `16+`).
+    pub content_rating: String,
     pub next_title: String,
     pub next_sub_title: String,
     /// The one-item lookahead's counterparts to [`Self::season`],
@@ -62,6 +68,14 @@ pub struct ProgramContext {
     /// code here reads a key inside it — it exists only to reach the overlay
     /// script's scope (ADR 0016). `Value::Null` when absent.
     pub metadata: serde_json::Value,
+    /// The item before the current one: its `metadata`, carried verbatim and
+    /// as opaque as [`Self::metadata`] (ADR 0016). A script compares the two to
+    /// notice a change between consecutive items — a new block starting — which
+    /// a single frame's current item cannot say. `Value::Null` when there is no
+    /// earlier item loaded (a channel's first item, or a playout pruned past it)
+    /// and when the earlier item carried no metadata, which a script cannot and
+    /// need not tell apart.
+    pub prev_metadata: serde_json::Value,
 }
 
 impl ProgramContext {
@@ -73,6 +87,7 @@ impl ProgramContext {
             season: -1,
             episode: -1,
             year: -1,
+            content_rating: String::new(),
             next_title: String::new(),
             next_sub_title: String::new(),
             next_season: -1,
@@ -81,6 +96,7 @@ impl ProgramContext {
             item_elapsed: -1.0,
             item_remaining: -1.0,
             metadata: serde_json::Value::Null,
+            prev_metadata: serde_json::Value::Null,
         }
     }
 }
@@ -130,6 +146,11 @@ struct ProgramRow {
     episode: Option<i64>,
     #[serde(default)]
     year: Option<i64>,
+    /// The catalog's rating for the item (`PlayoutItem::program`'s
+    /// `content_rating`), read here for the same reason `description` is:
+    /// the overlay parses the chunk files itself.
+    #[serde(default)]
+    content_rating: Option<String>,
 }
 
 /// Loads and caches the channel's chunked playout JSON. Call
@@ -218,6 +239,10 @@ impl ProgramContextSource {
             }
         }
         items.sort_by_key(|i| i.start);
+        // An item straddling a chunk boundary is written whole into both
+        // chunks, so it loads twice with the same start. Left in, the "next"
+        // and "previous" neighbour of such an item would be its own twin.
+        items.dedup_by_key(|i| i.start);
         self.items = items;
         Ok(())
     }
@@ -240,12 +265,14 @@ impl ProgramContextSource {
             return ProgramContext::unknown();
         }
         let next = self.items.get(idx + 1);
+        let prev = idx.checked_sub(1).and_then(|i| self.items.get(i));
         context_from_rows(
             item.program.as_ref(),
             next.and_then(|n| n.program.as_ref()),
             (now - item.start).as_seconds_f64(),
             (item.finish - now).as_seconds_f64(),
             item.metadata.clone(),
+            prev.and_then(|p| p.metadata.clone()),
         )
     }
 }
@@ -263,6 +290,7 @@ impl ProgramContext {
         elapsed: f64,
         remaining: f64,
         metadata: Option<serde_json::Value>,
+        prev_metadata: Option<serde_json::Value>,
     ) -> Self {
         let row = |v: Option<&serde_json::Value>| v.and_then(|v| ProgramRow::deserialize(v).ok());
         context_from_rows(
@@ -271,6 +299,7 @@ impl ProgramContext {
             elapsed,
             remaining,
             metadata,
+            prev_metadata,
         )
     }
 }
@@ -281,6 +310,7 @@ fn context_from_rows(
     elapsed: f64,
     remaining: f64,
     metadata: Option<serde_json::Value>,
+    prev_metadata: Option<serde_json::Value>,
 ) -> ProgramContext {
     let cur = program_fields(now);
     let nxt = program_fields(next);
@@ -291,6 +321,9 @@ fn context_from_rows(
         season: cur.season,
         episode: cur.episode,
         year: cur.year,
+        content_rating: now
+            .and_then(|p| p.content_rating.clone())
+            .unwrap_or_default(),
         next_title: nxt.title,
         next_sub_title: nxt.sub_title,
         next_season: nxt.season,
@@ -299,6 +332,7 @@ fn context_from_rows(
         item_elapsed: elapsed,
         item_remaining: remaining,
         metadata: metadata.unwrap_or(serde_json::Value::Null),
+        prev_metadata: prev_metadata.unwrap_or(serde_json::Value::Null),
     }
 }
 
@@ -628,6 +662,77 @@ mod tests {
 
         let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
         assert!(ctx.metadata.is_null());
+    }
+
+    /// The catalog's rating rides in the item's `program` object and reaches
+    /// the script as written; an item without one reads as the empty string.
+    #[test]
+    fn content_rating_reaches_the_context_and_defaults_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(
+            dir.path(),
+            "1_2.json",
+            r#"{ "version": "t", "items": [
+                { "id": "a", "start": "2026-04-13T00:00:00Z", "finish": "2026-04-13T00:10:00Z",
+                  "program": { "title": "Rated", "content_rating": "TV-MA" } },
+                { "id": "b", "start": "2026-04-13T00:10:00Z", "finish": "2026-04-13T00:20:00Z",
+                  "program": { "title": "Unrated" } }
+            ] }"#,
+        );
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 00:05 UTC))
+                .content_rating,
+            "TV-MA"
+        );
+        assert_eq!(
+            src.current_at(datetime!(2026-04-13 00:15 UTC))
+                .content_rating,
+            ""
+        );
+    }
+
+    /// Two consecutive items, the second airing after a block change: the
+    /// current item's `prev_metadata` is the one before it, and the first item
+    /// of a channel has none. The item straddling the chunk boundary is written
+    /// into both chunk files, and must not become its own predecessor.
+    #[test]
+    fn prev_metadata_is_the_item_before_not_its_chunk_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = |id: &str, start: &str, finish: &str, label: &str| {
+            format!(
+                r#"{{ "id": "{id}", "start": "{start}", "finish": "{finish}",
+                    "program": {{ "title": "{id}" }}, "metadata": {{ "pool_label": "{label}" }} }}"#
+            )
+        };
+        let a = item("a", "2026-04-13T00:00:00Z", "2026-04-13T00:10:00Z", "Kaiju");
+        let b = item(
+            "b",
+            "2026-04-13T00:10:00Z",
+            "2026-04-13T00:20:00Z",
+            "Zombies",
+        );
+        write_chunk(
+            dir.path(),
+            "1_2.json",
+            &format!(r#"{{ "version": "t", "items": [{a}, {b}] }}"#),
+        );
+        write_chunk(
+            dir.path(),
+            "2_3.json",
+            &format!(r#"{{ "version": "t", "items": [{b}] }}"#),
+        );
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let first = src.current_at(datetime!(2026-04-13 00:05 UTC));
+        assert!(first.prev_metadata.is_null());
+
+        let second = src.current_at(datetime!(2026-04-13 00:15 UTC));
+        assert_eq!(second.metadata["pool_label"], "Zombies");
+        assert_eq!(second.prev_metadata["pool_label"], "Kaiju");
     }
 
     #[test]

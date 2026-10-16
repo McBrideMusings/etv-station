@@ -6,18 +6,26 @@ channel against. Each principle has four parts:
 - what it means, with the source it comes from;
 - one real network that does it;
 - how a `channel.yaml` says it today, with the key and a short example;
-- where today's schema cannot say it, the bead that tracks the gap.
+- where today's schema cannot say it, the bead that tracks the gap;
+- how the Review view grades it, when a schedule yields a number for it.
 
 A number marked **unsourced** or **inference** is reasoning written for this
 page. No source states it. Treat it as a starting question for a review, not
-as a rule. A review asks each question and shows the numbers. Nothing on this
-page is a pass/fail threshold.
+as a rule.
+
+The Review view grades a principle 0 to 3 only when the simulated schedule
+measures it; the channel's total counts those principles alone. A principle
+with no number to measure, or one that does not apply to the channel, is
+listed with the reason and left out of the total. Every grade threshold below
+is **unsourced** unless it cites a source: it is the line this page draws, not
+an industry standard. `crates/etv-station/src/review.rs` computes them.
 
 The keys named below are documented in the [config schema](/schema), except
 `chance` and `from` on a pattern step, which the schema page does not cover yet;
 `crates/etv-station/src/config/pool.rs` defines both.
 Every YAML example is a fragment. `pools:`, `pattern:` and `sequencer:` sit
-inside one entry of `rule.blocks`, as the first example shows in full.
+inside one entry of `rule.blocks` or one `rule.slots` entry, and `slots:` and
+`schedules:` sit under `rule:`, as the first example shows in full.
 
 "Depth" on this page has the meaning in the [glossary](/CONTEXT#depth): how
 long a channel runs before something airs again. An episode count is called a
@@ -32,30 +40,37 @@ to whoever is watching at that hour
 **Network example.** Daytime shows aim at the audience that is home during the
 day; prime time aims at the whole household (same source).
 
-**In `channel.yaml` today.** One block whose pools are the dayparts, arranged
-by the daypart sequencer. Each pool claims its hours in its own `config:`; the
-pool with no hours fills every hour nobody claims. Hours are local to the
-station's `tz`.
+**In `channel.yaml` today.** Each daypart is a slot, and a schedule places it
+on its hours. `rule.blocks` fills every hour no schedule claims. Hours are local
+to the station's `tz`.
 
 ```yaml
 rule:
   blocks:
-    - pools:
+    - pools: [{ name: films, expr: 'item.type == "movie"' }]
+      pattern: [{ pool: films, take: 1 }]
+  slots:
+    latenight:
+      pools:
         - name: latenight
           expr: 'item.show in ["Rick and Morty", "The Boondocks"]'
-          config: { hour_start: 21, hour_end: 6 }
-        - name: default
-          expr: 'item.type == "movie"'
-      sequencer: "../plugins/daypart-sequencer.rhai"
+      pattern: [{ pool: latenight, take: 1 }]
+  schedules:
+    - name: nightly
+      hours: { "21..06": latenight }
 ```
 
-The sample script is `examples/plugins/daypart-sequencer.rhai`. Daypart
-boundaries drift by the overrun of the last item rather than cutting it
-([schema, Dayparting](/schema#dayparting-14)).
+A daypart boundary lands late by the overrun of whatever is airing across it,
+the item or the rest of its pattern cycle, rather than cutting it
+([schema, Schedules](/schema#schedules-rule-slots-and-rule-schedules)). A slot
+continues where it stopped the night before: its pool rotation and list
+position are kept while other blocks air. The sample is
+`examples/samples/adult-swim.yaml`.
 
-**Not expressible today.** A daypart pool cannot resume a show where it left
-off: every generation restarts it at the top of its list. Tracked in
-`etv-station-199`.
+**Grade.** Applies to a channel with two or more pools. The measure is the
+largest swing in any one pool's share of airtime between the day's four
+6-hour quarters (midnight, 6 AM, noon, 6 PM, local time). 30 points or more
+is 3, 20 is 2, 10 is 1, under 10 is 0 (**unsourced**).
 
 ## Block programming and episodes per block
 
@@ -96,8 +111,27 @@ on the same pool with `chance: 0.5` does not lengthen the visit, though: under
 `rotate: visit` each step is a new visit, so it adds three episodes of the
 next show in the rotation half the time.
 
-**Not expressible today.** `take` is a fixed count; there is no random range
-such as "2 to 4" episodes of one show. Tracked in `etv-station-cyq9`.
+**A random range.** `take` also accepts a range, so the visit length varies
+the way real blocks do:
+
+```yaml
+pattern:
+  - pool: shows
+    take: "2-4"        # or { min: 2, max: 4 }
+```
+
+Each visit is asked for 2, 3 or 4 episodes of one show, every size equally
+likely. The size is rolled per visit from the channel `seed`, so a pinned seed
+asks for the same sequence of sizes every time. A series that runs short follows
+`on_short`, as it does for a fixed count. Unlike a second step with `chance`,
+the visit always happens and the next show in the rotation is not pulled in;
+only the length changes. Field rules are in the
+[schema](./schema.md#pattern-step-take-how-many-items-one-visit-draws).
+
+**Grade.** Applies when a series airs. The measure is the mean number of
+episodes of one show per visit, ignoring interstitials between them. 2 to 4
+is 3 (the unsourced range above), over 4 up to 6 is 2, over 6 or 1.5 to 2 is
+1, under 1.5 is 0.
 
 ## Stripping, and how deep a show must be to strip
 
@@ -128,28 +162,37 @@ single-show channel against 20 weeks (140 days) stripped, about 45 times
 faster. Half-hour sitcoms (about 22 minutes) go about 65 a day, so the same
 100 episodes last about a day and a half.
 
-**In `channel.yaml` today.** A daypart pool restricted to weekday hours.
-Dayparts are whole hours, and the pool fills its hour: an hour-long drama airs
-about one episode a weekday, and a half-hour sitcom would air two or three.
+**In `channel.yaml` today.** A slot placed by a weekday schedule. The slot
+fills its range: an hour-long drama airs about one episode a weekday on
+`"18..19"`, and a half-hour sitcom on `"18:00..18:30"` airs one.
 
 ```yaml
-pools:
-  - name: strip
-    expr: 'item.show == "The X-Files"'
-    order: "season:asc,episode:asc"
-    config: { hour_start: 18, hour_end: 19, weekdays: [mon, tue, wed, thu, fri] }
-  - name: default
-    expr: 'item.type == "movie"'
-sequencer: "../plugins/daypart-sequencer.rhai"
+slots:
+  strip:
+    pools:
+      - name: strip
+        expr: 'item.show == "The X-Files"'
+        order: "season:asc,episode:asc"
+        advance: resume
+    pattern: [{ pool: strip, take: 1 }]
+schedules:
+  - name: weeknights
+    weekdays: [mon, tue, wed, thu, fri]
+    hours: { "18..19": strip }
 ```
 
-**Not expressible today.**
+`advance: resume` carries the strip on from the last episode aired, across
+generations and across the hours other blocks fill.
 
-- The strip does not resume across generations: each generation starts the
-  show again from its first episode. Tracked in `etv-station-199`.
-- A show that strips on two channels keeps a separate place on each, so it
-  restarts on every channel it appears on. Tracked in `etv-station-160`
-  (`cursor_scope: global`).
+**Not expressible today.** A show that strips on two channels keeps a separate
+place on each, so it restarts on every channel it appears on. Tracked in
+`etv-station-160` (`cursor_scope: global`).
+
+**Grade.** Applies when a show that aired has 75 or more episodes in the
+catalog (three seasons, per Strip programming above). The measure is the
+share of the span's weekdays on which that show starts an episode in its
+most-used weekday hour, taking the best such show. 80% or more is 3, 60% is
+2, 40% is 1, under 40% is 0 (**unsourced**).
 
 ## Episode order
 
@@ -183,6 +226,12 @@ it at load.
 **Review question.** Is each show on the channel self-contained (a sitcom, a
 procedural, a format show), which can air in any order, or narrative (a
 serialized drama), which needs broadcast order?
+
+**Grade.** Applies when a show airs twice from a pool whose `order` is not
+`random`; a random pool shuffles on purpose. The measure is the share of
+steps between consecutive airings of one show that do not go to the next
+episode, or to episode 1 of the next season. 0% is 3, up to 5% is 2, up to
+15% is 1, more is 0 (**unsourced**).
 
 ## Movie slot length and cheap repeats
 
@@ -227,6 +276,9 @@ channel's airtime goes to films versus series cannot be stated directly
 either; it falls out of `take` counts and runtimes. Tracked in
 `etv-station-wi81`.
 
+**Grade.** Not scored: padding a film to its slot is the principle, and the
+station cannot express it yet.
+
 ## Themed and seasonal periods
 
 **What it is.** A network gives part or all of its schedule to a theme for a
@@ -249,13 +301,32 @@ the February sweeps
 - TCM's Star of the Month moves between weekdays from month to month
   ([TCM October 2026 schedule PDF](https://static.tcm.com/2026-09/NPN_OCT26_PrimetimeSchedule_Final2.pdf)).
 
-**In `channel.yaml` today.** A theme can only be a standing block: a pool
-whose `expr` selects the theme (`item.collections.contains("Christmas")`)
-airs all year, not for a date range. A daypart pool's `weekdays:` covers a
-weekly slot such as a Star of the Month night, but not a month.
+**In `channel.yaml` today.** A slot holding the theme, placed by a schedule
+with `dates:`. A yearly span repeats every year and may cross December 31st; a
+span with years is a one-off.
 
-**Not expressible today.** A block cannot declare the calendar dates it airs
-on. Tracked in `etv-station-162`.
+```yaml
+slots:
+  christmas:
+    pools:
+      - name: christmas
+        expr: 'item.collections.contains("Hallmark Christmas")'
+    pattern: [{ pool: christmas, take: 1 }]
+schedules:
+  - name: countdown
+    dates: ["12-01..12-25"]
+    hours: { "00..24": christmas }
+```
+
+A dated schedule outranks a weekday one, so the season replaces the regular
+weekly grid without reordering anything. A theme for part of the day keeps the
+rest: a schedule that claims only `"18..24"` leaves the daytime to the weekly
+schedules and the any-time rules. A Star of the Month night is a schedule with
+both `dates:` (the month) and `weekdays:` (the night). The sample is
+`examples/samples/seasonal.yaml`.
+
+**Grade.** Not scored: a seasonal run is a choice a channel makes, not a standard
+it meets.
 
 ## Marathons
 
@@ -280,8 +351,24 @@ pattern:
 
 `take: all` with `group_by: season` airs a whole season in one visit.
 
-**Not expressible today.** A marathon on a date (New Year's Day,
-Thanksgiving) needs dated blocks. Tracked in `etv-station-162`.
+A marathon on a date is a slot placed on that date. A date that moves each
+year, such as Thanksgiving, lists each year's span:
+
+```yaml
+schedules:
+  - name: new-year
+    dates: ["01-01"]
+    hours: { "00..24": twilight }
+  - name: thanksgiving
+    dates: ["2026-11-26..2026-11-29", "2027-11-25..2027-11-28"]
+    hours: { "00..24": marathon }
+```
+
+**Not expressible today.** A rule such as "the fourth Thursday of November";
+each year's dates are written out.
+
+**Grade.** Not scored: a marathon is a choice a channel makes, not a standard
+it meets. The Review view shows the longest run of one show.
 
 ## Interstitials and bumpers
 
@@ -311,14 +398,19 @@ after each program, and the break's length varies with the next start time
   ```yaml
   overlay:
     extend:
-      layers:
-        - { type: image, path: logo.png, corner: bottom_right, height: 56 }
+      graphics:
+        - layers:
+            - { type: image, path: logo.png, corner: bottom_right, height: 56 }
   ```
 
 - **Lower third / snipe timing:** the station's Now/Next snipe
   (`deploy/appdata/shared/now-next-snipe.rhai`) reads its timing from the
   overlay's `config:`. `interval_secs` (default 300) sets how often it runs and
   `hold_secs` (default 4.5) how long each card stays.
+- **Naming a themed block on screen:** `label:` (and an optional `advisory:`)
+  on a pool. Every item the pool draws carries them, and the station's block
+  card (`deploy/appdata/shared/block-card.rhai`) shows them when the block
+  changes and on an interval. See `docs/schema.md` "Pool `label` / `advisory`".
 - **Bumpers between programs:** a pool of short files and a pattern step that
   draws one between programs.
 
@@ -335,6 +427,12 @@ after each program, and the break's length varies with the next start time
 **Not expressible today.** Filling the gap to the next clock boundary with
 bumpers, rather than airing a fixed count of them, is pad/fallback filler.
 Tracked in `etv-station-85`.
+
+**Grade.** Applies once two programs have aired. An airing under 5 minutes
+counts as an interstitial. The measure is the share of changes from one program to the
+next that have at least one interstitial between them. 90% or more is 3, 50%
+is 2, anything above 0 is 1, none is 0 (**unsourced**). The bug is not
+graded: a schedule does not show it.
 
 ## Rest periods and freshness
 
@@ -422,5 +520,10 @@ period airs about 2 films per films pool. A period shorter than one pass
 changes the list before the walk reaches slot 2, and the pool behaves like
 `advance: restart` on a new list each time.
 
-**Not expressible today.** Switching a pool's selection on a date, such as a
-new theme each month, needs dated blocks. Tracked in `etv-station-162`.
+A new theme each month is a slot per theme and a schedule per month whose
+`dates:` spans that month, such as `["04-01..04-30"]`.
+
+**Grade.** Applies once a program has aired. The measure is the days until
+any program (an airing of 5 minutes or more) airs a second time, or the whole
+span when nothing repeats; a repeating bumper does not count. 14 days or more
+is 3, 7 is 2 (FAST guidance to refresh weekly, above), 3 is 1, under 3 is 0.

@@ -202,7 +202,7 @@ pub fn resolve_channel(
 /// `window_start` is the absolute wall-clock instant this generation begins
 /// airing at — the daemon's own `from`, not the tick's "now". A sequencer
 /// block (#169, [`crate::sequence`]) reads it as `ctx.window.from`, which is
-/// what lets a daypart script ask "what hour does this generation start at"
+/// what lets a sequencer script ask "what hour does this generation start at"
 /// rather than "what hour is it while the daemon happens to be computing
 /// this". It also seeds a plugin's `timestamp()`/`elapsed()` clock (see
 /// below) — that is the only other place in the resolve pipeline any clock
@@ -246,8 +246,8 @@ pub fn resolve_channel_with_resume(
     // with nothing random in it does not care what period it is, so neither
     // cuts anything.
     let fill = match fill {
-        Some(span) if config.rule.blocks.iter().any(lays_seeded_list) => {
-            let pools = config.rule.blocks.iter().flat_map(|b| b.pools.iter());
+        Some(span) if config.rule.all_blocks().any(lays_seeded_list) => {
+            let pools = config.rule.all_blocks().flat_map(|b| b.pools.iter());
             match variety.next_rollover(window_start, pools) {
                 Some(boundary) => {
                     let until = (boundary - window_start).unsigned_abs();
@@ -270,6 +270,61 @@ pub fn resolve_channel_with_resume(
     if let Some(cat) = catalog {
         validate_groups_against_catalog(path, cat, &config.groups)?;
     }
+
+    // Which blocks this generation airs (ADR 0004). A channel with no
+    // `rule.schedules` airs its any-time `rule.blocks`, exactly as before. One
+    // with schedules airs whatever is on at `window_start` — one slot block,
+    // or the any-time blocks — and stops at the next instant that changes, so
+    // the next generation asks again. The item airing at that instant still
+    // finishes: `fill` bounds where a block stops laying items, not where the
+    // last one ends.
+    let schedule_tz = scoring.tz.unwrap_or(time_tz::timezones::db::UTC);
+    let calendar = crate::calendar::Calendar::new(&config.rule, schedule_tz);
+    let on_air = calendar.as_ref().map(|c| c.on_air(window_start));
+    let mut fill = fill;
+    if let (Some(cal), Some(on_air)) = (&calendar, on_air) {
+        let cut = fill.and_then(|f| cal.next_change(window_start, window_start + f));
+        if let Some(cut) = cut {
+            fill = Some((cut - window_start).unsigned_abs());
+        }
+        let (slot, schedule) = match on_air {
+            crate::calendar::OnAir::Slot { slot, schedule, .. } => (slot, schedule),
+            crate::calendar::OnAir::AnyTime => ("", ""),
+        };
+        tracing::info!(
+            event = "calendar.select",
+            channel = %path.display(),
+            window_start = %window_start,
+            tz = time_tz::TimeZone::name(schedule_tz),
+            slot = slot,
+            schedule = schedule,
+            cut = ?cut,
+            "schedule decided which block airs this generation",
+        );
+    }
+    let selected: Vec<(usize, &BlockInclude)> = match on_air {
+        Some(crate::calendar::OnAir::Slot { index, .. }) => config
+            .rule
+            .all_blocks()
+            .enumerate()
+            .filter(|(i, _)| *i == index)
+            .collect(),
+        _ => config.rule.blocks.iter().enumerate().collect(),
+    };
+    // A slot's entries list continues from its own position, not the
+    // any-time list's; every other piece of state is keyed by pool name,
+    // which validation keeps unique across the channel.
+    let original_state = state;
+    let slot_state;
+    let state = match on_air {
+        Some(crate::calendar::OnAir::Slot { slot, .. }) => {
+            let mut s = state.clone();
+            s.resume.position = state.resume.slot_positions.get(slot).copied().unwrap_or(0);
+            slot_state = s;
+            &slot_state
+        }
+        _ => state,
+    };
 
     // `path_index` is the catalog's canonical-path → entry_id map, built once by
     // the caller (the catalog is immutable after ingest). A manual `local` item
@@ -295,7 +350,7 @@ pub fn resolve_channel_with_resume(
     // Per block: a pool block's `BlockBuild::progress`, empty for an entries
     // block, whose progress is its list position instead.
     let mut pool_progress: Vec<Vec<BTreeMap<String, PoolResume>>> = Vec::new();
-    for (idx, include) in config.rule.blocks.iter().enumerate() {
+    for (pos, (idx, include)) in selected.into_iter().enumerate() {
         // A block airs after the blocks before it, so its own clock — what a
         // rollover inside its walk, or a sequencer's dayparts, are measured
         // against — starts where their estimated airtime ends.
@@ -309,7 +364,7 @@ pub fn resolve_channel_with_resume(
         };
         let BlockItems {
             items: block_items,
-            steps: block_steps,
+            steps: mut block_steps,
             pool_progress: block_progress,
         } = resolve_block(
             include,
@@ -362,6 +417,13 @@ pub fn resolve_channel_with_resume(
             item.block = idx;
             item
         }));
+        // `pool_progress` below is indexed by this generation's own block
+        // order, which differs from the block index when a slot airs alone.
+        for step in &mut block_steps {
+            if let Step::Pool { block, .. } = step {
+                *block = pos;
+            }
+        }
         steps.extend(block_steps);
         pool_progress.push(block_progress);
         block_spans.push((span_start, out.len(), block_is_pattern));
@@ -539,7 +601,16 @@ pub fn resolve_channel_with_resume(
         steps = permute(steps, &result.order);
     }
 
-    let progress = progress_per_item(&steps, &pool_progress, seat, resume_out.position);
+    let mut progress = progress_per_item(&steps, &pool_progress, seat, resume_out.position);
+    if let Some(on_air) = on_air {
+        carry_unaired_state(
+            on_air,
+            original_state,
+            &mut resume_out,
+            &mut progress,
+            config,
+        );
+    }
     Ok((out, resume_out, progress))
 }
 
@@ -561,6 +632,83 @@ fn lays_seeded_list(include: &BlockInclude) -> bool {
             .iter()
             .any(|e| matches!(e, Entry::Query(q) if random(&q.order)))
         || matches!(&include.fallback, Some(Fallback::Query(q)) if random(&q.order))
+}
+
+/// A schedule channel's generation airs one slot or the any-time blocks
+/// (ADR 0004); the state of every block it did not air passes through
+/// untouched, so a slot picks up where it stopped the next time a schedule
+/// places it. Applied to the generation's end state and to every per-item
+/// checkpoint alike, so a rewind restores the blocks that did not air too.
+fn carry_unaired_state(
+    on_air: crate::calendar::OnAir<'_>,
+    before: &GenerationState,
+    resume_out: &mut ResumeMap,
+    progress: &mut [Progress],
+    config: &ChannelConfig,
+) {
+    // Only state the current config can still read: a pool or slot renamed
+    // or removed since drops out here rather than riding the sidecar forever.
+    let pool_names: HashSet<&str> = config
+        .rule
+        .all_blocks()
+        .flat_map(|b| b.pools.iter().map(|p| p.name.as_str()))
+        .collect();
+    let carried_pools: BTreeMap<String, PoolResume> = before
+        .resume
+        .pools
+        .iter()
+        .filter(|(name, _)| pool_names.contains(name.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let carried_slots: BTreeMap<String, usize> = before
+        .resume
+        .slot_positions
+        .iter()
+        .filter(|(name, _)| config.rule.slots.contains_key(*name))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let carry_pools = |aired: &mut BTreeMap<String, PoolResume>| {
+        let mut all = carried_pools.clone();
+        all.append(aired);
+        *aired = all;
+    };
+    carry_pools(&mut resume_out.pools);
+    for p in progress.iter_mut() {
+        carry_pools(&mut p.pools);
+    }
+    let entries_slot = match on_air {
+        crate::calendar::OnAir::Slot { slot, index, .. } => config
+            .rule
+            .all_blocks()
+            .nth(index)
+            .filter(|b| !b.is_pattern() && !b.is_sequencer())
+            .map(|_| slot),
+        crate::calendar::OnAir::AnyTime => None,
+    };
+    let aired_slot = matches!(on_air, crate::calendar::OnAir::Slot { .. });
+    // The resolver counted the aired list's position in `position`. When a
+    // slot aired, that count belongs under the slot's name, and `position`
+    // goes back to the any-time list's untouched value.
+    let place = |position: &mut usize, slots: &mut BTreeMap<String, usize>| {
+        *slots = carried_slots.clone();
+        if let Some(slot) = entries_slot {
+            slots.insert(slot.to_string(), *position);
+        }
+        if aired_slot {
+            *position = before.resume.position;
+        }
+    };
+    place(&mut resume_out.position, &mut resume_out.slot_positions);
+    for p in progress.iter_mut() {
+        place(&mut p.position, &mut p.slot_positions);
+    }
+    // A rotating pool's period list belongs to its pool the same way its
+    // rotation does: a block that did not air keeps the list it was walking.
+    for (name, kept) in &before.resume.lists {
+        if pool_names.contains(name.as_str()) && !resume_out.lists.contains_key(name) {
+            resume_out.lists.insert(name.clone(), kept.clone());
+        }
+    }
 }
 
 /// Where one item sits in the progress of the block that produced it.
@@ -625,6 +773,7 @@ fn progress_per_item(
         out.push(Progress {
             pools,
             position: seat.map_or(position_without_entries, |s| s.position(entries_aired)),
+            slot_positions: BTreeMap::new(),
         });
         match *step {
             Step::Pool { block, seq } => pool_aired[block] = pool_aired[block].max(seq + 1),
@@ -669,7 +818,7 @@ pub fn resolve_channel_fingerprint_ids(
     };
 
     let mut ids: HashSet<String> = HashSet::new();
-    for (idx, include) in config.rule.blocks.iter().enumerate() {
+    for (idx, include) in config.rule.all_blocks().enumerate() {
         if include.is_pattern() || include.is_sequencer() {
             let cat = catalog.ok_or_else(|| {
                 unsupported(format!(
@@ -2003,7 +2152,10 @@ mod tests {
             retention_days: 1,
             seed: None,
             anchor: None,
-            rule: RuleConfig { blocks },
+            rule: RuleConfig {
+                blocks,
+                ..Default::default()
+            },
             groups: Vec::new(),
             overlay: None,
             annotate: None,
@@ -3127,6 +3279,8 @@ mod tests {
                 seed: None,
                 temperature: None,
                 tracks: None,
+                label: None,
+                advisory: None,
                 name: "movies".into(),
                 expr: Some("item.type == \"movie\"".into()),
                 plugin: None,
@@ -3152,6 +3306,8 @@ mod tests {
                 seed: None,
                 temperature: None,
                 tracks: None,
+                label: None,
+                advisory: None,
                 name: "shows".into(),
                 expr: Some("item.type == \"episode\"".into()),
                 plugin: None,
@@ -3956,6 +4112,8 @@ mod tests {
             seed: None,
             temperature: None,
             tracks: None,
+            label: None,
+            advisory: None,
             name: "shows".into(),
             expr: None,
             plugin: None,
@@ -4020,5 +4178,93 @@ mod tests {
             shows: vec!["got".into(), "inv".into()],
         }];
         assert!(validate_groups_against_catalog(path(), &cat, &groups).is_ok());
+    }
+
+    // ---- schedules (ADR 0004) ----------------------------------------------
+
+    /// Any-time list `a0..a9`; slot `night` (`n0..n9`) placed on 20:00-21:00
+    /// every day. Every item runs ten minutes.
+    fn scheduled_channel() -> ChannelConfig {
+        let list = |p: &str| {
+            include_with(
+                (0..10)
+                    .map(|i| Entry::Item(Box::new(item_entry_secs(&format!("{p}{i}"), 600))))
+                    .collect(),
+            )
+        };
+        let mut c = channel(vec![list("a")]);
+        c.rule.slots.insert("night".into(), list("n"));
+        c.rule.schedules =
+            serde_norway::from_str(r#"[{name: nightly, hours: {"20..21": night}}]"#).unwrap();
+        c
+    }
+
+    /// One daemon-shaped generation: a day of fill from `at`.
+    fn scheduled_generation(
+        state: &GenerationState,
+        at: OffsetDateTime,
+    ) -> (Vec<String>, ResumeMap, Vec<Progress>) {
+        let (items, next, progress) = resolve_channel_with_resume(
+            &scheduled_channel(),
+            path(),
+            &[],
+            None,
+            None,
+            state,
+            &Default::default(),
+            Some(Duration::from_secs(86_400)),
+            at,
+        )
+        .unwrap();
+        let ids = items
+            .into_iter()
+            .map(|i| i.id.trim_start_matches("lavfi:").to_string())
+            .collect();
+        (ids, next, progress)
+    }
+
+    /// The (any-time position, `night` position) each per-item checkpoint
+    /// would restore.
+    fn checkpoints(progress: &[Progress]) -> Vec<(usize, Option<usize>)> {
+        progress
+            .iter()
+            .map(|p| (p.position, p.slot_positions.get("night").copied()))
+            .collect()
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn each_list_keeps_its_own_place_across_the_slot_boundary() {
+        let mut state = GenerationState::empty();
+        state.resume.position = 3;
+        state.resume.slot_positions.insert("night".into(), 6);
+
+        // 19:00: the any-time list airs from a3 and stops at 20:00.
+        let at = time::macros::datetime!(2026-10-14 19:00 UTC);
+        let (first, after_first, progress) = scheduled_generation(&state, at);
+        assert_eq!(first, ids(&["a3", "a4", "a5", "a6", "a7", "a8"]));
+        assert_eq!(after_first.position, 9);
+        assert_eq!(after_first.slot_positions.get("night"), Some(&6));
+        // A rewind to any item of it restores the slot's place untouched.
+        assert_eq!(
+            checkpoints(&progress),
+            (3..9).map(|p| (p, Some(6))).collect::<Vec<_>>()
+        );
+
+        // 20:00: the slot continues from n6, wrapping, and leaves a9 waiting.
+        state.resume = after_first;
+        let at = time::macros::datetime!(2026-10-14 20:00 UTC);
+        let (second, after_second, progress) = scheduled_generation(&state, at);
+        assert_eq!(second, ids(&["n6", "n7", "n8", "n9", "n0", "n1"]));
+        assert_eq!(after_second.position, 9);
+        assert_eq!(after_second.slot_positions.get("night"), Some(&2));
+        // ...and a rewind into the slot's run restores the any-time place.
+        assert_eq!(
+            checkpoints(&progress),
+            [6, 7, 8, 9, 0, 1].map(|n| (9, Some(n))).to_vec()
+        );
     }
 }

@@ -177,7 +177,7 @@ pub struct ChannelConfig {
 impl ChannelConfig {
     /// Whether any block interleaves pools via a pattern (#72).
     pub fn is_pattern(&self) -> bool {
-        self.rule.blocks.iter().any(|b| b.is_pattern())
+        self.rule.all_blocks().any(|b| b.is_pattern())
     }
 
     /// Whether any pool on this channel draws its items from a scorer plugin
@@ -190,8 +190,7 @@ impl ChannelConfig {
     /// one (#131).
     pub fn uses_scorer_plugin(&self) -> bool {
         self.rule
-            .blocks
-            .iter()
+            .all_blocks()
             .any(|b| b.pools.iter().any(|p| p.plugin.is_some()))
     }
 
@@ -257,8 +256,7 @@ impl ChannelConfig {
     /// between two.
     pub fn adjacency_reach(&self) -> usize {
         self.rule
-            .blocks
-            .iter()
+            .all_blocks()
             .map(|b| b.adjacency_reach())
             .max()
             .unwrap_or(0)

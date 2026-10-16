@@ -554,8 +554,11 @@ def run_overlay_dump_text(overlay_spec: dict, programme: "Programme", next_title
         }
 
     spec = dict(overlay_spec)
-    script = spec.get("script")
-    if script:
+    graphics = [dict(g) for g in spec.get("graphics") or []]
+    for graphic in graphics:
+        script = graphic.get("script")
+        if not script:
+            continue
         local_path, err = rewrite_script_path(script)
         if err is not None:
             return {
@@ -566,7 +569,8 @@ def run_overlay_dump_text(overlay_spec: dict, programme: "Programme", next_title
                     f"  local path:     {local_path}"
                 ),
             }
-        spec["script"] = local_path
+        graphic["script"] = local_path
+    spec["graphics"] = graphics
 
     out_dir = REPO_ROOT / "tmp" / "claude" / "epg-browser"
     out_dir.mkdir(parents=True, exist_ok=True)

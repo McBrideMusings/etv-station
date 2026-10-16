@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use ersatztv_playout::playout::ProgramMetadata;
@@ -11,13 +12,58 @@ use super::mode::Mode;
 use super::order::Order;
 use super::overlay::OverlayDecl;
 use super::pool::{PatternStep, Pool};
+use super::schedule::Schedule;
 use crate::guide::GuideConfig;
 
-/// A channel's sequencing rule: an ordered list of block-includes that compose
-/// into the channel's playout. Replaces the v1 `loop_forever` rule (#46).
-#[derive(Debug, Deserialize, Serialize)]
+/// A channel's sequencing rule. `blocks` are the any-time rules, composed in
+/// order into the channel's playout; `schedules` place named `slots` blocks
+/// over ranges of the local day and override `blocks` there (ADR 0004).
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct RuleConfig {
     pub blocks: Vec<BlockInclude>,
+
+    /// Blocks a schedule can place, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: BTreeMap<String, BlockInclude>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<Schedule>,
+}
+
+impl RuleConfig {
+    /// Every block the channel can air, by block index: `blocks` first, then
+    /// `slots` in name order. A resolved item's `block` and every per-block
+    /// table (overlays, track rules) use this numbering.
+    pub fn all_blocks(&self) -> impl Iterator<Item = &BlockInclude> {
+        self.blocks.iter().chain(self.slots.values())
+    }
+
+    pub fn all_blocks_mut(&mut self) -> impl Iterator<Item = &mut BlockInclude> {
+        self.blocks.iter_mut().chain(self.slots.values_mut())
+    }
+
+    /// How an error or a log names block index `idx`: `block #2`, or
+    /// `slot "prime"`.
+    pub fn block_label(&self, idx: usize) -> String {
+        match self.slot_name(idx) {
+            Some(name) => format!("slot {name:?}"),
+            None => format!("block #{idx}"),
+        }
+    }
+
+    /// The slot name of block index `idx`, when it is a slot.
+    pub fn slot_name(&self, idx: usize) -> Option<&str> {
+        let n = idx.checked_sub(self.blocks.len())?;
+        self.slots.keys().nth(n).map(String::as_str)
+    }
+
+    /// The block index of slot `name`.
+    pub fn slot_index(&self, name: &str) -> Option<usize> {
+        self.slots
+            .keys()
+            .position(|k| k == name)
+            .map(|n| self.blocks.len() + n)
+    }
 }
 
 /// One `[[rule.blocks]]` entry. The block source is **either** a path to a
@@ -211,11 +257,16 @@ impl BlockInclude {
         // so validation refuses a block that mixes `take: "all"` with any
         // `constraints` instead. Every pool here therefore has `reach() == 0`
         // whenever a take-all step is present, and both sums go unread.
+        //
+        // A `take` range is sized pessimistically for the seam: the cycle at
+        // its longest (every range at its max) with the pool drawn at its
+        // least (every range at its min) is the widest tail a repeat can cross.
         let cycle_total: usize = self
             .pattern
             .iter()
-            .filter_map(|s| s.take.count())
-            .sum::<usize>();
+            .filter_map(|s| s.take.bounds())
+            .map(|(_, max)| max)
+            .sum();
         self.pools
             .iter()
             .map(|pool| {
@@ -223,7 +274,8 @@ impl BlockInclude {
                     .pattern
                     .iter()
                     .filter(|s| s.pool == pool.name)
-                    .filter_map(|s| s.take.count())
+                    .filter_map(|s| s.take.bounds())
+                    .map(|(min, _)| min)
                     .sum();
                 let reach = pool.constraints(block).reach();
                 // A pool no step draws from never reaches the seam at all.
