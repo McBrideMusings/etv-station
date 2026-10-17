@@ -583,6 +583,15 @@ hooks:
 | `generation_end` | after a channel writes one generation of schedule | that channel | `{phase, from, to, items, files}` |
 | `chunk_written` | for each playout file a generation writes | that channel | `{path, phase}` |
 | `schedule_item_change` | when the station clock passes an item boundary on a channel, watched or not; the item airing when the daemon starts is the baseline and fires nothing | that channel | `{item, previous}`, each `{id, title, start, finish}` |
+| `playback_item_change` | when ETV-next's channel worker begins encoding an item (it leads what the viewer sees by the worker's transcode buffer); only while someone is watching. Items already logged when the daemon starts fire nothing | that channel | `{at, item}`, `item` is `{id, title, start, finish}` |
+| `viewer_start` | when a viewer tunes in and ETV-next starts the channel's worker | that channel | `{at}` |
+| `viewer_stop` | when the worker ends: the last viewer left, or the run failed. A worker killed by a signal writes nothing, so no `viewer_stop` follows | that channel | `{at}` |
+
+The three playback triggers read `.playback-events.jsonl` in the channel's
+playout folder, one JSON line per event, written by the vendored ETV-next
+worker (`ersatztv-channel`'s `playback_events.rs`). The worker drops the file at
+a session start once it passes 256 KiB. The station polls it every 500 ms and
+logs each line it fires as `playback.event`.
 
 A hook in `station.yaml` runs for every channel's events; a hook in a
 `channel.yaml` runs only for that channel's. `startup` and `config_reload` reach
@@ -1009,8 +1018,9 @@ draws nothing; move those three keys under a `graphics:` entry.
 **What a script can read.** `time`, `frame`, the current item's `title`,
 `sub_title`, `description`, `season`, `episode`, `year`, `content_rating`
 (the catalog's rating for the item, `""` when it has none), the `next_*`
-equivalents, `item_elapsed`, `item_remaining`, its own `config`, and the
-item's opaque blob as `metadata`. `prev_metadata` is the blob of the item that
+equivalents, `item_elapsed`, `item_remaining`, `item_duration` (the two summed, `-1.0`
+when either is unknown), its own `config`, and the item's opaque blob as
+`metadata`. `prev_metadata` is the blob of the item that
 aired before it, so a script can notice a change between consecutive items;
 it is `()` for a channel's first item and when the earlier item carried none.
 Test for a map with `type_of(prev_metadata) == "map"` before reading a key
@@ -1045,6 +1055,25 @@ draws nothing.
     #{ type: "image", path: "card-logo.png", corner: "top_right", height: 64, opacity: 0.8 },
 ] }
 ```
+
+**Text layers.** A `text` layer draws one block of text. `\n` in `content` breaks
+a line, and the block is as wide as its widest line:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `align` | `left` | `left`, `center` or `right`: where a shorter line sits against the widest one. |
+| `bold` | `false` | the whole block in the bundled Inter Bold. |
+| `italic` | `false` | the whole block slanted. Inter has no italic cut, so this is a synthesized oblique. |
+| `markup` | `false` | read `*italic*` and `**bold**` spans in `content`; the markers are not drawn, and an unpaired one stays literal and spans do not nest. |
+| `visible_lines` | all | draw only the first N lines. The block is still measured and placed whole, so a line appearing never moves the lines already up. Settable per frame on a declared layer. |
+| `below` | none | the index (in the frame's layer list) of an earlier text layer to hang this one under: top edge on its bottom edge, and the `align` edge (left, center, right) flush with the same edge of that layer's box. `corner` and `margin` are ignored; `offset_x`/`offset_y` still apply. The other layer is measured from its whole content, so a credit sits under the widest line even while later lines are still hidden. A block whose `below` target is not drawn this frame is not drawn. |
+
+`corner: center` centers the block on the frame, for text, images and the
+watermark alike. `crates/etv-overlay/fixtures/scripts/text_card.rhai` is a
+working card built from these (centered lines revealed from `item_elapsed`, an
+italic span, a right-aligned credit); preview it with
+`etv-overlay render-still --config crates/etv-overlay/fixtures/text_card.yaml
+--time 1 --item-elapsed 20 --item-remaining 10 --output card.png`.
 
 ### Pool `label` / `advisory` — naming the block on screen
 

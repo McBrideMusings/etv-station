@@ -177,10 +177,13 @@ pub enum OverlayKind {
         #[serde(default = "default_scrim_color")]
         color: [u8; 4],
     },
-    /// Static single-line text overlay (channel banner, "TEST PATTERN", etc).
-    /// Dynamic content templating (e.g. `{title}` from program metadata) is
-    /// not yet wired — `content` is taken verbatim. See follow-up issue for
-    /// the station→overlay metadata bridge.
+    /// A text block: one line (channel banner, "TEST PATTERN") or several
+    /// (`\n` breaks a line). `content` is drawn verbatim unless `markup` is on;
+    /// a script sets it per frame.
+    ///
+    /// The block is as wide as its widest line, and `align` places each line
+    /// inside that width — so `center` centers the lines on one another, and
+    /// `corner` (including `center`) then places the whole block on the frame.
     Text {
         content: String,
         #[serde(default = "default_font_family")]
@@ -204,7 +207,50 @@ pub enum OverlayKind {
         corner: Corner,
         #[serde(default = "default_margin")]
         margin: u32,
+        /// How the lines of a multi-line block sit against its widest line.
+        #[serde(default)]
+        align: TextAlign,
+        /// The whole block in the bold face (Inter Bold, bundled).
+        #[serde(default)]
+        bold: bool,
+        /// The whole block slanted. Inter has no italic cut, so this is the
+        /// font stack's synthesized oblique.
+        #[serde(default)]
+        italic: bool,
+        /// Read `*italic*` and `**bold**` spans in `content`, marker pairs
+        /// removed from what is drawn. Off by default so a title containing an
+        /// asterisk draws as written. An unpaired marker stays literal, and spans
+        /// do not nest.
+        #[serde(default)]
+        markup: bool,
+        /// Draw only the first N lines. The block is still measured and placed
+        /// as a whole, so revealing a line never moves the lines already up —
+        /// the way to time a card's lines one after another from
+        /// `item_elapsed`. Absent draws every line.
+        #[serde(default)]
+        visible_lines: Option<u32>,
+        /// Place this block under an earlier text layer of the frame, by that
+        /// layer's index (a later or missing index draws nothing): its top edge on the other block's bottom edge, and
+        /// its `align` edge (left, center or right) flush with the same edge of
+        /// the other block's box. `corner` and `margin` are ignored;
+        /// `offset_x`/`offset_y` still apply. This is how a credit sits under
+        /// the widest line of a card without the script measuring text. The
+        /// other layer is measured from its whole content even when
+        /// `visible_lines` hides some of it; if it is not drawn this frame
+        /// this block is not drawn either.
+        #[serde(default)]
+        below: Option<usize>,
     },
+}
+
+/// Horizontal placement of a text block's lines against its widest line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 fn default_margin() -> u32 {
@@ -269,6 +315,8 @@ pub enum Corner {
     TopLeft,
     BottomRight,
     BottomLeft,
+    /// Centered on the frame in both directions; `margin` has no effect.
+    Center,
 }
 
 /// The four fields baked into the fifo's byte layout at spawn: they size the
@@ -460,6 +508,7 @@ graphics:
                 color,
                 corner,
                 margin,
+                ..
             } => {
                 assert_eq!(content, "ETV STATION");
                 assert_eq!(font_family, "Helvetica");
@@ -496,6 +545,7 @@ graphics:
                 color,
                 corner,
                 margin,
+                ..
             } => {
                 assert_eq!(content, "hi");
                 assert_eq!(font_family, "system-ui");

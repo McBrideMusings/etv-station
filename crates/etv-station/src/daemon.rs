@@ -1087,6 +1087,23 @@ async fn run_generation(
                 watch_stop,
             )));
         }
+        if [
+            crate::config::HookTrigger::PlaybackItemChange,
+            crate::config::HookTrigger::ViewerStart,
+            crate::config::HookTrigger::ViewerStop,
+        ]
+        .into_iter()
+        .any(|t| bus.wants(t, Some(&channel_name)))
+        {
+            let watch_stop = Arc::new(Notify::new());
+            stops.push(watch_stop.clone());
+            supervisor_handles.push(tokio::spawn(crate::hooks::run_playback_watch(
+                bus.clone(),
+                channel_name.clone(),
+                station.channels[idx].output_folder.clone(),
+                watch_stop,
+            )));
+        }
         let hook_bus = bus.clone();
         // One span per channel wraps the whole channel loop, so every event it
         // emits (roll ticks, chunk writes, retention deletes) carries the channel

@@ -150,6 +150,12 @@ pub async fn run_folders_held_by_session(channel_folder: &Path) -> HashSet<Strin
         .collect()
 }
 
+/// Append-only JSON-lines file in the channel's playout folder where the
+/// channel worker records playback: one line when a worker run starts, one for
+/// each item it begins encoding, one when the run ends. The station tails it;
+/// see `ersatztv_channel::playback_events` for the line shapes.
+pub const PLAYBACK_EVENTS_FILE_NAME: &str = ".playback-events.jsonl";
+
 /// Touched by the channel worker before it opens a live overlay's rawvideo fifo
 /// for read. Its presence tells the overlay producer (the separate etv-station
 /// daemon) that this channel is now being watched and its overlay process

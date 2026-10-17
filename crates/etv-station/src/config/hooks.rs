@@ -51,6 +51,12 @@ pub enum HookTrigger {
     /// When the station clock passes an item boundary on a channel, whether
     /// or not anyone is watching.
     ScheduleItemChange,
+    /// When ETV-next's channel worker begins encoding an item for a viewer.
+    PlaybackItemChange,
+    /// When a viewer tunes in and ETV-next starts the channel worker.
+    ViewerStart,
+    /// When the channel worker ends: the last viewer left or the run failed.
+    ViewerStop,
 }
 
 impl HookTrigger {
@@ -62,6 +68,9 @@ impl HookTrigger {
             HookTrigger::GenerationEnd => "generation_end",
             HookTrigger::ChunkWritten => "chunk_written",
             HookTrigger::ScheduleItemChange => "schedule_item_change",
+            HookTrigger::PlaybackItemChange => "playback_item_change",
+            HookTrigger::ViewerStart => "viewer_start",
+            HookTrigger::ViewerStop => "viewer_stop",
         }
     }
 }

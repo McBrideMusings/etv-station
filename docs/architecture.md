@@ -148,7 +148,7 @@ There is deliberately no streaming fallback. A Plex entry whose path does not re
 
 ## Why filesystem-only IPC
 
-Matches ETV-next's existing process model — it already uses files (`.ready`, `.heartbeat`) for signaling between server and channel subprocesses. No new protocol surface. `ls` shows you the state. Atomic emission via `rename(2)` means the consumer can't observe a half-written file.
+Matches ETV-next's existing process model — it already uses files (`.ready`, `.heartbeat`) for signaling between server and channel subprocesses. No new protocol surface. The channel worker also appends playback lines (session start and stop, item started) to `.playback-events.jsonl` in the playout folder, which the station tails to fire the `playback_item_change`, `viewer_start` and `viewer_stop` hooks. `ls` shows you the state. Atomic emission via `rename(2)` means the consumer can't observe a half-written file.
 
 ## Why Rust
 
@@ -213,6 +213,7 @@ The `etv-overlay pipe` subprocess (one per channel, supervised by `overlay_super
 | `next_sub_title` | string  | next item's `program.sub_title`                 |
 | `item_elapsed`   | float   | seconds since current item's `start` (`-1.0` if unknown) |
 | `item_remaining` | float   | seconds until current item's `finish` (`-1.0` if unknown) |
+| `item_duration`  | float   | `item_elapsed + item_remaining` (`-1.0` if either is unknown) |
 | `metadata`       | dynamic | currently-airing item's opaque `metadata` blob, verbatim (`()` if absent) |
 | `prev_metadata`  | dynamic | the previous item's `metadata` blob, verbatim (`()` if none) |
 | `content_rating` | string  | currently-airing item's catalog rating, e.g. `TV-MA`, `R` (`""` if none) |
