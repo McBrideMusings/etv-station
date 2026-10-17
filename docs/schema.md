@@ -2351,6 +2351,31 @@ Error cases:
 
 Worked sample: `examples/plugins/foryou-sequencer.rhai`.
 
+### Channel `annotate` — a plugin attaches metadata to every item
+
+A channel can name an `annotate:` script beside its `rule:`. After the whole
+schedule resolves, the station calls the script's `annotate(ctx, item)` once per
+item, in schedule order. The script never sees or changes ordering, selection
+or timing; it only returns metadata to add.
+
+```rhai
+fn hooks() { ["annotate"] }
+fn capabilities() { ["http"] }   // optional; `http` is the only capability offered
+
+fn annotate(ctx, item) {
+    // ctx.channel — the channel's name; ctx.http(url, method, body) with `http`
+    // item        — the catalog item map, plus `block` and `metadata`
+    #{ rating: 8 }               // keys to add, or () to add nothing
+}
+```
+
+The returned map merges into the item's metadata key by key. A key the item
+already carries (a `pool_provider`'s own `pick()` metadata, for one) keeps its
+value, and the station logs `annotate.key_collision`. A script error leaves that
+item unannotated and logs `annotate.failed`; the channel keeps airing. The
+`http` capability is granted by the script's own `capabilities()`, since
+`annotate:` is a bare path with no place for a channel grant. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
+
 ### Pattern step `take` — how many items one visit draws
 
 A step in a block's `pattern:` is `{pool, take, from, chance}`. `take` has
@@ -2455,7 +2480,41 @@ draws alone, so if two pools in one block resolve the same `entry_id`, neither
 pool's constraint sees the collision. Pools that must not collide have to be
 disjoint by construction — `examples/samples/kungfu.yaml` does it with the pools'
 own expressions, `examples/samples/foryou.yaml` with a plugin that splits on
-`item.type` — because the pool contract does not guarantee it.
+`item.type` — or the channel has to say so with `rule.no_repeat_within` (below),
+because the pool contract does not guarantee it.
+
+**`rule.no_repeat_within` spaces the whole channel.** Set on `rule`, beside
+`blocks` and `slots`, it takes the same two spellings and counts **channel**
+positions or wall-clock time across every pool, block and slot:
+
+```yaml
+rule:
+  no_repeat_within: "7d"   # no film twice in a week, whichever pool draws it
+  blocks:
+    - pools: [ … ]
+```
+
+The pattern walk checks it at every draw, beside the drawing pool's own rule,
+against one history: the play-history ledger's tail — every pool and slot that
+aired — then what earlier pattern and sequencer blocks of the same generation laid, then each
+draw as it is made. A series whose next item fails it is passed over exactly as a
+pool-rule clash is: a round-robin pool slides to the next series, a random pool
+rerolls. When nothing passes both, the channel rule gives way first, so the
+pool's own rule holds as it would without it; a draw that airs against the
+channel rule is logged as `constraints.unsatisfied` with `scope: channel`, and
+every generation it moved a draw logs `channel_repeat.applied` with how many
+draws it moved off their first choice (`blocked`) and how many aired against it
+anyway (`forced`). An earlier entries block of the same generation is not yet
+in the history — its list is seated and cut after the pattern blocks run — so
+it counts from the next generation on, once the ledger holds it.
+
+It does not ask a pool's source for more: a pool that has aired everything it
+holds refills as it always did, and a plugin pool already sees the channel's tail
+in `ctx.recent`. Entries and sequencer blocks are counted in the history but
+not constrained by it — a flat authored list and a script both own their order
+— and a channel with no pattern block
+fails its load if it sets the key. The tail the station keeps is sized to cover
+it, so a `"7d"` rule holds across generation boundaries too.
 
 **Mind the window size.** A no-repeat rule on a pool the pattern draws heavily
 from marches that pool forward instead of letting it revisit, so the wider

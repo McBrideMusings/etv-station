@@ -251,6 +251,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     }
 
     validate_schedules(path, &channel.rule)?;
+    validate_channel_repeat(path, &channel.rule)?;
 
     Ok(())
 }
@@ -1147,6 +1148,7 @@ fn validate_plugin_declares_annotate(
 ) -> Result<(), ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, annotate);
     let hooks = crate::score::declared_hooks(&script_path).map_err(bad)?;
+    crate::score::declared_capabilities(&script_path, "annotate").map_err(bad)?;
     if !hooks.iter().any(|h| h == "annotate") {
         return Err(bad(format!(
             "channel names plugin {} via `annotate:`, which requires the plugin to \
@@ -1197,6 +1199,21 @@ fn validate_pool_groups(
             }
             owner.insert(show.as_str(), gname.as_str());
         }
+    }
+    Ok(())
+}
+
+/// `rule.no_repeat_within` is enforced by the pattern walk alone, so on a
+/// channel with no pattern block it would do nothing — an unused knob that
+/// reads as a guarantee. Refused rather than silently ignored.
+fn validate_channel_repeat(path: &Path, rule: &super::RuleConfig) -> Result<(), ConfigError> {
+    if rule.no_repeat_within.is_some() && !rule.all_blocks().any(|b| b.is_pattern()) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: "`rule.no_repeat_within` is checked by the pattern walk, and this channel \
+                      has no pattern block; use a block's own `constraints` instead"
+                .into(),
+        });
     }
     Ok(())
 }
@@ -1764,6 +1781,30 @@ mod tests {
             separate_min_gap: Some(5),
         });
         assert_eq!(channel_with(vec![a, b]).adjacency_reach(), 5);
+    }
+
+    /// `rule.no_repeat_within` already counts channel positions, so a 24h rule
+    /// sizes the tail at its own conversion (one position per assumed minute),
+    /// and outranks a block whose reach is narrower.
+    #[test]
+    fn adjacency_reach_covers_the_channel_rule() {
+        let mut c = channel_with(vec![pattern_block(
+            vec![pool("movies")],
+            vec![step("movies", 1)],
+        )]);
+        assert_eq!(c.adjacency_reach(), 0);
+        c.rule.no_repeat_within = Some(NoRepeatWithin::Duration(Duration::from_secs(24 * 3600)));
+        assert_eq!(c.adjacency_reach(), 24 * 60);
+    }
+
+    /// Only the pattern walk checks the channel rule, so a channel with no
+    /// pattern block is refused rather than handed a rule that does nothing.
+    #[test]
+    fn a_channel_rule_without_a_pattern_block_is_refused() {
+        let mut c = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        c.rule.no_repeat_within = Some(NoRepeatWithin::Positions(3));
+        let err = validate_channel(&dummy_path(), &c).unwrap_err().to_string();
+        assert!(err.contains("rule.no_repeat_within"), "{err}");
     }
 
     /// A pool's gap counts *its own* draws, so the aired history it needs is
@@ -2474,6 +2515,18 @@ fn pick(ctx) { throw "pick must not run at load time"; }
         assert!(msg.contains("annotate"), "msg = {msg}");
         assert!(msg.contains("annotator.rhai"), "msg = {msg}");
         assert!(msg.contains("sequencer"), "msg = {msg}");
+    }
+
+    /// A script declaring a capability the annotate hook does not offer is
+    /// refused at load.
+    #[test]
+    fn an_annotate_script_declaring_an_unoffered_capability_is_rejected() {
+        let err = validate_annotate_script(
+            r#"fn hooks() { ["annotate"] }
+fn capabilities() { ["catalog_read"] }"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("catalog_read"), "err = {err}");
     }
 
     /// A channel that omits `annotate:` entirely loads exactly as before —

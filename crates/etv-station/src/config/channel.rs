@@ -274,11 +274,15 @@ impl ChannelConfig {
     /// make a wide `separate_min_gap` hold inside a generation and quietly lapse
     /// between two.
     pub fn adjacency_reach(&self) -> usize {
+        // The channel-wide rule already counts channel positions, so it needs
+        // no conversion — only the widest of it and every block's own reach.
+        let channel = self.rule.no_repeat_within.map_or(0, |gap| gap.reach());
         self.rule
             .all_blocks()
             .map(|b| b.adjacency_reach())
             .max()
             .unwrap_or(0)
+            .max(channel)
     }
 }
 
