@@ -272,10 +272,21 @@ pub fn build(
 
     // The metadata half of what plugin pools picked (#166) — `arrange()` sees
     // a pool's `pick()` record only as the bare `entry_id`s in `ctx.pools`,
-    // with the record's `metadata` stashed on the side by `crate::score::pick`
-    // and recovered here by id, through the same shared helper `pattern::build`
-    // uses (#203) so this path can't drop a field the pattern path keeps.
-    let mut metadata_out = crate::pattern::flatten_picked_extras(score_cache.picked_extras);
+    // with the record's `metadata` stashed on the side by `crate::score::pick`.
+    // Recovered by the pool `item_location` names as each id's home, so an id
+    // two pools both ranked carries that pool's record on every rerun, not
+    // whichever one a hash map yields first.
+    let mut metadata_out: HashMap<String, serde_json::Value> = HashMap::new();
+    for id in &arranged {
+        if let Some(&(pool_idx, _)) = item_location.get(id)
+            && let Some(m) = score_cache
+                .picked_extras
+                .get(&(series_by_pool[pool_idx].0.clone(), id.clone()))
+                .and_then(|extra| extra.metadata.clone())
+        {
+            metadata_out.insert(id.clone(), m);
+        }
+    }
     // Each drawn item carries its pool's `label:`/`advisory:`, read from
     // `item_location` like the `guide:` rung below.
     for id in &arranged {

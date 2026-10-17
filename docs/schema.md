@@ -170,7 +170,7 @@ without naming each one — see `catalog/query.rs`'s `method_predicate`.
 | `year` | int | |
 | `season` | int | |
 | `episode` | int | |
-| `absolute_episode` | int | franchise-wide episode number |
+| `absolute_episode` | int | franchise-wide episode number: Plex's own when it numbered every episode of the show, otherwise the regular episodes (season ≥ 1 with an episode number) renumbered 1..N by (season, episode); season 0 specials and episodes missing a season or episode get no number |
 | `duration_ms` | int | |
 | `genres` | tags | |
 | `labels` | tags | |
@@ -230,6 +230,87 @@ resolutions in two folders — matches either folder, because both are true.
 
 Only the last folder in the path counts: a file at `/media/library/bumpers/x.mkv`
 matches `"bumpers"` and not `"library"`.
+
+#### `keyword_score` — count matches against a keyword set (#161)
+
+`keyword_score(["a", "b", …])` returns how many of the listed keywords an item
+matches. Compare it to a threshold with the ordinary operators — `>=`, `>`, `==`,
+`!=`, `<=`, `<` — so a pool can ask for "enough of these that I mean it" where a
+single `genres.contains(...)` is one shared tag.
+
+A keyword matches when it is a case-insensitive substring of the title, or equals
+(ignoring case) one tag value: any genre, label, cast or director, as `item.tags`
+does. A keyword repeated in the list counts once. The station ships no keyword
+sets; the list is the channel author's.
+
+Plex genre is multi-valued, so `item.genres.contains("Comedy")` admits both
+*Beverly Hills Cop* (`Action`, `Comedy`, `Crime`) and *Shaun of the Dead*
+(`Comedy`, `Horror`). A Sitcoms-style pool that wants comedies and not
+action-comedies counts the action keywords and requires none:
+
+```yaml
+pools:
+  - name: comedies
+    expr: 'item.genres.contains("Comedy") && keyword_score(["action", "crime", "thriller"]) == 0'
+```
+
+That admits *Shaun of the Dead* and *Airplane!* (`Comedy` only) and drops *Beverly
+Hills Cop*, which scores 2. Loosen the pool to `< 2` to let a single-genre
+crossover back in. These three films are the fixture of the test
+`keyword_score_counts_matched_keywords_against_a_threshold` in `catalog/query.rs`;
+the scores above are what that test asserts.
+
+A pool whose `expr` can never match fails when the config loads, naming the pool:
+an empty keyword list, or a threshold the list cannot reach (`>= 3` over two
+keywords). `etv-query-test` evaluates the function against its own item fields (title and
+categories), so a set can be tuned there first; it does not apply the load-time
+threshold check, and it folds case with Unicode rules where the station folds
+ASCII only.
+
+#### `category("name")` — a keyword set defined once (#170)
+
+A category is a keyword set plus its threshold, declared in a file outside any
+channel and referenced by name. `category("kung-fu")` in a pool `expr` (or a
+pool's `sources` expression) means `keyword_score([…the category's keywords…]) >=
+<its threshold>`, so it is a yes/no test that combines with `&&` and `||` like
+any other:
+
+```yaml
+# station.yaml
+categories: ["categories/*.yaml"]   # literal paths or globs, relative to this file
+
+# categories/martial.yaml
+categories:
+  - name: kung-fu
+    keywords: ["kung fu", "martial arts", "shaolin"]
+    threshold: 2          # matches at least 2 of the 3
+
+# channels/kungfu.yaml and channels/action.yaml, each in a pool
+expr: 'category("kung-fu") && item.type == "movie"'
+```
+
+Both channels resolve the same item set, because the station expands the
+reference to the same inline form at load. Edit the file and reload, and every
+channel naming the category changes with it. The inline `keyword_score([...]) >= n`
+form keeps working exactly as before.
+
+**A category used by one pool is not worth declaring.** Naming it adds a file to
+look in and a name to remember, and buys nothing over writing the set inline in
+that pool. Reach for a category when a second pool wants the same set: the reuse
+is the whole payoff. The station ships no categories; what "kung fu" means is
+the channel author's.
+
+These fail at load, not at air time:
+
+- a reference to a category nobody declared, naming it and listing the declared
+  ones (the channel is dropped, as for any bad channel config);
+- two declarations of one name, naming both files and entry numbers (the whole
+  station refuses to load, since the category is shared);
+- an empty keyword set, or a threshold outside `1..=` the number of distinct
+  keywords.
+
+The reference is found by text, so a `category("…")` written inside a string
+literal of the expression is expanded too.
 
 ### `kind: collection` — play a catalog collection in its authored order
 
@@ -513,6 +594,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
+| `categories` | no — default empty | list of category files, literal or glob like `channels`; each declares named keyword sets pools reference as `category("name")` (see [`category`](#category-name-a-keyword-set-defined-once-170)) |
 | `source_roots` | no — default empty | list of directories the daemon walks to populate the catalog when `catalog_path` is set — an operational choice about what this deployment scans, not used for identity. Empty skips the filesystem scan entirely. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime. |
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
@@ -1569,7 +1651,8 @@ Watch state comes from the granted datastore's whole `plays` table
 (`watched_units_for`, plex-db-ex#60), not from `ctx.history`, which is the
 newest 1000 Tautulli rows and would call a film watched two years ago unseen.
 A pool with no `ctx.account_id` — a pooled channel — partitions on what the
-*house* has played, which is the closest true answer available to it. On a
+*house* has played, which is the closest true answer available to it; the
+script logs a `score.log` line saying so each generation. On a
 `unit: show` pool the partition keys on the series, matching the unit ranked.
 
 **`unusual_weight`** divides the score by `1 + unusual_weight × house cosine`,
@@ -1584,8 +1667,8 @@ vector's magnitude, so useful values are small. Measured on
 `002-for-pierce`, watching for the failure mode where titles the account's own
 taste says nothing about float up purely because the house dislikes them:
 `0.05`–`0.25` are clean, `0.5` puts 8 such titles in 42 picks, `1.0` puts 22
-in 43. It means nothing on a pooled channel, where the taste vector already is
-the house vector.
+in 43. On a pooled channel the taste vector already is the house vector, so a
+nonzero value there fails the generation with an error instead of doing nothing.
 
 Every pick's audit detail carries `house_score`, `unusual_weight` and `seen`,
 and the verdict names the half the pick came from — so `admin audit` says
@@ -2144,7 +2227,6 @@ Five knobs sit on the channel, under `scoring:`, all optional:
 | `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
 | `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
 | `user` | — | The account `single_user` follows: a Tautulli username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
-| `attribution` | `false` | Name who has been watching each item, in the guide and on screen. Off by default; see below. |
 | `explain` | `false` | Show a one-line "why this was picked" explanation in the guide, built from each item's `metadata.audit` trail. Off by default; see below. |
 
 `target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
@@ -2170,6 +2252,12 @@ otherwise. A `single_user` channel with nobody named would quietly fall back to
 the pooled history and rank a personal channel against everyone's viewing while
 looking perfectly healthy.
 
+`single_user` also requires `PLEX_URL` and `PLEX_TOKEN` in the daemon's
+environment, whatever the catalog ingests from and whatever datastores a scorer
+plugin is granted. Tautulli's user id is translated to a Plex account id through
+Plex, because the two differ only for the server owner and only Plex can say
+which account that is. A missing variable fails at load.
+
 What is *not* checked at load is whether the named account exists — that needs
 the network, and this is a config pass. Tautulli answers an unknown user with an
 empty history, which shows up at runtime as `rows=0` on that scope's
@@ -2183,48 +2271,6 @@ that resolves to nobody fails that channel's generation loudly, naming the
 user, every tick until it is fixed — never a silent fall back to the pooled
 vector, which would make a channel called "For Pierce" rank against everyone's
 viewing while looking perfectly healthy. See `ctx.account_id` above.
-
-#### `attribution` — naming who has been watching
-
-With `attribution: true`, each item the channel schedules gets a line appended to
-its guide description:
-
-```
-A hobbit sets out.
-
-Watched recently by bob, carol and dave
-```
-
-Up to three names, then `and N others`. A person who rewatched something is named
-once — the line says who has been watching, not how many plays there were — and
-within an item the most recent watchers are the ones that survive the cut. An
-item nobody on record has watched gets no line at all, and an item's existing
-synopsis is never replaced, only appended to.
-
-It reaches two surfaces from that one field:
-
-- **The guide.** `ProgramMetadata.description` is what ETV-next turns into XMLTV,
-  so the line shows up as the programme description in Plex.
-- **On screen.** The overlay parses the same playout JSON, so a Rhai overlay
-  script gets `description` (the whole thing) and `watched_by` (the credit line
-  on its own, empty when there isn't one). Gate a lower third on
-  `watched_by != ""`.
-
-Two things it cannot do. It says **"recently"** and never "this week", because
-Tautulli's `get_history` has no `since` parameter — the rows reach back as far as
-the last thousand reach. And it is only as fresh as the generation that wrote the
-chunk: a chunk written now and aired in six hours carries six-hour-old
-attribution, because there is no path from ETV-next back to the station to
-refresh a chunk in place. A channel that wants it current wants a short
-`window_days` and `chunk_hours`, as the For You sample already does for ranking.
-
-`attribution` is opt-in rather than derived because turning it on publishes every
-viewer's activity to everyone else watching that channel. On a shared server that
-is a privacy decision, not a formatting one.
-
-It is also a second reader of the watch history, alongside a scorer plugin — so a
-channel with `attribution: true` and no `plugin:` pool still fetches history,
-where before only a plugin could cause a fetch (#131).
 
 #### `explain` — why each item was picked
 
@@ -2255,14 +2301,7 @@ An item with no audit trail at all — nothing wrote one, or the channel has no
 existing synopsis is never replaced, only appended to. `detail` is never read
 to build this line; it stays opaque per ADR 0002.
 
-Description order is synopsis, explain line, attribution line: with both
-`explain` and `attribution` on, the why comes before the credit.
-
-Like `attribution`, `explain` reaches the overlay too: the credit line is
-pulled back out of `description` by a fixed prefix search from the end, so an
-explain line ahead of it does not interfere.
-
-`explain` is opt-in for the same reason `attribution` is — a `verdict` is
+`explain` is opt-in — a `verdict` is
 written for `admin audit`'s operator reader, not a viewer, so surfacing it
 (or a plugin's `guide`) to everyone watching the channel is a call made per
 channel, in writing, not derived automatically.
@@ -2407,7 +2446,10 @@ item unannotated and logs `annotate.failed`; the channel keeps airing. The
 channel grants exactly the capabilities the script declares (ADR 0015), as a
 pool does: a script declaring `http` with no `http` in `annotate.capabilities`
 is refused at load, naming the script and the field, and so is a grant the
-script never declares. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
+script never declares. `examples/plugins/attribution.rhai` is a worked
+example: it asks Tautulli who has recently watched each item and returns
+`#{ attribution: "Watched recently by bob and carol" }`, which an overlay script
+reads as `metadata.attribution`. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
 
 ### Pattern step `take` — how many items one visit draws
 

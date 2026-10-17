@@ -69,7 +69,7 @@ position are kept while other blocks air. The sample is
 
 **Grade.** Applies to a channel with two or more pools. The measure is the
 largest swing in any one pool's share of airtime between the day's four
-6-hour quarters (midnight, 6 AM, noon, 6 PM, local time). 30 points or more
+6-hour quarters (midnight, 6 AM, noon, 6 PM, local time); an airing's time is split across the quarters it covers. 30 points or more
 is 3, 20 is 2, 10 is 1, under 10 is 0 (**unsourced**).
 
 ## Block programming and episodes per block
@@ -190,8 +190,8 @@ place on each, so it restarts on every channel it appears on. Tracked in
 
 **Grade.** Applies when a show that aired has 75 or more episodes in the
 catalog (three seasons, per Strip programming above). The measure is the
-share of the span's weekdays on which that show starts an episode in its
-most-used weekday hour, taking the best such show. 80% or more is 3, 60% is
+share of the span's weekdays on which that show starts an episode within 30 minutes of its
+usual weekday start time, taking the best such show. 80% or more is 3, 60% is
 2, 40% is 1, under 40% is 0 (**unsourced**).
 
 ## Episode order
@@ -230,7 +230,8 @@ serialized drama), which needs broadcast order?
 **Grade.** Applies when a show airs twice from a pool whose `order` is not
 `random`; a random pool shuffles on purpose. The measure is the share of
 steps between consecutive airings of one show that do not go to the next
-episode, or to episode 1 of the next season. 0% is 3, up to 5% is 2, up to
+episode, to episode 1 of the next season, or back to the show's first aired
+episode (episode 1) after its last, as a looping channel does. 0% is 3, up to 5% is 2, up to
 15% is 1, more is 0 (**unsourced**).
 
 ## Movie slot length and cheap repeats
@@ -467,8 +468,17 @@ because rotation, `advance: resume` and scorer suppression all change it.
 - A pool whose `expr` reads a Plex collection (`item.collections.contains(...)`)
   changes with the collection, which is the station's form of a monthly
   rotation.
+- On an `advance: resume` pool, a multi-episode show played through to its
+  last episode sits out the rest of the lap: the rotation passes over it until
+  every other show has had a turn, then restarts it at episode 1. Films
+  (series of one) are not rested this way; `no_repeat_within` covers them.
 - `seed: { rotate: 2d }` and `temperature:` rotate what a ranked pool hands
   back. See the section below.
+
+**Grade.** Applies once a program has aired. The measure is the days until
+any program (an airing of 5 minutes or more) airs a second time, or the whole
+span when nothing repeats; a repeating bumper does not count. 14 days or more
+is 3, 7 is 2 (FAST guidance to refresh weekly, above), 3 is 1, under 3 is 0.
 
 ## Rotating the list: seed and temperature
 
@@ -522,8 +532,3 @@ changes the list before the walk reaches slot 2, and the pool behaves like
 
 A new theme each month is a slot per theme and a schedule per month whose
 `dates:` spans that month, such as `["04-01..04-30"]`.
-
-**Grade.** Applies once a program has aired. The measure is the days until
-any program (an airing of 5 minutes or more) airs a second time, or the whole
-span when nothing repeats; a repeating bumper does not count. 14 days or more
-is 3, 7 is 2 (FAST guidance to refresh weekly, above), 3 is 1, under 3 is 0.

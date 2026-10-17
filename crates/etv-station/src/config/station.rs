@@ -42,6 +42,13 @@ pub struct StationConfig {
     /// that doesn't exist is an error, and a glob matching nothing is an error.
     pub channels: Vec<String>,
 
+    /// Category files (#170): literal paths or globs, resolved like `channels`.
+    /// Each file declares named keyword sets that any channel's pool
+    /// expression references as `category("name")`. A name declared twice, or
+    /// referenced but never declared, fails the load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+
     /// Filesystem directories the daemon walks to populate the catalog when
     /// `catalog_path` is set — an operational choice about which parts of this
     /// deployment's disk the daemon is allowed to read. Empty (the default)

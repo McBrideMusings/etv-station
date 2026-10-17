@@ -284,12 +284,8 @@ impl RhaiEngine {
         scope.push_constant("frame", frame_index as i64);
         scope.push_constant("title", program.title.clone());
         scope.push_constant("sub_title", program.sub_title.clone());
-        // The current item's guide description. Its last line names who has
-        // been watching when the channel sets `scoring.attribution` (#113);
-        // `watched_by` is that line on its own, for a script that wants the
-        // credit without the synopsis above it.
+        // The current item's guide description.
         scope.push_constant("description", program.description.clone());
-        scope.push_constant("watched_by", watched_by_line(&program.description));
         // `-1` for absent, per `ProgramContext`. `season >= 0` is how a script
         // tells an episode from a film, since the station writes season and
         // episode only for episodes.
@@ -467,27 +463,6 @@ fn item_duration(program: &ProgramContext) -> f64 {
     } else {
         program.item_elapsed + program.item_remaining
     }
-}
-
-/// The attribution credit on its own, pulled back out of the description the
-/// station appended it to (#113).
-///
-/// The station writes the synopsis, a blank line, then the credit, so the
-/// credit is the last paragraph and starts with a known prefix. Matching on the
-/// prefix rather than "take the last paragraph" is what keeps a film whose
-/// synopsis happens to end in a short paragraph from being drawn on screen as
-/// if it were a credit.
-///
-/// Empty when the channel does not attribute, which is the common case — a
-/// script gates on `watched_by != ""`.
-fn watched_by_line(description: &str) -> String {
-    const PREFIX: &str = "Watched recently by ";
-    description
-        .lines()
-        .rev()
-        .find(|l| l.starts_with(PREFIX))
-        .unwrap_or_default()
-        .to_string()
 }
 
 fn apply_layer_override(layer: &mut LayerState, map: &rhai::Map) {
@@ -888,39 +863,6 @@ fade:
         } else {
             panic!("expected text");
         }
-    }
-
-    /// The credit is pulled back out of the description by its prefix, not by
-    /// "take the last paragraph" — a synopsis ending in a short paragraph must
-    /// not be drawn on screen as if it named viewers.
-    #[test]
-    fn watched_by_finds_the_credit_and_ignores_a_plain_synopsis() {
-        assert_eq!(
-            watched_by_line("A hobbit sets out.\n\nWatched recently by bob and carol"),
-            "Watched recently by bob and carol",
-        );
-        assert_eq!(
-            watched_by_line("Watched recently by bob"),
-            "Watched recently by bob",
-        );
-        assert_eq!(
-            watched_by_line("A hobbit sets out.\n\nHe comes back."),
-            "",
-            "a description with no credit must produce no credit",
-        );
-        assert_eq!(watched_by_line(""), "");
-    }
-
-    /// A `scoring.explain` line sits between the synopsis and the
-    /// attribution credit — the reversed line search still finds the credit
-    /// as the last matching line, unbothered by the extra paragraph ahead of
-    /// it.
-    #[test]
-    fn watched_by_finds_the_credit_past_an_explain_line() {
-        assert_eq!(
-            watched_by_line("A hobbit sets out.\n\nWhy: Ranked highest\n\nWatched recently by bob"),
-            "Watched recently by bob",
-        );
     }
 
     #[test]

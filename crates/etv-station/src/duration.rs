@@ -212,12 +212,18 @@ impl DurationCache {
                     && entry.mtime_secs == mtime_secs
                     && entry.streams.is_some()
                 {
+                    let probed = check_probe(
+                        &local_path,
+                        Duration::from_secs_f64(entry.duration_secs),
+                        entry.streams.as_deref().unwrap_or_default(),
+                        item,
+                    )?;
                     stats.from_cache += 1;
-                    let d = clamp_to_config(Duration::from_secs_f64(entry.duration_secs), item);
-                    return Ok(d);
+                    return Ok(clamp_to_config(probed, item));
                 }
 
                 let (probed, streams) = ffprobe_media(&local_path).await?;
+                let checked = check_probe(&local_path, probed, &streams, item);
                 self.entries.insert(
                     local_path,
                     CacheEntry {
@@ -228,7 +234,7 @@ impl DurationCache {
                 );
                 self.dirty = true;
                 stats.from_probe += 1;
-                Ok(clamp_to_config(probed, item))
+                Ok(clamp_to_config(checked?, item))
             }
         }
     }
@@ -256,6 +262,64 @@ fn config_duration(item: &ResolvedItem) -> Result<Duration, StationError> {
         });
     }
     Ok(out_p - in_p)
+}
+
+/// A probed length more than this many times the catalog's own runtime for the
+/// same file, or less than that fraction of it, is a bad container header, not
+/// a long or short film.
+const PROBE_DEVIATION_FACTOR: u32 = 2;
+
+/// Whether a probe describes a file that can air, or the reason it cannot: no
+/// video stream, no positive container length, or a length more than
+/// [`PROBE_DEVIATION_FACTOR`] off the catalog's runtime (a truncated download or
+/// a bad header). An unairable file fails like a non-zero ffprobe exit, so it
+/// becomes an error card or is dropped; the catalog's runtime is never
+/// substituted for a length the file does not have. The cache keeps the raw
+/// probe, so this runs on every use and a catalog update takes effect without
+/// re-probing.
+fn check_probe(
+    path: &Path,
+    probed: Duration,
+    streams: &[StreamInfo],
+    item: &ResolvedItem,
+) -> Result<Duration, StationError> {
+    let catalog = item.catalog_duration.filter(|c| !c.is_zero());
+    let reason = if !streams.iter().any(|s| s.kind == StreamKind::Video) {
+        Some("no video stream".to_string())
+    } else if probed.is_zero() {
+        Some("container duration is zero".to_string())
+    } else {
+        catalog
+            .filter(|&c| {
+                probed > c * PROBE_DEVIATION_FACTOR || probed * PROBE_DEVIATION_FACTOR < c
+            })
+            .map(|c| {
+                format!(
+                    "probed length {:.1}s is more than {PROBE_DEVIATION_FACTOR}x off the catalog runtime {:.1}s",
+                    probed.as_secs_f64(),
+                    c.as_secs_f64()
+                )
+            })
+    };
+    match reason {
+        None => Ok(probed),
+        Some(reason) => {
+            tracing::warn!(
+                event = "duration.probe_unairable",
+                item = %item.id,
+                path = %path.display(),
+                probed_secs = probed.as_secs_f64(),
+                catalog_secs = ?catalog.map(|c| c.as_secs_f64()),
+                stream_kinds = ?streams.iter().map(|s| s.kind).collect::<Vec<_>>(),
+                reason = %reason,
+                "file cannot air; item becomes an error card or is dropped"
+            );
+            Err(StationError::Ffprobe {
+                path: path.to_path_buf(),
+                reason,
+            })
+        }
+    }
 }
 
 fn clamp_to_config(probed: Duration, item: &ResolvedItem) -> Duration {
@@ -315,6 +379,12 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         }
     };
 
+    parse_probe(path, &stdout)
+}
+
+/// Turn ffprobe's JSON into a length and streams. Whether the file can air is
+/// [`check_probe`]'s call.
+fn parse_probe(path: &Path, stdout: &[u8]) -> Result<(Duration, Vec<StreamInfo>), StationError> {
     #[derive(Deserialize)]
     struct ProbeOut {
         format: ProbeFormat,
@@ -326,19 +396,23 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         duration: Option<String>,
     }
 
-    let probe: ProbeOut = serde_json::from_slice(&stdout).map_err(|e| StationError::Ffprobe {
+    let fail = |reason: String| StationError::Ffprobe {
         path: path.to_path_buf(),
-        reason: format!("parse json: {e}"),
-    })?;
-    let secs_str = probe.format.duration.ok_or_else(|| StationError::Ffprobe {
-        path: path.to_path_buf(),
-        reason: "format.duration missing".into(),
-    })?;
-    let secs: f64 = secs_str.parse().map_err(|e| StationError::Ffprobe {
-        path: path.to_path_buf(),
-        reason: format!("duration not a float: {e}"),
-    })?;
-    let streams = probe.streams.iter().map(ProbeStream::to_info).collect();
+        reason,
+    };
+    let probe: ProbeOut =
+        serde_json::from_slice(stdout).map_err(|e| fail(format!("parse json: {e}")))?;
+    let streams: Vec<StreamInfo> = probe.streams.iter().map(ProbeStream::to_info).collect();
+    let secs_str = probe
+        .format
+        .duration
+        .ok_or_else(|| fail("format.duration missing".into()))?;
+    let secs: f64 = secs_str
+        .parse()
+        .map_err(|e| fail(format!("duration not a float: {e}")))?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(fail(format!("duration not usable: {secs_str}")));
+    }
     Ok((Duration::from_secs_f64(secs), streams))
 }
 
@@ -654,6 +728,113 @@ mod tests {
                 duration_secs: 10.0,
             },
         );
+    }
+
+    fn video() -> Vec<StreamInfo> {
+        vec![StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "h264".into(),
+            lang: None,
+            title: None,
+            channels: None,
+            default: true,
+            forced: false,
+        }]
+    }
+
+    fn check(secs: u64, catalog: Option<u64>, streams: &[StreamInfo]) -> Result<Duration, String> {
+        let mut item = local_item("x", "/m/x.mkv");
+        item.catalog_duration = catalog.map(Duration::from_secs);
+        check_probe(
+            Path::new("/m/x.mkv"),
+            Duration::from_secs(secs),
+            streams,
+            &item,
+        )
+        .map_err(|e| e.unreadable_media().unwrap().1.to_string())
+    }
+
+    #[test]
+    fn a_probe_far_off_the_catalog_runtime_is_unairable_not_substituted() {
+        // Engaging Father Christmas: 85,452s probed against 5,040s catalogued.
+        assert!(
+            check(85_452, Some(5040), &video())
+                .unwrap_err()
+                .contains("off the catalog")
+        );
+        // Documentary Now! Dreams: 60s probed against 1,440s catalogued.
+        assert!(
+            check(60, Some(1440), &video())
+                .unwrap_err()
+                .contains("off the catalog")
+        );
+        assert_eq!(
+            check(5100, Some(5040), &video()),
+            Ok(Duration::from_secs(5100))
+        );
+        assert_eq!(
+            check(720, Some(1440), &video()),
+            Ok(Duration::from_secs(720))
+        );
+        // No catalog runtime: nothing to compare against.
+        assert_eq!(
+            check(85_452, None, &video()),
+            Ok(Duration::from_secs(85_452))
+        );
+    }
+
+    #[test]
+    fn a_probe_with_no_video_stream_or_no_length_is_unairable() {
+        let audio = [StreamInfo {
+            kind: StreamKind::Audio,
+            ..video()[0].clone()
+        }];
+        assert_eq!(
+            check(85_452, Some(5040), &audio),
+            Err("no video stream".into())
+        );
+        assert_eq!(check(60, None, &[]), Err("no video stream".into()));
+        assert!(check(0, None, &video()).unwrap_err().contains("zero"));
+
+        let na = br#"{"format":{"duration":"N/A"},"streams":[]}"#;
+        assert!(parse_probe(Path::new("/m/a.mkv"), na).is_err());
+        let ok = br#"{"format":{"duration":"60.5"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}"#;
+        let (len, streams) = parse_probe(Path::new("/m/a.mkv"), ok).unwrap();
+        assert_eq!(len, Duration::from_secs_f64(60.5));
+        assert_eq!(streams.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cached_probe_is_checked_on_every_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cached.mkv");
+        std::fs::write(&path, b"x").unwrap();
+        let mtime_secs = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let item = local_item("cached", path.to_str().unwrap());
+
+        for (streams, secs) in [(vec![], 60.0), (video(), 0.0)] {
+            let mut cache = DurationCache::default();
+            cache.entries.insert(
+                path.clone(),
+                CacheEntry {
+                    mtime_secs,
+                    duration_secs: secs,
+                    streams: Some(streams),
+                },
+            );
+            let err = cache
+                .duration_for(&item, &mut ProbeStats::default())
+                .await
+                .unwrap_err();
+            assert!(err.unreadable_media().is_some(), "{err}");
+        }
     }
 
     #[test]

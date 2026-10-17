@@ -546,3 +546,69 @@ async fn a_records_metadata_is_readable_in_the_emitted_playout_json_for_a_sequen
     let raw = String::from_utf8(bytes).unwrap();
     assert_eq!(raw.matches("\"metadata\"").count(), 2, "raw JSON: {raw}");
 }
+
+fn ranks_mov_a_because(reason: &str) -> String {
+    format!(
+        r#"
+fn sources() {{ #{{ movies: `item.type == "movie"` }} }}
+fn pick(ctx) {{
+    #{{ picks: [#{{ entry_id: "mov-a", metadata: #{{ reason: "{reason}" }} }}], workspace: () }}
+}}
+fn audit(ctx, picks, workspace) {{
+    #{{ "mov-a": #{{ stage: "pool", by: "test", verdict: "picked" }} }}
+}}
+"#
+    )
+}
+
+/// Two pools in one sequencer block both rank `mov-a`, each with its own
+/// `reason`. The airing carries the record of the pool `item_location`
+/// names as `mov-a`'s home — the later pool — on every rerun, not whichever
+/// record a hash map yields first. `HashMap`'s iteration order is re-seeded
+/// per map, so the loop is what makes a regression show up.
+#[test]
+fn an_id_two_pools_rank_carries_the_same_pools_metadata_on_every_rerun() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = write_plugin(&dir, "first.rhai", &ranks_mov_a_because("first pool"));
+    let second = write_plugin(&dir, "second.rhai", &ranks_mov_a_because("second pool"));
+    let arrange = write_plugin(
+        &dir,
+        "arrange.rhai",
+        r#"
+fn hooks() { ["sequencer"] }
+fn arrange(ctx) {
+    let out = [];
+    for item in ctx.pools.first { out.push(item.entry_id); }
+    out
+}
+"#,
+    );
+    let mut first_pool = foryou_pool(&first);
+    first_pool.name = "first".into();
+    let mut second_pool = foryou_pool(&second);
+    second_pool.name = "second".into();
+    let mut cfg = forwarding_sequencer_channel(&arrange, first_pool);
+    cfg.rule.blocks[0].pools.push(second_pool);
+
+    for run in 0..30 {
+        let (items, _, _) = resolve_channel_with_resume(
+            &cfg,
+            Path::new("foryou.yaml"),
+            &[],
+            None,
+            Some(&catalog()),
+            &GenerationState::default(),
+            &ScoreInputs::default(),
+            None,
+            CHUNK_BOUNDARY,
+        )
+        .unwrap();
+        let a = items.iter().find(|i| i.id == "mov-a").expect("mov-a airs");
+        let meta = a.metadata.as_ref().expect("mov-a carries metadata");
+        assert_eq!(
+            meta["reason"],
+            serde_json::json!("second pool"),
+            "run {run}"
+        );
+    }
+}

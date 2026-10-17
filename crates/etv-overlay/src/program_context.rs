@@ -30,9 +30,7 @@ const MTIME_POLL: Duration = Duration::from_secs(1);
 pub struct ProgramContext {
     pub title: String,
     pub sub_title: String,
-    /// The current item's guide description. On a channel with
-    /// `scoring.attribution` on, its last line names who has been watching
-    /// (#113) — which is what a lower third would draw.
+    /// The current item's guide description.
     pub description: String,
     /// Season number, or `-1` when the item carries none. Same absent-value
     /// convention as `item_elapsed`, and the discriminator a script uses to
@@ -195,8 +193,8 @@ struct ProgramRow {
     title: Option<String>,
     #[serde(default)]
     sub_title: Option<String>,
-    /// Carries the attribution line the station appends (#113). Read here and
-    /// not in ETV-next because the overlay parses these chunk files itself.
+    /// The guide description the station writes. Read here and not in
+    /// ETV-next because the overlay parses these chunk files itself.
     #[serde(default)]
     description: Option<String>,
     /// Written by the station for episodes only, so its presence is what a
@@ -473,10 +471,9 @@ mod tests {
         ]
     }"#;
 
-    /// A chunk written by a channel with `scoring.attribution` on, shaped the
-    /// way the station really writes it: the catalog synopsis, a blank line,
-    /// then the credit.
-    const ATTRIBUTED_CHUNK: &str = r#"{
+    /// A chunk shaped the way the station really writes a description: the
+    /// catalog synopsis, a blank line, then an appended line.
+    const DESCRIBED_CHUNK: &str = r#"{
         "version": "test",
         "items": [
             {
@@ -485,29 +482,26 @@ mod tests {
                 "finish": "2026-04-13T00:10:00Z",
                 "program": {
                     "title": "Alpha",
-                    "description": "A hobbit sets out.\n\nWatched recently by Bob Example and carol"
+                    "description": "A hobbit sets out.\n\nWhy: Ranked highest"
                 }
             }
         ]
     }"#;
 
-    /// The overlay reads the playout JSON itself, so the attribution line the
-    /// station appends has to survive that parse to reach a script (#113).
+    /// The overlay reads the playout JSON itself, so the description the
+    /// station writes has to survive that parse to reach a script.
     #[test]
-    fn carries_the_attribution_description_through_to_the_context() {
+    fn carries_the_description_through_to_the_context() {
         let dir = tempfile::tempdir().unwrap();
-        write_chunk(dir.path(), "chunk_a.json", ATTRIBUTED_CHUNK);
+        write_chunk(dir.path(), "chunk_a.json", DESCRIBED_CHUNK);
         let mut src = ProgramContextSource::new(dir.path().to_path_buf());
         src.refresh().unwrap();
 
         let ctx = src.current_at(datetime!(2026-04-13 00:05 UTC));
-        assert_eq!(
-            ctx.description,
-            "A hobbit sets out.\n\nWatched recently by Bob Example and carol",
-        );
+        assert_eq!(ctx.description, "A hobbit sets out.\n\nWhy: Ranked highest",);
     }
 
-    /// A channel that does not attribute writes no description, and that must
+    /// A chunk with no description, and that must
     /// arrive as an empty string rather than blowing up the parse.
     #[test]
     fn a_chunk_with_no_description_yields_an_empty_one() {

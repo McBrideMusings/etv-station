@@ -27,8 +27,6 @@
 //!   `countries`, `summary` (#186's catalog column — already the default
 //!   `description` with no `guide:` config needed; addressable here too, for
 //!   a template that wants it alongside other fields, e.g. `{summary|title}`)
-//! - the watch history: `watched_by` (the #113 credit line, or empty when
-//!   nobody on record has watched this entry)
 //! - the channel: `channel_identity`, `channel_name` (its display name, #158
 //!   decision #5), `program_title` (this item's own title before any guide
 //!   override — the series-convention default)
@@ -148,7 +146,6 @@ const ITEM_SCALAR_FIELDS: &[&str] = &[
 ];
 const ITEM_MULTI_FIELDS: &[&str] = &["genres", "cast", "directors", "writers", "countries"];
 const OTHER_SCALAR_FIELDS: &[&str] = &[
-    "watched_by",
     "channel_identity",
     "channel_name",
     "program_title",
@@ -253,7 +250,6 @@ pub struct RenderContext<'a> {
     /// The item's own default title (post series-convention, pre guide
     /// override) — addressed as `{program_title}`.
     pub program_title: Option<&'a str>,
-    pub watched_by: Option<&'a str>,
     pub next_title: Option<&'a str>,
     pub next_start: Option<OffsetDateTime>,
     pub prev_title: Option<&'a str>,
@@ -287,7 +283,6 @@ impl RenderContext<'_> {
             "directors" => self.fields.directors.join(", "),
             "writers" => self.fields.writers.join(", "),
             "countries" => self.fields.countries.join(", "),
-            "watched_by" => self.watched_by.unwrap_or_default().to_string(),
             "channel_identity" => self.channel_identity.to_string(),
             "channel_name" => self.channel_name.to_string(),
             "program_title" => self.program_title.unwrap_or_default().to_string(),
@@ -401,16 +396,6 @@ pub fn render_categories(templates: &[String], ctx: &RenderContext) -> Vec<Strin
     out
 }
 
-/// A description template's raw (pre-render) text referenced `{watched_by}`
-/// explicitly — the signal that the author has taken over the #113
-/// attribution line themselves, so the auto-append in
-/// [`crate::daemon`] must not also add it (see #158 decision #4).
-pub fn references_watched_by(template: &str) -> bool {
-    extract_placeholders(template)
-        .into_iter()
-        .any(|p| placeholder_branches(p).contains(&"watched_by"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +412,6 @@ mod tests {
             channel_identity: "diehard",
             channel_name: "Die Hard 24/7",
             program_title: Some(title),
-            watched_by: None,
             next_title: Some("Die Hard 2"),
             next_start: Some(t),
             prev_title: None,
@@ -560,11 +544,5 @@ mod tests {
         let fields = GuideFields::default();
         let c = ctx(&fields, "Die Hard");
         assert_eq!(render("open { brace", &c), "open { brace");
-    }
-
-    #[test]
-    fn watched_by_reference_is_detected_only_when_actually_named() {
-        assert!(references_watched_by("{summary}\n\n{watched_by}"));
-        assert!(!references_watched_by("{summary|title}"));
     }
 }

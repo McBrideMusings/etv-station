@@ -157,7 +157,7 @@ fn parse_json(raw: &str) -> Result<serde_json::Value, String> {
 /// `--duration`/`--samples` instead, one value per sampled instant) and plus
 /// `description` — `PreviewProgram` hardcodes that to empty in
 /// [`program_context_for`] because `render-still`/`watch` never needed it,
-/// but a script can read it (and the `watched_by` line it's parsed from), so
+/// but a script can read it, so
 /// `dump-text` has to be able to set it.
 #[derive(clap::Args, Clone)]
 struct DumpTextProgram {

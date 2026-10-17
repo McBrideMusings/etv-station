@@ -11,6 +11,7 @@ const HELPER_NAMES: &[&str] = &[
     "shorter_than",
     "longer_than",
     "icontains",
+    "keyword_score",
 ];
 
 pub struct CompiledProgram {
@@ -126,6 +127,44 @@ fn register_helpers(context: &mut Context<'_>, item: &NormalizedItem) {
     context.add_function("shorter_than", move |secs: f64| -> bool { runtime < secs });
     context.add_function("longer_than", move |secs: f64| -> bool { runtime > secs });
 
+    // `keyword_score(["a", "b"])` counts how many distinct keywords the item
+    // matches: a keyword matches when it is a substring of the title or equals
+    // a category. The station's catalog translation (`catalog/query.rs`)
+    // counts the same way over title and tags, so a set tuned here scores the
+    // same in a pool for ASCII keywords; the station also checks the threshold
+    // against the set size at load.
+    let title = item.title.to_lowercase();
+    let categories: Vec<String> = item.categories.iter().map(|s| s.to_lowercase()).collect();
+    context.add_function(
+        "keyword_score",
+        move |keywords: std::sync::Arc<Vec<cel::Value>>| -> Result<i64, cel::ExecutionError> {
+            let mut seen: Vec<String> = Vec::new();
+            for keyword in keywords.iter() {
+                let cel::Value::String(k) = keyword else {
+                    return Err(cel::ExecutionError::function_error(
+                        "keyword_score",
+                        "keywords must be strings",
+                    ));
+                };
+                let k = k.to_lowercase();
+                if !seen.contains(&k) {
+                    seen.push(k);
+                }
+            }
+            if seen.is_empty() {
+                return Err(cel::ExecutionError::function_error(
+                    "keyword_score",
+                    "the keyword set is empty",
+                ));
+            }
+            let hits = seen
+                .iter()
+                .filter(|k| title.contains(k.as_str()) || categories.contains(k))
+                .count();
+            Ok(hits as i64)
+        },
+    );
+
     context.add_function(
         "icontains",
         |haystack: std::sync::Arc<String>, needle: std::sync::Arc<String>| -> bool {
@@ -205,6 +244,21 @@ mod tests {
     fn category_exists_native_cel() {
         let p = compile("categories.exists(c, c == \"Sci-Fi\")").unwrap();
         assert!(p.matches(&item()).unwrap());
+    }
+
+    #[test]
+    fn keyword_score_counts_distinct_matches_in_title_and_categories() {
+        let at_least = |n: i64| {
+            compile(&format!(
+                "keyword_score([\"next generation\", \"sci-fi\", \"adventure\", \"Sci-Fi\", \"western\"]) >= {n}"
+            ))
+            .unwrap()
+            .matches(&item())
+            .unwrap()
+        };
+        // title, Sci-Fi and Adventure hit; the repeated Sci-Fi counts once; western misses.
+        assert!(at_least(3));
+        assert!(!at_least(4));
     }
 
     #[test]

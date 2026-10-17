@@ -1624,20 +1624,35 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .map(|(id, e)| (id.clone(), airing_label(e)))
         .collect();
 
+    // Fields that belong to the item, not the airing: one copy per entry id,
+    // however many times it airs. The page merges them back onto each airing.
+    let mut items: HashMap<&str, Value> = HashMap::new();
+    for a in &airings {
+        items.entry(a.id.as_str()).or_insert_with(|| {
+            let e = entries.get(&a.id).and_then(|e| e.as_ref());
+            json!({
+                "title": e.map(|e| e.title.clone()),
+                "season": e.and_then(|e| e.season),
+                "episode": e.and_then(|e| e.episode),
+                "year": e.and_then(|e| e.year),
+                "genres": genres.get(&a.id),
+                "collections": collections.get(&a.id),
+                "directors": directors.get(&a.id),
+                "content_rating": e.and_then(|e| e.content_rating.clone()),
+                "summary": e.and_then(|e| e.summary.clone()),
+            })
+        });
+    }
+
     let airings_json: Vec<Value> = airings
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            let e = entries.get(&a.id).and_then(|e| e.as_ref());
             json!({
                 "index": i,
                 "id": a.id,
                 "label": a.title,
-                "title": e.map(|e| e.title.clone()),
                 "show": a.show,
-                "season": e.and_then(|e| e.season),
-                "episode": e.and_then(|e| e.episode),
-                "year": e.and_then(|e| e.year),
                 "kind": a.kind,
                 "pool": a.pool,
                 "start": a.start.unix_timestamp(),
@@ -1645,11 +1660,6 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
                 "duration_secs": a.duration.whole_seconds(),
                 "ranking": ranking_of(simulated[i].metadata.as_ref()),
                 "audit": audits[i],
-                "genres": genres.get(&a.id),
-                "collections": collections.get(&a.id),
-                "directors": directors.get(&a.id),
-                "content_rating": e.and_then(|e| e.content_rating.clone()),
-                "summary": e.and_then(|e| e.summary.clone()),
             })
         })
         .collect();
@@ -1672,6 +1682,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
     obj.insert("since_last".into(), json!(since_last_json));
     obj.insert("notices".into(), json!(notices));
     obj.insert("airings".into(), json!(airings_json));
+    obj.insert("items".into(), json!(items));
     obj.insert("titles".into(), json!(titles));
     obj.insert(
         "day_starts".into(),

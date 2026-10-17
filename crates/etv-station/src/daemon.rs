@@ -704,10 +704,9 @@ fn translate_tautulli_id_to_plex(
 /// The catalog this generation's [`SharedHistory`] should join watch rows
 /// against — `None` when nothing in it would ever read the result (#131).
 ///
-/// Watch history reaches two places: `ScoreInputs::history`, which a Rhai script
-/// sees through a pool that names a `plugin:` (#74), and the attribution line a
-/// channel with `attribution: true` stamps into its items' guide text (#113). A
-/// station whose channels do neither has no reader, so fetching a thousand
+/// Watch history reaches one place: `ScoreInputs::history`, which a Rhai script
+/// sees through a pool that names a `plugin:` (#74). A station whose channels
+/// name none has no reader, so fetching a thousand
 /// `get_history` rows and joining them against the catalog on every tick
 /// produces a `Vec<WatchEvent>` that is dropped unread.
 ///
@@ -720,7 +719,7 @@ fn history_catalog(
     channels: &[LoadedChannel],
     catalog: Option<&Arc<CatalogInfo>>,
 ) -> Option<Arc<CatalogInfo>> {
-    if channels.iter().any(|c| c.config.reads_watch_history()) {
+    if channels.iter().any(|c| c.config.uses_scorer_plugin()) {
         catalog.cloned()
     } else {
         None
@@ -732,7 +731,7 @@ fn history_catalog(
 /// read history never asks, so its tick rate sets no window.
 fn history_scope_windows(channels: &[LoadedChannel]) -> HashMap<HistoryScope, Duration> {
     let mut windows: HashMap<HistoryScope, Duration> = HashMap::new();
-    for c in channels.iter().filter(|c| c.config.reads_watch_history()) {
+    for c in channels.iter().filter(|c| c.config.uses_scorer_plugin()) {
         windows
             .entry(c.config.history_scope())
             .and_modify(|w| *w = (*w).min(c.config.roll_interval))
@@ -2502,6 +2501,44 @@ mod regen_floor_tests {
         assert_eq!(regen_floor(&channel, boundary).await.unwrap(), boundary);
     }
 
+    /// A repair cuts at the broken item's own start, mid-chunk: films 3-6 go,
+    /// films 1-2 stay, and the surviving file stops claiming the cut span.
+    /// `regen_floor` at that instant would answer the chunk's end and keep film 3.
+    #[tokio::test]
+    async fn a_repair_cut_mid_chunk_removes_the_item_at_the_cut() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let anchor = datetime!(2026-01-01 00:00 UTC);
+        let items: Vec<_> = (0..6).map(|i| film(&format!("f{i}"), 3600)).collect();
+        let durations = vec![Duration::from_secs(3600); 6];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        let at = anchor + time::Duration::hours(2);
+        assert_eq!(
+            regen_floor(&channel, at).await.unwrap(),
+            anchor + time::Duration::hours(6),
+            "the floor reads past the item, which is why a repair does not use it",
+        );
+        wipe_playout_from(&channel, at).await.unwrap();
+
+        let files = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        assert_eq!(scan::highest_finish(&files).await, Some(at));
+    }
+
     /// Nothing written yet: regen_floor is a no-op, not an error.
     #[tokio::test]
     async fn returns_from_unchanged_with_no_existing_files() {
@@ -2804,6 +2841,34 @@ async fn forward_channel_loop(
         crate::resume::save(&channel.output_folder, &resume).await?;
     }
 
+    // ADR 0010: config is the only thing that moves a published slot for
+    // staleness, but a slot whose title is gone cannot play. The sweep can only
+    // swap in an error card (spans are fixed); a rewind from that item's own
+    // start lets a real title take the slot.
+    let unaired = crate::reconcile::unaired_items(channel, now).await?;
+    let unplayable = match catalog.as_ref() {
+        Some(catalog) => crate::reconcile::first_unplayable(catalog, &unaired)?,
+        None => None,
+    };
+    if let Some(at) = unplayable {
+        // `at` is an item's own start, so it is already an item boundary and
+        // nothing straddles it; `regen_floor` would read past it to the end of
+        // the containing chunk and leave the broken item in place. Only items
+        // starting after `now` are considered, so the airing item is never cut.
+        let regen_from = at;
+        let removed = wipe_playout_from(channel, regen_from).await?;
+        let cut = rewind_to_surviving(channel, ctx, &mut resume, regen_from).await?;
+        tracing::info!(
+            event = "resume.repair",
+            channel = %channel.name,
+            item_start = %at,
+            from = %regen_from,
+            truncated_from = %cut,
+            removed = removed,
+            "a scheduled title is no longer in the library; regenerating from that item's start",
+        );
+    }
+
     resume = pattern_catch_up(channel, ctx, &mut catalog, resume, "startup").await?;
 
     let mut interval = tokio::time::interval(channel.config.roll_interval);
@@ -2995,7 +3060,7 @@ async fn pattern_catch_up(
     // every *other* channel fetch its own scope too, for a `Vec<WatchEvent>`
     // that nothing then reads. Before #112 that cost nothing because they all
     // shared one entry.
-    let history = if channel.config.reads_watch_history() {
+    let history = if channel.config.uses_scorer_plugin() {
         ctx.history.current(&channel.config.history_scope()).await
     } else {
         Arc::from(Vec::new())
@@ -3004,8 +3069,7 @@ async fn pattern_catch_up(
     // The account id a scorer plugin ranks against when this channel is
     // `single_user`-scoped (#278), resolved from the same Tautulli fetch
     // `history` above just ran. `None` on a pooled channel and on any channel
-    // with no scorer plugin at all — attribution alone has no use for an id,
-    // only a display name, so it must not gate on this.
+    // with no scorer plugin at all.
     //
     // A `single_user` channel whose named user resolved to nobody fails this
     // generation loudly, naming the user, rather than letting `ctx.account_id`
@@ -3025,10 +3089,6 @@ async fn pattern_catch_up(
     } else {
         None
     };
-
-    // Whether this generation names watchers, read once — it cannot change
-    // inside a tick, and the check sits in the per-item loop below.
-    let attribution_wanted = channel.config.attributes_watchers();
 
     // Whether this generation shows a "why this was picked" line, read once
     // for the same reason (`scoring.explain`).
@@ -3196,25 +3256,21 @@ async fn pattern_catch_up(
             );
         }
 
-        // Render each item's `guide:` overrides (#158) and, on a channel that
-        // opted into it, name who has been watching (#113) — both need the
-        // schedule (this item's own start/finish, a one-item lookahead) and
-        // the watch history `history` already fetched above, neither of
-        // which `resolve_channel_with_resume` had: that call happens before
-        // duration-probing has assigned any item a real length. Stamped here
-        // rather than inside `resolve` for the same reason attribution
-        // always was — it lands on whatever the channel actually scheduled,
-        // however that list was chosen: a plugin pool, a CEL query, or a
-        // hand-written entry list all get the same treatment.
-        render_guide_and_attribution(
+        // Render each item's `guide:` overrides (#158) — they need the
+        // schedule (this item's own start/finish, a one-item lookahead),
+        // which `resolve_channel_with_resume` did not have: that call happens
+        // before duration-probing has assigned any item a real length. Done
+        // here rather than inside `resolve` so it lands on whatever the
+        // channel actually scheduled, however that list was chosen: a plugin
+        // pool, a CEL query, or a hand-written entry list all get the same
+        // treatment.
+        render_guide(
             &mut items,
             &durations,
             from,
             &channel.name,
             channel.config.display_name.as_deref(),
-            attribution_wanted,
             explain_wanted,
-            &history,
         );
 
         // A channel with an `anchor` in the past joins its list where elapsed
@@ -3985,19 +4041,28 @@ fn explain_line_for(metadata: Option<&serde_json::Value>) -> Option<String> {
     Some(format!("Why: {}", capitalize_first(verdict)))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn render_guide_and_attribution(
+/// Append a line to an existing description without destroying it.
+///
+/// A film out of the Plex catalog already has a synopsis in `description`, and
+/// that synopsis is what a viewer opening the guide actually wants; the line is
+/// an addition to it, never a replacement. Separated by a blank line so the two
+/// do not read as one paragraph.
+fn append_to_description(existing: Option<String>, line: &str) -> String {
+    match existing {
+        Some(text) if !text.trim().is_empty() => format!("{}\n\n{line}", text.trim_end()),
+        _ => line.to_string(),
+    }
+}
+
+pub(crate) fn render_guide(
     items: &mut [crate::resolve::ResolvedItem],
     durations: &[Duration],
     from: OffsetDateTime,
     channel_identity: &str,
     channel_display_name: Option<&str>,
-    attribution_wanted: bool,
     explain_wanted: bool,
-    history: &[crate::score::WatchEvent],
 ) {
     let channel_name = channel_display_name.unwrap_or(channel_identity);
-    let credits = attribution_wanted.then(|| crate::attribution::Attribution::build(history));
 
     // Snapshot every item's default title *before* any item in this pass is
     // rewritten, so item N's `{next_title}`/`{prev_title}` always reads item
@@ -4010,19 +4075,11 @@ pub(crate) fn render_guide_and_attribution(
 
     let generated_at = OffsetDateTime::now_utc();
     let mut airing = from;
-    let mut stamped = 0usize;
     for (idx, dur) in durations.iter().enumerate() {
         let start = airing;
         let stop = start + time::Duration::seconds_f64(dur.as_secs_f64());
         airing = stop;
 
-        let watched_by = credits
-            .as_ref()
-            .and_then(|c| c.line_for(&items[idx].id))
-            .map(|line| line.to_string());
-
-        // Description order is synopsis, explain line, attribution line —
-        // built once here so both branches below append it in that order.
         let explain = explain_wanted
             .then(|| explain_line_for(items[idx].metadata.as_ref()))
             .flatten();
@@ -4030,24 +4087,11 @@ pub(crate) fn render_guide_and_attribution(
         let Some(guide) = items[idx].guide.clone() else {
             // No `guide:` override anywhere in the cascade for this item —
             // the built-in defaults from `resolve` (series-title convention,
-            // genre categories) stand as written. `scoring.explain` and
-            // `attribution: true` still apply their lines on top, exactly as
-            // before #158.
-            if explain.is_some() || watched_by.is_some() {
+            // genre categories) stand as written. `scoring.explain` still
+            // applies its line on top.
+            if let Some(line) = &explain {
                 let program = items[idx].program.get_or_insert_with(Default::default);
-                if let Some(line) = &explain {
-                    program.description = Some(crate::attribution::append_to_description(
-                        program.description.take(),
-                        line,
-                    ));
-                }
-                if let Some(line) = &watched_by {
-                    program.description = Some(crate::attribution::append_to_description(
-                        program.description.take(),
-                        line,
-                    ));
-                    stamped += 1;
-                }
+                program.description = Some(append_to_description(program.description.take(), line));
             }
             continue;
         };
@@ -4070,7 +4114,6 @@ pub(crate) fn render_guide_and_attribution(
             channel_identity,
             channel_name,
             program_title: program_title.as_deref(),
-            watched_by: watched_by.as_deref(),
             next_title: base_titles
                 .get(idx + 1)
                 .and_then(|t: &Option<String>| t.as_deref()),
@@ -4093,47 +4136,14 @@ pub(crate) fn render_guide_and_attribution(
             let rendered = crate::guide::render(t, &ctx);
             program.sub_title = (!rendered.is_empty()).then_some(rendered);
         }
-        match &guide.description {
-            Some(t) => {
-                let rendered = crate::guide::render(t, &ctx);
-                program.description = (!rendered.is_empty()).then_some(rendered);
-                // A `guide:` template has no `{explain}` field to reference,
-                // so unlike `{watched_by}` there is no shorthand to check for
-                // — the explain line always appends here when explain is on.
-                if let Some(line) = &explain {
-                    program.description = Some(crate::attribution::append_to_description(
-                        program.description.take(),
-                        line,
-                    ));
-                }
-                // An explicit `{watched_by}` already carries the line — the
-                // shorthand appending it again would duplicate it (#158
-                // decision #4).
-                if let Some(line) = &watched_by
-                    && !crate::guide::references_watched_by(t)
-                {
-                    program.description = Some(crate::attribution::append_to_description(
-                        program.description.take(),
-                        line,
-                    ));
-                    stamped += 1;
-                }
-            }
-            None => {
-                if let Some(line) = &explain {
-                    program.description = Some(crate::attribution::append_to_description(
-                        program.description.take(),
-                        line,
-                    ));
-                }
-                if let Some(line) = &watched_by {
-                    program.description = Some(crate::attribution::append_to_description(
-                        program.description.take(),
-                        line,
-                    ));
-                    stamped += 1;
-                }
-            }
+        if let Some(t) = &guide.description {
+            let rendered = crate::guide::render(t, &ctx);
+            program.description = (!rendered.is_empty()).then_some(rendered);
+        }
+        // A `guide:` template has no `{explain}` field to reference, so the
+        // explain line always appends when explain is on.
+        if let Some(line) = &explain {
+            program.description = Some(append_to_description(program.description.take(), line));
         }
         if let Some(cats) = &guide.categories {
             let rendered = crate::guide::render_categories(cats, &ctx);
@@ -4141,25 +4151,13 @@ pub(crate) fn render_guide_and_attribution(
         }
         items[idx].program = Some(program);
     }
-
-    if attribution_wanted {
-        tracing::info!(
-            event = "attribution.stamped",
-            channel = %channel_identity,
-            items = items.len(),
-            stamped,
-            entries_with_watchers = credits.as_ref().map(|c| c.len()).unwrap_or(0),
-            "named recent watchers on this generation's items",
-        );
-    }
 }
 
 #[cfg(test)]
-mod render_guide_and_attribution_tests {
+mod render_guide_tests {
     use super::*;
     use crate::guide::{GuideConfig, GuideFields};
     use crate::resolve::ResolvedItem;
-    use crate::score::WatchEvent;
     use ersatztv_playout::playout::ProgramMetadata;
     use time::macros::datetime;
 
@@ -4186,14 +4184,6 @@ mod render_guide_and_attribution_tests {
         }
     }
 
-    fn watch(entry: &str, who: &str) -> WatchEvent {
-        WatchEvent {
-            entry_id: entry.into(),
-            watched_at: 0,
-            watcher: Some(who.into()),
-        }
-    }
-
     /// An item with no `guide:` override anywhere is untouched — the
     /// defaults resolve already computed (series-title convention, genre
     /// categories) stand exactly as written.
@@ -4201,15 +4191,13 @@ mod render_guide_and_attribution_tests {
     fn no_override_leaves_the_default_program_untouched() {
         let mut items = vec![item_with_guide("a", "Die Hard", None)];
         let durations = vec![Duration::from_secs(60)];
-        render_guide_and_attribution(
+        render_guide(
             &mut items,
             &durations,
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             None,
             false,
-            false,
-            &[],
         );
         assert_eq!(
             items[0].program.as_ref().unwrap().title.as_deref(),
@@ -4228,15 +4216,13 @@ mod render_guide_and_attribution_tests {
         };
         let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
         let durations = vec![Duration::from_secs(60)];
-        render_guide_and_attribution(
+        render_guide(
             &mut items,
             &durations,
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             Some("Die Hard 24/7"),
             false,
-            false,
-            &[],
         );
         let program = items[0].program.as_ref().unwrap();
         assert_eq!(program.title.as_deref(), Some("Die Hard 24/7"));
@@ -4260,15 +4246,13 @@ mod render_guide_and_attribution_tests {
         let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
         items[0].guide_fields.genres = vec!["Action".into(), "Thriller".into()];
         let durations = vec![Duration::from_secs(60)];
-        render_guide_and_attribution(
+        render_guide(
             &mut items,
             &durations,
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             None,
             false,
-            false,
-            &[],
         );
         assert_eq!(
             items[0].program.as_ref().unwrap().categories.as_deref(),
@@ -4305,15 +4289,13 @@ mod render_guide_and_attribution_tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
         ];
-        render_guide_and_attribution(
+        render_guide(
             &mut items,
             &durations,
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             None,
             false,
-            false,
-            &[],
         );
         assert_eq!(
             items[0].program.as_ref().unwrap().description.as_deref(),
@@ -4329,97 +4311,6 @@ mod render_guide_and_attribution_tests {
             items[2].program.as_ref().unwrap().description.as_deref(),
             Some("Second"),
             "the last item has no next, so prev is used"
-        );
-    }
-
-    /// `attribution: true` still appends the #113 line when no `guide:`
-    /// override is present at all.
-    #[test]
-    fn attribution_appends_with_no_guide_override() {
-        let mut items = vec![item_with_guide("a", "Die Hard", None)];
-        let durations = vec![Duration::from_secs(60)];
-        let history = vec![watch("a", "bob")];
-        render_guide_and_attribution(
-            &mut items,
-            &durations,
-            datetime!(2026-08-13 00:00 UTC),
-            "diehard",
-            None,
-            true,
-            false,
-            &history,
-        );
-        assert_eq!(
-            items[0].program.as_ref().unwrap().description.as_deref(),
-            Some("Watched recently by bob")
-        );
-    }
-
-    /// A description template that does NOT reference `{watched_by}` still
-    /// gets the #113 line appended.
-    #[test]
-    fn attribution_appends_after_a_description_template_that_omits_it() {
-        let guide = GuideConfig {
-            description: Some("Now playing".into()),
-            title: None,
-            sub_title: None,
-            categories: None,
-        };
-        let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
-        let durations = vec![Duration::from_secs(60)];
-        let history = vec![watch("a", "bob")];
-        render_guide_and_attribution(
-            &mut items,
-            &durations,
-            datetime!(2026-08-13 00:00 UTC),
-            "diehard",
-            None,
-            true,
-            false,
-            &history,
-        );
-        assert_eq!(
-            items[0].program.as_ref().unwrap().description.as_deref(),
-            Some("Now playing\n\nWatched recently by bob")
-        );
-    }
-
-    /// A description template that DOES reference `{watched_by}` already
-    /// carries the line — the shorthand must not duplicate it (#158
-    /// decision #4).
-    #[test]
-    fn an_explicit_watched_by_reference_is_not_duplicated() {
-        let guide = GuideConfig {
-            description: Some("Now playing. {watched_by}".into()),
-            title: None,
-            sub_title: None,
-            categories: None,
-        };
-        let mut items = vec![item_with_guide("a", "Die Hard", Some(guide))];
-        let durations = vec![Duration::from_secs(60)];
-        let history = vec![watch("a", "bob")];
-        render_guide_and_attribution(
-            &mut items,
-            &durations,
-            datetime!(2026-08-13 00:00 UTC),
-            "diehard",
-            None,
-            true,
-            false,
-            &history,
-        );
-        let desc = items[0]
-            .program
-            .as_ref()
-            .unwrap()
-            .description
-            .clone()
-            .unwrap();
-        assert_eq!(desc, "Now playing. Watched recently by bob");
-        assert_eq!(
-            desc.matches("Watched recently by bob").count(),
-            1,
-            "the line must appear exactly once, got {desc:?}"
         );
     }
 
@@ -4449,15 +4340,13 @@ mod render_guide_and_attribution_tests {
             ],
         }));
         let durations = vec![Duration::from_secs(60)];
-        render_guide_and_attribution(
+        render_guide(
             &mut items,
             &durations,
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             None,
-            false,
             true,
-            &[],
         );
         assert_eq!(
             items[0].program.as_ref().unwrap().description.as_deref(),
@@ -4472,15 +4361,13 @@ mod render_guide_and_attribution_tests {
         let mut items = vec![item_with_guide("a", "Die Hard", None)];
         items[0].metadata = Some(audit_with_pool_verdict("ranked highest"));
         let durations = vec![Duration::from_secs(60)];
-        render_guide_and_attribution(
+        render_guide(
             &mut items,
             &durations,
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             None,
-            false,
             true,
-            &[],
         );
         assert_eq!(
             items[0].program.as_ref().unwrap().description.as_deref(),
@@ -4495,41 +4382,15 @@ mod render_guide_and_attribution_tests {
         let mut items = vec![item_with_guide("a", "Die Hard", None)];
         items[0].metadata = Some(audit_with_pool_verdict("ranked highest"));
         let durations = vec![Duration::from_secs(60)];
-        render_guide_and_attribution(
+        render_guide(
             &mut items,
             &durations,
             datetime!(2026-08-13 00:00 UTC),
             "diehard",
             None,
             false,
-            false,
-            &[],
         );
         assert_eq!(items[0].program.as_ref().unwrap().description, None);
-    }
-
-    /// Description order is synopsis, explain line, attribution line — the
-    /// explain line lands before, not after, the #113 credit.
-    #[test]
-    fn explain_line_precedes_attribution_line() {
-        let mut items = vec![item_with_guide("a", "Die Hard", None)];
-        items[0].metadata = Some(audit_with_pool_verdict("ranked highest"));
-        let durations = vec![Duration::from_secs(60)];
-        let history = vec![watch("a", "bob")];
-        render_guide_and_attribution(
-            &mut items,
-            &durations,
-            datetime!(2026-08-13 00:00 UTC),
-            "diehard",
-            None,
-            true,
-            true,
-            &history,
-        );
-        assert_eq!(
-            items[0].program.as_ref().unwrap().description.as_deref(),
-            Some("Why: Ranked highest\n\nWatched recently by bob")
-        );
     }
 }
 

@@ -148,9 +148,20 @@ pub(crate) struct Series {
     /// no rotation of its own — always `0` on a series [`resolve_pool_series`]
     /// hands back.
     cursor: usize,
+    /// The series was played through to its last item and its cursor wrapped
+    /// back to the top without anything airing since. A resuming pool rests a
+    /// finished series until the lap clears (see [`PoolRuntime::rested`]).
+    finished: bool,
 }
 
 impl Series {
+    /// Move the cursor to `to`; a cursor past the last item wraps to the top
+    /// and marks the series finished.
+    fn advance_to(&mut self, to: usize) {
+        self.finished = to >= self.ids.len();
+        self.cursor = if self.finished { 0 } else { to };
+    }
+
     fn remaining(&self) -> usize {
         self.ids.len().saturating_sub(self.cursor)
     }
@@ -313,7 +324,22 @@ impl PoolRuntime<'_> {
     /// Whether this series' next item passes both rules: the pool's own and the
     /// channel's.
     fn admits(&self, si: usize, channel: &ChannelHistory) -> bool {
-        self.own_allows(si) && self.channel_allows(si, channel)
+        !self.rested(si) && self.own_allows(si) && self.channel_allows(si, channel)
+    }
+
+    /// Whether the series at `si` has been played through and is sitting out
+    /// the rest of the lap. A resuming pool does not loop a finished series
+    /// back to its first episode while other series have yet to take a turn:
+    /// it rests until every series has been visited and the lap clears, then
+    /// restarts like any other. A pool in which every series is resting still
+    /// serves (see [`Self::scan_from`]). A series of one item is a film, not a
+    /// run of episodes; how soon a film may air again is `no_repeat_within`'s
+    /// call, so it never rests here.
+    fn rested(&self, si: usize) -> bool {
+        self.cfg.advance == Advance::Resume
+            && self.series[si].ids.len() > 1
+            && self.series[si].finished
+            && self.lap.contains(&self.series[si].key)
     }
 
     /// Count a draw whose first choice the channel rule alone turned away, once
@@ -333,7 +359,9 @@ impl PoolRuntime<'_> {
     /// Neither this pool nor the channel constrains anything, so the first
     /// choice always stands.
     fn is_unconstrained(&self, channel: &ChannelHistory) -> bool {
-        self.limits.is_unconstrained() && channel.is_unconstrained()
+        self.limits.is_unconstrained()
+            && channel.is_unconstrained()
+            && !(0..self.series.len()).any(|si| self.rested(si))
     }
 
     /// `start`, or the first series after it that may serve — the draw-time half
@@ -390,10 +418,18 @@ impl PoolRuntime<'_> {
     /// `start`, or the first series after it the pool's own rule lets serve —
     /// `start` itself, counted as forced, when none does.
     fn own_eligible_from(&mut self, start: usize) -> usize {
+        let n = self.series.len();
+        // A series resting out the lap is the last resort, not a way out of
+        // the channel rule: prefer any that is not, before the pool's own rule.
+        if let Some(si) = (0..n)
+            .map(|step| (start + step) % n)
+            .find(|&si| !self.rested(si) && self.own_allows(si))
+        {
+            return si;
+        }
         if self.limits.is_unconstrained() {
             return start;
         }
-        let n = self.series.len();
         if let Some(si) = (0..n)
             .map(|step| (start + step) % n)
             .find(|&si| self.own_allows(si))
@@ -462,10 +498,7 @@ impl PoolRuntime<'_> {
         let s = &mut self.series[si];
         let n = want.min(s.remaining());
         let out = s.ids[s.cursor..s.cursor + n].to_vec();
-        s.cursor += n;
-        if s.cursor >= s.ids.len() {
-            s.cursor = 0;
-        }
+        s.advance_to(s.cursor + n);
         self.drawn.extend(out.iter().cloned());
         out
     }
@@ -841,7 +874,14 @@ impl PoolRuntime<'_> {
             .filter(|s| s.cursor > 0)
             .map(|s| (s.key.as_str(), s.ids[s.cursor - 1].as_str()))
             .collect();
+        let finished: HashSet<&str> = self
+            .series
+            .iter()
+            .filter(|s| s.finished)
+            .map(|s| s.key.as_str())
+            .collect();
         for s in &mut fresh.series {
+            s.finished = finished.contains(s.key.as_str());
             if let Some(last) = last_aired.get(s.key.as_str())
                 && let Some(pos) = s.ids.iter().position(|id| id == last)
             {
@@ -1705,30 +1745,6 @@ fn describe_take_from(from: TakeFrom) -> String {
     }
 }
 
-/// Flatten `ScoreCache::picked_extras`'s metadata half down to a plain
-/// `entry_id`-keyed map — the shape both [`build`] (the pattern walk) and
-/// `sequence::build` return in [`BlockBuild`] to their shared caller,
-/// `resolve::resolve_block`,
-/// which only ever sees a flat drawn-id list with no pool label left on any
-/// one of them. Two pools that both draw the same id and both attach
-/// metadata therefore collide here exactly as they already do for
-/// `Pool::constraints` — the same "blind across pools" limit, not a new one,
-/// and not fixable without giving every drawn id a pool label all the way
-/// out to `resolve::resolve_block`.
-///
-/// Kept as one shared helper (#203) so a future per-drawn-item field only
-/// has to be handled once — the flattening used to be written out twice,
-/// once here and once in `sequence::build`, which is exactly the shape that
-/// let #201 drop `metadata` silently on the sequencer path.
-pub(crate) fn flatten_picked_extras(
-    picked_extras: HashMap<(String, String), crate::score::PickedExtra>,
-) -> HashMap<String, serde_json::Value> {
-    picked_extras
-        .into_iter()
-        .filter_map(|((_pool, id), extra)| extra.metadata.map(|m| (id, m)))
-        .collect()
-}
-
 /// Resolve every pool's raw ordered id list — its `expr`/`plugin`/`groups`
 /// source, plus internal `order` for the non-plugin cases. A pool's *source*
 /// means the same thing regardless of which hook draws from the result, so
@@ -2320,6 +2336,7 @@ pub(crate) fn resolve_pool_series(
                     show_key,
                     ids: vec![id],
                     cursor: 0,
+                    finished: false,
                 });
             }
         }
@@ -2470,10 +2487,7 @@ fn pool_runtime<'a>(
             if let Some(last) = state.cursor.get(&s.show_key)
                 && let Some(pos) = s.ids.iter().position(|id| id == last)
             {
-                s.cursor = pos + 1;
-                if s.cursor >= s.ids.len() {
-                    s.cursor = 0;
-                }
+                s.advance_to(pos + 1);
             }
         }
         match prev {
@@ -3665,6 +3679,44 @@ mod tests {
         let (ids, _) = build_with(vec![p], vec![step("shows", 2)], Some(2), &state, 0);
         // inv continues after e2; got — its cursor gone — starts over at e1.
         assert_eq!(ids, vec!["inv-e3", "got-e1", "got-e2", "got-e3"]);
+    }
+
+    /// A resuming pool whose rotation comes back to a show it has played to the
+    /// end (the ledger's last id is the show's final episode) passes over it
+    /// while other shows have yet to take their turn this lap, then restarts it
+    /// once the lap clears (etv-station-hzfh.21).
+    #[test]
+    fn a_finished_show_rests_until_the_lap_clears() {
+        let mut p = episodes_pool(GroupBy::Show);
+        p.advance = Advance::Resume;
+        let mut resume = ResumeMap::new();
+        resume.pools.insert(
+            "shows".into(),
+            PoolResume {
+                list: None,
+                lap: vec!["show:inv".into()],
+                next: Some("show:inv".into()),
+                drawn: Vec::new(),
+                cycle: 0,
+                step: 0,
+            },
+        );
+        let state = GenerationState {
+            resume,
+            tail: Vec::new(),
+            cursor: BTreeMap::from([("show:inv".to_string(), "inv-s1e3".to_string())]),
+        };
+
+        let ids = build_seasons(p, vec![step_all("shows")], Some(2), &state);
+        assert_eq!(
+            ids,
+            vec![
+                // inv was played through this lap: got goes first…
+                "got-s1e1", "got-s1e2", "got-s1e3", "got-s1e4", "got-s2e1", "got-s2e2",
+                // …and with the lap cleared inv restarts at its top.
+                "inv-s1e1", "inv-s1e2", "inv-s1e3",
+            ],
+        );
     }
 
     /// `wrap = "loop"` restarts an exhausted show so the channel never runs dry.

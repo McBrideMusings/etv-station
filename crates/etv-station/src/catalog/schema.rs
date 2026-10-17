@@ -207,6 +207,16 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     CREATE INDEX idx_entries_show ON entries(COALESCE(show, ''));
     "#,
+    // v10 — keep the absolute episode number Plex itself reported, apart from
+    // the one the catalog serves (#105). `absolute_episode` is Plex's number
+    // for a fully indexed show and a computed (season, episode) flatten for
+    // any other; deciding which a show gets needs to know which episodes Plex
+    // actually numbered, which the served column can no longer say once it
+    // holds computed values. Existing rows were written straight from Plex.
+    r#"
+    ALTER TABLE entries ADD COLUMN plex_absolute_episode INTEGER;
+    UPDATE entries SET plex_absolute_episode = absolute_episode;
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

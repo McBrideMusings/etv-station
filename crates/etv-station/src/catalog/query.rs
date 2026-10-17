@@ -28,6 +28,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value;
 
 use super::error::CatalogError;
+use super::fields::{ScalarField, ScalarKind};
 
 /// A translated `WHERE` clause plus its positional bind parameters.
 pub struct WhereClause {
@@ -113,6 +114,20 @@ pub fn translate(cel_src: &str) -> Result<WhereClause, CatalogError> {
     Ok(WhereClause { sql, params })
 }
 
+/// Load-time check for a pool expression that calls `keyword_score`: runs the
+/// same translation resolution runs, so an empty keyword set or a threshold the
+/// set can never reach fails when the config loads. Any other expression is
+/// left to fail (or not) when it resolves.
+pub fn check_keyword_scores(cel_src: &str) -> Result<(), String> {
+    if !cel_src.contains(KEYWORD_SCORE) {
+        return Ok(());
+    }
+    translate(cel_src).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// The CEL function that counts how many of a keyword set an entry matches.
+const KEYWORD_SCORE: &str = "keyword_score";
+
 /// One field of the `item.*` query surface, resolved to its backing SQL.
 enum FieldKind {
     /// A text column on `entries`.
@@ -134,19 +149,13 @@ enum FieldKind {
 impl FieldKind {
     fn resolve(name: &str) -> Option<FieldKind> {
         use FieldKind::*;
+        if let Some(f) = ScalarField::from_name(name) {
+            return Some(match f.kind() {
+                ScalarKind::Str => Str(f.name()),
+                ScalarKind::Num => Num(f.name()),
+            });
+        }
         Some(match name {
-            "title" => Str("title"),
-            "show" => Str("show"),
-            "type" => Str("type"),
-            "content_rating" => Str("content_rating"),
-            "edition" => Str("edition"),
-            "studio" => Str("studio"),
-            "library" => Str("library"),
-            "year" => Num("year"),
-            "season" => Num("season"),
-            "episode" => Num("episode"),
-            "absolute_episode" => Num("absolute_episode"),
-            "duration_ms" => Num("duration_ms"),
             "genres" => Tag(Some("genre")),
             "labels" => Tag(Some("label")),
             "cast" => Tag(Some("cast")),
@@ -216,6 +225,12 @@ fn comparison(
     rhs: &IdedExpr,
     params: &mut Vec<Value>,
 ) -> Result<String, CatalogError> {
+    if let Some(args) = keyword_score_call(lhs) {
+        return keyword_score_comparison(func, args, rhs, params);
+    }
+    if let Some(args) = keyword_score_call(rhs) {
+        return keyword_score_comparison(mirror_comparison(func), args, lhs, params);
+    }
     let (field_name, literal, field_on_right) = field_and_literal(lhs, rhs)?;
     let kind = FieldKind::resolve(&field_name)
         .ok_or_else(|| err(format!("unknown query field item.{field_name}")))?;
@@ -269,6 +284,84 @@ fn comparison(
             "item.{field_name} is multi-valued; use membership (contains), not {op}"
         ))),
     }
+}
+
+/// The arguments of a free `keyword_score(...)` call, if `node` is one.
+fn keyword_score_call(node: &IdedExpr) -> Option<&[IdedExpr]> {
+    match &node.expr {
+        Expr::Call(call) if call.target.is_none() && call.func_name == KEYWORD_SCORE => {
+            Some(&call.args)
+        }
+        _ => None,
+    }
+}
+
+/// `keyword_score(["a", "b", …]) <op> <int>`: the count of distinct keywords an
+/// entry matches, compared to a threshold. A keyword matches when it is a
+/// case-insensitive substring of the title or equals (ignoring case) one of the
+/// entry's tag values — genres, labels and the rest of `item.tags`. The count
+/// is a sum of one `CASE` per keyword, so the comparison stays one predicate.
+///
+/// `func` already reads as `score <op> threshold` (the caller mirrors it when
+/// the call sat on the right). An empty set, or a threshold the set cannot
+/// reach, is an error: the pool would never match, and the author should hear
+/// about it rather than ship a dead channel.
+fn keyword_score_comparison(
+    func: &str,
+    args: &[IdedExpr],
+    threshold: &IdedExpr,
+    params: &mut Vec<Value>,
+) -> Result<String, CatalogError> {
+    let [list] = args else {
+        return Err(err("keyword_score() takes one list of keywords"));
+    };
+    let Expr::List(list) = &list.expr else {
+        return Err(err("keyword_score() needs a list literal of keywords"));
+    };
+    let mut keywords: Vec<String> = Vec::new();
+    for element in &list.elements {
+        let Value::Text(keyword) = literal_text(element)? else {
+            unreachable!("literal_text only yields Value::Text")
+        };
+        if !keywords.iter().any(|k| k.eq_ignore_ascii_case(&keyword)) {
+            keywords.push(keyword);
+        }
+    }
+    if keywords.is_empty() {
+        return Err(err("keyword_score() has an empty keyword set"));
+    }
+    let Value::Integer(n) = literal_int(threshold)? else {
+        unreachable!("literal_int only yields Value::Integer")
+    };
+    let size = keywords.len() as i64;
+    let (op, unreachable) = match func {
+        "_>=_" => (">=", n > size),
+        "_>_" => (">", n >= size),
+        "_==_" => ("=", n < 0 || n > size),
+        "_!=_" => ("<>", false),
+        "_<=_" => ("<=", n < 0),
+        "_<_" => ("<", n <= 0),
+        _ => unreachable!("comparison called with non-comparison op"),
+    };
+    if unreachable {
+        return Err(err(format!(
+            "keyword_score() of {size} keyword(s) can never satisfy {op} {n}"
+        )));
+    }
+
+    let cases: Vec<String> = keywords
+        .iter()
+        .map(|keyword| {
+            params.push(Value::Text(like_escape(keyword)));
+            params.push(Value::Text(keyword.clone()));
+            "(CASE WHEN COALESCE(entries.title, '') LIKE '%' || ? || '%' ESCAPE '\\' \
+             OR EXISTS (SELECT 1 FROM tags t WHERE t.entry_id = entries.entry_id \
+             AND lower(t.value) = lower(?)) THEN 1 ELSE 0 END)"
+                .to_string()
+        })
+        .collect();
+    params.push(Value::Integer(n));
+    Ok(format!("({}) {op} ?", cases.join(" + ")))
 }
 
 /// `item.<field> in [<literals>]`.
@@ -517,11 +610,13 @@ fn literal_like(node: &IdedExpr) -> Result<Value, CatalogError> {
     let Value::Text(s) = literal_text(node)? else {
         unreachable!("literal_text only yields Value::Text")
     };
-    let escaped = s
-        .replace('\\', "\\\\")
+    Ok(Value::Text(like_escape(&s)))
+}
+
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
         .replace('%', "\\%")
-        .replace('_', "\\_");
-    Ok(Value::Text(escaped))
+        .replace('_', "\\_")
 }
 
 fn literal_int(node: &IdedExpr) -> Result<Value, CatalogError> {
@@ -751,6 +846,65 @@ mod tests {
         let c = seeded();
         let got = c.resolve_query("item.year in [2001, 2003]").unwrap();
         assert_eq!(got, vec!["imdb:tt0120737", "imdb:tt0325980"]);
+    }
+
+    /// Beverly Hills Cop carries Action, Comedy and Crime; Shaun of the Dead
+    /// carries Comedy and Horror; Airplane! carries only Comedy.
+    fn seeded_comedies() -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        for (id, title, genres) in [
+            (
+                "cop",
+                "Beverly Hills Cop",
+                &["Action", "Comedy", "Crime"][..],
+            ),
+            ("shaun", "Shaun of the Dead", &["Comedy", "Horror"][..]),
+            ("plane", "Airplane!", &["Comedy"][..]),
+        ] {
+            let e = Entry::new(id, "movie", title, Source::Plex);
+            c.upsert_entry(&e).unwrap();
+            for g in genres {
+                c.add_tag(id, TagNs::Genre, g).unwrap();
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn keyword_score_counts_matched_keywords_against_a_threshold() {
+        let c = seeded_comedies();
+        let ids = |cel: &str| c.resolve_query(cel).unwrap();
+        assert_eq!(
+            ids(r#"keyword_score(["action", "crime", "thriller"]) >= 2"#),
+            vec!["cop"]
+        );
+        assert_eq!(
+            ids(r#"keyword_score(["action", "crime", "thriller"]) == 0"#),
+            vec!["plane", "shaun"]
+        );
+        // A keyword matches a title substring or a genre, ignoring case; a repeat counts once.
+        assert_eq!(
+            ids(r#"keyword_score(["the dead", "HORROR", "Horror"]) >= 2"#),
+            vec!["shaun"]
+        );
+        // The score is on the right of the comparison and combines with `&&`.
+        assert_eq!(
+            ids(r#"item.genres.contains("Comedy") && 1 > keyword_score(["action", "crime"])"#),
+            vec!["plane", "shaun"]
+        );
+    }
+
+    #[test]
+    fn keyword_score_rejects_an_empty_set_and_an_unreachable_threshold() {
+        let e = super::translate(r#"keyword_score([]) >= 1"#).err().unwrap();
+        assert!(e.to_string().contains("empty keyword set"), "{e}");
+        let e = super::translate(r#"keyword_score(["a", "b"]) >= 3"#)
+            .err()
+            .unwrap();
+        let msg = e.to_string();
+        assert!(msg.contains("2 keyword") && msg.contains(">= 3"), "{msg}");
+        assert!(super::translate(r#"keyword_score(["a", "b"]) > 2"#).is_err());
+        assert!(super::translate(r#"keyword_score(["a", "b"]) >= 2"#).is_ok());
     }
 
     #[test]

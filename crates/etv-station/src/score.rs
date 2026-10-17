@@ -144,6 +144,7 @@ use etv_overlay::config_carrier;
 use rhai::serde::DynamicDeserializer;
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Scope};
 
+use crate::catalog::fields::{ScalarField, ScalarValue};
 use crate::catalog::{Catalog, TagNs};
 use crate::pattern::MAX_TAKE;
 
@@ -156,13 +157,10 @@ pub struct WatchEvent {
     /// Unix seconds when the watch stopped.
     pub watched_at: i64,
     /// Who watched it, as Tautulli reports them — the account's friendly name
-    /// when it has one, else its username (#113).
+    /// when it has one, else its username.
     ///
     /// `None` when the history row named nobody, which is what a Tautulli that
-    /// has anonymised the row looks like. Nothing ranks on this; it exists so a
-    /// channel can say on screen and in the guide who has been watching. A
-    /// `single_user` channel's rows all carry the same name, which is why the
-    /// attribution line is only interesting on a pooled channel.
+    /// has anonymised the row looks like.
     pub watcher: Option<String>,
 }
 
@@ -1356,6 +1354,9 @@ pub(crate) fn engine() -> Engine {
         .register_fn("entry_id_for", ScoreCtx::entry_id_for)
         .register_fn("http", ScoreCtx::http);
     engine.register_fn("parse_json", crate::plugin_http::parse_json);
+    engine.register_fn("log", |text: &str| {
+        tracing::info!(event = "score.log", "{text}");
+    });
     engine
         .register_type_with_name::<Datastore>("Datastore")
         .register_fn("enrichment_for", Datastore::enrichment_for)
@@ -2298,22 +2299,14 @@ pub(crate) fn load_items(catalog: &Catalog, ids: &[String]) -> Result<Array, Str
         };
 
         let mut m = Map::new();
-        m.insert("entry_id".into(), entry.entry_id.into());
-        m.insert("type".into(), entry.kind.into());
-        m.insert("title".into(), entry.title.into());
-        insert_opt_str(&mut m, "title_sort", entry.title_sort);
-        insert_opt_str(&mut m, "show", entry.show);
-        insert_opt_str(&mut m, "show_id", entry.show_id);
-        insert_opt_int(&mut m, "season", entry.season);
-        insert_opt_int(&mut m, "episode", entry.episode);
-        insert_opt_int(&mut m, "absolute_episode", entry.absolute_episode);
-        insert_opt_str(&mut m, "edition", entry.edition);
-        insert_opt_str(&mut m, "studio", entry.studio);
-        insert_opt_int(&mut m, "year", entry.year);
-        insert_opt_str(&mut m, "release_date", entry.release_date);
-        insert_opt_int(&mut m, "duration_ms", entry.duration_ms);
-        insert_opt_str(&mut m, "content_rating", entry.content_rating);
-        insert_opt_str(&mut m, "library", entry.library);
+        m.insert("entry_id".into(), entry.entry_id.clone().into());
+        insert_opt_str(&mut m, "show_id", entry.show_id.clone());
+        for field in ScalarField::ALL {
+            match field.value(&entry) {
+                ScalarValue::Str(v) => insert_opt_str(&mut m, field.name(), v),
+                ScalarValue::Num(v) => insert_opt_int(&mut m, field.name(), v),
+            }
+        }
 
         for (key, by_id) in &tags {
             let values = by_id.get(id).map(Vec::as_slice).unwrap_or_default();

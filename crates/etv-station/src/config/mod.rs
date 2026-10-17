@@ -1,4 +1,5 @@
 mod block;
+mod categories;
 mod channel;
 mod constraints;
 mod entry;

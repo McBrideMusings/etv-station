@@ -1894,7 +1894,7 @@ fn catalog_item(
         // #186 default: the catalog's summary column, when the source
         // filled one, with no `guide:` config needed. A `guide.description`
         // template, if authored at any cascade level, overrides this in the
-        // render pass (`crate::daemon::render_guide_and_attribution`) —
+        // render pass (`crate::daemon::render_guide`) —
         // same as every other field here.
         description: entry.summary.clone(),
         season: as_u32(entry.season),

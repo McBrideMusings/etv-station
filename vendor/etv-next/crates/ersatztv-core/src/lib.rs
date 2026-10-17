@@ -346,6 +346,10 @@ pub async fn list_run_folders(channel_folder: &Path) -> Result<Vec<PathBuf>, std
 /// run can exist at once, and "keep the newest" collects the wrong one out
 /// from under that client (etv-station-262.1). A periodic sweep wants
 /// [`reap_unreferenced_run_folders`] instead.
+///
+/// With `keep_newest` false it also deletes a root playlist whose named run
+/// folders no longer exist, in the same call; an I/O error doing so is
+/// returned.
 pub async fn reap_run_folders(
     channel_folder: &Path,
     keep_newest: bool,
@@ -362,6 +366,13 @@ pub async fn reap_run_folders(
         }
         remove_dir_all(&folder).await?;
         removed += 1;
+    }
+
+    // Same step as the folder removal: the exit-time reap is what usually
+    // deletes the last run folder, and a root playlist left naming it would
+    // be served as a 200 whose segments 404 until the next periodic sweep.
+    if !keep_newest {
+        remove_orphaned_playlists(channel_folder).await?;
     }
 
     Ok(removed)
@@ -419,6 +430,44 @@ async fn run_folders_named_by_playlist(playlist_path: &Path) -> HashSet<String> 
     }
 
     referenced
+}
+
+/// Remove a root playlist (`live.m3u8` and/or `live_sub.m3u8`, judged
+/// independently) that no surviving run folder backs.
+///
+/// A playlist that names only folders that are gone describes nothing that
+/// exists; serving it hands a client a 200 whose first segment 404s. Both
+/// reap primitives call this in the same step that removes run folders, so
+/// there is no tick between the folder going and the playlist going.
+async fn remove_orphaned_playlists(channel_folder: &Path) -> Result<(), std::io::Error> {
+    for file_name in [LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME] {
+        let playlist_path = channel_folder.join(file_name);
+        if !tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
+            continue;
+        }
+
+        let named = run_folders_named_by_playlist(&playlist_path).await;
+        let mut any_survives = false;
+        for name in &named {
+            if tokio::fs::try_exists(channel_folder.join(name))
+                .await
+                .unwrap_or(false)
+            {
+                any_survives = true;
+                break;
+            }
+        }
+        // A playlist naming no run folder at all (header-only, or unreadable)
+        // is early or unknowable, not stale.
+        if !named.is_empty() && !any_survives {
+            match remove_file(&playlist_path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove run folders under `channel_folder` that no served playlist names.
@@ -495,33 +544,7 @@ pub async fn reap_unreferenced_run_folders(
     }
 
     if !keep_newest {
-        for file_name in [LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME] {
-            let playlist_path = channel_folder.join(file_name);
-            if !tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
-                // No playlist to reconsider — same "missing is not an
-                // error" rule run_folders_named_by_playlist follows.
-                continue;
-            }
-
-            let named = run_folders_named_by_playlist(&playlist_path).await;
-            let mut any_survives = false;
-            for name in &named {
-                if tokio::fs::try_exists(channel_folder.join(name))
-                    .await
-                    .unwrap_or(false)
-                {
-                    any_survives = true;
-                    break;
-                }
-            }
-            if !any_survives {
-                match remove_file(&playlist_path).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
+        remove_orphaned_playlists(channel_folder).await?;
     }
 
     Ok(removed)
@@ -837,6 +860,36 @@ mod run_folder_tests {
         assert_eq!(removed, 2);
         assert!(!older.exists());
         assert!(!newer.exists());
+    }
+
+    /// The exit-time reap removes the last run folder, so it must take the
+    /// playlist naming it in the same call — not leave it for the next sweep.
+    #[tokio::test]
+    async fn not_keeping_newest_removes_playlists_naming_only_the_folders_it_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let run = root.join("r0000000000001-0000");
+        tokio::fs::create_dir(&run).await.unwrap();
+        aged(&run);
+        tokio::fs::write(
+            root.join(LIVE_PLAYLIST_FILE_NAME),
+            "r0000000000001-0000/live000000.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join(LIVE_SUBTITLE_PLAYLIST_FILE_NAME),
+            "r0000000000001-0000/live000000.vtt\n",
+        )
+        .await
+        .unwrap();
+
+        let removed = reap_run_folders(root, false).await.unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!root.join(LIVE_PLAYLIST_FILE_NAME).exists());
+        assert!(!root.join(LIVE_SUBTITLE_PLAYLIST_FILE_NAME).exists());
     }
 
     /// A player that stalls past the playlist's window comes back for a

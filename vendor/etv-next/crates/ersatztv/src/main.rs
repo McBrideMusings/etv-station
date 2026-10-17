@@ -202,6 +202,7 @@ async fn run() -> Result<(), LineupError> {
                 .route("/channels.m3u", get(channel_playlist))
                 .route("/xmltv.xml", get(crate::xmltv::xmltv_epg))
                 .route("/health/channels.json", get(channel_health_report))
+                .route("/build.json", get(build_stamp))
                 // Plex has no M3U tuner type — of its four device kinds only
                 // `hdhomerun` is both a live-TV protocol and publicly
                 // implementable — so a server that wants Plex to carry its
@@ -331,6 +332,33 @@ async fn stream(
         )],
         content,
     ))
+}
+
+/// The commit and time the image was built from. The Dockerfile bakes both
+/// into the environment; outside the image they are unset and read `unknown`.
+#[derive(serde::Serialize, PartialEq, Debug)]
+struct BuildStamp {
+    revision: String,
+    created: String,
+}
+
+impl BuildStamp {
+    fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        let read = |name| {
+            get(name)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "unknown".to_owned())
+        };
+        Self {
+            revision: read("ETV_STATION_REVISION"),
+            created: read("ETV_STATION_CREATED"),
+        }
+    }
+}
+
+/// Which commit this server was built from, readable without `docker inspect`.
+async fn build_stamp() -> impl IntoResponse {
+    axum::Json(BuildStamp::from_env(|name| std::env::var(name).ok()))
 }
 
 #[derive(serde::Serialize)]
@@ -942,5 +970,23 @@ mod get_multi_variant_tests {
         let result = get_multi_variant(&channel, &HeaderMap::new()).await;
 
         assert!(!result.contains("TYPE=SUBTITLES"), "{result}");
+    }
+
+    #[test]
+    fn build_stamp_reads_the_baked_environment() {
+        let stamp = BuildStamp::from_env(|name| match name {
+            "ETV_STATION_REVISION" => Some("a4d013b".to_owned()),
+            "ETV_STATION_CREATED" => Some("2026-08-22T06:11:23Z".to_owned()),
+            _ => None,
+        });
+        assert_eq!(stamp.revision, "a4d013b");
+        assert_eq!(stamp.created, "2026-08-22T06:11:23Z");
+    }
+
+    #[test]
+    fn build_stamp_outside_the_image_is_unknown() {
+        let stamp = BuildStamp::from_env(|_| None);
+        assert_eq!(stamp.revision, "unknown");
+        assert_eq!(stamp.created, "unknown");
     }
 }
