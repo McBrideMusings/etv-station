@@ -647,8 +647,8 @@ impl HistoryDb {
     ///
     /// Same greatest-`start` / later-insertion tiebreak as
     /// [`HistoryDb::series_cursor`], but partitioned by `show_id` alone
-    /// instead of `(channel, show_id)` — a pool declaring `cursor_scope =
-    /// "show"` continues a series from wherever it last aired, on any
+    /// instead of `(channel, show_id)` — a pool declaring `cursor_scope:
+    /// global` continues a series from wherever it last aired, on any
     /// channel. Movies (`show_id IS NULL`) have no cross-channel identity to
     /// share and are excluded. Returns `show_id -> entry_id`.
     pub fn cross_channel_show_cursor(&self) -> Result<BTreeMap<String, String>, HistoryError> {

@@ -3335,6 +3335,7 @@ mod tests {
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
                 advance,
+                cursor_scope: Default::default(),
                 on_short: OnShort::Next,
                 constraints: None,
                 config: None,
@@ -3362,6 +3363,7 @@ mod tests {
                 select: Select::RoundRobin,
                 rotate: Rotate::Visit,
                 advance,
+                cursor_scope: Default::default(),
                 on_short: OnShort::Next,
                 constraints: None,
                 config: None,
@@ -3439,6 +3441,7 @@ mod tests {
             tail: db
                 .tail(CHANNEL, crate::constrain::DEFAULT_SEAM_TAIL)
                 .unwrap(),
+            global_cursor: Default::default(),
         }
     }
 
@@ -4198,6 +4201,7 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,

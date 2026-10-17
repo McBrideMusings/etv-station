@@ -85,8 +85,8 @@ use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{
-    Advance, Constraints, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate, Select,
-    ShowGroup, Take, TakeFrom,
+    Advance, Constraints, CursorScope, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate,
+    Select, ShowGroup, Take, TakeFrom,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
 use crate::guide::GuideConfig;
@@ -2484,7 +2484,11 @@ fn pool_runtime<'a>(
             // position it can find in its own list. The season that was playing
             // continues; the others sit at their top, which is where a season
             // nobody has started belongs.
-            if let Some(last) = state.cursor.get(&s.show_key)
+            let cursor = match cfg.cursor_scope {
+                CursorScope::Channel => &state.cursor,
+                CursorScope::Global => &state.global_cursor,
+            };
+            if let Some(last) = cursor.get(&s.show_key)
                 && let Some(pos) = s.ids.iter().position(|id| id == last)
             {
                 s.advance_to(pos + 1);
@@ -2728,6 +2732,7 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,
@@ -2758,6 +2763,7 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,
@@ -2792,6 +2798,7 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,
@@ -2889,6 +2896,7 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,
@@ -3199,6 +3207,7 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,
@@ -3256,6 +3265,7 @@ mod tests {
                 resume,
                 cursor,
                 tail,
+                global_cursor: Default::default(),
             },
         )
     }
@@ -3442,6 +3452,7 @@ mod tests {
                 resume,
                 cursor,
                 tail,
+                global_cursor: Default::default(),
             },
         )
     }
@@ -3670,6 +3681,7 @@ mod tests {
         let state = GenerationState {
             resume,
             tail: Vec::new(),
+            global_cursor: Default::default(),
             cursor: BTreeMap::from([
                 ("show:got".to_string(), "got-e99-deleted".to_string()),
                 ("show:inv".to_string(), "inv-e2".to_string()),
@@ -3679,6 +3691,32 @@ mod tests {
         let (ids, _) = build_with(vec![p], vec![step("shows", 2)], Some(2), &state, 0);
         // inv continues after e2; got — its cursor gone — starts over at e1.
         assert_eq!(ids, vec!["inv-e3", "got-e1", "got-e2", "got-e3"]);
+    }
+
+    /// `cursor_scope: global` reads the cross-channel cursor, so a show another
+    /// channel advanced continues here; the channel scope ignores it, and
+    /// `advance: restart` ignores both (#160).
+    #[test]
+    fn cursor_scope_picks_which_ledger_a_resuming_pool_reads() {
+        let state = GenerationState {
+            global_cursor: BTreeMap::from([("show:inv".to_string(), "inv-e2".to_string())]),
+            ..GenerationState::empty()
+        };
+        let run = |advance, scope| {
+            let mut p = shows_pool();
+            p.advance = advance;
+            p.cursor_scope = scope;
+            let (ids, _) = build_with(vec![p], vec![step("shows", 2)], Some(2), &state, 0);
+            ids
+        };
+        // Both shows are in the pool; round-robin opens on the first, got.
+        let global = run(Advance::Resume, CursorScope::Global);
+        let channel = run(Advance::Resume, CursorScope::Channel);
+        let restart = run(Advance::Restart, CursorScope::Global);
+        let inv_first = |ids: &Vec<String>| ids.iter().find(|i| i.starts_with("inv-")).cloned();
+        assert_eq!(inv_first(&global).as_deref(), Some("inv-e3"));
+        assert_eq!(inv_first(&channel).as_deref(), Some("inv-e1"));
+        assert_eq!(inv_first(&restart).as_deref(), Some("inv-e1"));
     }
 
     /// A resuming pool whose rotation comes back to a show it has played to the
@@ -3704,6 +3742,7 @@ mod tests {
         let state = GenerationState {
             resume,
             tail: Vec::new(),
+            global_cursor: Default::default(),
             cursor: BTreeMap::from([("show:inv".to_string(), "inv-s1e3".to_string())]),
         };
 
@@ -4321,6 +4360,7 @@ mod tests {
             resume,
             cursor,
             tail: first.clone(),
+            global_cursor: Default::default(),
         };
 
         let (second, _) = fill_movies(&cat, None, &state, four_hours);
@@ -4376,6 +4416,7 @@ mod tests {
             resume,
             cursor: first.iter().map(|id| (id.clone(), id.clone())).collect(),
             tail: first.clone(),
+            global_cursor: Default::default(),
         };
         let (second, pools) = walk(&state);
         assert_eq!(second, vec!["mov-04", "mov-05", "mov-06"]);
@@ -5496,6 +5537,7 @@ fn audit(ctx, picks, workspace) { #{} }
                 resume,
                 cursor: aired.iter().map(|id| (id.clone(), id.clone())).collect(),
                 tail: aired.clone(),
+                global_cursor: Default::default(),
             };
             states.push(state.clone());
         }

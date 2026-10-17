@@ -1426,6 +1426,7 @@ mod tests {
             select: Select::default(),
             rotate: Rotate::default(),
             advance: Advance::default(),
+            cursor_scope: Default::default(),
             on_short: OnShort::default(),
             constraints: None,
             config: None,

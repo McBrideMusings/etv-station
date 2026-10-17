@@ -138,6 +138,7 @@ fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
         select: Default::default(),
         rotate: Default::default(),
         advance: Default::default(),
+        cursor_scope: Default::default(),
         on_short: Default::default(),
         constraints: None,
         config: None,

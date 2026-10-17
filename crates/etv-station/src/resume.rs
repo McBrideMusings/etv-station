@@ -363,6 +363,10 @@ impl ResumeMap {
 pub struct GenerationState {
     pub resume: ResumeMap,
     pub cursor: BTreeMap<String, String>,
+    /// `show_id -> last-played entry_id` across every channel, read by pools
+    /// declaring `cursor_scope: global`. Projected from the same ledger as
+    /// `cursor`, just not narrowed to this channel (#160).
+    pub global_cursor: BTreeMap<String, String>,
     /// The most recently aired entry ids, oldest first — the adjacency seam the
     /// `no_repeat_within` pass reads so it does not repeat across a generation
     /// boundary (#73). Projected from the same ledger as `cursor`.
@@ -378,7 +382,7 @@ impl GenerationState {
     /// Whether anything has ever played on this channel. Used to tell a pattern
     /// channel that has run out of content apart from one that never had any.
     pub fn is_fresh(&self) -> bool {
-        self.resume.is_empty() && self.cursor.is_empty()
+        self.resume.is_empty() && self.cursor.is_empty() && self.global_cursor.is_empty()
     }
 }
 

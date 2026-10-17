@@ -35,8 +35,8 @@ pub use overlay::{
     resolve_decl,
 };
 pub use pool::{
-    Advance, DatastoreGrant, GroupBy, OnShort, PatternStep, Pool, Rotate, Select, ShowGroup, Take,
-    TakeFrom,
+    Advance, CursorScope, DatastoreGrant, GroupBy, OnShort, PatternStep, Pool, Rotate, Select,
+    ShowGroup, Take, TakeFrom,
 };
 pub use rule::{BlockInclude, RuleConfig};
 pub use schedule::{ClockRange, DateSpan, DayName, Schedule};
