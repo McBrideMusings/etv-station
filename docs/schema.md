@@ -873,8 +873,10 @@ the one item airing at the boundary. A pattern block stops at the first visit
 later by at most the visit that was airing: one movie, one `take: 3` run of
 episodes, a whole season for `take: all`. The rest of the cycle is not aired;
 the `.resume` sidecar records the cycle and the step the generation stopped
-before (`cycle`, `step`), and the next time the slot airs it opens on that
-step. A block with a `restart` pool has no rotation to carry across the stop,
+before (`cycle`, `step`) and a hash of the pattern it walked (`pattern`), and
+the next time the slot airs it opens on that step. If the pattern was edited
+in between, the stored step no longer means the same visit, so the cycle opens
+at step 0. A block with a `restart` pool has no rotation to carry across the stop,
 so it still ends on a cycle boundary.
 
 **State.** Each slot continues where it stopped the last time a schedule
@@ -1475,7 +1477,7 @@ resolve fails the channel's generation naming the pool and the set, and says
 `channel-authored source` rather than naming the script, so the error points at
 the file the expression is actually written in.
 
-#### Pool `profile`, `profile_files` and `exclude_keywords` — a taste profile
+#### Pool `profile`, `profile_files` and `ignore_keywords` — a taste profile
 
 A plugin pool can carry a **taste profile**: signed weights on keywords, catalog
 tag values, single items and CEL-defined sets, plus exclusions that remove a tag
@@ -1496,10 +1498,10 @@ the weight math (ADR 0002).
     - { set: 'item.collections.contains("Guilty Pleasures")', weight: 3.0 }
     - { genre: Animation,          exclude: true }
     - { item: "Cats (2019)",       exclude: true }
-  exclude_keywords: [duringcreditsstinger]
+  ignore_keywords: [duringcreditsstinger]
 ```
 
-**An entry** names exactly one reference and either a `weight` or `exclude: true`:
+**An entry** names exactly one reference and one of a `weight`, `exclude: true` or `require: true`:
 
 | Key | Resolves to |
 |---|---|
@@ -1513,24 +1515,47 @@ the weight math (ADR 0002).
 **`exclude: true`** in place of a `weight` removes every title the reference
 matches from the pool's candidates. It takes a catalog tag (matched against the
 catalog's own value, ignoring case for ASCII letters only — `horror` matches
-`Horror`, `élodie` does not match `Élodie`) or an `item`, never a
-`keyword` or a `set`. The station drops the matched entry ids from each of the
+`Horror`, `élodie` does not match `Élodie`), an `item`, or a `keyword` — never a
+`set`. A keyword resolves its spelling through `keyword_forms`, then matches
+every title whose movie or show carries that keyword in the pool's first
+granted datastore; an episode matches by its show's keywords, since it has none
+of its own, so `{ keyword: christmas, exclude: true }` removes Christmas films
+and every episode of a show tagged `christmas`. The station drops the matched entry ids from each of the
 pool's resolved `sources` sets before the script runs, so an excluded title is
 absent from `ctx.sets` and can never be picked — where a negative `weight` only
 scores it down and leaves it a candidate. An exclusion is not in `ctx.profile`.
-Two pools naming one script share resolved sets only when they exclude the same
-ids. Each resolved exclusion logs `profile exclusion resolved` (pool, reference,
-origin, `matched`) at info, and each set it narrows logs `profile exclusions
-removed candidates` (`candidates`, `excluded`, `remaining`) at debug; `taste-debug` prints each
+**`require: true`** is the reverse: it keeps only the titles the reference
+matches. It takes the same references as `exclude` (a keyword, a catalog tag or
+an `item`, never a `set`), and several `require` entries combine as "matches at
+least one of them". A themed pool lists its subjects and the scorer ranks only
+what carries one, by house taste as usual:
+
+```yaml
+profile:
+  - { keyword: halloween, require: true }
+  - { keyword: haunted house, require: true }
+  - { keyword: witch, require: true }
+  - { keyword: halloween, weight: 3.0 }   # optional: rank the most on-theme first
+```
+
+A title both required and excluded is excluded. A `require` entry is not in
+`ctx.profile` either.
+
+Two pools naming one script share resolved sets only when they narrow them the
+same way. Each resolved exclusion logs `profile exclusion resolved` and each
+requirement `profile requirement resolved` (pool, reference, origin, `matched`)
+at info, and each set they narrow logs `profile narrowing removed candidates`
+(`candidates`, `removed`, `remaining`) at debug; `taste-debug` prints each
 exclusion and its match count under the profile.
 
 **`profile_files`** are YAML lists of entries, relative to the channel file.
 Their entries arrive first, in list order, then the inline `profile`. A file
 holds a person's standing likes and dislikes, and several pools can name it.
 
-**`exclude_keywords`** go through the `keyword` rule and reach the script as
-`ctx.exclude_keywords`. A keyword excluded this way stops counting toward the
-score; the titles carrying it stay candidates.
+**`ignore_keywords`** go through the `keyword` rule and reach the script as
+`ctx.ignore_keywords`. A keyword ignored this way stops counting toward the
+score; the titles carrying it stay candidates. To remove those titles, write
+`{ keyword: …, exclude: true }` in `profile:` instead.
 
 **`ctx.profile`** is one map per entry: `kind` (`keyword`, `tag`, `item`,
 `set`), `namespace` and `value` for a keyword or tag, `items` (full item maps,
@@ -1538,18 +1563,18 @@ the same shape as `ctx.sets`) for an item or set, `weight`, `reference` (as
 written) and `origin` (the profile file's path as written, or `inline`). A pool
 with no profile reads empty arrays. Reading `ctx.profile` needs the
 `catalog_read` capability, the same as `ctx.sets`, since `item` and `set`
-entries carry catalog item maps; `ctx.exclude_keywords` is not gated.
+entries carry catalog item maps; `ctx.ignore_keywords` is not gated.
 
 Rejected at load, naming the pool, origin and position: any of the three on a
 pool with no `plugin`; an entry naming zero or two references, an empty value,
 an unknown key, a zero or non-finite weight, or an `item` in neither shape;
-`exclude: true` beside a `weight`, on a `keyword` or `set`, or `exclude: false`;
-an unreadable profile file; an empty `exclude_keywords` value. Failing the
+`exclude: true` beside a `weight` or on a `set`, or `exclude: false`; `require: true` beside a `weight` or `exclude`, or on a `set`, or `require: false`;
+an unreadable profile file; an empty `ignore_keywords` value. Failing the
 generation, naming the entry and the spelling: an `item` matching no entry or
 several (listed); a `set` that fails to resolve or matches nothing; an
 excluded tag value no catalog entry carries; a
-`keyword` or `exclude_keywords` spelling `keyword_forms` has never seen, or a
-`keyword`/`exclude_keywords` entry on a pool that grants no datastore.
+`keyword` or `ignore_keywords` spelling `keyword_forms` has never seen, or a
+`keyword`/`ignore_keywords` entry on a pool that grants no datastore.
 
 #### How `taste-cosine.rhai` scores a taste profile
 
@@ -1652,14 +1677,14 @@ and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
-#### `exclude_keywords` — tags that describe packaging, not subject
+#### `ignore_keywords` — tags that describe packaging, not subject
 
 ```yaml
-exclude_keywords: [duringcreditsstinger]
+ignore_keywords: [duringcreditsstinger]
 ```
 
 A pool field beside `profile` (see above), reaching `taste-cosine.rhai` as
-`ctx.exclude_keywords`. The script refuses an `exclude_keywords` written under
+`ctx.ignore_keywords`. The script refuses an `ignore_keywords` written under
 `config:`. Each entry matches one whole keyword exactly:
 `duringcreditsstinger` drops that tag and nothing else, never a substring such
 as `stinger`.

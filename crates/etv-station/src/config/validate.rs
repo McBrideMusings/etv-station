@@ -884,7 +884,7 @@ fn validate_block_pools<'a>(
             // profile file reads and parses. Catalog lookups wait for the
             // generation; a malformed entry never needs one to be refused.
             crate::profile::load(pool, base_dir)
-                .and_then(|_| crate::profile::check_exclude_keywords(pool))
+                .and_then(|_| crate::profile::check_ignore_keywords(pool))
                 .map_err(|m| bad(format!("pool {:?}: {m}", pool.name)))?;
             // Checked last among this pool's plugin checks — it is the one
             // that reads the script off disk, so the cheaper structural checks
@@ -909,10 +909,10 @@ fn validate_block_pools<'a>(
         if pool.plugin.is_none()
             && (!pool.profile.is_empty()
                 || !pool.profile_files.is_empty()
-                || !pool.exclude_keywords.is_empty())
+                || !pool.ignore_keywords.is_empty())
         {
             return Err(bad(format!(
-                "pool {:?} sets `profile`, `profile_files` or `exclude_keywords` without a \
+                "pool {:?} sets `profile`, `profile_files` or `ignore_keywords` without a \
                  `plugin` — they weight a scorer plugin's ranking, and a pool drawing from \
                  `expr` or `groups` has no script to hand them to",
                 pool.name
@@ -1418,7 +1418,7 @@ mod tests {
             sources: None,
             profile: Vec::new(),
             profile_files: Vec::new(),
-            exclude_keywords: Vec::new(),
+            ignore_keywords: Vec::new(),
             groups: Vec::new(),
             order: None,
             bucket_order: None,
@@ -2096,11 +2096,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_profile_files_or_exclude_keywords_without_a_plugin() {
+    fn rejects_profile_files_or_ignore_keywords_without_a_plugin() {
         let mut files = pool("files");
         files.profile_files = vec!["p.yaml".into()];
         let mut exclude = pool("exclude");
-        exclude.exclude_keywords = vec!["duringcreditsstinger".into()];
+        exclude.ignore_keywords = vec!["duringcreditsstinger".into()];
         for p in [files, exclude] {
             let name = p.name.clone();
             let block = pattern_block(vec![p], vec![step(&name, 1)]);

@@ -1353,21 +1353,36 @@ fn resolve_block(
     let mut items: Vec<ResolvedItem> = Vec::new();
     for entry in include.entries() {
         match entry {
-            Entry::Item(item) => items.push(resolve_item(
-                item,
-                defaults,
-                guide_defaults,
-                identity_roots,
-                path_index,
-            )),
+            Entry::Item(item) => {
+                let mut resolved = vec![resolve_item(
+                    item,
+                    defaults,
+                    guide_defaults,
+                    identity_roots,
+                    path_index,
+                )];
+                stamp_select(
+                    &mut resolved,
+                    "entries:item",
+                    "listed as an item in the block's entries",
+                    None,
+                );
+                items.extend(resolved);
+            }
             Entry::Query(query) => {
                 let cat = catalog.ok_or_else(|| {
                     unsupported(format!(
                         "block #{idx}: a query entry needs the catalog, which is not available"
                     ))
                 })?;
-                let resolved = resolve_query(cat, query, defaults, guide_defaults, seed)
+                let mut resolved = resolve_query(cat, query, defaults, guide_defaults, seed)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                stamp_select(
+                    &mut resolved,
+                    "entries:query",
+                    "matched the block's query entry",
+                    Some(serde_json::json!({ "query": query.query })),
+                );
                 items.extend(resolved);
             }
             Entry::Collection(collection) => {
@@ -1376,8 +1391,14 @@ fn resolve_block(
                         "block #{idx}: a collection entry needs the catalog, which is not available"
                     ))
                 })?;
-                let resolved = resolve_collection(cat, collection, defaults, guide_defaults)
+                let mut resolved = resolve_collection(cat, collection, defaults, guide_defaults)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                stamp_select(
+                    &mut resolved,
+                    "entries:collection",
+                    &format!("member of collection {:?}", collection.name),
+                    Some(serde_json::json!({ "collection": collection.name })),
+                );
                 items.extend(resolved);
             }
             Entry::Include(_) => {
@@ -1410,6 +1431,12 @@ fn resolve_block(
             path_index,
         )
         .map_err(|m| unsupported(format!("block #{idx}: fallback: {m}")))?;
+        stamp_select(
+            &mut items,
+            "entries:fallback",
+            "the block's entries resolved to nothing, so its fallback aired",
+            None,
+        );
     }
 
     // 1.6. Filter (#197) — narrow the resolved list before duplicates/order
@@ -1559,6 +1586,25 @@ fn resolve_pool_block_items(
         steps,
         pool_progress: progress,
     })
+}
+
+/// Record on every item of `items` the entries-block decision that put it on
+/// the schedule, as a `select` stage ([`crate::audit`]).
+fn stamp_select(
+    items: &mut [ResolvedItem],
+    by: &'static str,
+    verdict: &str,
+    detail: Option<serde_json::Value>,
+) {
+    for item in items {
+        crate::audit::push_stage(
+            &mut item.metadata,
+            "select",
+            by.into(),
+            verdict.into(),
+            detail.clone(),
+        );
+    }
 }
 
 /// Resolve a `query` entry against the catalog: run the CEL query, apply the
@@ -1994,11 +2040,9 @@ fn catalog_item(
             .filter(|ms| *ms > 0 && *ms <= MAX_CATALOG_DURATION_MS)
             .map(|ms| Duration::from_millis(ms as u64)),
         error_card: false,
-        // Set afterward, by `resolve_pool_block_items`'s post-pass (#166,
-        // #201) — shared by a pattern block and a sequencer block alike —
-        // for an id a plugin pool attached a blob to. Every other caller of
-        // this function has no pool/plugin context at all, so `None` here is
-        // the whole answer for them.
+        // Set afterward: `resolve_pool_block_items`'s post-pass (#166, #201)
+        // for an id a plugin pool attached a blob to, `stamp_select` for an
+        // entries block's query or collection result.
         metadata: None,
         // No item-level `guide:` for a catalog-resolved entry — there is no
         // per-entry config surface for a query/collection result, only the
@@ -2030,7 +2074,7 @@ fn resolve_item(
         // no catalog row behind it to fall back to.
         catalog_duration: None,
         error_card: false,
-        // No pool, no plugin — nothing could have attached a blob.
+        // No pool, no plugin; `stamp_select` adds the audit stage.
         metadata: None,
         // Item's own `guide:` wins, then the pre-merged block ∘ channel
         // cascade — the third and most specific cascade level.
@@ -2701,6 +2745,32 @@ mod tests {
         }
     }
 
+    fn audit_stages(item: &ResolvedItem) -> Vec<(String, String)> {
+        item.metadata.as_ref().unwrap()["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["stage"].as_str().unwrap().to_string(),
+                    r["by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fallback_item_records_why_the_fallback_aired() {
+        let cat = seeded_catalog();
+        let mut inc = query_block("item.title.contains(\"no such title\")", Order::Manual);
+        inc.fallback = Some(Fallback::Item(Box::new(item_entry("slate"))));
+        let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
+        assert_eq!(
+            audit_stages(&items[0]),
+            vec![("select".to_string(), "entries:fallback".to_string())]
+        );
+    }
+
     /// #186: `entries.summary` reaches `ProgramMetadata.description`, so the
     /// XMLTV guide carries a synopsis with no channel config. An entry with
     /// no summary must emit `description: None` rather than an empty string,
@@ -3327,7 +3397,7 @@ mod tests {
                 sources: None,
                 profile: Vec::new(),
                 profile_files: Vec::new(),
-                exclude_keywords: Vec::new(),
+                ignore_keywords: Vec::new(),
                 groups: Vec::new(),
                 order: Some(Order::parse("title:asc").unwrap()),
                 bucket_order: None,
@@ -3355,7 +3425,7 @@ mod tests {
                 sources: None,
                 profile: Vec::new(),
                 profile_files: Vec::new(),
-                exclude_keywords: Vec::new(),
+                ignore_keywords: Vec::new(),
                 groups: Vec::new(),
                 order: Some(Order::parse("season:asc,episode:asc").unwrap()),
                 bucket_order: None,
@@ -4193,7 +4263,7 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
             sources: None,
             profile: Vec::new(),
             profile_files: Vec::new(),
-            exclude_keywords: Vec::new(),
+            ignore_keywords: Vec::new(),
             groups: vec!["franchise".into()],
             order: None,
             bucket_order: None,

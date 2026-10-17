@@ -116,7 +116,7 @@ fn channel(plugin: &Path) -> ChannelConfig {
                     sources: None,
                     profile: Vec::new(),
                     profile_files: Vec::new(),
-                    exclude_keywords: Vec::new(),
+                    ignore_keywords: Vec::new(),
                     groups: Vec::new(),
                     order: None,
                     bucket_order: None,
