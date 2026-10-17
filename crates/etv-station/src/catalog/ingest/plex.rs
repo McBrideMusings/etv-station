@@ -679,6 +679,11 @@ pub fn ingest(
     plex: &PlexEnv,
     artwork_dir: Option<&Path>,
 ) -> Result<PlexIngestStats, PlexIngestError> {
+    // The delta cursor is taken before the first fetch: an item Plex stamps
+    // while the fetches run is then at or after the cursor, so the next delta
+    // re-reads it instead of losing it between the passes. Re-reading an item is
+    // harmless; `write_pass` upserts.
+    let started = OffsetDateTime::now_utc().unix_timestamp();
     let client = PlexClient::new(plex);
     let items = client.fetch_all(since)?;
     // The collection children fetch is the slow half — one sequential request
@@ -704,7 +709,6 @@ pub fn ingest(
         labels = labels.len(),
         "fetched labels; writing to the catalog",
     );
-    let started = OffsetDateTime::now_utc().unix_timestamp();
     let stats = write_pass(
         catalog,
         &items,
@@ -733,8 +737,8 @@ pub fn ingest(
 ///
 /// `started` is the delta cursor, written inside the same transaction so a
 /// failed pass cannot advance it past changes it never wrote. The caller takes
-/// it before the write begins: anything Plex modifies while the write runs is
-/// then re-read by the next pass rather than falling into the gap.
+/// it before its first fetch: anything Plex modifies while the fetches or the
+/// write run is then re-read by the next pass rather than falling into the gap.
 ///
 /// Split out of [`ingest`] so the full-pass-only gate on removals is testable
 /// without a live Plex server: `since.is_none()` is what says the pass was full.
@@ -4226,5 +4230,70 @@ mod tests {
             },
         ];
         assert_eq!(valid_accounts(raw), Vec::new());
+    }
+
+    /// The stored cursor must not be later than the first request of the pass.
+    /// A stub Plex stalls its first reply past a second boundary; a cursor taken
+    /// after the fetches would land at least a second after that request arrived,
+    /// and an item stamped in between would fall below `updatedAt >` forever.
+    #[test]
+    fn ingest_cursor_is_taken_before_the_first_fetch() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let first_request_at = Arc::new(AtomicI64::new(0));
+        let seen = Arc::clone(&first_request_at);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if seen
+                    .compare_exchange(
+                        0,
+                        OffsetDateTime::now_utc().unix_timestamp(),
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    std::thread::sleep(Duration::from_millis(1200));
+                }
+                let body = r#"{"MediaContainer":{"Directory":[]}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        let plex = PlexEnv {
+            base_url,
+            token: "t".into(),
+            path_from: String::new(),
+            path_to: String::new(),
+        };
+        let cat = Catalog::open_in_memory().unwrap();
+        ingest(&cat, &[], None, &plex, None).unwrap();
+
+        let first = first_request_at.load(Ordering::SeqCst);
+        let cursor = cat.last_plex_ingest().unwrap().unwrap();
+        assert!(first > 0, "stub never saw a request");
+        assert!(
+            cursor <= first,
+            "cursor {cursor} is later than the first request at {first}"
+        );
     }
 }
