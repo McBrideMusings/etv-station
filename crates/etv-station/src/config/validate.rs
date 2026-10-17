@@ -815,6 +815,11 @@ fn validate_block_pools<'a>(
         {
             return Err(bad(format!("pool {:?} has an empty expr", pool.name)));
         }
+        if let Some(expr) = &pool.expr
+            && let Err(e) = crate::catalog::query::check_keyword_scores(expr)
+        {
+            return Err(bad(format!("pool {:?} expr: {e}", pool.name)));
+        }
         if let Some(plugin) = &pool.plugin {
             if plugin.as_os_str().is_empty() {
                 return Err(bad(format!(
@@ -1527,6 +1532,29 @@ mod tests {
             check(None, Some("Gore"))
                 .unwrap_err()
                 .contains("without a `label`")
+        );
+    }
+
+    /// A `keyword_score` that can never match is a dead pool; load names the
+    /// pool and both numbers instead of shipping a silent empty channel.
+    #[test]
+    fn rejects_an_unreachable_or_empty_keyword_score_naming_the_pool() {
+        let check = |expr: &str| {
+            let mut p = pool("comedies");
+            p.expr = Some(expr.to_string());
+            let c = channel_with(vec![pattern_block(vec![p], vec![step("comedies", 1)])]);
+            validate_channel(&dummy_path(), &c).map_err(|e| format!("{e}"))
+        };
+        assert!(check(r#"keyword_score(["a", "b"]) >= 2"#).is_ok());
+        let msg = check(r#"keyword_score(["a", "b"]) >= 3"#).unwrap_err();
+        assert!(
+            msg.contains("\"comedies\"") && msg.contains("2 keyword") && msg.contains(">= 3"),
+            "{msg}"
+        );
+        let msg = check(r#"keyword_score([]) >= 1"#).unwrap_err();
+        assert!(
+            msg.contains("\"comedies\"") && msg.contains("empty keyword set"),
+            "{msg}"
         );
     }
 
