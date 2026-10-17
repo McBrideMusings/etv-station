@@ -96,10 +96,6 @@ fn validate_variety(
     }
 }
 
-/// Validate a channel after [`super::load`] has resolved every block-include
-/// into normalized inline form (path refs spliced, env vars expanded). The
-/// structural "exactly one of path/inline" check happens during load; this is
-/// the semantic pass over the resolved shape.
 fn validate_hooks(
     path: &Path,
     scope: &str,
@@ -116,6 +112,10 @@ fn validate_hooks(
     Ok(())
 }
 
+/// Validate a channel after [`super::load`] has resolved every block-include
+/// into normalized inline form (path refs spliced, env vars expanded). The
+/// structural "exactly one of path/inline" check happens during load; this is
+/// the semantic pass over the resolved shape.
 pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(), ConfigError> {
     validate_hooks(path, &format!("channel {:?}", channel.name), &channel.hooks)?;
     if channel.window_days == 0 {
@@ -1464,6 +1464,24 @@ mod tests {
         let err = validate_channel(&dummy_path(), &c).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("cannot be empty"), "msg = {msg}");
+    }
+
+    /// A malformed hook is refused at load, naming the channel and the entry,
+    /// not discovered one interval after the daemon starts.
+    #[test]
+    fn rejects_a_channel_hook_with_no_interval() {
+        let mut c = channel_with(Vec::new());
+        c.hooks = vec![crate::config::HookDecl {
+            on: crate::config::HookTrigger::Cron,
+            every: None,
+            run: "a.sh".into(),
+            grants: Vec::new(),
+        }];
+        let msg = format!("{}", validate_channel(&dummy_path(), &c).unwrap_err());
+        assert!(
+            msg.contains("hooks[0]") && msg.contains("every"),
+            "msg = {msg}"
+        );
     }
 
     /// The other direction: naming a user while leaving the scope pooled reads

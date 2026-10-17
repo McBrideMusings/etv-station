@@ -21,6 +21,21 @@ use crate::config::{HookDecl, HookGrant, Station};
 /// Longest a `http()` grant waits for a response.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longest one run may take — an executable, or a script together with every
+/// program it `exec`s — before it is killed. A run that outlives its interval
+/// already skips the next one; this bounds how long a hung run can do that.
+const RUN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Most bytes of a child's stdout or stderr kept in memory.
+const OUTPUT_CAP: usize = 1 << 20;
+
+/// Bytes of stderr carried into a failed run's log line.
+const STDERR_LOGGED: usize = 1000;
+
+/// Rhai operation budget for one script run: a `loop {}` ends with an error
+/// instead of holding a worker thread forever.
+const MAX_OPERATIONS: u64 = 100_000_000;
+
 /// Where a hook was declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookScope {
@@ -198,38 +213,106 @@ pub fn execute(spec: &HookSpec, fired_at: &str) -> Outcome {
 
 fn run_exec(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
     let path = spec.run_path();
-    let mut child = match Command::new(&path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return Outcome::failed(-1, format!("spawn {}: {e}", path.display())),
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        // A hook that never reads its stdin closes the pipe early; that is not
-        // a failure of the run.
-        let _ = stdin.write_all(event.to_string().as_bytes());
-    }
-    match child.wait_with_output() {
+    let mut cmd = Command::new(&path);
+    match capture(&mut cmd, Some(event.to_string()), RUN_TIMEOUT) {
+        Err(e) => Outcome::failed(-1, format!("spawn {}: {e}", path.display())),
         Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stdout.trim().is_empty() {
-                tracing::debug!(event = "hook.stdout", hook = %spec.label(), stdout = %stdout.trim());
+            if !out.stdout.trim().is_empty() {
+                tracing::debug!(event = "hook.stdout", hook = %spec.label(), stdout = %out.stdout.trim());
             }
-            if !stderr.trim().is_empty() {
-                tracing::debug!(event = "hook.stderr", hook = %spec.label(), stderr = %stderr.trim());
+            if out.timed_out {
+                return Outcome::failed(-1, format!("killed after {}s", RUN_TIMEOUT.as_secs()));
             }
-            match out.status.code() {
+            match out.code {
                 Some(0) => Outcome::ok(),
-                Some(c) => Outcome::failed(c, format!("exited {c}")),
-                None => Outcome::failed(-1, "killed by a signal"),
+                Some(c) => Outcome::failed(c, format!("exited {c}: {}", tail(&out.stderr))),
+                None => Outcome::failed(-1, format!("killed by a signal: {}", tail(&out.stderr))),
             }
         }
-        Err(e) => Outcome::failed(-1, format!("wait: {e}")),
     }
+}
+
+/// The last `STDERR_LOGGED` bytes of a stream, trimmed, for an error message.
+fn tail(text: &str) -> String {
+    let t = text.trim();
+    let start = t.len().saturating_sub(STDERR_LOGGED);
+    let start = (start..=t.len())
+        .find(|i| t.is_char_boundary(*i))
+        .unwrap_or(t.len());
+    t[start..].to_string()
+}
+
+struct Captured {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+/// Run `cmd` with optional stdin, collecting stdout and stderr (each capped at
+/// `OUTPUT_CAP` bytes) on reader threads so a chatty child never blocks on a
+/// full pipe, and kill it once `timeout` passes.
+fn capture(
+    cmd: &mut Command,
+    stdin: Option<String>,
+    timeout: Duration,
+) -> std::io::Result<Captured> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // A hook that never reads its stdin closes the pipe early; that is not
+        // a failure of the run.
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(text.as_bytes());
+        });
+    }
+    fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = r.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if buf.len() < OUTPUT_CAP {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    }
+    let out = child.stdout.take().map(drain);
+    let err = child.stderr.take().map(drain);
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (Some(status), false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break (None, true);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    Ok(Captured {
+        code: status.and_then(|s| s.code()),
+        stdout: out
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default(),
+        stderr: err
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default(),
+        timed_out,
+    })
 }
 
 fn run_rhai(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
@@ -258,6 +341,7 @@ fn run_rhai(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
 fn hook_engine(grants: &[HookGrant], label: String) -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
+    engine.set_max_operations(MAX_OPERATIONS);
     let log_label = label;
     engine.register_fn("log", move |text: &str| {
         tracing::info!(event = "hook.log", hook = %log_label, "{text}");
@@ -326,7 +410,14 @@ pub async fn run_cron(spec: HookSpec, stop: Arc<Notify>) {
     loop {
         tokio::select! {
             biased;
-            _ = stop.notified() => break,
+            _ = stop.notified() => {
+                // A reload starts a fresh loop for this hook; let the run in
+                // flight finish first so the two never overlap.
+                if let Some(h) = running.take() {
+                    let _ = h.await;
+                }
+                break;
+            }
             _ = interval.tick() => {
                 if running.as_ref().is_some_and(|h| !h.is_finished()) {
                     tracing::warn!(
@@ -413,6 +504,39 @@ mod tests {
         let granted = execute(&spec(dir.path(), "h.rhai", vec![HookGrant::Exec]), "t");
         assert_eq!(granted, Outcome::ok());
         assert_eq!(std::fs::read_to_string(out).unwrap(), "channel:news#1");
+    }
+
+    /// A run past the timeout is killed, and a failed run's stderr reaches the
+    /// error that is logged.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_program_is_killed_and_stderr_is_reported() {
+        let mut hung = Command::new("/bin/sleep");
+        hung.arg("30");
+        let started = Instant::now();
+        let out = capture(&mut hung, None, Duration::from_millis(200)).unwrap();
+        assert!(out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_script(
+            &dir.path().join("h.sh"),
+            "#!/bin/sh\necho boom >&2\nexit 2\n",
+        );
+        let o = execute(&spec(dir.path(), "h.sh", vec![]), "t");
+        assert_eq!(o.exit, 2);
+        assert!(o.error.unwrap().contains("boom"));
+    }
+
+    /// An endless script ends at the operation budget instead of holding its
+    /// worker thread.
+    #[test]
+    fn an_endless_script_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("h.rhai"), "loop { }").unwrap();
+        let o = execute(&spec(dir.path(), "h.rhai", vec![]), "t");
+        assert_eq!(o.exit, -1);
+        assert!(o.error.unwrap().contains("perations"));
     }
 
     #[test]

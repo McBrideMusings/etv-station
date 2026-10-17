@@ -578,7 +578,7 @@ hooks:
 
 The event is `{hook, trigger, scope, channel, fired_at}`: stdin JSON for an
 executable, the `event` constant for a script. A run still going at the next
-interval makes that interval skip (`hook.skipped`). The station keeps no record
+interval makes that interval skip (`hook.skipped`), and a run is killed after 10 minutes (a script is also stopped after 100 million operations). A reload waits for a run in flight, then restarts every interval from zero. A failed run's `hook.run` line carries the last 1000 bytes of the program's stderr. The station keeps no record
 of executions, so a script that starts outside work owns its own deduplication.
 
 Each run logs one `hook.run` line with `hook` (`station#0`, `channel:<name>#1`),
