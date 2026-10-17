@@ -4,7 +4,7 @@
 //!
 //! ```rhai
 //! fn hooks() { ["annotate"] }
-//! fn capabilities() { ["http"] }   // optional; `http` is the only one offered
+//! fn capabilities() { ["http"] }   // optional; the channel must grant it too
 //!
 //! // Called once per item, in schedule order. Returns a map of metadata keys
 //! // to add, or () to add nothing.
@@ -34,14 +34,17 @@ use rhai::{Dynamic, EvalAltResult, Map, Scope};
 use crate::catalog::Catalog;
 use crate::resolve::ResolvedItem;
 
-/// Capability names an annotate plugin may declare. Unlike a pool's, they need
-/// no channel grant: `annotate:` is a bare script path with nowhere to put one.
+/// Capability names an annotate plugin may declare. The channel's
+/// `annotate.capabilities` must grant exactly the declared set (ADR 0015).
 pub const ANNOTATE_CAPABILITIES: &[&str] = &["http"];
 
 /// Run `script`'s `annotate(ctx, item)` over every item and merge each
-/// returned patch into that item's metadata.
+/// returned patch into that item's metadata. `http` is whether the channel
+/// granted that capability; config load has already proven the grant equals
+/// what the script declares.
 pub fn annotate_items(
     script: &Path,
+    http: bool,
     channel: &str,
     items: &mut [ResolvedItem],
     catalog: Option<&Catalog>,
@@ -59,20 +62,6 @@ pub fn annotate_items(
             return;
         }
     };
-    let http = match crate::score::declared_capabilities(script, "annotate") {
-        Ok(caps) => caps.iter().any(|c| c.name() == "http"),
-        Err(e) => {
-            tracing::warn!(
-                event = "annotate.failed",
-                channel,
-                script = %script.display(),
-                error = %e,
-                "annotate script's capabilities could not be read; items keep the metadata they had"
-            );
-            return;
-        }
-    };
-
     // One budget for the whole pass, not one per item: a schedule of N items
     // must not be able to hold generation for N times the per-call cap.
     let budget = crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET);
@@ -314,7 +303,7 @@ mod tests {
 fn annotate(ctx, item) { #{ who: ctx.channel + ":" + item.entry_id, block: item.block } }"#,
         );
         let mut items = vec![lavfi("a", None), lavfi("b", None)];
-        annotate_items(&script, "ch", &mut items, None);
+        annotate_items(&script, false, "ch", &mut items, None);
         assert_eq!(items[0].metadata, Some(json!({"who": "ch:a", "block": 2})));
         assert_eq!(items[1].metadata, Some(json!({"who": "ch:b", "block": 2})));
     }
@@ -328,7 +317,7 @@ fn annotate(ctx, item) { #{ who: ctx.channel + ":" + item.entry_id, block: item.
 fn annotate(ctx, item) { #{ reason: "annotated", rating: 7 } }"#,
         );
         let mut items = vec![lavfi("a", Some(json!({"reason": "won an Oscar"})))];
-        annotate_items(&script, "ch", &mut items, None);
+        annotate_items(&script, false, "ch", &mut items, None);
         assert_eq!(
             items[0].metadata,
             Some(json!({"reason": "won an Oscar", "rating": 7}))
@@ -357,7 +346,7 @@ fn annotate(ctx, item) { #{ reason: "annotated", rating: 7 } }"#,
 fn annotate(ctx, item) { #{ seen: item.metadata.reason } }"#,
         );
         let mut items = vec![lavfi("a", Some(json!({"reason": "x"})))];
-        annotate_items(&script, "ch", &mut items, None);
+        annotate_items(&script, false, "ch", &mut items, None);
         assert_eq!(items[0].metadata, Some(json!({"reason": "x", "seen": "x"})));
     }
 
@@ -378,7 +367,7 @@ fn annotate(ctx, item) {
             lavfi("skip", None),
             lavfi("fine", None),
         ];
-        annotate_items(&script, "ch", &mut items, None);
+        annotate_items(&script, false, "ch", &mut items, None);
         assert_eq!(items[0].metadata, None);
         assert_eq!(items[1].metadata, None);
         assert_eq!(items[2].metadata, Some(json!({"ok": true})));
@@ -393,7 +382,7 @@ fn annotate(ctx, item) {
 fn annotate(ctx, item) { #{ body: ctx.http("http://127.0.0.1:9/", "GET", "") } }"#,
         );
         let mut items = vec![lavfi("a", None)];
-        annotate_items(&script, "ch", &mut items, None);
+        annotate_items(&script, false, "ch", &mut items, None);
         assert_eq!(items[0].metadata, None);
     }
 
@@ -410,7 +399,7 @@ fn annotate(ctx, item) {{ #{{ stars: parse_json(ctx.http("{url}/r", "GET", "")).
             ),
         );
         let mut items = vec![lavfi("a", None)];
-        annotate_items(&script, "ch", &mut items, None);
+        annotate_items(&script, true, "ch", &mut items, None);
         server.join().unwrap();
         assert_eq!(items[0].metadata, Some(json!({"stars": 4})));
     }

@@ -19,7 +19,7 @@ pub mod variety;
 
 pub use crate::guide::GuideConfig;
 pub use block::{BlockFile, Duplicates};
-pub use channel::{ChannelConfig, ChannelGuide, ChannelSubtitle, ScoringConfig};
+pub use channel::{AnnotateConfig, ChannelConfig, ChannelGuide, ChannelSubtitle, ScoringConfig};
 pub use constraints::{Constraints, NoRepeatWithin};
 pub use entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;

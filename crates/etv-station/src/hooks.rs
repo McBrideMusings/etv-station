@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,11 @@ const STDERR_LOGGED: usize = 1000;
 /// Rhai operation budget for one script run: a `loop {}` ends with an error
 /// instead of holding a worker thread forever.
 const MAX_OPERATIONS: u64 = 100_000_000;
+
+/// Set when a config reload ends the generation a run belongs to. A run that
+/// sees it kills its child (or stops its script) and returns, so a reload never
+/// waits out a slow hook.
+type Cancel = Arc<AtomicBool>;
 
 /// Where a hook was declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,14 +215,14 @@ fn event_json(spec: &HookSpec, event: &HookEvent) -> serde_json::Value {
 }
 
 /// Run a hook once, blocking, and log it. Callers on the async runtime go
-/// through `spawn_blocking`.
-pub fn execute(spec: &HookSpec, fired: &HookEvent) -> Outcome {
+/// through `spawn_blocking`. Setting `cancel` ends the run early.
+fn execute(spec: &HookSpec, fired: &HookEvent, cancel: &Cancel) -> Outcome {
     let started = Instant::now();
     let event = event_json(spec, fired);
     let outcome = if spec.decl.is_rhai() {
-        run_rhai(spec, &event)
+        run_rhai(spec, &event, cancel)
     } else {
-        run_exec(spec, &event)
+        run_exec(spec, &event, cancel)
     };
     let duration_ms = started.elapsed().as_millis() as u64;
     match &outcome.error {
@@ -241,14 +247,17 @@ pub fn execute(spec: &HookSpec, fired: &HookEvent) -> Outcome {
     outcome
 }
 
-fn run_exec(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
+fn run_exec(spec: &HookSpec, event: &serde_json::Value, cancel: &AtomicBool) -> Outcome {
     let path = spec.run_path();
     let mut cmd = Command::new(&path);
-    match capture(&mut cmd, Some(event.to_string()), RUN_TIMEOUT) {
+    match capture(&mut cmd, Some(event.to_string()), RUN_TIMEOUT, cancel) {
         Err(e) => Outcome::failed(-1, format!("spawn {}: {e}", path.display())),
         Ok(out) => {
             if !out.stdout.trim().is_empty() {
                 tracing::debug!(event = "hook.stdout", hook = %spec.label(), stdout = %out.stdout.trim());
+            }
+            if out.cancelled {
+                return Outcome::failed(-1, "killed by a config reload");
             }
             if out.timed_out {
                 return Outcome::failed(-1, format!("killed after {}s", RUN_TIMEOUT.as_secs()));
@@ -277,15 +286,18 @@ struct Captured {
     stdout: String,
     stderr: String,
     timed_out: bool,
+    /// The caller's `cancel` flag ended the run.
+    cancelled: bool,
 }
 
 /// Run `cmd` with optional stdin, collecting stdout and stderr (each capped at
 /// `OUTPUT_CAP` bytes) on reader threads so a chatty child never blocks on a
-/// full pipe, and kill it once `timeout` passes.
+/// full pipe, and kill it once `timeout` passes or `cancel` is set.
 fn capture(
     cmd: &mut Command,
     stdin: Option<String>,
     timeout: Duration,
+    cancel: &AtomicBool,
 ) -> std::io::Result<Captured> {
     use std::io::Read;
     let mut child = cmd
@@ -322,21 +334,22 @@ fn capture(
     let out = child.stdout.take().map(drain);
     let err = child.stderr.take().map(drain);
     let deadline = Instant::now() + timeout;
-    let (status, timed_out) = loop {
+    let (status, timed_out, cancelled) = loop {
         if let Some(status) = child.try_wait()? {
-            break (Some(status), false);
+            break (Some(status), false, false);
         }
-        if Instant::now() >= deadline {
+        let cancelled = cancel.load(Ordering::Relaxed);
+        if cancelled || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break (None, true);
+            break (None, !cancelled, cancelled);
         }
         std::thread::sleep(Duration::from_millis(25));
     };
     // After a kill, a grandchild may still hold the pipes open; joining the
     // readers would wait for it. Leave them to finish on their own.
     let collect = |h: Option<std::thread::JoinHandle<String>>| match h {
-        Some(h) if !timed_out => h.join().unwrap_or_default(),
+        Some(h) if !timed_out && !cancelled => h.join().unwrap_or_default(),
         _ => String::new(),
     };
     Ok(Captured {
@@ -344,16 +357,17 @@ fn capture(
         stdout: collect(out),
         stderr: collect(err),
         timed_out,
+        cancelled,
     })
 }
 
-fn run_rhai(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
+fn run_rhai(spec: &HookSpec, event: &serde_json::Value, cancel: &Cancel) -> Outcome {
     let path = spec.run_path();
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => return Outcome::failed(-1, format!("read {}: {e}", path.display())),
     };
-    let engine = hook_engine(&spec.decl.grants, spec.label());
+    let engine = hook_engine(&spec.decl.grants, spec.label(), cancel);
     let mut scope = Scope::new();
     match rhai::serde::to_dynamic(event) {
         Ok(d) => {
@@ -363,6 +377,9 @@ fn run_rhai(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
     }
     match engine.run_with_scope(&mut scope, &source) {
         Ok(()) => Outcome::ok(),
+        Err(_) if cancel.load(Ordering::Relaxed) => {
+            Outcome::failed(-1, "killed by a config reload")
+        }
         Err(e) => Outcome::failed(-1, format!("{}: {e}", path.display())),
     }
 }
@@ -370,17 +387,25 @@ fn run_rhai(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
 /// The engine a hook script runs in: `log(text)` and `parse_json(text)`
 /// always; `exec` and `http` only when granted. A call to an ungranted
 /// function is a script error ("function not found"), not a silent no-op.
-fn hook_engine(grants: &[HookGrant], label: String) -> Engine {
+fn hook_engine(grants: &[HookGrant], label: String, cancel: &Cancel) -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
     engine.set_max_operations(MAX_OPERATIONS);
+    let stop = cancel.clone();
+    engine.on_progress(move |_| {
+        stop.load(Ordering::Relaxed)
+            .then(|| Dynamic::from("killed by a config reload"))
+    });
     let log_label = label;
     engine.register_fn("log", move |text: &str| {
         tracing::info!(event = "hook.log", hook = %log_label, "{text}");
     });
     engine.register_fn("parse_json", crate::plugin_http::parse_json);
     if grants.contains(&HookGrant::Exec) {
-        engine.register_fn("exec", exec_grant);
+        let cancel = cancel.clone();
+        engine.register_fn("exec", move |program: &str, args: Array| {
+            Ok::<_, Box<rhai::EvalAltResult>>(exec_run(program, args, RUN_TIMEOUT, &cancel)?)
+        });
     }
     if grants.contains(&HookGrant::Http) {
         engine.register_fn("http", http_grant);
@@ -388,18 +413,26 @@ fn hook_engine(grants: &[HookGrant], label: String) -> Engine {
     engine
 }
 
-/// `exec(program, args)` -> `#{ code, stdout, stderr }`.
-fn exec_grant(program: &str, args: Array) -> Result<Map, Box<rhai::EvalAltResult>> {
-    Ok(exec_call(program, args, RUN_TIMEOUT)?)
-}
-
 /// Run `program` with `args` and no stdin, killing it after `timeout`. The one
 /// procedure behind a hook's granted `exec` and a bumper's `ctx.exec`. A spawn
 /// failure and a timeout are errors; a nonzero exit is a result the script reads.
 pub(crate) fn exec_call(program: &str, args: Array, timeout: Duration) -> Result<Map, String> {
+    exec_run(program, args, timeout, &AtomicBool::new(false))
+}
+
+/// `exec_call` that also stops when `cancel` is set.
+fn exec_run(
+    program: &str,
+    args: Array,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Map, String> {
     let args: Vec<String> = args.into_iter().map(|a| a.to_string()).collect();
-    let out = capture(Command::new(program).args(&args), None, timeout)
+    let out = capture(Command::new(program).args(&args), None, timeout, cancel)
         .map_err(|e| format!("exec {program}: {e}"))?;
+    if out.cancelled {
+        return Err(format!("exec {program}: killed by a config reload"));
+    }
     if out.timed_out {
         return Err(format!(
             "exec {program}: killed after {}s",
@@ -429,12 +462,14 @@ pub async fn run_cron(spec: HookSpec, stop: Arc<Notify>) {
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut running: Option<tokio::task::JoinHandle<Outcome>> = None;
+    let cancel = Cancel::default();
     loop {
         tokio::select! {
             biased;
             _ = stop.notified() => {
-                // A reload starts a fresh loop for this hook; let the run in
-                // flight finish first so the two never overlap.
+                // A reload starts a fresh loop for this hook; kill the run in
+                // flight first so the two never overlap.
+                cancel.store(true, Ordering::Relaxed);
                 if let Some(h) = running.take() {
                     let _ = h.await;
                 }
@@ -452,7 +487,8 @@ pub async fn run_cron(spec: HookSpec, stop: Arc<Notify>) {
                 }
                 let fired = HookEvent::now(None, serde_json::Value::Null);
                 let s = spec.clone();
-                running = Some(tokio::task::spawn_blocking(move || execute(&s, &fired)));
+                let c = cancel.clone();
+                running = Some(tokio::task::spawn_blocking(move || execute(&s, &fired, &c)));
             }
         }
     }
@@ -468,6 +504,7 @@ pub async fn run_cron(spec: HookSpec, stop: Arc<Notify>) {
 #[derive(Default)]
 pub struct HookBus {
     slots: Vec<Slot>,
+    cancel: Cancel,
 }
 
 struct Slot {
@@ -496,6 +533,7 @@ impl HookBus {
                     queue: Arc::default(),
                 })
                 .collect(),
+            cancel: Cancel::default(),
         }
     }
 
@@ -541,6 +579,7 @@ impl HookBus {
             if start_worker {
                 let spec = slot.spec.clone();
                 let queue = slot.queue.clone();
+                let cancel = self.cancel.clone();
                 tokio::task::spawn_blocking(move || {
                     loop {
                         let next = {
@@ -552,24 +591,25 @@ impl HookBus {
                             next
                         };
                         let Some(event) = next else { break };
-                        execute(&spec, &event);
+                        execute(&spec, &event, &cancel);
                     }
                 });
             }
         }
     }
 
-    /// Drop firings still waiting behind a run, so a generation ending does
-    /// not wait out a backlog.
-    pub fn discard_queued(&self) {
+    /// End this generation's hooks: drop firings still waiting behind a run
+    /// and kill the runs in flight, so a reload never waits on a slow hook.
+    pub fn cancel_all(&self) {
         for slot in &self.slots {
             slot.queue.lock().unwrap().pending.clear();
         }
+        self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Wait for every run in flight, and anything queued, to finish. A reload
-    /// calls this before the next generation starts, so two generations' runs
-    /// of one hook never overlap.
+    /// Wait for every run in flight to stop. A reload calls this after
+    /// `cancel_all` and before the next generation starts, so two generations'
+    /// runs of one hook never overlap.
     pub async fn drain(&self) {
         while self.slots.iter().any(|s| s.queue.lock().unwrap().running) {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -879,6 +919,7 @@ mod tests {
         let o = execute(
             &spec(dir.path(), "h.sh", vec![]),
             &ev("2026-01-01T00:00:00Z"),
+            &Cancel::default(),
         );
         assert_eq!(o.exit, 3);
         let seen: serde_json::Value =
@@ -903,10 +944,18 @@ mod tests {
             ),
         )
         .unwrap();
-        let denied = execute(&spec(dir.path(), "h.rhai", vec![]), &ev("t"));
+        let denied = execute(
+            &spec(dir.path(), "h.rhai", vec![]),
+            &ev("t"),
+            &Cancel::default(),
+        );
         assert_eq!(denied.exit, -1);
         assert!(!out.exists());
-        let granted = execute(&spec(dir.path(), "h.rhai", vec![HookGrant::Exec]), &ev("t"));
+        let granted = execute(
+            &spec(dir.path(), "h.rhai", vec![HookGrant::Exec]),
+            &ev("t"),
+            &Cancel::default(),
+        );
         assert_eq!(granted, Outcome::ok());
         assert_eq!(std::fs::read_to_string(out).unwrap(), "channel:news#1");
     }
@@ -919,7 +968,13 @@ mod tests {
         let mut hung = Command::new("/bin/sleep");
         hung.arg("30");
         let started = Instant::now();
-        let out = capture(&mut hung, None, Duration::from_millis(200)).unwrap();
+        let out = capture(
+            &mut hung,
+            None,
+            Duration::from_millis(200),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(out.timed_out);
         assert!(started.elapsed() < Duration::from_secs(5));
 
@@ -928,7 +983,11 @@ mod tests {
             &dir.path().join("h.sh"),
             "#!/bin/sh\necho boom >&2\nexit 2\n",
         );
-        let o = execute(&spec(dir.path(), "h.sh", vec![]), &ev("t"));
+        let o = execute(
+            &spec(dir.path(), "h.sh", vec![]),
+            &ev("t"),
+            &Cancel::default(),
+        );
         assert_eq!(o.exit, 2);
         assert!(o.error.unwrap().contains("boom"));
     }
@@ -939,7 +998,11 @@ mod tests {
     fn an_endless_script_is_stopped() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("h.rhai"), "loop { }").unwrap();
-        let o = execute(&spec(dir.path(), "h.rhai", vec![]), &ev("t"));
+        let o = execute(
+            &spec(dir.path(), "h.rhai", vec![]),
+            &ev("t"),
+            &Cancel::default(),
+        );
         assert_eq!(o.exit, -1);
         assert!(o.error.unwrap().contains("perations"));
     }
@@ -1028,6 +1091,39 @@ mod tests {
         assert_eq!(seen["scope"], "station");
         assert_eq!(seen["channel"], "news");
         assert_eq!(seen["data"]["file"], "x.json");
+    }
+
+    /// A reload (`cancel_all`) kills a run in flight; `drain` returns at once
+    /// instead of waiting out the hook's 10-minute timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reload_kills_a_hook_run_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        write_script(&dir.path().join("h.sh"), "#!/bin/sh\nexec sleep 60\n");
+        let bus = HookBus::new(vec![on(
+            HookTrigger::ChunkWritten,
+            HookScope::Station,
+            "h.sh",
+            dir.path(),
+        )]);
+        bus.fire(HookTrigger::ChunkWritten, None, serde_json::Value::Null);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        bus.cancel_all();
+        bus.drain().await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The same flag stops a Rhai script, which has no child process to kill.
+    #[test]
+    fn cancel_stops_an_endless_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("h.rhai"), "loop {}").unwrap();
+        let cancel = Cancel::default();
+        cancel.store(true, Ordering::Relaxed);
+        let o = execute(&spec(dir.path(), "h.rhai", vec![]), &ev("t"), &cancel);
+        let err = o.error.unwrap();
+        assert!(err.contains("config reload"), "{err}");
     }
 
     fn airing(id: &str, start: i64, finish: i64) -> Airing {

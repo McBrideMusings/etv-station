@@ -613,7 +613,7 @@ hooks of both scopes.
 
 The event is `{hook, trigger, scope, channel, fired_at, data}`: stdin JSON for an
 executable, the `event` constant for a script. A `cron` run still going when its interval
-elapses again makes that interval skip (`hook.skipped`); firings of the other triggers queue behind a run in flight and run one at a time (`hook.dropped` past 1000 waiting). A run is killed after 10 minutes (a script is also stopped after 100 million operations). A reload drops firings still queued, waits for a run in flight, then restarts every interval from zero. A failed run's `hook.run` line carries the last 1000 bytes of the program's stderr. The station keeps no record
+elapses again makes that interval skip (`hook.skipped`); firings of the other triggers queue behind a run in flight and run one at a time (`hook.dropped` past 1000 waiting). A run is killed after 10 minutes (a script is also stopped after 100 million operations). A reload drops firings still queued and kills a run in flight (`hook.run` reports `killed by a config reload`), so it never waits on a hook (a script blocked in `http` finishes that call, at most 30 seconds, before it stops); daemon shutdown kills runs the same way; the next generation's hooks then start, and every interval restarts from zero. A hook that must survive a reload has to hand its work to a process of its own. A failed run's `hook.run` line carries the last 1000 bytes of the program's stderr. The station keeps no record
 of executions, so a script that starts outside work owns its own deduplication.
 
 Each run logs one `hook.run` line with `hook` (`station#0`, `channel:<name>#1`),
@@ -2353,10 +2353,17 @@ Worked sample: `examples/plugins/foryou-sequencer.rhai`.
 
 ### Channel `annotate` — a plugin attaches metadata to every item
 
-A channel can name an `annotate:` script beside its `rule:`. After the whole
+A channel can name an `annotate:` script beside its `rule:`, with the
+capabilities the channel grants it. After the whole
 schedule resolves, the station calls the script's `annotate(ctx, item)` once per
 item, in schedule order. The script never sees or changes ordering, selection
 or timing; it only returns metadata to add.
+
+```yaml
+annotate:
+  plugin: ratings.rhai          # relative to this channel.yaml
+  capabilities: [http]          # must equal the script's capabilities()
+```
 
 ```rhai
 fn hooks() { ["annotate"] }
@@ -2373,8 +2380,10 @@ The returned map merges into the item's metadata key by key. A key the item
 already carries (a `pool_provider`'s own `pick()` metadata, for one) keeps its
 value, and the station logs `annotate.key_collision`. A script error leaves that
 item unannotated and logs `annotate.failed`; the channel keeps airing. The
-`http` capability is granted by the script's own `capabilities()`, since
-`annotate:` is a bare path with no place for a channel grant. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
+channel grants exactly the capabilities the script declares (ADR 0015), as a
+pool does: a script declaring `http` with no `http` in `annotate.capabilities`
+is refused at load, naming the script and the field, and so is a grant the
+script never declares. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
 
 ### Pattern step `take` — how many items one visit draws
 

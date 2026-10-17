@@ -641,7 +641,8 @@ pub fn resolve_channel_with_resume(
     }
     if let Some(annotate) = &config.annotate {
         crate::annotate::annotate_items(
-            &crate::annotate::script_path(path, annotate),
+            &crate::annotate::script_path(path, &annotate.plugin),
+            annotate.capabilities.iter().any(|c| c == "http"),
             &config.name,
             &mut out,
             catalog,
@@ -3988,7 +3989,10 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
         .unwrap();
         let cat = interleave_catalog();
         let mut cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
-        cfg.annotate = Some(script);
+        cfg.annotate = Some(crate::config::AnnotateConfig {
+            plugin: script,
+            capabilities: vec![],
+        });
         let items = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
         assert!(!items.is_empty());
         for item in &items {

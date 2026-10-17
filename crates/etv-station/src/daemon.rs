@@ -1237,9 +1237,9 @@ async fn run_generation(
         }
     }
 
-    // A run still going belongs to this generation's config; finish it before
-    // a reload starts the next generation's hooks.
-    bus.discard_queued();
+    // A run still going belongs to this generation's config; kill it before a
+    // reload starts the next generation's hooks.
+    bus.cancel_all();
     bus.drain().await;
 
     (do_reload, first_err)

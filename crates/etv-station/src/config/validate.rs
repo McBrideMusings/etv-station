@@ -1139,22 +1139,55 @@ fn validate_plugin_declares_sequencer(
 /// A channel naming a script for `annotate:` must be able to say the script
 /// does that job (ADR 0017) — the same check
 /// [`validate_plugin_declares_sequencer`] runs for a block's `sequencer:`,
-/// against the `annotate` hook instead. Channel-scoped, so `bad` here carries
-/// no block index — the error names the channel's config path alone.
+/// against the `annotate` hook instead — and grants it exactly the
+/// capabilities its `capabilities()` declares (ADR 0015), the two-way check
+/// [`validate_plugin_capabilities`] runs for a pool. Channel-scoped, so `bad`
+/// here carries no block index — the error names the channel's config path
+/// alone.
 fn validate_plugin_declares_annotate(
-    annotate: &Path,
+    annotate: &crate::config::AnnotateConfig,
     base_dir: &Path,
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
-    let script_path = crate::score::resolve_plugin_path(base_dir, annotate);
+    let script_path = crate::score::resolve_plugin_path(base_dir, &annotate.plugin);
     let hooks = crate::score::declared_hooks(&script_path).map_err(bad)?;
-    crate::score::declared_capabilities(&script_path, "annotate").map_err(bad)?;
+    let declared = crate::score::declared_capabilities(&script_path, "annotate").map_err(bad)?;
     if !hooks.iter().any(|h| h == "annotate") {
         return Err(bad(format!(
             "channel names plugin {} via `annotate:`, which requires the plugin to \
              declare the `annotate` hook, but it only declares: {}",
             script_path.display(),
             hooks.join(", ")
+        )));
+    }
+
+    let offered = crate::score::offered_capabilities("annotate");
+    for cap in &annotate.capabilities {
+        if !offered.contains(&cap.as_str()) {
+            return Err(bad(format!(
+                "channel `annotate.capabilities` grants {cap:?}, but the annotate hook does \
+                 not offer {cap} (it offers: {})",
+                crate::score::join_offered(offered)
+            )));
+        }
+    }
+    let declared: HashSet<&str> = declared
+        .iter()
+        .map(crate::score::Capability::name)
+        .collect();
+    let granted: HashSet<&str> = annotate.capabilities.iter().map(String::as_str).collect();
+    if let Some(cap) = declared.difference(&granted).next() {
+        return Err(bad(format!(
+            "channel `annotate` names plugin {}, which declares capability {cap:?} that \
+             `annotate.capabilities` does not grant",
+            script_path.display()
+        )));
+    }
+    if let Some(cap) = granted.difference(&declared).next() {
+        return Err(bad(format!(
+            "channel `annotate.capabilities` grants {cap:?} that plugin {} never declares — \
+             a grant nobody asked for is a typo or a stale config",
+            script_path.display()
         )));
     }
     Ok(())
@@ -2491,11 +2524,21 @@ fn pick(ctx) { throw "pick must not run at load time"; }
     /// pool sources items, so the fixture channel doesn't need a `plugin:`
     /// pool at all.
     fn validate_annotate_script(body: &str) -> Result<(), ConfigError> {
+        validate_annotate_script_granting(body, vec![])
+    }
+
+    fn validate_annotate_script_granting(
+        body: &str,
+        granted: Vec<&str>,
+    ) -> Result<(), ConfigError> {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("annotator.rhai");
         std::fs::write(&script, body).unwrap();
         let mut channel = channel_with(vec![inline_block(vec![item_entry("a")])]);
-        channel.annotate = Some(script);
+        channel.annotate = Some(crate::config::AnnotateConfig {
+            plugin: script,
+            capabilities: granted.into_iter().map(String::from).collect(),
+        });
         validate_channel(&dir.path().join("channel.yaml"), &channel)
     }
 
@@ -2527,6 +2570,42 @@ fn capabilities() { ["catalog_read"] }"#,
         )
         .unwrap_err();
         assert!(format!("{err}").contains("catalog_read"), "err = {err}");
+    }
+
+    /// A script declaring `http` that the channel does not grant is refused,
+    /// naming the script and the `annotate.capabilities` field (ADR 0015).
+    #[test]
+    fn an_annotate_script_declaring_http_the_channel_does_not_grant_is_rejected() {
+        let err = validate_annotate_script(
+            r#"fn hooks() { ["annotate"] }
+fn capabilities() { ["http"] }"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("annotator.rhai"), "msg = {msg}");
+        assert!(msg.contains("http"), "msg = {msg}");
+        assert!(msg.contains("annotate.capabilities"), "msg = {msg}");
+    }
+
+    /// The other direction: a grant the script never declares is refused.
+    #[test]
+    fn an_annotate_grant_the_script_never_declares_is_rejected() {
+        let err = validate_annotate_script_granting(r#"fn hooks() { ["annotate"] }"#, vec!["http"])
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("annotator.rhai"), "msg = {msg}");
+        assert!(msg.contains("never declares"), "msg = {msg}");
+    }
+
+    /// A grant matching the declaration loads.
+    #[test]
+    fn an_annotate_grant_matching_the_declaration_validates() {
+        validate_annotate_script_granting(
+            r#"fn hooks() { ["annotate"] }
+fn capabilities() { ["http"] }"#,
+            vec!["http"],
+        )
+        .unwrap();
     }
 
     /// A channel that omits `annotate:` entirely loads exactly as before —
