@@ -78,6 +78,31 @@
             }
           ]
         },
+        "overlay": {
+          "description": "Which overlay script draws over this item. An object runs `script` with `vars` bound in place of the channel's overlay; the string \"none\" draws nothing. Omit for the channel's own overlay. The server carries it untouched for the overlay process.",
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "script"
+              ],
+              "properties": {
+                "script": {
+                  "type": "string"
+                },
+                "vars": {
+                  "type": "object"
+                }
+              }
+            },
+            {
+              "const": "none"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "program": {
           "description": "Optional EPG metadata. Whatever is provided here is emitted in the XMLTV guide; missing fields are simply omitted. Producers of playout JSON are responsible for populating these — the server never sources them externally.",
           "oneOf": [
