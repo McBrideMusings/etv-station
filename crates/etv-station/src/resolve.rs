@@ -368,7 +368,7 @@ pub fn resolve_channel_with_resume(
         // yet — it is seated and cut below — so it is left out rather than
         // counted with items that will never air.
         let channel_aired: Vec<String> = match config.rule.no_repeat_within {
-            Some(_) => state
+            Some(_) if include.is_pattern() => state
                 .tail
                 .iter()
                 .cloned()
@@ -379,7 +379,7 @@ pub fn resolve_channel_with_resume(
                         .flat_map(|&(start, end, _)| out[start..end].iter().map(|i| i.id.clone())),
                 )
                 .collect(),
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         let channel_rule = config
             .rule
@@ -387,6 +387,7 @@ pub fn resolve_channel_with_resume(
             .map(|gap| crate::pattern::ChannelRule {
                 gap,
                 aired: &channel_aired,
+                nominal: nominal_item_runtime(config),
             });
         let BlockItems {
             items: block_items,

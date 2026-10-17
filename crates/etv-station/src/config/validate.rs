@@ -1200,12 +1200,6 @@ fn validate_pool_groups(
     Ok(())
 }
 
-/// `rule.schedules` and `rule.slots` (ADR 0004): every schedule names
-/// itself uniquely, places at least one range, places only slots that exist,
-/// and never places two slots over the same minute; every slot is placed by
-/// some schedule, since an unplaced one would never air. No block on such a
-/// channel authors `cycles`: an authored count overrides `fill`, which is
-/// where a generation stops at the next schedule boundary.
 /// `rule.no_repeat_within` is enforced by the pattern walk alone, so on a
 /// channel with no pattern block it would do nothing — an unused knob that
 /// reads as a guarantee. Refused rather than silently ignored.
@@ -1221,6 +1215,12 @@ fn validate_channel_repeat(path: &Path, rule: &super::RuleConfig) -> Result<(), 
     Ok(())
 }
 
+/// `rule.schedules` and `rule.slots` (ADR 0004): every schedule names
+/// itself uniquely, places at least one range, places only slots that exist,
+/// and never places two slots over the same minute; every slot is placed by
+/// some schedule, since an unplaced one would never air. No block on such a
+/// channel authors `cycles`: an authored count overrides `fill`, which is
+/// where a generation stops at the next schedule boundary.
 fn validate_schedules(path: &Path, rule: &super::RuleConfig) -> Result<(), ConfigError> {
     let bad = |message: String| ConfigError::Validation {
         path: path.to_path_buf(),

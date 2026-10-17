@@ -311,21 +311,23 @@ impl PoolRuntime<'_> {
     }
 
     /// Whether this series' next item passes both rules: the pool's own and the
-    /// channel's. A series turned away by the channel rule alone is counted, so
-    /// the end-of-walk log says how often the channel rule moved a draw.
-    fn admits(&self, si: usize, channel: &mut ChannelHistory) -> bool {
-        let own = self.own_allows(si);
-        let chan = self.channel_allows(si, channel);
-        if own && !chan {
+    /// channel's.
+    fn admits(&self, si: usize, channel: &ChannelHistory) -> bool {
+        self.own_allows(si) && self.channel_allows(si, channel)
+    }
+
+    /// Count a draw whose first choice the channel rule alone turned away, once
+    /// per draw, so the end-of-walk log says how many draws the rule moved.
+    fn note_blocked(&self, si: usize, channel: &mut ChannelHistory) {
+        if self.own_allows(si) && !self.channel_allows(si, channel) {
             channel.blocked += 1;
             tracing::debug!(
                 event = "channel_repeat.blocked",
                 pool = %self.cfg.name,
                 id = self.next_id(si).map(String::as_str).unwrap_or("-"),
-                "rule.no_repeat_within turned this draw away; trying the next series",
+                "rule.no_repeat_within turned this draw away; trying another series",
             );
         }
-        own && chan
     }
 
     /// Neither this pool nor the channel constrains anything, so the first
@@ -361,21 +363,28 @@ impl PoolRuntime<'_> {
         if self.is_unconstrained(channel) {
             return Some(start);
         }
-        let n = self.series.len();
-        if n == 0 {
+        if self.series.is_empty() {
             return None;
         }
+        self.note_blocked(start, channel);
+        Some(self.scan_from(start, channel))
+    }
+
+    /// The walk [`Self::eligible_from`] makes, without counting `start` as a
+    /// moved draw — [`Self::eligible_pick`] has already counted it.
+    fn scan_from(&mut self, start: usize, channel: &mut ChannelHistory) -> usize {
+        let n = self.series.len();
         for step in 0..n {
             let si = (start + step) % n;
             if self.admits(si, channel) {
-                return Some(si);
+                return si;
             }
         }
         let si = self.own_eligible_from(start);
         if !self.channel_allows(si, channel) {
             channel.forced += 1;
         }
-        Some(si)
+        si
     }
 
     /// `start`, or the first series after it the pool's own rule lets serve —
@@ -416,6 +425,7 @@ impl PoolRuntime<'_> {
         if self.is_unconstrained(channel) || self.admits(first, channel) {
             return Some(first);
         }
+        self.note_blocked(first, channel);
         if self.cfg.select == Select::Random {
             for attempt in 1..=RANDOM_REROLLS {
                 let rolled = roll.u64_at(nonce.wrapping_add(attempt.wrapping_mul(REROLL_STRIDE)));
@@ -426,7 +436,7 @@ impl PoolRuntime<'_> {
                 }
             }
         }
-        self.eligible_from(first, channel)
+        Some(self.scan_from(first, channel))
     }
 
     /// Fold what a draw emitted into the recent window, so the next draw in the
@@ -868,6 +878,10 @@ pub struct ChannelRule<'a> {
     pub gap: NoRepeatWithin,
     /// Oldest first.
     pub aired: &'a [String],
+    /// The channel's stand-in length for an item nothing has measured, used
+    /// when nothing in the history is measured either. Counting such an item
+    /// at zero would keep it inside a temporal gap forever.
+    pub nominal: Duration,
 }
 
 /// What [`ChannelRule`] checks a draw against: the channel's aired history,
@@ -888,6 +902,8 @@ struct ChannelHistory<'c> {
     asked: HashSet<String>,
     /// Stands in for an id the catalog never measured.
     mean: Duration,
+    /// Stands in when nothing has been measured at all, so `mean` is zero.
+    nominal: Duration,
     /// Candidates the pool's own rule allowed and this rule turned away.
     blocked: usize,
     /// Draws that aired against this rule because nothing else could.
@@ -903,10 +919,12 @@ impl<'c> ChannelHistory<'c> {
             durations: HashMap::new(),
             asked: HashSet::new(),
             mean: Duration::ZERO,
+            nominal: Duration::ZERO,
             blocked: 0,
             forced: 0,
         };
         if let Some(rule) = rule {
+            history.nominal = rule.nominal;
             history.limits = Limits {
                 no_repeat: match rule.gap {
                     NoRepeatWithin::Positions(n) => RepeatGap::Positions(n),
@@ -936,11 +954,15 @@ impl<'c> ChannelHistory<'c> {
         if matches!(self.limits.no_repeat, RepeatGap::Duration(_)) {
             self.measure(ids);
         }
-        let mean = self.mean;
+        let fallback = if self.mean.is_zero() {
+            self.nominal
+        } else {
+            self.mean
+        };
         self.recent.extend(ids.iter().map(|id| ItemKeys {
             id: id.clone(),
             group: Vec::new(),
-            duration: self.durations.get(id).copied().unwrap_or(mean),
+            duration: self.durations.get(id).copied().unwrap_or(fallback),
         }));
         let keep = crate::constrain::history_needed(&self.recent, self.limits);
         let cut = self.recent.len() - keep;
@@ -4388,6 +4410,7 @@ mod tests {
             gap.map(|gap| ChannelRule {
                 gap,
                 aired: &state.tail,
+                nominal: Duration::from_secs(30 * 60),
             }),
         )
         .expect("pattern builds")
@@ -4435,6 +4458,20 @@ mod tests {
             &aired(&["got-e1", "mov-1"]),
         );
         assert_eq!(ids, vec!["mov-2"], "{ids:?}");
+    }
+
+    /// When every film the pool holds aired inside the gap, the channel rule
+    /// gives way and the rotation's own choice airs: a channel that cannot
+    /// honour its rule still puts television on the air.
+    #[test]
+    fn a_channel_rule_nothing_can_satisfy_still_airs() {
+        let ids = build_channel(
+            &[step("movies", 1)],
+            1,
+            Some(NoRepeatWithin::Positions(3)),
+            &aired(&["mov-1", "mov-2", "mov-3"]),
+        );
+        assert_eq!(ids, vec!["mov-1"], "{ids:?}");
     }
 
     /// The pool's own list is reordered so the first draw does not repeat what

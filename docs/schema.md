@@ -2478,12 +2478,16 @@ rerolls. When nothing passes both, the channel rule gives way first, so the
 pool's own rule holds as it would without it; a draw that airs against the
 channel rule is logged as `constraints.unsatisfied` with `scope: channel`, and
 every generation it moved a draw logs `channel_repeat.applied` with how many
-candidates it turned away (`blocked`) and how many aired anyway (`forced`).
+draws it moved off their first choice (`blocked`) and how many aired against it
+anyway (`forced`). An earlier entries block of the same generation is not yet
+in the history — its list is seated and cut after the pattern blocks run — so
+it counts from the next generation on, once the ledger holds it.
 
 It does not ask a pool's source for more: a pool that has aired everything it
 holds refills as it always did, and a plugin pool already sees the channel's tail
-in `ctx.recent`. Entries and sequencer blocks are not checked — a flat authored
-list and a script both own their order — and a channel with no pattern block
+in `ctx.recent`. Entries and sequencer blocks are counted in the history but
+not constrained by it — a flat authored list and a script both own their order
+— and a channel with no pattern block
 fails its load if it sets the key. The tail the station keeps is sized to cover
 it, so a `"7d"` rule holds across generation boundaries too.
 
