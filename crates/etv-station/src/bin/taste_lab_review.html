@@ -237,6 +237,8 @@ async function load(channel, days, push) {
       <h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
     return;
   }
+  // Per-item catalog fields arrive once per entry id in `items`; merge them onto each airing.
+  for (const a of data.airings) Object.assign(a, data.items[a.id]);
   current = data;
   render(data);
 }
