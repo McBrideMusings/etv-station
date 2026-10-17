@@ -42,7 +42,8 @@
 //! // `"http"` gates `ctx.http(url, method, body)`, the one way a script
 //! // reaches an outside service (ADR 0014): it returns the response body as
 //! // text, errors on a 4xx/5xx, and gives up after
-//! // `plugin_http::GENERATION_TIMEOUT`. `parse_json(text)`, a global
+//! // `plugin_http::GENERATION_TIMEOUT`, and all of a `pick()` call's calls together
+//! // at `plugin_http::GENERATION_BUDGET`. `parse_json(text)`, a global
 //! // function, needs no capability.
 //! fn capabilities() { ["catalog_read", "watch_history"] }
 //!
@@ -622,9 +623,15 @@ pub enum Capability {
     /// own folder. Offered by [`crate::bumper::hook`] only.
     Read,
     /// `ctx.http(url, method, body)`: one HTTP call through
-    /// [`crate::plugin_http::call`] (ADR 0014). Offered to pools and the
+    /// [`crate::plugin_http::call`] (ADR 0014), drawing on the call's
+    /// [`crate::plugin_http::Budget`]. Offered to pools and the
     /// bumper hook.
     Http,
+    /// `ctx.exec(program, args)` on the bumper hook: one child process through
+    /// [`crate::hooks::exec_call`], killed after
+    /// [`crate::plugin_http::GENERATION_TIMEOUT`]. Offered by
+    /// [`crate::bumper::hook`] only.
+    Exec,
     Datastore(String),
 }
 
@@ -642,6 +649,7 @@ impl Capability {
             Capability::Probe => "probe",
             Capability::Read => "read",
             Capability::Http => "http",
+            Capability::Exec => "exec",
             Capability::Datastore(name) => name,
         }
     }
@@ -766,6 +774,7 @@ pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capab
             "watch_history" => Capability::WatchHistory,
             "probe" => Capability::Probe,
             "read" => Capability::Read,
+            "exec" => Capability::Exec,
             _ => Capability::Http,
         });
     }
@@ -891,6 +900,8 @@ struct ScoreCtx {
     /// Whether `http` was granted; `false` turns `ctx.http(..)` into the
     /// error [`ungranted`] words.
     http: bool,
+    /// What this `pick()` call has left for outside calls.
+    budget: crate::plugin_http::Budget,
 }
 
 /// What a script gets back for reading a `ctx` field its pool was not granted
@@ -959,12 +970,9 @@ impl ScoreCtx {
         if !self.http {
             return Err(ungranted("http"));
         }
-        Ok(crate::plugin_http::call(
-            url,
-            method,
-            body,
-            crate::plugin_http::GENERATION_TIMEOUT,
-        )?)
+        Ok(self.budget.within("ctx.http()", |timeout| {
+            crate::plugin_http::call(url, method, body, timeout)
+        })?)
     }
 
     /// `ctx.account_id` (#278): the resolved account id as a Rhai integer, or
@@ -1647,12 +1655,14 @@ pub fn pick(
                 .unwrap_or_default(),
         ),
         http: granted.http,
+        budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
     };
 
     // `audit()` needs its own `ctx`, built from the same inputs `pick()` gets
     // — cloned before the move below, since `ScoreCtx` is consumed by
     // `Dynamic::from` (ADR 0011, ADR 0013).
-    let ctx_for_audit = ctx.clone();
+    let mut ctx_for_audit = ctx.clone();
+    ctx_for_audit.budget = crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET);
 
     let envelope: Dynamic = engine
         .call_fn(&mut scope, ast, "pick", (Dynamic::from(ctx),))
