@@ -1749,7 +1749,7 @@ impl Scorer {
                 cat,
                 &self.script,
                 self.sources.as_ref(),
-                &self.cache.excluded(&pool.name),
+                &self.cache.narrowing(&pool.name),
             )
             .unwrap();
         self
@@ -2073,12 +2073,12 @@ fn a_single_valued_tag_field_matches_a_tag_entry() {
     );
 }
 
-/// `exclude_keywords` under `config:` is refused, not silently ignored:
+/// `ignore_keywords` under `config:` is refused, not silently ignored:
 /// `config:` is opaque to the station, so nothing else would notice.
 #[test]
-fn exclude_keywords_under_config_is_refused() {
+fn ignore_keywords_under_config_is_refused() {
     let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
-    let config = serde_json::json!({ "exclude_keywords": ["time"] });
+    let config = serde_json::json!({ "ignore_keywords": ["time"] });
     let err = scorer
         .try_pick_for("movies", 0, 3, Some(config), None, &[])
         .unwrap_err();

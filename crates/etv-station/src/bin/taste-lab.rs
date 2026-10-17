@@ -797,7 +797,7 @@ fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
         .cache
         .prepare_profile(&state.catalog, &pw.pool, &channel_dir)
         .map_err(|e| format!("profile: {e}"))?;
-    let excluded = state.cache.excluded(pool_name);
+    let excluded = state.cache.narrowing(pool_name);
     state
         .cache
         .prepare(
@@ -1164,7 +1164,7 @@ fn enrich_audit(catalog: &Catalog, metadata: Option<&Value>) -> Option<Value> {
 
 fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
     let Some(resolved) = cache.profile(pool_name) else {
-        return json!({ "entries": [], "exclude_keywords": [], "exclusions": [] });
+        return json!({ "entries": [], "ignore_keywords": [], "exclusions": [] });
     };
     let entries: Vec<Value> = resolved
         .entries
@@ -1178,8 +1178,8 @@ fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
             v
         })
         .collect();
-    let exclude_keywords: Vec<Value> = resolved
-        .exclude_keywords
+    let ignore_keywords: Vec<Value> = resolved
+        .ignore_keywords
         .iter()
         .map(|d| rhai::serde::from_dynamic::<Value>(d).unwrap_or(Value::Null))
         .collect();
@@ -1196,7 +1196,7 @@ fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
         .collect();
     json!({
         "entries": entries,
-        "exclude_keywords": exclude_keywords,
+        "ignore_keywords": ignore_keywords,
         "exclusions": exclusions,
     })
 }

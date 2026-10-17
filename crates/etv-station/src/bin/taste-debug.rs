@@ -245,7 +245,7 @@ fn main() -> Result<(), String> {
             &catalog,
             &script_path,
             pool_cfg.sources.as_ref(),
-            &cache.excluded(&cli.pool),
+            &cache.narrowing(&cli.pool),
         )
         .map_err(|e| format!("prepare: {e}"))?;
     if let Some(profile) = cache.profile(&cli.pool) {
@@ -403,13 +403,13 @@ fn print_profile(profile: &etv_station::profile::ResolvedProfile) {
             field("origin"),
         );
     }
-    if !profile.exclude_keywords.is_empty() {
+    if !profile.ignore_keywords.is_empty() {
         let ex: Vec<String> = profile
-            .exclude_keywords
+            .ignore_keywords
             .iter()
             .map(|k| k.to_string())
             .collect();
-        println!("  exclude_keywords: {}", ex.join(", "));
+        println!("  ignore_keywords: {}", ex.join(", "));
     }
     for x in &profile.exclusions {
         println!(
