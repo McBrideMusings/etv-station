@@ -198,7 +198,7 @@ The station file also declares an optional `device_id` — how Plex tells this t
 
 ## Event hooks
 
-`hooks:` in `station.yaml` and `channel.yaml` run a Rhai script or any executable on a `cron` interval, logging each run; hooks cannot change the schedule (ADR 0021). Format and behavior: `docs/schema.md` §Event hooks.
+`hooks:` in `station.yaml` and `channel.yaml` run a Rhai script or any executable on a `cron` interval or at a daemon event (`startup`, `config_reload`, `generation_end`, `chunk_written`, `schedule_item_change`), logging each run; hooks cannot change the schedule (ADR 0021). Format and behavior: `docs/schema.md` §Event hooks.
 
 ## Time zone
 

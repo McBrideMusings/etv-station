@@ -7,16 +7,18 @@
 //! writes (`event = "hook.run"`), so a script that starts outside work owns
 //! its own deduplication.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rhai::{Array, Dynamic, Engine, Map, Scope};
+use time::OffsetDateTime;
 use tokio::sync::Notify;
 
-use crate::config::{HookDecl, HookGrant, Station};
+use crate::config::{HookDecl, HookGrant, HookTrigger, Station};
 
 /// Longest a `http()` grant waits for a response.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -163,26 +165,53 @@ impl Outcome {
     }
 }
 
+/// One firing of a trigger: what a hook is told when it runs.
+#[derive(Debug, Clone)]
+pub struct HookEvent {
+    /// The channel the event happened on; `None` for a daemon-wide event
+    /// (`startup`, `config_reload`, `cron`).
+    pub channel: Option<String>,
+    /// Trigger-specific fields, handed to the hook as `data`.
+    pub data: serde_json::Value,
+    pub fired_at: String,
+}
+
+impl HookEvent {
+    pub fn now(channel: Option<String>, data: serde_json::Value) -> Self {
+        HookEvent {
+            channel,
+            data,
+            fired_at: OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// The event JSON an executable reads on stdin and a script sees as `event`.
-fn event_json(spec: &HookSpec, fired_at: &str) -> serde_json::Value {
-    let (scope, channel) = match &spec.scope {
-        HookScope::Station => ("station", serde_json::Value::Null),
-        HookScope::Channel(n) => ("channel", serde_json::Value::String(n.clone())),
+/// `channel` is the channel the event happened on, else the channel that
+/// declared the hook, else null.
+fn event_json(spec: &HookSpec, event: &HookEvent) -> serde_json::Value {
+    let (scope, declared) = match &spec.scope {
+        HookScope::Station => ("station", None),
+        HookScope::Channel(n) => ("channel", Some(n.clone())),
     };
+    let channel = event.channel.clone().or(declared);
     serde_json::json!({
         "hook": spec.label(),
         "trigger": spec.decl.on.as_str(),
         "scope": scope,
         "channel": channel,
-        "fired_at": fired_at,
+        "fired_at": event.fired_at,
+        "data": event.data,
     })
 }
 
 /// Run a hook once, blocking, and log it. Callers on the async runtime go
 /// through `spawn_blocking`.
-pub fn execute(spec: &HookSpec, fired_at: &str) -> Outcome {
+pub fn execute(spec: &HookSpec, fired: &HookEvent) -> Outcome {
     let started = Instant::now();
-    let event = event_json(spec, fired_at);
+    let event = event_json(spec, fired);
     let outcome = if spec.decl.is_rhai() {
         run_rhai(spec, &event)
     } else {
@@ -428,12 +457,253 @@ pub async fn run_cron(spec: HookSpec, stop: Arc<Notify>) {
                     );
                     continue;
                 }
-                let fired_at = time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default();
+                let fired = HookEvent::now(None, serde_json::Value::Null);
                 let s = spec.clone();
-                running = Some(tokio::task::spawn_blocking(move || execute(&s, &fired_at)));
+                running = Some(tokio::task::spawn_blocking(move || execute(&s, &fired)));
             }
+        }
+    }
+}
+
+/// Every hook of one config generation, and which of them are mid-run.
+///
+/// The daemon fires an event into it; each hook declared `on:` that trigger
+/// runs on a blocking thread. A hook still running when its trigger fires
+/// again waits its turn: firings queue and run one after another, so a slow
+/// hook never runs two copies of itself and no boundary or file is lost. A daemon-wide event (no channel) reaches every hook of that
+/// trigger; a channel event reaches the station's hooks and that channel's.
+#[derive(Default)]
+pub struct HookBus {
+    slots: Vec<Slot>,
+}
+
+struct Slot {
+    spec: Arc<HookSpec>,
+    queue: Arc<Mutex<SlotQueue>>,
+}
+
+/// Firings waiting for a hook's current run to finish. `running` is true from
+/// the moment a worker is spawned until it finds the queue empty.
+#[derive(Default)]
+struct SlotQueue {
+    running: bool,
+    pending: VecDeque<HookEvent>,
+}
+
+/// Most firings queued behind one slow hook; further ones are dropped (logged).
+const QUEUE_CAP: usize = 1000;
+
+impl HookBus {
+    pub fn new(specs: Vec<HookSpec>) -> Self {
+        HookBus {
+            slots: specs
+                .into_iter()
+                .map(|spec| Slot {
+                    spec: Arc::new(spec),
+                    queue: Arc::default(),
+                })
+                .collect(),
+        }
+    }
+
+    fn matches(slot: &Slot, trigger: HookTrigger, channel: Option<&str>) -> bool {
+        slot.spec.decl.on == trigger
+            && match (&slot.spec.scope, channel) {
+                (_, None) | (HookScope::Station, _) => true,
+                (HookScope::Channel(declared), Some(on)) => declared == on,
+            }
+    }
+
+    /// Whether any hook would run for this trigger on this channel.
+    pub fn wants(&self, trigger: HookTrigger, channel: Option<&str>) -> bool {
+        self.slots
+            .iter()
+            .any(|s| Self::matches(s, trigger, channel))
+    }
+
+    /// Run every matching hook, each on its own blocking thread. Must be
+    /// called inside the tokio runtime.
+    pub fn fire(&self, trigger: HookTrigger, channel: Option<&str>, data: serde_json::Value) {
+        for slot in self
+            .slots
+            .iter()
+            .filter(|s| Self::matches(s, trigger, channel))
+        {
+            let event = HookEvent::now(channel.map(str::to_owned), data.clone());
+            let start_worker = {
+                let mut q = slot.queue.lock().unwrap();
+                if q.pending.len() >= QUEUE_CAP {
+                    tracing::warn!(
+                        event = "hook.dropped",
+                        hook = %slot.spec.label(),
+                        trigger = trigger.as_str(),
+                        queued = q.pending.len(),
+                        "hook is far behind its events, dropping this firing",
+                    );
+                    continue;
+                }
+                q.pending.push_back(event);
+                !std::mem::replace(&mut q.running, true)
+            };
+            if start_worker {
+                let spec = slot.spec.clone();
+                let queue = slot.queue.clone();
+                tokio::task::spawn_blocking(move || {
+                    loop {
+                        let next = {
+                            let mut q = queue.lock().unwrap();
+                            let next = q.pending.pop_front();
+                            if next.is_none() {
+                                q.running = false;
+                            }
+                            next
+                        };
+                        let Some(event) = next else { break };
+                        execute(&spec, &event);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Drop firings still waiting behind a run, so a generation ending does
+    /// not wait out a backlog.
+    pub fn discard_queued(&self) {
+        for slot in &self.slots {
+            slot.queue.lock().unwrap().pending.clear();
+        }
+    }
+
+    /// Wait for every run in flight, and anything queued, to finish. A reload
+    /// calls this before the next generation starts, so two generations' runs
+    /// of one hook never overlap.
+    pub async fn drain(&self) {
+        while self.slots.iter().any(|s| s.queue.lock().unwrap().running) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// One scheduled item as the schedule watcher sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Airing {
+    pub id: String,
+    pub start: OffsetDateTime,
+    pub finish: OffsetDateTime,
+    pub title: Option<String>,
+}
+
+impl Airing {
+    fn json(&self) -> serde_json::Value {
+        let rfc = &time::format_description::well_known::Rfc3339;
+        serde_json::json!({
+            "id": self.id,
+            "title": self.title,
+            "start": self.start.format(rfc).unwrap_or_default(),
+            "finish": self.finish.format(rfc).unwrap_or_default(),
+        })
+    }
+}
+
+/// The item airing at `now` (latest start wins when chunks overlap) and the
+/// next instant the answer can change: the soonest start or finish after `now`.
+fn airing_at(items: &[Airing], now: OffsetDateTime) -> (Option<Airing>, Option<OffsetDateTime>) {
+    let current = items
+        .iter()
+        .filter(|i| i.start <= now && now < i.finish)
+        .max_by_key(|i| i.start)
+        .cloned();
+    let next = items
+        .iter()
+        .flat_map(|i| [i.start, i.finish])
+        .filter(|t| *t > now)
+        .min();
+    (current, next)
+}
+
+/// Longest the watcher sleeps between looks at the playout files, so a
+/// regenerated schedule is noticed even when the old next boundary was far off.
+const WATCH_RECHECK: Duration = Duration::from_secs(30);
+
+/// The items of the playout files around `now`: the chunks containing it and
+/// the one after.
+async fn read_airings(folder: &std::path::Path, now: OffsetDateTime) -> Vec<Airing> {
+    let Ok(files) = crate::scan::scan_output_folder(folder).await else {
+        return Vec::new();
+    };
+    let following = files.iter().find(|f| f.start > now).map(|f| f.path.clone());
+    let mut paths: Vec<PathBuf> = files
+        .iter()
+        .filter(|f| f.start <= now && f.finish >= now)
+        .map(|f| f.path.clone())
+        .collect();
+    paths.extend(following);
+    let mut out = Vec::new();
+    for path in paths {
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(playout) = serde_json::from_slice::<ersatztv_playout::playout::Playout>(&bytes)
+        else {
+            continue;
+        };
+        out.extend(playout.items.into_iter().map(|i| Airing {
+            id: i.id,
+            start: i.start,
+            finish: i.finish,
+            title: i.program.and_then(|p| p.title),
+        }));
+    }
+    out
+}
+
+/// Fire `schedule_item_change` each time the station clock passes an item
+/// boundary on `channel`, whether or not anyone is watching. The item airing
+/// when the watcher starts is the baseline and fires nothing.
+pub async fn run_schedule_watch(
+    bus: Arc<HookBus>,
+    channel: String,
+    folder: PathBuf,
+    stop: Arc<Notify>,
+) {
+    let mut last: Option<Airing> = None;
+    let mut baselined = false;
+    loop {
+        let now = OffsetDateTime::now_utc();
+        let items = read_airings(&folder, now).await;
+        let (current, next) = airing_at(&items, now);
+        if let Some(cur) = &current {
+            let changed = last
+                .as_ref()
+                .is_none_or(|l| (&l.id, l.start) != (&cur.id, cur.start));
+            if baselined && changed {
+                tracing::info!(
+                    event = "schedule.item_change",
+                    channel = %channel,
+                    id = %cur.id,
+                    start = %cur.start,
+                    "station clock passed an item boundary",
+                );
+                bus.fire(
+                    HookTrigger::ScheduleItemChange,
+                    Some(&channel),
+                    serde_json::json!({
+                        "item": cur.json(),
+                        "previous": last.as_ref().map(Airing::json),
+                    }),
+                );
+            }
+            last = Some(cur.clone());
+        }
+        baselined = true;
+        let wait = next
+            .map(|t| Duration::try_from(t - now).unwrap_or_default() + Duration::from_millis(50))
+            .unwrap_or(WATCH_RECHECK)
+            .min(WATCH_RECHECK);
+        tokio::select! {
+            biased;
+            _ = stop.notified() => break,
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 }
@@ -457,6 +727,14 @@ mod tests {
         }
     }
 
+    fn ev(fired_at: &str) -> HookEvent {
+        HookEvent {
+            channel: None,
+            data: serde_json::Value::Null,
+            fired_at: fired_at.into(),
+        }
+    }
+
     #[cfg(unix)]
     fn write_script(path: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -474,7 +752,10 @@ mod tests {
             &dir.path().join("h.sh"),
             &format!("#!/bin/sh\ncat > {}\nexit 3\n", out.display()),
         );
-        let o = execute(&spec(dir.path(), "h.sh", vec![]), "2026-01-01T00:00:00Z");
+        let o = execute(
+            &spec(dir.path(), "h.sh", vec![]),
+            &ev("2026-01-01T00:00:00Z"),
+        );
         assert_eq!(o.exit, 3);
         let seen: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap();
@@ -498,10 +779,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let denied = execute(&spec(dir.path(), "h.rhai", vec![]), "t");
+        let denied = execute(&spec(dir.path(), "h.rhai", vec![]), &ev("t"));
         assert_eq!(denied.exit, -1);
         assert!(!out.exists());
-        let granted = execute(&spec(dir.path(), "h.rhai", vec![HookGrant::Exec]), "t");
+        let granted = execute(&spec(dir.path(), "h.rhai", vec![HookGrant::Exec]), &ev("t"));
         assert_eq!(granted, Outcome::ok());
         assert_eq!(std::fs::read_to_string(out).unwrap(), "channel:news#1");
     }
@@ -523,7 +804,7 @@ mod tests {
             &dir.path().join("h.sh"),
             "#!/bin/sh\necho boom >&2\nexit 2\n",
         );
-        let o = execute(&spec(dir.path(), "h.sh", vec![]), "t");
+        let o = execute(&spec(dir.path(), "h.sh", vec![]), &ev("t"));
         assert_eq!(o.exit, 2);
         assert!(o.error.unwrap().contains("boom"));
     }
@@ -534,9 +815,188 @@ mod tests {
     fn an_endless_script_is_stopped() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("h.rhai"), "loop { }").unwrap();
-        let o = execute(&spec(dir.path(), "h.rhai", vec![]), "t");
+        let o = execute(&spec(dir.path(), "h.rhai", vec![]), &ev("t"));
         assert_eq!(o.exit, -1);
         assert!(o.error.unwrap().contains("perations"));
+    }
+
+    fn on(trigger: HookTrigger, scope: HookScope, run: &str, dir: &std::path::Path) -> HookSpec {
+        HookSpec {
+            scope,
+            index: 0,
+            decl: HookDecl {
+                on: trigger,
+                every: None,
+                run: run.into(),
+                grants: vec![],
+            },
+            base_dir: dir.to_path_buf(),
+        }
+    }
+
+    /// A daemon-wide event reaches hooks of every scope; a channel event
+    /// reaches the station's hooks and only that channel's own.
+    #[test]
+    fn a_channel_event_reaches_only_its_channels_hooks() {
+        let d = std::path::Path::new("/cfg");
+        let bus = HookBus::new(vec![
+            on(HookTrigger::ChunkWritten, HookScope::Station, "a.sh", d),
+            on(
+                HookTrigger::ChunkWritten,
+                HookScope::Channel("news".into()),
+                "b.sh",
+                d,
+            ),
+            on(
+                HookTrigger::ChunkWritten,
+                HookScope::Channel("movies".into()),
+                "c.sh",
+                d,
+            ),
+            on(
+                HookTrigger::Startup,
+                HookScope::Channel("movies".into()),
+                "d.sh",
+                d,
+            ),
+        ]);
+        let hits = |t, ch| {
+            bus.slots
+                .iter()
+                .filter(|s| HookBus::matches(s, t, ch))
+                .map(|s| s.spec.decl.run.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            hits(HookTrigger::ChunkWritten, Some("news")),
+            ["a.sh", "b.sh"]
+        );
+        assert_eq!(hits(HookTrigger::Startup, None), ["d.sh"]);
+        assert!(!bus.wants(HookTrigger::ScheduleItemChange, Some("news")));
+    }
+
+    /// A fired event runs the executable with the trigger, channel and data on
+    /// stdin, and `drain` returns once it has finished.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fired_event_reaches_the_executable_with_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen.json");
+        write_script(
+            &dir.path().join("h.sh"),
+            &format!("#!/bin/sh\ncat > {}\n", out.display()),
+        );
+        let bus = HookBus::new(vec![on(
+            HookTrigger::ChunkWritten,
+            HookScope::Station,
+            "h.sh",
+            dir.path(),
+        )]);
+        bus.fire(
+            HookTrigger::ChunkWritten,
+            Some("news"),
+            serde_json::json!({"file": "x.json"}),
+        );
+        bus.drain().await;
+        let seen: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap();
+        assert_eq!(seen["trigger"], "chunk_written");
+        assert_eq!(seen["scope"], "station");
+        assert_eq!(seen["channel"], "news");
+        assert_eq!(seen["data"]["file"], "x.json");
+    }
+
+    fn airing(id: &str, start: i64, finish: i64) -> Airing {
+        Airing {
+            id: id.into(),
+            start: OffsetDateTime::from_unix_timestamp(start).unwrap(),
+            finish: OffsetDateTime::from_unix_timestamp(finish).unwrap(),
+            title: None,
+        }
+    }
+
+    #[test]
+    fn the_airing_item_and_next_boundary_follow_the_clock() {
+        let items = [
+            airing("a", 0, 100),
+            airing("b", 100, 250),
+            airing("a", 100, 250),
+        ];
+        let at = |t| OffsetDateTime::from_unix_timestamp(t).unwrap();
+        let (cur, next) = airing_at(&items, at(50));
+        assert_eq!(cur.unwrap().id, "a");
+        assert_eq!(next, Some(at(100)));
+        let (cur, next) = airing_at(&items, at(100));
+        assert_eq!(cur.unwrap().start, at(100));
+        assert_eq!(next, Some(at(250)));
+        assert_eq!(airing_at(&items, at(250)), (None, None));
+    }
+
+    /// The watcher fires once per boundary and stays silent for the item that
+    /// is airing when it starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_watcher_fires_when_the_clock_passes_a_boundary() {
+        use ersatztv_playout::playout::DATE_FORMAT;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("out");
+        std::fs::create_dir(&folder).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let t = |secs: i64| now + time::Duration::seconds(secs);
+        let item = |id: &str, a: OffsetDateTime, b: OffsetDateTime| {
+            serde_json::json!({
+                "id": id,
+                "start": a.format(&time::format_description::well_known::Rfc3339).unwrap(),
+                "finish": b.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            })
+        };
+        let (from, to) = (t(-60), t(60));
+        let name = format!(
+            "{}_{}.json",
+            from.format(&DATE_FORMAT).unwrap(),
+            to.format(&DATE_FORMAT).unwrap()
+        );
+        let body = serde_json::json!({
+            "version": "https://ersatztv.org/playout/version/0.0.1",
+            "items": [item("one", t(-60), t(2)), item("two", t(2), t(60))],
+        });
+        std::fs::write(folder.join(name), body.to_string()).unwrap();
+        let out = dir.path().join("log");
+        write_script(
+            &dir.path().join("h.sh"),
+            &format!(
+                "#!/bin/sh\ncat >> {}\necho >> {}\n",
+                out.display(),
+                out.display()
+            ),
+        );
+        let bus = Arc::new(HookBus::new(vec![on(
+            HookTrigger::ScheduleItemChange,
+            HookScope::Station,
+            "h.sh",
+            dir.path(),
+        )]));
+        let stop = Arc::new(Notify::new());
+        let watch = tokio::spawn(run_schedule_watch(
+            bus.clone(),
+            "news".into(),
+            folder,
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(4000)).await;
+        stop.notify_one();
+        watch.await.unwrap();
+        bus.drain().await;
+        let text = std::fs::read_to_string(out).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert_eq!(lines[0]["data"]["item"]["id"], "two");
+        assert_eq!(lines[0]["data"]["previous"]["id"], "one");
+        assert_eq!(lines[0]["channel"], "news");
     }
 
     #[test]
