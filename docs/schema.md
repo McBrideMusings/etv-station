@@ -2204,7 +2204,6 @@ Five knobs sit on the channel, under `scoring:`, all optional:
 | `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
 | `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
 | `user` | — | The account `single_user` follows: a Tautulli username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
-| `attribution` | `false` | Name who has been watching each item, in the guide and on screen. Off by default; see below. |
 | `explain` | `false` | Show a one-line "why this was picked" explanation in the guide, built from each item's `metadata.audit` trail. Off by default; see below. |
 
 `target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
@@ -2250,48 +2249,6 @@ user, every tick until it is fixed — never a silent fall back to the pooled
 vector, which would make a channel called "For Pierce" rank against everyone's
 viewing while looking perfectly healthy. See `ctx.account_id` above.
 
-#### `attribution` — naming who has been watching
-
-With `attribution: true`, each item the channel schedules gets a line appended to
-its guide description:
-
-```
-A hobbit sets out.
-
-Watched recently by bob, carol and dave
-```
-
-Up to three names, then `and N others`. A person who rewatched something is named
-once — the line says who has been watching, not how many plays there were — and
-within an item the most recent watchers are the ones that survive the cut. An
-item nobody on record has watched gets no line at all, and an item's existing
-synopsis is never replaced, only appended to.
-
-It reaches two surfaces from that one field:
-
-- **The guide.** `ProgramMetadata.description` is what ETV-next turns into XMLTV,
-  so the line shows up as the programme description in Plex.
-- **On screen.** The overlay parses the same playout JSON, so a Rhai overlay
-  script gets `description` (the whole thing) and `watched_by` (the credit line
-  on its own, empty when there isn't one). Gate a lower third on
-  `watched_by != ""`.
-
-Two things it cannot do. It says **"recently"** and never "this week", because
-Tautulli's `get_history` has no `since` parameter — the rows reach back as far as
-the last thousand reach. And it is only as fresh as the generation that wrote the
-chunk: a chunk written now and aired in six hours carries six-hour-old
-attribution, because there is no path from ETV-next back to the station to
-refresh a chunk in place. A channel that wants it current wants a short
-`window_days` and `chunk_hours`, as the For You sample already does for ranking.
-
-`attribution` is opt-in rather than derived because turning it on publishes every
-viewer's activity to everyone else watching that channel. On a shared server that
-is a privacy decision, not a formatting one.
-
-It is also a second reader of the watch history, alongside a scorer plugin — so a
-channel with `attribution: true` and no `plugin:` pool still fetches history,
-where before only a plugin could cause a fetch (#131).
-
 #### `explain` — why each item was picked
 
 With `explain: true`, each item the channel schedules gets a "why" line
@@ -2321,14 +2278,7 @@ An item with no audit trail at all — nothing wrote one, or the channel has no
 existing synopsis is never replaced, only appended to. `detail` is never read
 to build this line; it stays opaque per ADR 0002.
 
-Description order is synopsis, explain line, attribution line: with both
-`explain` and `attribution` on, the why comes before the credit.
-
-Like `attribution`, `explain` reaches the overlay too: the credit line is
-pulled back out of `description` by a fixed prefix search from the end, so an
-explain line ahead of it does not interfere.
-
-`explain` is opt-in for the same reason `attribution` is — a `verdict` is
+`explain` is opt-in — a `verdict` is
 written for `admin audit`'s operator reader, not a viewer, so surfacing it
 (or a plugin's `guide`) to everyone watching the channel is a call made per
 channel, in writing, not derived automatically.
@@ -2473,7 +2423,10 @@ item unannotated and logs `annotate.failed`; the channel keeps airing. The
 channel grants exactly the capabilities the script declares (ADR 0015), as a
 pool does: a script declaring `http` with no `http` in `annotate.capabilities`
 is refused at load, naming the script and the field, and so is a grant the
-script never declares. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
+script never declares. `examples/plugins/attribution.rhai` is a worked
+example: it asks Tautulli who has recently watched each item and returns
+`#{ attribution: "Watched recently by bob and carol" }`, which an overlay script
+reads as `metadata.attribution`. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
 
 ### Pattern step `take` — how many items one visit draws
 
