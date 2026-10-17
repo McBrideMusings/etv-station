@@ -432,15 +432,13 @@ impl PlaylistManager {
                 }
 
                 let path = self.output_folder.join(&removed.path);
-                tokio::fs::remove_file(&path).await?;
+                remove_file_if_present(&path).await?;
 
                 let vtt_path = self.output_folder.join(format!(
                     "{}.vtt",
                     removed.path.strip_suffix(".ts").unwrap_or(&removed.path)
                 ));
-                if vtt_path.exists() {
-                    tokio::fs::remove_file(&vtt_path).await?;
-                }
+                remove_file_if_present(&vtt_path).await?;
             }
         }
 
@@ -785,6 +783,14 @@ async fn write_atomically(
     tokio::fs::rename(temp.path(), destination).await?;
 
     Ok(())
+}
+
+/// Removes `path`, treating a file that is already gone as removed.
+async fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(unix)]
@@ -1495,6 +1501,34 @@ mod tests {
         assert!(
             !prior_folder.join("live000000.vtt").exists(),
             "its subtitle sidecar must be removed too"
+        );
+    }
+
+    /// A trimmed segment whose file is already gone must not stop `update()`
+    /// from trimming the rest and writing the playlist in the same tick.
+    #[tokio::test]
+    async fn trimming_segments_whose_files_are_missing_still_writes_the_playlist() {
+        let dir = TempDir::new().unwrap();
+        let mut pm = manager(
+            dir.path(),
+            OffsetDateTime::now_utc() - SEGMENT_RETENTION - Duration::from_secs(600),
+        )
+        .await;
+        push_segments(&mut pm, 3);
+        for s in pm.segments.iter_mut() {
+            s.program_date_time -= SEGMENT_RETENTION + Duration::from_secs(60);
+        }
+
+        pm.update().await.unwrap();
+
+        assert!(
+            pm.segments.is_empty(),
+            "every stale entry is trimmed in one tick"
+        );
+        assert_eq!(pm.media_sequence, 3);
+        assert!(
+            dir.path().join("live.m3u8").exists(),
+            "the playlist is written despite the missing files"
         );
     }
 
