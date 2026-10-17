@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::block::BlockFile;
+use super::categories::{self, Categories};
 use super::channel::ChannelConfig;
 use super::entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
 use super::overlay::{self, ChannelOverlays};
@@ -122,6 +123,7 @@ fn load_with(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    let categories = load_categories(station_path, &base, &station.categories)?;
     let channel_paths = expand_channel_patterns(station_path, &base, &station.channels)?;
     let lineup = channel_paths.clone();
 
@@ -132,7 +134,7 @@ fn load_with(
     let mut channels = Vec::with_capacity(channel_paths.len());
     let mut dropped = Vec::new();
     for channel_path in channel_paths {
-        match load_one_channel(&station, &base, &channel_path, refs) {
+        match load_one_channel(&station, &base, &channel_path, &categories, refs) {
             Ok(channel) => channels.push(channel),
             Err(e) => {
                 tracing::error!(
@@ -169,10 +171,12 @@ fn load_one_channel(
     station: &StationConfig,
     base: &Path,
     channel_path: &Path,
+    categories: &Categories,
     env: EnvLookup<'_>,
 ) -> Result<LoadedChannel, ConfigError> {
     let mut config: ChannelConfig = read_config_file(channel_path)?;
     resolve_blocks(&mut config, channel_path, env)?;
+    expand_categories(&mut config, channel_path, categories)?;
     validate::validate_channel(channel_path, &config)?;
     let name = resolve_identity(channel_path, &config)?;
     apply_station_variety(&mut config, station, &name);
@@ -198,6 +202,60 @@ fn load_one_channel(
         config,
         overlays,
     })
+}
+
+/// Read every category file the station's `categories:` patterns name. A bad
+/// or duplicate declaration fails the whole station load: categories are
+/// shared, so there is no single channel to drop for it.
+fn load_categories(
+    station_path: &Path,
+    base: &Path,
+    patterns: &[String],
+) -> Result<Categories, ConfigError> {
+    let invalid = |message: String| ConfigError::Validation {
+        path: station_path.to_path_buf(),
+        message,
+    };
+    let mut files = Vec::new();
+    for path in expand_channel_patterns(station_path, base, patterns)? {
+        let parsed = categories::read_category_file(&path).map_err(invalid)?;
+        files.push((path, parsed));
+    }
+    Categories::from_files(files).map_err(invalid)
+}
+
+/// Replace `category("name")` in every pool expression of one channel with its
+/// inline `keyword_score` form (#170), before the channel validates.
+fn expand_categories(
+    config: &mut ChannelConfig,
+    channel_path: &Path,
+    categories: &Categories,
+) -> Result<(), ConfigError> {
+    let labels: Vec<String> = (0..config.rule.all_blocks().count())
+        .map(|idx| config.rule.block_label(idx))
+        .collect();
+    for (label, include) in labels.iter().zip(config.rule.all_blocks_mut()) {
+        for pool in &mut include.pools {
+            let fail = |e: String| ConfigError::Validation {
+                path: channel_path.to_path_buf(),
+                message: format!("{label} pool {:?}: {e}", pool.name),
+            };
+            if let Some(expr) = &pool.expr {
+                pool.expr = Some(categories.expand(expr).map_err(fail)?);
+            }
+            if let Some(sources) = &mut pool.sources {
+                for (set, expr) in sources.iter_mut() {
+                    *expr = categories
+                        .expand(expr)
+                        .map_err(|e| ConfigError::Validation {
+                            path: channel_path.to_path_buf(),
+                            message: format!("{label} pool {:?} source {set:?}: {e}", pool.name),
+                        })?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Drop every channel whose declared `number` (#263) or `name` (#414)
@@ -1265,6 +1323,7 @@ mod tests {
             tz: "UTC".into(),
             output_base: PathBuf::from("out"),
             channels: vec!["channels/a.yaml".into()],
+            categories: Vec::new(),
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,
@@ -1832,5 +1891,124 @@ mod tests {
             .collect();
         files.sort();
         files
+    }
+
+    /// A station dir with `categories/*.yaml`, one channel per `(file, expr)`.
+    fn category_station(categories: &[(&str, &str)], channels: &[(&str, &str)]) -> PathBuf {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir.join("categories")).unwrap();
+        std::fs::create_dir_all(dir.join("channels")).unwrap();
+        for (file, body) in categories {
+            std::fs::write(dir.join("categories").join(file), body).unwrap();
+        }
+        for (n, (file, expr)) in channels.iter().enumerate() {
+            let name = file.trim_end_matches(".yaml");
+            std::fs::write(
+                dir.join("channels").join(file),
+                format!(
+                    "number: {}\nname: {name}\nrule:\n  blocks:\n    - mode: all\n      pools:\n        - name: p\n          expr: '{expr}'\n      pattern:\n        - pool: p\n          take: 1\n",
+                    n + 1
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("station.yaml"),
+            "output_base: out\nchannels: [\"channels/*.yaml\"]\ncategories: [\"categories/*.yaml\"]\nnormalization:\n  audio: {}\n  video: {}\n",
+        )
+        .unwrap();
+        dir.join("station.yaml")
+    }
+
+    const KUNG_FU: &str = "categories:\n  - name: kung-fu\n    keywords: [\"kung fu\", \"martial arts\", \"shaolin\"]\n    threshold: 2\n";
+
+    fn pool_exprs(loaded: &Station) -> Vec<(String, String)> {
+        loaded
+            .channels
+            .iter()
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.config.rule.blocks[0].pools[0].expr.clone().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_channels_referencing_one_category_get_the_same_expansion() {
+        let path = category_station(
+            &[("martial.yaml", KUNG_FU)],
+            &[
+                ("action.yaml", r#"category("kung-fu")"#),
+                (
+                    "kungfu.yaml",
+                    r#"category("kung-fu") && item.type == "movie""#,
+                ),
+            ],
+        );
+        let loaded = load_with_env(&path, &no_env).unwrap();
+        assert!(loaded.dropped.is_empty(), "{:?}", loaded.dropped);
+        let exprs = pool_exprs(&loaded);
+        let inline = r#"(keyword_score(["kung fu", "martial arts", "shaolin"]) >= 2)"#;
+        assert_eq!(exprs[0].1, inline);
+        assert_eq!(exprs[1].1, format!(r#"{inline} && item.type == "movie""#));
+    }
+
+    #[test]
+    fn retuning_a_category_retunes_every_channel_that_names_it() {
+        let channels = [
+            ("a.yaml", r#"category("kung-fu")"#),
+            ("b.yaml", r#"category("kung-fu")"#),
+        ];
+        let path = category_station(&[("c.yaml", KUNG_FU)], &channels);
+        let before = pool_exprs(&load_with_env(&path, &no_env).unwrap());
+        std::fs::write(
+            path.parent().unwrap().join("categories/c.yaml"),
+            KUNG_FU.replace("threshold: 2", "threshold: 3"),
+        )
+        .unwrap();
+        let after = pool_exprs(&load_with_env(&path, &no_env).unwrap());
+        assert!(before.iter().all(|(_, e)| e.ends_with(">= 2)")));
+        assert!(after.iter().all(|(_, e)| e.ends_with(">= 3)")), "{after:?}");
+    }
+
+    #[test]
+    fn an_undefined_category_drops_the_channel_naming_it_and_the_defined_ones() {
+        let path = category_station(
+            &[("c.yaml", KUNG_FU)],
+            &[
+                ("a.yaml", r#"category("nope")"#),
+                ("b.yaml", r#"category("kung-fu")"#),
+            ],
+        );
+        let loaded = load_with_env(&path, &no_env).unwrap();
+        assert_eq!(loaded.channels.len(), 1);
+        let reason = &loaded.dropped[0].reason;
+        assert!(
+            reason.contains("\"nope\"") && reason.contains("kung-fu"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn two_categories_with_one_name_fail_the_station_load_naming_both_files() {
+        let path = category_station(
+            &[("one.yaml", KUNG_FU), ("two.yaml", KUNG_FU)],
+            &[("a.yaml", r#"category("kung-fu")"#)],
+        );
+        let err = load_with_env(&path, &no_env).unwrap_err().to_string();
+        assert!(
+            err.contains("one.yaml") && err.contains("two.yaml") && err.contains("kung-fu"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_inline_keyword_score_form_loads_unchanged() {
+        let inline = r#"keyword_score(["a", "b"]) >= 1"#;
+        let path = category_station(&[("c.yaml", KUNG_FU)], &[("a.yaml", inline)]);
+        let loaded = load_with_env(&path, &no_env).unwrap();
+        assert_eq!(pool_exprs(&loaded)[0].1, inline);
     }
 }
