@@ -948,6 +948,16 @@ it is `()` for a channel's first item and when the earlier item carried none.
 Test for a map with `type_of(prev_metadata) == "map"` before reading a key
 from either.
 
+**An item's own overlay.** A playout entry may carry `overlay`, which the
+station writes and the overlay process obeys while that item airs:
+`{script, vars}` runs that script instead of the channel's overlay (and the
+cascade is skipped), `"none"` draws nothing, and an entry without the field
+keeps the channel overlay. `script` is read as written, so the station writes
+an absolute path. The script sees `vars` as a map, empty when the entry named
+none, so `vars.title` reads as `()` rather than failing; a script under
+`shared/bumpers/` must tolerate every key being unset. An item overlay has no
+layers of its own, so the script's `layers` result has nothing to address.
+
 ### Pool `label` / `advisory` — naming the block on screen
 
 A pool can say what it is called on air, and warn about what it contains:

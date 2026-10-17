@@ -12,7 +12,7 @@ use etv_overlay::overlay_spec::{OverlayKind, OverlaySpec};
 use etv_overlay::overlay_timeline::OverlayTimelineSource;
 use etv_overlay::phase_watchdog::{self, Phase, PhaseWatch};
 use etv_overlay::program_context::{ProgramContext, ProgramContextSource};
-use etv_overlay::rhai_engine::RhaiEngine;
+use etv_overlay::rhai_engine::{ItemOverlayEngine, RhaiEngine};
 use etv_overlay::vello_renderer::VelloRenderer;
 use time::OffsetDateTime;
 
@@ -389,6 +389,7 @@ fn program_context_for(p: PreviewProgram) -> ProgramContext {
         item_remaining: p.item_remaining,
         metadata: p.metadata.unwrap_or(serde_json::Value::Null),
         prev_metadata: p.prev_metadata.unwrap_or(serde_json::Value::Null),
+        overlay: None,
     }
 }
 
@@ -820,6 +821,7 @@ fn pipe_to_fifo(
     let mut renderer = VelloRenderer::new(base.width, base.height, base.pixel_format)?;
     let mut active_spec = timeline_source.spec_at(OffsetDateTime::now_utc()).cloned();
     let mut engine = build_engine_for(active_spec.as_ref())?;
+    let mut item_engine = ItemOverlayEngine::default();
     let start = std::time::Instant::now();
     // The overlay half of the two-clock instrumentation. The heartbeat lands
     // beside the fifo so anything that can see the channel's playout folder can
@@ -911,7 +913,13 @@ fn pipe_to_fifo(
         watch.enter(Phase::ProgramContext);
         let ctx = current_context(program_source.as_mut());
         watch.enter(Phase::Evaluate);
-        let state = engine.evaluate(time_seconds, frame_index, &ctx);
+        // An item that names its own overlay replaces the channel's for as long
+        // as it airs; an item that names none leaves the channel overlay alone.
+        let airing = match &ctx.overlay {
+            Some(overlay) => item_engine.engine_for(overlay),
+            None => &engine,
+        };
+        let state = airing.evaluate(time_seconds, frame_index, &ctx);
         watch.enter(Phase::Render);
         let frame = renderer.render_frame(&state)?;
         match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN, IDLE_TIMEOUT, &watch)? {
@@ -1057,6 +1065,7 @@ fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
         item_remaining: -1.0,
         metadata: p.metadata.clone().unwrap_or(serde_json::Value::Null),
         prev_metadata: p.prev_metadata.clone().unwrap_or(serde_json::Value::Null),
+        overlay: None,
     }
 }
 
