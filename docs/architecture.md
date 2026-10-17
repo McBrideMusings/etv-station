@@ -214,7 +214,7 @@ The `etv-overlay pipe` subprocess (one per channel, supervised by `overlay_super
 | `item_elapsed`   | float   | seconds since current item's `start` (`-1.0` if unknown) |
 | `item_remaining` | float   | seconds until current item's `finish` (`-1.0` if unknown) |
 | `item_duration`  | float   | `item_elapsed + item_remaining` (`-1.0` if either is unknown) |
-| `metadata`       | dynamic | currently-airing item's opaque `metadata` blob, verbatim (`()` if absent) |
+| `metadata`       | dynamic | currently-airing item's opaque `metadata` blob, verbatim (an empty map if absent) |
 | `prev_metadata`  | dynamic | the previous item's `metadata` blob, verbatim (`()` if none) |
 | `content_rating` | string  | currently-airing item's catalog rating, e.g. `TV-MA`, `R` (`""` if none) |
 | `config`         | map     | this graphic's own `config:` (empty map if unset) |
