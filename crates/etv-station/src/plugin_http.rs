@@ -8,12 +8,64 @@
 //! hook worker indefinitely. Errors and logs carry the method and host, never
 //! the full URL: a URL may carry a token in its query.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rhai::{Dynamic, EvalAltResult};
 
 /// Longest a `ctx.http` call made during generation waits for a response.
 pub const GENERATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most time one script call (`pick()`, `build()`) may spend in outside calls
+/// — `ctx.http` and `ctx.exec` together — however many it makes.
+pub const GENERATION_BUDGET: Duration = Duration::from_secs(30);
+
+/// The time one script call has left for outside calls. Clones share the
+/// remainder, so the `ctx` a script holds and the engine's copy draw from one
+/// budget.
+#[derive(Debug, Clone)]
+pub struct Budget {
+    total: Duration,
+    left: Arc<Mutex<Duration>>,
+}
+
+impl Budget {
+    pub fn new(total: Duration) -> Self {
+        Self {
+            total,
+            left: Arc::new(Mutex::new(total)),
+        }
+    }
+
+    /// Runs `f` with a timeout of [`GENERATION_TIMEOUT`] or what is left,
+    /// whichever is shorter, and charges the time it took. With nothing left
+    /// it does not run `f`: the error names the budget and the log line
+    /// carries it.
+    pub fn within<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce(Duration) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let left = *self.left.lock().unwrap_or_else(|e| e.into_inner());
+        if left.is_zero() {
+            tracing::warn!(
+                event = "plugin.http",
+                call = what,
+                budget_s = self.total.as_secs_f64(),
+                "plugin script spent its budget for outside calls"
+            );
+            return Err(format!(
+                "{what}: this script call's {}s budget for outside calls (ctx.http, ctx.exec) is spent",
+                self.total.as_secs()
+            ));
+        }
+        let started = Instant::now();
+        let result = f(left.min(GENERATION_TIMEOUT)).map_err(|e| format!("{what}: {e}"));
+        let mut left = self.left.lock().unwrap_or_else(|e| e.into_inner());
+        *left = left.saturating_sub(started.elapsed());
+        result
+    }
+}
 
 /// `method` `url` with `body` (sent only when non-empty), returning the
 /// response body as text. A 4xx/5xx status, a transport failure and a timeout
@@ -141,6 +193,30 @@ pub(crate) mod tests {
         let e = call(&url, "get", "", Duration::from_millis(300)).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5), "{e}");
         assert!(!e.contains("secret"), "error leaked the query: {e}");
+        drop(listener);
+    }
+
+    #[test]
+    fn fifty_calls_to_a_server_that_never_answers_stop_at_the_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let budget = Budget::new(Duration::from_millis(600));
+        let started = Instant::now();
+        let mut last = Ok(String::new());
+        for _ in 0..50 {
+            last = budget.within("ctx.http()", |t| call(&url, "get", "", t));
+            if last.is_err() && started.elapsed() > Duration::from_millis(600) {
+                break;
+            }
+        }
+        let calls_done = started.elapsed();
+        assert!(calls_done < Duration::from_secs(3), "{calls_done:?}");
+        let e = last.unwrap_err();
+        assert!(e.contains("http"), "{e}");
+        let e = budget
+            .within("ctx.http()", |t| call(&url, "get", "", t))
+            .unwrap_err();
+        assert!(e.contains("budget") && e.contains("is spent"), "{e}");
         drop(listener);
     }
 

@@ -511,7 +511,7 @@ fn the_committed_example_plugin_runs_and_scores_correctly() {
 fn the_script_declares_pool_provider_and_all_three_capabilities() {
     let path = plugin_path();
     assert_eq!(declared_hooks(&path).unwrap(), vec!["pool_provider"]);
-    let caps = declared_capabilities(&path).unwrap();
+    let caps = declared_capabilities(&path, "pool_provider").unwrap();
     assert_eq!(
         caps,
         vec![

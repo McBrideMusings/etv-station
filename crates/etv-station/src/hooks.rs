@@ -333,14 +333,16 @@ fn capture(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
+    // After a kill, a grandchild may still hold the pipes open; joining the
+    // readers would wait for it. Leave them to finish on their own.
+    let collect = |h: Option<std::thread::JoinHandle<String>>| match h {
+        Some(h) if !timed_out => h.join().unwrap_or_default(),
+        _ => String::new(),
+    };
     Ok(Captured {
         code: status.and_then(|s| s.code()),
-        stdout: out
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default(),
-        stderr: err
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default(),
+        stdout: collect(out),
+        stderr: collect(err),
         timed_out,
     })
 }
@@ -388,25 +390,26 @@ fn hook_engine(grants: &[HookGrant], label: String) -> Engine {
 
 /// `exec(program, args)` -> `#{ code, stdout, stderr }`.
 fn exec_grant(program: &str, args: Array) -> Result<Map, Box<rhai::EvalAltResult>> {
+    Ok(exec_call(program, args, RUN_TIMEOUT)?)
+}
+
+/// Run `program` with `args` and no stdin, killing it after `timeout`. The one
+/// procedure behind a hook's granted `exec` and a bumper's `ctx.exec`. A spawn
+/// failure and a timeout are errors; a nonzero exit is a result the script reads.
+pub(crate) fn exec_call(program: &str, args: Array, timeout: Duration) -> Result<Map, String> {
     let args: Vec<String> = args.into_iter().map(|a| a.to_string()).collect();
-    let out = Command::new(program)
-        .args(&args)
-        .stdin(Stdio::null())
-        .output()
+    let out = capture(Command::new(program).args(&args), None, timeout)
         .map_err(|e| format!("exec {program}: {e}"))?;
+    if out.timed_out {
+        return Err(format!(
+            "exec {program}: killed after {}s",
+            timeout.as_secs()
+        ));
+    }
     let mut m = Map::new();
-    m.insert(
-        "code".into(),
-        Dynamic::from(out.status.code().unwrap_or(-1) as i64),
-    );
-    m.insert(
-        "stdout".into(),
-        Dynamic::from(String::from_utf8_lossy(&out.stdout).into_owned()),
-    );
-    m.insert(
-        "stderr".into(),
-        Dynamic::from(String::from_utf8_lossy(&out.stderr).into_owned()),
-    );
+    m.insert("code".into(), Dynamic::from(out.code.unwrap_or(-1) as i64));
+    m.insert("stdout".into(), Dynamic::from(out.stdout));
+    m.insert("stderr".into(), Dynamic::from(out.stderr));
     Ok(m)
 }
 
@@ -844,6 +847,23 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `exec_call` kills a program that outlives its timeout and reports an error.
+    #[test]
+    fn exec_call_kills_a_program_past_its_timeout() {
+        let started = Instant::now();
+        let err = exec_call(
+            "/bin/sh",
+            vec![
+                Dynamic::from("-c".to_string()),
+                Dynamic::from("sleep 30".to_string()),
+            ],
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(err.contains("killed after"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// An executable gets the event JSON on stdin and its exit code is reported.

@@ -19,7 +19,7 @@
 //! ```
 //!
 //! `ctx` carries no filesystem or network handle: `build` can only see what
-//! the host put in it. Three capability-gated calls reach outside it, each
+//! the host put in it. Four capability-gated calls reach outside it, each
 //! declared in `capabilities()` and granted by the channel
 //! ([`BUMPER_CAPABILITIES`]):
 //!
@@ -37,6 +37,16 @@
 //!   4xx/5xx, a transport failure, or no response within
 //!   [`crate::plugin_http::GENERATION_TIMEOUT`] is an error. `parse_json(text)`
 //!   turns the body into maps and arrays and needs no grant.
+//!
+//!   `ctx.http` and `ctx.exec` share one budget per `build()` call,
+//!   [`crate::plugin_http::GENERATION_BUDGET`]: each call's timeout is capped at
+//!   what is left, and once it is spent every further call errors at once,
+//!   naming the budget.
+//! - `exec` — `ctx.exec(program, args)` runs one program with no stdin through
+//!   [`crate::hooks::exec_call`] and returns `#{ code, stdout, stderr }`. A
+//!   spawn failure, or a run that outlives
+//!   [`crate::plugin_http::GENERATION_TIMEOUT`] (the child is killed), is an
+//!   error; a nonzero `code` is the script's to read.
 //!
 //! `ctx.airings(filter)` reads the airings ledger (`history.db`) and needs no
 //! grant: it is in-process and read-only. It returns an array of maps
@@ -69,7 +79,7 @@ use super::timeline::{
 };
 
 /// Capability names a bumper plugin may declare: each gates one `ctx` call.
-pub const BUMPER_CAPABILITIES: &[&str] = &["probe", "read", "http"];
+pub const BUMPER_CAPABILITIES: &[&str] = &["probe", "read", "http", "exec"];
 
 /// The largest file `ctx.read` returns.
 pub const READ_LIMIT_BYTES: u64 = 1 << 20;
@@ -104,7 +114,7 @@ pub struct BumperInput {
     /// `YYYY-MM-DD` the gap airs on, in the station's time zone.
     pub air_date: String,
     /// Capabilities the channel granted this script; `ctx.probe`,
-    /// `ctx.read` and `ctx.http` error unless their name is here.
+    /// `ctx.read`, `ctx.http` and `ctx.exec` error unless their name is here.
     pub granted: Vec<String>,
     /// The airings ledger `ctx.airings` reads; `None` answers every query
     /// with an empty array.
@@ -142,23 +152,11 @@ pub fn validate_script(script: &Path, granted: &[String]) -> Result<(), String> 
             req.why
         ));
     }
-    let declared: Vec<String> = crate::score::declared_capabilities(script)?
+    let declared: Vec<String> = crate::score::declared_capabilities(script, "bumper")?
         .iter()
         .map(|c| c.name().to_string())
         .collect();
     for cap in &declared {
-        if !BUMPER_CAPABILITIES.contains(&cap.as_str()) {
-            return Err(format!(
-                "plugin {} declares capability {cap:?}, which the bumper hook does not offer \
-                 (it offers: {})",
-                script.display(),
-                if BUMPER_CAPABILITIES.is_empty() {
-                    "none".to_string()
-                } else {
-                    BUMPER_CAPABILITIES.join(", ")
-                }
-            ));
-        }
         if !granted.contains(cap) {
             return Err(format!(
                 "plugin {} declares capability {cap:?} that its channel does not grant",
@@ -193,6 +191,7 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
         granted: input.granted.clone(),
         history: input.history.clone(),
         channel: input.channel.name.clone(),
+        budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
     });
     let mut scope = Scope::new();
     let value: Dynamic = engine
@@ -594,6 +593,8 @@ struct Host {
     history: Option<Arc<HistoryDb>>,
     /// The channel `ctx.airings` queries unless the filter names another.
     channel: String,
+    /// What this `build()` call has left for `ctx.http` and `ctx.exec`.
+    budget: crate::plugin_http::Budget,
 }
 
 impl Host {
@@ -657,10 +658,30 @@ impl Host {
 
     fn http(&self, url: &str, method: &str, body: &str) -> RhaiResult<String> {
         self.require("http")?;
-        Ok(
-            crate::plugin_http::call(url, method, body, crate::plugin_http::GENERATION_TIMEOUT)
-                .map_err(|e| format!("ctx.http(): {e}"))?,
-        )
+        Ok(self.budget.within("ctx.http()", |timeout| {
+            crate::plugin_http::call(url, method, body, timeout)
+        })?)
+    }
+
+    fn exec(&self, program: &str, args: rhai::Array) -> RhaiResult<Map> {
+        self.require("exec")?;
+        let started = std::time::Instant::now();
+        let result = self.budget.within("ctx.exec()", |timeout| {
+            crate::hooks::exec_call(program, args, timeout)
+        });
+        tracing::info!(
+            event = "bumper.exec",
+            program,
+            ok = result.is_ok(),
+            code = result
+                .as_ref()
+                .ok()
+                .and_then(|m| m.get("code"))
+                .map(|c| c.to_string()),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "bumper script ran a program"
+        );
+        Ok(result?)
     }
 }
 
@@ -888,9 +909,14 @@ fn bumper_engine(host: Host) -> rhai::Engine {
     });
     let h = host.clone();
     engine.register_fn("read", move |_ctx: &mut Map, path: &str| h.read(path));
+    let h = host.clone();
     engine.register_fn(
         "http",
-        move |_ctx: &mut Map, url: &str, method: &str, body: &str| host.http(url, method, body),
+        move |_ctx: &mut Map, url: &str, method: &str, body: &str| h.http(url, method, body),
+    );
+    engine.register_fn(
+        "exec",
+        move |_ctx: &mut Map, program: &str, args: rhai::Array| host.exec(program, args),
     );
 
     engine
@@ -1406,6 +1432,27 @@ fn build(ctx) {
         );
         let msg = build(&path, &granted(&["read"])).unwrap_err().to_string();
         assert!(msg.contains("capability `http` not declared"), "{msg}");
+    }
+
+    #[test]
+    fn exec_errors_unless_granted_and_returns_code_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(
+            &dir,
+            r#"fn hooks() { ["bumper"] }
+fn capabilities() { ["exec"] }
+fn build(ctx) {
+    let r = ctx.exec("/bin/sh", ["-c", "printf out; printf err >&2; exit 3"]);
+    let t = timeline();
+    t.push(segment().black().fixed(1).name(`${r.code}:${r.stdout}:${r.stderr}`));
+    t
+}"#,
+        );
+        validate_script(&path, &["exec".into()]).unwrap();
+        let built = build(&path, &granted(&["exec"])).unwrap();
+        assert_eq!(built.timeline.segments[0].name, "3:out:err");
+        let msg = build(&path, &granted(&[])).unwrap_err().to_string();
+        assert!(msg.contains("capability `exec` not declared"), "{msg}");
     }
 
     #[test]
