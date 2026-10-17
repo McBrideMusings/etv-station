@@ -316,11 +316,13 @@ impl Catalog {
 
     /// Settle `absolute_episode` for every episode of each show in `show_ids`
     /// (#105). All-or-nothing per show: when Plex numbered every episode, its
-    /// numbers stand; when any episode lacks one, every episode of the show is
-    /// renumbered 1..N by `(season, episode)` — Plex's partial values
-    /// included — so two number spaces are never mixed. Only regular episodes
-    /// (`season >= 1` with an episode number) take a computed number; season 0
-    /// specials and rows missing a season or episode get none, so they never
+    /// numbers stand; when any regular episode lacks one, every regular
+    /// episode of the show is renumbered 1..N by `(season, episode)` — Plex's
+    /// partial values included — so two number spaces are never mixed. Only
+    /// regular episodes (`season >= 1` with an episode number) are judged for
+    /// "fully indexed" and take a computed number; season 0 specials and rows
+    /// missing a season or episode keep Plex's number or NULL when Plex's
+    /// numbers stand, and get none when the show is renumbered, so they never
     /// shift the regular run.
     ///
     /// Reads the show's whole episode set from the catalog rather than the
@@ -341,7 +343,9 @@ impl Catalog {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })?
                 .collect::<Result<_, _>>()?;
-            let fully_indexed = rows.iter().all(|(_, plex, _, _)| plex.is_some());
+            let fully_indexed = rows
+                .iter()
+                .all(|(_, plex, _, regular)| !regular || plex.is_some());
             let mut next = 0;
             for (entry_id, plex, current, regular) in &rows {
                 let wanted = if fully_indexed {

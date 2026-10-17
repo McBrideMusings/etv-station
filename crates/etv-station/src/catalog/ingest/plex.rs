@@ -3674,8 +3674,29 @@ mod tests {
         ];
         ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
         assert_eq!(
-            absolutes(&cat, &[(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (1, 99), (1, 98)]),
+            absolutes(
+                &cat,
+                &[(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (1, 99), (1, 98)]
+            ),
             vec![None, None, Some(1), Some(2), Some(3), None, None]
+        );
+    }
+
+    #[test]
+    fn an_unindexed_special_does_not_flip_an_otherwise_indexed_show() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let items = [
+            show_ep(0, 1, None),
+            show_ep(1, 1, Some(101)),
+            show_ep(1, 2, Some(102)),
+            show_ep(2, 1, Some(150)),
+            show_ep(2, 2, Some(151)),
+            show_ep(2, 3, Some(152)),
+        ];
+        ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+        assert_eq!(
+            absolutes(&cat, &[(0, 1), (1, 1), (1, 2), (2, 1), (2, 2), (2, 3)]),
+            vec![None, Some(101), Some(102), Some(150), Some(151), Some(152)]
         );
     }
 
