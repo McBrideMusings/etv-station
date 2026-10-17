@@ -1588,6 +1588,27 @@ fn build_overlay_context(channel: &LoadedChannel) -> Option<overlay_supervisor::
     })
 }
 
+/// The fifo path written into `channelN.json`. Absolute for the same reason
+/// `playout.folder` is: ETV-next resolves a relative path against its own
+/// config dir, not the station's CWD. `None` (logged) when the CWD cannot be
+/// read, so the channel publishes no overlay rather than a path ETV-next
+/// would resolve wrongly.
+fn published_fifo_path(output_folder: &Path) -> Option<String> {
+    let fifo = overlay_supervisor::resolve_fifo_path(output_folder);
+    match std::path::absolute(&fifo) {
+        Ok(abs) => Some(abs.to_string_lossy().into_owned()),
+        Err(err) => {
+            tracing::warn!(
+                event = "overlay.fifo_path_unresolved",
+                fifo = %fifo.display(),
+                error = %err,
+                "cannot make the overlay fifo path absolute; publishing no overlay"
+            );
+            None
+        }
+    }
+}
+
 /// The `overlay` block ETV-next reads out of its rendered `channelN.json`.
 ///
 /// Its geometry is the **channel's** resolved config, never a block's: it
@@ -1600,9 +1621,7 @@ fn build_overlay_context(channel: &LoadedChannel) -> Option<overlay_supervisor::
 pub(crate) fn load_overlay_playout_spec(channel: &LoadedChannel) -> Option<PlayoutOverlaySpec> {
     let spec = channel.overlays.base.as_ref()?;
     Some(PlayoutOverlaySpec {
-        fifo_path: overlay_supervisor::resolve_fifo_path(&channel.output_folder)
-            .to_string_lossy()
-            .into_owned(),
+        fifo_path: published_fifo_path(&channel.output_folder)?,
         pixel_format: String::from(spec.pixel_format.ffmpeg_arg()),
         width: spec.width,
         height: spec.height,
@@ -5448,6 +5467,20 @@ mod history_catalog_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_fifo_path_is_absolute_for_a_relative_output_folder() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected = cwd.join("examples/output/test/overlay.fifo");
+        assert_eq!(
+            published_fifo_path(Path::new("examples/output/test")).as_deref(),
+            Some(&*expected.to_string_lossy())
+        );
+        assert_eq!(
+            published_fifo_path(Path::new("/data/playout/hbo")).as_deref(),
+            Some("/data/playout/hbo/overlay.fifo")
+        );
+    }
 
     const CHANNEL_BODY: &str = r#"
 number = 1

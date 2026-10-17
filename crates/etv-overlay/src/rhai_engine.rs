@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rhai::{AST, Dynamic, Engine, Scope};
 
@@ -99,9 +100,29 @@ struct Graphic {
     /// The directory the script was read from, which a relative `path` in a
     /// layer the script declares resolves against.
     script_dir: Option<PathBuf>,
+    /// The error message last warned for this graphic, `None` while it
+    /// evaluates cleanly. [`RhaiEngine::evaluate`] runs once per frame, so a
+    /// broken script would otherwise warn ~30 times a second.
+    warned: Mutex<Option<String>>,
 }
 
 impl Graphic {
+    /// Whether `message` is worth a warn line: true the first time this
+    /// graphic fails, and again whenever the message changes or the graphic
+    /// recovered in between.
+    fn should_warn(&self, message: &str) -> bool {
+        let mut warned = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        if warned.as_deref() == Some(message) {
+            return false;
+        }
+        *warned = Some(message.to_owned());
+        true
+    }
+
+    fn clear_warned(&self) {
+        *self.warned.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     fn new(base_layers: Vec<OverlayKind>, config: Option<&serde_json::Value>) -> Self {
         let config = match config {
             Some(value) => rhai::serde::to_dynamic(value).unwrap_or_else(|e| {
@@ -116,6 +137,7 @@ impl Graphic {
             config,
             vars: Dynamic::from_map(rhai::Map::new()),
             script_dir: None,
+            warned: Mutex::new(None),
         }
     }
 }
@@ -234,11 +256,18 @@ impl RhaiEngine {
         program: &ProgramContext,
     ) -> OverlayState {
         let states = self.graphics.iter().map(|graphic| {
-            self.evaluate_graphic(graphic, time_seconds, frame_index, program)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("rhai script eval failed: {e}");
+            match self.evaluate_graphic(graphic, time_seconds, frame_index, program) {
+                Ok(state) => {
+                    graphic.clear_warned();
+                    state
+                }
+                Err(e) => {
+                    if graphic.should_warn(&e.to_string()) {
+                        tracing::warn!("rhai script eval failed: {e}");
+                    }
                     OverlayState::from_layers(graphic.base_layers.clone())
-                })
+                }
+            }
         });
         OverlayState::combine(states)
     }
@@ -582,6 +611,16 @@ mod tests {
             corner: Corner::BottomLeft,
             margin: 32,
         }
+    }
+
+    #[test]
+    fn a_repeated_script_error_warns_once_until_it_changes_or_recovers() {
+        let graphic = Graphic::new(vec![], None);
+        assert!(graphic.should_warn("boom"));
+        assert!(!graphic.should_warn("boom"));
+        assert!(graphic.should_warn("different"));
+        graphic.clear_warned();
+        assert!(graphic.should_warn("different"));
     }
 
     #[test]
