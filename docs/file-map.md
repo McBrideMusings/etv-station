@@ -25,7 +25,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 |---|---|
 | `crates/etv-station/` | The daemon binary crate. |
 | `crates/etv-query-test/` | Phase A CEL feasibility harness. Queries Plex + FS catalogs with CEL; see `./tools/query.sh`. |
-| `crates/etv-query-test/src/cel_eval.rs` | CEL compile + per-item eval. Case-insensitive; custom helpers: `season_in`, `icontains`, `in_collection`, `has_category`, `shorter_than`, `longer_than`. |
+| `crates/etv-query-test/src/cel_eval.rs` | CEL compile + per-item eval. Case-insensitive; custom helpers: `season_in`, `icontains`, `in_collection`, `has_category`, `shorter_than`, `longer_than`, `keyword_score`. |
 | `crates/etv-query-test/src/plex.rs` | Read-only Plex HTTP client: section/show/collection ingestion, show-collection enrichment, path translation, `type_from_section`. |
 | `crates/etv-query-test/src/fs_catalog.rs` | FS scanner: glob + ffprobe, `type_from_path` (dir-name → semantic type), `ETV_FS_ROOTS` config, path-keyed result map. |
 | `crates/etv-query-test/src/normalize.rs` | `NormalizedItem`: unified record shape for both Plex and FS items. `sources: Vec<String>`, `media_type`, all CEL-bound fields. |
