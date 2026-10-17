@@ -776,31 +776,50 @@ fn read_in_dir(dir: &Path, path: &str) -> Result<Option<String>, String> {
         .map_err(|_| format!("{path:?} is not UTF-8 text"))
 }
 
+/// Longest `ctx.probe` waits for `ffprobe`; a stale mount otherwise blocks the
+/// whole generation.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// `ffprobe` output for `path` as the map `ctx.probe` returns. Only the `file`
 /// protocol is allowed, so a path cannot name a URL. `Ok(None)` when
 /// ffprobe runs but rejects the file; `Err` when ffprobe cannot be run.
 fn probe_media(path: &Path) -> Result<Option<serde_json::Value>, String> {
     use serde_json::{Map as JsonMap, Value, json};
 
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            "-protocol_whitelist",
-            "file",
-            "-i",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|e| format!("cannot run ffprobe: {e}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let raw: Value = serde_json::from_slice(&output.stdout)
+    let args: Vec<std::ffi::OsString> = [
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .iter()
+    .map(Into::into)
+    .chain([path.as_os_str().to_owned()])
+    .collect();
+    let stdout = match crate::ffprobe::run_bounded(&args, PROBE_TIMEOUT)
+        .map_err(|e| format!("cannot run ffprobe: {e}"))?
+    {
+        crate::ffprobe::Bounded::Done {
+            success: true,
+            stdout,
+        } => stdout,
+        crate::ffprobe::Bounded::Done { .. } => return Ok(None),
+        crate::ffprobe::Bounded::TimedOut => {
+            tracing::warn!(
+                event = "bumper.probe_timeout",
+                path = %path.display(),
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "ffprobe did not finish; ctx.probe returns ()"
+            );
+            return Ok(None);
+        }
+    };
+    let raw: Value = serde_json::from_slice(&stdout)
         .map_err(|e| format!("ffprobe printed invalid JSON: {e}"))?;
 
     let tags = |v: &Value| -> Value {

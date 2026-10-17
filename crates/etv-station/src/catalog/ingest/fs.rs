@@ -242,7 +242,7 @@ pub fn type_from_path(path: &Path) -> String {
 /// error, non-zero exit, unparseable output) — a scan tolerates individual bad
 /// files rather than aborting the whole pass.
 async fn ffprobe_seconds(path: &Path) -> Option<f64> {
-    let output = tokio::process::Command::new("ffprobe")
+    let output = tokio::process::Command::new(crate::ffprobe::program())
         .args([
             "-v",
             "error",
