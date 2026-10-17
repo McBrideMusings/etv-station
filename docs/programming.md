@@ -474,6 +474,11 @@ because rotation, `advance: resume` and scorer suppression all change it.
 - `seed: { rotate: 2d }` and `temperature:` rotate what a ranked pool hands
   back. See the section below.
 
+**Grade.** Applies once a program has aired. The measure is the days until
+any program (an airing of 5 minutes or more) airs a second time, or the whole
+span when nothing repeats; a repeating bumper does not count. 14 days or more
+is 3, 7 is 2 (FAST guidance to refresh weekly, above), 3 is 1, under 3 is 0.
+
 ## Rotating the list: seed and temperature
 
 **What it is.** A ranked pool, such as a taste-scored films pool, returns
@@ -526,8 +531,3 @@ changes the list before the walk reaches slot 2, and the pool behaves like
 
 A new theme each month is a slot per theme and a schedule per month whose
 `dates:` spans that month, such as `["04-01..04-30"]`.
-
-**Grade.** Applies once a program has aired. The measure is the days until
-any program (an airing of 5 minutes or more) airs a second time, or the whole
-span when nothing repeats; a repeating bumper does not count. 14 days or more
-is 3, 7 is 2 (FAST guidance to refresh weekly, above), 3 is 1, under 3 is 0.
