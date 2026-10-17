@@ -28,6 +28,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value;
 
 use super::error::CatalogError;
+use super::fields::{ScalarField, ScalarKind};
 
 /// A translated `WHERE` clause plus its positional bind parameters.
 pub struct WhereClause {
@@ -148,19 +149,13 @@ enum FieldKind {
 impl FieldKind {
     fn resolve(name: &str) -> Option<FieldKind> {
         use FieldKind::*;
+        if let Some(f) = ScalarField::from_name(name) {
+            return Some(match f.kind() {
+                ScalarKind::Str => Str(f.name()),
+                ScalarKind::Num => Num(f.name()),
+            });
+        }
         Some(match name {
-            "title" => Str("title"),
-            "show" => Str("show"),
-            "type" => Str("type"),
-            "content_rating" => Str("content_rating"),
-            "edition" => Str("edition"),
-            "studio" => Str("studio"),
-            "library" => Str("library"),
-            "year" => Num("year"),
-            "season" => Num("season"),
-            "episode" => Num("episode"),
-            "absolute_episode" => Num("absolute_episode"),
-            "duration_ms" => Num("duration_ms"),
             "genres" => Tag(Some("genre")),
             "labels" => Tag(Some("label")),
             "cast" => Tag(Some("cast")),

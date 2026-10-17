@@ -16,6 +16,7 @@
 //! ```
 
 pub mod error;
+pub mod fields;
 pub mod identity;
 pub mod ingest;
 pub mod model;

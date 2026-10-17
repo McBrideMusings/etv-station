@@ -21,24 +21,12 @@
 use crate::config::{Dir, FieldSort};
 
 use super::error::CatalogError;
+use super::fields::ScalarField;
 
 /// Map an order field to its backing `entries` column, rejecting anything not
 /// a sortable scalar (tag/multi-valued fields have no single sort value).
 fn sort_column(field: &str) -> Option<&'static str> {
-    Some(match field {
-        "title" => "title",
-        "title_sort" => "title_sort",
-        "show" => "show",
-        "year" => "year",
-        "release_date" => "release_date",
-        "season" => "season",
-        "episode" => "episode",
-        "absolute_episode" => "absolute_episode",
-        "duration_ms" => "duration_ms",
-        "content_rating" => "content_rating",
-        "edition" => "edition",
-        _ => return None,
-    })
+    ScalarField::from_name(field).map(ScalarField::name)
 }
 
 /// Build the `ORDER BY` body for a compound `field:dir` sort, with nulls forced
