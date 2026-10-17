@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, Layout,
@@ -154,6 +155,9 @@ fn build_text_layout(
     layout
 }
 
+/// How long a failed image path waits before its decode is tried again.
+const IMAGE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// One decoded source image plus whatever drawn-size shrinks of it have
 /// already been computed. `raw` is decoded once per path and used both for
 /// its aspect ratio and, when a layer draws it at or above its own size, as
@@ -193,15 +197,15 @@ pub struct VelloRenderer {
     height: u32,
     padded_bytes_per_row: u32,
     unpadded_bytes_per_row: u32,
-    // `None` caches a decode failure so an image that keeps failing every
-    // frame (missing file, unsupported format) is only ever opened and
-    // decoded once per process, not 30x/sec. Fixing the file in place
-    // doesn't clear this cache — the overlay process needs a restart to pick
-    // it up, which the supervisor already does on config reload. Each entry
-    // also holds a lazily-populated cache of that source shrunk to whatever
-    // drawn sizes have actually been requested (#3djq) — see
-    // [`ImageCacheEntry`].
-    image_cache: HashMap<PathBuf, Option<ImageCacheEntry>>,
+    // Successfully decoded images only. Each entry also holds a
+    // lazily-populated cache of that source shrunk to whatever drawn sizes
+    // have actually been requested (#3djq) — see [`ImageCacheEntry`].
+    image_cache: HashMap<PathBuf, ImageCacheEntry>,
+    // When each path last failed to decode. A failed path is retried once
+    // [`IMAGE_RETRY_INTERVAL`] has passed, so a render that lands minutes
+    // later appears without a restart, while a persistently bad file is
+    // opened about once a second rather than 30x/sec.
+    image_failed_at: HashMap<PathBuf, Instant>,
     font_context: FontContext,
     layout_context: LayoutContext<()>,
     warned_missing_glyphs: HashSet<String>,
@@ -298,6 +302,7 @@ impl VelloRenderer {
             padded_bytes_per_row,
             unpadded_bytes_per_row,
             image_cache: HashMap::new(),
+            image_failed_at: HashMap::new(),
             font_context,
             layout_context: LayoutContext::new(),
             warned_missing_glyphs: HashSet::new(),
@@ -610,11 +615,31 @@ impl VelloRenderer {
                 margin,
                 height: image_height,
             } => {
-                // An image that cannot be decoded drops just this layer
+                // An image that cannot be decoded draws a placeholder square
                 // instead of taking the whole render down: every other layer
                 // still draws, render_frame still returns a full frame, and
-                // the fifo keeps a writer (#302).
+                // the fifo keeps a writer (#302). The path is retried, so the
+                // real image replaces the placeholder once it decodes.
                 let Some(entry) = self.load_or_get_image(path) else {
+                    let side = *image_height as f64;
+                    let (x0, y0) = corner_origin_f64(
+                        *corner,
+                        *margin as f64,
+                        side,
+                        side,
+                        self.width,
+                        self.height,
+                    );
+                    let x0 = x0 + layer.offset_x as f64;
+                    let y0 = y0 + layer.offset_y as f64;
+                    let alpha = (opacity.clamp(0.0, 1.0) * 255.0) as u8;
+                    scene.fill(
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        Color::from_rgba8(255, 0, 255, alpha),
+                        None,
+                        &Rect::new(x0, y0, x0 + side, y0 + side),
+                    );
                     return Ok(());
                 };
                 let (src_w, src_h) = (entry.raw.image.width, entry.raw.image.height);
@@ -825,35 +850,43 @@ impl VelloRenderer {
     }
 
     /// Infallible: a PNG that cannot be decoded is not a render failure, only
-    /// a missing layer. Logs once per path (not once per frame) and caches
-    /// the negative result so a persistently bad image is opened and decoded
-    /// exactly once, not on every frame.
+    /// a placeholder layer. Logs once per path (not once per frame) and
+    /// retries the decode at most once per [`IMAGE_RETRY_INTERVAL`], so an
+    /// image that appears later is picked up without a restart.
     fn load_or_get_image(&mut self, path: &Path) -> Option<&ImageCacheEntry> {
-        use std::collections::hash_map::Entry;
-        let warned = &mut self.warned_bad_images;
-        let slot = match self.image_cache.entry(path.to_path_buf()) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => {
-                let decoded = match decode_png(path) {
-                    Ok(image) => Some(ImageCacheEntry {
-                        raw: image,
-                        shrunk: HashMap::new(),
-                    }),
-                    Err(err) => {
-                        if warned.insert(path.to_path_buf()) {
-                            tracing::error!(
-                                path = %path.display(),
-                                error = %err,
-                                "image could not be decoded; dropping this layer and continuing to render",
-                            );
-                        }
-                        None
-                    }
-                };
-                e.insert(decoded)
+        if !self.image_cache.contains_key(path) {
+            if let Some(failed) = self.image_failed_at.get(path)
+                && failed.elapsed() < IMAGE_RETRY_INTERVAL
+            {
+                return None;
             }
-        };
-        slot.as_ref()
+            match decode_png(path) {
+                Ok(image) => {
+                    self.image_failed_at.remove(path);
+                    self.warned_bad_images.remove(path);
+                    self.image_cache.insert(
+                        path.to_path_buf(),
+                        ImageCacheEntry {
+                            raw: image,
+                            shrunk: HashMap::new(),
+                        },
+                    );
+                }
+                Err(err) => {
+                    self.image_failed_at
+                        .insert(path.to_path_buf(), Instant::now());
+                    if self.warned_bad_images.insert(path.to_path_buf()) {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %err,
+                            "image could not be decoded; drawing a placeholder and retrying",
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        self.image_cache.get(path)
     }
 
     /// Returns `path`'s source image area-averaged down to `(drawn_w,
@@ -866,7 +899,7 @@ impl VelloRenderer {
         drawn_w: u32,
         drawn_h: u32,
     ) -> Option<&PenikoImage> {
-        let ImageCacheEntry { raw, shrunk } = self.image_cache.get_mut(path)?.as_mut()?;
+        let ImageCacheEntry { raw, shrunk } = self.image_cache.get_mut(path)?;
         Some(
             shrunk.entry((drawn_w, drawn_h)).or_insert_with(|| {
                 PenikoImage::new(shrink_image_box(&raw.image, drawn_w, drawn_h))
