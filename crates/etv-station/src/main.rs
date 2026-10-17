@@ -238,8 +238,9 @@ fn main() -> ExitCode {
         }
     };
 
-    // Query mode: print resolved folders and exit before any tracing/runtime
-    // setup, so stdout carries only the folder list for a caller to capture.
+    // Query mode: print resolved folders and exit before the daemon's tracing
+    // and runtime setup. `load_for` logs to stderr only, so stdout carries just
+    // the folder list for a caller to capture.
     if cli.list_folders {
         return list_folders(config);
     }
@@ -254,7 +255,7 @@ fn main() -> ExitCode {
         return dump_overlay(config, channel);
     }
 
-    // Tracing comes up before this one, unlike `--list-folders` above: the
+    // Tracing comes up on stdout before this one, unlike `--list-folders` above: the
     // container entrypoint runs `--render-etv-next` on every start, and config
     // loading now *warns* about a key it does not recognise rather than
     // refusing the file. Without a subscriber that warning goes nowhere, so the
@@ -670,12 +671,14 @@ fn dropped_line(d: &etv_station::config::DroppedChannel) -> String {
 /// configs the loader left out.
 ///
 /// The loader drops a bad channel rather than failing the station (#263), and
-/// its `channel.load_failed` event goes through tracing — which these modes
-/// never install, because a fmt subscriber writes to stdout and `--list-folders`'
-/// stdout is parsed by the container entrypoint. Without this notice a dropped
+/// its `channel.load_failed` event goes through tracing, which
+/// [`init_stderr_tracing`] installs for these modes on stderr (a stdout
+/// subscriber would corrupt `--list-folders`' output, which the container
+/// entrypoint parses). Without this notice a dropped
 /// channel simply isn't there, and "the station has 58" reads as the station's
 /// real size (#420).
 fn load_for(prefix: &str, config_path: &Path) -> Result<config::Station, ExitCode> {
+    init_stderr_tracing();
     match config::load(config_path) {
         Ok(station) => {
             if let Some(notice) = dropped_notice(prefix, &station) {
@@ -1248,6 +1251,20 @@ fn print_one_sided(label: &str, rows: &[(String, String)]) {
             rows.len() - reconcile_plexdb::ONE_SIDED_SAMPLE_LIMIT
         );
     }
+}
+
+/// A subscriber for the one-shot modes that writes to stderr, so the loader's
+/// warnings (an unrecognised config key, a dropped channel) reach the operator
+/// without touching stdout, which `--list-folders` and `--audit` callers parse.
+/// Defaults to `warn` rather than the daemon's `info`; `RUST_LOG` overrides it.
+/// `try_init` leaves an already-installed subscriber alone.
+fn init_stderr_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .try_init();
 }
 
 fn init_tracing(format: LogFormat) {
