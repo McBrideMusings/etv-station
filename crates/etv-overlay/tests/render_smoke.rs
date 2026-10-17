@@ -62,12 +62,13 @@ fn renders_watermark_with_visible_box() {
 }
 
 /// An image layer pointing at a file that cannot be decoded as a PNG must not
-/// fail `render_frame` — the frame still comes out, and every other layer
-/// (a sibling watermark here) still draws. Losing the image is cosmetic;
-/// losing the whole frame would starve the channel's HLS fifo of a writer
-/// and black out the channel (#302).
+/// fail `render_frame` — the frame still comes out, every other layer (a
+/// sibling watermark here) still draws, and the image's slot shows a magenta
+/// placeholder. Losing the whole frame would starve the channel's HLS fifo of a
+/// writer and black out the channel (#302). Once a real PNG lands at the same
+/// path the placeholder gives way to it, without a restart.
 #[test]
-fn an_undecodable_image_drops_only_its_layer() {
+fn an_undecodable_image_draws_a_placeholder_then_recovers() {
     let mut renderer = match VelloRenderer::new(320, 240, PixelFormat::Rgba8) {
         Ok(r) => r,
         Err(e) => {
@@ -77,12 +78,12 @@ fn an_undecodable_image_drops_only_its_layer() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let bad_image = dir.path().join("not_a_png.png");
-    std::fs::write(&bad_image, b"this is not a png file").unwrap();
+    let image = dir.path().join("late.png");
+    std::fs::write(&image, b"this is not a png file").unwrap();
 
     let state = OverlayState::from_layers(vec![
         OverlayKind::Image {
-            path: bad_image,
+            path: image.clone(),
             corner: Corner::TopLeft,
             margin: 10,
             height: 40,
@@ -101,14 +102,31 @@ fn an_undecodable_image_drops_only_its_layer() {
     assert_eq!(frame.len(), 320 * 240 * 4);
 
     // The sibling watermark still drew: top-right box spans x in [220, 300],
-    // y in [20, 100] — the bad image cost only its own layer.
-    let x = 260usize;
-    let y = 60usize;
-    let idx = (y * 320 + x) * 4;
+    // y in [20, 100].
+    let idx = (60 * 320 + 260) * 4;
     assert!(
         frame[idx + 3] > 100,
         "watermark should still render even though the image failed to decode, got alpha={}",
         frame[idx + 3]
+    );
+
+    // The placeholder is a 40x40 magenta square at (10, 10).
+    let ph = (30 * 320 + 30) * 4;
+    assert_eq!(
+        &frame[ph..ph + 4],
+        &[255, 0, 255, 255],
+        "expected a magenta placeholder where the image should be"
+    );
+
+    // A real image arrives at the same path; the retry interval is 1s.
+    let blue: Vec<u8> = (0..4 * 4).flat_map(|_| [0u8, 0, 255, 255]).collect();
+    write_rgba_png(&image, 4, 4, &blue);
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let frame = renderer.render_frame(&state).expect("render");
+    assert_eq!(
+        &frame[ph..ph + 4],
+        &[0, 0, 255, 255],
+        "the decoded image should replace the placeholder"
     );
 }
 

@@ -271,7 +271,7 @@ fn clamp_to_config(probed: Duration, item: &ResolvedItem) -> Duration {
 }
 
 async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), StationError> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(crate::ffprobe::program())
         .args([
             "-v",
             "error",
