@@ -4498,6 +4498,7 @@ mod tests {
             resume.pools = built.resume.clone();
             GenerationState {
                 resume,
+                global_cursor: Default::default(),
                 cursor: built
                     .ids
                     .iter()
