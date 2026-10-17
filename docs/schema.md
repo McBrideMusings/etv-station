@@ -992,7 +992,27 @@ keeps the channel overlay. `script` is read as written, so the station writes
 an absolute path. The script sees `vars` as a map, empty when the entry named
 none, so `vars.title` reads as `()` rather than failing; a script under
 `shared/bumpers/` must tolerate every key being unset. An item overlay has no
-layers of its own, so the script's `layers` result has nothing to address.
+declared layers, so its script draws only the layers it declares in its
+result (below).
+
+**A script declares layers in its result.** Each entry of the `layers` array a
+script returns addresses the layer at its index. An entry with a `type` key is
+a whole layer, written exactly as a spec's `layers:` entry — it replaces the
+declared layer at that index, or adds one past the last. An entry without
+`type` overrides the declared layer at its index (`content`, `corner`,
+`visible`, `opacity`, `offset_x`, `offset_y`); one past the end is ignored.
+The per-frame keys work beside `type` too. A relative image `path` resolves
+against the script's own directory. A declaration that does not parse (an
+unknown `type`, a missing `content`) is a script error: the graphic falls back
+to its declared layers for that frame, which for an item overlay means it
+draws nothing.
+
+```rhai
+#{ layers: [
+    #{ type: "text", content: vars.title ?? "", corner: "bottom_left", font_size: 40.0 },
+    #{ type: "image", path: "card-logo.png", corner: "top_right", height: 64, opacity: 0.8 },
+] }
+```
 
 ### Pool `label` / `advisory` — naming the block on screen
 
