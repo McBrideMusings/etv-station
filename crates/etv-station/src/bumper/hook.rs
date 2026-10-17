@@ -61,6 +61,7 @@ use std::sync::{Arc, Mutex};
 use rhai::{Dynamic, EvalAltResult, Map, Scope};
 use time::OffsetDateTime;
 
+use crate::ffprobe::PROBE_TIMEOUT;
 use crate::history::{AiringFilter, AiringKind, HistoryDb, LedgerRow};
 
 use super::timeline::{
@@ -788,10 +789,6 @@ fn read_in_dir(dir: &Path, path: &str) -> Result<Option<String>, String> {
         .map(Some)
         .map_err(|_| format!("{path:?} is not UTF-8 text"))
 }
-
-/// Longest `ctx.probe` waits for `ffprobe`; a stale mount otherwise blocks the
-/// whole generation.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `ffprobe` output for `path` as the map `ctx.probe` returns. Only the `file`
 /// protocol is allowed, so a path cannot name a URL. `Ok(None)` when

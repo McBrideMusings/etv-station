@@ -18,6 +18,10 @@ pub fn program() -> OsString {
     }
 }
 
+/// Longest any caller waits for one `ffprobe`; a stale network mount otherwise
+/// blocks the caller indefinitely.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How a bounded run ended.
 pub enum Bounded {
     /// The process exited before the deadline.
@@ -31,6 +35,14 @@ pub enum Bounded {
 /// rather than blocking on the child.
 pub fn run_bounded(args: &[OsString], timeout: Duration) -> std::io::Result<Bounded> {
     run_program(&program(), args, timeout)
+}
+
+/// [`run_bounded`] for async callers: the polling wait runs on the blocking
+/// pool, so it does not hold a runtime worker.
+pub async fn run_bounded_async(args: Vec<OsString>) -> std::io::Result<Bounded> {
+    tokio::task::spawn_blocking(move || run_bounded(&args, PROBE_TIMEOUT))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 fn run_program(
