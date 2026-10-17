@@ -201,6 +201,9 @@ const BLOCK_GRADE2_MAX: f64 = 6.0;
 const BLOCK_GRADE1_MIN: f64 = 1.5;
 /// Stripping: percent of weekdays that earns grade 3, 2, 1.
 const STRIPPING_SHARE: [f64; 3] = [80.0, 60.0, 40.0];
+/// Stripping: minutes either side of a show's usual start that still count as
+/// holding its time slot.
+const STRIPPING_WINDOW_MINUTES: i64 = 30;
 /// Episode order: percent out of order that still earns grade 3, 2, 1.
 const EPISODE_ORDER_OUT: [f64; 3] = [0.0, 5.0, 15.0];
 /// Interstitials: percent of program changes filled that earns grade 3, 2.
@@ -307,8 +310,21 @@ fn dayparting(g: &GradeInputs) -> PrincipleGrade {
         HashMap::new(),
     ];
     for a in g.airings {
-        let q = a.start.to_timezone(g.tz).hour() as usize / 6;
-        *secs[q].entry(a.pool.as_str()).or_insert(0.0) += a.duration.as_seconds_f64();
+        // Split the airing at each local 6-hour boundary it crosses.
+        let end = a.start + a.duration;
+        let mut t = a.start;
+        while t < end {
+            let local = t.to_timezone(g.tz);
+            let q = local.hour() as usize / 6;
+            let into_quarter = Duration::seconds(
+                i64::from(local.hour() % 6) * 3600
+                    + i64::from(local.minute()) * 60
+                    + i64::from(local.second()),
+            ) + Duration::nanoseconds(i64::from(local.nanosecond()));
+            let next = (t + (Duration::hours(6) - into_quarter)).min(end);
+            *secs[q].entry(a.pool.as_str()).or_insert(0.0) += (next - t).as_seconds_f64();
+            t = next;
+        }
     }
     let shares: Vec<HashMap<&str, f64>> = secs
         .iter()
@@ -386,7 +402,8 @@ fn block_programming(g: &GradeInputs) -> PrincipleGrade {
 }
 
 /// For each show with a strippable library, the share of weekdays in the span
-/// on which it starts an episode in its most-used weekday hour.
+/// on which it starts an episode within [`STRIPPING_WINDOW_MINUTES`] of its
+/// usual weekday start time.
 fn stripping(g: &GradeInputs) -> PrincipleGrade {
     const NAME: &str = "Stripping";
     let weekdays: HashSet<time::Date> = {
@@ -416,19 +433,31 @@ fn stripping(g: &GradeInputs) -> PrincipleGrade {
     }
     let mut best: Option<(&str, f64)> = None;
     for show in deep {
-        let starts: Vec<(time::Date, u8)> = g
+        let starts: Vec<(time::Date, i64)> = g
             .airings
             .iter()
             .filter(|a| a.show_id.as_deref() == Some(show))
             .map(|a| a.start.to_timezone(g.tz))
             .filter(|l| !matches!(l.weekday(), Weekday::Saturday | Weekday::Sunday))
-            .map(|l| (l.date(), l.hour()))
+            .map(|l| (l.date(), i64::from(l.hour()) * 60 + i64::from(l.minute())))
             .collect();
-        let mut by_hour: HashMap<u8, HashSet<time::Date>> = HashMap::new();
-        for (date, hour) in &starts {
-            by_hour.entry(*hour).or_default().insert(*date);
-        }
-        let days = by_hour.values().map(HashSet::len).max().unwrap_or(0);
+        // The usual start is whichever actual start has the most weekdays
+        // starting within the window of it (clock distance wraps at midnight).
+        let days = starts
+            .iter()
+            .map(|(_, anchor)| {
+                starts
+                    .iter()
+                    .filter(|(_, m)| {
+                        let d = (m - anchor).abs();
+                        d.min(24 * 60 - d) <= STRIPPING_WINDOW_MINUTES
+                    })
+                    .map(|(date, _)| *date)
+                    .collect::<HashSet<_>>()
+                    .len()
+            })
+            .max()
+            .unwrap_or(0);
         let share = days as f64 / weekdays.len() as f64 * 100.0;
         if best.is_none_or(|(_, b)| share > b) {
             best = Some((show, share));
@@ -446,17 +475,33 @@ fn stripping(g: &GradeInputs) -> PrincipleGrade {
         grade,
         share,
         format!(
-            "{} holds one weekday hour on {share:.0}% of weekdays",
+            "{} holds its start time on {share:.0}% of weekdays",
             show_name(g.airings, show)
         ),
     )
 }
 
 /// The share of steps between consecutive airings of one show that do not go
-/// to the next episode (or to episode 1 of the next season).
+/// to the next episode, to episode 1 of the next season, or back to the
+/// show's first aired episode after its last.
 fn episode_order(g: &GradeInputs) -> PrincipleGrade {
     const NAME: &str = "Episode order";
     let mut last: HashMap<&str, (i64, i64)> = HashMap::new();
+    // A loop that reaches a show's last aired episode starts over at its first.
+    let mut span: HashMap<&str, [(i64, i64); 2]> = HashMap::new();
+    for a in g.airings {
+        if a.kind != "episode" || g.random_order_pools.contains(&a.pool) {
+            continue;
+        }
+        if let (Some(show), Some(season), Some(episode)) =
+            (a.show_id.as_deref(), a.season, a.episode)
+        {
+            let key = (season, episode);
+            let e = span.entry(show).or_insert([key, key]);
+            e[0] = e[0].min(key);
+            e[1] = e[1].max(key);
+        }
+    }
     let (mut steps, mut out) = (0usize, 0usize);
     for a in g.airings {
         if a.kind != "episode" || g.random_order_pools.contains(&a.pool) {
@@ -468,7 +513,13 @@ fn episode_order(g: &GradeInputs) -> PrincipleGrade {
         };
         if let Some((ps, pe)) = last.insert(show, (season, episode)) {
             steps += 1;
-            let next = (season == ps && episode == pe + 1) || (season == ps + 1 && episode == 1);
+            let [first, final_ep] = span[show];
+            let wrap = first != final_ep
+                && first.1 == 1
+                && (ps, pe) == final_ep
+                && (season, episode) == first;
+            let next =
+                (season == ps && episode == pe + 1) || (season == ps + 1 && episode == 1) || wrap;
             if !next {
                 out += 1;
             }
@@ -775,6 +826,74 @@ mod tests {
         let shallow: HashMap<String, usize> = [("x".to_string(), 40)].into();
         let g = grade_principles(&inputs(&s, &HashSet::new(), &shallow, 5));
         assert_eq!(grade_of(&g, "Stripping").grade, None);
+    }
+
+    #[test]
+    fn stripping_counts_a_start_time_that_drifts_within_the_window() {
+        // Weekdays Mon-Fri; starts at 05:00, 05:25, 04:45, 05:10, 05:20 UTC (all within 30 min).
+        let offs = [0, 24 * 60 + 25, 48 * 60 - 15, 72 * 60 + 10, 96 * 60 + 20];
+        let s: Vec<ReviewAiring> = offs
+            .iter()
+            .enumerate()
+            .map(|(d, m)| ReviewAiring {
+                start: T0 + Duration::minutes(*m),
+                ..ep(&format!("x{d}"), "x", "strip", 1, d as i64 + 1, 0)
+            })
+            .collect();
+        let deep: HashMap<String, usize> = [("x".to_string(), 100)].into();
+        let g = grade_principles(&inputs(&s, &HashSet::new(), &deep, 5));
+        assert_eq!(grade_of(&g, "Stripping").value, Some(100.0));
+    }
+
+    #[test]
+    fn dayparting_splits_an_airing_across_the_quarters_it_covers() {
+        // T0 is 05:00 UTC. The 3-hour film is 1h in quarter 0 and 2h in quarter 1.
+        let film = ReviewAiring {
+            duration: Duration::hours(3),
+            ..airing("m1", "films", None, 0)
+        };
+        let series = |id: &str, h: i64, hours: i64| ReviewAiring {
+            duration: Duration::hours(hours),
+            ..airing(id, "series", Some("s"), h)
+        };
+        let s = vec![
+            series("e0", -5, 1),
+            film,
+            series("e1", 3, 4),
+            airing("m2", "films", None, 7),
+            series("e2", 8, 1),
+            airing("m3", "films", None, 13),
+            series("e3", 14, 1),
+        ];
+        let g = grade_principles(&inputs(&s, &HashSet::new(), &HashMap::new(), 1));
+        let d = grade_of(&g, "Dayparting");
+        // films: 50%, 33.3%, 50%, 50% of each quarter; series is the mirror.
+        assert!((d.value.unwrap() - 50.0 / 3.0).abs() < 1e-9);
+        assert_eq!(d.grade, Some(1));
+    }
+
+    #[test]
+    fn episode_order_counts_a_loop_wrap_to_the_first_episode_as_in_order() {
+        let s = vec![
+            ep("a1", "a", "series", 1, 1, 0),
+            ep("a2", "a", "series", 1, 2, 1),
+            ep("a3", "a", "series", 1, 3, 2),
+            ep("a1b", "a", "series", 1, 1, 3),
+        ];
+        let g = grade_principles(&inputs(&s, &HashSet::new(), &HashMap::new(), 1));
+        let o = grade_of(&g, "Episode order");
+        assert_eq!(o.value, Some(0.0));
+        assert_eq!(o.grade, Some(3));
+    }
+
+    #[test]
+    fn a_single_aired_episode_repeating_is_not_a_loop_wrap() {
+        let s = vec![
+            ep("a1", "a", "series", 1, 1, 0),
+            ep("a1b", "a", "series", 1, 1, 1),
+        ];
+        let g = grade_principles(&inputs(&s, &HashSet::new(), &HashMap::new(), 1));
+        assert_eq!(grade_of(&g, "Episode order").value, Some(100.0));
     }
 
     #[test]

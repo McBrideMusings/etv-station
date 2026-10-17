@@ -316,9 +316,14 @@ impl Catalog {
 
     /// Settle `absolute_episode` for every episode of each show in `show_ids`
     /// (#105). All-or-nothing per show: when Plex numbered every episode, its
-    /// numbers stand; when any episode lacks one, every episode of the show is
-    /// renumbered 1..N by `(season, episode)` — Plex's partial values
-    /// included — so two number spaces are never mixed.
+    /// numbers stand; when any regular episode lacks one, every regular
+    /// episode of the show is renumbered 1..N by `(season, episode)` — Plex's
+    /// partial values included — so two number spaces are never mixed. Only
+    /// regular episodes (`season >= 1` with an episode number) are judged for
+    /// "fully indexed" and take a computed number; season 0 specials and rows
+    /// missing a season or episode keep Plex's number or NULL when Plex's
+    /// numbers stand, and get none when the show is renumbered, so they never
+    /// shift the regular run.
     ///
     /// Reads the show's whole episode set from the catalog rather than the
     /// ingest batch, so a delta carrying part of a show lands the numbering a
@@ -326,21 +331,30 @@ impl Catalog {
     pub fn reconcile_absolute_episodes(&self, show_ids: &[String]) -> Result<usize, CatalogError> {
         let mut changed = 0;
         for show_id in show_ids {
-            let rows: Vec<(String, Option<i64>, Option<i64>)> = self
+            let rows: Vec<(String, Option<i64>, Option<i64>, bool)> = self
                 .conn
                 .prepare(
-                    "SELECT entry_id, plex_absolute_episode, absolute_episode FROM entries
+                    "SELECT entry_id, plex_absolute_episode, absolute_episode,
+                            COALESCE(season >= 1 AND episode IS NOT NULL, 0) FROM entries
                      WHERE show_id = ?1
                      ORDER BY season, episode, entry_id",
                 )?
-                .query_map(params![show_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .query_map(params![show_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
                 .collect::<Result<_, _>>()?;
-            let fully_indexed = rows.iter().all(|(_, plex, _)| plex.is_some());
-            for (i, (entry_id, plex, current)) in rows.iter().enumerate() {
+            let fully_indexed = rows
+                .iter()
+                .all(|(_, plex, _, regular)| !regular || plex.is_some());
+            let mut next = 0;
+            for (entry_id, plex, current, regular) in &rows {
                 let wanted = if fully_indexed {
                     *plex
+                } else if *regular {
+                    next += 1;
+                    Some(next)
                 } else {
-                    Some(i as i64 + 1)
+                    None
                 };
                 if wanted != *current {
                     self.conn.execute(
