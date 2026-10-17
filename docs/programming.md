@@ -467,6 +467,10 @@ because rotation, `advance: resume` and scorer suppression all change it.
 - A pool whose `expr` reads a Plex collection (`item.collections.contains(...)`)
   changes with the collection, which is the station's form of a monthly
   rotation.
+- On an `advance: resume` pool, a multi-episode show played through to its
+  last episode sits out the rest of the lap: the rotation passes over it until
+  every other show has had a turn, then restarts it at episode 1. Films
+  (series of one) are not rested this way; `no_repeat_within` covers them.
 - `seed: { rotate: 2d }` and `temperature:` rotate what a ranked pool hands
   back. See the section below.
 
