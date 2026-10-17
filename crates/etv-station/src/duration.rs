@@ -23,6 +23,12 @@ pub struct DurationCache {
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
     mtime_secs: i64,
+    /// The file's byte length when probed. An entry is trusted only while
+    /// both this and `mtime_secs` match, so a remux that preserves the mtime
+    /// is probed again. An entry written without it reads as 0 and is probed
+    /// again.
+    #[serde(default)]
+    size_bytes: u64,
     duration_secs: f64,
     /// The file's streams (#261), read by the same `ffprobe` call as the
     /// duration. `None` is an entry written before streams were recorded; it
@@ -208,8 +214,11 @@ impl DurationCache {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
 
+                let size_bytes = metadata.len();
+
                 if let Some(entry) = self.entries.get(&local_path)
                     && entry.mtime_secs == mtime_secs
+                    && entry.size_bytes == size_bytes
                     && entry.streams.is_some()
                 {
                     let probed = check_probe(
@@ -228,6 +237,7 @@ impl DurationCache {
                     local_path,
                     CacheEntry {
                         mtime_secs,
+                        size_bytes,
                         duration_secs: probed.as_secs_f64(),
                         streams: Some(streams),
                     },
@@ -482,6 +492,7 @@ impl DurationCache {
             PathBuf::from(path),
             CacheEntry {
                 mtime_secs: 0,
+                size_bytes: 0,
                 duration_secs: 60.0,
                 streams: Some(streams),
             },
@@ -725,6 +736,7 @@ mod tests {
             CacheEntry {
                 streams: None,
                 mtime_secs: 1,
+                size_bytes: 0,
                 duration_secs: 10.0,
             },
         );
@@ -825,6 +837,7 @@ mod tests {
                 path.clone(),
                 CacheEntry {
                     mtime_secs,
+                    size_bytes: 1,
                     duration_secs: secs,
                     streams: Some(streams),
                 },
@@ -835,6 +848,44 @@ mod tests {
                 .unwrap_err();
             assert!(err.unreadable_media().is_some(), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_same_mtime_file_of_another_size_is_probed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remuxed.mkv");
+        std::fs::write(&path, b"x").unwrap();
+        let mtime_secs = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let item = local_item("remuxed", path.to_str().unwrap());
+        let seed = |size_bytes| {
+            let mut cache = DurationCache::default();
+            cache.entries.insert(
+                path.clone(),
+                CacheEntry {
+                    mtime_secs,
+                    size_bytes,
+                    duration_secs: 60.0,
+                    streams: Some(video()),
+                },
+            );
+            cache
+        };
+
+        let mut stats = ProbeStats::default();
+        seed(1).duration_for(&item, &mut stats).await.unwrap();
+        assert_eq!((stats.from_cache, stats.from_probe), (1, 0));
+
+        // The file is 1 byte; a cached 2-byte entry is stale. The fake file
+        // is not real media, so the re-probe fails rather than hitting cache.
+        let mut stats = ProbeStats::default();
+        let _ = seed(2).duration_for(&item, &mut stats).await;
+        assert_eq!(stats.from_cache, 0);
     }
 
     #[test]
