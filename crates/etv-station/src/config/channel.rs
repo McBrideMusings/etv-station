@@ -153,6 +153,12 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotate: Option<PathBuf>,
 
+    /// Event hooks (ADR 0021) scoped to this channel; same shape as the
+    /// station's `hooks:`. A relative `run` resolves against this file's
+    /// directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::config::HookDecl>,
+
     /// Named show groups (#165), declared once and referenced by name from
     /// any pool's `groups:` field — see [`ShowGroup`]. Empty on every channel
     /// written before this, which is what an absent `groups:` key means.

@@ -39,6 +39,7 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
         }
     }
 
+    validate_hooks(path, "station", &station.hooks)?;
     validate_tracks(path, "station", station.tracks.as_ref())?;
     validate_variety(
         path,
@@ -99,7 +100,24 @@ fn validate_variety(
 /// into normalized inline form (path refs spliced, env vars expanded). The
 /// structural "exactly one of path/inline" check happens during load; this is
 /// the semantic pass over the resolved shape.
+fn validate_hooks(
+    path: &Path,
+    scope: &str,
+    hooks: &[crate::config::HookDecl],
+) -> Result<(), ConfigError> {
+    for (i, hook) in hooks.iter().enumerate() {
+        if let Some(message) = hook.problem(scope, i) {
+            return Err(ConfigError::Validation {
+                path: path.to_path_buf(),
+                message,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(), ConfigError> {
+    validate_hooks(path, &format!("channel {:?}", channel.name), &channel.hooks)?;
     if channel.window_days == 0 {
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
@@ -1382,6 +1400,7 @@ mod tests {
             groups: Vec::new(),
             overlay: None,
             annotate: None,
+            hooks: Vec::new(),
         }
     }
 
@@ -1522,6 +1541,7 @@ mod tests {
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
             device_id: None,
+            hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
         };
@@ -1547,6 +1567,7 @@ mod tests {
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
             device_id: None,
+            hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
         };
@@ -1573,6 +1594,7 @@ mod tests {
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
             device_id: None,
+            hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
         };
@@ -1597,6 +1619,7 @@ mod tests {
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
             device_id: None,
+            hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
         };

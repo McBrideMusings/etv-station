@@ -506,6 +506,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `tracks` | no | the station level of the [track-selection](#track-selection) rules: which audio and subtitle stream of each file plays |
 | `seed` | no — default unset | a number, or a rotation — see [Seed and temperature](#seed-and-temperature). Every channel that sets no `seed:` of its own inherits it, **each number salted with that channel's `name`**. Unset means every unseeded channel draws a new seed each local day from a fixed base. |
 | `temperature` | no — default `0` | a number ≥ 0, or a rotation — see [Seed and temperature](#seed-and-temperature). Every channel that sets no `temperature:` of its own inherits it. |
+| `hooks` | no — default empty | list of [event hooks](#event-hooks) that run for the whole station |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
 
@@ -548,7 +549,42 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `tracks` | no | the channel level of the [track-selection](#track-selection) rules; blocks, pools and items refine it |
 | `subtitle` | no | `{ default_on: true \| false }` — announce this channel's subtitle track as `DEFAULT=YES`; unset leaves the station's `normalization.subtitle.default_on` |
+| `hooks` | no — default empty | list of [event hooks](#event-hooks) scoped to this channel |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
+
+### Event hooks
+
+`hooks:` appears in `station.yaml` and in `channel.yaml`. Each entry runs code
+when something happens; it cannot change the schedule (ADR 0021). Source:
+`config/hooks.rs`, `hooks.rs`.
+
+```yaml
+hooks:
+  - on: cron
+    every: 15m                 # humantime; at least 1s; the first run is one interval after start
+    run: hooks/notify.sh       # any executable: the event JSON arrives on stdin
+  - on: cron
+    every: 1h
+    run: hooks/refresh.rhai    # a .rhai script runs on a worker thread
+    grants: [http, exec]       # only a .rhai script takes grants
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `on` | **yes** | the trigger. Only `cron` exists so far. |
+| `every` | for `cron` | interval between runs |
+| `run` | **yes** | path, relative to the declaring file's directory. A name ending `.rhai` is a script; anything else is executed as a program. |
+| `grants` | no | `exec` adds `exec(program, args)` -> `#{ code, stdout, stderr }`; `http` adds `http(url, method, body)` -> body text. A script with neither can compute and call `log(text)`. Refused on an executable, which runs with the daemon's own permissions. |
+
+The event is `{hook, trigger, scope, channel, fired_at}`: stdin JSON for an
+executable, the `event` constant for a script. A run still going at the next
+interval makes that interval skip (`hook.skipped`). The station keeps no record
+of executions, so a script that starts outside work owns its own deduplication.
+
+Each run logs one `hook.run` line with `hook` (`station#0`, `channel:<name>#1`),
+`trigger`, `duration_ms` and `exit` (the exit code; `0` for a script that
+finished; `-1` when no code exists). `etv-station --config <station.yaml>
+--list-hooks` (or `admin hooks`) prints every configured hook.
 
 ### Channel numbers
 

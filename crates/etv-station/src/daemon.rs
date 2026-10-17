@@ -1073,6 +1073,23 @@ async fn run_generation(
         ));
     }
 
+    // Event hooks (ADR 0021): one cron loop per configured hook, stopped with
+    // the generation like a channel loop, so a reload that edits `hooks:` takes
+    // effect. Each run logs `hook.run`.
+    for spec in crate::hooks::collect(station) {
+        let stop = Arc::new(Notify::new());
+        stops.push(stop.clone());
+        tracing::info!(
+            event = "hook.start",
+            hook = %spec.label(),
+            trigger = spec.decl.on.as_str(),
+            every_secs = spec.decl.every.map(|d| d.as_secs()),
+            run = %spec.run_path().display(),
+            "starting event hook",
+        );
+        supervisor_handles.push(tokio::spawn(crate::hooks::run_cron(spec, stop)));
+    }
+
     // The **catalog refresh** tick. Before this, ingest ran once at startup and
     // never again, so a library change — a rename, a new episode, a title
     // pulled — was invisible until the next restart. `catalog_refresh_secs`

@@ -3,6 +3,7 @@ mod channel;
 mod constraints;
 mod entry;
 mod filter;
+mod hooks;
 mod load;
 mod mode;
 mod order;
@@ -22,6 +23,7 @@ pub use channel::{ChannelConfig, ChannelSubtitle, ScoringConfig};
 pub use constraints::{Constraints, NoRepeatWithin};
 pub use entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
+pub use hooks::{HookDecl, HookGrant, HookTrigger};
 pub use load::{
     DroppedChannel, LoadedChannel, Station, load, load_for_inspection, read_channel, read_station,
 };
