@@ -76,6 +76,63 @@ pub struct ProgramContext {
     /// and when the earlier item carried no metadata, which a script cannot and
     /// need not tell apart.
     pub prev_metadata: serde_json::Value,
+    /// Which overlay draws over the current item, when the playout entry names
+    /// one (`PlayoutItem::overlay` in `vendor/etv-next`). `None` means the entry
+    /// says nothing and the channel's own overlay applies.
+    pub overlay: Option<ItemOverlay>,
+}
+
+/// A playout item's own overlay selection, in place of the channel's overlay.
+/// Written by the station; the wire shape is `{"script": ..., "vars": {...}}`
+/// or the string `"none"`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemOverlay {
+    /// Draw nothing over this item, channel overlay included.
+    None,
+    /// Run `script` with `vars` bound as the `vars` map, and skip the channel's
+    /// overlay. A relative `script` path is read against the process's working
+    /// directory, so the station writes an absolute one.
+    Script {
+        script: PathBuf,
+        vars: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+impl ItemOverlay {
+    /// Reads the `overlay` value of a playout item. A value that is neither
+    /// `"none"` nor an object with a string `script` reads as absent: a
+    /// malformed override falls back to the channel overlay for that item.
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
+        match value {
+            serde_json::Value::String(s) if s == "none" => Some(Self::None),
+            serde_json::Value::Object(map) => {
+                let Some(script) = map.get("script").and_then(|s| s.as_str()) else {
+                    tracing::warn!(overlay = %value, "item overlay object has no string `script`; ignoring it");
+                    return None;
+                };
+                let vars = match map.get("vars") {
+                    Some(serde_json::Value::Object(vars)) => vars.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                Some(Self::Script {
+                    script: PathBuf::from(script),
+                    vars,
+                })
+            }
+            other => {
+                tracing::warn!(overlay = %other, "item overlay is not an object or \"none\"; ignoring it");
+                None
+            }
+        }
+    }
+}
+
+fn deserialize_item_overlay<'de, D>(deserializer: D) -> Result<Option<ItemOverlay>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(ItemOverlay::from_value))
 }
 
 impl ProgramContext {
@@ -97,6 +154,7 @@ impl ProgramContext {
             item_remaining: -1.0,
             metadata: serde_json::Value::Null,
             prev_metadata: serde_json::Value::Null,
+            overlay: None,
         }
     }
 }
@@ -126,6 +184,9 @@ struct ItemRow {
     /// it. Carried verbatim into [`ProgramContext::metadata`] (ADR 0016).
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+    /// `PlayoutItem::overlay`: this item's own overlay selection.
+    #[serde(default, deserialize_with = "deserialize_item_overlay")]
+    overlay: Option<ItemOverlay>,
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -273,6 +334,7 @@ impl ProgramContextSource {
             (item.finish - now).as_seconds_f64(),
             item.metadata.clone(),
             prev.and_then(|p| p.metadata.clone()),
+            item.overlay.clone(),
         )
     }
 }
@@ -300,6 +362,7 @@ impl ProgramContext {
             remaining,
             metadata,
             prev_metadata,
+            None,
         )
     }
 }
@@ -311,6 +374,7 @@ fn context_from_rows(
     remaining: f64,
     metadata: Option<serde_json::Value>,
     prev_metadata: Option<serde_json::Value>,
+    overlay: Option<ItemOverlay>,
 ) -> ProgramContext {
     let cur = program_fields(now);
     let nxt = program_fields(next);
@@ -333,6 +397,7 @@ fn context_from_rows(
         item_remaining: remaining,
         metadata: metadata.unwrap_or(serde_json::Value::Null),
         prev_metadata: prev_metadata.unwrap_or(serde_json::Value::Null),
+        overlay,
     }
 }
 

@@ -996,6 +996,36 @@ it is `()` for a channel's first item and when the earlier item carried none.
 Test for a map with `type_of(prev_metadata) == "map"` before reading a key
 from either.
 
+**An item's own overlay.** A playout entry may carry `overlay`, which the
+station writes and the overlay process obeys while that item airs:
+`{script, vars}` runs that script instead of the channel's overlay (and the
+cascade is skipped), `"none"` draws nothing, and an entry without the field
+keeps the channel overlay. `script` is read as written, so the station writes
+an absolute path. The script sees `vars` as a map, empty when the entry named
+none, so `vars.title` reads as `()` rather than failing; a script under
+`shared/bumpers/` must tolerate every key being unset. An item overlay has no
+declared layers, so its script draws only the layers it declares in its
+result (below).
+
+**A script declares layers in its result.** Each entry of the `layers` array a
+script returns addresses the layer at its index. An entry with a `type` key is
+a whole layer, written exactly as a spec's `layers:` entry — it replaces the
+declared layer at that index, or adds one past the last. An entry without
+`type` overrides the declared layer at its index (`content`, `corner`,
+`visible`, `opacity`, `offset_x`, `offset_y`); one past the end is ignored.
+The per-frame keys work beside `type` too. A relative image `path` resolves
+against the script's own directory. A declaration that does not parse (an
+unknown `type`, a missing `content`) is a script error: the graphic falls back
+to its declared layers for that frame, which for an item overlay means it
+draws nothing.
+
+```rhai
+#{ layers: [
+    #{ type: "text", content: vars.title ?? "", corner: "bottom_left", font_size: 40.0 },
+    #{ type: "image", path: "card-logo.png", corner: "top_right", height: 64, opacity: 0.8 },
+] }
+```
+
 ### Pool `label` / `advisory` — naming the block on screen
 
 A pool can say what it is called on air, and warn about what it contains:
@@ -1620,14 +1650,15 @@ candidate dump stays `taste-debug`'s job.
 #### `hooks()` — what a script says it can do
 
 A plugin declares its hooks and the station wires only the declared ones
-(#159). Two names exist:
+(#159). These names exist:
 
 | Hook | What a script implementing it does |
 |---|---|
 | `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
 | `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-a-plugin-arranges-the-block-itself). |
+| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps; `next` is `()` at the generation frontier), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin declares and is granted no capability yet. |
 
-A script may declare one or both. The declaration lives in the script, not in
+A script may declare any of them. The declaration lives in the script, not in
 the channel config, so swapping one scorer for another needs no YAML edit.
 
 `hooks()` is read by compiling the script and calling that one function —

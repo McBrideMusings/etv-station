@@ -353,8 +353,9 @@ pub fn resolve_plugin_path(base_dir: &Path, plugin: &Path) -> PathBuf {
 /// it is what a `plugin:` pool has always meant. `sequencer` and `annotate`
 /// (ADR 0017) are declarable only; nothing calls either yet, so a script may
 /// claim one but the station does not act on it until a later slice
-/// implements the hook itself.
-pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer", "annotate"];
+/// implements the hook itself. `bumper` is run by [`crate::bumper::hook`];
+/// no channel config names a bumper script yet.
+pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer", "annotate", "bumper"];
 
 /// Read and compile `script_path` once (#408) — the single read+compile every
 /// load-time plugin check shares now, so a caller that needs more than one
@@ -478,12 +479,20 @@ pub struct RequiredFn {
 ///   thing that can see them; run it before deploying a change to this list.
 ///
 /// See `docs/schema.md` § "Changing the plugin contract".
-pub const REQUIRED_HOOK_FNS: &[RequiredFn] = &[RequiredFn {
-    hook: "pool_provider",
-    name: "audit",
-    signature: "audit(ctx, picks, workspace)",
-    why: "every pool_provider must explain its picks",
-}];
+pub const REQUIRED_HOOK_FNS: &[RequiredFn] = &[
+    RequiredFn {
+        hook: "pool_provider",
+        name: "audit",
+        signature: "audit(ctx, picks, workspace)",
+        why: "every pool_provider must explain its picks",
+    },
+    RequiredFn {
+        hook: "bumper",
+        name: "build",
+        signature: "build(ctx)",
+        why: "a bumper is its build function",
+    },
+];
 
 /// Which of [`REQUIRED_HOOK_FNS`] the script at `script_path` owes for the
 /// hooks it declares, and does not implement.

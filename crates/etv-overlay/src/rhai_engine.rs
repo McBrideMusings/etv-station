@@ -1,9 +1,9 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rhai::{AST, Dynamic, Engine, Scope};
 
 use crate::overlay_spec::{Corner, OverlayKind, OverlaySpec};
-use crate::program_context::ProgramContext;
+use crate::program_context::{ItemOverlay, ProgramContext};
 
 /// Cap for per-frame text content overrides set by Rhai scripts. A runaway
 /// script that builds a huge string should not flood the renderer; if a
@@ -92,6 +92,13 @@ struct Graphic {
     /// frame: converting there would re-walk the whole table 30 times a second
     /// to produce the same result. Cloning a `Dynamic` map is a refcount.
     config: Dynamic,
+    /// The `vars` map a playout item's overlay selection binds. An empty map
+    /// for every graphic that is not an item's override, so a script reads
+    /// `vars.whatever` unconditionally and gets unit for anything unset.
+    vars: Dynamic,
+    /// The directory the script was read from, which a relative `path` in a
+    /// layer the script declares resolves against.
+    script_dir: Option<PathBuf>,
 }
 
 impl Graphic {
@@ -107,6 +114,8 @@ impl Graphic {
             ast: None,
             base_layers,
             config,
+            vars: Dynamic::from_map(rhai::Map::new()),
+            script_dir: None,
         }
     }
 }
@@ -172,6 +181,27 @@ impl RhaiEngine {
         Ok(engine)
     }
 
+    /// The engine for one playout item's own overlay selection, in place of the
+    /// channel's overlay: `None` draws nothing, a script runs with its `vars`
+    /// bound and no declared layers, so it draws only the layers it declares in
+    /// its result (see [`apply_script_result`]). A script that fails to load
+    /// returns the error; the caller decides what the item shows instead.
+    pub fn for_item_overlay(overlay: &ItemOverlay) -> anyhow::Result<Self> {
+        let mut engine = Self::bare();
+        engine.graphics.push(Graphic::new(Vec::new(), None));
+        if let ItemOverlay::Script { script, vars } = overlay {
+            let vars = rhai::serde::to_dynamic(vars).unwrap_or_else(|e| {
+                tracing::warn!("item overlay vars are not representable in Rhai: {e}");
+                Dynamic::from_map(rhai::Map::new())
+            });
+            if let Some(graphic) = engine.graphics.last_mut() {
+                graphic.vars = vars;
+            }
+            engine.load_script(script)?;
+        }
+        Ok(engine)
+    }
+
     /// Compile `path` as the script of the most recently added graphic.
     pub fn load_script(&mut self, path: &Path) -> anyhow::Result<()> {
         let source = std::fs::read_to_string(path)
@@ -185,6 +215,7 @@ impl RhaiEngine {
             .last_mut()
             .ok_or_else(|| anyhow::anyhow!("no graphic to attach a script to"))?;
         graphic.ast = Some(ast);
+        graphic.script_dir = path.parent().map(Path::to_path_buf);
         Ok(())
     }
 
@@ -248,6 +279,7 @@ impl RhaiEngine {
         // `config.whatever` unconditionally and get unit for anything unset —
         // which is also why a mistyped key is silent.
         scope.push_constant("config", graphic.config.clone());
+        scope.push_constant("vars", graphic.vars.clone());
         scope.push_constant("time", time_seconds);
         scope.push_constant("frame", frame_index as i64);
         scope.push_constant("title", program.title.clone());
@@ -299,13 +331,57 @@ impl RhaiEngine {
             .engine
             .eval_ast_with_scope::<Dynamic>(&mut scope, ast)?;
         if let Some(map) = value.try_cast::<rhai::Map>() {
-            apply_script_result(&mut state, &map);
+            apply_script_result(&mut state, &map, graphic.script_dir.as_deref())?;
         }
         Ok(state)
     }
 }
 
-fn apply_script_result(state: &mut OverlayState, map: &rhai::Map) {
+/// The engine for whichever playout item overlay is airing, rebuilt only when
+/// the selection changes. An item whose script cannot load gets an engine that
+/// draws nothing, kept under that selection so the failure is warned once rather
+/// than once per frame.
+#[derive(Default)]
+pub struct ItemOverlayEngine {
+    current: Option<(ItemOverlay, RhaiEngine)>,
+}
+
+impl ItemOverlayEngine {
+    pub fn engine_for(&mut self, overlay: &ItemOverlay) -> &RhaiEngine {
+        let stale = self
+            .current
+            .as_ref()
+            .is_none_or(|(loaded, _)| loaded != overlay);
+        if stale {
+            let engine = RhaiEngine::for_item_overlay(overlay).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "item overlay failed to load; drawing nothing for it");
+                RhaiEngine::for_item_overlay(&ItemOverlay::None)
+                    .expect("the none overlay has no script to fail")
+            });
+            tracing::info!(
+                ?overlay,
+                "item overlay selected; channel overlay suppressed"
+            );
+            self.current = Some((overlay.clone(), engine));
+        }
+        &self.current.as_ref().expect("just set").1
+    }
+}
+
+/// Folds a script's returned map into `state`. Each `layers` entry addresses
+/// the layer at its index. An entry carrying `type` declares that layer outright,
+/// in the same shape as a spec's `layers:` entry, replacing a declared layer or
+/// appending past the last one — how a script with no declared layers (an
+/// item's own overlay) draws anything. An entry without `type` overrides the
+/// declared layer at its index, and one past the end has nothing to override.
+///
+/// A declaration that does not parse is a script error: the graphic falls back
+/// to its declared layers, as for any other.
+fn apply_script_result(
+    state: &mut OverlayState,
+    map: &rhai::Map,
+    script_dir: Option<&Path>,
+) -> Result<(), Box<rhai::EvalAltResult>> {
     if let Some(visible) = map.get("visible").and_then(|v| v.as_bool().ok()) {
         state.visible = visible;
     }
@@ -316,12 +392,63 @@ fn apply_script_result(state: &mut OverlayState, map: &rhai::Map) {
         .get("layers")
         .and_then(|v| v.clone().try_cast::<rhai::Array>())
     {
-        for (i, entry) in layers.into_iter().enumerate().take(state.layers.len()) {
-            if let Some(layer_map) = entry.try_cast::<rhai::Map>() {
-                apply_layer_override(&mut state.layers[i], &layer_map);
+        let mut declared_any = false;
+        for (i, entry) in layers.into_iter().enumerate() {
+            let Some(layer_map) = entry.try_cast::<rhai::Map>() else {
+                continue;
+            };
+            if layer_map.contains_key("type") {
+                declared_any = true;
+                let layer = LayerState::from_kind(declared_layer(&layer_map, script_dir)?);
+                if i < state.layers.len() {
+                    state.layers[i] = layer;
+                } else {
+                    // A declaration past a gap leaves the skipped indices empty,
+                    // so every entry still lands at the index it was written at.
+                    state
+                        .layers
+                        .resize_with(i, || LayerState::from_kind(OverlayKind::Empty));
+                    state.layers.push(layer);
+                }
+            }
+            // The per-frame keys beside `type` (`visible`, `opacity`,
+            // `offset_x`/`offset_y`) are not part of a layer's kind, so a
+            // declared layer takes them here, as overrides, like any other —
+            // and its `content` passes the same length cap.
+            if let Some(layer) = state.layers.get_mut(i) {
+                apply_layer_override(layer, &layer_map);
             }
         }
+        // A graphic with nothing drawable declared starts invisible; a layer
+        // its script declared this frame makes it visible, unless the script
+        // set `visible` itself.
+        let set_visible = map.get("visible").is_some_and(|v| v.as_bool().is_ok());
+        if declared_any && !set_visible {
+            state.visible = state.layers.iter().any(|l| l.visible);
+        }
     }
+    Ok(())
+}
+
+/// A layer a script declared, parsed as a spec's `layers:` entry would be. A
+/// relative image path resolves against the script's own directory, as a spec's
+/// resolves against the spec's. The error names the `type` and the parse
+/// failure, never the whole map, whose text may be a long `vars` value.
+fn declared_layer(
+    map: &rhai::Map,
+    script_dir: Option<&Path>,
+) -> Result<OverlayKind, Box<rhai::EvalAltResult>> {
+    let mut kind: OverlayKind = rhai::serde::from_dynamic(&Dynamic::from_map(map.clone()))
+        .map_err(|e| {
+            let ty = map.get("type").map(ToString::to_string).unwrap_or_default();
+            format!("layer declaration of type {ty:?}: {e}")
+        })?;
+    if let (OverlayKind::Image { path, .. }, Some(dir)) = (&mut kind, script_dir)
+        && path.is_relative()
+    {
+        *path = dir.join(&*path);
+    }
+    Ok(kind)
 }
 
 /// The attribution credit on its own, pulled back out of the description the
@@ -385,7 +512,13 @@ fn apply_content_override(kind: &mut OverlayKind, mut content: String) {
             cap = MAX_SCRIPT_TEXT_LEN,
             "rhai script returned oversize text content; truncating",
         );
-        content.truncate(MAX_SCRIPT_TEXT_LEN);
+        // Back off to a char boundary: `truncate` panics inside a multibyte
+        // character, and script text can carry any `vars` value.
+        let mut cut = MAX_SCRIPT_TEXT_LEN;
+        while !content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        content.truncate(cut);
     }
     *c = content;
 }
