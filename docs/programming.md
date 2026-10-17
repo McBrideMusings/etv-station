@@ -187,7 +187,8 @@ generations and across the hours other blocks fill.
 **Across channels.** By default a show that strips on two channels keeps a
 separate place on each. Add `cursor_scope: global` to the pool and it continues
 from the latest episode of that show aired on any channel; the second channel to
-air it carries on rather than replaying. `advance: restart` still restarts —
+air it carries on rather than replaying. Only shows share a place; a movie pool
+has no show to key on and restarts. `advance: restart` still restarts —
 the scope picks which cursor a resuming pool reads, not whether it reads one.
 
 **Grade.** Applies when a show that aired has 75 or more episodes in the

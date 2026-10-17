@@ -495,7 +495,9 @@ pub struct Pool {
     pub advance: Advance,
 
     /// Which ledger a resuming pool reads its place from: this channel's, or
-    /// every channel's. Only meaningful with `advance: resume`.
+    /// every channel's. Only meaningful with `advance: resume`, and only for
+    /// episodes: a movie has no show to share, so a movie pool's `global`
+    /// cursor is always empty and it restarts.
     #[serde(default)]
     pub cursor_scope: CursorScope,
 

@@ -165,7 +165,7 @@ pub fn simulate(
                 resume: resume.clone(),
                 cursor: ledger.cursor.clone(),
                 tail: ledger.tail(config.adjacency_reach()),
-                global_cursor: Default::default(),
+                global_cursor: ledger.cursor.clone(),
             };
             let scoring = ScoreInputs {
                 target_count: target_count(config, from, target),

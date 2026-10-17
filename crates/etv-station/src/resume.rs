@@ -382,7 +382,7 @@ impl GenerationState {
     /// Whether anything has ever played on this channel. Used to tell a pattern
     /// channel that has run out of content apart from one that never had any.
     pub fn is_fresh(&self) -> bool {
-        self.resume.is_empty() && self.cursor.is_empty() && self.global_cursor.is_empty()
+        self.resume.is_empty() && self.cursor.is_empty()
     }
 }
 
