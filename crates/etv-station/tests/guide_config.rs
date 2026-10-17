@@ -27,7 +27,10 @@ fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> Channe
         number: 1,
         name: "test".into(),
         display_name: None,
-        guide,
+        guide: guide.map(|text| etv_station::config::ChannelGuide {
+            text,
+            show_bumpers: None,
+        }),
         scoring: None,
         window_days: 1,
         chunk_hours: 24,

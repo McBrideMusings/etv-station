@@ -323,6 +323,7 @@ mod tests {
                 full_sweep_after_secs: 0,
                 ffmpeg: crate::config::station::default_ffmpeg(),
                 normalization: crate::config::station::empty_normalization_for_test(),
+                guide: Default::default(),
             },
             channels: vec![LoadedChannel {
                 overlays: Default::default(),

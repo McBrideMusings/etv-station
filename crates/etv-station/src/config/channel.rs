@@ -19,6 +19,19 @@ pub struct ChannelSubtitle {
     pub default_on: Option<bool>,
 }
 
+/// A channel's `guide:` block: the text defaults every item inherits, plus the
+/// one setting that only exists at channel level.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChannelGuide {
+    #[serde(flatten)]
+    pub text: GuideConfig,
+    /// List bumper items as their own guide rows instead of folding each into
+    /// the programme before it. `None` leaves the station's
+    /// `guide.show_bumpers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_bumpers: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChannelConfig {
     /// This channel's dial number (#263) — required, and no longer derived
@@ -65,7 +78,7 @@ pub struct ChannelConfig {
     /// still gets the series-title convention and genre-tag categories for
     /// free, with no config needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guide: Option<GuideConfig>,
+    pub guide: Option<ChannelGuide>,
 
     /// Channel-level track-selection rules (#261), under the station's and
     /// over nothing: blocks, pools and items refine them.

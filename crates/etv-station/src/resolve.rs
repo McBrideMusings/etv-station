@@ -381,7 +381,7 @@ pub fn resolve_channel_with_resume(
             fill,
             block_start,
             &mut resume_out,
-            config.guide.as_ref(),
+            config.guide.as_ref().map(|g| &g.text),
         )?;
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished

@@ -19,7 +19,7 @@ pub mod variety;
 
 pub use crate::guide::GuideConfig;
 pub use block::{BlockFile, Duplicates};
-pub use channel::{ChannelConfig, ChannelSubtitle, ScoringConfig};
+pub use channel::{ChannelConfig, ChannelGuide, ChannelSubtitle, ScoringConfig};
 pub use constraints::{Constraints, NoRepeatWithin};
 pub use entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
 pub use filter::Filter;
@@ -40,6 +40,6 @@ pub use pool::{
 pub use rule::{BlockInclude, RuleConfig};
 pub use schedule::{ClockRange, DateSpan, DayName, Schedule};
 pub use source::SourceConfig;
-pub use station::{StationConfig, derive_channel_seed};
+pub use station::{StationConfig, StationGuide, derive_channel_seed};
 pub use tracks::TrackRules;
 pub use variety::{SeedSpec, TemperatureSpec};

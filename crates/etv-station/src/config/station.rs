@@ -173,6 +173,19 @@ pub struct StationConfig {
     /// empty one that ETV-next then rejects (`audio`/`video` are required
     /// there too).
     pub normalization: NormalizationConfig,
+
+    /// Station-wide guide settings; a channel's `guide:` overrides them.
+    #[serde(default)]
+    pub guide: StationGuide,
+}
+
+/// The station-level `guide:` block.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StationGuide {
+    /// List bumper items as their own guide rows. Off, each bumper folds into
+    /// the programme before it.
+    #[serde(default)]
+    pub show_bumpers: bool,
 }
 
 /// Mix a station [`seed`](StationConfig::seed) with one channel's declared

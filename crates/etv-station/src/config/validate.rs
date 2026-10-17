@@ -155,7 +155,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
 
     validate_taste_scope(path, channel)?;
     validate_show_groups(path, &channel.groups)?;
-    validate_guide(path, "channel", channel.guide.as_ref())?;
+    validate_guide(path, "channel", channel.guide.as_ref().map(|g| &g.text))?;
     validate_tracks(path, "channel", channel.tracks.as_ref())?;
     validate_variety(
         path,
@@ -1562,6 +1562,7 @@ mod tests {
             hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
+            guide: Default::default(),
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         let msg = format!("{err}");
@@ -1588,6 +1589,7 @@ mod tests {
             hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
+            guide: Default::default(),
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
@@ -1615,6 +1617,7 @@ mod tests {
             hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
+            guide: Default::default(),
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("America/Atlantis"), "err = {err}");
@@ -1640,6 +1643,7 @@ mod tests {
             hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
+            guide: Default::default(),
         };
         assert!(validate_station(&dummy_path(), &s).is_err());
     }

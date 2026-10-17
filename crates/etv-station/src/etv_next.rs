@@ -236,6 +236,9 @@ pub struct ChannelRender {
     /// The channel's own `subtitle.default_on` (#290). `None` leaves whatever
     /// the station's `normalization.subtitle.default_on` says.
     pub subtitle_default_on: Option<bool>,
+    /// List bumper items as their own guide rows (`guide.show_bumpers`),
+    /// already resolved: the channel's own value, else the station's.
+    pub show_bumpers: bool,
 }
 
 /// Where [`render_with`] gets the tuner identity it publishes.
@@ -276,6 +279,7 @@ pub fn render_with(
             display_name: ch.config.display_name.clone(),
             overlay: crate::daemon::load_overlay_playout_spec(ch),
             subtitle_default_on: ch.config.subtitle.as_ref().and_then(|s| s.default_on),
+            show_bumpers: resolve_show_bumpers(ch.config.guide.as_ref(), &station.station.guide),
         })
         .collect();
     // The station config is the only place the tuner identity can come from,
@@ -299,6 +303,16 @@ pub fn render_with(
         dropped: station.dropped,
         ..rendered
     })
+}
+
+/// A channel's own `guide.show_bumpers` wins; otherwise the station's.
+fn resolve_show_bumpers(
+    channel: Option<&crate::config::ChannelGuide>,
+    station: &crate::config::StationGuide,
+) -> bool {
+    channel
+        .and_then(|g| g.show_bumpers)
+        .unwrap_or(station.show_bumpers)
 }
 
 /// The directory holding the station config, which is where state that must
@@ -475,6 +489,14 @@ pub fn render_channels(
                 }
             }
         }
+
+        // The XMLTV route reads this to decide whether a bumper gets its own
+        // guide row or folds into the programme before it. Written for every
+        // channel, `false` included, so the file says what the guide does.
+        channel.insert(
+            "guide".to_string(),
+            serde_json::json!({"show_bumpers": channel_render.show_bumpers}),
+        );
 
         let channel_path = opts.out_dir.join(format!("channel{number}.json"));
         write_json(&channel_path, &Value::Object(channel))?;
@@ -694,6 +716,7 @@ mod tests {
             .enumerate()
             .map(|(i, folder)| ChannelRender {
                 subtitle_default_on: None,
+                show_bumpers: false,
                 number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name: None,
@@ -710,6 +733,7 @@ mod tests {
             .enumerate()
             .map(|(i, (folder, display_name))| ChannelRender {
                 subtitle_default_on: None,
+                show_bumpers: false,
                 number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name,
@@ -986,6 +1010,7 @@ mod tests {
         let channels = vec![
             ChannelRender {
                 subtitle_default_on: None,
+                show_bumpers: false,
                 number: 1,
                 folder: PathBuf::from("out/hbo"),
                 display_name: None,
@@ -1001,6 +1026,7 @@ mod tests {
             },
             ChannelRender {
                 subtitle_default_on: None,
+                show_bumpers: false,
                 number: 2,
                 folder: PathBuf::from("out/plain"),
                 display_name: None,
@@ -1043,6 +1069,7 @@ mod tests {
             display_name: None,
             overlay: None,
             subtitle_default_on,
+            show_bumpers: false,
         };
         let channels = vec![channel(1, None), channel(2, Some(false))];
         render_channels(&channels, &ffmpeg(), &station_on, &opts(dir.path()), "id").unwrap();
@@ -1058,6 +1085,46 @@ mod tests {
     }
 
     #[test]
+    fn a_channels_show_bumpers_beats_the_stations() {
+        use crate::config::{ChannelGuide, StationGuide};
+        let on = StationGuide { show_bumpers: true };
+        let off = StationGuide::default();
+        let channel = |v| ChannelGuide {
+            show_bumpers: v,
+            ..Default::default()
+        };
+        assert!(!resolve_show_bumpers(None, &off));
+        assert!(resolve_show_bumpers(None, &on));
+        assert!(resolve_show_bumpers(Some(&channel(None)), &on));
+        assert!(!resolve_show_bumpers(Some(&channel(Some(false))), &on));
+        assert!(resolve_show_bumpers(Some(&channel(Some(true))), &off));
+    }
+
+    #[test]
+    fn show_bumpers_lands_in_each_channel_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = |number: i64, show_bumpers: bool| ChannelRender {
+            number,
+            folder: PathBuf::from(format!("out/ch{number}")),
+            display_name: None,
+            overlay: None,
+            subtitle_default_on: None,
+            show_bumpers,
+        };
+        let channels = vec![channel(1, true), channel(2, false)];
+        render_with_defaults(&channels, &opts(dir.path()), "id").unwrap();
+
+        assert_eq!(
+            read(&dir.path().join("channel1.json"))["guide"]["show_bumpers"],
+            true
+        );
+        assert_eq!(
+            read(&dir.path().join("channel2.json"))["guide"]["show_bumpers"],
+            false
+        );
+    }
+
+    #[test]
     fn default_on_is_off_unless_someone_sets_it() {
         let dir = tempfile::tempdir().unwrap();
         let channels = vec![ChannelRender {
@@ -1066,6 +1133,7 @@ mod tests {
             display_name: None,
             overlay: None,
             subtitle_default_on: None,
+            show_bumpers: false,
         }];
         render_with_defaults(&channels, &opts(dir.path()), "id").unwrap();
         let channel = read(&dir.path().join("channel1.json"));

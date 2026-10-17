@@ -1275,6 +1275,7 @@ mod tests {
             hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
+            guide: Default::default(),
         }
     }
 

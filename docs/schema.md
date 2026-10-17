@@ -328,6 +328,20 @@ format requires (director, actor, writer) whatever order they are written in
 here. `country` becomes one `<country>` element per entry. `star_rating` is
 passed through verbatim into `<star-rating><value>`.
 
+### Bumpers in the guide
+
+A bumper's playout item id starts with `bumper:`
+(`ersatztv_playout::playout::BUMPER_ID_PREFIX`). ETV-next's XMLTV route folds
+each bumper into the programme before it: the bumper gets no `<programme>` and
+that programme's `stop` moves out to the bumper's end, so the guide shows one
+row per programme and no gap. A bumper with no programme before it keeps its
+own row.
+
+`guide.show_bumpers: true` lists every bumper as its own row instead. It is set
+in `station.yaml` under `guide:` (default `false`) and overridden per channel in
+`channel.yaml` under `guide:`. The station writes the resolved value into each
+`channelN.json` as `guide.show_bumpers`, and the XMLTV route reads it from there.
+
 Set on a block's `program:` for defaults; set on an entry's `program:` to
 override per item. Item values win over block defaults.
 
