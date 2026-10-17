@@ -267,6 +267,51 @@ categories), so a set can be tuned there first; it does not apply the load-time
 threshold check, and it folds case with Unicode rules where the station folds
 ASCII only.
 
+#### `category("name")` — a keyword set defined once (#170)
+
+A category is a keyword set plus its threshold, declared in a file outside any
+channel and referenced by name. `category("kung-fu")` in a pool `expr` (or a
+pool's `sources` expression) means `keyword_score([…the category's keywords…]) >=
+<its threshold>`, so it is a yes/no test that combines with `&&` and `||` like
+any other:
+
+```yaml
+# station.yaml
+categories: ["categories/*.yaml"]   # literal paths or globs, relative to this file
+
+# categories/martial.yaml
+categories:
+  - name: kung-fu
+    keywords: ["kung fu", "martial arts", "shaolin"]
+    threshold: 2          # matches at least 2 of the 3
+
+# channels/kungfu.yaml and channels/action.yaml, each in a pool
+expr: 'category("kung-fu") && item.type == "movie"'
+```
+
+Both channels resolve the same item set, because the station expands the
+reference to the same inline form at load. Edit the file and reload, and every
+channel naming the category changes with it. The inline `keyword_score([...]) >= n`
+form keeps working exactly as before.
+
+**A category used by one pool is not worth declaring.** Naming it adds a file to
+look in and a name to remember, and buys nothing over writing the set inline in
+that pool. Reach for a category when a second pool wants the same set: the reuse
+is the whole payoff. The station ships no categories; what "kung fu" means is
+the channel author's.
+
+These fail at load, not at air time:
+
+- a reference to a category nobody declared, naming it and listing the declared
+  ones (the channel is dropped, as for any bad channel config);
+- two declarations of one name, naming both files and entry numbers (the whole
+  station refuses to load, since the category is shared);
+- an empty keyword set, or a threshold outside `1..=` the number of distinct
+  keywords.
+
+The reference is found by text, so a `category("…")` written inside a string
+literal of the expression is expanded too.
+
 ### `kind: collection` — play a catalog collection in its authored order
 
 Emits every member of one collection in the sequence hand-arranged in the source
@@ -549,6 +594,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
+| `categories` | no — default empty | list of category files, literal or glob like `channels`; each declares named keyword sets pools reference as `category("name")` (see [`category`](#category-name-a-keyword-set-defined-once-170)) |
 | `source_roots` | no — default empty | list of directories the daemon walks to populate the catalog when `catalog_path` is set — an operational choice about what this deployment scans, not used for identity. Empty skips the filesystem scan entirely. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime. |
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
