@@ -344,6 +344,13 @@ pub struct ScoringConfig {
     /// Required when `taste_scope` is `single_user` and rejected otherwise; both
     /// halves are enforced in `config::validate` so a typo fails at load rather
     /// than silently ranking against the whole server.
+    ///
+    /// `single_user` also requires `PLEX_URL` and `PLEX_TOKEN` on the daemon,
+    /// independently of how the catalog is ingested and of any scorer plugin's
+    /// `plexdb_reader` datastore: Tautulli's user id must be translated to a
+    /// Plex account id, and only Plex can confirm that mapping (the two ids
+    /// differ for the server owner and nobody else). `config::validate`
+    /// rejects the channel at load when either variable is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
