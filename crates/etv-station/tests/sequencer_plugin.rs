@@ -333,6 +333,7 @@ fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
         seed: Some(etv_station::config::SeedSpec::Fixed(7)),
         overlay: None,
         annotate: None,
+        hooks: Vec::new(),
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {

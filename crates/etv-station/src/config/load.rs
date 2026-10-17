@@ -1272,6 +1272,7 @@ mod tests {
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
             device_id: None,
+            hooks: Vec::new(),
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
         }

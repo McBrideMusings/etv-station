@@ -42,6 +42,7 @@ fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> Channe
         groups: Vec::new(),
         overlay: None,
         annotate: None,
+        hooks: Vec::new(),
     }
 }
 
