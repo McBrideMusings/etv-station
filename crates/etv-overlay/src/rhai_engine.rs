@@ -313,17 +313,22 @@ impl RhaiEngine {
         // The current item's opaque metadata blob (ADR 0016) — the one
         // channel through which anything plugin-specific reaches a script.
         // No Rust code here reads a key inside it. Same conversion as
-        // `config` above; anything unrepresentable in Rhai drops to unit
-        // rather than failing the whole evaluation.
-        scope.push_constant(
-            "metadata",
+        // `config` above. An item that attached nothing reads as an empty
+        // map, so `metadata.foo == ()` behaves the same whether the blob is
+        // absent or merely lacks the key; anything unrepresentable in Rhai
+        // drops to unit rather than failing the whole evaluation.
+        let metadata = if program.metadata.is_null() {
+            Dynamic::from(rhai::Map::new())
+        } else {
             rhai::serde::to_dynamic(&program.metadata).unwrap_or_else(|e| {
                 tracing::warn!("item metadata is not representable in Rhai: {e}");
                 Dynamic::UNIT
-            }),
-        );
+            })
+        };
+        scope.push_constant("metadata", metadata);
         // The item before the current one, for a script comparing two
-        // consecutive items. Same conversion and same opacity as `metadata`.
+        // consecutive items. Same opacity as `metadata`, but an absent blob
+        // stays unit: "no earlier item" is a state a script tests for.
         scope.push_constant(
             "prev_metadata",
             rhai::serde::to_dynamic(&program.prev_metadata).unwrap_or_else(|e| {
@@ -797,13 +802,14 @@ fade:
         }
     }
 
-    /// An item with no metadata must evaluate without panicking or erroring —
-    /// the script sees unit, not a missing-field error.
+    /// An item with no metadata reads as an empty map, so a guard on a key
+    /// evaluates without error and identically to an item whose metadata
+    /// merely lacks that key.
     #[test]
-    fn missing_metadata_evaluates_without_panicking() {
+    fn missing_metadata_is_an_empty_map() {
         let script = write_script(
             r#"
-            #{ visible: metadata == () }
+            #{ visible: type_of(metadata) == "map" && metadata.len() == 0 && metadata.anything == () }
             "#,
         );
         let mut engine = RhaiEngine::new(vec![watermark()]);
@@ -813,6 +819,33 @@ fade:
             .try_evaluate(0.0, 0, &ProgramContext::unknown())
             .unwrap();
         assert!(state.visible);
+
+        let mut other = ProgramContext::unknown();
+        other.metadata = serde_json::json!({ "score": 1 });
+        let state = engine.try_evaluate(0.0, 0, &other).unwrap();
+        assert!(!state.visible, "a non-empty map is not the empty one");
+    }
+
+    /// Nested values arrive as Rhai arrays and maps, not as strings.
+    #[test]
+    fn nested_metadata_is_an_array_of_maps() {
+        let script = write_script(
+            r#"
+            let first = metadata.audit[0];
+            #{ layers: [ #{ content: type_of(metadata.audit) + ":" + first.kind + ":" + metadata.audit.len() } ] }
+            "#,
+        );
+        let mut engine = RhaiEngine::new(vec![text("placeholder")]);
+        engine.load_script(script.path()).unwrap();
+
+        let mut ctx = ProgramContext::unknown();
+        ctx.metadata = serde_json::json!({ "audit": [ { "kind": "score" }, { "kind": "pool" } ] });
+
+        let state = engine.evaluate(0.0, 0, &ctx);
+        match &state.layers[0].kind {
+            OverlayKind::Text { content, .. } => assert_eq!(content, "array:score:2"),
+            _ => panic!("expected text layer"),
+        }
     }
 
     #[test]
