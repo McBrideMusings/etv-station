@@ -660,6 +660,22 @@ impl Catalog {
         Ok(row)
     }
 
+    /// Every entry with the id its descriptive facts are filed under in the
+    /// plexdb store: its `show_id` when it has one (an episode carries no
+    /// keywords of its own, its show does), its own `entry_id` otherwise.
+    /// One statement over the whole catalog.
+    pub fn fact_units(&self) -> Result<Vec<(String, String)>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entry_id, COALESCE(show_id, entry_id) FROM entries")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// The `show_id` of each requested entry, in one round trip.
     ///
     /// The pattern engine (#72) needs nothing from an entry but its `show_id`,

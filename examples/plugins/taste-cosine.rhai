@@ -69,7 +69,7 @@
 //                        (kind, namespace, value, items, weight, reference,
 //                        origin), files first then inline — empty when the
 //                        pool authored none
-//   ctx.exclude_keywords the pool's `exclude_keywords:`, already normalized
+//   ctx.ignore_keywords the pool's `ignore_keywords:`, already normalized
 //   ctx.pool             the name of the pool asking
 //   ctx.target_count     how many items this generation needs
 //   ctx.config           this pool's `config:` block, or an empty map
@@ -342,11 +342,11 @@ fn pick(ctx) {
     // A list under `config:` is refused rather than ignored: `config:` is
     // opaque to the station, so nothing else would notice the exclusions had
     // stopped applying.
-    if ctx.config["exclude_keywords"] != () {
-        throw "exclude_keywords is a pool field beside `profile:`, not a `config:` key — move it up one level";
+    if ctx.config["ignore_keywords"] != () {
+        throw "ignore_keywords is a pool field beside `profile:`, not a `config:` key — move it up one level";
     }
     let excluded = #{};
-    for k in ctx.exclude_keywords { excluded[k] = true; }
+    for k in ctx.ignore_keywords { excluded[k] = true; }
 
     // THE TASTE PROFILE, netted into two maps keyed `bucket \x01 value`, where
     // a bucket is `keywords` or the item-map key a catalog tag sits under
@@ -785,7 +785,7 @@ fn pick(ctx) {
             // The profile's keyword cosines use the same divisor, so the
             // keyword half of favor and disfavor sits on the taste scale.
             // Eligible for exploration only with a keyword left after
-            // exclude_keywords, for the same reason as the df pass above.
+            // ignore_keywords, for the same reason as the df pass above.
             eligible = n > 0;
             if n > 0 {
                 let divisor = n.to_float().sqrt();

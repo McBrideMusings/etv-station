@@ -411,9 +411,9 @@ pub struct Pool {
 
     /// Keywords this pool's scorer drops from scoring entirely, resolved the
     /// way a profile `keyword:` entry is and handed over as
-    /// `ctx.exclude_keywords`.
+    /// `ctx.ignore_keywords`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude_keywords: Vec<String>,
+    pub ignore_keywords: Vec<String>,
 
     /// Named show groups (#165) this pool draws its items from — every member
     /// show's episodes, across every group listed, unioned. Mutually
