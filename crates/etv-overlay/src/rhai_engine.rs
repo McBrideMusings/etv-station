@@ -305,6 +305,11 @@ impl RhaiEngine {
         scope.push_constant("next_year", program.next_year);
         scope.push_constant("item_elapsed", program.item_elapsed);
         scope.push_constant("item_remaining", program.item_remaining);
+        // The item's whole length, `item_elapsed + item_remaining`, so a script
+        // can pace a reveal against the item it sits on (a card whose lines
+        // land at fixed fractions of its length). `-1.0` when either half is
+        // unknown, the same sentinel as the two it is made from.
+        scope.push_constant("item_duration", item_duration(program));
         // The current item's opaque metadata blob (ADR 0016) — the one
         // channel through which anything plugin-specific reaches a script.
         // No Rust code here reads a key inside it. Same conversion as
@@ -451,6 +456,14 @@ fn declared_layer(
     Ok(kind)
 }
 
+fn item_duration(program: &ProgramContext) -> f64 {
+    if program.item_elapsed < 0.0 || program.item_remaining < 0.0 {
+        -1.0
+    } else {
+        program.item_elapsed + program.item_remaining
+    }
+}
+
 /// The attribution credit on its own, pulled back out of the description the
 /// station appended it to (#113).
 ///
@@ -490,6 +503,11 @@ fn apply_layer_override(layer: &mut LayerState, map: &rhai::Map) {
         .and_then(|v| v.clone().into_string().ok())
     {
         apply_content_override(&mut layer.kind, content);
+    }
+    if let Some(lines) = map.get("visible_lines").and_then(|v| v.as_int().ok())
+        && let OverlayKind::Text { visible_lines, .. } = &mut layer.kind
+    {
+        *visible_lines = Some(lines.clamp(0, u32::MAX as i64) as u32);
     }
     if let Some(corner) = map
         .get("corner")
@@ -543,6 +561,7 @@ fn parse_corner(s: &str) -> Option<Corner> {
         "top_right" => Some(Corner::TopRight),
         "bottom_left" => Some(Corner::BottomLeft),
         "bottom_right" => Some(Corner::BottomRight),
+        "center" => Some(Corner::Center),
         _ => None,
     }
 }
@@ -573,6 +592,12 @@ mod tests {
             font_family: "system-ui".into(),
             font_size: 32.0,
             letter_spacing: 0.0,
+            align: Default::default(),
+            bold: false,
+            italic: false,
+            markup: false,
+            visible_lines: None,
+            below: None,
             color: [255, 255, 255, 255],
             corner: Corner::BottomLeft,
             margin: 32,

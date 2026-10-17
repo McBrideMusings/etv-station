@@ -1,0 +1,13 @@
+width: 640
+height: 360
+framerate: 30
+pixel_format: rgba8
+graphics:
+  - script: scripts/text_card.rhai
+    config:
+      font_size: 20
+      line_gap: 1.5
+      credit: "@CassiePlush"
+      lines:
+        - "**@adultswim speaks to me**"
+        - "**on a personal level**"

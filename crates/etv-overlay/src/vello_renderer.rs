@@ -3,8 +3,8 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontFamily, Layout, LayoutContext,
-    PositionedLayoutItem, StyleProperty,
+    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, Layout,
+    LayoutContext, PositionedLayoutItem, StyleProperty,
 };
 use vello::kurbo::{Affine, Point, Rect, RoundedRect};
 use vello::peniko::{
@@ -13,7 +13,7 @@ use vello::peniko::{
 use vello::wgpu;
 use vello::{AaConfig, AaSupport, Glyph, RenderParams, Renderer, RendererOptions, Scene};
 
-use crate::overlay_spec::{Corner, Edge, OverlayKind, PixelFormat};
+use crate::overlay_spec::{Corner, Edge, OverlayKind, PixelFormat, TextAlign};
 use crate::rhai_engine::{LayerState, OverlayState};
 
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
@@ -24,6 +24,10 @@ const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 /// `assets/fonts/README.md` for provenance.
 const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
 const FALLBACK_FONT_FAMILY: &str = "Inter";
+/// Vendored Latin-subset Inter Bold (~47KB, SIL OFL), the bold face of the same
+/// family. There is no italic cut: italic text is the stack's synthesized
+/// oblique ([`glyph_skew`]).
+const FALLBACK_BOLD_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Bold.ttf");
 
 /// The Parley font stack `draw_text` shapes with: the configured family first,
 /// then the vendored Inter fallback so anything the family doesn't cover (or
@@ -34,9 +38,75 @@ fn font_stack(font_family: &str) -> String {
     format!("{font_family}, {FALLBACK_FONT_FAMILY}")
 }
 
+/// How a text block is styled beyond family, size and spacing: the alignment
+/// of its lines, whole-block bold and italic, and the spans of a `markup`
+/// block (byte ranges into the text actually drawn).
+#[derive(Default)]
+struct TextFace {
+    align: TextAlign,
+    bold: bool,
+    italic: bool,
+    spans: Vec<MarkupSpan>,
+}
+
+/// A `*italic*` or `**bold**` span of a marked-up text, as byte offsets into
+/// the text with its markers removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkupSpan {
+    start: usize,
+    end: usize,
+    bold: bool,
+}
+
+/// Removes `*italic*` and `**bold**` markers from `content`, returning the text
+/// to draw and the spans the markers delimited. A marker with no partner later
+/// in the text stays in it as written, so a stray asterisk is not lost.
+fn parse_markup(content: &str) -> (String, Vec<MarkupSpan>) {
+    let mut out = String::with_capacity(content.len());
+    let mut spans = Vec::new();
+    let mut rest = content;
+    while !rest.is_empty() {
+        let (marker, bold) = if rest.starts_with("**") {
+            ("**", true)
+        } else if rest.starts_with('*') {
+            ("*", false)
+        } else {
+            let ch = rest.chars().next().expect("rest is non-empty");
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        };
+        let after = &rest[marker.len()..];
+        match after.find(marker) {
+            Some(close) if close > 0 => {
+                let start = out.len();
+                out.push_str(&after[..close]);
+                spans.push(MarkupSpan {
+                    start,
+                    end: out.len(),
+                    bold,
+                });
+                rest = &after[close + marker.len()..];
+            }
+            _ => {
+                out.push_str(marker);
+                rest = after;
+            }
+        }
+    }
+    (out, spans)
+}
+
+/// The shear a run was asked to slant by, when its font has no italic cut of
+/// its own and the stack synthesizes one.
+fn glyph_skew(synthesis_skew: Option<f32>) -> Option<Affine> {
+    synthesis_skew.map(|degrees| Affine::skew(degrees.to_radians().tan() as f64, 0.0))
+}
+
 /// Build and line-break a Parley layout for `content`, shaping it with
 /// [`font_stack`]. Shared by [`VelloRenderer::draw_text`] and the unit tests so
 /// both exercise the same `font_stack` + shaping path.
+#[allow(clippy::too_many_arguments)]
 fn build_text_layout(
     font_context: &mut FontContext,
     layout_context: &mut LayoutContext<()>,
@@ -45,15 +115,42 @@ fn build_text_layout(
     font_size: f32,
     letter_spacing: f32,
     max_width: Option<f32>,
+    face: &TextFace,
 ) -> Layout<()> {
     let stack = font_stack(font_family);
     let mut builder = layout_context.ranged_builder(font_context, content, 1.0, true);
     builder.push_default(StyleProperty::FontFamily(FontFamily::Source(stack.into())));
     builder.push_default(StyleProperty::FontSize(font_size));
     builder.push_default(StyleProperty::LetterSpacing(letter_spacing));
+    if face.bold {
+        builder.push_default(StyleProperty::FontWeight(FontWeight::BOLD));
+    }
+    if face.italic {
+        builder.push_default(StyleProperty::FontStyle(FontStyle::Italic));
+    }
+    for span in &face.spans {
+        if span.bold {
+            builder.push(
+                StyleProperty::FontWeight(FontWeight::BOLD),
+                span.start..span.end,
+            );
+        } else {
+            builder.push(
+                StyleProperty::FontStyle(FontStyle::Italic),
+                span.start..span.end,
+            );
+        }
+    }
     let mut layout = builder.build(content);
     layout.break_all_lines(max_width);
-    layout.align(Alignment::Start, AlignmentOptions::default());
+    layout.align(
+        match face.align {
+            TextAlign::Left => Alignment::Left,
+            TextAlign::Center => Alignment::Center,
+            TextAlign::Right => Alignment::Right,
+        },
+        AlignmentOptions::default(),
+    );
     layout
 }
 
@@ -67,6 +164,22 @@ fn build_text_layout(
 struct ImageCacheEntry {
     raw: PenikoImage,
     shrunk: HashMap<(u32, u32), PenikoImage>,
+}
+
+/// Where and how a text layer is drawn this frame, apart from its styling.
+struct TextPlacement<'a> {
+    font_family: &'a str,
+    font_size: f32,
+    letter_spacing: f32,
+    color: [u8; 4],
+    corner: Corner,
+    margin: u32,
+    offset_x: f32,
+    offset_y: f32,
+    opacity: f32,
+    visible_lines: Option<usize>,
+    /// The box of the block this one hangs under, when it does.
+    below: Option<Rect>,
 }
 
 pub struct VelloRenderer {
@@ -93,6 +206,9 @@ pub struct VelloRenderer {
     layout_context: LayoutContext<()>,
     warned_missing_glyphs: HashSet<String>,
     warned_bad_images: HashSet<PathBuf>,
+    /// The box each text layer of the frame being built occupied, by layer
+    /// index, for a later layer placed `below` it.
+    text_boxes: HashMap<usize, Rect>,
 }
 
 impl VelloRenderer {
@@ -166,6 +282,9 @@ impl VelloRenderer {
         font_context
             .collection
             .register_fonts(Blob::from(FALLBACK_FONT_BYTES.to_vec()), None);
+        font_context
+            .collection
+            .register_fonts(Blob::from(FALLBACK_BOLD_FONT_BYTES.to_vec()), None);
 
         Ok(Self {
             device,
@@ -183,6 +302,7 @@ impl VelloRenderer {
             layout_context: LayoutContext::new(),
             warned_missing_glyphs: HashSet::new(),
             warned_bad_images: HashSet::new(),
+            text_boxes: HashMap::new(),
         })
     }
 
@@ -341,6 +461,7 @@ impl VelloRenderer {
             font_size,
             letter_spacing,
             max_width,
+            &TextFace::default(),
         );
 
         let brush = Color::from_rgba8(color[0], color[1], color[2], color[3]);
@@ -402,12 +523,13 @@ impl VelloRenderer {
     }
 
     fn build_scene(&mut self, scene: &mut Scene, state: &OverlayState) -> anyhow::Result<()> {
-        for layer in &state.layers {
+        self.text_boxes.clear();
+        for (index, layer) in state.layers.iter().enumerate() {
             if !layer.visible {
                 continue;
             }
             let effective_opacity = state.opacity * layer.opacity;
-            self.build_layer(scene, layer, effective_opacity)?;
+            self.build_layer(scene, index, layer, effective_opacity)?;
         }
         Ok(())
     }
@@ -415,6 +537,7 @@ impl VelloRenderer {
     fn build_layer(
         &mut self,
         scene: &mut Scene,
+        index: usize,
         layer: &LayerState,
         opacity: f32,
     ) -> anyhow::Result<()> {
@@ -542,42 +665,70 @@ impl VelloRenderer {
                 color,
                 corner,
                 margin,
+                align,
+                bold,
+                italic,
+                markup,
+                visible_lines,
+                below,
             } => {
-                self.draw_text(
+                let (drawn, spans) = if *markup {
+                    parse_markup(content)
+                } else {
+                    (content.clone(), Vec::new())
+                };
+                let face = TextFace {
+                    align: *align,
+                    bold: *bold,
+                    italic: *italic,
+                    spans,
+                };
+                let anchor = match below {
+                    Some(other) => match self.text_boxes.get(other) {
+                        Some(rect) => Some(*rect),
+                        // The block this one hangs from is not on screen this
+                        // frame, so there is nowhere to put it.
+                        None => return Ok(()),
+                    },
+                    None => None,
+                };
+                let placed = self.draw_text(
                     scene,
-                    content,
-                    font_family,
-                    *font_size,
-                    *letter_spacing,
-                    *color,
-                    *corner,
-                    *margin,
-                    layer.offset_x,
-                    layer.offset_y,
-                    opacity,
+                    &drawn,
+                    TextPlacement {
+                        font_family,
+                        font_size: *font_size,
+                        letter_spacing: *letter_spacing,
+                        color: *color,
+                        corner: *corner,
+                        margin: *margin,
+                        offset_x: layer.offset_x,
+                        offset_y: layer.offset_y,
+                        opacity,
+                        visible_lines: visible_lines.map(|n| n as usize),
+                        below: anchor,
+                    },
+                    &face,
                 );
+                if let Some(rect) = placed {
+                    self.text_boxes.insert(index, rect);
+                }
             }
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Draws a text block and returns the box it occupies (measured on every
+    /// line, drawn or not), or `None` when `content` is empty.
     fn draw_text(
         &mut self,
         scene: &mut Scene,
         content: &str,
-        font_family: &str,
-        font_size: f32,
-        letter_spacing: f32,
-        color: [u8; 4],
-        corner: Corner,
-        margin: u32,
-        offset_x: f32,
-        offset_y: f32,
-        opacity: f32,
-    ) {
+        place: TextPlacement<'_>,
+        face: &TextFace,
+    ) -> Option<Rect> {
         if content.is_empty() {
-            return;
+            return None;
         }
         // `build_text_layout` appends the vendored fallback to the stack so
         // anything the configured family doesn't cover (or any host where the
@@ -587,30 +738,44 @@ impl VelloRenderer {
             &mut self.font_context,
             &mut self.layout_context,
             content,
-            font_family,
-            font_size,
-            letter_spacing,
+            place.font_family,
+            place.font_size,
+            place.letter_spacing,
             None,
+            face,
         );
 
         let text_w = layout.width() as f64;
         let text_h = layout.height() as f64;
-        let (x0, y0) = corner_origin_f64(
-            corner,
-            margin as f64,
-            text_w,
-            text_h,
-            self.width,
-            self.height,
-        );
-        let x0 = x0 + offset_x as f64;
-        let y0 = y0 + offset_y as f64;
+        let (x0, y0) = match place.below {
+            Some(above) => {
+                let x = match face.align {
+                    TextAlign::Left => above.x0,
+                    TextAlign::Center => above.center().x - text_w / 2.0,
+                    TextAlign::Right => above.x1 - text_w,
+                };
+                (x, above.y1)
+            }
+            None => corner_origin_f64(
+                place.corner,
+                place.margin as f64,
+                text_w,
+                text_h,
+                self.width,
+                self.height,
+            ),
+        };
+        let x0 = x0 + place.offset_x as f64;
+        let y0 = y0 + place.offset_y as f64;
+        let rect = Rect::new(x0, y0, x0 + text_w, y0 + text_h);
 
-        let alpha = (color[3] as f32 / 255.0) * opacity;
+        let color = place.color;
+        let alpha = (color[3] as f32 / 255.0) * place.opacity;
         let brush = Color::from_rgba8(color[0], color[1], color[2], (alpha * 255.0) as u8);
 
+        let shown = place.visible_lines.unwrap_or(usize::MAX);
         let mut total_glyphs = 0usize;
-        for line in layout.lines() {
+        for line in layout.lines().take(shown) {
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                     continue;
@@ -634,6 +799,7 @@ impl VelloRenderer {
                     .font_size(run_font_size)
                     .brush(brush)
                     .transform(Affine::translate((x0, y0)))
+                    .glyph_transform(glyph_skew(run.synthesis().skew()))
                     .draw(Fill::NonZero, glyphs.into_iter());
             }
         }
@@ -642,14 +808,20 @@ impl VelloRenderer {
         // Inter fallback couldn't shape the string — likely a non-Latin
         // codepoint, since the vendored font is a Latin subset. Log once per
         // font_family so the operator sees the symptom instead of an
-        // empty-looking overlay.
-        if total_glyphs == 0 && self.warned_missing_glyphs.insert(font_family.to_string()) {
+        // empty-looking overlay. A block with every line hidden is not that.
+        if shown > 0
+            && total_glyphs == 0
+            && self
+                .warned_missing_glyphs
+                .insert(place.font_family.to_string())
+        {
             tracing::error!(
-                font_family = font_family,
+                font_family = place.font_family,
                 content = content,
                 "text overlay produced no glyphs; configured font family is missing on host and vendored fallback could not shape the content (non-Latin?)",
             );
         }
+        Some(rect)
     }
 
     /// Infallible: a PNG that cannot be decoded is not a render failure, only
@@ -778,6 +950,7 @@ fn corner_origin(
         Corner::TopRight => (w - m - s, m),
         Corner::BottomLeft => (m, h - m - s),
         Corner::BottomRight => (w - m - s, h - m - s),
+        Corner::Center => ((w - s) / 2, (h - s) / 2),
     }
 }
 
@@ -796,6 +969,7 @@ fn corner_origin_f64(
         Corner::TopRight => (cw - margin - width, margin),
         Corner::BottomLeft => (margin, ch - margin - height),
         Corner::BottomRight => (cw - margin - width, ch - margin - height),
+        Corner::Center => ((cw - width) / 2.0, (ch - height) / 2.0),
     }
 }
 
@@ -1010,7 +1184,166 @@ mod tests {
         };
         fcx.collection
             .register_fonts(Blob::from(FALLBACK_FONT_BYTES.to_vec()), None);
+        fcx.collection
+            .register_fonts(Blob::from(FALLBACK_BOLD_FONT_BYTES.to_vec()), None);
         fcx
+    }
+
+    fn layout_of(content: &str, face: &TextFace) -> Layout<()> {
+        let mut fcx = fonts_free_context();
+        let mut lcx: LayoutContext<()> = LayoutContext::new();
+        build_text_layout(&mut fcx, &mut lcx, content, "Inter", 40.0, 0.0, None, face)
+    }
+
+    /// Per glyph run: the font blob's length and the synthesized skew.
+    fn runs_of(layout: &Layout<()>) -> Vec<(usize, Option<f32>)> {
+        let mut runs = Vec::new();
+        for line in layout.lines() {
+            for item in line.items() {
+                if let PositionedLayoutItem::GlyphRun(run) = item {
+                    let run = run.run();
+                    runs.push((run.font().data.as_ref().len(), run.synthesis().skew()));
+                }
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn markup_removes_paired_markers_and_records_their_spans() {
+        let (text, spans) = parse_markup("a *b* **cd** e");
+        assert_eq!(text, "a b cd e");
+        assert_eq!(
+            spans,
+            [
+                MarkupSpan {
+                    start: 2,
+                    end: 3,
+                    bold: false
+                },
+                MarkupSpan {
+                    start: 4,
+                    end: 6,
+                    bold: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn markup_leaves_an_unpaired_marker_in_the_text() {
+        assert_eq!(parse_markup("5 * 3"), ("5 * 3".to_string(), vec![]));
+        assert_eq!(parse_markup("**"), ("**".to_string(), vec![]));
+        assert_eq!(
+            parse_markup("é*é*"),
+            (
+                "éé".to_string(),
+                vec![MarkupSpan {
+                    start: 2,
+                    end: 4,
+                    bold: false
+                }]
+            )
+        );
+    }
+
+    #[test]
+    fn bold_shapes_with_the_bold_face_and_regular_does_not() {
+        let regular = runs_of(&layout_of("Card", &TextFace::default()));
+        let bold = runs_of(&layout_of(
+            "Card",
+            &TextFace {
+                bold: true,
+                ..TextFace::default()
+            },
+        ));
+        assert_eq!(regular[0].0, FALLBACK_FONT_BYTES.len());
+        assert_eq!(bold[0].0, FALLBACK_BOLD_FONT_BYTES.len());
+        assert_eq!(
+            bold[0].1, None,
+            "bold is a real face, not a synthesized one"
+        );
+    }
+
+    #[test]
+    fn italic_asks_the_renderer_for_a_slant() {
+        let upright = runs_of(&layout_of("Card", &TextFace::default()));
+        let italic = runs_of(&layout_of(
+            "Card",
+            &TextFace {
+                italic: true,
+                ..TextFace::default()
+            },
+        ));
+        assert_eq!(upright[0].1, None);
+        let skew = italic[0]
+            .1
+            .expect("an upright-only family is slanted by synthesis");
+        assert!(skew > 0.0, "skew {skew}");
+    }
+
+    #[test]
+    fn a_markup_span_changes_only_its_own_run() {
+        let (text, spans) = parse_markup("plain *slanted* plain");
+        let face = TextFace {
+            spans,
+            ..TextFace::default()
+        };
+        let runs = runs_of(&layout_of(&text, &face));
+        let slanted = runs.iter().filter(|r| r.1.is_some()).count();
+        assert_eq!(slanted, 1, "{runs:?}");
+        assert!(runs.len() >= 3, "{runs:?}");
+    }
+
+    /// The first glyph of each line, as its x offset in the block.
+    fn line_starts(layout: &Layout<()>) -> Vec<f32> {
+        layout
+            .lines()
+            .map(|line| {
+                line.items()
+                    .find_map(|item| match item {
+                        PositionedLayoutItem::GlyphRun(run) => {
+                            run.positioned_glyphs().next().map(|g| g.x)
+                        }
+                        _ => None,
+                    })
+                    .expect("every line has a glyph")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn alignment_places_a_short_line_against_the_widest_one() {
+        let content = "A very wide first line\nshort";
+        let left = layout_of(content, &TextFace::default());
+        let center = layout_of(
+            content,
+            &TextFace {
+                align: TextAlign::Center,
+                ..TextFace::default()
+            },
+        );
+        let right = layout_of(
+            content,
+            &TextFace {
+                align: TextAlign::Right,
+                ..TextFace::default()
+            },
+        );
+        let width = left.width();
+        assert!((center.width() - width).abs() < 0.5 && (right.width() - width).abs() < 0.5);
+        let (l, c, r) = (
+            line_starts(&left),
+            line_starts(&center),
+            line_starts(&right),
+        );
+        assert!(l[1] < 1.0, "left {l:?}");
+        // The short line's slack is split evenly when centered, all on its
+        // left when right-aligned.
+        let slack = r[1];
+        assert!(slack > 50.0, "right {r:?}");
+        assert!((c[1] - slack / 2.0).abs() < 1.5, "center {c:?} right {r:?}");
+        assert!(c[0] < 1.0 && r[0] < 1.0, "the widest line fills the block");
     }
 
     /// Directly guards the regression #60 names: a refactor of the text font
@@ -1039,6 +1372,7 @@ mod tests {
             32.0,
             0.0,
             None,
+            &TextFace::default(),
         );
 
         let mut total_glyphs = 0usize;
