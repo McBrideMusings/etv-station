@@ -170,7 +170,7 @@ without naming each one — see `catalog/query.rs`'s `method_predicate`.
 | `year` | int | |
 | `season` | int | |
 | `episode` | int | |
-| `absolute_episode` | int | franchise-wide episode number |
+| `absolute_episode` | int | franchise-wide episode number: Plex's own when it numbered every episode of the show, otherwise every episode of the show renumbered 1..N by (season, episode) |
 | `duration_ms` | int | |
 | `genres` | tags | |
 | `labels` | tags | |
