@@ -37,6 +37,11 @@
 //!   4xx/5xx, a transport failure, or no response within
 //!   [`crate::plugin_http::GENERATION_TIMEOUT`] is an error. `parse_json(text)`
 //!   turns the body into maps and arrays and needs no grant.
+//!
+//!   `ctx.http` and `ctx.exec` share one budget per `build()` call,
+//!   [`crate::plugin_http::GENERATION_BUDGET`]: each call's timeout is capped at
+//!   what is left, and once it is spent every further call errors at once,
+//!   naming the budget.
 //! - `exec` — `ctx.exec(program, args)` runs one program with no stdin through
 //!   [`crate::hooks::exec_call`] and returns `#{ code, stdout, stderr }`. A
 //!   spawn failure, or a run that outlives
@@ -186,6 +191,7 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
         granted: input.granted.clone(),
         history: input.history.clone(),
         channel: input.channel.name.clone(),
+        budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
     });
     let mut scope = Scope::new();
     let value: Dynamic = engine
@@ -587,6 +593,8 @@ struct Host {
     history: Option<Arc<HistoryDb>>,
     /// The channel `ctx.airings` queries unless the filter names another.
     channel: String,
+    /// What this `build()` call has left for `ctx.http` and `ctx.exec`.
+    budget: crate::plugin_http::Budget,
 }
 
 impl Host {
@@ -650,16 +658,17 @@ impl Host {
 
     fn http(&self, url: &str, method: &str, body: &str) -> RhaiResult<String> {
         self.require("http")?;
-        Ok(
-            crate::plugin_http::call(url, method, body, crate::plugin_http::GENERATION_TIMEOUT)
-                .map_err(|e| format!("ctx.http(): {e}"))?,
-        )
+        Ok(self.budget.within("ctx.http()", |timeout| {
+            crate::plugin_http::call(url, method, body, timeout)
+        })?)
     }
 
     fn exec(&self, program: &str, args: rhai::Array) -> RhaiResult<Map> {
         self.require("exec")?;
         let started = std::time::Instant::now();
-        let result = crate::hooks::exec_call(program, args, crate::plugin_http::GENERATION_TIMEOUT);
+        let result = self.budget.within("ctx.exec()", |timeout| {
+            crate::hooks::exec_call(program, args, timeout)
+        });
         tracing::info!(
             event = "bumper.exec",
             program,
@@ -672,7 +681,7 @@ impl Host {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "bumper script ran a program"
         );
-        Ok(result.map_err(|e| format!("ctx.exec(): {e}"))?)
+        Ok(result?)
     }
 }
 
