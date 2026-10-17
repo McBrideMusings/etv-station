@@ -122,9 +122,8 @@ struct Cli {
     /// Force a channel to throw away its schedule from the next item boundary
     /// forward and regenerate it, then exit. Names a channel the way its
     /// directory is (`002-for-pierce`), by bare name (`for-pierce`), or by
-    /// channel number (`2`) — the same number ETV-next and the guide use, which
-    /// is the channel's position in the station config. `all` marks every
-    /// channel.
+    /// channel number (`2`) — the `number:` the channel declares, the same
+    /// number ETV-next and the guide use. `all` marks every channel.
     ///
     /// A refresh normally happens on its own when a channel's configuration
     /// changes. This is the override for when you want one anyway — after
@@ -854,8 +853,8 @@ fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
 /// Resolve `target` to the channels it names, the same forgiving way for
 /// every one-shot mode that accepts a channel argument: exact name, bare name
 /// after the numeric directory prefix (`for-pierce` finds `002-for-pierce`),
-/// substring, channel number (1-based, its position in the station config —
-/// the same number the guide and ETV-next show), or `all`.
+/// substring, channel number (the `number:` the channel declares — the same
+/// number the guide and ETV-next show; gaps are legal), or `all`.
 ///
 /// Messages carry no command prefix — each caller prepends its own, so
 /// `refresh-channel`'s and `audit`'s errors read as their own tool's output.
@@ -866,13 +865,22 @@ fn resolve_channels<'a>(
     if target == "all" {
         return Ok(station.channels.iter().collect());
     }
-    if let Ok(number) = target.parse::<usize>() {
-        return match number.checked_sub(1).and_then(|i| station.channels.get(i)) {
+    if let Ok(number) = target.parse::<i64>() {
+        return match station.channels.iter().find(|c| c.config.number == number) {
             Some(ch) => Ok(vec![ch]),
-            None => Err(format!(
-                "no channel number {number}; the station has {}",
-                station.channels.len(),
-            )),
+            None => {
+                let mut numbers: Vec<i64> =
+                    station.channels.iter().map(|c| c.config.number).collect();
+                numbers.sort_unstable();
+                Err(format!(
+                    "no channel number {number}; the station has numbers {}",
+                    numbers
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            }
         };
     }
 
@@ -1332,6 +1340,25 @@ mod tests {
             let listed = listing.iter().find(|c| c.name == ch.name).unwrap();
             assert_eq!(listed.number, ch.config.number);
         }
+    }
+
+    /// A numeric channel argument matches the declared `number:`, never the
+    /// channel's position; a miss refuses and names the numbers that exist (#421).
+    #[test]
+    fn resolve_channels_matches_declared_number_not_position() {
+        let dir = tempfile::tempdir().unwrap();
+        write_channel_toml(dir.path(), "a.toml", 7, None);
+        write_channel_toml(dir.path(), "b.toml", 121, None);
+        write_station_toml(dir.path(), &["a.toml", "b.toml"]);
+        let station = config::load(&dir.path().join("station.toml")).unwrap();
+
+        let hit = resolve_channels(&station, "121").unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].name, "b");
+
+        // 2 is a valid position but not a declared number.
+        let err = resolve_channels(&station, "2").unwrap_err();
+        assert_eq!(err, "no channel number 2; the station has numbers 7, 121");
     }
 
     /// A one-shot mode names every channel config the loader dropped, with its
