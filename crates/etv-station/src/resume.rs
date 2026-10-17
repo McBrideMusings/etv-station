@@ -219,6 +219,14 @@ pub struct PoolResume {
     /// and a list that changed completely opens on its top.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lap: Vec<String>,
+    /// The ids already drawn from the list named by `list`, across every
+    /// generation of its period. A generation that opens in the same period
+    /// starts from these, so a frozen list that has been walked to its end
+    /// asks its source for more rather than wrapping to its top. Empty for a
+    /// pool whose list does not rotate, and ignored when `list` differs from
+    /// the list the next generation holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drawn: Vec<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
