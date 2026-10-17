@@ -3136,6 +3136,7 @@ async fn pattern_catch_up(
         let state = crate::resume::GenerationState {
             resume: resume.clone(),
             cursor: ctx.history_db.series_cursor(&channel.name)?,
+            global_cursor: ctx.history_db.cross_channel_show_cursor()?,
             tail: ctx
                 .history_db
                 .tail(&channel.name, channel.config.adjacency_reach())?,

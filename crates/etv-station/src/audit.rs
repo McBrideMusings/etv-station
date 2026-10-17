@@ -2,11 +2,13 @@
 //! that are not a Rhai plugin.
 //!
 //! A `pool_provider` plugin explains itself in its own `audit()` function and
-//! [`crate::score`] merges what it returns (ADR 0011). Nothing else did, so on
-//! the 60 channels with no `plugin:` pool every item read `(unexplained — no
-//! audit trail)` in the report — which is exactly backwards, since a channel
-//! whose selection logic is *not* custom is the one a reader has the least
-//! other way to reason about.
+//! [`crate::score`] merges what it returns (ADR 0011). Every other path that
+//! puts an item on a schedule writes its own record through this module — a
+//! pattern or sequencer draw in [`crate::pattern`], an `entries:` item, query,
+//! collection or fallback in [`crate::resolve`], the channel-unavailable card
+//! in [`crate::error_card`] — so no item reads `(unexplained — no audit
+//! trail)` in the report. A channel whose selection logic is *not* custom is
+//! the one a reader has the least other way to reason about.
 //!
 //! This module is the station's own side of that contract: the same
 //! `#{ stage, by, verdict, detail }` shape, the same closed

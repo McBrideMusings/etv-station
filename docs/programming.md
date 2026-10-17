@@ -184,9 +184,12 @@ schedules:
 `advance: resume` carries the strip on from the last episode aired, across
 generations and across the hours other blocks fill.
 
-**Not expressible today.** A show that strips on two channels keeps a separate
-place on each, so it restarts on every channel it appears on. Tracked in
-`etv-station-160` (`cursor_scope: global`).
+**Across channels.** By default a show that strips on two channels keeps a
+separate place on each. Add `cursor_scope: global` to the pool and it continues
+from the latest episode of that show aired on any channel; the second channel to
+air it carries on rather than replaying. Only shows share a place; a movie pool
+has no show to key on and restarts. `advance: restart` still restarts —
+the scope picks which cursor a resuming pool reads, not whether it reads one.
 
 **Grade.** Applies when a show that aired has 75 or more episodes in the
 catalog (three seasons, per Strip programming above). The measure is the

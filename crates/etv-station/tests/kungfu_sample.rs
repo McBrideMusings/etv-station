@@ -137,6 +137,7 @@ fn advance_state(
         tail: db
             .tail(CHANNEL, etv_station::constrain::DEFAULT_SEAM_TAIL)
             .unwrap(),
+        global_cursor: Default::default(),
     }
 }
 

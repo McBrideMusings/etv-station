@@ -646,6 +646,7 @@ fn audit(ctx, picks, workspace) {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,

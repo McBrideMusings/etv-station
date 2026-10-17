@@ -124,6 +124,7 @@ fn channel(plugin: &Path) -> ChannelConfig {
                     select: Default::default(),
                     rotate: Default::default(),
                     advance: Advance::Restart,
+                    cursor_scope: Default::default(),
                     on_short: Default::default(),
                     constraints: None,
                     config: None,

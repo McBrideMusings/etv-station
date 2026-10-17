@@ -262,6 +262,19 @@ pub enum Advance {
     Resume,
 }
 
+/// Whose airings a resuming pool continues from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorScope {
+    /// Only this channel's own airings: a show carried by two channels keeps a
+    /// separate place on each.
+    #[default]
+    Channel,
+    /// The latest airing of the show on any channel, so a show carried by two
+    /// channels continues rather than restarting on each.
+    Global,
+}
+
 /// How a visit fills slots the current series can't supply. Only meaningful
 /// with `rotate = "visit"`, where one visit draws `take` items from one series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -480,6 +493,13 @@ pub struct Pool {
 
     #[serde(default)]
     pub advance: Advance,
+
+    /// Which ledger a resuming pool reads its place from: this channel's, or
+    /// every channel's. Only meaningful with `advance: resume`, and only for
+    /// episodes: a movie has no show to share, so a movie pool's `global`
+    /// cursor is always empty and it restarts.
+    #[serde(default)]
+    pub cursor_scope: CursorScope,
 
     #[serde(default)]
     pub on_short: OnShort,

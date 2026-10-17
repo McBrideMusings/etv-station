@@ -584,6 +584,7 @@ mod tests {
             select: Select::RoundRobin,
             rotate: Rotate::Visit,
             advance: Advance::Restart,
+            cursor_scope: Default::default(),
             on_short: OnShort::Next,
             constraints: None,
             config: None,
@@ -964,6 +965,7 @@ fn arrange(ctx) {
             resume: resume_map,
             cursor: BTreeMap::new(),
             tail: Vec::new(),
+            global_cursor: Default::default(),
         };
         let BlockBuild { ids, .. } = build(
             &cat,
