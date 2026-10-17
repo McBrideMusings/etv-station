@@ -943,6 +943,7 @@ fn arrange(ctx) {
                 list: None,
                 lap: Vec::new(),
                 next: Some("show:whatever".into()),
+                drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
             },

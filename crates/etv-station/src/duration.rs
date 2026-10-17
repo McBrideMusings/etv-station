@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 use crate::atomic::atomic_write_json;
 use crate::config::SourceConfig;
@@ -271,30 +270,50 @@ fn clamp_to_config(probed: Duration, item: &ResolvedItem) -> Duration {
 }
 
 async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), StationError> {
-    let output = Command::new(crate::ffprobe::program())
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            "-i",
-        ])
-        .arg(path)
-        .output()
-        .await
-        .map_err(|e| StationError::FfprobeUnavailable {
+    let args: Vec<std::ffi::OsString> = [
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-i",
+    ]
+    .iter()
+    .map(Into::into)
+    .chain([path.as_os_str().to_owned()])
+    .collect();
+    let stdout = match crate::ffprobe::run_bounded_async(args).await.map_err(|e| {
+        StationError::FfprobeUnavailable {
             reason: format!("spawn: {e}"),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(StationError::Ffprobe {
-            path: path.to_path_buf(),
-            reason: format!("non-zero exit: {stderr}"),
-        });
-    }
+        }
+    })? {
+        crate::ffprobe::Bounded::Done {
+            success: true,
+            stdout,
+        } => stdout,
+        crate::ffprobe::Bounded::Done { .. } => {
+            return Err(StationError::Ffprobe {
+                path: path.to_path_buf(),
+                reason: "non-zero exit".into(),
+            });
+        }
+        crate::ffprobe::Bounded::TimedOut => {
+            tracing::warn!(
+                event = "duration.probe_timeout",
+                path = %path.display(),
+                timeout_secs = crate::ffprobe::PROBE_TIMEOUT.as_secs(),
+                "ffprobe did not finish; item becomes an error card"
+            );
+            return Err(StationError::Ffprobe {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "ffprobe timed out after {}s",
+                    crate::ffprobe::PROBE_TIMEOUT.as_secs()
+                ),
+            });
+        }
+    };
 
     #[derive(Deserialize)]
     struct ProbeOut {
@@ -307,11 +326,10 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         duration: Option<String>,
     }
 
-    let probe: ProbeOut =
-        serde_json::from_slice(&output.stdout).map_err(|e| StationError::Ffprobe {
-            path: path.to_path_buf(),
-            reason: format!("parse json: {e}"),
-        })?;
+    let probe: ProbeOut = serde_json::from_slice(&stdout).map_err(|e| StationError::Ffprobe {
+        path: path.to_path_buf(),
+        reason: format!("parse json: {e}"),
+    })?;
     let secs_str = probe.format.duration.ok_or_else(|| StationError::Ffprobe {
         path: path.to_path_buf(),
         reason: "format.duration missing".into(),

@@ -707,6 +707,15 @@ impl PoolRuntime<'_> {
             } else {
                 Vec::new()
             },
+            // Only a pool walking a held list needs this: the list outlives
+            // the generation, so what was drawn from it must too.
+            drawn: if self.cfg.advance == Advance::Resume && self.list_key.is_some() {
+                let mut drawn: Vec<String> = self.drawn.iter().cloned().collect();
+                drawn.sort();
+                drawn
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -2231,6 +2240,21 @@ fn pool_runtime<'a>(
             }
             Some(p) => {
                 rt.lap = p.lap.iter().cloned().collect();
+                // The same held list: what earlier generations of this period
+                // drew from it counts toward draining it.
+                if rt.list_key.is_some() && p.list == rt.list_key {
+                    let held: HashSet<&str> = rt
+                        .series
+                        .iter()
+                        .flat_map(|s| s.ids.iter().map(String::as_str))
+                        .collect();
+                    rt.drawn = p
+                        .drawn
+                        .iter()
+                        .filter(|id| held.contains(id.as_str()))
+                        .cloned()
+                        .collect();
+                }
                 if let Some(next) = p.next.as_ref()
                     && let Some(pos) = rt.series.iter().position(|s| &s.key == next)
                 {
@@ -3367,6 +3391,7 @@ mod tests {
                 list: None,
                 lap: Vec::new(),
                 next: Some("show:inv".into()),
+                drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
             },
@@ -5125,6 +5150,50 @@ fn audit(ctx, picks, workspace) { #{} }
 
         let (again, _) = walk_generations(&pool, &variety, 16);
         assert_eq!(aired, again, "a rerun of the same dates reproduces");
+    }
+
+    /// A held list that earlier generations walked to its end asks its source
+    /// for more instead of wrapping to its top (etv-station-hzfh.18). The
+    /// script hands back only four unaired films per call, so the period's
+    /// list is exhausted after four generations.
+    #[test]
+    fn a_held_list_walked_to_its_end_refills_instead_of_wrapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("four.rhai");
+        std::fs::write(
+            &script,
+            r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let out = [];
+    for n in 1..=12 {
+        let id = if n < 10 { "film-0" + n } else { "film-" + n };
+        if !ctx.recent.contains(id) { out.push(id); }
+    }
+    out.truncate(4);
+    #{ picks: out, workspace: () }
+}
+fn audit(ctx, picks, workspace) { #{} }
+"#,
+        )
+        .unwrap();
+        let mut pool = plugin_pool(&script);
+        pool.advance = Advance::Resume;
+        let variety = crate::variety::Variety::for_test(Some(every(2)), None);
+        // 8 generations, 6h apart, all inside the one 2-day period.
+        let (aired, states) = walk_generations(&pool, &variety, 8);
+        let distinct: HashSet<&String> = aired.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            8,
+            "no film repeats inside the period: {aired:?}"
+        );
+        assert_eq!(
+            states[7].resume.lists["movies"].len(),
+            1,
+            "the period's one list grew rather than being re-ranked"
+        );
+        assert_eq!(states[7].resume.lists["movies"][0].ids.len(), 8);
     }
 
     /// The same pool under a fixed seed never rolls over: it re-ranks every

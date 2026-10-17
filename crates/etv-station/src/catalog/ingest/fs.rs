@@ -242,25 +242,37 @@ pub fn type_from_path(path: &Path) -> String {
 /// error, non-zero exit, unparseable output) — a scan tolerates individual bad
 /// files rather than aborting the whole pass.
 async fn ffprobe_seconds(path: &Path) -> Option<f64> {
-    let output = tokio::process::Command::new(crate::ffprobe::program())
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let args: Vec<std::ffi::OsString> = [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]
+    .iter()
+    .map(Into::into)
+    .chain([path.as_os_str().to_owned()])
+    .collect();
+    let stdout = match crate::ffprobe::run_bounded_async(args).await.ok()? {
+        crate::ffprobe::Bounded::Done {
+            success: true,
+            stdout,
+        } => stdout,
+        crate::ffprobe::Bounded::Done { .. } => return None,
+        crate::ffprobe::Bounded::TimedOut => {
+            tracing::warn!(
+                event = "catalog.probe_timeout",
+                path = %path.display(),
+                timeout_secs = crate::ffprobe::PROBE_TIMEOUT.as_secs(),
+                "ffprobe did not finish; file skipped"
+            );
+            return None;
+        }
+    };
     // `parse::<f64>` accepts "nan"/"inf"; reject non-finite so a corrupt probe
     // records an unknown duration (None) rather than a garbage 0 / i64::MAX ms.
-    String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&stdout)
         .trim()
         .parse::<f64>()
         .ok()
