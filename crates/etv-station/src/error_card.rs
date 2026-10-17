@@ -112,7 +112,7 @@ pub(crate) fn playback_error_params(title: &str, reason: &str) -> String {
 /// Returned as a fresh item rather than applied to an existing one because there
 /// is no resolved item to rewrite: the channel failed before it produced any.
 pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration) -> ResolvedItem {
-    ResolvedItem {
+    let mut card = ResolvedItem {
         block: 0,
         id,
         source: SourceConfig::Lavfi {
@@ -133,7 +133,15 @@ pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration
         guide_fields: crate::guide::GuideFields::default(),
         tracks: None,
         selected: None,
-    }
+    };
+    crate::audit::push_stage(
+        &mut card.metadata,
+        "select",
+        "station:channel_card".into(),
+        "the channel's loop stopped, so the station aired its unavailable card".into(),
+        Some(serde_json::json!({ "reason": reason })),
+    );
+    card
 }
 
 /// Stacked lines on black, plus silence. The filter-graph shape — two

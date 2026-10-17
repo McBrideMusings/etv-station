@@ -198,8 +198,7 @@ fn build_playout_item(
         PlayoutItem::scheduled(item.id.clone(), start, finish, item.to_playout_source());
     playout_item.program = item.program.as_ref().map(clone_program);
     // A plugin pool's metadata blob (#166), carried untouched from
-    // `ResolvedItem::metadata`. `PlayoutItem::scheduled` already defaults this
-    // to `None`, so an item nothing attached to changes no output.
+    // `ResolvedItem::metadata`, which always holds at least an `audit` trail.
     playout_item.metadata = item.metadata.clone();
     playout_item.tracks = item.selected.and_then(playout_tracks);
     playout_item
