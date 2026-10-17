@@ -5,7 +5,7 @@ use ersatztv_playout::playout::ProgramMetadata;
 use serde::{Deserialize, Serialize};
 
 use super::block::{BlockFile, Duplicates};
-use super::constraints::Constraints;
+use super::constraints::{Constraints, NoRepeatWithin};
 use super::entry::{Entry, Fallback};
 use super::filter::Filter;
 use super::mode::Mode;
@@ -28,6 +28,15 @@ pub struct RuleConfig {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<Schedule>,
+
+    /// The same `entry_id` may not recur within this many channel positions,
+    /// or this much wall-clock time, whichever pool, block or slot drew it
+    /// (etv-station-hzfh.19). A pool's own `constraints` see only that pool's
+    /// draws; this sees everything the channel aired. Checked by the pattern
+    /// walk at every draw, beside the pool's own rule — see
+    /// [`crate::pattern::ChannelRepeat`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_repeat_within: Option<NoRepeatWithin>,
 }
 
 impl RuleConfig {

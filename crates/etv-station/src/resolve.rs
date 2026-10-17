@@ -362,6 +362,33 @@ pub fn resolve_channel_with_resume(
                 .sum();
             window_start + time::Duration::seconds_f64(laid.as_secs_f64())
         };
+        // The channel-wide repeat rule reads what aired before this block: the
+        // ledger's tail, then what earlier pattern and sequencer blocks of this
+        // generation already laid. An earlier entries block's span is not final
+        // yet — it is seated and cut below — so it is left out rather than
+        // counted with items that will never air.
+        let channel_aired: Vec<String> = match config.rule.no_repeat_within {
+            Some(_) if include.is_pattern() => state
+                .tail
+                .iter()
+                .cloned()
+                .chain(
+                    block_spans
+                        .iter()
+                        .filter(|(_, _, is_pattern)| *is_pattern)
+                        .flat_map(|&(start, end, _)| out[start..end].iter().map(|i| i.id.clone())),
+                )
+                .collect(),
+            _ => Vec::new(),
+        };
+        let channel_rule = config
+            .rule
+            .no_repeat_within
+            .map(|gap| crate::pattern::ChannelRule {
+                gap,
+                aired: &channel_aired,
+                nominal: nominal_item_runtime(config),
+            });
         let BlockItems {
             items: block_items,
             steps: mut block_steps,
@@ -382,6 +409,7 @@ pub fn resolve_channel_with_resume(
             block_start,
             &mut resume_out,
             config.guide.as_ref().map(|g| &g.text),
+            channel_rule,
         )?;
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished
@@ -1211,6 +1239,7 @@ fn resolve_block(
     window_start: OffsetDateTime,
     resume_out: &mut ResumeMap,
     channel_guide: Option<&GuideConfig>,
+    channel_rule: Option<crate::pattern::ChannelRule<'_>>,
 ) -> Result<BlockItems, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
@@ -1255,6 +1284,7 @@ fn resolve_block(
             window_start,
             score_env,
             fill,
+            channel_rule,
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(build.resume.clone());

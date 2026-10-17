@@ -251,6 +251,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
     }
 
     validate_schedules(path, &channel.rule)?;
+    validate_channel_repeat(path, &channel.rule)?;
 
     Ok(())
 }
@@ -1235,6 +1236,21 @@ fn validate_pool_groups(
     Ok(())
 }
 
+/// `rule.no_repeat_within` is enforced by the pattern walk alone, so on a
+/// channel with no pattern block it would do nothing — an unused knob that
+/// reads as a guarantee. Refused rather than silently ignored.
+fn validate_channel_repeat(path: &Path, rule: &super::RuleConfig) -> Result<(), ConfigError> {
+    if rule.no_repeat_within.is_some() && !rule.all_blocks().any(|b| b.is_pattern()) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: "`rule.no_repeat_within` is checked by the pattern walk, and this channel \
+                      has no pattern block; use a block's own `constraints` instead"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 /// `rule.schedules` and `rule.slots` (ADR 0004): every schedule names
 /// itself uniquely, places at least one range, places only slots that exist,
 /// and never places two slots over the same minute; every slot is placed by
@@ -1798,6 +1814,30 @@ mod tests {
             separate_min_gap: Some(5),
         });
         assert_eq!(channel_with(vec![a, b]).adjacency_reach(), 5);
+    }
+
+    /// `rule.no_repeat_within` already counts channel positions, so a 24h rule
+    /// sizes the tail at its own conversion (one position per assumed minute),
+    /// and outranks a block whose reach is narrower.
+    #[test]
+    fn adjacency_reach_covers_the_channel_rule() {
+        let mut c = channel_with(vec![pattern_block(
+            vec![pool("movies")],
+            vec![step("movies", 1)],
+        )]);
+        assert_eq!(c.adjacency_reach(), 0);
+        c.rule.no_repeat_within = Some(NoRepeatWithin::Duration(Duration::from_secs(24 * 3600)));
+        assert_eq!(c.adjacency_reach(), 24 * 60);
+    }
+
+    /// Only the pattern walk checks the channel rule, so a channel with no
+    /// pattern block is refused rather than handed a rule that does nothing.
+    #[test]
+    fn a_channel_rule_without_a_pattern_block_is_refused() {
+        let mut c = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        c.rule.no_repeat_within = Some(NoRepeatWithin::Positions(3));
+        let err = validate_channel(&dummy_path(), &c).unwrap_err().to_string();
+        assert!(err.contains("rule.no_repeat_within"), "{err}");
     }
 
     /// A pool's gap counts *its own* draws, so the aired history it needs is

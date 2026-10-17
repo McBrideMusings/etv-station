@@ -37,6 +37,20 @@ pub enum NoRepeatWithin {
     Duration(Duration),
 }
 
+impl NoRepeatWithin {
+    /// How many positions back this gap can reach — the count itself when
+    /// positional, and a conservative conversion when temporal (see
+    /// [`MIN_ASSUMED_ITEM_SECS`]).
+    pub fn reach(self) -> usize {
+        match self {
+            NoRepeatWithin::Positions(n) => n,
+            NoRepeatWithin::Duration(d) => {
+                usize::try_from(d.as_secs().div_ceil(MIN_ASSUMED_ITEM_SECS)).unwrap_or(usize::MAX)
+            }
+        }
+    }
+}
+
 impl Default for NoRepeatWithin {
     /// `Positions(0)` — the unconstrained sentinel `Constraints::no_repeat_gap`
     /// resolves an absent value to, matching `separate`'s own `0`.
@@ -154,13 +168,7 @@ impl Constraints {
     /// against real (estimated) item durations once the history this sizes is
     /// in hand.
     pub fn reach(&self) -> usize {
-        let no_repeat_positions = match self.no_repeat_gap() {
-            NoRepeatWithin::Positions(n) => n,
-            NoRepeatWithin::Duration(d) => {
-                usize::try_from(d.as_secs().div_ceil(MIN_ASSUMED_ITEM_SECS)).unwrap_or(usize::MAX)
-            }
-        };
-        no_repeat_positions.max(self.separate_gap())
+        self.no_repeat_gap().reach().max(self.separate_gap())
     }
 }
 

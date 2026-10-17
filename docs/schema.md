@@ -613,7 +613,7 @@ hooks of both scopes.
 
 The event is `{hook, trigger, scope, channel, fired_at, data}`: stdin JSON for an
 executable, the `event` constant for a script. A `cron` run still going when its interval
-elapses again makes that interval skip (`hook.skipped`); firings of the other triggers queue behind a run in flight and run one at a time (`hook.dropped` past 1000 waiting). A run is killed after 10 minutes (a script is also stopped after 100 million operations). A reload drops firings still queued, waits for a run in flight, then restarts every interval from zero. A failed run's `hook.run` line carries the last 1000 bytes of the program's stderr. The station keeps no record
+elapses again makes that interval skip (`hook.skipped`); firings of the other triggers queue behind a run in flight and run one at a time (`hook.dropped` past 1000 waiting). A run is killed after 10 minutes (a script is also stopped after 100 million operations). A reload drops firings still queued and kills a run in flight (`hook.run` reports `killed by a config reload`), so it never waits on a hook (a script blocked in `http` finishes that call, at most 30 seconds, before it stops); daemon shutdown kills runs the same way; the next generation's hooks then start, and every interval restarts from zero. A hook that must survive a reload has to hand its work to a process of its own. A failed run's `hook.run` line carries the last 1000 bytes of the program's stderr. The station keeps no record
 of executions, so a script that starts outside work owns its own deduplication.
 
 Each run logs one `hook.run` line with `hook` (`station#0`, `channel:<name>#1`),
@@ -1794,7 +1794,7 @@ opened only by name:
 
 | Capability | Gates | Declared as |
 |---|---|---|
-| `catalog_read` | `ctx.sets` — the items each `sources()` query matched | `"catalog_read"` |
+| `catalog_read` | `ctx.sets` — the items each `sources()` query matched; `ctx.entry_id_for(source, id)` — the `entry_id` the catalog filed under that `(source, source_id)` provenance row (`source` is `"plex"` or `"local_fs"`), or `()` when none matches, so a script joining its own external history (a Tautulli `rating_key`) resolves it without the daemon owning the join (ADR 0014) | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
 | `http` | `ctx.http(url, method, body)` — one HTTP call returning the response body as text; a 4xx/5xx, a transport failure or 10 seconds without a response is an error; one `pick()` call's `ctx.http` calls together may spend 30 seconds, after which each further call errors at once, naming the budget (ADR 0014) | `"http"` |
 | a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
@@ -2489,7 +2489,41 @@ draws alone, so if two pools in one block resolve the same `entry_id`, neither
 pool's constraint sees the collision. Pools that must not collide have to be
 disjoint by construction — `examples/samples/kungfu.yaml` does it with the pools'
 own expressions, `examples/samples/foryou.yaml` with a plugin that splits on
-`item.type` — because the pool contract does not guarantee it.
+`item.type` — or the channel has to say so with `rule.no_repeat_within` (below),
+because the pool contract does not guarantee it.
+
+**`rule.no_repeat_within` spaces the whole channel.** Set on `rule`, beside
+`blocks` and `slots`, it takes the same two spellings and counts **channel**
+positions or wall-clock time across every pool, block and slot:
+
+```yaml
+rule:
+  no_repeat_within: "7d"   # no film twice in a week, whichever pool draws it
+  blocks:
+    - pools: [ … ]
+```
+
+The pattern walk checks it at every draw, beside the drawing pool's own rule,
+against one history: the play-history ledger's tail — every pool and slot that
+aired — then what earlier pattern and sequencer blocks of the same generation laid, then each
+draw as it is made. A series whose next item fails it is passed over exactly as a
+pool-rule clash is: a round-robin pool slides to the next series, a random pool
+rerolls. When nothing passes both, the channel rule gives way first, so the
+pool's own rule holds as it would without it; a draw that airs against the
+channel rule is logged as `constraints.unsatisfied` with `scope: channel`, and
+every generation it moved a draw logs `channel_repeat.applied` with how many
+draws it moved off their first choice (`blocked`) and how many aired against it
+anyway (`forced`). An earlier entries block of the same generation is not yet
+in the history — its list is seated and cut after the pattern blocks run — so
+it counts from the next generation on, once the ledger holds it.
+
+It does not ask a pool's source for more: a pool that has aired everything it
+holds refills as it always did, and a plugin pool already sees the channel's tail
+in `ctx.recent`. Entries and sequencer blocks are counted in the history but
+not constrained by it — a flat authored list and a script both own their order
+— and a channel with no pattern block
+fails its load if it sets the key. The tail the station keeps is sized to cover
+it, so a `"7d"` rule holds across generation boundaries too.
 
 **Mind the window size.** A no-repeat rule on a pool the pattern draws heavily
 from marches that pool forward instead of letting it revisit, so the wider
