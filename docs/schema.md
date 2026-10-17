@@ -1034,7 +1034,8 @@ draws nothing; move those three keys under a `graphics:` entry.
 (the catalog's rating for the item, `""` when it has none), the `next_*`
 equivalents, `item_elapsed`, `item_remaining`, `item_duration` (the two summed, `-1.0`
 when either is unknown), its own `config`, and the item's opaque blob as
-`metadata`. `prev_metadata` is the blob of the item that
+`metadata` (an empty map when the item attached none, so `metadata.foo == ()`
+works on any item). `prev_metadata` is the blob of the item that
 aired before it, so a script can notice a change between consecutive items;
 it is `()` for a channel's first item and when the earlier item carried none.
 Test for a map with `type_of(prev_metadata) == "map"` before reading a key
