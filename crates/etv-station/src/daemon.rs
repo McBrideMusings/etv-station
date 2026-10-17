@@ -2501,6 +2501,44 @@ mod regen_floor_tests {
         assert_eq!(regen_floor(&channel, boundary).await.unwrap(), boundary);
     }
 
+    /// A repair cuts at the broken item's own start, mid-chunk: films 3-6 go,
+    /// films 1-2 stay, and the surviving file stops claiming the cut span.
+    /// `regen_floor` at that instant would answer the chunk's end and keep film 3.
+    #[tokio::test]
+    async fn a_repair_cut_mid_chunk_removes_the_item_at_the_cut() {
+        let dir = tempdir().unwrap();
+        let channel = ch(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let anchor = datetime!(2026-01-01 00:00 UTC);
+        let items: Vec<_> = (0..6).map(|i| film(&format!("f{i}"), 3600)).collect();
+        let durations = vec![Duration::from_secs(3600); 6];
+        let rule = Sequential::new(&items, &durations);
+        emit_window(
+            &channel.output_folder,
+            &rule,
+            anchor,
+            tz,
+            6,
+            anchor,
+            anchor + rule.total_duration(),
+        )
+        .await
+        .unwrap();
+
+        let at = anchor + time::Duration::hours(2);
+        assert_eq!(
+            regen_floor(&channel, at).await.unwrap(),
+            anchor + time::Duration::hours(6),
+            "the floor reads past the item, which is why a repair does not use it",
+        );
+        wipe_playout_from(&channel, at).await.unwrap();
+
+        let files = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        assert_eq!(scan::highest_finish(&files).await, Some(at));
+    }
+
     /// Nothing written yet: regen_floor is a no-op, not an error.
     #[tokio::test]
     async fn returns_from_unchanged_with_no_existing_files() {
@@ -2801,6 +2839,34 @@ async fn forward_channel_loop(
     if resume.config_id.as_deref() != config_id.as_deref() {
         resume.config_id = config_id;
         crate::resume::save(&channel.output_folder, &resume).await?;
+    }
+
+    // ADR 0010: config is the only thing that moves a published slot for
+    // staleness, but a slot whose title is gone cannot play. The sweep can only
+    // swap in an error card (spans are fixed); a rewind from that item's own
+    // start lets a real title take the slot.
+    let unaired = crate::reconcile::unaired_items(channel, now).await?;
+    let unplayable = match catalog.as_ref() {
+        Some(catalog) => crate::reconcile::first_unplayable(catalog, &unaired)?,
+        None => None,
+    };
+    if let Some(at) = unplayable {
+        // `at` is an item's own start, so it is already an item boundary and
+        // nothing straddles it; `regen_floor` would read past it to the end of
+        // the containing chunk and leave the broken item in place. Only items
+        // starting after `now` are considered, so the airing item is never cut.
+        let regen_from = at;
+        let removed = wipe_playout_from(channel, regen_from).await?;
+        let cut = rewind_to_surviving(channel, ctx, &mut resume, regen_from).await?;
+        tracing::info!(
+            event = "resume.repair",
+            channel = %channel.name,
+            item_start = %at,
+            from = %regen_from,
+            truncated_from = %cut,
+            removed = removed,
+            "a scheduled title is no longer in the library; regenerating from that item's start",
+        );
     }
 
     resume = pattern_catch_up(channel, ctx, &mut catalog, resume, "startup").await?;
