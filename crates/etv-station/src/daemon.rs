@@ -3291,6 +3291,7 @@ async fn pattern_catch_up(
                     // way. The flag is what keeps a scorer from counting an
                     // error card as a film somebody watched.
                     error_card: item.error_card,
+                    ..Default::default()
                 }
             })
             .collect();

@@ -167,6 +167,7 @@ async fn repair_channel(
             start: *start,
             played_at: now,
             error_card: false,
+            ..Default::default()
         })
         .collect();
 
@@ -254,6 +255,7 @@ mod tests {
                 start: cursor,
                 played_at: cursor,
                 error_card: false,
+                ..Default::default()
             });
             cursor = finish;
         }

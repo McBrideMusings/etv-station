@@ -618,6 +618,26 @@ whole station — one bad channel config costs one channel, not the station
   logged naming both config files and the number; neither is silently
   preferred, and every channel with a unique number still serves.
 
+### The airings ledger
+
+`history.db` holds one `airings` row per playout item, programmes and bumper
+segments alike. `kind` is `programme` or `bumper`; a bumper row also carries
+`source` (the clip or still path, render path, or lavfi graph), `in_ms` and
+`out_ms` (the slice of a clip played) and `produced_by` (the plugin script that
+built it). The resume cursor, the adjacency tail and the scorer's recency input
+read `kind = programme` rows only, so a bumper segment never moves a series or
+counts as a repeat. A rewind deletes rows at and after the rewind instant, so
+bumper rows leave with the schedule they belonged to.
+
+A bumper script reads the ledger with `ctx.airings(filter)`, which needs no
+capability grant. It returns an array of maps `#{ channel, entry_id, show_id,
+start_ms, kind, source, in_ms, out_ms, produced_by, error_card }`, past and
+scheduled rows alike. Filter keys, all optional: `channel` (default the
+bumper's own; `"*"` for every channel), `kind`, `entry_id`, `show_id`,
+`source`, `produced_by`, `from_ms` and `to_ms` (epoch milliseconds bounding the
+start; inclusive, exclusive), `order` (`"asc"` default, or `"desc"`) and
+`limit` (default 100, at most 1000). An unknown key is an error.
+
 ### Channel identity
 
 `name:` is the channel's identity (#414). It is required, and it is **never

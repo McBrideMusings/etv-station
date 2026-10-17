@@ -125,6 +125,7 @@ fn advance_state(
             start: OffsetDateTime::UNIX_EPOCH,
             played_at: OffsetDateTime::UNIX_EPOCH,
             error_card: false,
+            ..Default::default()
         })
         .collect();
     db.record(CHANNEL, &seed).unwrap();
@@ -136,6 +137,7 @@ fn advance_state(
             start: OffsetDateTime::UNIX_EPOCH,
             played_at: OffsetDateTime::UNIX_EPOCH,
             error_card: false,
+            ..Default::default()
         })
         .collect();
     db.record(CHANNEL, &airings).unwrap();

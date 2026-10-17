@@ -3378,6 +3378,7 @@ mod tests {
                 start: OffsetDateTime::UNIX_EPOCH,
                 played_at: OffsetDateTime::UNIX_EPOCH,
                 error_card: false,
+                ..Default::default()
             })
             .collect();
         db.record(CHANNEL, &seed).unwrap();
@@ -3389,6 +3390,7 @@ mod tests {
                 start: OffsetDateTime::UNIX_EPOCH,
                 played_at: OffsetDateTime::UNIX_EPOCH,
                 error_card: false,
+                ..Default::default()
             })
             .collect();
         db.record(CHANNEL, &airings).unwrap();
@@ -3726,6 +3728,7 @@ mod tests {
                 start: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(i as i64),
                 played_at: OffsetDateTime::UNIX_EPOCH,
                 error_card: false,
+                ..Default::default()
             })
             .collect();
         db.record(CHANNEL, &records).unwrap();
