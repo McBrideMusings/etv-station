@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ersatztv_channel::playback_events::PlaybackEvent;
 use rhai::{Array, Dynamic, Engine, Map, Scope};
 use time::OffsetDateTime;
 use tokio::sync::Notify;
@@ -708,6 +709,120 @@ pub async fn run_schedule_watch(
     }
 }
 
+/// How often the playback watcher looks for new lines in the worker's log.
+const PLAYBACK_POLL: Duration = Duration::from_millis(500);
+
+/// The complete lines of the playback log past `offset`, decoded, and the
+/// offset after them. A log shorter than `offset` was dropped by the worker
+/// and is read from its start; a missing log reads as empty. A trailing line
+/// without its newline is left for the next look.
+fn read_playback_events(path: &std::path::Path, offset: u64) -> (Vec<PlaybackEvent>, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (Vec::new(), 0);
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let offset = if len < offset { 0 } else { offset };
+    let mut buf = Vec::new();
+    if file.seek(SeekFrom::Start(offset)).is_err() || file.read_to_end(&mut buf).is_err() {
+        return (Vec::new(), offset);
+    }
+    let Some(end) = buf.iter().rposition(|b| *b == b'\n') else {
+        return (Vec::new(), offset);
+    };
+    let events = buf[..end]
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| match serde_json::from_slice(line) {
+            Ok(event) => Some(event),
+            Err(e) => {
+                tracing::warn!(
+                    event = "playback.bad_line",
+                    path = %path.display(),
+                    error = %e,
+                    line = %String::from_utf8_lossy(line),
+                    "skipping an unreadable playback log line",
+                );
+                None
+            }
+        })
+        .collect();
+    (events, offset + end as u64 + 1)
+}
+
+/// The trigger a playback log line fires, the event name it logs under, and
+/// the hook's `data`.
+fn playback_hook(event: &PlaybackEvent) -> (HookTrigger, &'static str, serde_json::Value) {
+    let rfc = &time::format_description::well_known::Rfc3339;
+    let stamp = |t: &OffsetDateTime| t.format(rfc).unwrap_or_default();
+    match event {
+        PlaybackEvent::SessionStarted { at, .. } => (
+            HookTrigger::ViewerStart,
+            "session_started",
+            serde_json::json!({ "at": stamp(at) }),
+        ),
+        PlaybackEvent::SessionStopped { at, .. } => (
+            HookTrigger::ViewerStop,
+            "session_stopped",
+            serde_json::json!({ "at": stamp(at) }),
+        ),
+        PlaybackEvent::ItemStarted {
+            at,
+            item_id,
+            start,
+            finish,
+            title,
+            ..
+        } => (
+            HookTrigger::PlaybackItemChange,
+            "item_started",
+            serde_json::json!({
+                "at": stamp(at),
+                "item": {
+                    "id": item_id,
+                    "title": title,
+                    "start": stamp(start),
+                    "finish": stamp(finish),
+                },
+            }),
+        ),
+    }
+}
+
+/// Tail the playback log ETV-next's channel worker writes into `folder` and
+/// fire `playback_item_change`, `viewer_start` and `viewer_stop` for each new
+/// line. Lines already in the log when the watcher starts are history and
+/// fire nothing.
+pub async fn run_playback_watch(
+    bus: Arc<HookBus>,
+    channel: String,
+    folder: PathBuf,
+    stop: Arc<Notify>,
+) {
+    let path = folder.join(ersatztv_core::PLAYBACK_EVENTS_FILE_NAME);
+    let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    loop {
+        let (events, next) = read_playback_events(&path, offset);
+        offset = next;
+        for event in &events {
+            let (trigger, name, data) = playback_hook(event);
+            tracing::info!(
+                event = "playback.event",
+                channel = %channel,
+                kind = name,
+                data = %data,
+                "channel worker reported playback",
+            );
+            bus.fire(trigger, Some(&channel), data);
+        }
+        tokio::select! {
+            biased;
+            _ = stop.notified() => break,
+            _ = tokio::time::sleep(PLAYBACK_POLL) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1112,98 @@ mod tests {
         assert_eq!(lines[0]["data"]["item"]["id"], "two");
         assert_eq!(lines[0]["data"]["previous"]["id"], "one");
         assert_eq!(lines[0]["channel"], "news");
+    }
+
+    fn playback_lines(ids: &[&str]) -> String {
+        ids.iter()
+            .map(|id| {
+                format!(
+                    "{{\"event\":\"item_started\",\"at\":\"2026-01-01T12:00:00Z\",\"channel\":\"7\",\"item_id\":\"{id}\",\"start\":\"2026-01-01T12:00:00Z\",\"finish\":\"2026-01-01T12:30:00Z\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    /// The reader returns only lines past its offset, leaves a line still
+    /// being written, and starts over when the worker dropped the log.
+    #[test]
+    fn the_playback_reader_resumes_at_its_offset_and_survives_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".playback-events.jsonl");
+        assert_eq!(read_playback_events(&path, 0), (vec![], 0));
+
+        let first = playback_lines(&["a"]);
+        std::fs::write(&path, format!("{first}{{\"event\":\"item_st")).unwrap();
+        let (events, offset) = read_playback_events(&path, 0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(offset, first.len() as u64);
+
+        std::fs::write(&path, format!("{first}{}", playback_lines(&["b"]))).unwrap();
+        let (events, after) = read_playback_events(&path, offset);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], PlaybackEvent::ItemStarted { item_id, .. } if item_id == "b"));
+
+        std::fs::write(&path, playback_lines(&["c"])).unwrap();
+        let (events, _) = read_playback_events(&path, after);
+        assert!(matches!(&events[0], PlaybackEvent::ItemStarted { item_id, .. } if item_id == "c"));
+    }
+
+    /// A line the worker appends after the watcher starts reaches a
+    /// `playback_item_change` hook with the item in `data`; a line already in
+    /// the log at start does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_line_fires_playback_item_change_but_history_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen.jsonl");
+        write_script(
+            &dir.path().join("h.sh"),
+            &format!(
+                "#!/bin/sh\ncat >> {}\necho >> {}\n",
+                out.display(),
+                out.display()
+            ),
+        );
+        let folder = dir.path().join("playout");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join(ersatztv_core::PLAYBACK_EVENTS_FILE_NAME),
+            playback_lines(&["old"]),
+        )
+        .unwrap();
+        let bus = Arc::new(HookBus::new(vec![on(
+            HookTrigger::PlaybackItemChange,
+            HookScope::Station,
+            "h.sh",
+            dir.path(),
+        )]));
+        let stop = Arc::new(Notify::new());
+        let watch = tokio::spawn(run_playback_watch(
+            bus.clone(),
+            "news".into(),
+            folder.clone(),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ersatztv_channel::playback_events::append(
+            &folder,
+            &serde_json::from_str(playback_lines(&["new"]).trim()).unwrap(),
+        );
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        stop.notify_one();
+        watch.await.unwrap();
+        bus.drain().await;
+        let text = std::fs::read_to_string(out).unwrap();
+        let seen: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(seen.len(), 1, "{text}");
+        assert_eq!(seen[0]["trigger"], "playback_item_change");
+        assert_eq!(seen[0]["channel"], "news");
+        assert_eq!(seen[0]["data"]["item"]["id"], "new");
+        assert_eq!(seen[0]["data"]["item"]["finish"], "2026-01-01T12:30:00Z");
     }
 
     #[test]

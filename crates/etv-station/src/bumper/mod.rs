@@ -3,4 +3,5 @@
 //! [`hook`] runs the plugin's `build(ctx)`.
 
 pub mod hook;
+pub mod ledger;
 pub mod timeline;

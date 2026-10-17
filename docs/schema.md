@@ -583,6 +583,15 @@ hooks:
 | `generation_end` | after a channel writes one generation of schedule | that channel | `{phase, from, to, items, files}` |
 | `chunk_written` | for each playout file a generation writes | that channel | `{path, phase}` |
 | `schedule_item_change` | when the station clock passes an item boundary on a channel, watched or not; the item airing when the daemon starts is the baseline and fires nothing | that channel | `{item, previous}`, each `{id, title, start, finish}` |
+| `playback_item_change` | when ETV-next's channel worker begins encoding an item (it leads what the viewer sees by the worker's transcode buffer); only while someone is watching. Items already logged when the daemon starts fire nothing | that channel | `{at, item}`, `item` is `{id, title, start, finish}` |
+| `viewer_start` | when a viewer tunes in and ETV-next starts the channel's worker | that channel | `{at}` |
+| `viewer_stop` | when the worker ends: the last viewer left, or the run failed. A worker killed by a signal writes nothing, so no `viewer_stop` follows | that channel | `{at}` |
+
+The three playback triggers read `.playback-events.jsonl` in the channel's
+playout folder, one JSON line per event, written by the vendored ETV-next
+worker (`ersatztv-channel`'s `playback_events.rs`). The worker drops the file at
+a session start once it passes 256 KiB. The station polls it every 500 ms and
+logs each line it fires as `playback.event`.
 
 A hook in `station.yaml` runs for every channel's events; a hook in a
 `channel.yaml` runs only for that channel's. `startup` and `config_reload` reach
@@ -617,6 +626,26 @@ whole station — one bad channel config costs one channel, not the station
 - **Two channels declaring the same `number:` are both refused.** An ERROR is
   logged naming both config files and the number; neither is silently
   preferred, and every channel with a unique number still serves.
+
+### The airings ledger
+
+`history.db` holds one `airings` row per playout item, programmes and bumper
+segments alike. `kind` is `programme` or `bumper`; a bumper row also carries
+`source` (the clip or still path, render path, or lavfi graph), `in_ms` and
+`out_ms` (the slice of a clip played) and `produced_by` (the plugin script that
+built it). The resume cursor, the adjacency tail and the scorer's recency input
+read `kind = programme` rows only, so a bumper segment never moves a series or
+counts as a repeat. A rewind deletes rows at and after the rewind instant, so
+bumper rows leave with the schedule they belonged to.
+
+A bumper script reads the ledger with `ctx.airings(filter)`, which needs no
+capability grant. It returns an array of maps `#{ channel, entry_id, show_id,
+start_ms, kind, source, in_ms, out_ms, produced_by, error_card }`, past and
+scheduled rows alike. Filter keys, all optional: `channel` (default the
+bumper's own; `"*"` for every channel), `kind`, `entry_id`, `show_id`,
+`source`, `produced_by`, `from_ms` and `to_ms` (epoch milliseconds bounding the
+start; inclusive, exclusive), `order` (`"asc"` default, or `"desc"`) and
+`limit` (default 100, at most 1000). An unknown key is an error.
 
 ### Channel identity
 

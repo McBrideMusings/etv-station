@@ -97,6 +97,125 @@ pub struct PlayRecord {
     /// [`HistoryDb::tail`] filters on this flag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub error_card: bool,
+
+    /// Whether this row is a programme (a catalog item the scheduler chose) or
+    /// one segment of a bumper timeline filling a gap. Every read that stands
+    /// for "what was watched" or "where a series is" — the resume cursor, the
+    /// adjacency tail, the recency input — counts programmes only.
+    #[serde(default, skip_serializing_if = "AiringKind::is_programme")]
+    pub kind: AiringKind,
+
+    /// The media the slot played: the file path for a clip or still, the
+    /// profile for a render, the lavfi graph for a generated source. `None`
+    /// for a programme, which `entry_id` already names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// For a clip segment, the slice of `source` played, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_ms: Option<u64>,
+
+    /// The plugin script that built a bumper segment; `None` for a programme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_by: Option<String>,
+}
+
+/// A programme row at the Unix epoch with no entry: a base for struct-update
+/// syntax, so a caller names only the fields that differ.
+impl Default for PlayRecord {
+    fn default() -> Self {
+        Self {
+            entry_id: String::new(),
+            show_id: None,
+            start: OffsetDateTime::UNIX_EPOCH,
+            played_at: OffsetDateTime::UNIX_EPOCH,
+            error_card: false,
+            kind: AiringKind::Programme,
+            source: None,
+            in_ms: None,
+            out_ms: None,
+            produced_by: None,
+        }
+    }
+}
+
+/// What a ledger row is. See [`PlayRecord::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiringKind {
+    #[default]
+    Programme,
+    Bumper,
+}
+
+impl AiringKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiringKind::Programme => "programme",
+            AiringKind::Bumper => "bumper",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "programme" => Some(AiringKind::Programme),
+            "bumper" => Some(AiringKind::Bumper),
+            _ => None,
+        }
+    }
+
+    fn is_programme(&self) -> bool {
+        *self == AiringKind::Programme
+    }
+}
+
+/// One ledger row with the channel it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerRow {
+    pub channel: String,
+    pub record: PlayRecord,
+}
+
+/// A query over the ledger: every set field must match. `from`/`to` bound
+/// [`PlayRecord::start`] (inclusive, exclusive), so a filter reaches scheduled
+/// rows in the future exactly as it reaches rows already aired.
+#[derive(Debug, Clone)]
+pub struct AiringFilter {
+    pub channel: Option<String>,
+    pub kind: Option<AiringKind>,
+    pub entry_id: Option<String>,
+    pub show_id: Option<String>,
+    pub source: Option<String>,
+    pub produced_by: Option<String>,
+    pub from: Option<OffsetDateTime>,
+    pub to: Option<OffsetDateTime>,
+    /// Newest first when true, oldest first otherwise.
+    pub newest_first: bool,
+    pub limit: usize,
+}
+
+impl Default for AiringFilter {
+    /// Matches every row, newest last, capped at [`AiringFilter::DEFAULT_LIMIT`].
+    fn default() -> Self {
+        Self {
+            channel: None,
+            kind: None,
+            entry_id: None,
+            show_id: None,
+            source: None,
+            produced_by: None,
+            from: None,
+            to: None,
+            newest_first: false,
+            limit: Self::DEFAULT_LIMIT,
+        }
+    }
+}
+
+impl AiringFilter {
+    pub const DEFAULT_LIMIT: usize = 100;
 }
 
 impl PlayRecord {
@@ -138,6 +257,10 @@ pub enum HistoryError {
     /// it stores.
     #[error("history row has an unrepresentable start_ns: {ns}")]
     CorruptTimestamp { ns: i64 },
+
+    /// A `kind` column holding a string this module never writes.
+    #[error("history row has an unknown kind: {kind:?}")]
+    CorruptKind { kind: String },
 }
 
 /// Ordered migrations for the history database. Same discipline as the
@@ -169,6 +292,16 @@ const MIGRATIONS: &[&str] = &[
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    "#,
+    // v2 — bumper segments share the ledger with programmes. `kind` separates
+    // them; `source`, `in_ms`, `out_ms` and `produced_by` say what a segment
+    // played and which plugin built it. Existing rows are all programmes.
+    r#"
+    ALTER TABLE airings ADD COLUMN kind TEXT NOT NULL DEFAULT 'programme';
+    ALTER TABLE airings ADD COLUMN source TEXT;
+    ALTER TABLE airings ADD COLUMN in_ms INTEGER;
+    ALTER TABLE airings ADD COLUMN out_ms INTEGER;
+    ALTER TABLE airings ADD COLUMN produced_by TEXT;
     "#,
 ];
 
@@ -236,6 +369,12 @@ pub struct MigrationStats {
 /// bounded reads and writes behind one lock costs nothing next to that.
 pub struct HistoryDb {
     conn: Mutex<Connection>,
+}
+
+impl std::fmt::Debug for HistoryDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryDb").finish_non_exhaustive()
+    }
 }
 
 impl HistoryDb {
@@ -454,7 +593,7 @@ impl HistoryDb {
                            PARTITION BY COALESCE(show_id, entry_id)
                            ORDER BY start_ns DESC, id DESC
                        ) AS rn
-                FROM airings WHERE channel = ?1
+                FROM airings WHERE channel = ?1 AND kind = 'programme'
              ) WHERE rn = 1",
         )?;
         let rows = stmt.query_map(params![channel], |row| {
@@ -492,7 +631,7 @@ impl HistoryDb {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT entry_id FROM airings
-             WHERE channel = ?1 AND error_card = 0
+             WHERE channel = ?1 AND error_card = 0 AND kind = 'programme'
              ORDER BY start_ns DESC, id DESC
              LIMIT ?2",
         )?;
@@ -520,7 +659,7 @@ impl HistoryDb {
                        ROW_NUMBER() OVER (
                            PARTITION BY show_id ORDER BY start_ns DESC, id DESC
                        ) AS rn
-                FROM airings WHERE show_id IS NOT NULL
+                FROM airings WHERE show_id IS NOT NULL AND kind = 'programme'
              ) WHERE rn = 1",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -551,6 +690,97 @@ impl HistoryDb {
         Ok(())
     }
 
+    /// Rows matching `filter`, in start order, at most `filter.limit` of them
+    /// (`limit == 0` returns none). Scheduled rows are included: the ledger
+    /// holds every row until a rewind deletes it.
+    pub fn airings(&self, filter: &AiringFilter) -> Result<Vec<LedgerRow>, HistoryError> {
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let mut text = |clause: &'static str, v: &Option<String>| {
+            if let Some(v) = v {
+                clauses.push(clause);
+                args.push(v.clone().into());
+            }
+        };
+        text("channel = ?", &filter.channel);
+        text("kind = ?", &filter.kind.map(|k| k.as_str().to_string()));
+        text("entry_id = ?", &filter.entry_id);
+        text("show_id = ?", &filter.show_id);
+        text("source = ?", &filter.source);
+        text("produced_by = ?", &filter.produced_by);
+        if let Some(from) = filter.from {
+            clauses.push("start_ns >= ?");
+            args.push(to_ns(from).into());
+        }
+        if let Some(to) = filter.to {
+            clauses.push("start_ns < ?");
+            args.push(to_ns(to).into());
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        let order = if filter.newest_first { "DESC" } else { "ASC" };
+        args.push(i64::try_from(filter.limit).unwrap_or(i64::MAX).into());
+        let sql = format!(
+            "SELECT channel, entry_id, show_id, start_ns, played_at_ns, error_card,
+                    kind, source, in_ms, out_ms, produced_by
+             FROM airings {where_sql}
+             ORDER BY start_ns {order}, id {order}
+             LIMIT ?"
+        );
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                channel,
+                entry_id,
+                show_id,
+                start,
+                played_at,
+                err,
+                kind,
+                source,
+                in_ms,
+                out_ms,
+                by,
+            ) = row?;
+            out.push(LedgerRow {
+                channel,
+                record: PlayRecord {
+                    entry_id,
+                    show_id,
+                    start: from_ns(start)?,
+                    played_at: from_ns(played_at)?,
+                    error_card: err != 0,
+                    kind: AiringKind::parse(&kind).ok_or(HistoryError::CorruptKind { kind })?,
+                    source,
+                    in_ms: in_ms.and_then(|v| u64::try_from(v).ok()),
+                    out_ms: out_ms.and_then(|v| u64::try_from(v).ok()),
+                    produced_by: by,
+                },
+            });
+        }
+        Ok(out)
+    }
+
     /// How many airings are on record for `channel`.
     pub fn count(&self, channel: &str) -> Result<usize, HistoryError> {
         let conn = self.lock();
@@ -565,8 +795,9 @@ impl HistoryDb {
 
 fn insert_record(conn: &Connection, channel: &str, r: &PlayRecord) -> Result<(), HistoryError> {
     conn.execute(
-        "INSERT INTO airings (channel, entry_id, show_id, start_ns, played_at_ns, error_card)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO airings (channel, entry_id, show_id, start_ns, played_at_ns, error_card,
+                              kind, source, in_ms, out_ms, produced_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             channel,
             r.entry_id,
@@ -574,6 +805,11 @@ fn insert_record(conn: &Connection, channel: &str, r: &PlayRecord) -> Result<(),
             to_ns(r.start),
             to_ns(r.played_at),
             r.error_card as i64,
+            r.kind.as_str(),
+            r.source,
+            r.in_ms.map(|v| v as i64),
+            r.out_ms.map(|v| v as i64),
+            r.produced_by,
         ],
     )?;
     Ok(())
@@ -636,6 +872,7 @@ mod tests {
             start: at(hour),
             played_at: at(0),
             error_card: false,
+            ..Default::default()
         }
     }
 
@@ -646,6 +883,7 @@ mod tests {
             start: at(hour),
             played_at: at(0),
             error_card: false,
+            ..Default::default()
         }
     }
 
@@ -772,6 +1010,7 @@ mod tests {
                     start: at(1),
                     played_at: at(0),
                     error_card: true,
+                    ..Default::default()
                 },
             ],
         )
@@ -985,5 +1224,138 @@ mod tests {
         // Reopening the same file sees what was written.
         let reopened = HistoryDb::open(&path).unwrap();
         assert_eq!(reopened.count("ch1").unwrap(), 1);
+    }
+
+    fn bumper_row(name: &str, hour: i64) -> PlayRecord {
+        PlayRecord {
+            entry_id: name.into(),
+            start: at(hour),
+            played_at: at(0),
+            kind: AiringKind::Bumper,
+            source: Some(format!("/m/{name}.mkv")),
+            in_ms: Some(500),
+            out_ms: Some(2_500),
+            produced_by: Some("tease.rhai".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bumper_rows_never_move_a_cursor_or_the_tail() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        db.record(
+            "ch1",
+            &[
+                ep("s1e1", "show-a", 1),
+                bumper_row("tease", 2),
+                ep("s1e2", "show-a", 3),
+            ],
+        )
+        .unwrap();
+        // A bumper after the last programme must not become "last played".
+        db.record("ch1", &[bumper_row("late", 9)]).unwrap();
+
+        assert_eq!(db.tail("ch1", 5).unwrap(), vec!["s1e1", "s1e2"]);
+        assert_eq!(db.series_cursor("ch1").unwrap().len(), 1);
+        assert_eq!(db.series_cursor("ch1").unwrap()["show-a"], "s1e2");
+        assert_eq!(db.cross_channel_show_cursor().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn airings_filters_and_round_trips_bumper_columns() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        db.record("ch1", &[ep("s1e1", "show-a", 1), bumper_row("tease", 2)])
+            .unwrap();
+        db.record("ch2", &[bumper_row("other", 2)]).unwrap();
+
+        let rows = db
+            .airings(&AiringFilter {
+                channel: Some("ch1".into()),
+                kind: Some(AiringKind::Bumper),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record, bumper_row("tease", 2));
+
+        let everywhere = db
+            .airings(&AiringFilter {
+                produced_by: Some("tease.rhai".into()),
+                newest_first: true,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(everywhere.len(), 2);
+
+        let windowed = db
+            .airings(&AiringFilter {
+                channel: Some("ch1".into()),
+                from: Some(at(2)),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            windowed.len(),
+            1,
+            "from is inclusive, so the hour-1 row is out"
+        );
+    }
+
+    #[test]
+    fn a_rewind_deletes_future_bumper_rows_with_the_schedule() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        db.record(
+            "ch1",
+            &[
+                ep("s1e1", "show-a", 1),
+                bumper_row("early", 2),
+                bumper_row("future", 6),
+            ],
+        )
+        .unwrap();
+        db.truncate_from("ch1", at(4)).unwrap();
+        let left: Vec<String> = db
+            .airings(&AiringFilter {
+                channel: Some("ch1".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|r| r.record.entry_id)
+            .collect();
+        assert_eq!(left, vec!["s1e1", "early"]);
+    }
+
+    #[test]
+    fn a_v1_database_upgrades_with_its_rows_as_programmes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (1);
+                 INSERT INTO airings (channel, entry_id, show_id, start_ns, played_at_ns, error_card)
+                 VALUES ('ch1', 'old', 'show-a', 1000, 500, 0);",
+            )
+            .unwrap();
+        }
+        let db = HistoryDb::open(&path).unwrap();
+        let rows = db
+            .airings(&AiringFilter {
+                channel: Some("ch1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.entry_id, "old");
+        assert_eq!(rows[0].record.kind, AiringKind::Programme);
+        assert_eq!(rows[0].record.source, None);
+        assert_eq!(db.tail("ch1", 5).unwrap(), vec!["old"]);
     }
 }

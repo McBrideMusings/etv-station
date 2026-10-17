@@ -33,6 +33,13 @@
 //!   folder (up to [`READ_LIMIT_BYTES`]), or `()` when it does not exist. A path
 //!   that resolves outside that folder is an error.
 //!
+//! `ctx.airings(filter)` reads the airings ledger (`history.db`) and needs no
+//! grant: it is in-process and read-only. It returns an array of maps
+//! `#{ channel, entry_id, show_id, start_ms, kind, source, in_ms, out_ms,
+//! produced_by, error_card }`, past and scheduled rows alike. The filter keys
+//! are listed on [`airing_filter`]; with no `kind` it returns programmes and
+//! bumper segments together.
+//!
 //! The builder (`timeline()`, `segment()`, `clip(..)`) constructs the same
 //! [`Timeline`] structs a later declarative format would deserialize into.
 //! Every builder method counts its calls; [`BuiltTimeline::usage`] returns
@@ -47,6 +54,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rhai::{Dynamic, EvalAltResult, Map, Scope};
+use time::OffsetDateTime;
+
+use crate::history::{AiringFilter, AiringKind, HistoryDb, LedgerRow};
 
 use super::timeline::{
     AudioSource, Duration, OverlayVars, Segment, SegmentAudio, SegmentSource, Timeline,
@@ -90,6 +100,9 @@ pub struct BumperInput {
     /// Capabilities the channel granted this script; `ctx.probe` and
     /// `ctx.read` error unless their name is here.
     pub granted: Vec<String>,
+    /// The airings ledger `ctx.airings` reads; `None` answers every query
+    /// with an empty array.
+    pub history: Option<Arc<HistoryDb>>,
 }
 
 /// A script's timeline plus how it built it.
@@ -172,6 +185,8 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from(".")),
         granted: input.granted.clone(),
+        history: input.history.clone(),
+        channel: input.channel.name.clone(),
     });
     let mut scope = Scope::new();
     let value: Dynamic = engine
@@ -570,6 +585,9 @@ struct Host {
     /// The plugin's own folder: the only place `ctx.read` reaches.
     dir: PathBuf,
     granted: Vec<String>,
+    history: Option<Arc<HistoryDb>>,
+    /// The channel `ctx.airings` queries unless the filter names another.
+    channel: String,
 }
 
 impl Host {
@@ -596,6 +614,29 @@ impl Host {
         }
     }
 
+    /// `ctx.airings(filter)`: ledger rows, past and scheduled, as maps.
+    fn airings(&self, filter: Map) -> RhaiResult<Dynamic> {
+        let parsed = airing_filter(&filter, &self.channel)?;
+        let rows = match &self.history {
+            Some(db) => db
+                .airings(&parsed)
+                .map_err(|e| format!("ctx.airings(): {e}"))?,
+            None => Vec::new(),
+        };
+        tracing::info!(
+            event = "bumper.airings",
+            channel = %self.channel,
+            filter = ?parsed,
+            rows = rows.len(),
+            "bumper script queried the airings ledger"
+        );
+        Ok(rows
+            .into_iter()
+            .map(|row| Dynamic::from_map(airing_map(row)))
+            .collect::<Vec<_>>()
+            .into())
+    }
+
     fn read(&self, path: &str) -> RhaiResult<Dynamic> {
         self.require("read")?;
         let text = read_in_dir(&self.dir, path).map_err(|e| format!("ctx.read(): {e}"))?;
@@ -607,6 +648,98 @@ impl Host {
         );
         Ok(text.map(Dynamic::from).unwrap_or(Dynamic::UNIT))
     }
+}
+
+/// The default and largest `limit` of a `ctx.airings` call.
+const AIRINGS_DEFAULT_LIMIT: usize = 100;
+const AIRINGS_MAX_LIMIT: usize = 1000;
+
+/// A `ctx.airings` filter map as an [`AiringFilter`]. Keys: `channel` (default
+/// the bumper's own; `"*"` for every channel), `kind` (`"programme"` or
+/// `"bumper"`), `entry_id`, `show_id`, `source`, `produced_by`, `from_ms` and
+/// `to_ms` (epoch milliseconds bounding the start, inclusive then exclusive),
+/// `order` (`"asc"` or `"desc"`, default `"asc"`) and `limit` (default 100,
+/// at most 1000). An unknown key is an error, so a typo never widens a query.
+fn airing_filter(filter: &Map, own_channel: &str) -> RhaiResult<AiringFilter> {
+    let text = |key: &str, v: &Dynamic| -> RhaiResult<String> {
+        v.clone()
+            .into_string()
+            .map_err(|_| format!("ctx.airings(): `{key}` must be a string").into())
+    };
+    let ms = |key: &str, v: &Dynamic| -> RhaiResult<OffsetDateTime> {
+        let n = v
+            .as_int()
+            .map_err(|_| format!("ctx.airings(): `{key}` must be an integer of milliseconds"))?;
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(n) * 1_000_000)
+            .map_err(|_| format!("ctx.airings(): `{key}` is out of range").into())
+    };
+    let mut out = AiringFilter {
+        channel: Some(own_channel.to_string()),
+        limit: AIRINGS_DEFAULT_LIMIT,
+        ..Default::default()
+    };
+    for (key, value) in filter {
+        match key.as_str() {
+            "channel" => {
+                let c = text("channel", value)?;
+                out.channel = (c != "*").then_some(c);
+            }
+            "kind" => {
+                let k = text("kind", value)?;
+                out.kind = Some(AiringKind::parse(&k).ok_or_else(|| {
+                    format!("ctx.airings(): `kind` must be \"programme\" or \"bumper\", got {k:?}")
+                })?);
+            }
+            "entry_id" => out.entry_id = Some(text("entry_id", value)?),
+            "show_id" => out.show_id = Some(text("show_id", value)?),
+            "source" => out.source = Some(text("source", value)?),
+            "produced_by" => out.produced_by = Some(text("produced_by", value)?),
+            "from_ms" => out.from = Some(ms("from_ms", value)?),
+            "to_ms" => out.to = Some(ms("to_ms", value)?),
+            "order" => {
+                out.newest_first = match text("order", value)?.as_str() {
+                    "asc" => false,
+                    "desc" => true,
+                    other => {
+                        return err(format!(
+                            "ctx.airings(): `order` must be \"asc\" or \"desc\", got {other:?}"
+                        ));
+                    }
+                }
+            }
+            "limit" => {
+                let n = value
+                    .as_int()
+                    .map_err(|_| "ctx.airings(): `limit` must be an integer".to_string())?;
+                out.limit = usize::try_from(n)
+                    .map_err(|_| "ctx.airings(): `limit` must not be negative".to_string())?
+                    .min(AIRINGS_MAX_LIMIT);
+            }
+            other => return err(format!("ctx.airings(): unknown filter key `{other}`")),
+        }
+    }
+    Ok(out)
+}
+
+fn airing_map(row: LedgerRow) -> Map {
+    let LedgerRow { channel, record } = row;
+    let opt = |v: Option<String>| v.map(Dynamic::from).unwrap_or(Dynamic::UNIT);
+    let opt_ms = |v: Option<u64>| v.map(|n| Dynamic::from(n as i64)).unwrap_or(Dynamic::UNIT);
+    let mut m = Map::new();
+    m.insert("channel".into(), channel.into());
+    m.insert("entry_id".into(), record.entry_id.into());
+    m.insert("show_id".into(), opt(record.show_id));
+    m.insert(
+        "start_ms".into(),
+        ((record.start.unix_timestamp_nanos() / 1_000_000) as i64).into(),
+    );
+    m.insert("kind".into(), record.kind.as_str().to_string().into());
+    m.insert("source".into(), opt(record.source));
+    m.insert("in_ms".into(), opt_ms(record.in_ms));
+    m.insert("out_ms".into(), opt_ms(record.out_ms));
+    m.insert("produced_by".into(), opt(record.produced_by));
+    m.insert("error_card".into(), record.error_card.into());
+    m
 }
 
 /// `path` read as text, when it resolves inside `dir`. `Ok(None)` for a file
@@ -720,6 +853,10 @@ fn bumper_engine(host: Host) -> rhai::Engine {
 
     let h = host.clone();
     engine.register_fn("probe", move |_ctx: &mut Map, path: &str| h.probe(path));
+    let h = host.clone();
+    engine.register_fn("airings", move |_ctx: &mut Map, filter: Map| {
+        h.airings(filter)
+    });
     engine.register_fn("read", move |_ctx: &mut Map, path: &str| host.read(path));
 
     engine
@@ -993,6 +1130,7 @@ mod tests {
             },
             air_date: "2026-10-17".into(),
             granted: Vec::new(),
+            history: None,
         }
     }
 
@@ -1278,5 +1416,107 @@ fn build(ctx) {{
             panic!("probe duration became {:?}", seg.duration)
         };
         assert!((1500..1520).contains(&ms), "{ms}");
+    }
+
+    fn ledger_with_a_programme_and_two_bumpers() -> Arc<HistoryDb> {
+        use crate::history::PlayRecord;
+        use time::macros::datetime;
+        let db = HistoryDb::open_in_memory().unwrap();
+        let t0 = datetime!(2026-10-17 20:00 UTC);
+        let bumper = |name: &str, secs: i64, source: &str| PlayRecord {
+            entry_id: name.into(),
+            start: t0 + time::Duration::seconds(secs),
+            played_at: t0,
+            kind: AiringKind::Bumper,
+            source: Some(source.into()),
+            in_ms: Some(1_000),
+            out_ms: Some(4_000),
+            produced_by: Some("tease.rhai".into()),
+            ..Default::default()
+        };
+        let programme = PlayRecord {
+            entry_id: "film-1".into(),
+            start: t0 + time::Duration::seconds(60),
+            played_at: t0,
+            ..Default::default()
+        };
+        db.record(
+            "Night",
+            &[
+                bumper("a", 0, "/m/a.mkv"),
+                programme,
+                bumper("b", 120, "/m/b.mkv"),
+            ],
+        )
+        .unwrap();
+        db.record("Other", &[bumper("c", 0, "/m/c.mkv")]).unwrap();
+        Arc::new(db)
+    }
+
+    #[test]
+    fn airings_returns_this_channels_rows_past_and_scheduled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(
+            &dir,
+            r#"fn hooks() { ["bumper"] }
+fn build(ctx) {
+    let all = ctx.airings(#{});
+    let bumpers = ctx.airings(#{ kind: "bumper", order: "desc", limit: 1 });
+    let by_source = ctx.airings(#{ source: "/m/a.mkv" });
+    let elsewhere = ctx.airings(#{ channel: "*", kind: "bumper" });
+    let t = timeline();
+    t.push(segment().black().fixed(1.0));
+    t.push(segment().black().fixed_ms(all.len()));
+    t.push(segment().black().fixed_ms(bumpers[0].start_ms - 1792267200000));
+    t.push(segment().black().fixed_ms(by_source[0].out_ms));
+    t.push(segment().black().fixed_ms(elsewhere.len()));
+    t
+}"#,
+        );
+        let input = BumperInput {
+            history: Some(ledger_with_a_programme_and_two_bumpers()),
+            ..input(None)
+        };
+        let built = build(&path, &input).unwrap();
+        let ms: Vec<u64> = built
+            .timeline
+            .segments
+            .iter()
+            .map(|s| match s.duration {
+                Duration::Fixed(ms) => ms,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        // 3 own rows; newest bumper "b" starts 120s after 20:00 UTC
+        // (the script subtracts 20:00 UTC, 1792267200000 ms); the source
+        // filter finds "a" with out_ms 4000; 3 bumpers across channels.
+        assert_eq!(ms, vec![1_000, 3, 120_000, 4_000, 3]);
+    }
+
+    #[test]
+    fn airings_rejects_an_unknown_filter_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(
+            &dir,
+            "fn hooks() { [\"bumper\"] }\nfn build(ctx) { ctx.airings(#{ kinds: \"bumper\" }); timeline() }",
+        );
+        let msg = build(&path, &input(None)).unwrap_err().to_string();
+        assert!(msg.contains("unknown filter key `kinds`"), "{msg}");
+    }
+
+    #[test]
+    fn airings_without_a_ledger_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(
+            &dir,
+            r#"fn hooks() { ["bumper"] }
+fn build(ctx) {
+    let t = timeline();
+    t.push(segment().black().fixed_ms(ctx.airings(#{}).len() + 1000));
+    t
+}"#,
+        );
+        let built = build(&path, &input(None)).unwrap();
+        assert_eq!(built.timeline.segments[0].duration, Duration::Fixed(1_000));
     }
 }

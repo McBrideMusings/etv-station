@@ -148,7 +148,7 @@ There is deliberately no streaming fallback. A Plex entry whose path does not re
 
 ## Why filesystem-only IPC
 
-Matches ETV-next's existing process model — it already uses files (`.ready`, `.heartbeat`) for signaling between server and channel subprocesses. No new protocol surface. `ls` shows you the state. Atomic emission via `rename(2)` means the consumer can't observe a half-written file.
+Matches ETV-next's existing process model — it already uses files (`.ready`, `.heartbeat`) for signaling between server and channel subprocesses. No new protocol surface. The channel worker also appends playback lines (session start and stop, item started) to `.playback-events.jsonl` in the playout folder, which the station tails to fire the `playback_item_change`, `viewer_start` and `viewer_stop` hooks. `ls` shows you the state. Atomic emission via `rename(2)` means the consumer can't observe a half-written file.
 
 ## Why Rust
 
