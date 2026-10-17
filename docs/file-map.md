@@ -222,6 +222,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `.claude/skills/frame-grab.md` | Skill: `ffmpeg` frame capture from a live HLS stream; reads image inline so Claude can see the frame. |
 | `.claude/skills/programming/SKILL.md` | Skill: loaded before any `channel.yaml` schedule edit or channel review — points at `docs/programming.md` for the principles and runs taste-lab's Review view before and after to report the numbers that moved. |
 | `.claude/skills/read-logs.md` | Skill: locate and read the most recent `tmp/<cmd>.*.log` file from a dev run. |
+| `.claude/skills/swarm-worker/SKILL.md` | Skill: read by every swarm worker before its first build — which commands take the shared heavy lock, the cheap check, the per-worker `ETV_PORT`, and why `tools/kill-dev.sh` never runs in a worker. |
 | `.claude/skills/upstream-sync/SKILL.md` | Skill: absorb upstream ErsatzTV/next into `vendor/etv-next` — the survey, the schema and ffmpeg-pin checks, and the conflict doctrine for the files this project rewrote. |
 
 ## Vendored

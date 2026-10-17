@@ -24,4 +24,4 @@ if [ -f .env ]; then
 fi
 
 exec env ETV_STATION_TZ="${ETV_STATION_TZ:-UTC}" \
-  cargo run -p etv-station -- --config "$STATION_CONFIG" "$@"
+  cargo run -p etv-station --bin etv-station -- --config "$STATION_CONFIG" "$@"
