@@ -73,6 +73,11 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // reload reverts to this instead of killing a daemon that's streaming fine.
     // See #90 and docs/adr/0001-reload-generation-revert.md.
     let mut last_good: Option<Arc<Station>> = None;
+    // Which lifecycle events the next generation announces to its hooks.
+    let mut announce = Announce {
+        startup: true,
+        config_reload: false,
+    };
     loop {
         let tz = match prepare_generation(&station).await {
             Ok(tz) => {
@@ -117,6 +122,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
             &history_db,
             plex.as_ref(),
             &signals,
+            std::mem::take(&mut announce),
         )
         .await;
 
@@ -150,6 +156,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
                 }
                 tracing::info!(event = "config.reload", config = %config_path.display(), "configuration reloaded");
                 station = Arc::new(s);
+                announce.config_reload = true;
             }
             Err(e) => {
                 tracing::error!(
@@ -234,6 +241,9 @@ struct StationContext<'a> {
     /// The station-level `tracks:` rules (#261), the base of the track
     /// selection cascade.
     station_tracks: Option<&'a crate::config::TrackRules>,
+    /// Event hooks (ADR 0021): the generation's hooks, fired at the points a
+    /// channel writes schedule.
+    hooks: &'a crate::hooks::HookBus,
 }
 
 /// The station's copy of "what has been watched lately" — one per distinct
@@ -989,6 +999,17 @@ async fn ingest_catalog(
 /// the `station` Arc for the next generation with no task still reading it.
 /// `run` is the sole caller and sole waiter on both signals, so `notify_one`'s
 /// stored permit makes the wait race-free without an explicit `enable()`.
+/// The lifecycle events a generation's hooks are told about when it begins.
+#[derive(Default)]
+struct Announce {
+    /// The daemon process just started.
+    startup: bool,
+    /// A config reload parsed; this generation runs whichever config is now
+    /// in force (the new one, or the last good one if the new one would not
+    /// prepare).
+    config_reload: bool,
+}
+
 async fn run_generation(
     station: &Arc<Station>,
     tz: &'static Tz,
@@ -996,6 +1017,7 @@ async fn run_generation(
     history_db: &Arc<HistoryDb>,
     plex: Option<&PlexEnv>,
     signals: &Signals,
+    announce: Announce,
 ) -> (bool, Option<StationError>) {
     let Signals {
         shutdown,
@@ -1004,6 +1026,7 @@ async fn run_generation(
     } = signals;
     let mut handles = Vec::new();
     let mut supervisor_handles = Vec::new();
+    let bus = Arc::new(crate::hooks::HookBus::new(crate::hooks::collect(station)));
     // One watch history for the whole station (#126). Built per generation
     // because a reload can change both the roll intervals it is sized from and
     // whether any channel still reads a history at all; the catalog behind it is
@@ -1051,6 +1074,20 @@ async fn run_generation(
         let stop = Arc::new(Notify::new());
         stops.push(stop.clone());
         let channel_name = station.channels[idx].name.clone();
+        if bus.wants(
+            crate::config::HookTrigger::ScheduleItemChange,
+            Some(&channel_name),
+        ) {
+            let watch_stop = Arc::new(Notify::new());
+            stops.push(watch_stop.clone());
+            supervisor_handles.push(tokio::spawn(crate::hooks::run_schedule_watch(
+                bus.clone(),
+                channel_name.clone(),
+                station.channels[idx].output_folder.clone(),
+                watch_stop,
+            )));
+        }
+        let hook_bus = bus.clone();
         // One span per channel wraps the whole channel loop, so every event it
         // emits (roll ticks, chunk writes, retention deletes) carries the channel
         // in its span context for correlation.
@@ -1065,6 +1102,7 @@ async fn run_generation(
                     history: &hist,
                     history_db: &hdb,
                     station_tracks: s.station.tracks.as_ref(),
+                    hooks: &hook_bus,
                 };
                 let result = supervise_channel(ch, ctx, stop).await;
                 (ch.name.clone(), result)
@@ -1088,6 +1126,21 @@ async fn run_generation(
             "starting event hook",
         );
         supervisor_handles.push(tokio::spawn(crate::hooks::run_cron(spec, stop)));
+    }
+
+    if announce.startup {
+        bus.fire(
+            crate::config::HookTrigger::Startup,
+            None,
+            serde_json::json!({}),
+        );
+    }
+    if announce.config_reload {
+        bus.fire(
+            crate::config::HookTrigger::ConfigReload,
+            None,
+            serde_json::json!({}),
+        );
     }
 
     // The **catalog refresh** tick. Before this, ingest ran once at startup and
@@ -1166,6 +1219,11 @@ async fn run_generation(
             tracing::warn!(event = "overlay.supervisor_error", error = %e, "overlay supervisor task ended with error");
         }
     }
+
+    // A run still going belongs to this generation's config; finish it before
+    // a reload starts the next generation's hooks.
+    bus.discard_queued();
+    bus.drain().await;
 
     (do_reload, first_err)
 }
@@ -3170,6 +3228,15 @@ async fn pattern_catch_up(
         )
         .await?;
         log_emission(&channel.name, phase, &written, from, to);
+        fire_emission_hooks(
+            ctx.hooks,
+            &channel.name,
+            phase,
+            &written,
+            from,
+            to,
+            items.len(),
+        );
 
         // Checkpoint every item boundary this generation wrote, on top of the
         // one at `from`. A wipe cuts at an item boundary anywhere inside the
@@ -3296,6 +3363,7 @@ mod resume_fingerprint_survives_generation_tests {
             history,
             history_db,
             station_tracks: None,
+            hooks: Box::leak(Box::default()),
         }
     }
 
@@ -4406,6 +4474,43 @@ mod render_guide_and_attribution_tests {
 
 pub(crate) fn window_duration(window_days: u32) -> time::Duration {
     time::Duration::seconds(window_days as i64 * 24 * 3600)
+}
+
+/// Tell the channel's hooks about one generation: a `chunk_written` per file,
+/// then a `generation_end`.
+fn fire_emission_hooks(
+    hooks: &crate::hooks::HookBus,
+    channel: &str,
+    phase: &'static str,
+    written: &[PathBuf],
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    items: usize,
+) {
+    use crate::config::HookTrigger;
+    let rfc = &time::format_description::well_known::Rfc3339;
+    let (from, to) = (
+        from.format(rfc).unwrap_or_default(),
+        to.format(rfc).unwrap_or_default(),
+    );
+    for path in written {
+        hooks.fire(
+            HookTrigger::ChunkWritten,
+            Some(channel),
+            serde_json::json!({ "path": path, "phase": phase }),
+        );
+    }
+    hooks.fire(
+        HookTrigger::GenerationEnd,
+        Some(channel),
+        serde_json::json!({
+            "phase": phase,
+            "from": from,
+            "to": to,
+            "items": items,
+            "files": written,
+        }),
+    );
 }
 
 fn log_emission(

@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 pub struct HookDecl {
     pub on: HookTrigger,
 
-    /// Interval between runs. Required for `on: cron`, and measured from the
+    /// Interval between runs. Required for `on: cron` (and refused on every
+    /// other trigger), and measured from the
     /// daemon's start (or the last config reload): the first run is one
     /// interval away.
     #[serde(
@@ -37,13 +38,30 @@ pub struct HookDecl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookTrigger {
+    /// Every `every`, measured from the daemon's start or last config reload.
     Cron,
+    /// Once, when the daemon process starts (not on a config reload).
+    Startup,
+    /// Once per accepted config reload, after the new config is running.
+    ConfigReload,
+    /// After a channel finishes generating one span of schedule.
+    GenerationEnd,
+    /// After each playout file a generation writes.
+    ChunkWritten,
+    /// When the station clock passes an item boundary on a channel, whether
+    /// or not anyone is watching.
+    ScheduleItemChange,
 }
 
 impl HookTrigger {
     pub fn as_str(self) -> &'static str {
         match self {
             HookTrigger::Cron => "cron",
+            HookTrigger::Startup => "startup",
+            HookTrigger::ConfigReload => "config_reload",
+            HookTrigger::GenerationEnd => "generation_end",
+            HookTrigger::ChunkWritten => "chunk_written",
+            HookTrigger::ScheduleItemChange => "schedule_item_change",
         }
     }
 }
@@ -99,6 +117,13 @@ impl HookDecl {
                 }
                 Some(_) => {}
             },
+            _ if self.every.is_some() => {
+                return Some(format!(
+                    "{at} is on: {} and takes no `every:` — only on: cron does",
+                    self.on.as_str()
+                ));
+            }
+            _ => {}
         }
         if !self.grants.is_empty() && !self.is_rhai() {
             return Some(format!(
@@ -134,6 +159,23 @@ mod tests {
         assert!(h.is_rhai());
         assert_eq!(h.grants, vec![HookGrant::Http, HookGrant::Exec]);
         assert_eq!(h.problem("station", 0), None);
+    }
+
+    #[test]
+    fn an_event_trigger_parses_and_refuses_every() {
+        for on in [
+            "startup",
+            "config_reload",
+            "generation_end",
+            "chunk_written",
+            "schedule_item_change",
+        ] {
+            let h = parse(&format!("on: {on}\nrun: a.sh\n"));
+            assert_eq!(h.on.as_str(), on);
+            assert_eq!(h.problem("station", 0), None);
+        }
+        let h = parse("on: startup\nevery: 1m\nrun: a.sh\n");
+        assert!(h.problem("station", 0).unwrap().contains("every"));
     }
 
     #[test]

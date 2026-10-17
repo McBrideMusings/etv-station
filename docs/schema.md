@@ -571,14 +571,26 @@ hooks:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `on` | **yes** | the trigger. Only `cron` exists so far. |
-| `every` | for `cron` | interval between runs |
+| `on` | **yes** | the trigger: `cron`, or one of the events below |
+| `every` | for `cron` only | interval between runs; refused on every other trigger |
 | `run` | **yes** | path, relative to the declaring file's directory. A name ending `.rhai` is a script; anything else is executed as a program. |
 | `grants` | no | `exec` adds `exec(program, args)` -> `#{ code, stdout, stderr }`; `http` adds `http(url, method, body)` -> body text. A script with neither can compute and call `log(text)`. Refused on an executable, which runs with the daemon's own permissions. |
 
-The event is `{hook, trigger, scope, channel, fired_at}`: stdin JSON for an
-executable, the `event` constant for a script. A run still going at the next
-interval makes that interval skip (`hook.skipped`), and a run is killed after 10 minutes (a script is also stopped after 100 million operations). A reload waits for a run in flight, then restarts every interval from zero. A failed run's `hook.run` line carries the last 1000 bytes of the program's stderr. The station keeps no record
+| Trigger | Fires | `channel` | `data` |
+|---|---|---|---|
+| `startup` | once, when the daemon process starts | the declaring channel, else null | `{}` |
+| `config_reload` | once per config reload that parsed, as the generation under the config in force begins | the declaring channel, else null | `{}` |
+| `generation_end` | after a channel writes one generation of schedule | that channel | `{phase, from, to, items, files}` |
+| `chunk_written` | for each playout file a generation writes | that channel | `{path, phase}` |
+| `schedule_item_change` | when the station clock passes an item boundary on a channel, watched or not; the item airing when the daemon starts is the baseline and fires nothing | that channel | `{item, previous}`, each `{id, title, start, finish}` |
+
+A hook in `station.yaml` runs for every channel's events; a hook in a
+`channel.yaml` runs only for that channel's. `startup` and `config_reload` reach
+hooks of both scopes.
+
+The event is `{hook, trigger, scope, channel, fired_at, data}`: stdin JSON for an
+executable, the `event` constant for a script. A `cron` run still going when its interval
+elapses again makes that interval skip (`hook.skipped`); firings of the other triggers queue behind a run in flight and run one at a time (`hook.dropped` past 1000 waiting). A run is killed after 10 minutes (a script is also stopped after 100 million operations). A reload drops firings still queued, waits for a run in flight, then restarts every interval from zero. A failed run's `hook.run` line carries the last 1000 bytes of the program's stderr. The station keeps no record
 of executions, so a script that starts outside work owns its own deduplication.
 
 Each run logs one `hook.run` line with `hook` (`station#0`, `channel:<name>#1`),

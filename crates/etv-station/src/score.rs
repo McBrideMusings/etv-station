@@ -611,6 +611,12 @@ pub fn check_plugin_dir(dir: &Path) -> Result<Vec<PluginCheck>, String> {
 pub enum Capability {
     CatalogRead,
     WatchHistory,
+    /// `ctx.probe(path)` on the bumper hook: container metadata for a media
+    /// file. Offered by [`crate::bumper::hook`] only; a pool cannot grant it.
+    Probe,
+    /// `ctx.read(path)` on the bumper hook: a text file inside the plugin's
+    /// own folder. Offered by [`crate::bumper::hook`] only.
+    Read,
     Datastore(String),
 }
 
@@ -625,6 +631,8 @@ impl Capability {
         match self {
             Capability::CatalogRead => "catalog_read",
             Capability::WatchHistory => "watch_history",
+            Capability::Probe => "probe",
+            Capability::Read => "read",
             Capability::Datastore(name) => name,
         }
     }
@@ -705,12 +713,19 @@ pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, Stri
         match name.as_str() {
             "catalog_read" => out.push(Capability::CatalogRead),
             "watch_history" => out.push(Capability::WatchHistory),
+            "probe" => out.push(Capability::Probe),
+            "read" => out.push(Capability::Read),
             _ => {
                 return Err(format!(
                     "plugin {} declares unknown capability {name:?} — known capabilities \
                      are: {}, or `#{{ datastore: \"name\" }}`",
                     script_path.display(),
-                    KNOWN_CAPABILITIES.join(", ")
+                    KNOWN_CAPABILITIES
+                        .iter()
+                        .chain(&["probe", "read"])
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
         }
