@@ -246,6 +246,7 @@ mod tests {
                 watermark: None,
                 program: None,
                 metadata: None,
+                overlay: None,
             });
             records.push(PlayRecord {
                 entry_id: id,
