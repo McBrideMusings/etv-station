@@ -229,14 +229,10 @@ const EXPOSED_TAGS: &[(&str, TagNs)] = &[
 /// one resolved set.
 pub type PoolSources = std::collections::BTreeMap<String, String>;
 
-/// Entry ids a pool's profile excludes (etv-station-sctf.7) — see
-/// [`crate::profile::ResolvedProfile::excluded`]. Empty for a pool that
-/// excludes nothing.
-pub type Excluded = std::collections::BTreeSet<String>;
-
 /// What one [`ScoreCache`] entry was resolved against: the script, the pool's
-/// own `sources` table if it wrote one, and the ids its profile excludes.
-type CacheKey = (PathBuf, Option<PoolSources>, Excluded);
+/// own `sources` table if it wrote one, and how its profile narrows the
+/// candidates ([`crate::profile::Narrowing`]).
+type CacheKey = (PathBuf, Option<PoolSources>, crate::profile::Narrowing);
 
 /// One generation's compiled scripts and resolved query sets, keyed by script
 /// path, the sources it was resolved against, and the ids the pool's profile
@@ -259,10 +255,11 @@ type CacheKey = (PathBuf, Option<PoolSources>, Excluded);
 /// extra catalog pass are paid only by a pool that asked for something
 /// different, which is exactly the pool that needs them.
 ///
-/// The excluded ids are the third part of the key for the same reason: a
-/// profile's `exclude: true` entries (etv-station-sctf.7) remove titles from
-/// the resolved sets themselves, so a pool excluding horror cannot share sets
-/// with a sibling that does not. Pools excluding nothing still share.
+/// The narrowing is the third part of the key for the same reason: a
+/// profile's `exclude: true` and `require: true` entries (etv-station-sctf.7)
+/// change the resolved sets themselves, so a pool excluding horror cannot
+/// share sets with a sibling that does not. Pools narrowing nothing still
+/// share.
 ///
 /// Scoped to a single generation and dropped with it, so a catalog that changes
 /// between generations is picked up on the next one.
@@ -921,8 +918,8 @@ struct ScoreCtx {
     /// entry, files first then inline. Gated on `catalog_read`, the same as
     /// `sets`: an `item` or `set` entry carries full catalog item maps.
     profile: Option<Dynamic>,
-    /// The pool's `exclude_keywords`, each through the keyword rule.
-    exclude_keywords: Dynamic,
+    /// The pool's `ignore_keywords`, each through the keyword rule.
+    ignore_keywords: Dynamic,
     /// Filled only when `catalog_read` was granted — same gate as `sets`.
     entry_ids: Option<Arc<HashMap<(String, String), String>>>,
     /// Whether `http` was granted; `false` turns `ctx.http(..)` into the
@@ -1001,8 +998,8 @@ impl ScoreCtx {
             .ok_or_else(|| ungranted("catalog_read"))
     }
 
-    fn get_exclude_keywords(&mut self) -> Dynamic {
-        self.exclude_keywords.clone()
+    fn get_ignore_keywords(&mut self) -> Dynamic {
+        self.ignore_keywords.clone()
     }
 
     /// `ctx.http(url, method, body)` — see [`Capability::Http`].
@@ -1352,7 +1349,7 @@ pub(crate) fn engine() -> Engine {
         .register_get("temperature", ScoreCtx::get_temperature)
         .register_get("account_id", ScoreCtx::get_account_id)
         .register_get("profile", ScoreCtx::get_profile)
-        .register_get("exclude_keywords", ScoreCtx::get_exclude_keywords)
+        .register_get("ignore_keywords", ScoreCtx::get_ignore_keywords)
         .register_fn("datastore", ScoreCtx::get_datastore)
         .register_fn("entry_id_for", ScoreCtx::entry_id_for)
         .register_fn("http", ScoreCtx::http);
@@ -1388,11 +1385,12 @@ impl ScoreCache {
     /// them. [`pick`] must be handed the same value, since the two together are
     /// the cache key.
     ///
-    /// `excluded` is [`Self::excluded`] for the pool, so a pool with a profile
-    /// runs [`Self::prepare_profile`] first. Every id in it is dropped from
-    /// each resolved set before the set is built, so the script never sees an
-    /// excluded title in `ctx.sets` (etv-station-sctf.7). [`pick`] reads the
-    /// same set back from the pool's stored profile.
+    /// `narrowing` is [`Self::narrowing`] for the pool, so a pool with a
+    /// profile runs [`Self::prepare_profile`] first. Every id it does not keep
+    /// is dropped from each resolved set before the set is built, so the
+    /// script never sees an excluded title, or one a `require` entry did not
+    /// match, in `ctx.sets` (etv-station-sctf.7). [`pick`] reads the same
+    /// narrowing back from the pool's stored profile.
     ///
     /// **This is the only half of scoring that touches the catalog.** Callers
     /// run every pool's `prepare` up front, while the catalog handle is in
@@ -1407,24 +1405,24 @@ impl ScoreCache {
         catalog: &Catalog,
         script_path: &Path,
         sources: Option<&PoolSources>,
-        excluded: &Excluded,
+        narrowing: &crate::profile::Narrowing,
     ) -> Result<(), String> {
         let key = (
             script_path.to_path_buf(),
             sources.cloned(),
-            excluded.clone(),
+            narrowing.clone(),
         );
         if self.entries.contains_key(&key) {
             return Ok(());
         }
-        let cached = compile_and_resolve(catalog, &engine(), script_path, sources, excluded)?;
+        let cached = compile_and_resolve(catalog, &engine(), script_path, sources, narrowing)?;
         self.entries.insert(key, cached);
         Ok(())
     }
 
-    /// Load and resolve `pool`'s taste profile and `exclude_keywords` against
+    /// Load and resolve `pool`'s taste profile and `ignore_keywords` against
     /// the catalog, for [`pick`] to hand over as `ctx.profile` and
-    /// `ctx.exclude_keywords`. Touches the catalog, so it belongs to the same
+    /// `ctx.ignore_keywords`. Touches the catalog, so it belongs to the same
     /// half as [`Self::prepare`]. A pool that authored neither stores nothing,
     /// and its script reads empty arrays.
     ///
@@ -1442,7 +1440,7 @@ impl ScoreCache {
     ) -> Result<(), String> {
         if pool.profile.is_empty()
             && pool.profile_files.is_empty()
-            && pool.exclude_keywords.is_empty()
+            && pool.ignore_keywords.is_empty()
         {
             // Still records an (empty) entry rather than leaving `self.profiles`
             // untouched — [`pick`] reads a missing entry as empty anyway
@@ -1471,7 +1469,7 @@ impl ScoreCache {
         let resolved = crate::profile::resolve(
             catalog,
             &entries,
-            &pool.exclude_keywords,
+            &pool.ignore_keywords,
             keyword_store.as_ref(),
         )?;
         for x in &resolved.exclusions {
@@ -1483,6 +1481,15 @@ impl ScoreCache {
                 "profile exclusion resolved"
             );
         }
+        for x in &resolved.requirements {
+            tracing::info!(
+                pool = %pool.name,
+                reference = %x.reference,
+                origin = %x.origin,
+                matched = x.entry_ids.len(),
+                "profile requirement resolved"
+            );
+        }
         self.profiles.insert(pool.name.clone(), resolved);
         Ok(())
     }
@@ -1492,13 +1499,13 @@ impl ScoreCache {
         self.profiles.get(pool_name)
     }
 
-    /// The entry ids `pool_name`'s profile excludes from its candidates —
-    /// empty when it excludes nothing or has no stored profile. What
-    /// [`Self::prepare`] takes and [`pick`] keys on.
-    pub fn excluded(&self, pool_name: &str) -> Excluded {
+    /// How `pool_name`'s profile narrows its candidates — empty when it
+    /// narrows nothing or has no stored profile. What [`Self::prepare`] takes
+    /// and [`pick`] keys on.
+    pub fn narrowing(&self, pool_name: &str) -> crate::profile::Narrowing {
         self.profiles
             .get(pool_name)
-            .map(|p| p.excluded.clone())
+            .map(|p| p.narrowing.clone())
             .unwrap_or_default()
     }
 
@@ -1614,12 +1621,12 @@ pub fn pick(
     // `sources` is part of the cache key (#210), so the same value the pool
     // handed `prepare` has to come back here — a mismatch would find no entry
     // and report the bug below rather than quietly ranking another pool's set.
-    // The excluded ids, the key's third part, come from the pool's own stored
-    // profile, the same place its `prepare` call read them.
+    // The narrowing, the key's third part, comes from the pool's own stored
+    // profile, the same place its `prepare` call read it.
     let key = (
         script_path.to_path_buf(),
         sources.cloned(),
-        cache.excluded(pool_name),
+        cache.narrowing(pool_name),
     );
     let cached = cache.entries.get(&key).ok_or_else(|| {
         format!(
@@ -1692,10 +1699,10 @@ pub fn pick(
                     .unwrap_or_default(),
             )
         }),
-        exclude_keywords: Dynamic::from_array(
+        ignore_keywords: Dynamic::from_array(
             cache
                 .profile(pool_name)
-                .map(|p| p.exclude_keywords.clone())
+                .map(|p| p.ignore_keywords.clone())
                 .unwrap_or_default(),
         ),
         entry_ids: granted.entry_ids.filter(|_| granted.catalog_read),
@@ -2145,7 +2152,7 @@ fn compile_and_resolve(
     engine: &Engine,
     script_path: &Path,
     pool_sources: Option<&PoolSources>,
-    excluded: &Excluded,
+    narrowing: &crate::profile::Narrowing,
 ) -> Result<CachedScript, String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
@@ -2161,16 +2168,16 @@ fn compile_and_resolve(
         let mut ids = catalog
             .resolve_query(&cel)
             .map_err(|e| format!("{whose} {name:?} ({cel}): {e}"))?;
-        if !excluded.is_empty() {
+        if !narrowing.is_empty() {
             let before = ids.len();
-            ids.retain(|id| !excluded.contains(id));
+            ids.retain(|id| narrowing.keeps(id));
             tracing::debug!(
                 plugin = %script_path.display(),
                 set = %name,
                 candidates = before,
-                excluded = before - ids.len(),
+                removed = before - ids.len(),
                 remaining = ids.len(),
-                "profile exclusions removed candidates"
+                "profile narrowing removed candidates"
             );
         }
         let items = load_items(catalog, &ids).map_err(|e| format!("{whose} {name:?}: {e}"))?;
@@ -2380,7 +2387,7 @@ mod tests {
         pool_config: Option<&serde_json::Value>,
         cache: &mut ScoreCache,
     ) -> Result<Vec<String>, String> {
-        cache.prepare(catalog, script_path, None, &cache.excluded(pool_name))?;
+        cache.prepare(catalog, script_path, None, &cache.narrowing(pool_name))?;
         pick(
             cache,
             script_path,
@@ -2517,8 +2524,8 @@ fn pick(ctx) {
         } else { e.namespace + "=" + e.value };
         out.push(e.kind + ":" + what + ":" + e.weight + "@" + e.origin);
     }
-    for k in ctx.exclude_keywords { out.push("exclude:" + k); }
-    if out.is_empty() { out.push("no-profile:" + ctx.profile.len() + ":" + ctx.exclude_keywords.len()); }
+    for k in ctx.ignore_keywords { out.push("exclude:" + k); }
+    if out.is_empty() { out.push("no-profile:" + ctx.profile.len() + ":" + ctx.ignore_keywords.len()); }
     #{ picks: out, workspace: () }
 }
 fn audit(ctx, picks, workspace) { #{} }
@@ -2529,7 +2536,7 @@ fn audit(ctx, picks, workspace) { #{} }
     }
 
     /// A minimal real plexdb store, schema v10, holding only `keyword_forms`
-    /// — the one table a pool's `keyword`/`exclude_keywords` resolution reads
+    /// — the one table a pool's `keyword`/`ignore_keywords` resolution reads
     /// (`crate::profile::resolve_keyword_surface`). `forms` is
     /// `(surface, stored keyword)` pairs.
     fn write_keyword_store_fixture(path: &std::path::Path, forms: &[(&str, &str)]) {
@@ -2630,7 +2637,7 @@ profile_files: [a.yaml, b.yaml]
 profile:
   - {{ item: "Heat (1995)", weight: -1.5 }}
   - {{ set: 'item.year == 2002', weight: 3.0 }}
-exclude_keywords: ["DuringCreditsStinger "]
+ignore_keywords: ["DuringCreditsStinger "]
 "#,
             db = db.display(),
         ));
@@ -4584,7 +4591,7 @@ fn audit(ctx, picks, workspace) { #{} }
         for pool in [&movies, &others] {
             cache.prepare_profile(&cat, pool, dir.path()).unwrap();
             cache
-                .prepare(&cat, &p, None, &cache.excluded(&pool.name))
+                .prepare(&cat, &p, None, &cache.narrowing(&pool.name))
                 .unwrap();
         }
 
@@ -4596,6 +4603,83 @@ fn audit(ctx, picks, workspace) { #{} }
         assert_eq!(
             echo_for(&cache, &p, None, "others"),
             vec!["fs:heat-a", "fs:heat-b", "imdb:tt0113277", "m2"]
+        );
+    }
+
+    /// A `keyword` exclusion removes every title whose movie or show carries
+    /// the keyword in the datastore — a film by its own keywords, an episode
+    /// by its show's — while titles without it stay candidates.
+    #[test]
+    fn a_keyword_exclusion_removes_films_and_episodes_carrying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let cat = profile_catalog();
+        let mut ep = Entry::new("ep-1", "episode", "A Very Special Episode", Source::Plex);
+        ep.show_id = Some("tvdb:77".into());
+        cat.upsert_entry(&ep).unwrap();
+        let db = dir.path().join("taste.db");
+        write_keyword_store_fixture(&db, &[("Christmas", "christmas")]);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE enrichment (item_id TEXT, namespace TEXT, source TEXT, key TEXT,
+                                      value TEXT, fetched_at TEXT, rank INTEGER);
+             INSERT INTO enrichment VALUES
+               ('imdb:tt0113277', 'keywords', 'tmdb', 'keyword', 'christmas', '2026-01-01', NULL),
+               ('tvdb:77',        'keywords', 'tmdb', 'keyword', 'christmas', '2026-01-01', NULL),
+               ('m2',             'keywords', 'tmdb', 'keyword', 'heist',     '2026-01-01', NULL);",
+        )
+        .unwrap();
+        let pool = profile_pool(&format!(
+            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
+             profile:\n  - {{ keyword: Christmas, exclude: true }}\n",
+            db = db.display(),
+        ));
+        let mut cache = ScoreCache::default();
+        cache.prepare_profile(&cat, &pool, dir.path()).unwrap();
+        let excluded = cache.narrowing("movies");
+        assert_eq!(
+            excluded.excluded.iter().cloned().collect::<Vec<_>>(),
+            vec!["ep-1".to_string(), "imdb:tt0113277".to_string()],
+        );
+        cache.prepare(&cat, &p, None, &excluded).unwrap();
+        assert_eq!(
+            echo_for(&cache, &p, None, "movies"),
+            vec!["fs:heat-a", "fs:heat-b", "m2"],
+            "Heat (1995) carries the keyword and is not a candidate"
+        );
+    }
+
+    /// `require: true` entries keep only titles matching at least one of
+    /// them: a keyword one and a tag one together keep the Christmas film
+    /// and the horror film, and drop the rest.
+    #[test]
+    fn require_entries_keep_only_titles_matching_one_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, ECHO_SET);
+        let cat = profile_catalog();
+        let db = dir.path().join("taste.db");
+        write_keyword_store_fixture(&db, &[("christmas", "christmas")]);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE enrichment (item_id TEXT, namespace TEXT, source TEXT, key TEXT,
+                                      value TEXT, fetched_at TEXT, rank INTEGER);
+             INSERT INTO enrichment VALUES
+               ('imdb:tt0113277', 'keywords', 'tmdb', 'keyword', 'christmas', '2026-01-01', NULL);",
+        )
+        .unwrap();
+        let pool = profile_pool(&format!(
+            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
+             profile:\n  - {{ keyword: christmas, require: true }}\n  - {{ genre: Horror, require: true }}\n",
+            db = db.display(),
+        ));
+        let mut cache = ScoreCache::default();
+        cache.prepare_profile(&cat, &pool, dir.path()).unwrap();
+        let narrowing = cache.narrowing("movies");
+        cache.prepare(&cat, &p, None, &narrowing).unwrap();
+        assert_eq!(
+            echo_for(&cache, &p, None, "movies"),
+            vec!["imdb:tt0113277", "m2"],
+            "only Heat (1995), keyworded christmas, and Beta, a horror film"
         );
     }
 
@@ -4619,7 +4703,7 @@ fn audit(ctx, picks, workspace) { #{} }
         let mut cache = ScoreCache::default();
         cache.prepare_profile(&cat, &pool, dir.path()).unwrap();
         cache
-            .prepare(&cat, &p, None, &cache.excluded("movies"))
+            .prepare(&cat, &p, None, &cache.narrowing("movies"))
             .unwrap();
         assert_eq!(echo(&cache, &p, None), vec!["fs:heat-a", "fs:heat-b"]);
     }

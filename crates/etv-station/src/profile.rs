@@ -75,11 +75,17 @@ pub struct ProfileEntry {
     /// `true` removes every title this entry's tag or item reference matches
     /// from the pool's candidates, in place of a `weight`. Unlike a negative
     /// weight, which only scores a title down, an excluded title never reaches
-    /// the scorer. Unlike the pool's `exclude_keywords`, which zeroes a
+    /// the scorer. Unlike the pool's `ignore_keywords`, which zeroes a
     /// keyword's contribution and leaves its titles in the pool, this removes
     /// titles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<bool>,
+    /// `true` keeps only titles this entry's reference matches, in place of a
+    /// `weight`. Several `require` entries in one profile combine as "matches
+    /// at least one of them", so a themed pool lists its subjects one per
+    /// entry and everything else leaves the candidates before the scorer runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require: Option<bool>,
 }
 
 /// What a checked entry does with what it references.
@@ -89,6 +95,30 @@ pub enum Effect {
     Weight(f64),
     /// Removed from the pool's candidates; never reaches the scorer.
     Exclude,
+    /// One of the matches a candidate needs to stay in the pool.
+    Require,
+}
+
+/// Which catalog entries a pool's candidates are narrowed to before its
+/// script runs: never one in `excluded`, and, when the profile has any
+/// `require: true` entries, only one in `required`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Narrowing {
+    pub excluded: BTreeSet<String>,
+    /// `None` when nothing is required — every candidate not excluded stays.
+    pub required: Option<BTreeSet<String>>,
+}
+
+impl Narrowing {
+    /// Whether this narrows nothing.
+    pub fn is_empty(&self) -> bool {
+        self.excluded.is_empty() && self.required.is_none()
+    }
+
+    /// Whether `id` stays a candidate.
+    pub fn keeps(&self, id: &str) -> bool {
+        !self.excluded.contains(id) && self.required.as_ref().is_none_or(|r| r.contains(id))
+    }
 }
 
 /// What one entry points at, once its shape has been checked.
@@ -136,22 +166,25 @@ impl LoadedEntry {
 }
 
 /// A pool's profile, resolved against the catalog: what `ctx.profile` and
-/// `ctx.exclude_keywords` hold, and which titles leave the pool's candidates.
+/// `ctx.ignore_keywords` hold, and which titles leave the pool's candidates.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedProfile {
-    /// The weighted entries — `exclude: true` entries are not among them.
+    /// The weighted entries — `exclude` and `require` entries are not among
+    /// them.
     pub entries: Array,
-    pub exclude_keywords: Array,
+    pub ignore_keywords: Array,
     /// Each `exclude: true` entry and the titles it matched.
-    pub exclusions: Vec<ResolvedExclusion>,
-    /// Every entry id any of [`Self::exclusions`] matched — what
-    /// [`crate::score::ScoreCache::prepare`] drops from the pool's sets.
-    pub excluded: BTreeSet<String>,
+    pub exclusions: Vec<ResolvedMatch>,
+    /// Each `require: true` entry and the titles it matched.
+    pub requirements: Vec<ResolvedMatch>,
+    /// What [`Self::exclusions`] and [`Self::requirements`] narrow the pool's
+    /// sets to — what [`crate::score::ScoreCache::prepare`] applies.
+    pub narrowing: Narrowing,
 }
 
-/// One `exclude: true` entry, resolved.
+/// One `exclude: true` or `require: true` entry, resolved.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedExclusion {
+pub struct ResolvedMatch {
     /// `key: value` as authored, e.g. `genre: Horror`.
     pub reference: String,
     pub origin: String,
@@ -246,6 +279,27 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, Effect), String
     if value.trim().is_empty() {
         return Err(format!("has an empty `{key}`"));
     }
+    match entry.require {
+        Some(false) => {
+            return Err(format!(
+                "`{key}: {value}` has `require: false`, which requires nothing — remove it"
+            ));
+        }
+        Some(true) if entry.weight.is_some() || entry.exclude.is_some() => {
+            return Err(format!(
+                "`{key}: {value}` sets `require` beside `weight` or `exclude` — an entry does \
+                 one thing; write a second entry to also weight it"
+            ));
+        }
+        Some(true) if key == "set" => {
+            return Err(format!(
+                "`{key}: {value}` cannot be required — `require` takes a keyword, a catalog \
+                 tag or an `item`; narrow candidates by query with the pool's `sources`"
+            ));
+        }
+        Some(true) => return Ok((reference_for(key, value)?, value.clone(), Effect::Require)),
+        None => {}
+    }
     let effect = match (entry.exclude, entry.weight) {
         (Some(true), Some(_)) => {
             return Err(format!(
@@ -254,11 +308,10 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, Effect), String
             ));
         }
         (Some(true), None) => {
-            if key == "keyword" || key == "set" {
+            if key == "set" {
                 return Err(format!(
-                    "`{key}: {value}` cannot be excluded — `exclude` takes a catalog tag or an \
-                     `item`; drop a keyword from scoring with the pool's `exclude_keywords`, \
-                     and narrow candidates by query with the pool's `sources`"
+                    "`{key}: {value}` cannot be excluded — `exclude` takes a keyword, a catalog \
+                     tag or an `item`; narrow candidates by query with the pool's `sources`"
                 ));
             }
             Effect::Exclude
@@ -285,11 +338,15 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, Effect), String
             Effect::Weight(weight)
         }
     };
+    Ok((reference_for(key, value)?, value.clone(), effect))
+}
 
-    let reference = match key {
+/// The [`Reference`] an entry's one reference key and value name.
+fn reference_for(key: &str, value: &str) -> Result<Reference, String> {
+    Ok(match key {
         "keyword" => Reference::Keyword(normalize_keyword(value)),
         "item" => Reference::Item(parse_item(value)?),
-        "set" => Reference::Set(value.clone()),
+        "set" => Reference::Set(value.to_string()),
         tag => {
             let namespace = TAG_KEYS
                 .iter()
@@ -301,8 +358,7 @@ pub fn check(entry: &ProfileEntry) -> Result<(Reference, String, Effect), String
                 value: value.trim().to_lowercase(),
             }
         }
-    };
-    Ok((reference, value.clone(), effect))
+    })
 }
 
 fn parse_item(raw: &str) -> Result<ItemRef, String> {
@@ -371,10 +427,10 @@ fn push_checked(
     Ok(())
 }
 
-/// Check a pool's `exclude_keywords`: none may be empty.
-pub fn check_exclude_keywords(pool: &Pool) -> Result<(), String> {
-    if pool.exclude_keywords.iter().any(|k| k.trim().is_empty()) {
-        return Err("`exclude_keywords` has an empty entry".into());
+/// Check a pool's `ignore_keywords`: none may be empty.
+pub fn check_ignore_keywords(pool: &Pool) -> Result<(), String> {
+    if pool.ignore_keywords.iter().any(|k| k.trim().is_empty()) {
+        return Err("`ignore_keywords` has an empty entry".into());
     }
     Ok(())
 }
@@ -396,21 +452,39 @@ fn resolve_keyword_surface(
 /// Resolve every loaded entry against the catalog. `keyword_store` is the
 /// pool's granted datastore (its first grant — the same one a channel author
 /// points a `keyword:`-reading scorer at), needed only when an entry or
-/// `exclude_keywords` names a keyword; `None` fails such an entry naming the
+/// `ignore_keywords` names a keyword; `None` fails such an entry naming the
 /// pool's missing grant, rather than resolving nothing.
 pub fn resolve(
     catalog: &Catalog,
     entries: &[LoadedEntry],
-    exclude_keywords: &[String],
+    ignore_keywords: &[String],
     keyword_store: Option<&plexdb_reader::Reader>,
 ) -> Result<ResolvedProfile, String> {
     let mut out = Array::with_capacity(entries.len());
     let mut exclusions = Vec::new();
+    let mut requirements = Vec::new();
+    let mut keywords: Option<KeywordIndex> = None;
     for entry in entries {
         let weight = match entry.effect {
             Effect::Weight(w) => w,
             Effect::Exclude => {
-                exclusions.push(resolve_exclusion(catalog, entry)?);
+                exclusions.push(resolve_match(
+                    catalog,
+                    entry,
+                    keyword_store,
+                    &mut keywords,
+                    "excluded",
+                )?);
+                continue;
+            }
+            Effect::Require => {
+                requirements.push(resolve_match(
+                    catalog,
+                    entry,
+                    keyword_store,
+                    &mut keywords,
+                    "required",
+                )?);
                 continue;
             }
         };
@@ -464,42 +538,79 @@ pub fn resolve(
         m.insert("origin".into(), entry.origin.clone().into());
         out.push(Dynamic::from_map(m));
     }
-    let exclude = if exclude_keywords.is_empty() {
+    let ignored = if ignore_keywords.is_empty() {
         Array::new()
     } else {
         let reader = keyword_store.ok_or_else(|| {
-            "`exclude_keywords` needs a granted datastore to resolve its spellings against — \
+            "`ignore_keywords` needs a granted datastore to resolve its spellings against — \
              this pool grants none"
                 .to_string()
         })?;
-        let mut resolved = Array::with_capacity(exclude_keywords.len());
-        for raw in exclude_keywords {
+        let mut resolved = Array::with_capacity(ignore_keywords.len());
+        for raw in ignore_keywords {
             let surface = normalize_keyword(raw);
             let stored = resolve_keyword_surface(reader, &surface)
-                .map_err(|msg| format!("exclude_keywords: {msg}"))?;
+                .map_err(|msg| format!("ignore_keywords: {msg}"))?;
             resolved.push(Dynamic::from(stored));
         }
         resolved
     };
-    let excluded = exclusions
-        .iter()
-        .flat_map(|x| x.entry_ids.iter().cloned())
-        .collect();
+    let narrowing = Narrowing {
+        excluded: exclusions
+            .iter()
+            .flat_map(|x| x.entry_ids.iter().cloned())
+            .collect(),
+        required: (!requirements.is_empty()).then(|| {
+            requirements
+                .iter()
+                .flat_map(|x| x.entry_ids.iter().cloned())
+                .collect()
+        }),
+    };
     Ok(ResolvedProfile {
         entries: out,
-        exclude_keywords: exclude,
+        ignore_keywords: ignored,
         exclusions,
-        excluded,
+        requirements,
+        narrowing,
     })
 }
 
-/// The catalog entries one `exclude: true` entry matches. A tag value matches
-/// ASCII-case-insensitively (`Horror` = `horror`, but `É` ≠ `é`); an item resolves exactly as a weighted `item:` does.
+/// The catalog entries one `exclude: true` or `require: true` entry matches.
+/// A tag value matches ASCII-case-insensitively (`Horror` = `horror`, but
+/// `É` ≠ `é`); an item resolves exactly as a weighted `item:` does; a keyword
+/// resolves its spelling through `keyword_forms`, then matches every entry
+/// whose movie or show carries that stored keyword in `keyword_store` — an
+/// episode by its show's keywords, since it has none of its own. `keywords`
+/// holds the catalog's keyword index once the first keyword entry built it.
 /// Matching nothing fails, naming the entry, on the same terms as a `set`
-/// that matches nothing: a misspelt exclusion would otherwise exclude nothing
-/// and say so nowhere.
-fn resolve_exclusion(catalog: &Catalog, entry: &LoadedEntry) -> Result<ResolvedExclusion, String> {
+/// that matches nothing: a misspelt entry would otherwise narrow nothing, or
+/// everything, and say so nowhere. `verb` is `excluded` or `required`.
+fn resolve_match(
+    catalog: &Catalog,
+    entry: &LoadedEntry,
+    keyword_store: Option<&plexdb_reader::Reader>,
+    keywords: &mut Option<KeywordIndex>,
+    verb: &str,
+) -> Result<ResolvedMatch, String> {
     let (key, entry_ids) = match &entry.reference {
+        Reference::Keyword(k) => {
+            let reader = keyword_store.ok_or_else(|| {
+                format!(
+                    "{}: a {verb} `keyword: {}` needs a granted datastore to read keywords \
+                     from — this pool grants none",
+                    entry.locate(),
+                    entry.written
+                )
+            })?;
+            let stored = resolve_keyword_surface(reader, k)
+                .map_err(|msg| format!("{}: {msg}", entry.locate()))?;
+            if keywords.is_none() {
+                *keywords = Some(KeywordIndex::build(catalog, reader)?);
+            }
+            let index = keywords.as_ref().expect("built just above");
+            ("keyword", index.entries_with(&stored))
+        }
         Reference::Tag { namespace, .. } => {
             let (key, _, column) = TAG_KEYS
                 .iter()
@@ -519,9 +630,9 @@ fn resolve_exclusion(catalog: &Catalog, entry: &LoadedEntry) -> Result<ResolvedE
                 .map_err(|msg| format!("{}: `item: {}` {msg}", entry.locate(), entry.written))?;
             ("item", vec![id])
         }
-        Reference::Keyword(_) | Reference::Set(_) => {
+        Reference::Set(_) => {
             return Err(format!(
-                "{}: only a tag or an `item` can be excluded",
+                "{}: only a keyword, a tag or an `item` can be {verb}",
                 entry.locate()
             ));
         }
@@ -529,15 +640,50 @@ fn resolve_exclusion(catalog: &Catalog, entry: &LoadedEntry) -> Result<ResolvedE
     let reference = format!("{key}: {}", entry.written.trim());
     if entry_ids.is_empty() {
         return Err(format!(
-            "{}: excluded `{reference}` matches no catalog items, so it would exclude nothing",
+            "{}: {verb} `{reference}` matches no catalog items",
             entry.locate()
         ));
     }
-    Ok(ResolvedExclusion {
+    Ok(ResolvedMatch {
         reference,
         origin: entry.origin.clone(),
         entry_ids,
     })
+}
+
+/// Every catalog entry beside the stored keywords its movie or show carries:
+/// one catalog pass for each entry's fact id, one bulk keyword read for the
+/// distinct fact ids. Built once per profile, however many keyword entries
+/// it has.
+struct KeywordIndex {
+    units: Vec<(String, String)>,
+    by_unit: std::collections::HashMap<String, BTreeSet<String>>,
+}
+
+impl KeywordIndex {
+    fn build(catalog: &Catalog, reader: &plexdb_reader::Reader) -> Result<Self, String> {
+        let units = catalog.fact_units().map_err(|e| e.to_string())?;
+        let facts = reader
+            .enrichment_for_many(units.iter().map(|(_, unit)| unit.as_str()), "keywords")
+            .map_err(|e| format!("reading keywords: {e}"))?;
+        let by_unit = facts
+            .into_iter()
+            .map(|(unit, fs)| (unit, fs.into_iter().map(|f| f.value).collect()))
+            .collect();
+        Ok(Self { units, by_unit })
+    }
+
+    /// Every entry whose movie or show carries `keyword`, in id order.
+    fn entries_with(&self, keyword: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .units
+            .iter()
+            .filter(|(_, unit)| self.by_unit.get(unit).is_some_and(|k| k.contains(keyword)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
 }
 
 fn resolve_item(catalog: &Catalog, item: &ItemRef) -> Result<String, String> {
@@ -644,15 +790,38 @@ mod tests {
         assert!(msg.contains("both `weight` and `exclude`"), "msg = {msg}");
     }
 
-    /// `exclude_keywords` already owns keywords, and `sources` owns queries.
+    /// `sources` owns queries, so a `set` cannot be excluded; a keyword can.
     #[test]
-    fn a_keyword_or_set_cannot_be_excluded() {
-        for yaml in [
-            "{ keyword: heist, exclude: true }",
-            "{ set: 'item.year < 1970', exclude: true }",
+    fn a_set_cannot_be_excluded_but_a_keyword_can() {
+        let msg = check(&entry("{ set: 'item.year < 1970', exclude: true }")).unwrap_err();
+        assert!(msg.contains("cannot be excluded"), "msg = {msg}");
+        let (_, _, effect) = check(&entry("{ keyword: heist, exclude: true }")).unwrap();
+        assert_eq!(effect, Effect::Exclude);
+    }
+
+    /// `require` does one thing: beside a weight or an exclude, on a set, or
+    /// set to false, it is refused naming the entry rather than half-applied.
+    #[test]
+    fn require_stands_alone_on_a_keyword_tag_or_item() {
+        let (_, _, effect) = check(&entry("{ keyword: halloween, require: true }")).unwrap();
+        assert_eq!(effect, Effect::Require);
+        for (yaml, says) in [
+            (
+                "{ keyword: halloween, require: true, weight: 2 }",
+                "beside `weight`",
+            ),
+            (
+                "{ genre: Horror, require: true, exclude: true }",
+                "beside `weight` or `exclude`",
+            ),
+            (
+                "{ set: 'item.year < 1970', require: true }",
+                "cannot be required",
+            ),
+            ("{ keyword: halloween, require: false }", "requires nothing"),
         ] {
             let msg = check(&entry(yaml)).unwrap_err();
-            assert!(msg.contains("cannot be excluded"), "msg = {msg}");
+            assert!(msg.contains(says), "{yaml}: msg = {msg}");
         }
     }
 
