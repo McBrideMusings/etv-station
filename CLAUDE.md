@@ -88,6 +88,10 @@ variables are unset stops and asks rather than proceeding.
 reads (`PlexEnv::from_env`), so configuring the skill configures the ingest too.
 Radarr and Sonarr are discovery conveniences only — the daemon never contacts them.
 
+## `tools/*.py` is not auto-formatted
+
+No Python formatter is configured for this repo (no `pyproject.toml`, no `ruff.toml`), and none is to be run against `tools/*.py` — not `ruff format`, `black`, or a generic "format the files you changed" step. No ruff setting reproduces the files' existing style: `ruff format --diff` over the six scripts rewrites 439 lines at defaults and still 156 at the closest setting (`line-length = 120`, double quotes). Keep a change to these scripts to the lines it needs, in the style of the lines around it. If a formatter already rewrote a file, undo it with `git diff` review and a hand revert of the formatter's hunks, never `git checkout -- <file>`, which also discards your uncommitted fix.
+
 ## Documentation
 
 This project has a VitePress docs site under `docs/`. Run `bun run docs:dev` to read it on `http://localhost:5193`.
