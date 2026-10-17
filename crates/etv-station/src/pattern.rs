@@ -896,6 +896,7 @@ pub fn build(
     // An authored `cycles` is the author saying how long a pass runs, and the
     // window does not get to argue with it. Only a derived count is bounded.
     let budget = fill.filter(|_| cycles.is_none());
+    let derived_cycles = cycles.is_none();
 
     // Each pool's seed and temperature as the generation opens. A pool whose
     // dice rotate is re-checked at every visit below, which needs the walk to
@@ -999,8 +1000,10 @@ pub fn build(
         .unwrap_or(0);
     // The step of `first_cycle` the previous generation stopped before, from
     // the same pool that holds `first_cycle`.
+    let stop_at_visit = pools.iter().all(|p| p.advance == Advance::Resume);
     let first_step = pools
         .iter()
+        .filter(|_| stop_at_visit)
         .filter(|p| p.advance == Advance::Resume)
         .filter_map(|p| state.resume.pool(&p.name))
         .filter(|r| r.cycle == first_cycle)
@@ -1013,7 +1016,13 @@ pub fn build(
     // started the next slot hours late. That needs every pool to resume, since
     // the next generation picks the cycle up at a step and a `restart` pool
     // would start over under it; a block holding one stops between cycles.
-    let stop_at_visit = pools.iter().all(|p| p.advance == Advance::Resume);
+    // A derived count was sized in whole cycles, and a partial first cycle
+    // spends one of them on its remainder.
+    let cycles = if derived_cycles && first_step > 0 {
+        cycles + 1
+    } else {
+        cycles
+    };
     // Where the next generation opens: the visit the walk stopped before, or
     // the start of the cycle after the last one it finished.
     let mut stopped_at = (first_cycle, first_step);
@@ -1093,7 +1102,12 @@ pub fn build(
             }
             // A rewind to here regenerates from this visit, with the rotation
             // as it stands before it and the rolls this visit would have made.
-            let before = pools_resume(&runtimes, cycle, step_idx);
+            let (at_cycle, at_step) = if stop_at_visit || step_idx == 0 {
+                (cycle, step_idx)
+            } else {
+                (cycle + 1, 0)
+            };
+            let before = pools_resume(&runtimes, at_cycle, at_step);
             let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
             progress.extend(std::iter::repeat_n(before, drawn.len()));
             if measure {
