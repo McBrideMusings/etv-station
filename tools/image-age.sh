@@ -19,9 +19,10 @@ base=${1:-${PROD_URL:-}}
 
 stamp=$(curl -fsS --max-time 15 "${base%/}/build.json") \
   || { echo "fatal: could not read ${base%/}/build.json (a container built before #362 has no such route)" >&2; exit 2; }
-revision=$(printf %s "$stamp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])') \
+command -v python3 >/dev/null || { echo "fatal: python3 not found on PATH" >&2; exit 2; }
+fields=$(printf %s "$stamp" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["revision"], d["created"])') \
   || { echo "fatal: unparseable stamp: $stamp" >&2; exit 2; }
-created=$(printf %s "$stamp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["created"])')
+read -r revision created <<<"$fields"
 
 git -C "$repo_root" fetch -q origin main || { echo "fatal: git fetch origin main failed" >&2; exit 2; }
 tip=$(git -C "$repo_root" rev-parse origin/main)
