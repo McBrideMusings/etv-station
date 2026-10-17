@@ -395,7 +395,6 @@ function render(d) {
 // A step's take: `[min, max]`, null for `take: all`.
 const takeText = (t) => (t == null ? 'all' : t[0] === t[1] ? String(t[0]) : `${t[0]}-${t[1]}`);
 const stepsWords = (steps) => steps.map((s) => (s.take == null ? `all of one ${s.pool} pick` : `${takeText(s.take)} from ${s.pool}`)).join(', then ');
-  + (e.weekdays && e.weekdays.length ? ` ${e.weekdays.join(' ')}` : '');
 
 function patternWords(blocks) {
   return blocks.map((b) => {
