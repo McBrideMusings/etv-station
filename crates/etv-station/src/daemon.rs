@@ -312,10 +312,14 @@ struct SharedHistory {
     /// `/accounts` does not recognise: there is no pooled-vector fallback to
     /// degrade to.
     plex: Option<PlexEnv>,
-    /// How long a fetched history is reused before the next channel to ask
-    /// refetches. Set to the shortest `roll_interval` on the station, so no
-    /// channel ever sees a history older than one of its own ticks.
+    /// How long a scope listed in `scope_refresh` is reused before the next
+    /// channel to ask refetches; also the window for a scope that is not listed.
     refresh_after: Duration,
+    /// Per-scope refresh windows: the shortest `roll_interval` among the
+    /// channels that read that scope's history, so no channel ever sees a
+    /// history older than one of its own ticks, and a fast channel on one scope
+    /// does not shorten the window of any other scope (#371).
+    scope_refresh: HashMap<HistoryScope, Duration>,
     /// One entry per audience any channel has asked for so far, created on first
     /// ask. Scopes come from the channel list, which is fixed for the life of a
     /// generation, so this cannot grow without bound under a running station.
@@ -397,6 +401,7 @@ impl SharedHistory {
             tautulli,
             plex,
             refresh_after,
+            scope_refresh: HashMap::new(),
             state: tokio::sync::Mutex::new(HashMap::new()),
             accounts: tokio::sync::Mutex::new(None),
             accounts_fetch: Arc::new(|env| {
@@ -405,6 +410,32 @@ impl SharedHistory {
                 })
             }),
         }
+    }
+
+    /// Give each scope its own refresh window instead of the single
+    /// `refresh_after` (#371).
+    fn with_scope_refresh(mut self, windows: HashMap<HistoryScope, Duration>) -> Self {
+        self.scope_refresh = windows;
+        self
+    }
+
+    /// How long `scope`'s fetched history is reused.
+    fn window(&self, scope: &HistoryScope) -> Duration {
+        self.scope_refresh
+            .get(scope)
+            .copied()
+            .unwrap_or(self.refresh_after)
+    }
+
+    /// How long the station-wide `/accounts` list is reused: the shortest
+    /// window among the `single_user` scopes, the only ones that read it.
+    fn accounts_window(&self) -> Duration {
+        self.scope_refresh
+            .iter()
+            .filter(|(scope, _)| matches!(scope, HistoryScope::User(_)))
+            .map(|(_, window)| *window)
+            .min()
+            .unwrap_or(self.refresh_after)
     }
 
     /// Test-only seam (#283): install a counting or failing fetcher in place
@@ -417,7 +448,7 @@ impl SharedHistory {
     }
 
     /// The history to generate `scope`'s channels against right now, fetching it
-    /// first if that scope's cached copy has aged past `refresh_after`.
+    /// first if that scope's cached copy has aged past its [`Self::window`].
     ///
     /// Each scope ages independently: a channel ranking against one person does
     /// not refresh the server-wide pool, and vice versa.
@@ -467,7 +498,7 @@ impl SharedHistory {
         let mut state = self.state.lock().await;
         let cache = state.entry(scope.clone()).or_default();
         if let Some(at) = cache.fetched_at
-            && at.elapsed() < self.refresh_after
+            && at.elapsed() < self.window(scope)
         {
             return (Arc::clone(&cache.events), cache.account_id.clone());
         }
@@ -596,7 +627,7 @@ impl SharedHistory {
     }
 
     /// The station-wide `/accounts` list (#283), fetched once per
-    /// `refresh_after` window and shared by every `single_user` scope that
+    /// [`Self::accounts_window`] and shared by every `single_user` scope that
     /// resolves inside it — see the doc on [`Self::accounts`] for why one
     /// fetch answers every scope.
     ///
@@ -606,7 +637,7 @@ impl SharedHistory {
     async fn plex_accounts(&self, env: PlexEnv) -> Result<Arc<[PlexAccount]>, String> {
         let mut accounts = self.accounts.lock().await;
         if let Some(cache) = accounts.as_ref()
-            && cache.fetched_at.elapsed() < self.refresh_after
+            && cache.fetched_at.elapsed() < self.accounts_window()
         {
             return cache.result.clone();
         }
@@ -694,6 +725,20 @@ fn history_catalog(
     } else {
         None
     }
+}
+
+/// Each audience's refresh window: the shortest `roll_interval` among the
+/// channels that read that audience's history (#371). A channel that does not
+/// read history never asks, so its tick rate sets no window.
+fn history_scope_windows(channels: &[LoadedChannel]) -> HashMap<HistoryScope, Duration> {
+    let mut windows: HashMap<HistoryScope, Duration> = HashMap::new();
+    for c in channels.iter().filter(|c| c.config.reads_watch_history()) {
+        windows
+            .entry(c.config.history_scope())
+            .and_modify(|w| *w = (*w).min(c.config.roll_interval))
+            .or_insert(c.config.roll_interval);
+    }
+    windows
 }
 
 /// What an ingest pass should do about the Plex half of the catalog.
@@ -1028,25 +1073,23 @@ async fn run_generation(
     let mut supervisor_handles = Vec::new();
     let bus = Arc::new(crate::hooks::HookBus::new(crate::hooks::collect(station)));
     // One watch history for the whole station (#126). Built per generation
-    // because a reload can change both the roll intervals it is sized from and
-    // whether any channel still reads a history at all; the catalog behind it is
-    // the same one every generation shares. With no channels nothing ever asks,
-    // and a zero window is the inert choice — it means "always refetch", which
-    // is the pre-#126 behaviour.
-    let history = Arc::new(SharedHistory::new(
-        history_catalog(&station.channels, catalog),
-        // The one read of `TAUTULLI_URL`/`TAUTULLI_API_KEY` in the daemon (#132).
-        crate::tautulli::credentials_from_env(),
-        // The same `PLEX_URL`/`PLEX_TOKEN` connection the catalog ingest used
-        // at startup (#281) — not a second read of the environment.
-        plex.cloned(),
-        station
-            .channels
-            .iter()
-            .map(|c| c.config.roll_interval)
-            .min()
-            .unwrap_or(Duration::ZERO),
-    ));
+    // because a reload can change both the roll intervals its per-scope windows
+    // come from (`history_scope_windows`, #371) and whether any channel still
+    // reads a history at all; the catalog behind it is the same one every
+    // generation shares. Only a scope some channel reads is ever asked for, so
+    // the constructor's own window is never consulted.
+    let history = Arc::new(
+        SharedHistory::new(
+            history_catalog(&station.channels, catalog),
+            // The one read of `TAUTULLI_URL`/`TAUTULLI_API_KEY` in the daemon (#132).
+            crate::tautulli::credentials_from_env(),
+            // The same `PLEX_URL`/`PLEX_TOKEN` connection the catalog ingest used
+            // at startup (#281) — not a second read of the environment.
+            plex.cloned(),
+            Duration::ZERO,
+        )
+        .with_scope_refresh(history_scope_windows(&station.channels)),
+    );
     // One stop signal per spawned task. `notify_one` stores a permit if the task
     // is not yet parked, so a reload that races a slow generation startup
     // (duration probing, catch-up emit) is never lost — unlike `notify_waiters`,
@@ -4955,6 +4998,47 @@ mod shared_history_tests {
         );
     }
 
+    /// The `/accounts` window follows the `single_user` scopes only; the pooled
+    /// scope never reads it (#371).
+    #[test]
+    fn the_accounts_window_ignores_the_pooled_scope() {
+        let history = SharedHistory::new(None, None, None, Duration::ZERO).with_scope_refresh(
+            HashMap::from([
+                (HistoryScope::AllUsers, Duration::from_secs(5)),
+                (HistoryScope::User("Pierce".into()), Duration::from_secs(60)),
+                (HistoryScope::User("Madi".into()), Duration::from_secs(90)),
+            ]),
+        );
+        assert_eq!(history.accounts_window(), Duration::from_secs(60));
+    }
+
+    /// The pooled scope stays cached across its own 1h window while a sibling
+    /// scope on a 60s tick refetches every minute (#371).
+    #[tokio::test(start_paused = true)]
+    async fn a_fast_scope_does_not_shorten_the_pooled_scope_window() {
+        let (info, _catalog_dir) = catalog_without_tautulli();
+        let pierce = HistoryScope::User("Pierce".to_string());
+        let history = SharedHistory::new(Some(info), None, None, Duration::ZERO)
+            .with_scope_refresh(HashMap::from([
+                (HistoryScope::AllUsers, Duration::from_secs(3600)),
+                (pierce.clone(), Duration::from_secs(60)),
+            ]));
+        history.current(&HistoryScope::AllUsers).await;
+        history.current(&pierce).await;
+        let all_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
+        let pierce_at = stamp(&history, &pierce).await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        history.current(&HistoryScope::AllUsers).await;
+        history.current(&pierce).await;
+
+        assert_eq!(
+            stamp(&history, &HistoryScope::AllUsers).await.unwrap(),
+            all_at
+        );
+        assert!(stamp(&history, &pierce).await.unwrap() > pierce_at);
+    }
+
     // ---- SharedHistory::account_id (#278) ------------------------------------
 
     /// A pooled channel has no one account to resolve, on a station with a
@@ -5393,6 +5477,45 @@ mod history_catalog_tests {
         assert!(none.is_some() && some.is_some());
         assert_ne!(none, some);
         assert_eq!(some, channel_config_fingerprint(&ch, Some(&rules)));
+    }
+
+    /// A one-pool channel on its own tick, ranking against `scoring` (a YAML
+    /// fragment, empty for none) through `source`.
+    fn ticking(interval: &str, scoring: &str, source: &str) -> LoadedChannel {
+        let mut ch = channel("c", source);
+        let yaml = format!(
+            "number: 1\nname: x\nroll_interval: {interval}\n{scoring}rule:\n  blocks:\n    - pools:\n        - name: p\n          {source}\n      pattern:\n        - pool: p\n          take: 1\n"
+        );
+        ch.config = serde_norway::from_str(&yaml).unwrap();
+        ch
+    }
+
+    /// A channel that ticks fast shortens only its own audience's window (#371).
+    /// Every other audience keeps the shortest tick of the channels that read it,
+    /// and a channel that reads no history sets no window.
+    #[test]
+    fn scope_windows_come_from_the_channels_reading_each_scope() {
+        let plugin = "plugin: taste-engine.rhai";
+        let pierce = "scoring:\n  taste_scope: single_user\n  user: Pierce\n";
+        let channels = vec![
+            ticking("1h", "", plugin),
+            ticking("2h", "", plugin),
+            ticking("60s", pierce, plugin),
+            ticking("30s", "", "expr: 'item.type == \"movie\"'"),
+        ];
+
+        let windows = history_scope_windows(&channels);
+
+        assert_eq!(
+            windows.len(),
+            2,
+            "the non-reader adds no scope: {windows:?}"
+        );
+        assert_eq!(windows[&HistoryScope::AllUsers], Duration::from_secs(3600));
+        assert_eq!(
+            windows[&HistoryScope::User("Pierce".into())],
+            Duration::from_secs(60),
+        );
     }
 
     /// A station with no `catalog_path` is unchanged — there is nothing to join
