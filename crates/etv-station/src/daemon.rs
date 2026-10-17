@@ -2549,8 +2549,9 @@ mod regen_floor_tests {
     }
 }
 
-/// Hash the channel's *configuration*: its config bytes and its resolved
-/// overlay, and nothing else. Stored as [`crate::resume::ResumeMap::config_id`],
+/// Hash the channel's *configuration*: its config bytes, its resolved overlay,
+/// and the contents of the `profile_files` its pools name, and nothing else.
+/// Stored as [`crate::resume::ResumeMap::config_id`],
 /// and compared against on every start and reload to decide whether the written
 /// future still reflects what the channel is configured to do.
 ///
@@ -2566,7 +2567,8 @@ mod regen_floor_tests {
 /// and on a taste-scored channel that would rewrite the whole unaired schedule
 /// for a reason nobody configured. A new title reaches the screen as the window
 /// extends forward, which is soon enough. Dropping the catalog also makes this
-/// cheap and infallible: there is no query to run and no `&Catalog` to borrow.
+/// cheap and infallible: there is no query to run and no `&Catalog` to borrow,
+/// only a small read per profile file.
 ///
 /// Returns `None` only if the config or overlay cannot be serialized, which
 /// regenerates rather than skipping on a guess.
@@ -2622,7 +2624,38 @@ fn channel_config_fingerprint(
     hasher.update(&tracks_bytes);
     hasher.update((overlay_bytes.len() as u64).to_le_bytes());
     hasher.update(&overlay_bytes);
+    hash_profile_files(channel, &mut hasher);
     Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Fold the contents of every `profile_files` file the channel's pools name
+/// into `hasher`. The config serializes those as paths only, so a weight or
+/// `exclude: true` edit inside a profile file would otherwise leave the
+/// fingerprint unchanged. An unreadable file hashes as a distinct marker, so
+/// it appearing, vanishing or changing still moves the hash.
+fn hash_profile_files(channel: &LoadedChannel, hasher: &mut Sha256) {
+    let base_dir = channel
+        .config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    for block in channel.config.rule.all_blocks() {
+        for pool in &block.pools {
+            for file in &pool.profile_files {
+                let path = crate::score::resolve_plugin_path(base_dir, file);
+                let path_bytes = path.to_string_lossy();
+                hasher.update((path_bytes.len() as u64).to_le_bytes());
+                hasher.update(path_bytes.as_bytes());
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        hasher.update([1u8]);
+                        hasher.update((bytes.len() as u64).to_le_bytes());
+                        hasher.update(&bytes);
+                    }
+                    Err(_) => hasher.update([0u8]),
+                }
+            }
+        }
+    }
 }
 
 /// The marker a forced refresh leaves for the daemon, consumed on the next
@@ -5339,6 +5372,28 @@ mod history_catalog_tests {
         assert!(none.is_some() && some.is_some());
         assert_ne!(none, some);
         assert_eq!(some, channel_config_fingerprint(&ch, Some(&rules)));
+    }
+
+    /// A weight or `exclude` edit inside a `profile_files` file leaves the
+    /// channel config untouched, so the fingerprint has to hash the file's
+    /// contents or the unaired schedule never refreshes.
+    #[test]
+    fn editing_a_profile_file_changes_the_channel_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile.yaml");
+        std::fs::write(&profile, "- item: imdb:tt0113277\n  weight: 2\n").unwrap();
+        let mut ch = channel(
+            "foryou",
+            "plugin: taste-engine.rhai\n          profile_files: [profile.yaml]",
+        );
+        ch.config_path = dir.path().join("foryou.yaml");
+
+        let before = channel_config_fingerprint(&ch, None);
+        assert_eq!(before, channel_config_fingerprint(&ch, None));
+        std::fs::write(&profile, "- item: imdb:tt0113277\n  weight: 3\n").unwrap();
+        let after = channel_config_fingerprint(&ch, None);
+        assert!(before.is_some() && after.is_some());
+        assert_ne!(before, after);
     }
 
     /// A one-pool channel on its own tick, ranking against `scoring` (a YAML
