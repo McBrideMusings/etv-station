@@ -6,9 +6,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use ersatztv::error::LineupError;
-use ersatztv_playout::playout::{
-    Credits, DATE_FORMAT, PlayoutItem, ProgramMetadata, is_bumper_id,
-};
+use ersatztv_playout::playout::{Credits, DATE_FORMAT, PlayoutItem, ProgramMetadata, is_bumper_id};
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use time::OffsetDateTime;
