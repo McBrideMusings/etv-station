@@ -1705,30 +1705,6 @@ fn describe_take_from(from: TakeFrom) -> String {
     }
 }
 
-/// Flatten `ScoreCache::picked_extras`'s metadata half down to a plain
-/// `entry_id`-keyed map — the shape both [`build`] (the pattern walk) and
-/// `sequence::build` return in [`BlockBuild`] to their shared caller,
-/// `resolve::resolve_block`,
-/// which only ever sees a flat drawn-id list with no pool label left on any
-/// one of them. Two pools that both draw the same id and both attach
-/// metadata therefore collide here exactly as they already do for
-/// `Pool::constraints` — the same "blind across pools" limit, not a new one,
-/// and not fixable without giving every drawn id a pool label all the way
-/// out to `resolve::resolve_block`.
-///
-/// Kept as one shared helper (#203) so a future per-drawn-item field only
-/// has to be handled once — the flattening used to be written out twice,
-/// once here and once in `sequence::build`, which is exactly the shape that
-/// let #201 drop `metadata` silently on the sequencer path.
-pub(crate) fn flatten_picked_extras(
-    picked_extras: HashMap<(String, String), crate::score::PickedExtra>,
-) -> HashMap<String, serde_json::Value> {
-    picked_extras
-        .into_iter()
-        .filter_map(|((_pool, id), extra)| extra.metadata.map(|m| (id, m)))
-        .collect()
-}
-
 /// Resolve every pool's raw ordered id list — its `expr`/`plugin`/`groups`
 /// source, plus internal `order` for the non-plugin cases. A pool's *source*
 /// means the same thing regardless of which hook draws from the result, so
