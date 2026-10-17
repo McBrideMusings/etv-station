@@ -2374,7 +2374,7 @@ already carries (a `pool_provider`'s own `pick()` metadata, for one) keeps its
 value, and the station logs `annotate.key_collision`. A script error leaves that
 item unannotated and logs `annotate.failed`; the channel keeps airing. The
 `http` capability is granted by the script's own `capabilities()`, since
-`annotate:` is a bare path with no place for a channel grant.
+`annotate:` is a bare path with no place for a channel grant. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
 
 ### Pattern step `take` — how many items one visit draws
 

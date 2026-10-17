@@ -73,6 +73,9 @@ pub fn annotate_items(
         }
     };
 
+    // One budget for the whole pass, not one per item: a schedule of N items
+    // must not be able to hold generation for N times the per-call cap.
+    let budget = crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET);
     let mut engine = crate::score::engine();
     engine.register_fn(
         "http",
@@ -84,10 +87,9 @@ pub fn annotate_items(
             if !http {
                 return Err("capability `http` not declared".into());
             }
-            Ok(
-                crate::plugin_http::call(url, method, body, crate::plugin_http::GENERATION_TIMEOUT)
-                    .map_err(|e| format!("ctx.http(): {e}"))?,
-            )
+            Ok(budget.within("ctx.http()", |timeout| {
+                crate::plugin_http::call(url, method, body, timeout)
+            })?)
         },
     );
 
