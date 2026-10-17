@@ -16,8 +16,9 @@ Every one of these runs through `H`:
   root workspace).
 - Any `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `cargo run`, in either
   workspace (`cargo --manifest-path vendor/etv-next/Cargo.toml ...` for the vendored one).
-- `./tools/dev-run.sh`, `./tools/verify-integration.sh`, `./tools/dev-station.sh` — they build
-  both etv-next binaries and the daemon, and run ffmpeg.
+- `./tools/dev-run.sh`, `./tools/verify-integration.sh` — they build both etv-next binaries and
+  the daemon, and run ffmpeg.
+- `./tools/dev-station.sh` — builds and runs only the station daemon.
 - `./tools/overlay-test.sh`, `./tools/overlay-still.sh` — Vello render plus ffmpeg encode.
 - `bun install`, `bun run docs:build`.
 
@@ -40,6 +41,14 @@ the same `CARGO_TARGET_DIR`.
 
 ## Per-worker resources
 
+- **The dev stack is one per machine, whatever the port.** `dev-run.sh`'s preflight
+  (`tools/dev-run.sh` `preflight_stale_procs`) and `verify-integration.sh`'s orphan check match
+  `etv-station`, `ersatztv`, `etv-overlay` and dev ffmpeg processes machine-wide with `pgrep`.
+  A run beside another worker's stack, or the main checkout's, refuses at preflight or fails
+  its orphan check. So `dev-run.sh`, `verify-integration.sh` and `dev-station.sh` run only
+  inside `swarm heavy`, which also keeps two workers' runs apart. If the preflight still
+  refuses, the main checkout's stack is running: report that in your pass's result and skip
+  the integration run. Never kill it.
 - **HTTP port.** `dev-run.sh` and `verify-integration.sh` bind `ETV_PORT` (default 8409, the
   main checkout's). Give each run your own port, derived from the bead id:
 
@@ -52,9 +61,13 @@ the same `CARGO_TARGET_DIR`.
 - **Docs port.** `bun run docs:dev` binds 5193. Don't run it in a worker; `bun run docs:build`
   checks a docs change without a server.
 - **Output and temp paths.** `examples/output/` and `tmp/` are relative to the worktree, so each
-  worker already has its own. Stop every daemon and ETV-next process you started, by its PID,
-  before the pass ends. Never run `./tools/kill-dev.sh` in a worker: it matches process names
-  machine-wide (`pgrep`) and kills the other workers' and the main checkout's dev stacks too.
+  worker already has its own.
+- **Cleanup.** `dev-run.sh` and `verify-integration.sh` kill their own process groups from a
+  `cleanup` trap when they exit or are interrupted, so ending the script ends its stack. A
+  process you started directly (a `cargo run`, an `etv-overlay`) you stop by the PID you
+  recorded when you started it. Never run `./tools/kill-dev.sh`, `pkill` or `killall` in a
+  worker: they match process names machine-wide and kill the other workers' and the main
+  checkout's stacks too.
 - **`deploy/appdata/*`** is gitignored and absent from worktrees. No worker reads or edits it.
 
 ## Slot cap
