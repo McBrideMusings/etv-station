@@ -61,7 +61,12 @@ fn run_program(
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
+            // SIGKILL does not land while a stale mount holds the process in
+            // an uninterruptible read, so reap it on a thread rather than
+            // block the caller past the deadline.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             // The reader ends once the killed child's pipe closes; a process
             // stuck in the kernel may keep it open, so do not join it.
             return Ok(Bounded::TimedOut);
