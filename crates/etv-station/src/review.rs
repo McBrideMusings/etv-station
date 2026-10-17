@@ -187,6 +187,27 @@ pub const INTERSTITIAL_MAX: Duration = Duration::minutes(5);
 /// ([Wikipedia, Strip programming](https://en.wikipedia.org/wiki/Strip_programming)).
 pub const STRIP_MIN_EPISODES: usize = 75;
 
+// Grade thresholds. `docs/programming.md` states each in its principle's
+// **Grade.** paragraph; `grade_thresholds_match_the_doc` fails when the two
+// differ.
+
+/// Dayparting: swing in points of airtime that earns grade 3, 2, 1.
+const DAYPARTING_SWING: [f64; 3] = [30.0, 20.0, 10.0];
+/// Block programming: episodes per visit that earn grade 3 (inclusive range).
+const BLOCK_IDEAL: (f64, f64) = (2.0, 4.0);
+/// Block programming: the upper bound of grade 2.
+const BLOCK_GRADE2_MAX: f64 = 6.0;
+/// Block programming: the lower bound of grade 1 below the ideal range.
+const BLOCK_GRADE1_MIN: f64 = 1.5;
+/// Stripping: percent of weekdays that earns grade 3, 2, 1.
+const STRIPPING_SHARE: [f64; 3] = [80.0, 60.0, 40.0];
+/// Episode order: percent out of order that still earns grade 3, 2, 1.
+const EPISODE_ORDER_OUT: [f64; 3] = [0.0, 5.0, 15.0];
+/// Interstitials: percent of program changes filled that earns grade 3, 2.
+const INTERSTITIAL_SHARE: [f64; 2] = [90.0, 50.0];
+/// Rest periods: days to the first repeat that earn grade 3, 2, 1.
+const REST_DAYS: [f64; 3] = [14.0, 7.0, 3.0];
+
 /// One principle from `docs/programming.md`, measured against a schedule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrincipleGrade {
@@ -312,9 +333,9 @@ fn dayparting(g: &GradeInputs) -> PrincipleGrade {
         .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .expect("two or more pools");
     let grade = match swing {
-        s if s >= 30.0 => 3,
-        s if s >= 20.0 => 2,
-        s if s >= 10.0 => 1,
+        s if s >= DAYPARTING_SWING[0] => 3,
+        s if s >= DAYPARTING_SWING[1] => 2,
+        s if s >= DAYPARTING_SWING[2] => 1,
         _ => 0,
     };
     graded(
@@ -351,9 +372,9 @@ fn block_programming(g: &GradeInputs) -> PrincipleGrade {
     }
     let mean = runs.iter().map(|r| r.1).sum::<usize>() as f64 / runs.len() as f64;
     let grade = match mean {
-        m if (2.0..=4.0).contains(&m) => 3,
-        m if m > 4.0 && m <= 6.0 => 2,
-        m if m > 6.0 || m >= 1.5 => 1,
+        m if (BLOCK_IDEAL.0..=BLOCK_IDEAL.1).contains(&m) => 3,
+        m if m > BLOCK_IDEAL.1 && m <= BLOCK_GRADE2_MAX => 2,
+        m if m > BLOCK_GRADE2_MAX || m >= BLOCK_GRADE1_MIN => 1,
         _ => 0,
     };
     graded(
@@ -415,9 +436,9 @@ fn stripping(g: &GradeInputs) -> PrincipleGrade {
     }
     let (show, share) = best.expect("at least one deep show");
     let grade = match share {
-        s if s >= 80.0 => 3,
-        s if s >= 60.0 => 2,
-        s if s >= 40.0 => 1,
+        s if s >= STRIPPING_SHARE[0] => 3,
+        s if s >= STRIPPING_SHARE[1] => 2,
+        s if s >= STRIPPING_SHARE[2] => 1,
         _ => 0,
     };
     graded(
@@ -458,9 +479,9 @@ fn episode_order(g: &GradeInputs) -> PrincipleGrade {
     }
     let pct = out as f64 / steps as f64 * 100.0;
     let grade = match pct {
-        p if p <= 0.0 => 3,
-        p if p <= 5.0 => 2,
-        p if p <= 15.0 => 1,
+        p if p <= EPISODE_ORDER_OUT[0] => 3,
+        p if p <= EPISODE_ORDER_OUT[1] => 2,
+        p if p <= EPISODE_ORDER_OUT[2] => 1,
         _ => 0,
     };
     graded(
@@ -512,8 +533,8 @@ fn interstitials(g: &GradeInputs) -> PrincipleGrade {
     }
     let pct = filled as f64 / changes as f64 * 100.0;
     let grade = match pct {
-        p if p >= 90.0 => 3,
-        p if p >= 50.0 => 2,
+        p if p >= INTERSTITIAL_SHARE[0] => 3,
+        p if p >= INTERSTITIAL_SHARE[1] => 2,
         p if p > 0.0 => 1,
         _ => 0,
     };
@@ -545,9 +566,9 @@ fn rest_periods(g: &GradeInputs) -> PrincipleGrade {
         None => (span, format!("nothing repeats in {span:.0} days")),
     };
     let grade = match days {
-        d if d >= 14.0 => 3,
-        d if d >= 7.0 => 2,
-        d if d >= 3.0 => 1,
+        d if d >= REST_DAYS[0] => 3,
+        d if d >= REST_DAYS[1] => 2,
+        d if d >= REST_DAYS[2] => 1,
         _ => 0,
     };
     graded(NAME, grade, days, measure)
@@ -805,6 +826,85 @@ mod tests {
         assert_eq!(grade_of(&g, "Rest periods").grade, Some(3));
         let g = grade_principles(&inputs(&[], &HashSet::new(), &HashMap::new(), 14));
         assert_eq!(grade_of(&g, "Rest periods").grade, None);
+    }
+
+    /// The text of the **Grade.** paragraph under the `## <heading>` section
+    /// of `docs/programming.md`, whitespace collapsed to single spaces.
+    fn doc_grade(heading: &str) -> String {
+        let doc = include_str!("../../../docs/programming.md");
+        let section = doc
+            .split("\n## ")
+            .find(|s| s.starts_with(heading))
+            .unwrap_or_else(|| panic!("no `## {heading}` section in docs/programming.md"));
+        let grade = section
+            .split("**Grade.**")
+            .nth(1)
+            .unwrap_or_else(|| panic!("`## {heading}` has no **Grade.** paragraph"));
+        let para = grade.split("\n\n").next().expect("a paragraph");
+        para.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn assert_doc_says(heading: &str, expected: &[String]) {
+        let para = doc_grade(heading);
+        for want in expected {
+            assert!(
+                para.contains(want.as_str()),
+                "docs/programming.md `## {heading}` Grade paragraph does not say {want:?}:\n{para}"
+            );
+        }
+    }
+
+    #[test]
+    fn grade_thresholds_match_the_doc() {
+        let [d3, d2, d1] = DAYPARTING_SWING;
+        assert_doc_says(
+            "Dayparting",
+            &[format!(
+                "{d3} points or more is 3, {d2} is 2, {d1} is 1, under {d1} is 0"
+            )],
+        );
+        let (lo, hi) = BLOCK_IDEAL;
+        assert_doc_says(
+            "Block programming",
+            &[format!(
+                "{lo} to {hi} is 3 (the unsourced range above), over {hi} up to {BLOCK_GRADE2_MAX} is 2, over {BLOCK_GRADE2_MAX} or {BLOCK_GRADE1_MIN} to {lo} is 1, under {BLOCK_GRADE1_MIN} is 0"
+            )],
+        );
+        let [s3, s2, s1] = STRIPPING_SHARE;
+        assert_doc_says(
+            "Stripping",
+            &[
+                format!("{STRIP_MIN_EPISODES} or more episodes"),
+                format!("{s3}% or more is 3, {s2}% is 2, {s1}% is 1, under {s1}% is 0"),
+            ],
+        );
+        let [e3, e2, e1] = EPISODE_ORDER_OUT;
+        assert_doc_says(
+            "Episode order",
+            &[format!(
+                "{e3}% is 3, up to {e2}% is 2, up to {e1}% is 1, more is 0"
+            )],
+        );
+        let [i3, i2] = INTERSTITIAL_SHARE;
+        assert_doc_says(
+            "Interstitials and bumpers",
+            &[
+                format!("under {} minutes", INTERSTITIAL_MAX.whole_minutes()),
+                format!("{i3}% or more is 3, {i2}% is 2, anything above 0 is 1, none is 0"),
+            ],
+        );
+        let [r3, r2, r1] = REST_DAYS;
+        assert_doc_says(
+            "Rest periods",
+            &[
+                format!("{r3} days or more is 3, {r2} is 2"),
+                format!("{r1} is 1, under {r1} is 0"),
+                format!(
+                    "an airing of {} minutes or more",
+                    INTERSTITIAL_MAX.whole_minutes()
+                ),
+            ],
+        );
     }
 
     #[test]
