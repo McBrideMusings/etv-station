@@ -11,6 +11,16 @@ const DATE_CONFIG: iso8601::EncodedConfig =
 
 pub const DATE_FORMAT: Iso8601<DATE_CONFIG> = Iso8601::<DATE_CONFIG>;
 
+/// Prefix of the `id` of every item the station inserts as a bumper. The
+/// playout schema has no item-kind field, so the id is the marker; every
+/// reader that must tell a bumper from a programme asks [`is_bumper_id`].
+pub const BUMPER_ID_PREFIX: &str = "bumper:";
+
+/// Whether a playout item id names a bumper rather than a programme.
+pub fn is_bumper_id(id: &str) -> bool {
+    id.starts_with(BUMPER_ID_PREFIX)
+}
+
 pub const SUPPORTED_SCHEMA: SchemaVersion = SchemaVersion {
     breaking: 0,
     compatible: 3,

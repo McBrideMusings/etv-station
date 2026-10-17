@@ -8,6 +8,18 @@ use serde::Deserialize;
 struct ConfigHint {
     #[serde(default)]
     normalization: NormalizationHint,
+    #[serde(default)]
+    guide: GuideHint,
+}
+
+/// The channel's `guide` settings. Written by the station into `channelN.json`;
+/// the worker process ignores them, only the XMLTV route reads them.
+#[derive(Deserialize, Default)]
+struct GuideHint {
+    /// List bumper items as their own guide rows. Off folds each bumper into
+    /// the programme before it.
+    #[serde(default)]
+    show_bumpers: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -83,6 +95,7 @@ pub struct ChannelModel {
     group: Option<String>,
     bandwidth_bps: u32,
     subtitle: SubtitleHint,
+    show_bumpers: bool,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +153,7 @@ impl ChannelModel {
         let bandwidth_bps = (video + audio) * 1100; // kbps => bps + 10% for hls overhead
 
         let subtitle = hint.normalization.subtitle;
+        let show_bumpers = hint.guide.show_bumpers;
 
         let playout_folder = read_playout_folder(&channel_config, &config_base).await?;
 
@@ -157,6 +171,7 @@ impl ChannelModel {
             group: channel.group.clone(),
             bandwidth_bps,
             subtitle,
+            show_bumpers,
         })
     }
 
@@ -198,6 +213,12 @@ impl ChannelModel {
 
     pub fn bandwidth_bps(&self) -> u32 {
         self.bandwidth_bps
+    }
+
+    /// Whether the guide lists bumper items as their own rows instead of
+    /// folding them into the preceding programme.
+    pub fn show_bumpers(&self) -> bool {
+        self.show_bumpers
     }
 
     /// Whether this channel serves subtitles as their own selectable track.

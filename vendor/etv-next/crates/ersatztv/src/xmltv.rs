@@ -6,7 +6,9 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use ersatztv::error::LineupError;
-use ersatztv_playout::playout::{Credits, DATE_FORMAT, PlayoutItem, ProgramMetadata};
+use ersatztv_playout::playout::{
+    Credits, DATE_FORMAT, PlayoutItem, ProgramMetadata, is_bumper_id,
+};
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use time::OffsetDateTime;
@@ -75,8 +77,12 @@ fn build_xmltv(
         }
 
         for (tvg_id, items) in sections {
-            for item in items {
-                write_programme(&mut w, tvg_id, item, base_url)?;
+            let show_bumpers = channels
+                .iter()
+                .find(|c| c.tvg_id() == tvg_id)
+                .is_some_and(ChannelModel::show_bumpers);
+            for (item, stop) in programme_spans(items, show_bumpers) {
+                write_programme(&mut w, tvg_id, item, stop, base_url)?;
             }
         }
 
@@ -85,6 +91,33 @@ fn build_xmltv(
     }
 
     String::from_utf8(buf.into_inner()).map_err(|e| LineupError::XmltvFailure(e.to_string()))
+}
+
+/// Each guide row for a channel's items, as the item and the time its row
+/// stops.
+///
+/// A bumper item (see [`is_bumper_id`]) is folded into the programme before
+/// it: it gets no row, and that programme's stop moves out to the bumper's
+/// finish, so the guide shows one row per programme and no gap where the
+/// bumpers play. With `show_bumpers` set every item keeps its own row. A
+/// bumper with no programme before it (the first item on the channel) keeps
+/// its own row, since there is nothing to fold it into.
+fn programme_spans(
+    items: &[PlayoutItem],
+    show_bumpers: bool,
+) -> Vec<(&PlayoutItem, OffsetDateTime)> {
+    let mut spans: Vec<(&PlayoutItem, OffsetDateTime)> = Vec::with_capacity(items.len());
+    for item in items {
+        if !show_bumpers
+            && is_bumper_id(&item.id)
+            && let Some((_, stop)) = spans.last_mut()
+        {
+            *stop = (*stop).max(item.finish);
+            continue;
+        }
+        spans.push((item, item.finish));
+    }
+    spans
 }
 
 /// Resolve an icon `src` against `base_url` when it's relative (`/artwork/...`,
@@ -137,10 +170,11 @@ fn write_programme<W: std::io::Write>(
     w: &mut Writer<W>,
     tvg_id: &str,
     item: &PlayoutItem,
+    finish: OffsetDateTime,
     base_url: &str,
 ) -> Result<(), LineupError> {
     let start = format_xmltv_datetime(item.start);
-    let stop = format_xmltv_datetime(item.finish);
+    let stop = format_xmltv_datetime(finish);
 
     let mut elem = BytesStart::new("programme");
     elem.push_attribute(("start", start.as_str()));
@@ -688,6 +722,101 @@ mod tests {
             bare_body.trim().is_empty(),
             "bare programme should have no children, got: {bare_body:?}"
         );
+    }
+
+    fn bumper_item(id: &str, start: OffsetDateTime, finish: OffsetDateTime) -> PlayoutItem {
+        PlayoutItem {
+            id: id.into(),
+            start,
+            finish,
+            ..bare_item()
+        }
+    }
+
+    async fn channel_with_config(channel_json: &str) -> (tempfile::TempDir, ChannelModel) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("playout")).unwrap();
+        let cfg_path = dir.path().join("channel.json");
+        std::fs::write(&cfg_path, channel_json).unwrap();
+        let cfg = ersatztv::config::ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: None,
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
+        (dir, channel)
+    }
+
+    // A programme 12:00-12:30 followed by two bumpers to 12:35, then a second
+    // programme to 13:00.
+    fn programmes_with_bumpers() -> Vec<PlayoutItem> {
+        vec![
+            fully_populated_item(),
+            bumper_item(
+                "bumper:a",
+                datetime!(2026-04-30 12:30:00 +00:00:00),
+                datetime!(2026-04-30 12:32:00 +00:00:00),
+            ),
+            bumper_item(
+                "bumper:b",
+                datetime!(2026-04-30 12:32:00 +00:00:00),
+                datetime!(2026-04-30 12:35:00 +00:00:00),
+            ),
+            bumper_item(
+                "b",
+                datetime!(2026-04-30 12:35:00 +00:00:00),
+                datetime!(2026-04-30 13:00:00 +00:00:00),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn bumpers_fold_into_the_previous_programme_by_default() {
+        let (_dir, channel) = channel_with_config(r#"{"playout":{"folder":"playout"}}"#).await;
+        let sections = vec![(channel.tvg_id().to_owned(), programmes_with_bumpers())];
+
+        let xml = build_xmltv(std::slice::from_ref(&channel), &sections, "http://x.test").unwrap();
+
+        assert_eq!(xml.matches("<programme ").count(), 2, "{xml}");
+        assert!(
+            xml.contains(r#"start="20260430120000 +0000" stop="20260430123500 +0000""#),
+            "first programme stops where the last bumper ends: {xml}"
+        );
+        assert!(
+            xml.contains(r#"start="20260430123500 +0000" stop="20260430130000 +0000""#),
+            "{xml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_bumpers_lists_each_bumper_as_its_own_row() {
+        let (_dir, channel) = channel_with_config(
+            r#"{"playout":{"folder":"playout"},"guide":{"show_bumpers":true}}"#,
+        )
+        .await;
+        let sections = vec![(channel.tvg_id().to_owned(), programmes_with_bumpers())];
+
+        let xml = build_xmltv(std::slice::from_ref(&channel), &sections, "http://x.test").unwrap();
+
+        assert_eq!(xml.matches("<programme ").count(), 4, "{xml}");
+        assert!(
+            xml.contains(r#"start="20260430120000 +0000" stop="20260430123000 +0000""#),
+            "programme keeps its own stop: {xml}"
+        );
+    }
+
+    #[test]
+    fn a_leading_bumper_keeps_its_own_row() {
+        let items = vec![bumper_item(
+            "bumper:a",
+            datetime!(2026-04-30 12:00:00 +00:00:00),
+            datetime!(2026-04-30 12:01:00 +00:00:00),
+        )];
+        assert_eq!(programme_spans(&items, false).len(), 1);
     }
 
     // #187: the station only ever writes a path relative to this server's own
