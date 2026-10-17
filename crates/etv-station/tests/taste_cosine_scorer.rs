@@ -1534,6 +1534,28 @@ fn seen_only_and_seen_exclude_partition_the_candidates() {
     );
 }
 
+/// A nonzero `unusual_weight` with no account is a pool asking for a term a
+/// pooled channel cannot deliver; it fails rather than ranking as if unset.
+#[test]
+fn unusual_weight_on_a_pooled_channel_is_refused() {
+    let scorer = seen_scorer();
+    let config = serde_json::json!({ "exploration_fraction": 0.0, "unusual_weight": 0.5 });
+    let err = scorer
+        .try_pick_for("movies", 0, 10, Some(config), None, &[])
+        .unwrap_err();
+    assert!(err.contains("unusual_weight"), "{err}");
+    assert!(err.contains("single_user"), "{err}");
+}
+
+/// `seen` on a pooled channel stays legal: it partitions on the house's plays.
+#[test]
+fn seen_on_a_pooled_channel_partitions_on_the_house() {
+    let scorer = seen_scorer();
+    let config = serde_json::json!({ "exploration_fraction": 0.0, "seen": "exclude" });
+    let picked = scorer.pick_for("movies", 0, 10, Some(config), None, &[]);
+    assert_eq!(order_of(&picked), vec!["mov-d"]);
+}
+
 /// `seen: any` — the default — is every candidate, so a pool that never sets
 /// the key behaves as it always did.
 #[test]

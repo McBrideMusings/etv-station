@@ -210,8 +210,8 @@ fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
 // See the score assembly in pick() for why it divides rather than subtracts.
 //
 // Meaningful only on a `taste_scope: single_user` channel. On a pooled
-// channel the taste vector IS the house vector, so this subtracts a scaled
-// copy of the first term and only flattens the ranking.
+// channel the taste vector IS the house vector, so the term would only
+// flatten the ranking; a nonzero value there is refused with an error.
 //
 // Zero by default.
 fn unusual_weight(ctx) { tunable(ctx, "unusual_weight", 0.0).to_float() }
@@ -468,6 +468,7 @@ fn pick(ctx) {
         let ids = if ctx.account_id != () {
             ds.watched_units_for(ctx.account_id)
         } else {
+            log("pool " + ctx.pool + ": seen: " + mode + " partitions on what the whole house has played — this channel has no taste_scope: single_user account");
             ds.watched_units()
         };
         for id in ids { watched[id] = true; }
@@ -623,6 +624,9 @@ fn pick(ctx) {
     // only when a pool asks for it, and skipped outright on a pooled channel,
     // where it would be the same vector `weights` already holds.
     let gamma = unusual_weight(ctx);
+    if gamma != 0.0 && ctx.account_id == () {
+        throw "pool " + ctx.pool + ": config.unusual_weight needs a `taste_scope: single_user` channel — on a pooled channel the taste vector already is the house vector, so the term would do nothing";
+    }
     let house_weights = #{};
     if gamma != 0.0 && ctx.account_id != () {
         let house = ds.pooled_taste_vector();
