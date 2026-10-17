@@ -293,7 +293,7 @@ impl PoolRuntime<'_> {
 
     /// Whether this series' next item may air right now, given what this pool
     /// has already emitted (#115).
-    fn is_eligible(&self, si: usize) -> bool {
+    fn own_allows(&self, si: usize) -> bool {
         match self.next_id(si) {
             Some(id) => !crate::constrain::conflicts_with_recent(
                 &self.recent,
@@ -302,6 +302,36 @@ impl PoolRuntime<'_> {
             ),
             None => true,
         }
+    }
+
+    /// Whether this series' next item may air right now, given everything the
+    /// channel has aired — every pool, every block, every slot.
+    fn channel_allows(&self, si: usize, channel: &ChannelHistory) -> bool {
+        self.next_id(si).is_none_or(|id| channel.allows(id))
+    }
+
+    /// Whether this series' next item passes both rules: the pool's own and the
+    /// channel's. A series turned away by the channel rule alone is counted, so
+    /// the end-of-walk log says how often the channel rule moved a draw.
+    fn admits(&self, si: usize, channel: &mut ChannelHistory) -> bool {
+        let own = self.own_allows(si);
+        let chan = self.channel_allows(si, channel);
+        if own && !chan {
+            channel.blocked += 1;
+            tracing::debug!(
+                event = "channel_repeat.blocked",
+                pool = %self.cfg.name,
+                id = self.next_id(si).map(String::as_str).unwrap_or("-"),
+                "rule.no_repeat_within turned this draw away; trying the next series",
+            );
+        }
+        own && chan
+    }
+
+    /// Neither this pool nor the channel constrains anything, so the first
+    /// choice always stands.
+    fn is_unconstrained(&self, channel: &ChannelHistory) -> bool {
+        self.limits.is_unconstrained() && channel.is_unconstrained()
     }
 
     /// `start`, or the first series after it that may serve — the draw-time half
@@ -317,12 +347,18 @@ impl PoolRuntime<'_> {
     /// already mean. It is the wrong one for a random draw, which is why
     /// [`Self::eligible_pick`] rerolls instead.
     ///
+    /// The channel's `rule.no_repeat_within` is checked here too, beside the
+    /// pool's own rule, so a series the channel aired recently from another
+    /// pool is slid past the same way. When no series passes both, the channel
+    /// rule gives way first: the pool's own rule is the tighter, authored-for-
+    /// this-pool one, and the walk below keeps it exactly as it stood.
+    ///
     /// When no series can serve, `start` serves anyway and the clash is counted.
     /// A pool that cannot satisfy its own constraint still has to put television
     /// on the air — the same doctrine [`crate::constrain::order_constrained`]
     /// applies to a list it cannot arrange.
-    fn eligible_from(&mut self, start: usize) -> Option<usize> {
-        if self.limits.is_unconstrained() {
+    fn eligible_from(&mut self, start: usize, channel: &mut ChannelHistory) -> Option<usize> {
+        if self.is_unconstrained(channel) {
             return Some(start);
         }
         let n = self.series.len();
@@ -331,12 +367,32 @@ impl PoolRuntime<'_> {
         }
         for step in 0..n {
             let si = (start + step) % n;
-            if self.is_eligible(si) {
+            if self.admits(si, channel) {
                 return Some(si);
             }
         }
+        let si = self.own_eligible_from(start);
+        if !self.channel_allows(si, channel) {
+            channel.forced += 1;
+        }
+        Some(si)
+    }
+
+    /// `start`, or the first series after it the pool's own rule lets serve —
+    /// `start` itself, counted as forced, when none does.
+    fn own_eligible_from(&mut self, start: usize) -> usize {
+        if self.limits.is_unconstrained() {
+            return start;
+        }
+        let n = self.series.len();
+        if let Some(si) = (0..n)
+            .map(|step| (start + step) % n)
+            .find(|&si| self.own_allows(si))
+        {
+            return si;
+        }
         self.forced += 1;
-        Some(start)
+        start
     }
 
     /// Which series opens a visit, honouring both `select` and the pool's
@@ -350,22 +406,27 @@ impl PoolRuntime<'_> {
     /// keyed like every other decision here, so a pinned seed still reproduces
     /// the schedule. Exhausting them falls back to the ordered walk, which is
     /// also what reports an unsatisfiable pool.
-    fn eligible_pick(&mut self, roll: &RollKey, nonce: u64) -> Option<usize> {
+    fn eligible_pick(
+        &mut self,
+        roll: &RollKey,
+        nonce: u64,
+        channel: &mut ChannelHistory,
+    ) -> Option<usize> {
         let first = self.pick(roll, nonce)?;
-        if self.limits.is_unconstrained() || self.is_eligible(first) {
+        if self.is_unconstrained(channel) || self.admits(first, channel) {
             return Some(first);
         }
         if self.cfg.select == Select::Random {
             for attempt in 1..=RANDOM_REROLLS {
                 let rolled = roll.u64_at(nonce.wrapping_add(attempt.wrapping_mul(REROLL_STRIDE)));
                 if let Some(si) = self.series_at(rolled as usize)
-                    && self.is_eligible(si)
+                    && self.admits(si, channel)
                 {
                     return Some(si);
                 }
             }
         }
-        self.eligible_from(first)
+        self.eligible_from(first, channel)
     }
 
     /// Fold what a draw emitted into the recent window, so the next draw in the
@@ -481,7 +542,13 @@ impl PoolRuntime<'_> {
     }
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
-    fn visit(&mut self, take: Take, from: TakeFrom, roll: &RollKey) -> Result<Vec<String>, String> {
+    fn visit(
+        &mut self,
+        take: Take,
+        from: TakeFrom,
+        roll: &RollKey,
+        channel: &mut ChannelHistory,
+    ) -> Result<Vec<String>, String> {
         // A range is decided once per visit, here, so a `rotate = "slot"` visit
         // sizes its slots from the same roll a `rotate = "visit"` draw does.
         let take = match take {
@@ -513,11 +580,11 @@ impl PoolRuntime<'_> {
                     if self.is_dry() {
                         break;
                     }
-                    out.extend(self.serve(Take::Count(1), from, roll, slot as u64)?);
+                    out.extend(self.serve(Take::Count(1), from, roll, slot as u64, channel)?);
                 }
                 Ok(out)
             }
-            Rotate::Visit => self.serve(take, from, roll, 0),
+            Rotate::Visit => self.serve(take, from, roll, 0, channel),
         }
     }
 
@@ -534,8 +601,9 @@ impl PoolRuntime<'_> {
         from: TakeFrom,
         roll: &RollKey,
         nonce: u64,
+        channel: &mut ChannelHistory,
     ) -> Result<Vec<String>, String> {
-        let first = self.eligible_pick(roll, nonce);
+        let first = self.eligible_pick(roll, nonce, channel);
         let override_take = match self.cfg.rotate {
             Rotate::Visit => first.and_then(|si| self.take_override_for(si)),
             Rotate::Slot => None,
@@ -611,6 +679,7 @@ impl PoolRuntime<'_> {
             // Before the next draw, not after the visit: a visit's filler must
             // not replay what the visit itself just aired (#115).
             self.remember(&taken);
+            channel.remember(&taken);
             out.extend(taken);
             if out.len() >= take {
                 break;
@@ -619,13 +688,16 @@ impl PoolRuntime<'_> {
             current = match self.cfg.on_short {
                 OnShort::Next => self
                     .series_after(si)
-                    .and_then(|next| self.eligible_from(next)),
+                    .and_then(|next| self.eligible_from(next, channel)),
                 // `wrap` is the author saying "stay on this series", so it does
                 // not shop around — but a clash it forces is still a clash the
                 // config asked for and could not have, so it is counted.
                 OnShort::Wrap => {
-                    if !self.limits.is_unconstrained() && !self.is_eligible(si) {
+                    if !self.limits.is_unconstrained() && !self.own_allows(si) {
                         self.forced += 1;
+                    }
+                    if !self.channel_allows(si, channel) {
+                        channel.forced += 1;
                     }
                     Some(si)
                 }
@@ -783,6 +855,129 @@ impl PoolRuntime<'_> {
     }
 }
 
+/// The channel-wide `rule.no_repeat_within` (etv-station-hzfh.19) handed to
+/// one pattern block's walk.
+///
+/// A pool's own `constraints` see only that pool's draws, so two pools
+/// resolving the same film air it days apart with nothing noticing. This rule
+/// sees what the channel aired instead: `aired` is the ledger's tail —
+/// unfiltered, so every pool and every slot that ever aired is in it — followed
+/// by whatever earlier blocks of the same generation laid.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelRule<'a> {
+    pub gap: NoRepeatWithin,
+    /// Oldest first.
+    pub aired: &'a [String],
+}
+
+/// What [`ChannelRule`] checks a draw against: the channel's aired history,
+/// extended by every draw of every pool in the walk as it happens, so a pool
+/// drawing later in the same visit or cycle sees what another pool just aired.
+///
+/// Unconstrained, and never consulted, when the channel sets no rule.
+struct ChannelHistory<'c> {
+    catalog: &'c Catalog,
+    limits: Limits,
+    /// Oldest first, trimmed to what the rule can still reach.
+    recent: Vec<ItemKeys>,
+    /// What the catalog says each id seen so far runs for. Only read by a
+    /// temporal rule, so only filled for one.
+    durations: HashMap<String, Duration>,
+    /// Ids already asked of the catalog, measured or not, so an unmeasured one
+    /// is not re-queried on every draw.
+    asked: HashSet<String>,
+    /// Stands in for an id the catalog never measured.
+    mean: Duration,
+    /// Candidates the pool's own rule allowed and this rule turned away.
+    blocked: usize,
+    /// Draws that aired against this rule because nothing else could.
+    forced: usize,
+}
+
+impl<'c> ChannelHistory<'c> {
+    fn new(catalog: &'c Catalog, rule: Option<ChannelRule<'_>>) -> Self {
+        let mut history = Self {
+            catalog,
+            limits: Limits::default(),
+            recent: Vec::new(),
+            durations: HashMap::new(),
+            asked: HashSet::new(),
+            mean: Duration::ZERO,
+            blocked: 0,
+            forced: 0,
+        };
+        if let Some(rule) = rule {
+            history.limits = Limits {
+                no_repeat: match rule.gap {
+                    NoRepeatWithin::Positions(n) => RepeatGap::Positions(n),
+                    NoRepeatWithin::Duration(d) => RepeatGap::Duration(d),
+                },
+                separate: 0,
+            };
+            history.remember(rule.aired);
+        }
+        history
+    }
+
+    fn is_unconstrained(&self) -> bool {
+        self.limits.is_unconstrained()
+    }
+
+    /// Whether `id` may air next without repeating inside the channel's gap.
+    fn allows(&self, id: &str) -> bool {
+        !crate::constrain::conflicts_with_recent(&self.recent, &ItemKeys::new(id), self.limits)
+    }
+
+    /// Fold what just aired into the history, then trim it to the rule's reach.
+    fn remember(&mut self, ids: &[String]) {
+        if self.is_unconstrained() || ids.is_empty() {
+            return;
+        }
+        if matches!(self.limits.no_repeat, RepeatGap::Duration(_)) {
+            self.measure(ids);
+        }
+        let mean = self.mean;
+        self.recent.extend(ids.iter().map(|id| ItemKeys {
+            id: id.clone(),
+            group: Vec::new(),
+            duration: self.durations.get(id).copied().unwrap_or(mean),
+        }));
+        let keep = crate::constrain::history_needed(&self.recent, self.limits);
+        let cut = self.recent.len() - keep;
+        self.recent.drain(..cut);
+    }
+
+    /// Look up the runtimes of whichever of `ids` the catalog has not been
+    /// asked about yet, on the same rule a pool's own runtimes are read by.
+    fn measure(&mut self, ids: &[String]) {
+        let missing: Vec<String> = ids
+            .iter()
+            .filter(|id| self.asked.insert((*id).clone()))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        match pool_runtimes(self.catalog, &missing) {
+            Ok((found, _)) => {
+                self.durations.extend(found);
+                if !self.durations.is_empty() {
+                    self.mean =
+                        self.durations.values().sum::<Duration>() / self.durations.len() as u32;
+                }
+            }
+            // The rule still holds, measured at the mean for these ids — a
+            // catalog read failing is no reason to stop putting television on.
+            Err(e) => tracing::warn!(
+                event = "channel_repeat.durations_failed",
+                ids = missing.len(),
+                error = %e,
+                "could not read runtimes for rule.no_repeat_within; counting these items at the mean",
+            ),
+        }
+    }
+}
+
 /// A keyed roll: every random decision hashes its own coordinates rather than
 /// drawing from a running stream, so adding or skipping a step never shifts
 /// another step's outcome.
@@ -849,6 +1044,9 @@ pub(crate) fn mix_seed(a: u64, b: u64) -> u64 {
 /// `block_constraints` is the block's own `[constraints]` table, which every
 /// pool that declares none inherits (#115).
 ///
+/// `channel_rule` is the channel's `rule.no_repeat_within`, checked at every
+/// draw beside the drawing pool's own rule — see [`ChannelRule`].
+///
 /// `fill` is how much airtime the caller still has to cover — the daemon's
 /// `target - from`. It bounds a **derived** cycle count: without it, a block
 /// with no explicit `cycles` runs until its largest pool drains once, and 51
@@ -901,6 +1099,7 @@ pub fn build(
     window_start: time::OffsetDateTime,
     score_env: crate::score::ScoreEnv<'_>,
     fill: Option<Duration>,
+    channel_rule: Option<ChannelRule<'_>>,
 ) -> Result<BlockBuild, String> {
     // An authored `cycles` is the author saying how long a pass runs, and the
     // window does not get to argue with it. Only a derived count is bounded.
@@ -965,6 +1164,8 @@ pub fn build(
         }
         None => derive_cycles(&runtimes, pattern, &by_name),
     };
+
+    let mut channel = ChannelHistory::new(catalog, channel_rule);
 
     let mut out = Vec::new();
     // Pool state entering each drawn id — the state before that id's visit.
@@ -1117,7 +1318,7 @@ pub fn build(
                 (cycle + 1, 0)
             };
             let before = pools_resume(&runtimes, at_cycle, at_step);
-            let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
+            let drawn = runtimes[idx].visit(step.take, step.from, &roll, &mut channel)?;
             progress.extend(std::iter::repeat_n(before, drawn.len()));
             if measure {
                 laid += runtimes[idx].runtime_of(&drawn);
@@ -1244,6 +1445,29 @@ pub fn build(
                 "pool adjacency constraints could not be honoured on every draw; aired the closest choice available",
             );
         }
+    }
+
+    if channel.blocked > 0 || channel.forced > 0 {
+        tracing::info!(
+            event = "channel_repeat.applied",
+            gap = ?channel_rule.map(|r| r.gap),
+            blocked = channel.blocked,
+            forced = channel.forced,
+            drawn = out.len(),
+            "rule.no_repeat_within moved draws off items the channel aired recently",
+        );
+    }
+    if channel.forced > 0 {
+        // Every series' next item had aired on the channel inside the gap, so
+        // one aired anyway. Said separately from a pool's own shortfall: the
+        // fix is a wider pool set or a narrower gap, not a pool's constraints.
+        tracing::warn!(
+            event = "constraints.unsatisfied",
+            scope = "channel",
+            phase = "draw",
+            violations = channel.forced,
+            "rule.no_repeat_within could not be honoured on every draw; aired the closest choice available",
+        );
     }
 
     let resume_out = pools_resume(&runtimes, stopped_at.0, stopped_at.1);
@@ -2655,6 +2879,7 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
+            None,
         )
         .expect("pattern builds")
         .ids
@@ -2973,6 +3198,7 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
+            None,
         )
         .expect("pattern builds");
 
@@ -3090,6 +3316,7 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("nonesuch"), "err = {err}");
@@ -3120,6 +3347,7 @@ mod tests {
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .unwrap_err();
@@ -3153,6 +3381,7 @@ mod tests {
             &crate::variety::Variety::fixed(seed),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .expect("pattern builds");
@@ -3203,6 +3432,7 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
+            None,
         )
         .expect("pattern builds");
 
@@ -3245,6 +3475,7 @@ mod tests {
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .expect("pattern builds");
@@ -3746,6 +3977,7 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("unknown pool"), "err = {err}");
@@ -3765,6 +3997,7 @@ mod tests {
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .unwrap_err();
@@ -3787,6 +4020,7 @@ mod tests {
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .unwrap_err();
@@ -3812,6 +4046,7 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("maximum"), "err = {err}");
@@ -3834,6 +4069,7 @@ mod tests {
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .expect("take = all should not be capped");
@@ -3861,6 +4097,7 @@ mod tests {
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .unwrap();
@@ -3917,6 +4154,7 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             fill,
+            None,
         )
         .expect("pattern builds");
         (ids, resume)
@@ -4045,6 +4283,7 @@ mod tests {
                 time::OffsetDateTime::UNIX_EPOCH,
                 test_env(),
                 three_hours,
+                None,
             )
             .expect("pattern builds");
             (built.ids, built.resume)
@@ -4118,9 +4357,84 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
             None,
+            None,
         )
         .expect("pattern builds")
         .ids
+    }
+
+    /// Two pools resolving the same films, walked under a channel-wide rule.
+    fn build_channel(
+        pattern: &[PatternStep],
+        cycles: usize,
+        gap: Option<NoRepeatWithin>,
+        state: &GenerationState,
+    ) -> Vec<String> {
+        let mut other = movies_pool();
+        other.name = "rewatch".into();
+        let cat = catalog();
+        build(
+            &cat,
+            &[movies_pool(), other],
+            &[],
+            pattern,
+            Some(cycles),
+            None,
+            state,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
+            test_env(),
+            None,
+            gap.map(|gap| ChannelRule {
+                gap,
+                aired: &state.tail,
+            }),
+        )
+        .expect("pattern builds")
+        .ids
+    }
+
+    /// Pools are blind to each other, so two pools over one library air the
+    /// same film back to back; `rule.no_repeat_within` sees both pools' draws
+    /// and keeps every film three channel positions from its last airing.
+    #[test]
+    fn a_channel_rule_spaces_draws_across_pools() {
+        let pattern = [step("movies", 1), step("rewatch", 1)];
+        let blind = build_channel(&pattern, 3, None, &GenerationState::empty());
+        assert_eq!(
+            blind,
+            vec!["mov-1", "mov-1", "mov-2", "mov-2", "mov-3", "mov-3"],
+            "without the rule each pool walks the same list",
+        );
+
+        let ids = build_channel(
+            &pattern,
+            3,
+            Some(NoRepeatWithin::Positions(2)),
+            &GenerationState::empty(),
+        );
+        assert_eq!(ids.len(), 6, "{ids:?}");
+        for (i, id) in ids.iter().enumerate() {
+            let earlier = &ids[i.saturating_sub(2)..i];
+            assert!(
+                !earlier.contains(id),
+                "{id} repeats within 2 channel positions at {i}: {ids:?}"
+            );
+        }
+    }
+
+    /// The rule reads the ledger's tail unfiltered: a film the channel aired
+    /// last generation, from whichever pool or slot, must not open this one —
+    /// even from a pool with no constraints of its own to read a seam for.
+    #[test]
+    fn a_channel_rule_rejects_what_another_slot_just_aired() {
+        let ids = build_channel(
+            &[step("movies", 1)],
+            1,
+            Some(NoRepeatWithin::Duration(Duration::from_secs(24 * 60 * 60))),
+            &aired(&["got-e1", "mov-1"]),
+        );
+        assert_eq!(ids, vec!["mov-2"], "{ids:?}");
     }
 
     /// The pool's own list is reordered so the first draw does not repeat what
@@ -4218,6 +4532,7 @@ mod tests {
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             test_env(),
+            None,
             None,
         )
         .unwrap();
@@ -4438,6 +4753,7 @@ fn audit(ctx, picks, workspace) { #{} }
             time::OffsetDateTime::UNIX_EPOCH,
             env,
             None,
+            None,
         )
         .expect("pattern builds");
         assert_eq!(ids, vec!["mov-1", "mov-2", "mov-3"], "{ids:?}");
@@ -4486,6 +4802,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &crate::variety::Variety::fixed(0),
             time::OffsetDateTime::UNIX_EPOCH,
             env,
+            None,
             None,
         )
         .expect("an exhausted source is not an error");
@@ -5077,6 +5394,7 @@ fn audit(ctx, picks, workspace) { #{} }
                 start + time::Duration::hours(6 * g as i64),
                 env,
                 None,
+                None,
             )
             .expect("pattern builds");
             aired.extend(built.ids.iter().cloned());
@@ -5238,6 +5556,7 @@ fn audit(ctx, picks, workspace) { #{} }
             start,
             env,
             None,
+            None,
         )
         .unwrap();
         let lists = &built.lists["movies"];
@@ -5283,6 +5602,7 @@ fn audit(ctx, picks, workspace) { #{} }
             time::macros::datetime!(2026-01-01 00:00 UTC),
             test_env(),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(built.ids, vec!["film-07"]);
@@ -5316,6 +5636,7 @@ fn audit(ctx, picks, workspace) { #{} }
             &variety,
             time::macros::datetime!(2026-01-01 00:00 UTC),
             test_env(),
+            None,
             None,
         )
         .unwrap();
