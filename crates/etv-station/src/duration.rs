@@ -259,22 +259,27 @@ fn config_duration(item: &ResolvedItem) -> Result<Duration, StationError> {
 }
 
 /// A probed length more than this many times the catalog's own runtime for the
-/// same file is a bad container header, not a long film.
-const PROBE_OVERRUN_FACTOR: u32 = 2;
+/// same file, or less than that fraction of it, is a bad container header, not
+/// a long or short film.
+const PROBE_DEVIATION_FACTOR: u32 = 2;
 
 /// The catalog's runtime when the probe claims the file is over
-/// [`PROBE_OVERRUN_FACTOR`] times longer than it; the probe otherwise. The
-/// cache keeps the raw probe, so this runs on every use and a catalog update
-/// takes effect without re-probing.
+/// [`PROBE_DEVIATION_FACTOR`] times longer, or under 1/[`PROBE_DEVIATION_FACTOR`]
+/// as long; the probe otherwise. The cache keeps the raw probe, so this runs on
+/// every use and a catalog update takes effect without re-probing.
 fn trusted_probe(probed: Duration, item: &ResolvedItem) -> Duration {
     match item.catalog_duration {
-        Some(catalog) if !catalog.is_zero() && probed > catalog * PROBE_OVERRUN_FACTOR => {
+        Some(catalog)
+            if !catalog.is_zero()
+                && (probed > catalog * PROBE_DEVIATION_FACTOR
+                    || probed * PROBE_DEVIATION_FACTOR < catalog) =>
+        {
             tracing::warn!(
                 event = "duration.probe_rejected",
                 item = %item.id,
                 probed_secs = probed.as_secs_f64(),
                 catalog_secs = catalog.as_secs_f64(),
-                "probed length is over {PROBE_OVERRUN_FACTOR}x the catalog runtime; using the catalog's",
+                "probed length is more than {PROBE_DEVIATION_FACTOR}x off the catalog runtime; using the catalog's",
             );
             catalog
         }
@@ -696,6 +701,29 @@ mod tests {
         assert_eq!(
             trusted_probe(Duration::from_secs(85_452), &item),
             Duration::from_secs(85_452)
+        );
+    }
+
+    #[test]
+    fn a_probe_far_under_the_catalog_runtime_is_rejected() {
+        let mut item = local_item("documentary-now-dreams", "/m/x.mkv");
+        item.catalog_duration = Some(Duration::from_secs(1440));
+        assert_eq!(
+            trusted_probe(Duration::from_secs(60), &item),
+            Duration::from_secs(1440)
+        );
+        assert_eq!(
+            trusted_probe(Duration::from_secs(1300), &item),
+            Duration::from_secs(1300)
+        );
+        assert_eq!(
+            trusted_probe(Duration::from_secs(720), &item),
+            Duration::from_secs(720)
+        );
+        item.catalog_duration = None;
+        assert_eq!(
+            trusted_probe(Duration::from_secs(60), &item),
+            Duration::from_secs(60)
         );
     }
 
