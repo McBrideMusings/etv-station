@@ -1596,7 +1596,8 @@ pub(crate) fn resolve_pool_sources(
             // the same grant back to decide what `ctx.sets`/`ctx.history`/
             // `ctx.datastore(name)` (#181) resolve to for this call.
             let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities)
-                .with_datastores(&cfg.datastores)
+                .with_entry_ids(catalog)
+                .and_then(|g| g.with_datastores(&cfg.datastores))
                 .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
             let picked = crate::score::pick(
                 score_cache,
@@ -1824,7 +1825,8 @@ fn refill_pool(
 
     let path = score_env.resolve_path(plugin);
     let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities)
-        .with_datastores(&cfg.datastores)
+        .with_entry_ids(catalog)
+        .and_then(|g| g.with_datastores(&cfg.datastores))
         .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
 
     // What the pool has already aired this generation is exactly what it must

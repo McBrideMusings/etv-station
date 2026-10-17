@@ -789,6 +789,14 @@ pub struct GrantedCapabilities {
     pub watch_history: bool,
     /// Whether `ctx.http` may call out.
     pub http: bool,
+    /// The catalog's `(source, source_id) -> entry_id` provenance rows, filled
+    /// by [`Self::with_entry_ids`] only when `catalog_read` was granted. `None`
+    /// turns `ctx.entry_id_for(..)` into the error [`ungranted`] words.
+    ///
+    /// A snapshot rather than a handle: [`Catalog`] wraps a `rusqlite`
+    /// connection, which is not `Sync` and so cannot live inside a Rhai
+    /// [`Dynamic`], and `pick` takes no catalog.
+    pub entry_ids: Option<Arc<HashMap<(String, String), String>>>,
     /// Opened handles for every datastore this pool was granted (#181), keyed
     /// by the grant's name — the same name a script's `capabilities()`
     /// declares via `#{ datastore: "name" }`. Empty for a pool that grants
@@ -815,8 +823,28 @@ impl GrantedCapabilities {
             catalog_read: has("catalog_read"),
             watch_history: has("watch_history"),
             http: has("http"),
+            entry_ids: None,
             datastores: HashMap::new(),
         }
+    }
+
+    /// Snapshot the catalog's source-id join into this capability set when
+    /// `catalog_read` was granted, so `ctx.entry_id_for(source, id)` can resolve
+    /// an external id (a Plex `ratingKey`, say) to this repo's `entry_id`. A
+    /// pool without the grant gets nothing and the call refuses (ADR 0014).
+    /// Rows the catalog marks missing stay in, exactly as
+    /// [`Catalog::entry_id_for_source`] returns them: the lookup reports what
+    /// the join holds, and the script decides what to do with it.
+    pub fn with_entry_ids(mut self, catalog: &Catalog) -> Result<Self, String> {
+        if self.catalog_read {
+            let rows = catalog.all_sources().map_err(|e| e.to_string())?;
+            self.entry_ids = Some(Arc::new(
+                rows.into_iter()
+                    .map(|r| ((r.source.to_string(), r.source_id), r.entry_id))
+                    .collect(),
+            ));
+        }
+        Ok(self)
     }
 
     /// Open every grant in `grants` and fold the handles into this capability
@@ -897,6 +925,8 @@ struct ScoreCtx {
     profile: Option<Dynamic>,
     /// The pool's `exclude_keywords`, each through the keyword rule.
     exclude_keywords: Dynamic,
+    /// Filled only when `catalog_read` was granted — same gate as `sets`.
+    entry_ids: Option<Arc<HashMap<(String, String), String>>>,
     /// Whether `http` was granted; `false` turns `ctx.http(..)` into the
     /// error [`ungranted`] words.
     http: bool,
@@ -913,6 +943,18 @@ fn ungranted(capability: &str) -> Box<EvalAltResult> {
 impl ScoreCtx {
     fn get_sets(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
         self.sets.clone().ok_or_else(|| ungranted("catalog_read"))
+    }
+    /// `ctx.entry_id_for(source, id)`: the `entry_id` the catalog filed under
+    /// that `(source, source_id)` provenance row, or `()` when none matches.
+    fn entry_id_for(&mut self, source: &str, id: &str) -> Result<Dynamic, Box<EvalAltResult>> {
+        let ids = self
+            .entry_ids
+            .as_ref()
+            .ok_or_else(|| ungranted("catalog_read"))?;
+        Ok(match ids.get(&(source.to_string(), id.to_string())) {
+            Some(entry_id) => Dynamic::from(entry_id.clone()),
+            None => Dynamic::UNIT,
+        })
     }
     fn get_pool(&mut self) -> String {
         self.pool.clone()
@@ -1314,6 +1356,7 @@ pub(crate) fn engine() -> Engine {
         .register_get("profile", ScoreCtx::get_profile)
         .register_get("exclude_keywords", ScoreCtx::get_exclude_keywords)
         .register_fn("datastore", ScoreCtx::get_datastore)
+        .register_fn("entry_id_for", ScoreCtx::entry_id_for)
         .register_fn("http", ScoreCtx::http);
     engine.register_fn("parse_json", crate::plugin_http::parse_json);
     engine
@@ -1654,6 +1697,7 @@ pub fn pick(
                 .map(|p| p.exclude_keywords.clone())
                 .unwrap_or_default(),
         ),
+        entry_ids: granted.entry_ids.filter(|_| granted.catalog_read),
         http: granted.http,
         budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
     };
@@ -3509,6 +3553,75 @@ fn pick(ctx) {
             "test",
             None,
             GrantedCapabilities::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("catalog_read"), "got {err}");
+    }
+
+    fn entry_id_for_script() -> &'static str {
+        r#"
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let hit = ctx.entry_id_for("plex", "rk-1");
+    let miss = ctx.entry_id_for("plex", "nope");
+    if miss != () { throw "a missing id must be unit"; }
+    #{ picks: [hit], workspace: #{} }
+}
+fn audit(ctx, picks, workspace) { #{} }
+"#
+    }
+
+    #[test]
+    fn entry_id_for_resolves_a_source_id_when_catalog_read_is_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, entry_id_for_script());
+        let cat = catalog();
+        cat.add_source(&crate::catalog::EntrySource {
+            source: Source::Plex,
+            source_id: "rk-1".into(),
+            entry_id: "m2".into(),
+            playback_path: "/x".into(),
+            last_seen: None,
+            missing_since: None,
+        })
+        .unwrap();
+        let mut cache = ScoreCache::default();
+        cache.prepare(&cat, &p, None, &Default::default()).unwrap();
+        let granted = GrantedCapabilities::from_names(&["catalog_read".to_string()])
+            .with_entry_ids(&cat)
+            .unwrap();
+        let picked = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            crate::variety::Dice::fixed(0),
+            "test",
+            None,
+            granted,
+        )
+        .unwrap();
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, "m2");
+    }
+
+    #[test]
+    fn entry_id_for_without_catalog_read_fails_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, entry_id_for_script());
+        let cat = catalog();
+        let mut cache = ScoreCache::default();
+        cache.prepare(&cat, &p, None, &Default::default()).unwrap();
+        let granted = GrantedCapabilities::default().with_entry_ids(&cat).unwrap();
+        let err = pick(
+            &cache,
+            &p,
+            None,
+            &ScoreInputs::default(),
+            crate::variety::Dice::fixed(0),
+            "test",
+            None,
+            granted,
         )
         .unwrap_err();
         assert!(err.contains("catalog_read"), "got {err}");

@@ -1794,7 +1794,7 @@ opened only by name:
 
 | Capability | Gates | Declared as |
 |---|---|---|
-| `catalog_read` | `ctx.sets` — the items each `sources()` query matched | `"catalog_read"` |
+| `catalog_read` | `ctx.sets` — the items each `sources()` query matched; `ctx.entry_id_for(source, id)` — the `entry_id` the catalog filed under that `(source, source_id)` provenance row (`source` is `"plex"` or `"local_fs"`), or `()` when none matches, so a script joining its own external history (a Tautulli `rating_key`) resolves it without the daemon owning the join (ADR 0014) | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
 | `http` | `ctx.http(url, method, body)` — one HTTP call returning the response body as text; a 4xx/5xx, a transport failure or 10 seconds without a response is an error; one `pick()` call's `ctx.http` calls together may spend 30 seconds, after which each further call errors at once, naming the budget (ADR 0014) | `"http"` |
 | a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
