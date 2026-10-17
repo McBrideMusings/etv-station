@@ -95,9 +95,10 @@ pub fn annotate_items(
     ctx.insert("channel".into(), channel.to_string().into());
     let ctx = Dynamic::from_map(ctx);
 
+    let catalog_items = catalog_item_maps(channel, items, catalog);
     let mut annotated = 0usize;
     for item in items.iter_mut() {
-        let arg = item_map(item, catalog);
+        let arg = item_map(item, catalog_items.get(&item.id).cloned());
         let mut scope = Scope::new();
         let reply: Dynamic = match engine.call_fn(&mut scope, &ast, "annotate", (ctx.clone(), arg))
         {
@@ -117,8 +118,11 @@ pub fn annotate_items(
         match patch_from(reply) {
             Ok(None) => {}
             Ok(Some(patch)) => {
+                let sent = patch.len();
                 let collided = merge_patch(&mut item.metadata, patch);
-                annotated += 1;
+                if collided.len() < sent {
+                    annotated += 1;
+                }
                 for key in &collided {
                     tracing::warn!(
                         event = "annotate.key_collision",
@@ -149,19 +153,54 @@ pub fn annotate_items(
     );
 }
 
-fn item_map(item: &ResolvedItem, catalog: Option<&Catalog>) -> Dynamic {
-    let from_catalog = catalog
-        .and_then(|c| crate::score::load_items(c, std::slice::from_ref(&item.id)).ok())
-        .and_then(|mut a| a.pop())
-        .filter(Dynamic::is_map);
-    let mut map = match from_catalog {
-        Some(d) => d.cast::<Map>(),
-        None => {
-            let mut m = Map::new();
-            m.insert("entry_id".into(), item.id.clone().into());
-            m
-        }
+/// The catalog's item map for every resolved id the catalog knows, read in
+/// bulk ([`crate::score::load_items`] is written for that). An inline item has
+/// no catalog row and gets the bare map from [`item_map`].
+fn catalog_item_maps(
+    channel: &str,
+    items: &[ResolvedItem],
+    catalog: Option<&Catalog>,
+) -> std::collections::HashMap<String, Map> {
+    let Some(catalog) = catalog else {
+        return Default::default();
     };
+    let mut ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    let loaded = catalog
+        .entries_for(&ids)
+        .map_err(|e| e.to_string())
+        .and_then(|found| {
+            ids.retain(|id| found.contains_key(id));
+            crate::score::load_items(catalog, &ids)
+        });
+    match loaded {
+        Ok(maps) => maps
+            .into_iter()
+            .filter_map(|d| d.try_cast::<Map>())
+            .filter_map(|m| {
+                let id = m.get("entry_id")?.clone().into_string().ok()?;
+                Some((id, m))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                event = "annotate.catalog_failed",
+                channel,
+                error = %e,
+                "reading catalog rows for annotate failed; items reach the script as bare entry_id maps"
+            );
+            Default::default()
+        }
+    }
+}
+
+fn item_map(item: &ResolvedItem, from_catalog: Option<Map>) -> Dynamic {
+    let mut map = from_catalog.unwrap_or_else(|| {
+        let mut m = Map::new();
+        m.insert("entry_id".into(), item.id.clone().into());
+        m
+    });
     map.insert("block".into(), (item.block as i64).into());
     let existing = item
         .metadata
@@ -292,6 +331,19 @@ fn annotate(ctx, item) { #{ reason: "annotated", rating: 7 } }"#,
             items[0].metadata,
             Some(json!({"reason": "won an Oscar", "rating": 7}))
         );
+    }
+
+    #[test]
+    fn a_colliding_key_keeps_the_existing_value_and_a_non_object_takes_no_patch() {
+        let mut have = Some(json!({"a": 1}));
+        let patch = json!({"a": 2, "b": 3}).as_object().unwrap().clone();
+        assert_eq!(merge_patch(&mut have, patch), vec!["a".to_string()]);
+        assert_eq!(have, Some(json!({"a": 1, "b": 3})));
+
+        let mut scalar = Some(json!("text"));
+        let patch = json!({"a": 2}).as_object().unwrap().clone();
+        assert_eq!(merge_patch(&mut scalar, patch), vec!["a".to_string()]);
+        assert_eq!(scalar, Some(json!("text")));
     }
 
     #[test]

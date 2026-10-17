@@ -2477,6 +2477,18 @@ fn pick(ctx) { throw "pick must not run at load time"; }
         assert!(msg.contains("sequencer"), "msg = {msg}");
     }
 
+    /// A script declaring a capability the annotate hook does not offer is
+    /// refused at load.
+    #[test]
+    fn an_annotate_script_declaring_an_unoffered_capability_is_rejected() {
+        let err = validate_annotate_script(
+            r#"fn hooks() { ["annotate"] }
+fn capabilities() { ["catalog_read"] }"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("catalog_read"), "err = {err}");
+    }
+
     /// A channel that omits `annotate:` entirely loads exactly as before —
     /// the field is optional and its absence changes nothing. `channel_with`
     /// never sets `annotate`, so this is just the ordinary happy path.
