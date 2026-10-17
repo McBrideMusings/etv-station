@@ -648,10 +648,29 @@ impl Capability {
     }
 }
 
-/// The simple (non-parameterized) capability names `capabilities()` may
-/// return as bare strings. A named datastore is declared separately, as
-/// `#{ datastore: "name" }` — see [`declared_capabilities`].
-pub const KNOWN_CAPABILITIES: &[&str] = &["catalog_read", "watch_history", "http"];
+/// The simple (non-parameterized) capability names a `pool_provider` script's
+/// `capabilities()` may return as bare strings. A named datastore is declared
+/// separately, as `#{ datastore: "name" }` — see [`declared_capabilities`].
+pub const POOL_CAPABILITIES: &[&str] = &["catalog_read", "watch_history", "http"];
+
+/// The simple capability names `hook` offers a script — the one table both
+/// [`declared_capabilities`] and the pool and bumper validators read.
+pub fn offered_capabilities(hook: &str) -> &'static [&'static str] {
+    match hook {
+        "pool_provider" => POOL_CAPABILITIES,
+        "bumper" => crate::bumper::hook::BUMPER_CAPABILITIES,
+        _ => &[],
+    }
+}
+
+/// `"a, b, c"`, or `"none"` for an empty list.
+pub fn join_offered(offered: &[&str]) -> String {
+    if offered.is_empty() {
+        "none".to_string()
+    } else {
+        offered.join(", ")
+    }
+}
 
 /// Read the capabilities a plugin script declares, without running its
 /// scoring path or touching the catalog — the same load-time-only shape as
@@ -665,11 +684,14 @@ pub const KNOWN_CAPABILITIES: &[&str] = &["catalog_read", "watch_history", "http
 /// script whose `capabilities()` genuinely throws still fails loudly instead
 /// of being read as "declares nothing".
 ///
+/// `hook` names the hook the script serves; a simple capability that hook does
+/// not [offer](offered_capabilities) fails naming what it does offer.
+///
 /// Every failure names the script: an unreadable or uncompilable file, a
 /// throwing `capabilities()`, an entry that is neither a string nor a
-/// `#{ datastore: "name" }` map, an unknown string capability, or a datastore
-/// entry with an empty or non-string name.
-pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, String> {
+/// `#{ datastore: "name" }` map, an unknown string capability, a capability
+/// another hook offers, or a datastore entry with an empty or non-string name.
+pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capability>, String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
     let engine = engine();
@@ -720,26 +742,32 @@ pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, Stri
                 script_path.display()
             )
         })?;
-        match name.as_str() {
-            "catalog_read" => out.push(Capability::CatalogRead),
-            "watch_history" => out.push(Capability::WatchHistory),
-            "probe" => out.push(Capability::Probe),
-            "read" => out.push(Capability::Read),
-            "http" => out.push(Capability::Http),
-            _ => {
-                return Err(format!(
-                    "plugin {} declares unknown capability {name:?} — known capabilities \
-                     are: {}, or `#{{ datastore: \"name\" }}`",
-                    script_path.display(),
-                    KNOWN_CAPABILITIES
-                        .iter()
-                        .chain(&["probe", "read"])
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
+        let offered = offered_capabilities(hook);
+        let offered_by_any_hook = ["pool_provider", "bumper"]
+            .iter()
+            .any(|h| offered_capabilities(h).contains(&name.as_str()));
+        if !offered_by_any_hook {
+            return Err(format!(
+                "plugin {} declares unknown capability {name:?} — the {hook} hook offers: {}, \
+                 or `#{{ datastore: \"name\" }}`",
+                script_path.display(),
+                join_offered(offered)
+            ));
         }
+        if !offered.contains(&name.as_str()) {
+            return Err(format!(
+                "plugin {}: the {hook} hook does not offer {name} (it offers: {})",
+                script_path.display(),
+                join_offered(offered)
+            ));
+        }
+        out.push(match name.as_str() {
+            "catalog_read" => Capability::CatalogRead,
+            "watch_history" => Capability::WatchHistory,
+            "probe" => Capability::Probe,
+            "read" => Capability::Read,
+            _ => Capability::Http,
+        });
     }
     Ok(out)
 }
@@ -3156,7 +3184,7 @@ fn pick(ctx) { throw "pick must not run"; }
             r#"fn capabilities() { ["catalog_read", "watch_history"] }"#,
         );
         assert_eq!(
-            declared_capabilities(&p).unwrap(),
+            declared_capabilities(&p, "pool_provider").unwrap(),
             vec![Capability::CatalogRead, Capability::WatchHistory]
         );
     }
@@ -3169,7 +3197,7 @@ fn pick(ctx) { throw "pick must not run"; }
             r#"fn capabilities() { ["catalog_read", #{ datastore: "taste_db" }] }"#,
         );
         assert_eq!(
-            declared_capabilities(&p).unwrap(),
+            declared_capabilities(&p, "pool_provider").unwrap(),
             vec![
                 Capability::CatalogRead,
                 Capability::Datastore("taste_db".into())
@@ -3184,7 +3212,10 @@ fn pick(ctx) { throw "pick must not run"; }
     fn declared_capabilities_defaults_to_empty_when_the_function_is_absent() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, r#"fn hooks() { ["pool_provider"] }"#);
-        assert_eq!(declared_capabilities(&p).unwrap(), Vec::new());
+        assert_eq!(
+            declared_capabilities(&p, "pool_provider").unwrap(),
+            Vec::new()
+        );
     }
 
     /// Unlike an empty `hooks()`, an empty `capabilities()` is not an error —
@@ -3193,14 +3224,17 @@ fn pick(ctx) { throw "pick must not run"; }
     fn declared_capabilities_accepts_an_explicit_empty_array() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, "fn capabilities() { [] }");
-        assert_eq!(declared_capabilities(&p).unwrap(), Vec::new());
+        assert_eq!(
+            declared_capabilities(&p, "pool_provider").unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
     fn declared_capabilities_rejects_an_unknown_name() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, r#"fn capabilities() { ["telepathy"] }"#);
-        let e = declared_capabilities(&p).unwrap_err();
+        let e = declared_capabilities(&p, "pool_provider").unwrap_err();
         assert!(e.contains("telepathy"), "got {e}");
         assert!(e.contains("catalog_read"), "got {e}");
         assert!(e.contains("watch_history"), "got {e}");
@@ -3210,7 +3244,7 @@ fn pick(ctx) { throw "pick must not run"; }
     fn declared_capabilities_rejects_a_datastore_entry_with_an_empty_name() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, r#"fn capabilities() { [#{ datastore: "" }] }"#);
-        let e = declared_capabilities(&p).unwrap_err();
+        let e = declared_capabilities(&p, "pool_provider").unwrap_err();
         assert!(e.contains("empty"), "got {e}");
     }
 
@@ -3218,7 +3252,7 @@ fn pick(ctx) { throw "pick must not run"; }
     fn declared_capabilities_rejects_an_unrecognized_map_shape() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, r#"fn capabilities() { [#{ wat: "taste_db" }] }"#);
-        let e = declared_capabilities(&p).unwrap_err();
+        let e = declared_capabilities(&p, "pool_provider").unwrap_err();
         assert!(e.contains("not a recognized capability"), "got {e}");
     }
 
@@ -3236,7 +3270,7 @@ fn pick(ctx) { throw "pick must not run"; }
 "#,
         );
         assert_eq!(
-            declared_capabilities(&p).unwrap(),
+            declared_capabilities(&p, "pool_provider").unwrap(),
             vec![Capability::CatalogRead]
         );
     }
