@@ -2351,6 +2351,31 @@ Error cases:
 
 Worked sample: `examples/plugins/foryou-sequencer.rhai`.
 
+### Channel `annotate` — a plugin attaches metadata to every item
+
+A channel can name an `annotate:` script beside its `rule:`. After the whole
+schedule resolves, the station calls the script's `annotate(ctx, item)` once per
+item, in schedule order. The script never sees or changes ordering, selection
+or timing; it only returns metadata to add.
+
+```rhai
+fn hooks() { ["annotate"] }
+fn capabilities() { ["http"] }   // optional; `http` is the only capability offered
+
+fn annotate(ctx, item) {
+    // ctx.channel — the channel's name; ctx.http(url, method, body) with `http`
+    // item        — the catalog item map, plus `block` and `metadata`
+    #{ rating: 8 }               // keys to add, or () to add nothing
+}
+```
+
+The returned map merges into the item's metadata key by key. A key the item
+already carries (a `pool_provider`'s own `pick()` metadata, for one) keeps its
+value, and the station logs `annotate.key_collision`. A script error leaves that
+item unannotated and logs `annotate.failed`; the channel keeps airing. The
+`http` capability is granted by the script's own `capabilities()`, since
+`annotate:` is a bare path with no place for a channel grant.
+
 ### Pattern step `take` — how many items one visit draws
 
 A step in a block's `pattern:` is `{pool, take, from, chance}`. `take` has

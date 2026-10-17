@@ -1,3 +1,4 @@
+pub mod annotate;
 pub mod atomic;
 pub mod attribution;
 pub mod audit;

@@ -355,10 +355,9 @@ pub fn resolve_plugin_path(base_dir: &Path, plugin: &Path) -> PathBuf {
 }
 
 /// Hook names the station understands (#159). `pool_provider` is wired up —
-/// it is what a `plugin:` pool has always meant. `sequencer` and `annotate`
-/// (ADR 0017) are declarable only; nothing calls either yet, so a script may
-/// claim one but the station does not act on it until a later slice
-/// implements the hook itself. `bumper` is run by [`crate::bumper::hook`];
+/// it is what a `plugin:` pool has always meant. `sequencer` is declarable
+/// only; nothing calls it yet. `annotate` is run by [`crate::annotate`] over a
+/// channel's finished schedule (ADR 0017). `bumper` is run by [`crate::bumper::hook`];
 /// no channel config names a bumper script yet.
 pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer", "annotate", "bumper"];
 
@@ -658,6 +657,7 @@ pub const POOL_CAPABILITIES: &[&str] = &["catalog_read", "watch_history", "http"
 pub fn offered_capabilities(hook: &str) -> &'static [&'static str] {
     match hook {
         "pool_provider" => POOL_CAPABILITIES,
+        "annotate" => crate::annotate::ANNOTATE_CAPABILITIES,
         "bumper" => crate::bumper::hook::BUMPER_CAPABILITIES,
         _ => &[],
     }

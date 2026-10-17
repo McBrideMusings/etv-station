@@ -1147,6 +1147,7 @@ fn validate_plugin_declares_annotate(
 ) -> Result<(), ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, annotate);
     let hooks = crate::score::declared_hooks(&script_path).map_err(bad)?;
+    crate::score::declared_capabilities(&script_path, "annotate").map_err(bad)?;
     if !hooks.iter().any(|h| h == "annotate") {
         return Err(bad(format!(
             "channel names plugin {} via `annotate:`, which requires the plugin to \
