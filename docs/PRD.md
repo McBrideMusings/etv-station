@@ -196,6 +196,10 @@ A top-level station file (`station.toml` or `station.yaml`) declares `output_bas
 
 The station file also declares an optional `device_id` — how Plex tells this tuner apart from every other one it has seen. Set, it is used verbatim as the tuner identity ETV-next reports to Plex. Unset, one is minted on first run and stored at `{station-config-dir}/.device_id` — beside the station config rather than on the data volume, so that clearing the data volume to force a catalog rebuild can't wipe it out, and it can't live in the rendered `lineup.json` either, since the container regenerates that file from the station config at every start. This matters because Plex keys a DVR's entire channel mapping on this id, so a value that changes between restarts reads as a new tuner and costs a full remap by hand.
 
+## Event hooks
+
+`hooks:` in `station.yaml` and `channel.yaml` run a Rhai script or any executable on a `cron` interval, logging each run; hooks cannot change the schedule (ADR 0021). Format and behavior: `docs/schema.md` §Event hooks.
+
 ## Time zone
 
 The station file declares a station-wide `tz` field — an IANA zone name (e.g. `America/Chicago`). Default `UTC`. The `ETV_STATION_TZ` environment variable overrides the file value at runtime, which is the Docker-friendly knob.

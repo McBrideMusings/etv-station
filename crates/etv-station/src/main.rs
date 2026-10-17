@@ -32,6 +32,11 @@ struct Cli {
     #[arg(long)]
     list_folders: bool,
 
+    /// Print every configured event hook (station and channel `hooks:`), one
+    /// per line, and exit instead of running the daemon. Backs `admin hooks`.
+    #[arg(long)]
+    list_hooks: bool,
+
     /// Render ETV-next's lineup.json + channelN.json into this directory from
     /// the station config, then exit. The `ffmpeg`/`normalization` playback
     /// profile every channel body is built from comes from the station config
@@ -240,6 +245,10 @@ fn main() -> ExitCode {
         return list_folders(config);
     }
 
+    if cli.list_hooks {
+        return list_hooks(config);
+    }
+
     // Same reasoning as `--list-folders`: stdout carries only the YAML, so a
     // caller can redirect it straight into a spec file.
     if let Some(channel) = cli.dump_overlay.as_deref() {
@@ -359,6 +368,20 @@ fn list_folders(config_path: &Path) -> ExitCode {
     for ch in &station.channels {
         println!("{}", ch.output_folder.display());
     }
+    ExitCode::SUCCESS
+}
+
+/// Load the station config and print one line per configured event hook (ADR
+/// 0021): label, trigger, interval, kind, grants, resolved `run` path.
+fn list_hooks(config_path: &Path) -> ExitCode {
+    let station = match load_for("list-hooks", config_path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    print!(
+        "{}",
+        etv_station::hooks::describe(&etv_station::hooks::collect(&station))
+    );
     ExitCode::SUCCESS
 }
 

@@ -156,6 +156,11 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracks: Option<crate::config::TrackRules>,
 
+    /// Event hooks (ADR 0021): code run at station events — today `cron` on an
+    /// interval. A hook cannot change the schedule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::config::HookDecl>,
+
     /// ETV-next's `ffmpeg:` block, deserialized through its own type so a
     /// renamed field fails this build instead of being silently dropped.
     /// Every field defaults, so `ffmpeg:` can be omitted entirely.

@@ -2159,6 +2159,7 @@ mod tests {
             groups: Vec::new(),
             overlay: None,
             annotate: None,
+            hooks: Vec::new(),
         }
     }
 

@@ -3,7 +3,7 @@ use std::path::Path;
 use rhai::{AST, Dynamic, Engine, Scope};
 
 use crate::overlay_spec::{Corner, OverlayKind, OverlaySpec};
-use crate::program_context::ProgramContext;
+use crate::program_context::{ItemOverlay, ProgramContext};
 
 /// Cap for per-frame text content overrides set by Rhai scripts. A runaway
 /// script that builds a huge string should not flood the renderer; if a
@@ -92,6 +92,10 @@ struct Graphic {
     /// frame: converting there would re-walk the whole table 30 times a second
     /// to produce the same result. Cloning a `Dynamic` map is a refcount.
     config: Dynamic,
+    /// The `vars` map a playout item's overlay selection binds. An empty map
+    /// for every graphic that is not an item's override, so a script reads
+    /// `vars.whatever` unconditionally and gets unit for anything unset.
+    vars: Dynamic,
 }
 
 impl Graphic {
@@ -107,6 +111,7 @@ impl Graphic {
             ast: None,
             base_layers,
             config,
+            vars: Dynamic::from_map(rhai::Map::new()),
         }
     }
 }
@@ -168,6 +173,26 @@ impl RhaiEngine {
                         None => anyhow::anyhow!("graphic {i}: {e}"),
                     })?;
             }
+        }
+        Ok(engine)
+    }
+
+    /// The engine for one playout item's own overlay selection, in place of the
+    /// channel's overlay: `None` draws nothing, a script runs with its `vars`
+    /// bound and no layers of its own to drive. A script that fails to load
+    /// returns the error; the caller decides what the item shows instead.
+    pub fn for_item_overlay(overlay: &ItemOverlay) -> anyhow::Result<Self> {
+        let mut engine = Self::bare();
+        engine.graphics.push(Graphic::new(Vec::new(), None));
+        if let ItemOverlay::Script { script, vars } = overlay {
+            let vars = rhai::serde::to_dynamic(vars).unwrap_or_else(|e| {
+                tracing::warn!("item overlay vars are not representable in Rhai: {e}");
+                Dynamic::from_map(rhai::Map::new())
+            });
+            if let Some(graphic) = engine.graphics.last_mut() {
+                graphic.vars = vars;
+            }
+            engine.load_script(script)?;
         }
         Ok(engine)
     }
@@ -248,6 +273,7 @@ impl RhaiEngine {
         // `config.whatever` unconditionally and get unit for anything unset —
         // which is also why a mistyped key is silent.
         scope.push_constant("config", graphic.config.clone());
+        scope.push_constant("vars", graphic.vars.clone());
         scope.push_constant("time", time_seconds);
         scope.push_constant("frame", frame_index as i64);
         scope.push_constant("title", program.title.clone());
@@ -302,6 +328,37 @@ impl RhaiEngine {
             apply_script_result(&mut state, &map);
         }
         Ok(state)
+    }
+}
+
+/// The engine for whichever playout item overlay is airing, rebuilt only when
+/// the selection changes. An item whose script cannot load gets an engine that
+/// draws nothing, kept under that selection so the failure is warned once rather
+/// than once per frame.
+#[derive(Default)]
+pub struct ItemOverlayEngine {
+    current: Option<(ItemOverlay, RhaiEngine)>,
+}
+
+impl ItemOverlayEngine {
+    pub fn engine_for(&mut self, overlay: &ItemOverlay) -> &RhaiEngine {
+        let stale = self
+            .current
+            .as_ref()
+            .is_none_or(|(loaded, _)| loaded != overlay);
+        if stale {
+            let engine = RhaiEngine::for_item_overlay(overlay).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "item overlay failed to load; drawing nothing for it");
+                RhaiEngine::for_item_overlay(&ItemOverlay::None)
+                    .expect("the none overlay has no script to fail")
+            });
+            tracing::info!(
+                ?overlay,
+                "item overlay selected; channel overlay suppressed"
+            );
+            self.current = Some((overlay.clone(), engine));
+        }
+        &self.current.as_ref().expect("just set").1
     }
 }
 

@@ -298,6 +298,7 @@ mod tests {
             groups: Vec::new(),
             overlay: None,
             annotate: None,
+            hooks: Vec::new(),
         }
     }
 
@@ -311,6 +312,7 @@ mod tests {
                 seed: None,
                 tz: "UTC".into(),
                 device_id: None,
+                hooks: Vec::new(),
                 output_base: PathBuf::from("/tmp/out"),
                 channels: Vec::new(),
                 source_roots: Vec::new(),

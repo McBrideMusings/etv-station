@@ -18,6 +18,7 @@ pub mod errors;
 pub mod etv_next;
 pub mod guide;
 pub mod history;
+pub mod hooks;
 pub mod memstat;
 pub mod overlay_supervisor;
 pub mod overlay_timeline;
