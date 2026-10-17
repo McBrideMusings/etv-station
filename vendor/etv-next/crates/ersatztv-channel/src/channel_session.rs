@@ -1280,6 +1280,7 @@ impl ChannelSession {
             watermark: None,
             program: None,
             metadata: None,
+            overlay: None,
         }
     }
 
@@ -2017,6 +2018,7 @@ fn build_error_card_item(
         watermark: None,
         program: None,
         metadata: None,
+        overlay: None,
     }
 }
 

@@ -438,6 +438,7 @@ mod tests {
             // Present on purpose: nothing in this repo reads `metadata`, so if it
             // ever leaked into the guide these assertions would say so.
             metadata: Some(serde_json::json!({ "picked_because": "oscar" })),
+            overlay: None,
         }
     }
 
@@ -451,6 +452,7 @@ mod tests {
             watermark: None,
             program: None,
             metadata: None,
+            overlay: None,
         }
     }
 

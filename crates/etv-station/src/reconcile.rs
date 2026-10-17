@@ -353,6 +353,7 @@ mod tests {
                 ..Default::default()
             }),
             metadata: None,
+            overlay: None,
         }
     }
 

@@ -399,6 +399,7 @@ mod tests {
                     ..Default::default()
                 }),
                 metadata: audit_for(i),
+                overlay: None,
             });
             cursor = finish;
         }
@@ -640,6 +641,7 @@ mod tests {
             watermark: None,
             program: None,
             metadata: None,
+            overlay: None,
         }
     }
 
