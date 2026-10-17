@@ -156,13 +156,10 @@ pub struct WatchEvent {
     /// Unix seconds when the watch stopped.
     pub watched_at: i64,
     /// Who watched it, as Tautulli reports them — the account's friendly name
-    /// when it has one, else its username (#113).
+    /// when it has one, else its username.
     ///
     /// `None` when the history row named nobody, which is what a Tautulli that
-    /// has anonymised the row looks like. Nothing ranks on this; it exists so a
-    /// channel can say on screen and in the guide who has been watching. A
-    /// `single_user` channel's rows all carry the same name, which is why the
-    /// attribution line is only interesting on a pooled channel.
+    /// has anonymised the row looks like.
     pub watcher: Option<String>,
 }
 

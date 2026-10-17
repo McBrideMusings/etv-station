@@ -229,26 +229,10 @@ impl ChannelConfig {
             .any(|b| b.pools.iter().any(|p| p.plugin.is_some()))
     }
 
-    /// Whether this channel names recent watchers on its items (#113).
-    pub fn attributes_watchers(&self) -> bool {
-        self.scoring.as_ref().is_some_and(|s| s.attribution)
-    }
-
     /// Whether this channel shows a "why this was picked" line in the guide
     /// (`scoring.explain`).
     pub fn explains_why(&self) -> bool {
         self.scoring.as_ref().is_some_and(|s| s.explain)
-    }
-
-    /// Whether anything on this channel reads the server's watch history.
-    ///
-    /// Two readers, not one: a scorer plugin ranks with it (#74), and
-    /// `attribution` turns it into guide and on-screen text (#113). A channel
-    /// that does neither must never trigger a fetch — that is #131's rule, and
-    /// widening the reader set without widening this check is how a station
-    /// silently starts calling Tautulli for results nothing consumes.
-    pub fn reads_watch_history(&self) -> bool {
-        self.uses_scorer_plugin() || self.attributes_watchers()
     }
 
     /// Whose watch history this channel ranks against (#112).
@@ -354,22 +338,10 @@ pub struct ScoringConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
-    /// Name on screen and in the guide who has been watching each item (#113).
-    ///
-    /// Off by default, and deliberately opt-in rather than derived: turning it
-    /// on publishes every viewer's activity to everyone else watching the
-    /// channel, which is a call the person running the server makes once, per
-    /// channel, in writing.
-    ///
-    /// Costs nothing when off — the line is only built for a channel that asked
-    /// for it.
-    #[serde(default)]
-    pub attribution: bool,
-
     /// Show a one-line "why this was picked" explanation in the guide, built
     /// from each item's own `metadata.audit` trail (ADR 0011).
     ///
-    /// Off by default and opt-in like [`attribution`](Self::attribution): a
+    /// Off by default and opt-in: a
     /// plugin's `guide` sentence or a built-in stage's `verdict` is written
     /// for a different reader (an operator running `admin audit`, or the
     /// plugin author), so surfacing it to every viewer is a call the person
@@ -401,7 +373,6 @@ impl Default for ScoringConfig {
             nominal_item_secs: default_nominal_item_secs(),
             taste_scope: TasteScope::default(),
             user: None,
-            attribution: false,
             explain: false,
         }
     }

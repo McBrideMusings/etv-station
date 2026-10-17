@@ -40,7 +40,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::catalog::Catalog;
 use crate::config::{ChannelConfig, ScoringConfig};
-use crate::daemon::{render_guide_and_attribution, target_count, window_duration};
+use crate::daemon::{render_guide, target_count, window_duration};
 use crate::resolve::resolve_channel_with_resume;
 use crate::resume::{GenerationState, ResumeMap};
 use crate::score::ScoreInputs;
@@ -194,15 +194,13 @@ pub fn simulate(
                 .iter()
                 .map(|i| i.catalog_duration.unwrap_or(nominal))
                 .collect();
-            render_guide_and_attribution(
+            render_guide(
                 &mut items,
                 &lengths,
                 from,
                 config.name.trim(),
                 config.display_name.as_deref(),
-                false,
                 config.explains_why(),
-                &[],
             );
 
             let mut airing_start = from;
