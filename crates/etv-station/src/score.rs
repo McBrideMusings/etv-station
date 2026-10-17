@@ -39,6 +39,11 @@
 //! // `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`,
 //! // `pooled_taste_vector`, `watched_units_for`, `watched_units` — or fails
 //! // the pick() call naming the datastore if it was never granted.
+//! // `"http"` gates `ctx.http(url, method, body)`, the one way a script
+//! // reaches an outside service (ADR 0014): it returns the response body as
+//! // text, errors on a 4xx/5xx, and gives up after
+//! // `plugin_http::GENERATION_TIMEOUT`. `parse_json(text)`, a global
+//! // function, needs no capability.
 //! fn capabilities() { ["catalog_read", "watch_history"] }
 //!
 //! // Every catalog query this plugin will read, named. Run once, up front —
@@ -617,6 +622,10 @@ pub enum Capability {
     /// `ctx.read(path)` on the bumper hook: a text file inside the plugin's
     /// own folder. Offered by [`crate::bumper::hook`] only.
     Read,
+    /// `ctx.http(url, method, body)`: one HTTP call through
+    /// [`crate::plugin_http::call`] (ADR 0014). Offered to pools and the
+    /// bumper hook.
+    Http,
     Datastore(String),
 }
 
@@ -633,6 +642,7 @@ impl Capability {
             Capability::WatchHistory => "watch_history",
             Capability::Probe => "probe",
             Capability::Read => "read",
+            Capability::Http => "http",
             Capability::Datastore(name) => name,
         }
     }
@@ -641,7 +651,7 @@ impl Capability {
 /// The simple (non-parameterized) capability names `capabilities()` may
 /// return as bare strings. A named datastore is declared separately, as
 /// `#{ datastore: "name" }` — see [`declared_capabilities`].
-pub const KNOWN_CAPABILITIES: &[&str] = &["catalog_read", "watch_history"];
+pub const KNOWN_CAPABILITIES: &[&str] = &["catalog_read", "watch_history", "http"];
 
 /// Read the capabilities a plugin script declares, without running its
 /// scoring path or touching the catalog — the same load-time-only shape as
@@ -715,6 +725,7 @@ pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, Stri
             "watch_history" => out.push(Capability::WatchHistory),
             "probe" => out.push(Capability::Probe),
             "read" => out.push(Capability::Read),
+            "http" => out.push(Capability::Http),
             _ => {
                 return Err(format!(
                     "plugin {} declares unknown capability {name:?} — known capabilities \
@@ -739,6 +750,8 @@ pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, Stri
 pub struct GrantedCapabilities {
     pub catalog_read: bool,
     pub watch_history: bool,
+    /// Whether `ctx.http` may call out.
+    pub http: bool,
     /// Opened handles for every datastore this pool was granted (#181), keyed
     /// by the grant's name — the same name a script's `capabilities()`
     /// declares via `#{ datastore: "name" }`. Empty for a pool that grants
@@ -764,6 +777,7 @@ impl GrantedCapabilities {
         Self {
             catalog_read: has("catalog_read"),
             watch_history: has("watch_history"),
+            http: has("http"),
             datastores: HashMap::new(),
         }
     }
@@ -846,6 +860,9 @@ struct ScoreCtx {
     profile: Option<Dynamic>,
     /// The pool's `exclude_keywords`, each through the keyword rule.
     exclude_keywords: Dynamic,
+    /// Whether `http` was granted; `false` turns `ctx.http(..)` into the
+    /// error [`ungranted`] words.
+    http: bool,
 }
 
 /// What a script gets back for reading a `ctx` field its pool was not granted
@@ -907,6 +924,19 @@ impl ScoreCtx {
 
     fn get_exclude_keywords(&mut self) -> Dynamic {
         self.exclude_keywords.clone()
+    }
+
+    /// `ctx.http(url, method, body)` — see [`Capability::Http`].
+    fn http(&mut self, url: &str, method: &str, body: &str) -> Result<String, Box<EvalAltResult>> {
+        if !self.http {
+            return Err(ungranted("http"));
+        }
+        Ok(crate::plugin_http::call(
+            url,
+            method,
+            body,
+            crate::plugin_http::GENERATION_TIMEOUT,
+        )?)
     }
 
     /// `ctx.account_id` (#278): the resolved account id as a Rhai integer, or
@@ -1247,7 +1277,9 @@ pub(crate) fn engine() -> Engine {
         .register_get("account_id", ScoreCtx::get_account_id)
         .register_get("profile", ScoreCtx::get_profile)
         .register_get("exclude_keywords", ScoreCtx::get_exclude_keywords)
-        .register_fn("datastore", ScoreCtx::get_datastore);
+        .register_fn("datastore", ScoreCtx::get_datastore)
+        .register_fn("http", ScoreCtx::http);
+    engine.register_fn("parse_json", crate::plugin_http::parse_json);
     engine
         .register_type_with_name::<Datastore>("Datastore")
         .register_fn("enrichment_for", Datastore::enrichment_for)
@@ -1586,6 +1618,7 @@ pub fn pick(
                 .map(|p| p.exclude_keywords.clone())
                 .unwrap_or_default(),
         ),
+        http: granted.http,
     };
 
     // `audit()` needs its own `ctx`, built from the same inputs `pick()` gets
@@ -2672,6 +2705,53 @@ profile:
             err.contains("capability `catalog_read` not declared"),
             "err = {err}"
         );
+    }
+
+    /// `ctx.http` reaches out only when the pool granted `http`; the body it
+    /// returns reads back through `parse_json`.
+    #[test]
+    fn ctx_http_needs_the_http_grant() {
+        let (url, server) =
+            crate::plugin_http::tests::serve_once("200 OK", r#"{"ids":["m2","m1"]}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            &dir,
+            r#"fn hooks() { ["pool_provider"] }
+fn capabilities() { ["http"] }
+fn sources() { #{ movies: `item.type == "movie"` } }
+fn pick(ctx) {
+    let reply = parse_json(ctx.http(ctx.config.url, "GET", ""));
+    #{ picks: reply.ids, workspace: () }
+}
+fn audit(ctx, picks, workspace) { #{} }
+"#,
+        );
+        let mut cache = ScoreCache::default();
+        cache
+            .prepare(&catalog(), &p, None, &Default::default())
+            .unwrap();
+        let config = serde_json::json!({ "url": format!("{url}/rank") });
+        let run = |granted| {
+            pick(
+                &cache,
+                &p,
+                None,
+                &ScoreInputs::default(),
+                crate::variety::Dice::fixed(0),
+                "movies",
+                Some(&config),
+                granted,
+            )
+        };
+        let err = run(GrantedCapabilities::default()).unwrap_err();
+        assert!(
+            err.contains("capability `http` not declared"),
+            "err = {err}"
+        );
+        let picked = run(GrantedCapabilities::from_names(&["http".into()])).unwrap();
+        assert_eq!(server.join().unwrap(), "GET /rank HTTP/1.1");
+        let ids: Vec<_> = picked.into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["m2", "m1"]);
     }
 
     #[test]

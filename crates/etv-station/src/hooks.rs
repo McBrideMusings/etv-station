@@ -365,9 +365,9 @@ fn run_rhai(spec: &HookSpec, event: &serde_json::Value) -> Outcome {
     }
 }
 
-/// The engine a hook script runs in: `log(text)` always; `exec` and `http`
-/// only when granted. A call to an ungranted function is a script error
-/// ("function not found"), not a silent no-op.
+/// The engine a hook script runs in: `log(text)` and `parse_json(text)`
+/// always; `exec` and `http` only when granted. A call to an ungranted
+/// function is a script error ("function not found"), not a silent no-op.
 fn hook_engine(grants: &[HookGrant], label: String) -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
@@ -376,6 +376,7 @@ fn hook_engine(grants: &[HookGrant], label: String) -> Engine {
     engine.register_fn("log", move |text: &str| {
         tracing::info!(event = "hook.log", hook = %log_label, "{text}");
     });
+    engine.register_fn("parse_json", crate::plugin_http::parse_json);
     if grants.contains(&HookGrant::Exec) {
         engine.register_fn("exec", exec_grant);
     }
@@ -411,19 +412,7 @@ fn exec_grant(program: &str, args: Array) -> Result<Map, Box<rhai::EvalAltResult
 
 /// `http(url, method, body)` -> response body text. A 4xx/5xx is an error.
 fn http_grant(url: &str, method: &str, body: &str) -> Result<String, Box<rhai::EvalAltResult>> {
-    let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
-    let req = agent.request(&method.to_uppercase(), url);
-    let resp = if body.is_empty() {
-        req.call()
-    } else {
-        req.send_string(body)
-    };
-    match resp {
-        Ok(r) => Ok(r.into_string().map_err(|e| format!("http body: {e}"))?),
-        Err(ureq::Error::Status(code, _)) => Err(format!("http {method} -> status {code}").into()),
-        // ureq puts the URL in its error's Display; a URL may carry a token.
-        Err(_) => Err(format!("http {method} failed (transport error)").into()),
-    }
+    Ok(crate::plugin_http::call(url, method, body, HTTP_TIMEOUT)?)
 }
 
 /// The cron loop for one hook: sleep one `every`, run, repeat until `stop`.

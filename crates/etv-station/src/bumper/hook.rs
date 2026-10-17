@@ -19,7 +19,7 @@
 //! ```
 //!
 //! `ctx` carries no filesystem or network handle: `build` can only see what
-//! the host put in it. Two capability-gated calls reach outside it, each
+//! the host put in it. Three capability-gated calls reach outside it, each
 //! declared in `capabilities()` and granted by the channel
 //! ([`BUMPER_CAPABILITIES`]):
 //!
@@ -32,6 +32,11 @@
 //! - `read` — `ctx.read(path)` returns a UTF-8 text file from the plugin's own
 //!   folder (up to [`READ_LIMIT_BYTES`]), or `()` when it does not exist. A path
 //!   that resolves outside that folder is an error.
+//! - `http` — `ctx.http(url, method, body)` makes one HTTP call through
+//!   [`crate::plugin_http::call`] and returns the response body as text. A
+//!   4xx/5xx, a transport failure, or no response within
+//!   [`crate::plugin_http::GENERATION_TIMEOUT`] is an error. `parse_json(text)`
+//!   turns the body into maps and arrays and needs no grant.
 //!
 //! `ctx.airings(filter)` reads the airings ledger (`history.db`) and needs no
 //! grant: it is in-process and read-only. It returns an array of maps
@@ -63,7 +68,7 @@ use super::timeline::{
 };
 
 /// Capability names a bumper plugin may declare: each gates one `ctx` call.
-pub const BUMPER_CAPABILITIES: &[&str] = &["probe", "read"];
+pub const BUMPER_CAPABILITIES: &[&str] = &["probe", "read", "http"];
 
 /// The largest file `ctx.read` returns.
 pub const READ_LIMIT_BYTES: u64 = 1 << 20;
@@ -97,8 +102,8 @@ pub struct BumperInput {
     pub channel: ChannelInfo,
     /// `YYYY-MM-DD` the gap airs on, in the station's time zone.
     pub air_date: String,
-    /// Capabilities the channel granted this script; `ctx.probe` and
-    /// `ctx.read` error unless their name is here.
+    /// Capabilities the channel granted this script; `ctx.probe`,
+    /// `ctx.read` and `ctx.http` error unless their name is here.
     pub granted: Vec<String>,
     /// The airings ledger `ctx.airings` reads; `None` answers every query
     /// with an empty array.
@@ -648,6 +653,14 @@ impl Host {
         );
         Ok(text.map(Dynamic::from).unwrap_or(Dynamic::UNIT))
     }
+
+    fn http(&self, url: &str, method: &str, body: &str) -> RhaiResult<String> {
+        self.require("http")?;
+        Ok(
+            crate::plugin_http::call(url, method, body, crate::plugin_http::GENERATION_TIMEOUT)
+                .map_err(|e| format!("ctx.http(): {e}"))?,
+        )
+    }
 }
 
 /// The default and largest `limit` of a `ctx.airings` call.
@@ -865,7 +878,7 @@ fn probe_media(path: &Path) -> Result<Option<serde_json::Value>, String> {
 }
 
 /// The station's plugin engine plus the bumper builder, `ctx.rng` and the
-/// gated `ctx.probe` / `ctx.read`.
+/// gated `ctx.probe` / `ctx.read` / `ctx.http`.
 fn bumper_engine(host: Host) -> rhai::Engine {
     let usage = Usage::default();
     let mut engine = crate::score::engine();
@@ -876,7 +889,12 @@ fn bumper_engine(host: Host) -> rhai::Engine {
     engine.register_fn("airings", move |_ctx: &mut Map, filter: Map| {
         h.airings(filter)
     });
-    engine.register_fn("read", move |_ctx: &mut Map, path: &str| host.read(path));
+    let h = host.clone();
+    engine.register_fn("read", move |_ctx: &mut Map, path: &str| h.read(path));
+    engine.register_fn(
+        "http",
+        move |_ctx: &mut Map, url: &str, method: &str, body: &str| host.http(url, method, body),
+    );
 
     engine
         .register_type_with_name::<Rng>("Rng")
@@ -1370,7 +1388,7 @@ fn build(ctx) {
     }
 
     #[test]
-    fn probe_and_read_error_unless_granted() {
+    fn probe_read_and_http_error_unless_granted() {
         let dir = tempfile::tempdir().unwrap();
         let path = script(
             &dir,
@@ -1384,6 +1402,37 @@ fn build(ctx) {
         );
         let msg = build(&path, &granted(&["probe"])).unwrap_err().to_string();
         assert!(msg.contains("capability `read` not declared"), "{msg}");
+        let path = script(
+            &dir,
+            "fn hooks() { [\"bumper\"] }\n\
+             fn build(ctx) { ctx.http(\"http://127.0.0.1:9/\", \"GET\", \"\"); timeline() }",
+        );
+        let msg = build(&path, &granted(&["read"])).unwrap_err().to_string();
+        assert!(msg.contains("capability `http` not declared"), "{msg}");
+    }
+
+    #[test]
+    fn http_returns_the_body_and_parse_json_reads_it() {
+        let (url, server) =
+            crate::plugin_http::tests::serve_once("200 OK", r#"{"title":"Up Next"}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(
+            &dir,
+            &format!(
+                r#"fn hooks() {{ ["bumper"] }}
+fn capabilities() {{ ["http"] }}
+fn build(ctx) {{
+    let reply = parse_json(ctx.http("{url}/next", "GET", ""));
+    let t = timeline();
+    t.push(segment().black().fixed(1).name(reply.title));
+    t
+}}"#
+            ),
+        );
+        validate_script(&path, &["http".into()]).unwrap();
+        let built = build(&path, &granted(&["http"])).unwrap();
+        assert_eq!(server.join().unwrap(), "GET /next HTTP/1.1");
+        assert_eq!(built.timeline.segments[0].name, "Up Next");
     }
 
     #[test]

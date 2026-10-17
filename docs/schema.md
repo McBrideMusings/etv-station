@@ -588,7 +588,7 @@ hooks:
 | `on` | **yes** | the trigger: `cron`, or one of the events below |
 | `every` | for `cron` only | interval between runs; refused on every other trigger |
 | `run` | **yes** | path, relative to the declaring file's directory. A name ending `.rhai` is a script; anything else is executed as a program. |
-| `grants` | no | `exec` adds `exec(program, args)` -> `#{ code, stdout, stderr }`; `http` adds `http(url, method, body)` -> body text. A script with neither can compute and call `log(text)`. Refused on an executable, which runs with the daemon's own permissions. |
+| `grants` | no | `exec` adds `exec(program, args)` -> `#{ code, stdout, stderr }`; `http` adds `http(url, method, body)` -> body text, waiting at most 30 seconds. A script with neither can compute and call `log(text)` and `parse_json(text)`. Refused on an executable, which runs with the daemon's own permissions. |
 
 | Trigger | Fires | `channel` | `data` |
 |---|---|---|---|
@@ -1719,7 +1719,7 @@ A plugin declares its hooks and the station wires only the declared ones
 |---|---|
 | `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
 | `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-a-plugin-arranges-the-block-itself). |
-| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps; `next` is `()` at the generation frontier), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin declares and is granted no capability yet. |
+| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps; `next` is `()` at the generation frontier), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`), `read` (`ctx.read(path)`, a file in its own folder) and `http` (`ctx.http(url, method, body)`, the same call and 10-second limit a pool's `http` has); each must be both declared and granted. `parse_json(text)` needs no grant. |
 
 A script may declare any of them. The declaration lives in the script, not in
 the channel config, so swapping one scorer for another needs no YAML edit.
@@ -1787,13 +1787,16 @@ changed — a new required function, a renamed hook, a new required capability.
 
 Nothing is available to a script ambiently beyond `ctx.pool`, `ctx.config`,
 `ctx.target_count`, `ctx.now`, `ctx.recent`, `ctx.seed`, and `ctx.account_id`
-— the inputs every plugin pool receives with no declaration at all. Two more
-are gated behind a declaration, and a third is opened only by name:
+— the inputs every plugin pool receives with no declaration at all, plus the
+global `parse_json(text)`, which turns JSON text into maps and arrays (`null`
+becomes `()`). Three more are gated behind a declaration, and a fourth is
+opened only by name:
 
 | Capability | Gates | Declared as |
 |---|---|---|
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
+| `http` | `ctx.http(url, method, body)` — one HTTP call returning the response body as text; a 4xx/5xx, a transport failure or 10 seconds without a response is an error (ADR 0014) | `"http"` |
 | a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
 
 Unlike `hooks()`, `capabilities()` is optional — a script with no such function
@@ -2263,7 +2266,7 @@ pools:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `capabilities` | list of strings | the simple capabilities granted — `catalog_read`, `watch_history` |
+| `capabilities` | list of strings | the simple capabilities granted — `catalog_read`, `watch_history`, `http` |
 | `datastores` | list of `{ name, path }` | named external stores granted, one entry per `#{ datastore: "name" }` the script declares |
 
 The check is **symmetric, and both directions fail the load**: a capability the

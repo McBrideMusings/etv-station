@@ -24,6 +24,7 @@ pub mod memstat;
 pub mod overlay_supervisor;
 pub mod overlay_timeline;
 pub mod pattern;
+pub mod plugin_http;
 pub mod profile;
 pub mod reconcile;
 pub mod resolve;
