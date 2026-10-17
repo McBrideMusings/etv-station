@@ -1148,6 +1148,7 @@ fn validate_plugin_declares_annotate(
 ) -> Result<(), ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, annotate);
     let hooks = crate::score::declared_hooks(&script_path).map_err(bad)?;
+    crate::score::declared_capabilities(&script_path, "annotate").map_err(bad)?;
     if !hooks.iter().any(|h| h == "annotate") {
         return Err(bad(format!(
             "channel names plugin {} via `annotate:`, which requires the plugin to \
@@ -2514,6 +2515,18 @@ fn pick(ctx) { throw "pick must not run at load time"; }
         assert!(msg.contains("annotate"), "msg = {msg}");
         assert!(msg.contains("annotator.rhai"), "msg = {msg}");
         assert!(msg.contains("sequencer"), "msg = {msg}");
+    }
+
+    /// A script declaring a capability the annotate hook does not offer is
+    /// refused at load.
+    #[test]
+    fn an_annotate_script_declaring_an_unoffered_capability_is_rejected() {
+        let err = validate_annotate_script(
+            r#"fn hooks() { ["annotate"] }
+fn capabilities() { ["catalog_read"] }"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("catalog_read"), "err = {err}");
     }
 
     /// A channel that omits `annotate:` entirely loads exactly as before —

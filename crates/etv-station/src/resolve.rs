@@ -639,6 +639,14 @@ pub fn resolve_channel_with_resume(
             config,
         );
     }
+    if let Some(annotate) = &config.annotate {
+        crate::annotate::annotate_items(
+            &crate::annotate::script_path(path, annotate),
+            &config.name,
+            &mut out,
+            catalog,
+        );
+    }
     Ok((out, resume_out, progress))
 }
 
@@ -3964,6 +3972,30 @@ mod tests {
         }
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
         assert!(format!("{err}").contains("zero items"), "err = {err}");
+    }
+
+    /// A channel naming `annotate:` has its script run over the finished
+    /// schedule, and the item map carries the catalog's own columns (ADR 0017).
+    #[test]
+    fn a_channel_annotate_script_patches_every_resolved_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("annotate.rhai");
+        std::fs::write(
+            &script,
+            r#"fn hooks() { ["annotate"] }
+fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
+        )
+        .unwrap();
+        let cat = interleave_catalog();
+        let mut cfg = channel(vec![interleave_block(crate::config::Advance::Restart)]);
+        cfg.annotate = Some(script);
+        let items = resolve_channel(&cfg, path(), &[], None, Some(&cat)).unwrap();
+        assert!(!items.is_empty());
+        for item in &items {
+            let meta = item.metadata.as_ref().expect("annotated");
+            assert_eq!(meta["seen"], serde_json::json!(item.id));
+            assert!(meta["title"].is_string(), "meta = {meta}");
+        }
     }
 
     #[test]
