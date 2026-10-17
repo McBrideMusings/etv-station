@@ -704,40 +704,16 @@ pub fn ingest(
         labels = labels.len(),
         "fetched labels; writing to the catalog",
     );
-    // One transaction for the whole write pass — a mid-ingest failure rolls back
-    // rather than leaving a partial catalog. Entries are written before
-    // collections/labels so member ratingKeys resolve to their entry ids.
-    //
-    // The ingest timestamp is written inside the same transaction, so a failed
-    // pass cannot advance the delta cursor past changes it never wrote. It is
-    // taken *before* the fetch, not after: anything Plex modifies while the
-    // ingest is running is then re-read by the next pass rather than falling
-    // into the gap between the fetch and the commit.
     let started = OffsetDateTime::now_utc().unix_timestamp();
-    // Prune deleted collections only on a full pass (`since` is None); a delta
-    // fetch omits unchanged collections, which must not be read as deletions.
-    let prune_absent = since.is_none();
-    let stats: PlexIngestStats = catalog.in_transaction(|c| {
-        let mut stats = ingest_items(c, &items, identity_roots)?;
-        ingest_labels(c, &labels)?;
-        ingest_collections(c, &collections, prune_absent)?;
-        // Reconcile *item* deletions, the same contract `ingest_collections`
-        // has had all along and the fs ingester has had since #144. Before ADR
-        // 0006 the Plex path reconciled collections and nothing else: a title
-        // pulled out of the library simply stopped being mentioned by every
-        // later fetch and sat in the catalog forever, still schedulable, still
-        // pointing at a file Plex no longer serves.
-        //
-        // Full pass only. A delta fetch returns just the changed items, so
-        // "not stamped by this pass" there means "unchanged" — marking on it
-        // would take the entire library out of the pool in one go.
-        if let (true, Some(stamp)) = (prune_absent, stats.scan_stamp.as_deref()) {
-            stats.sources_marked_missing = c.mark_unseen_sources_missing(Source::Plex, stamp)?;
-            stats.entries_marked_missing = c.mark_entries_missing_without_live_sources(stamp)?;
-        }
-        c.set_last_plex_ingest(started)?;
-        Ok::<PlexIngestStats, PlexIngestError>(stats)
-    })?;
+    let stats = write_pass(
+        catalog,
+        &items,
+        &collections,
+        &labels,
+        identity_roots,
+        since,
+        started,
+    )?;
 
     // Deliberately outside the transaction above: this makes network requests
     // per item (potentially thousands), and a sqlite write transaction has no
@@ -749,6 +725,51 @@ pub fn ingest(
     }
 
     Ok(stats)
+}
+
+/// Write one fetched pass to the catalog in a single transaction — a mid-ingest
+/// failure rolls back rather than leaving a partial catalog. Entries are written
+/// before collections/labels so member ratingKeys resolve to their entry ids.
+///
+/// `started` is the delta cursor, written inside the same transaction so a
+/// failed pass cannot advance it past changes it never wrote. The caller takes
+/// it before the write begins: anything Plex modifies while the write runs is
+/// then re-read by the next pass rather than falling into the gap.
+///
+/// Split out of [`ingest`] so the full-pass-only gate on removals is testable
+/// without a live Plex server: `since.is_none()` is what says the pass was full.
+fn write_pass(
+    catalog: &Catalog,
+    items: &[PlexItem],
+    collections: &[ParsedCollection],
+    labels: &[ParsedLabel],
+    identity_roots: &[String],
+    since: Option<i64>,
+    started: i64,
+) -> Result<PlexIngestStats, PlexIngestError> {
+    // Prune deleted collections only on a full pass (`since` is None); a delta
+    // fetch omits unchanged collections, which must not be read as deletions.
+    let prune_absent = since.is_none();
+    catalog.in_transaction(|c| {
+        let mut stats = ingest_items(c, items, identity_roots)?;
+        ingest_labels(c, labels)?;
+        ingest_collections(c, collections, prune_absent)?;
+        // Reconcile *item* deletions, the same contract `ingest_collections`
+        // has had all along and the fs ingester has had since #144. A title
+        // pulled out of the library simply stops being mentioned by every later
+        // fetch; without this it sat in the catalog forever, still
+        // schedulable, still pointing at a file Plex no longer serves.
+        //
+        // Full pass only. A delta fetch returns just the changed items, so
+        // "not stamped by this pass" there means "unchanged" — marking on it
+        // would take the entire library out of the pool in one go.
+        if let (true, Some(stamp)) = (prune_absent, stats.scan_stamp.as_deref()) {
+            stats.sources_marked_missing = c.mark_unseen_sources_missing(Source::Plex, stamp)?;
+            stats.entries_marked_missing = c.mark_entries_missing_without_live_sources(stamp)?;
+        }
+        c.set_last_plex_ingest(started)?;
+        Ok::<PlexIngestStats, PlexIngestError>(stats)
+    })
 }
 
 /// Resolve the entry an item should attach to, if any: the entry this exact
@@ -2099,6 +2120,44 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    /// The removal gate is the whole risk of marking (#215): a delta fetch
+    /// returns only changed items, so a delta pass reporting two items must not
+    /// take the rest of the library out of the pool. A full pass reporting the
+    /// same two must.
+    #[test]
+    fn only_a_full_pass_marks_titles_missing() {
+        let roots = ["/data/media".to_string()];
+        let items: Vec<PlexItem> = (0..4)
+            .map(|i| {
+                movie(
+                    &format!("rk-{i}"),
+                    &format!("/data/media/m/{i}.mkv"),
+                    &[(ExternalNs::Imdb, &format!("tt-{i}"))],
+                )
+            })
+            .collect();
+        let live = |cat: &Catalog| {
+            cat.all_entry_ids()
+                .unwrap()
+                .iter()
+                .filter(|id| cat.entry(id).unwrap().unwrap().missing_since.is_none())
+                .count()
+        };
+
+        let cat = Catalog::open_in_memory().unwrap();
+        write_pass(&cat, &items, &[], &[], &roots, None, 1).unwrap();
+        age_plex_rows(&cat);
+        let delta = write_pass(&cat, &items[..2], &[], &[], &roots, Some(1), 2).unwrap();
+        assert_eq!(delta.sources_marked_missing, 0);
+        assert_eq!(delta.entries_marked_missing, 0);
+        assert_eq!(live(&cat), 4, "a delta pass must prune nothing");
+
+        let full = write_pass(&cat, &items[..2], &[], &[], &roots, None, 3).unwrap();
+        assert_eq!(full.sources_marked_missing, 2);
+        assert_eq!(full.entries_marked_missing, 2);
+        assert_eq!(live(&cat), 2);
     }
 
     /// Before ADR 0006 the Plex ingest reconciled *collections* and nothing

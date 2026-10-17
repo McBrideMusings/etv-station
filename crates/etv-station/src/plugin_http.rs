@@ -169,9 +169,31 @@ pub(crate) mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
+            // Read the whole request, body included: closing with unread bytes
+            // makes the OS reset the connection, and the client sees that as
+            // "Network Error" instead of the status.
+            let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let (head_len, body_len) = loop {
+                let n = sock.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
+                    let body_len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    break (pos + 4, body_len);
+                }
+                assert!(n > 0, "client closed before finishing its headers");
+            };
+            while raw.len() < head_len + body_len {
+                let n = sock.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before finishing its body");
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let request = String::from_utf8_lossy(&raw).into_owned();
             let reply = format!(
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
