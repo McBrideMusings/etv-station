@@ -207,6 +207,12 @@ pub struct PoolResume {
     /// rather than replaying them.
     #[serde(default, skip_serializing_if = "is_zero_step")]
     pub step: usize,
+    /// [`crate::pattern::pattern_id`] of the pattern `step` was recorded
+    /// under. `step` indexes into that pattern as written, so a generation
+    /// honours it only when the pattern it walks has the same id; any edit to
+    /// the pattern opens the cycle at step 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     /// [`crate::variety::Dice::list_key`] of the list `next` points into, or
     /// `None` when nothing about this pool rotates. A different key next time
     /// means a rollover: `next` belongs to a list that no longer exists.

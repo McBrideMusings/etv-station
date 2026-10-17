@@ -957,6 +957,7 @@ fn arrange(ctx) {
                 drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
+                pattern: None,
             },
         );
         let state = GenerationState {

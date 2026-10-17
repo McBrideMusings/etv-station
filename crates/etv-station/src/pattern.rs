@@ -806,6 +806,8 @@ impl PoolRuntime<'_> {
             } else {
                 0
             },
+            // Stamped by `pools_resume`, which knows the pattern.
+            pattern: None,
             // Only a round-robin pool has a meaningful "next": a random pool
             // draws afresh every visit.
             next: match self.cfg.select {
@@ -1273,12 +1275,16 @@ pub fn build(
     // The step of `first_cycle` the previous generation stopped before, from
     // the same pool that holds `first_cycle`.
     let stop_at_visit = pools.iter().all(|p| p.advance == Advance::Resume);
+    // A step indexes into the pattern it was recorded under, so one recorded
+    // under a pattern that has since been edited is not honoured.
+    let pattern_id = pattern_id(pattern);
     let first_step = pools
         .iter()
         .filter(|_| stop_at_visit)
         .filter(|p| p.advance == Advance::Resume)
         .filter_map(|p| state.resume.pool(&p.name))
         .filter(|r| r.cycle == first_cycle)
+        .filter(|r| r.pattern.as_deref() == Some(pattern_id.as_str()))
         .map(|r| r.step)
         .max()
         .unwrap_or(0);
@@ -1379,7 +1385,7 @@ pub fn build(
             } else {
                 (cycle + 1, 0)
             };
-            let before = pools_resume(&runtimes, at_cycle, at_step);
+            let before = pools_resume(&runtimes, at_cycle, at_step, &pattern_id);
             let drawn = runtimes[idx].visit(step.take, step.from, &roll, &mut channel)?;
             progress.extend(std::iter::repeat_n(before, drawn.len()));
             if measure {
@@ -1532,7 +1538,7 @@ pub fn build(
         );
     }
 
-    let resume_out = pools_resume(&runtimes, stopped_at.0, stopped_at.1);
+    let resume_out = pools_resume(&runtimes, stopped_at.0, stopped_at.1, &pattern_id);
     progress.push(resume_out.clone());
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
@@ -1657,10 +1663,33 @@ fn rollover<'a>(
 
 /// Every pool's resume state as the walk stands now, `cycle` and `step` being
 /// the pattern position a generation resuming from here starts at.
-fn pools_resume(runtimes: &[PoolRuntime], cycle: u64, step: usize) -> BTreeMap<String, PoolResume> {
+fn pools_resume(
+    runtimes: &[PoolRuntime],
+    cycle: u64,
+    step: usize,
+    pattern_id: &str,
+) -> BTreeMap<String, PoolResume> {
     runtimes
         .iter()
-        .map(|rt| (rt.cfg.name.clone(), rt.to_resume(cycle, step)))
+        .map(|rt| {
+            let mut resume = rt.to_resume(cycle, step);
+            if resume.step > 0 {
+                resume.pattern = Some(pattern_id.to_string());
+            }
+            (rt.cfg.name.clone(), resume)
+        })
+        .collect()
+}
+
+/// Identity of a pattern as written: a hash of its steps, so a stored step
+/// is only honoured by a generation walking the same pattern.
+fn pattern_id(pattern: &[PatternStep]) -> String {
+    use sha2::{Digest, Sha256};
+    let json = serde_json::to_string(pattern).expect("a pattern serializes");
+    Sha256::digest(json.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
         .collect()
 }
 
@@ -3663,6 +3692,7 @@ mod tests {
                 drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
+                pattern: None,
             },
         );
         // The ledger remembers an airing whose entry has since left the
@@ -3699,6 +3729,7 @@ mod tests {
                 drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
+                pattern: None,
             },
         );
         let state = GenerationState {
@@ -4384,6 +4415,70 @@ mod tests {
             (held.cycle, held.step),
             (3, 0),
             "a whole cycle ends at step 0"
+        );
+    }
+
+    /// A stored step indexes into the pattern it was recorded under, so a
+    /// pattern edited between two generations opens its cycle at step 0
+    /// (etv-station-09ub). Generation one stops before step 1 of a two-step
+    /// pattern; generation two walks a three-step pattern. Resumed at step 1 it
+    /// would end the window mid-cycle at (cycle 2, step 1); opened at step 0 it
+    /// lays three visits and ends on a cycle boundary.
+    #[test]
+    fn an_edited_pattern_opens_its_cycle_at_step_zero() {
+        let cat = hourly_movies(24);
+        let walk = |pattern: &[PatternStep], state: &GenerationState| {
+            let mut movies = movies_pool();
+            movies.advance = Advance::Resume;
+            build(
+                &cat,
+                &[movies],
+                &[],
+                pattern,
+                None,
+                None,
+                state,
+                &crate::variety::Variety::fixed(0),
+                time::OffsetDateTime::UNIX_EPOCH,
+                test_env(),
+                Some(Duration::from_secs(3 * 3600)),
+                None,
+            )
+            .expect("pattern builds")
+        };
+        let two = [step("movies", 1), step("movies", 1)];
+        let three = [step("movies", 1), step("movies", 1), step("movies", 1)];
+
+        let first = walk(&two, &GenerationState::empty());
+        assert_eq!(first.resume["movies"].step, 1, "stopped before visit 2");
+
+        let state_from = |built: &BlockBuild| {
+            let mut resume = ResumeMap::new();
+            resume.pools = built.resume.clone();
+            GenerationState {
+                resume,
+                cursor: built
+                    .ids
+                    .iter()
+                    .map(|id| (id.clone(), id.clone()))
+                    .collect(),
+                tail: built.ids.clone(),
+            }
+        };
+
+        let edited = walk(&three, &state_from(&first));
+        let held = &edited.resume["movies"];
+        assert_eq!(
+            (held.cycle, held.step),
+            (2, 0),
+            "the edited pattern must open at step 0 and end on a cycle boundary"
+        );
+
+        let same = walk(&two, &state_from(&first));
+        assert_eq!(
+            (same.resume["movies"].cycle, same.resume["movies"].step),
+            (3, 0),
+            "an unchanged pattern still resumes at its stored step"
         );
     }
 

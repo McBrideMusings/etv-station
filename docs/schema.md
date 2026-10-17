@@ -873,8 +873,10 @@ the one item airing at the boundary. A pattern block stops at the first visit
 later by at most the visit that was airing: one movie, one `take: 3` run of
 episodes, a whole season for `take: all`. The rest of the cycle is not aired;
 the `.resume` sidecar records the cycle and the step the generation stopped
-before (`cycle`, `step`), and the next time the slot airs it opens on that
-step. A block with a `restart` pool has no rotation to carry across the stop,
+before (`cycle`, `step`) and a hash of the pattern it walked (`pattern`), and
+the next time the slot airs it opens on that step. If the pattern was edited
+in between, the stored step no longer means the same visit, so the cycle opens
+at step 0. A block with a `restart` pool has no rotation to carry across the stop,
 so it still ends on a cycle boundary.
 
 **State.** Each slot continues where it stopped the last time a schedule
