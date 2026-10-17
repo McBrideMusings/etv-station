@@ -3657,6 +3657,29 @@ mod tests {
     }
 
     #[test]
+    fn specials_and_unnumbered_rows_do_not_shift_the_regular_run() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut no_ep = show_ep(1, 99, None);
+        no_ep.episode = None;
+        let mut no_season = show_ep(1, 98, None);
+        no_season.season = None;
+        let items = [
+            no_season,
+            show_ep(0, 1, None),
+            show_ep(0, 2, None),
+            show_ep(1, 1, None),
+            show_ep(1, 2, None),
+            show_ep(2, 1, None),
+            no_ep,
+        ];
+        ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+        assert_eq!(
+            absolutes(&cat, &[(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (1, 99), (1, 98)]),
+            vec![None, None, Some(1), Some(2), Some(3), None, None]
+        );
+    }
+
+    #[test]
     fn a_movie_is_left_without_an_absolute_episode() {
         let cat = Catalog::open_in_memory().unwrap();
         let m = movie("rk-m", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-m")]);
