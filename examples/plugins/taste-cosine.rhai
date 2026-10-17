@@ -621,14 +621,14 @@ fn pick(ctx) {
     }
 
     // The house's own profile, for the "unusual choice" term (#411). Fetched
-    // only when a pool asks for it, and skipped outright on a pooled channel,
-    // where it would be the same vector `weights` already holds.
+    // only when a pool asks for it. A pooled channel is refused below: there
+    // it would be the same vector `weights` already holds.
     let gamma = unusual_weight(ctx);
     if gamma != 0.0 && ctx.account_id == () {
-        throw "pool " + ctx.pool + ": config.unusual_weight needs a `taste_scope: single_user` channel — on a pooled channel the taste vector already is the house vector, so the term would do nothing";
+        throw "pool " + ctx.pool + ": config.unusual_weight needs a `taste_scope: single_user` channel — on a pooled channel the taste vector already is the house vector, so the term would only flatten the ranking";
     }
     let house_weights = #{};
-    if gamma != 0.0 && ctx.account_id != () {
+    if gamma != 0.0 {
         let house = ds.pooled_taste_vector();
         for attr in house.attributes {
             if attr.namespace == ns && excluded[attr.value] == () {
