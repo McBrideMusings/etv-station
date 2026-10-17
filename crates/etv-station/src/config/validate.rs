@@ -987,15 +987,17 @@ fn validate_plugin_capabilities(
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, plugin);
-    let capabilities = crate::score::declared_capabilities(&script_path)
+    let capabilities = crate::score::declared_capabilities(&script_path, "pool_provider")
         .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
 
     for cap in &pool.capabilities {
-        if !crate::score::KNOWN_CAPABILITIES.contains(&cap.as_str()) {
+        let offered = crate::score::offered_capabilities("pool_provider");
+        if !offered.contains(&cap.as_str()) {
             return Err(bad(format!(
-                "pool {:?} grants unknown capability {cap:?} — known capabilities are: {}",
+                "pool {:?} grants capability {cap:?}, but the pool_provider hook does not \
+                 offer {cap} (it offers: {})",
                 pool.name,
-                crate::score::KNOWN_CAPABILITIES.join(", ")
+                crate::score::join_offered(offered)
             )));
         }
     }
@@ -2569,6 +2571,28 @@ fn capabilities() { ["catalog_read"] }
         let msg = format!("{err}");
         assert!(msg.contains("watch_history"), "msg = {msg}");
         assert!(msg.contains("never declares"), "msg = {msg}");
+    }
+
+    /// A bumper-only capability fails the same way whether or not the pool
+    /// grants it, naming what the pool_provider hook offers.
+    #[test]
+    fn a_pool_script_declaring_a_bumper_only_capability_is_rejected() {
+        let body = r#"
+fn hooks() { ["pool_provider"] }
+fn audit(ctx, picks, workspace) { #{} }
+fn capabilities() { ["probe"] }
+"#;
+        for granted in [vec![], vec!["probe"]] {
+            let err = validate_plugin_script_with_capabilities(body, granted, vec![]).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(
+                    "the pool_provider hook does not offer probe (it offers: catalog_read, \
+                     watch_history, http)"
+                ),
+                "msg = {msg}"
+            );
+        }
     }
 
     #[test]

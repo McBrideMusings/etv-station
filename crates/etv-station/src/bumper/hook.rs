@@ -147,23 +147,11 @@ pub fn validate_script(script: &Path, granted: &[String]) -> Result<(), String> 
             req.why
         ));
     }
-    let declared: Vec<String> = crate::score::declared_capabilities(script)?
+    let declared: Vec<String> = crate::score::declared_capabilities(script, "bumper")?
         .iter()
         .map(|c| c.name().to_string())
         .collect();
     for cap in &declared {
-        if !BUMPER_CAPABILITIES.contains(&cap.as_str()) {
-            return Err(format!(
-                "plugin {} declares capability {cap:?}, which the bumper hook does not offer \
-                 (it offers: {})",
-                script.display(),
-                if BUMPER_CAPABILITIES.is_empty() {
-                    "none".to_string()
-                } else {
-                    BUMPER_CAPABILITIES.join(", ")
-                }
-            ));
-        }
         if !granted.contains(cap) {
             return Err(format!(
                 "plugin {} declares capability {cap:?} that its channel does not grant",
