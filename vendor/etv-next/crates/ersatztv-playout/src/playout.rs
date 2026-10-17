@@ -94,6 +94,37 @@ pub struct PlayoutItem {
     /// common case and costs nothing on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Which overlay script draws over this item, selected by whatever
+    /// produced this playout JSON: `{"script": ..., "vars": {...}}` runs that
+    /// script in place of the channel's overlay, and `"none"` draws nothing.
+    /// Absent means the channel's own overlay.
+    ///
+    /// **Nothing in this repo reads it.** Like `metadata`, it is deserialized,
+    /// held and re-serialized for the overlay process on the other side of the
+    /// channel's overlay fifo, which owns what the script path and vars mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<ItemOverlay>,
+}
+
+/// A playout item's overlay selection. See [`PlayoutItem::overlay`].
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ItemOverlay {
+    /// The JSON string `"none"`: draw nothing over this item.
+    Disabled(OverlayNone),
+    /// Run `script` with `vars` bound, in place of the channel's overlay.
+    Script {
+        script: String,
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        vars: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+/// The one value `ItemOverlay::Disabled` accepts: the string `"none"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum OverlayNone {
+    #[serde(rename = "none")]
+    None,
 }
 
 /// Spec for a live overlay source feeding the secondary input of an ffmpeg
@@ -224,6 +255,7 @@ impl PlayoutItem {
             watermark: None,
             program: None,
             metadata: None,
+            overlay: None,
         })
     }
 
@@ -245,7 +277,7 @@ impl PlayoutItem {
     }
 
     /// Construct a scheduled item from an already-resolved source, defaulting
-    /// every optional field (`tracks`/`watermark`/`program`/`metadata`). Callers
+    /// every optional field (`tracks`/`watermark`/`program`/`metadata`/`overlay`). Callers
     /// set whichever optionals they drive afterward. New optional schema fields
     /// default here, so producers that use this constructor don't need editing
     /// when the schema grows.
@@ -264,6 +296,7 @@ impl PlayoutItem {
             watermark: None,
             program: None,
             metadata: None,
+            overlay: None,
         }
     }
 }
@@ -734,5 +767,54 @@ mod schedule_requests_subtitle_tests {
 
         assert!(!schedule_requests_subtitle(dir.path()).await);
         assert!(!schedule_requests_subtitle(&dir.path().join("does-not-exist")).await);
+    }
+}
+
+#[cfg(test)]
+mod item_overlay_tests {
+    use super::*;
+
+    fn item_json(overlay: &str) -> String {
+        format!(
+            r#"{{"id":"a","start":"2026-10-17T00:00:00Z","finish":"2026-10-17T00:01:00Z"{overlay}}}"#
+        )
+    }
+
+    fn roundtrip(overlay: &str) -> (Option<ItemOverlay>, serde_json::Value) {
+        let item: PlayoutItem = serde_json::from_str(&item_json(overlay)).unwrap();
+        let out = serde_json::to_value(&item).unwrap();
+        (item.overlay, out)
+    }
+
+    #[test]
+    fn script_and_vars_survive_a_roundtrip() {
+        let (overlay, out) = roundtrip(
+            r#","overlay":{"script":"shared/bumpers/card.rhai","vars":{"title":"Up Next"}}"#,
+        );
+        let Some(ItemOverlay::Script { script, vars }) = overlay else {
+            panic!("expected a script overlay");
+        };
+        assert_eq!(script, "shared/bumpers/card.rhai");
+        assert_eq!(vars["title"], "Up Next");
+        assert_eq!(out["overlay"]["vars"]["title"], "Up Next");
+    }
+
+    #[test]
+    fn none_survives_a_roundtrip() {
+        let (overlay, out) = roundtrip(r#","overlay":"none""#);
+        assert_eq!(overlay, Some(ItemOverlay::Disabled(OverlayNone::None)));
+        assert_eq!(out["overlay"], "none");
+    }
+
+    #[test]
+    fn absent_stays_absent() {
+        let (overlay, out) = roundtrip("");
+        assert_eq!(overlay, None);
+        assert!(out.get("overlay").is_none());
+    }
+
+    #[test]
+    fn any_other_string_is_rejected() {
+        assert!(serde_json::from_str::<PlayoutItem>(&item_json(r#","overlay":"off""#)).is_err());
     }
 }
