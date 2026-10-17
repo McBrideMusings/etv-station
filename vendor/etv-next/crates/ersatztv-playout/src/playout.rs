@@ -115,8 +115,11 @@ pub enum ItemOverlay {
     /// Run `script` with `vars` bound, in place of the channel's overlay.
     Script {
         script: String,
-        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-        vars: serde_json::Map<String, serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vars: Option<serde_json::Map<String, serde_json::Value>>,
+        /// Any other key the producer put in the object, written back as read.
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
 }
 
@@ -791,11 +794,11 @@ mod item_overlay_tests {
         let (overlay, out) = roundtrip(
             r#","overlay":{"script":"shared/bumpers/card.rhai","vars":{"title":"Up Next"}}"#,
         );
-        let Some(ItemOverlay::Script { script, vars }) = overlay else {
+        let Some(ItemOverlay::Script { script, vars, .. }) = overlay else {
             panic!("expected a script overlay");
         };
         assert_eq!(script, "shared/bumpers/card.rhai");
-        assert_eq!(vars["title"], "Up Next");
+        assert_eq!(vars.unwrap()["title"], "Up Next");
         assert_eq!(out["overlay"]["vars"]["title"], "Up Next");
     }
 
@@ -804,6 +807,22 @@ mod item_overlay_tests {
         let (overlay, out) = roundtrip(r#","overlay":"none""#);
         assert_eq!(overlay, Some(ItemOverlay::Disabled(OverlayNone::None)));
         assert_eq!(out["overlay"], "none");
+    }
+
+    #[test]
+    fn unknown_keys_and_empty_vars_are_written_back_as_read() {
+        let input = r#","overlay":{"script":"x.rhai","vars":{},"mode":"fast"}"#;
+        let (_, out) = roundtrip(input);
+        assert_eq!(
+            out["overlay"],
+            serde_json::json!({"script":"x.rhai","vars":{},"mode":"fast"})
+        );
+    }
+
+    #[test]
+    fn a_script_without_vars_stays_without_vars() {
+        let (_, out) = roundtrip(r#","overlay":{"script":"x.rhai"}"#);
+        assert_eq!(out["overlay"], serde_json::json!({"script":"x.rhai"}));
     }
 
     #[test]
