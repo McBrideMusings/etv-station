@@ -59,6 +59,69 @@ use crate::config::LoadedChannel;
 use crate::errors::StationError;
 use crate::resolve::pick_playback_source;
 
+/// Every item in `channel`'s output folder that has not started, as
+/// `(catalog entry id, start)`.
+///
+/// Split from [`first_unplayable`] because `Catalog` is not `Sync`: a reference
+/// to it cannot be held across the awaits here and still be spawned.
+pub async fn unaired_items(
+    channel: &LoadedChannel,
+    now: OffsetDateTime,
+) -> Result<Vec<(String, OffsetDateTime)>, StationError> {
+    let mut out = Vec::new();
+    for file in crate::scan::scan_output_folder(&channel.output_folder).await? {
+        if file.finish <= now {
+            continue;
+        }
+        let bytes = tokio::fs::read(&file.path)
+            .await
+            .map_err(|source| StationError::Io {
+                path: file.path.clone(),
+                source,
+            })?;
+        let playout: Playout =
+            serde_json::from_slice(&bytes).map_err(|source| StationError::PlayoutCorrupt {
+                path: file.path.clone(),
+                source,
+            })?;
+        out.extend(
+            playout
+                .items
+                .into_iter()
+                .filter(|i| i.start > now)
+                .map(|i| (i.id, i.start)),
+        );
+    }
+    Ok(out)
+}
+
+/// The `start` of the earliest of `unaired` whose catalog entry has gone
+/// missing, or `None` when every one can still play.
+///
+/// Reads the same `missing_since` the sweep reads, and tests the **entry**, not
+/// whether the item is already an error card: a slot carded by an earlier sweep
+/// and one not yet swept have the same missing entry, and both need a real title
+/// back. An id the catalog does not know is an inline item and is not this
+/// function's business (see [`reconcile_item`]).
+pub fn first_unplayable(
+    catalog: &Catalog,
+    unaired: &[(String, OffsetDateTime)],
+) -> Result<Option<OffsetDateTime>, StationError> {
+    let mut earliest: Option<OffsetDateTime> = None;
+    for (id, start) in unaired {
+        if earliest.is_some_and(|e| e <= *start) {
+            continue;
+        }
+        if catalog
+            .entry(id)?
+            .is_some_and(|e| e.missing_since.is_some())
+        {
+            earliest = Some(*start);
+        }
+    }
+    Ok(earliest)
+}
+
 /// What one sweep changed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileCounts {
@@ -625,6 +688,62 @@ mod tests {
         assert_eq!(
             source_path(&items_at(&file).await[0]),
             Some("/media/b-new.mkv"),
+        );
+    }
+
+    /// A deleted title two items ahead is found at its own start, not the
+    /// first unaired item's; with nothing missing the answer is `None`.
+    #[tokio::test]
+    async fn the_first_unplayable_unaired_item_is_found_at_its_own_start() {
+        let dir = TempDir::new().unwrap();
+        let db = catalog_at(&dir, "imdb:tt1", "/media/a.mkv");
+        let cat = Catalog::open(&db).unwrap();
+        cat.upsert_entry(&Entry::new("imdb:tt2", "movie", "Gone", Source::LocalFs))
+            .unwrap();
+        write_playout(
+            &dir,
+            vec![
+                item(
+                    "imdb:tt0",
+                    "/media/aired.mkv",
+                    datetime!(2026-08-16 10:00:00 UTC),
+                    datetime!(2026-08-16 12:00:00 UTC),
+                ),
+                item(
+                    "imdb:tt1",
+                    "/media/a.mkv",
+                    datetime!(2026-08-16 13:00:00 UTC),
+                    datetime!(2026-08-16 15:00:00 UTC),
+                ),
+                item(
+                    "imdb:tt2",
+                    "/media/b.mkv",
+                    datetime!(2026-08-16 15:00:00 UTC),
+                    datetime!(2026-08-16 17:00:00 UTC),
+                ),
+                item(
+                    "inline-x",
+                    "/media/c.mkv",
+                    datetime!(2026-08-16 17:00:00 UTC),
+                    datetime!(2026-08-16 19:00:00 UTC),
+                ),
+            ],
+        )
+        .await;
+        let ch = channel(&dir);
+
+        assert_eq!(
+            first_unplayable(&cat, &unaired_items(&ch, now()).await.unwrap()).unwrap(),
+            None,
+            "nothing missing, so nothing to repair",
+        );
+
+        cat.mark_entries_missing_without_live_sources("2027-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            first_unplayable(&cat, &unaired_items(&ch, now()).await.unwrap()).unwrap(),
+            Some(datetime!(2026-08-16 15:00:00 UTC)),
+            "tt1 still has a live source, tt2 has none; the inline id is ignored",
         );
     }
 
