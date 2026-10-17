@@ -140,8 +140,10 @@ pub enum OverlayKind {
     /// pixels and width is derived from the image's aspect. Grayscale,
     /// grayscale+alpha, palette, and 16-bit PNGs are normalized to 8-bit
     /// RGB/RGBA at decode time; a source that still cannot be decoded (a
-    /// genuinely corrupt file, or a missing path) drops just this layer —
-    /// logged once — rather than failing the whole render (#302). Drawn
+    /// genuinely corrupt file, or a missing path) draws a magenta placeholder
+    /// square of `height` and is retried about once a second, so a render that
+    /// lands later replaces it; the failure is logged once — rather than
+    /// failing the whole render (#302). Drawn
     /// smaller than its source, the image is area-averaged down to its drawn
     /// size before drawing (#3djq) — Vello 0.9 samples without minification
     /// filtering, so scaling a large source down in the draw transform alone
