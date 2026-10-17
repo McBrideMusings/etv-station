@@ -573,6 +573,8 @@ python3 -c "import json;print(json.load(open('tmp/claude/render/channel1.json'))
 A channel with an overlay prints its own `fifo_path`; a channel without prints
 `None`. Two channels printing the *same* fifo path is a bug — each writes its own.
 
+- Scorer-supplied data reaches an overlay: run `cargo test -p etv-overlay --lib metadata` and expect `script_reads_a_key_out_of_metadata`, `missing_metadata_is_an_empty_map` and `nested_metadata_is_an_array_of_maps` to pass. These feed `ProgramContext.metadata` and read it back through the Rhai scope, which is the only surface that tells scorer data from a script default (`admin overlay-watch` renders against a fixture with no plugin behind it).
+
 **Only a real frame proves it.** The spec reaching ffmpeg does not mean anything
 was drawn: the overlay process is spawned on demand and can crash after ffmpeg
 has already committed to reading its fifo. Grab a frame and look:
@@ -984,3 +986,7 @@ The overlay half is `crates/etv-overlay/src/phase_watchdog.rs`: the frame loop
 marks its phase, a watchdog thread writes `overlay.heartbeat` beside the fifo
 once a second and logs `overlay.phase_stall` on a 1/2/4/8s backoff. Cost in the
 frame loop is two relaxed atomic stores per phase.
+
+## Verifying the channel-wide repeat rule (`rule.no_repeat_within`)
+
+`cargo test -p etv-station --lib a_channel_rule` covers spacing across pools, the ledger-tail seam, and the forced fallback. At the surface, run taste-lab Review on a scratch channel whose pools overlap — three `select: random` pools over one expression — once without the key and once with `rule: { no_repeat_within: "7d" }`, then compare `first_repeat.days` and the smallest gap between two airings of the same `entry_id` in `airings`. Observed 2026-10-17 on 14 days of Animation films: 0.15 days without the rule, 7.0 days with it. At the daemon, `event="channel_repeat.applied"` logs `blocked`/`forced` per generation, and `constraints.unsatisfied scope=channel` means the rule could not hold.

@@ -43,7 +43,8 @@ The common operations:
 ./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
 ./tools/verify-integration.sh            # smoke test: start dev stack, probe HTTP endpoints, verify clean shutdown
 ./tools/verify-all.sh                    # test + clippy + fmt --check in BOTH workspaces
-./tools/verify-all.sh test|lint|fmt      # one check, still across both workspaces
+./tools/verify-all.sh test|lint|fmt-check  # one read-only check, still across both workspaces
+./tools/verify-all.sh fmt                # rustfmt both workspaces — WRITES files
 bun run docs:dev                         # serve VitePress docs on http://localhost:5193
 ./tools/overlay-test.sh                  # render a Vello overlay onto a bumper fixture and open the mp4
 ./tools/overlay-still.sh                 # render a single overlay frame to PNG and open it
@@ -90,7 +91,7 @@ Radarr and Sonarr are discovery conveniences only — the daemon never contacts 
 
 ## `tools/*.py` is not auto-formatted
 
-No Python formatter is configured for this repo (no `pyproject.toml`, no `ruff.toml`), and none is to be run against `tools/*.py` — not `ruff format`, `black`, or a generic "format the files you changed" step. No ruff setting reproduces the files' existing style: `ruff format --diff` over the six scripts rewrites 439 lines at defaults and still 156 at the closest setting (`line-length = 120`, double quotes). Keep a change to these scripts to the lines it needs, in the style of the lines around it. If a formatter already rewrote a file, undo it with `git diff` review and a hand revert of the formatter's hunks, never `git checkout -- <file>`, which also discards your uncommitted fix.
+No Python formatter is configured for this repo (no `pyproject.toml`, no `ruff.toml`), and none is to be run against `tools/*.py` — not `ruff format`, `black`, or a generic "format the files you changed" step, because no formatter setting reproduces the files' existing style. Keep a change to these scripts to the lines it needs, in the style of the lines around it. If a formatter already rewrote a file, undo it with `git diff` review and a hand revert of the formatter's hunks, never `git checkout -- <file>`, which also discards your uncommitted fix.
 
 ## Documentation
 
