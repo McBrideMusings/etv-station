@@ -1441,6 +1441,7 @@ fn build(ctx) {{
         let media = dir.path().join("m.mkv");
         let made = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-v",
                 "error",
                 "-f",
