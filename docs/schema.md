@@ -231,6 +231,42 @@ resolutions in two folders — matches either folder, because both are true.
 Only the last folder in the path counts: a file at `/media/library/bumpers/x.mkv`
 matches `"bumpers"` and not `"library"`.
 
+#### `keyword_score` — count matches against a keyword set (#161)
+
+`keyword_score(["a", "b", …])` returns how many of the listed keywords an item
+matches. Compare it to a threshold with the ordinary operators — `>=`, `>`, `==`,
+`!=`, `<=`, `<` — so a pool can ask for "enough of these that I mean it" where a
+single `genres.contains(...)` is one shared tag.
+
+A keyword matches when it is a case-insensitive substring of the title, or equals
+(ignoring case) one tag value: any genre, label, cast or director, as `item.tags`
+does. A keyword repeated in the list counts once. The station ships no keyword
+sets; the list is the channel author's.
+
+Plex genre is multi-valued, so `item.genres.contains("Comedy")` admits both
+*Beverly Hills Cop* (`Action`, `Comedy`, `Crime`) and *Shaun of the Dead*
+(`Comedy`, `Horror`). A Sitcoms-style pool that wants comedies and not
+action-comedies counts the action keywords and requires none:
+
+```yaml
+pools:
+  - name: comedies
+    expr: 'item.genres.contains("Comedy") && keyword_score(["action", "crime", "thriller"]) == 0'
+```
+
+That admits *Shaun of the Dead* and *Airplane!* (`Comedy` only) and drops *Beverly
+Hills Cop*, which scores 2. Loosen the pool to `< 2` to let a single-genre
+crossover back in. These three films are the fixture of the test
+`keyword_score_counts_matched_keywords_against_a_threshold` in `catalog/query.rs`;
+the scores above are what that test asserts.
+
+A pool whose `expr` can never match fails when the config loads, naming the pool:
+an empty keyword list, or a threshold the list cannot reach (`>= 3` over two
+keywords). `etv-query-test` evaluates the function against its own item fields (title and
+categories), so a set can be tuned there first; it does not apply the load-time
+threshold check, and it folds case with Unicode rules where the station folds
+ASCII only.
+
 ### `kind: collection` — play a catalog collection in its authored order
 
 Emits every member of one collection in the sequence hand-arranged in the source
