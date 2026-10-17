@@ -20,7 +20,7 @@
 # Registered in examples/station.yaml via the `samples/*.yaml` glob. Resolves
 # to nothing unless the station's `catalog_path` points at a populated catalog
 # holding these collections.
-number: 12
+number: 50
 name: seasonal
 display_name: "Seasonal"
 window_days: 1
