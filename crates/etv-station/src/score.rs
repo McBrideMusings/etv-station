@@ -626,6 +626,11 @@ pub enum Capability {
     /// [`crate::plugin_http::call`] (ADR 0014). Offered to pools and the
     /// bumper hook.
     Http,
+    /// `ctx.exec(program, args)` on the bumper hook: one child process through
+    /// [`crate::hooks::exec_call`], killed after
+    /// [`crate::plugin_http::GENERATION_TIMEOUT`]. Offered by
+    /// [`crate::bumper::hook`] only.
+    Exec,
     Datastore(String),
 }
 
@@ -643,6 +648,7 @@ impl Capability {
             Capability::Probe => "probe",
             Capability::Read => "read",
             Capability::Http => "http",
+            Capability::Exec => "exec",
             Capability::Datastore(name) => name,
         }
     }
@@ -726,6 +732,7 @@ pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, Stri
             "probe" => out.push(Capability::Probe),
             "read" => out.push(Capability::Read),
             "http" => out.push(Capability::Http),
+            "exec" => out.push(Capability::Exec),
             _ => {
                 return Err(format!(
                     "plugin {} declares unknown capability {name:?} — known capabilities \
@@ -733,7 +740,7 @@ pub fn declared_capabilities(script_path: &Path) -> Result<Vec<Capability>, Stri
                     script_path.display(),
                     KNOWN_CAPABILITIES
                         .iter()
-                        .chain(&["probe", "read"])
+                        .chain(&["probe", "read", "exec"])
                         .copied()
                         .collect::<Vec<_>>()
                         .join(", ")
