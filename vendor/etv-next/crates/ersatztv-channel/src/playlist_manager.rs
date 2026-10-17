@@ -107,6 +107,9 @@ pub struct PlaylistManager {
     target_duration_f64: f64,
     pending_discontinuity: bool,
     last_segment_end: OffsetDateTime,
+    /// The stall window never starts before this, whatever `last_segment_end`
+    /// says — see [`PlaylistManager::restart_stall_clock`].
+    stall_clock_floor: OffsetDateTime,
     current_session_start: OffsetDateTime,
 
     pts_offset: Option<PtsOffset>,
@@ -242,6 +245,7 @@ impl PlaylistManager {
             // a new encoder run.
             pending_discontinuity: resumed != SequenceState::default(),
             last_segment_end,
+            stall_clock_floor: OffsetDateTime::UNIX_EPOCH,
             current_session_start: last_segment_end,
 
             pts_offset: None,
@@ -268,6 +272,17 @@ impl PlaylistManager {
 
     pub fn last_progress(&self) -> &OffsetDateTime {
         &self.last_progress
+    }
+
+    /// Start the stall window over from now.
+    ///
+    /// The window normally runs from the newest segment's end, so time an item
+    /// spends failing counts against whatever replaces it: a source that takes
+    /// 46s to die leaves its error card 14s to render, start ffmpeg and write a
+    /// segment before the session is torn down. The replacement is a recovery
+    /// and gets a full window of its own.
+    pub fn restart_stall_clock(&mut self) {
+        self.stall_clock_floor = OffsetDateTime::now_utc();
     }
 
     /// Wall-clock end of the newest segment produced so far.
@@ -486,9 +501,13 @@ impl PlaylistManager {
         // of the content we hold. It starts at the session start time and only
         // advances when a segment is added, so a session that has never produced
         // a single segment is measured the same way as one that stopped
-        // mid-stream — no separate never-started case.
+        // mid-stream — no separate never-started case. The one exception is
+        // `stall_clock_floor`: an item that failed and is being replaced by an
+        // error card starts the window over, so the card is not charged for
+        // the time the failure took.
         if viewer_is_watching {
-            let starved_for = OffsetDateTime::now_utc() - self.last_segment_end;
+            let starved_for =
+                OffsetDateTime::now_utc() - self.last_segment_end.max(self.stall_clock_floor);
             let limit =
                 time::Duration::seconds((self.target_duration * STALL_TARGET_DURATIONS) as i64);
             if starved_for > limit && !self.stalled {
@@ -920,6 +939,29 @@ mod tests {
         .await;
         pm.update().await.unwrap();
 
+        assert_eq!(pm.abort(), Some(SessionAbort::SegmentStall));
+    }
+
+    /// etv-station-191x: an item that spent 46s failing left its error card 14s
+    /// before the stall fired. Restarting the clock at the failure gives the
+    /// card a full window, and only a full window.
+    #[tokio::test]
+    async fn restarted_stall_clock_gives_a_replacement_a_fresh_window() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(
+            dir.path(),
+            OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS + 5),
+        )
+        .await;
+        pm.restart_stall_clock();
+        pm.update().await.unwrap();
+        assert_eq!(pm.abort(), None);
+
+        pm.stall_clock_floor =
+            OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS + 5);
+        pm.update().await.unwrap();
         assert_eq!(pm.abort(), Some(SessionAbort::SegmentStall));
     }
 

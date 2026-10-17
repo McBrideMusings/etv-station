@@ -591,6 +591,7 @@ impl ChannelSession {
                     .and_then(|p| p.title.as_deref())
                     .unwrap_or("(untitled)");
                 log::error!("item '{item_title}' failed, replacing with an error card: {e}");
+                self.playlist_manager.lock().await.restart_stall_clock();
                 let fake_item = self
                     .error_card_playout_item(Some(current_item.finish), item_title, &e.to_string())
                     .await;
