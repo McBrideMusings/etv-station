@@ -19,6 +19,21 @@ pub struct ChannelSubtitle {
     pub default_on: Option<bool>,
 }
 
+/// A channel's `annotate:` entry (ADR 0017): the script and the capabilities
+/// the channel grants it. Same two keys a pool uses (`plugin:`,
+/// `capabilities:`), checked the same way at load (ADR 0015): the grant must
+/// equal what the script's `capabilities()` declares.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AnnotateConfig {
+    /// The script, relative to the channel config's directory.
+    pub plugin: PathBuf,
+    /// Capabilities this channel grants the script; `http` is the only one
+    /// the annotate hook offers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
 /// A channel's `guide:` block: the text defaults every item inherits, plus the
 /// one setting that only exists at channel level.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -160,11 +175,12 @@ pub struct ChannelConfig {
     ///
     /// At config load, the named script must declare the `annotate` hook
     /// (`hooks()`, the same declaration `pool_provider`/`sequencer` already
-    /// use) — a script that doesn't fails load with a named error. `None`
+    /// use) — a script that doesn't fails load with a named error — and the
+    /// entry's `capabilities` must equal the script's declared set. `None`
     /// (the default) means every item keeps whatever metadata its source and
     /// blocks already gave it, unchanged from before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotate: Option<PathBuf>,
+    pub annotate: Option<AnnotateConfig>,
 
     /// Event hooks (ADR 0021) scoped to this channel; same shape as the
     /// station's `hooks:`. A relative `run` resolves against this file's
