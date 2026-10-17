@@ -307,6 +307,7 @@ pub fn ingest_items(
         scan_stamp: now.clone(),
         ..PlexIngestStats::default()
     };
+    let mut touched_shows = std::collections::BTreeSet::new();
     for item in items {
         let canonical = canonical_path(&item.playback_path, &roots);
         // Identity precedence (locked #47 model, pin added by #279/ADR 0009):
@@ -399,9 +400,14 @@ pub fn ingest_items(
         entry.episode = item
             .episode
             .or_else(|| existing.as_ref().and_then(|e| e.episode));
-        entry.absolute_episode = item
-            .absolute_episode
-            .or_else(|| existing.as_ref().and_then(|e| e.absolute_episode));
+        // What Plex numbered, kept apart from the served `absolute_episode`
+        // (which `reconcile_absolute_episodes` may overwrite with a computed
+        // number). A delta that omits the field keeps the last Plex value.
+        let plex_absolute = match item.absolute_episode {
+            Some(n) => Some(n),
+            None => catalog.plex_absolute_episode(&entry_id)?,
+        };
+        entry.absolute_episode = plex_absolute;
         entry.year = item.year.or_else(|| existing.as_ref().and_then(|e| e.year));
         entry.release_date = or_existing(
             item.release_date.clone(),
@@ -445,6 +451,10 @@ pub fn ingest_items(
             stats.summary_missing += 1;
         }
         catalog.upsert_entry(&entry)?;
+        catalog.set_plex_absolute_episode(&entry_id, plex_absolute)?;
+        if let Some(show_id) = &entry.show_id {
+            touched_shows.insert(show_id.clone());
+        }
         stats.entries_written += 1;
 
         // Record every GUID so the entry is reachable by any of them, even when
@@ -488,6 +498,8 @@ pub fn ingest_items(
         }
         stats.sources_written += 1;
     }
+    let touched_shows: Vec<String> = touched_shows.into_iter().collect();
+    catalog.reconcile_absolute_episodes(&touched_shows)?;
     Ok(stats)
 }
 
@@ -3472,6 +3484,186 @@ mod tests {
         assert_eq!(
             cat.resolve_query("item.absolute_episode == 154").unwrap(),
             vec!["imdb:tt-ae".to_string()]
+        );
+    }
+
+    /// An episode of one show (`Naruto`, GUID `tt-abs`) at `(season, episode)`
+    /// carrying Plex's `absolute` index, if any. The ratingKey is `rk-S-E`.
+    fn show_ep(season: i64, episode: i64, absolute: Option<i64>) -> PlexItem {
+        let mut e = movie(
+            &format!("rk-{season}-{episode}"),
+            &format!("/data/media/tv/abs/s{season:02}e{episode:02}.mkv"),
+            &[],
+        );
+        e.kind = "episode".into();
+        e.title = format!("S{season}E{episode}");
+        e.show = Some("Abs Show".into());
+        e.show_rating_key = Some("9001".into());
+        e.show_external_ids = vec![(ExternalNs::Imdb, "tt-abs".to_string())];
+        e.season = Some(season);
+        e.episode = Some(episode);
+        e.absolute_episode = absolute;
+        e
+    }
+
+    /// `absolute_episode` of each `(season, episode)` rating key, in the order given.
+    fn absolutes(cat: &Catalog, keys: &[(i64, i64)]) -> Vec<Option<i64>> {
+        keys.iter()
+            .map(|(s, e)| {
+                let id = cat
+                    .entry_id_for_source(Source::Plex, &format!("rk-{s}-{e}"))
+                    .unwrap()
+                    .unwrap();
+                cat.entry(&id).unwrap().unwrap().absolute_episode
+            })
+            .collect()
+    }
+
+    const ABS_KEYS: [(i64, i64); 5] = [(1, 1), (1, 2), (2, 1), (2, 2), (2, 3)];
+
+    #[test]
+    fn a_show_plex_never_numbered_is_flattened_across_seasons() {
+        let cat = Catalog::open_in_memory().unwrap();
+        // Ingested out of air order: the flatten sorts, it does not trust the batch.
+        let items = [
+            show_ep(2, 3, None),
+            show_ep(1, 1, None),
+            show_ep(2, 1, None),
+            show_ep(1, 2, None),
+            show_ep(2, 2, None),
+        ];
+        ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+        assert_eq!(
+            absolutes(&cat, &ABS_KEYS),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+            "season 2 continues from season 1 rather than restarting"
+        );
+    }
+
+    #[test]
+    fn a_fully_indexed_show_keeps_plexs_numbers() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let items = [
+            show_ep(1, 1, Some(101)),
+            show_ep(1, 2, Some(102)),
+            show_ep(2, 1, Some(150)),
+            show_ep(2, 2, Some(151)),
+            show_ep(2, 3, Some(152)),
+        ];
+        ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+        assert_eq!(
+            absolutes(&cat, &ABS_KEYS),
+            vec![Some(101), Some(102), Some(150), Some(151), Some(152)]
+        );
+    }
+
+    #[test]
+    fn one_unindexed_episode_renumbers_the_whole_show_including_plexs_values() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let items = [
+            show_ep(1, 1, Some(101)),
+            show_ep(1, 2, Some(102)),
+            show_ep(2, 1, None),
+            show_ep(2, 2, Some(151)),
+            show_ep(2, 3, Some(152)),
+        ];
+        ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+        assert_eq!(
+            absolutes(&cat, &ABS_KEYS),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+            "no NULL left, and none of Plex's partial values survive"
+        );
+    }
+
+    #[test]
+    fn a_delta_batch_of_part_of_a_show_numbers_it_as_a_full_ingest_would() {
+        let full = Catalog::open_in_memory().unwrap();
+        let all = [
+            show_ep(1, 1, None),
+            show_ep(1, 2, None),
+            show_ep(2, 1, None),
+            show_ep(2, 2, None),
+            show_ep(2, 3, None),
+        ];
+        ingest_items(&full, &all, &["/data/media".into()]).unwrap();
+
+        let delta = Catalog::open_in_memory().unwrap();
+        ingest_items(&delta, &all[..3], &["/data/media".into()]).unwrap();
+        ingest_items(&delta, &all[3..], &["/data/media".into()]).unwrap();
+        assert_eq!(absolutes(&delta, &ABS_KEYS), absolutes(&full, &ABS_KEYS));
+    }
+
+    #[test]
+    fn a_delta_that_unindexes_one_episode_flips_the_show_and_a_reindex_flips_it_back() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let indexed = [
+            show_ep(1, 1, Some(101)),
+            show_ep(1, 2, Some(102)),
+            show_ep(2, 1, Some(150)),
+            show_ep(2, 2, Some(151)),
+            show_ep(2, 3, Some(152)),
+        ];
+        ingest_items(&cat, &indexed, &["/data/media".into()]).unwrap();
+
+        // One episode loses its Plex index. (An ingest that merely omits the
+        // field keeps the last Plex value, like every other merged column, so
+        // the loss is set directly.) The whole show flips to computed numbers.
+        let lost = show_ep(2, 1, None);
+        cat.set_plex_absolute_episode(
+            &cat.entry_id_for_source(Source::Plex, "rk-2-1")
+                .unwrap()
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+        ingest_items(&cat, &[lost], &["/data/media".into()]).unwrap();
+        assert_eq!(
+            absolutes(&cat, &ABS_KEYS),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
+        );
+
+        ingest_items(&cat, &[show_ep(2, 1, Some(150))], &["/data/media".into()]).unwrap();
+        assert_eq!(
+            absolutes(&cat, &ABS_KEYS),
+            vec![Some(101), Some(102), Some(150), Some(151), Some(152)]
+        );
+    }
+
+    #[test]
+    fn re_ingesting_an_unchanged_show_changes_no_absolute_episode() {
+        for items in [
+            vec![
+                show_ep(1, 1, None),
+                show_ep(1, 2, Some(7)),
+                show_ep(2, 1, None),
+                show_ep(2, 2, None),
+                show_ep(2, 3, None),
+            ],
+            vec![
+                show_ep(1, 1, Some(1)),
+                show_ep(1, 2, Some(2)),
+                show_ep(2, 1, Some(3)),
+                show_ep(2, 2, Some(4)),
+                show_ep(2, 3, Some(9)),
+            ],
+        ] {
+            let cat = Catalog::open_in_memory().unwrap();
+            ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+            let first = absolutes(&cat, &ABS_KEYS);
+            ingest_items(&cat, &items, &["/data/media".into()]).unwrap();
+            assert_eq!(absolutes(&cat, &ABS_KEYS), first);
+            assert!(first.iter().all(Option::is_some));
+        }
+    }
+
+    #[test]
+    fn a_movie_is_left_without_an_absolute_episode() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let m = movie("rk-m", "/data/media/m/x.mkv", &[(ExternalNs::Imdb, "tt-m")]);
+        ingest_items(&cat, &[m], &["/data/media".into()]).unwrap();
+        assert_eq!(
+            cat.entry("imdb:tt-m").unwrap().unwrap().absolute_episode,
+            None
         );
     }
 
