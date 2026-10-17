@@ -19,8 +19,19 @@
 //! ```
 //!
 //! `ctx` carries no filesystem or network handle: `build` can only see what
-//! the host put in it. Phase 1 offers no capability-gated field, so a bumper
-//! plugin declares and is granted none ([`BUMPER_CAPABILITIES`]).
+//! the host put in it. Two capability-gated calls reach outside it, each
+//! declared in `capabilities()` and granted by the channel
+//! ([`BUMPER_CAPABILITIES`]):
+//!
+//! - `probe` — `ctx.probe(path)` runs `ffprobe` on a media file and returns
+//!   `#{ duration_ms, format, tags, streams }`, or `()` when the file cannot be
+//!   probed. `tags` is the container's metadata (ComfyUI writes `prompt` and
+//!   `workflow` there), keys lower-cased; each stream map has `index`, `kind`,
+//!   `codec`, `lang`, `width`, `height`, `channels` and its own lower-cased
+//!   `tags`.
+//! - `read` — `ctx.read(path)` returns a UTF-8 text file from the plugin's own
+//!   folder (up to [`READ_LIMIT_BYTES`]), or `()` when it does not exist. A path
+//!   that resolves outside that folder is an error.
 //!
 //! The builder (`timeline()`, `segment()`, `clip(..)`) constructs the same
 //! [`Timeline`] structs a later declarative format would deserialize into.
@@ -41,10 +52,11 @@ use super::timeline::{
     AudioSource, Duration, OverlayVars, Segment, SegmentAudio, SegmentSource, Timeline,
 };
 
-/// Capability names a bumper plugin may declare. Empty in Phase 1: `ctx`
-/// has no gated field yet, so a declared capability would name a field the
-/// script cannot read.
-pub const BUMPER_CAPABILITIES: &[&str] = &[];
+/// Capability names a bumper plugin may declare: each gates one `ctx` call.
+pub const BUMPER_CAPABILITIES: &[&str] = &["probe", "read"];
+
+/// The largest file `ctx.read` returns.
+pub const READ_LIMIT_BYTES: u64 = 1 << 20;
 
 /// Why a bumper script produced no timeline.
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +87,9 @@ pub struct BumperInput {
     pub channel: ChannelInfo,
     /// `YYYY-MM-DD` the gap airs on, in the station's time zone.
     pub air_date: String,
+    /// Capabilities the channel granted this script; `ctx.probe` and
+    /// `ctx.read` error unless their name is here.
+    pub granted: Vec<String>,
 }
 
 /// A script's timeline plus how it built it.
@@ -150,7 +165,14 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
         message,
     };
     let ast = crate::score::compile_plugin(script).map_err(&fail)?;
-    let engine = bumper_engine();
+    let engine = bumper_engine(Host {
+        dir: script
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        granted: input.granted.clone(),
+    });
     let mut scope = Scope::new();
     let value: Dynamic = engine
         .call_fn(&mut scope, &ast, "build", (ctx_map(input).map_err(&fail)?,))
@@ -542,10 +564,163 @@ fn bed_source(source: Dynamic, opts: Map) -> RhaiResult<AudioSource> {
     })
 }
 
-/// The station's plugin engine plus the bumper builder and `ctx.rng`.
-fn bumper_engine() -> rhai::Engine {
+/// What the gated `ctx` calls need from the host.
+#[derive(Debug, Clone)]
+struct Host {
+    /// The plugin's own folder: the only place `ctx.read` reaches.
+    dir: PathBuf,
+    granted: Vec<String>,
+}
+
+impl Host {
+    fn require(&self, capability: &str) -> RhaiResult<()> {
+        if self.granted.iter().any(|g| g == capability) {
+            Ok(())
+        } else {
+            err(format!("capability `{capability}` not declared"))
+        }
+    }
+
+    fn probe(&self, path: &str) -> RhaiResult<Dynamic> {
+        self.require("probe")?;
+        let probed = probe_media(Path::new(path)).map_err(|e| format!("ctx.probe(): {e}"))?;
+        tracing::info!(
+            event = "bumper.probe",
+            path,
+            found = probed.is_some(),
+            "bumper script probed a file"
+        );
+        match probed {
+            Some(value) => rhai::serde::to_dynamic(value),
+            None => Ok(Dynamic::UNIT),
+        }
+    }
+
+    fn read(&self, path: &str) -> RhaiResult<Dynamic> {
+        self.require("read")?;
+        let text = read_in_dir(&self.dir, path).map_err(|e| format!("ctx.read(): {e}"))?;
+        tracing::info!(
+            event = "bumper.read",
+            path,
+            bytes = text.as_ref().map(String::len),
+            "bumper script read a plugin file"
+        );
+        Ok(text.map(Dynamic::from).unwrap_or(Dynamic::UNIT))
+    }
+}
+
+/// `path` read as text, when it resolves inside `dir`. `Ok(None)` for a file
+/// that does not exist; `Err` for one that escapes `dir`, is too large, or is
+/// not UTF-8.
+fn read_in_dir(dir: &Path, path: &str) -> Result<Option<String>, String> {
+    let root = dir
+        .canonicalize()
+        .map_err(|e| format!("plugin folder {}: {e}", dir.display()))?;
+    let target = match root.join(path).canonicalize() {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{path:?}: {e}")),
+    };
+    if !target.starts_with(&root) {
+        return Err(format!(
+            "{path:?} is outside the plugin folder {}",
+            root.display()
+        ));
+    }
+    let meta = std::fs::metadata(&target).map_err(|e| format!("{path:?}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path:?} is not a file"));
+    }
+    if meta.len() > READ_LIMIT_BYTES {
+        return Err(format!(
+            "{path:?} is {} bytes, over the {READ_LIMIT_BYTES}-byte limit",
+            meta.len()
+        ));
+    }
+    let bytes = std::fs::read(&target).map_err(|e| format!("{path:?}: {e}"))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| format!("{path:?} is not UTF-8 text"))
+}
+
+/// `ffprobe` output for `path` as the map `ctx.probe` returns. Only the `file`
+/// protocol is allowed, so a path cannot name a URL. `Ok(None)` when
+/// ffprobe runs but rejects the file; `Err` when ffprobe cannot be run.
+fn probe_media(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    use serde_json::{Map as JsonMap, Value, json};
+
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            "-protocol_whitelist",
+            "file",
+            "-i",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("cannot run ffprobe: {e}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let raw: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("ffprobe printed invalid JSON: {e}"))?;
+
+    let tags = |v: &Value| -> Value {
+        let mut out = JsonMap::new();
+        if let Some(obj) = v.get("tags").and_then(Value::as_object) {
+            for (k, val) in obj {
+                if let Some(s) = val.as_str() {
+                    out.insert(k.to_ascii_lowercase(), json!(s));
+                }
+            }
+        }
+        Value::Object(out)
+    };
+    let duration_ms = raw["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|secs| (secs * 1000.0).round() as i64);
+    let streams: Vec<Value> = raw["streams"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|s| {
+            let stream_tags = tags(s);
+            json!({
+                "index": s["index"].as_i64(),
+                "kind": s["codec_type"].as_str().unwrap_or("other"),
+                "codec": s["codec_name"].as_str().unwrap_or(""),
+                "lang": stream_tags["language"].as_str().filter(|l| *l != "und"),
+                "width": s["width"].as_i64(),
+                "height": s["height"].as_i64(),
+                "channels": s["channels"].as_i64(),
+                "tags": stream_tags,
+            })
+        })
+        .collect();
+    Ok(Some(json!({
+        "duration_ms": duration_ms,
+        "format": raw["format"]["format_name"].as_str().unwrap_or(""),
+        "tags": tags(&raw["format"]),
+        "streams": streams,
+    })))
+}
+
+/// The station's plugin engine plus the bumper builder, `ctx.rng` and the
+/// gated `ctx.probe` / `ctx.read`.
+fn bumper_engine(host: Host) -> rhai::Engine {
     let usage = Usage::default();
     let mut engine = crate::score::engine();
+
+    let h = host.clone();
+    engine.register_fn("probe", move |_ctx: &mut Map, path: &str| h.probe(path));
+    engine.register_fn("read", move |_ctx: &mut Map, path: &str| host.read(path));
 
     engine
         .register_type_with_name::<Rng>("Rng")
@@ -817,6 +992,7 @@ mod tests {
                 vocabulary: vec!["alpha".into(), "beta".into(), "gamma".into()],
             },
             air_date: "2026-10-17".into(),
+            granted: Vec::new(),
         }
     }
 
@@ -976,5 +1152,131 @@ fn build(ctx) {
         let no_build = script(&dir, "fn hooks() { [\"bumper\"] }");
         let msg = validate_script(&no_build, &[]).unwrap_err();
         assert!(msg.contains("build(ctx)"), "{msg}");
+    }
+
+    fn granted(names: &[&str]) -> BumperInput {
+        BumperInput {
+            granted: names.iter().map(|n| n.to_string()).collect(),
+            ..input(None)
+        }
+    }
+
+    #[test]
+    fn read_returns_a_plugin_file_and_unit_for_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("words.txt"), "alpha beta").unwrap();
+        let path = script(
+            &dir,
+            r#"fn hooks() { ["bumper"] }
+fn capabilities() { ["read"] }
+fn build(ctx) {
+    let t = timeline();
+    let text = ctx.read("words.txt");
+    if ctx.read("nope.txt") != () { throw "missing file must be ()"; }
+    t.push(segment().black().fixed(1).name(text));
+    t
+}"#,
+        );
+        validate_script(&path, &["read".into()]).unwrap();
+        let built = build(&path, &granted(&["read"])).unwrap();
+        assert_eq!(built.timeline.segments[0].name, "alpha beta");
+    }
+
+    #[test]
+    fn read_refuses_paths_outside_the_plugin_folder() {
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "s").unwrap();
+        let plugin = outer.path().join("plugin");
+        std::fs::create_dir(&plugin).unwrap();
+        std::os::unix::fs::symlink(outer.path().join("secret.txt"), plugin.join("link.txt"))
+            .unwrap();
+        for target in [
+            "../secret.txt".to_string(),
+            "link.txt".to_string(),
+            outer.path().join("secret.txt").display().to_string(),
+        ] {
+            let err = read_in_dir(&plugin, &target).unwrap_err();
+            assert!(err.contains("outside the plugin folder"), "{target}: {err}");
+        }
+    }
+
+    #[test]
+    fn read_refuses_a_file_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big.txt"),
+            vec![b'x'; READ_LIMIT_BYTES as usize + 1],
+        )
+        .unwrap();
+        let err = read_in_dir(dir.path(), "big.txt").unwrap_err();
+        assert!(err.contains("over the"), "{err}");
+    }
+
+    #[test]
+    fn probe_and_read_error_unless_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(
+            &dir,
+            "fn hooks() { [\"bumper\"] }\nfn build(ctx) { ctx.probe(\"x.mp4\"); timeline() }",
+        );
+        let msg = build(&path, &granted(&[])).unwrap_err().to_string();
+        assert!(msg.contains("capability `probe` not declared"), "{msg}");
+        let path = script(
+            &dir,
+            "fn hooks() { [\"bumper\"] }\nfn build(ctx) { ctx.read(\"x\"); timeline() }",
+        );
+        let msg = build(&path, &granted(&["probe"])).unwrap_err().to_string();
+        assert!(msg.contains("capability `read` not declared"), "{msg}");
+    }
+
+    #[test]
+    fn probe_reports_duration_streams_and_container_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("m.mkv");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=64x48:d=1.5:r=10",
+            ])
+            .args(["-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "1.5"])
+            .args([
+                "-metadata",
+                "Prompt={\"a\":1}",
+                "-metadata:s:a:0",
+                "language=eng",
+            ])
+            .arg(&media)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let path = script(
+            &dir,
+            &format!(
+                r#"fn hooks() {{ ["bumper"] }}
+fn capabilities() {{ ["probe"] }}
+fn build(ctx) {{
+    let p = ctx.probe("{m}");
+    if ctx.probe("{m}.absent") != () {{ throw "unprobeable file must be ()"; }}
+    let t = timeline();
+    let audio = p.streams.filter(|s| s.kind == "audio")[0];
+    t.push(segment().black().fixed_ms(p.duration_ms)
+        .name(`${{p.tags.prompt}}|${{p.streams.len()}}|${{p.streams[0].width}}x${{p.streams[0].height}}|${{audio.lang}}`));
+    t
+}}"#,
+                m = media.display()
+            ),
+        );
+        let built = build(&path, &granted(&["probe"])).unwrap();
+        let seg = &built.timeline.segments[0];
+        assert_eq!(seg.name, "{\"a\":1}|2|64x48|eng");
+        // The container pads a 1.5s encode by a few ms.
+        let Duration::Fixed(ms) = seg.duration else {
+            panic!("probe duration became {:?}", seg.duration)
+        };
+        assert!((1500..1520).contains(&ms), "{ms}");
     }
 }
