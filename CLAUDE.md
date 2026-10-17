@@ -2,6 +2,10 @@
 
 `etv-station` is a standalone playout-JSON generator daemon for [ErsatzTV-next](https://github.com/ErsatzTV/next). It reads station/channel TOML configs, applies a sequencing rule (v1: Loop Forever), and writes playout JSON files to a shared volume that ETV-next consumes.
 
+## Core exposes facts; plugins own policy
+
+The station core offers generic facts and primitives — the schedule, the airings ledger, `ctx.probe`, granted `exec`/`http` — and a Rhai plugin decides what to do with them. Before proposing anything core-side, name the generic fact it exposes. If its name is a plugin's concept (a job, a clip, a render, a joke, a ranking), it belongs in a plugin, not the station — including when the reason is speed. ADR 0014 and ADR 0021 are the decisions behind this.
+
 ## Architecture in one sentence
 
 One container running two programs over one folder, with one shared schema: `etv-station` writes `{start}_{finish}.json` files; ETV-next reads them, produces HLS + XMLTV. The schema is a path dependency on the vendored ETV-next source under `vendor/etv-next/`, so drift is a compile-time error.
