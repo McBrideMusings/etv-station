@@ -2146,6 +2146,12 @@ otherwise. A `single_user` channel with nobody named would quietly fall back to
 the pooled history and rank a personal channel against everyone's viewing while
 looking perfectly healthy.
 
+`single_user` also requires `PLEX_URL` and `PLEX_TOKEN` in the daemon's
+environment, whatever the catalog ingests from and whatever datastores a scorer
+plugin is granted. Tautulli's user id is translated to a Plex account id through
+Plex, because the two differ only for the server owner and only Plex can say
+which account that is. A missing variable fails at load.
+
 What is *not* checked at load is whether the named account exists — that needs
 the network, and this is a config pass. Tautulli answers an unknown user with an
 empty history, which shows up at runtime as `rows=0` on that scope's

@@ -117,6 +117,25 @@ fn validate_hooks(
 /// structural "exactly one of path/inline" check happens during load; this is
 /// the semantic pass over the resolved shape.
 pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(), ConfigError> {
+    validate_channel_with_plex(path, channel, plex_env_present())
+}
+
+/// Whether `PLEX_URL` and `PLEX_TOKEN` are both set and non-empty — the same
+/// test [`crate::catalog::ingest::plex::PlexEnv::from_env`] applies, without
+/// its half-configured warning (this runs once per channel).
+fn plex_env_present() -> bool {
+    ["PLEX_URL", "PLEX_TOKEN"]
+        .iter()
+        .all(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
+}
+
+/// [`validate_channel`] with the environment's Plex configuration passed in,
+/// so a test states it rather than mutating process-wide env vars.
+fn validate_channel_with_plex(
+    path: &Path,
+    channel: &ChannelConfig,
+    plex_configured: bool,
+) -> Result<(), ConfigError> {
     validate_hooks(path, &format!("channel {:?}", channel.name), &channel.hooks)?;
     if channel.window_days == 0 {
         return Err(ConfigError::Validation {
@@ -153,7 +172,7 @@ pub(super) fn validate_channel(path: &Path, channel: &ChannelConfig) -> Result<(
         );
     }
 
-    validate_taste_scope(path, channel)?;
+    validate_taste_scope(path, channel, plex_configured)?;
     validate_show_groups(path, &channel.groups)?;
     validate_guide(path, "channel", channel.guide.as_ref().map(|g| &g.text))?;
     validate_tracks(path, "channel", channel.tracks.as_ref())?;
@@ -345,10 +364,19 @@ fn validate_guide_templates(
 /// that must not resolve to an empty taste vector. A `user` that cannot be
 /// carried all the way through both fails that generation loudly, naming the
 /// user, rather than letting the plugin quietly rank against the pooled
-/// vector instead. See `daemon::pattern_catch_up`,
+/// vector instead. Because that Plex fetch is unavoidable — only Plex can say
+/// whether the account is the server owner — `single_user` also requires
+/// `PLEX_URL`/`PLEX_TOKEN` here, at load, so a missing one fails at startup
+/// rather than on the first generation. The daemon's runtime error stays as
+/// the backstop for an environment that changes after load. See
+/// `daemon::pattern_catch_up`,
 /// [`crate::tautulli::resolve_account_id`], and
 /// `daemon::SharedHistory::resolve_account_id`.
-fn validate_taste_scope(path: &Path, channel: &ChannelConfig) -> Result<(), ConfigError> {
+fn validate_taste_scope(
+    path: &Path,
+    channel: &ChannelConfig,
+    plex_configured: bool,
+) -> Result<(), ConfigError> {
     let Some(scoring) = channel.scoring.as_ref() else {
         return Ok(());
     };
@@ -368,6 +396,11 @@ fn validate_taste_scope(path: &Path, channel: &ChannelConfig) -> Result<(), Conf
         (TasteScope::SingleUser, Some(u)) if u.trim().is_empty() => {
             bad("`user` cannot be empty under taste_scope: single_user")
         }
+        (TasteScope::SingleUser, Some(_)) if !plex_configured => bad(
+            "taste_scope: single_user requires PLEX_URL and PLEX_TOKEN to be set — \
+             the Tautulli user id must be translated to a Plex account id, and only \
+             Plex can say whether the account is the server owner (whose two ids differ)",
+        ),
         (TasteScope::AllUsers, Some(_)) => {
             bad("`user` is only meaningful with taste_scope: single_user; \
              the default all_users pools every user's history")
@@ -1549,7 +1582,33 @@ mod tests {
     #[test]
     fn accepts_a_single_user_channel_that_names_someone() {
         let c = channel_scoped_to(TasteScope::SingleUser, Some("carol"));
-        assert!(validate_channel(&dummy_path(), &c).is_ok());
+        assert!(validate_channel_with_plex(&dummy_path(), &c, true).is_ok());
+    }
+
+    /// #282: the Tautulli→Plex account translation is a hard requirement, so
+    /// a `single_user` channel without Plex configured fails at load, naming
+    /// both variables, instead of on its first generation.
+    #[test]
+    fn rejects_single_user_without_plex_configured() {
+        let c = channel_scoped_to(TasteScope::SingleUser, Some("carol"));
+        let msg = validate_channel_with_plex(&dummy_path(), &c, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("PLEX_URL") && msg.contains("PLEX_TOKEN"),
+            "msg = {msg}"
+        );
+    }
+
+    /// Every scope other than `single_user` loads the same with or without Plex.
+    #[test]
+    fn plex_is_not_required_outside_single_user() {
+        let pooled = channel_scoped_to(TasteScope::AllUsers, None);
+        let unscored = channel_with(vec![inline_block(vec![item_entry("a")])]);
+        for plex in [false, true] {
+            assert!(validate_channel_with_plex(&dummy_path(), &pooled, plex).is_ok());
+            assert!(validate_channel_with_plex(&dummy_path(), &unscored, plex).is_ok());
+        }
     }
 
     /// #112 must not change what an already-written config means: every channel
@@ -1585,7 +1644,7 @@ mod tests {
     fn a_padded_user_is_trimmed_before_it_becomes_a_scope() {
         let c = channel_scoped_to(TasteScope::SingleUser, Some("  carol  "));
         assert!(
-            validate_channel(&dummy_path(), &c).is_ok(),
+            validate_channel_with_plex(&dummy_path(), &c, true).is_ok(),
             "padding is not itself a config error, which is why trimming matters",
         );
         assert_eq!(
