@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
+use ersatztv_channel::playback_events::{self, PlaybackEvent};
 use ersatztv_core::{
     HEARTBEAT_FILE_NAME, LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME,
     OVERLAY_WANTED_FILE_NAME, OVERLAY_WRITER_POLL_INTERVAL, OVERLAY_WRITER_TIMEOUT,
@@ -213,6 +214,10 @@ pub struct ChannelSession {
 
     cached_subtitles: Option<(String, Arc<Vec<Cue>>)>,
     dynamic_http_client: reqwest::Client,
+
+    /// The item last written to the playback log, so an item resumed after
+    /// the transcode fell behind is announced once.
+    announced_item: Option<(String, OffsetDateTime)>,
 }
 
 impl ChannelSession {
@@ -327,10 +332,44 @@ impl ChannelSession {
             timeout_notify: Arc::new(tokio::sync::Notify::new()),
             cached_subtitles: None,
             dynamic_http_client,
+            announced_item: None,
         })
     }
 
     pub async fn run(&mut self, troubleshoot: bool) -> Result<(), ChannelError> {
+        self.log_playback(|at, channel| PlaybackEvent::SessionStarted { at, channel });
+        let result = self.run_session(troubleshoot).await;
+        self.log_playback(|at, channel| PlaybackEvent::SessionStopped { at, channel });
+        result
+    }
+
+    /// Append one event to the playout folder's playback log.
+    fn log_playback(&self, event: impl FnOnce(OffsetDateTime, String) -> PlaybackEvent) {
+        let event = event(
+            OffsetDateTime::now_utc(),
+            self.channel_config.number().to_owned(),
+        );
+        playback_events::append(self.channel_config.expanded_playout_folder(), &event);
+    }
+
+    /// Record `item` as started unless it is the one last recorded.
+    fn announce_item(&mut self, item: &PlayoutItem) {
+        let key = (item.id.clone(), item.start);
+        if self.announced_item.as_ref() == Some(&key) {
+            return;
+        }
+        self.log_playback(|at, channel| PlaybackEvent::ItemStarted {
+            at,
+            channel,
+            item_id: item.id.clone(),
+            start: item.start,
+            finish: item.finish,
+            title: item.program.as_ref().and_then(|p| p.title.clone()),
+        });
+        self.announced_item = Some(key);
+    }
+
+    async fn run_session(&mut self, troubleshoot: bool) -> Result<(), ChannelError> {
         self.prep_output_folder().await?;
 
         self.ffmpeg_info = FfmpegInfo::load(
@@ -503,7 +542,10 @@ impl ChannelSession {
         }
 
         let current_item = match current_item_result {
-            Ok(playout_item) => playout_item,
+            Ok(playout_item) => {
+                self.announce_item(&playout_item);
+                playout_item
+            }
             Err(ChannelError::PlayoutJsonNoItem { next_start }) => {
                 self.fake_playout_item(next_start)
             }
