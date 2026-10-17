@@ -944,6 +944,7 @@ fn arrange(ctx) {
                 lap: Vec::new(),
                 next: Some("show:whatever".into()),
                 cycle: 0,
+                step: 0,
             },
         );
         let state = GenerationState {

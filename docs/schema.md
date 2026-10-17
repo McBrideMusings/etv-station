@@ -695,11 +695,14 @@ the instant, the any-time `rule.blocks` air.
 any-time blocks. It stops laying items at the next minute a different block
 would be on, and what is airing then finishes before the next block starts,
 never cut short and never followed by dead air. For an entries block that is
-the one item airing at the boundary. A pattern block finishes the pattern cycle
-in progress, so its boundary can land later by the rest of that cycle: up to
-three episodes for "1 movie, then 3 episodes", a whole season for `take: all`.
-A slot meant to start on time is written with short cycles, typically one
-`take: 1` step.
+the one item airing at the boundary. A pattern block stops at the first visit
+(pattern step) that would start at or after the boundary, so its boundary lands
+later by at most the visit that was airing: one movie, one `take: 3` run of
+episodes, a whole season for `take: all`. The rest of the cycle is not aired;
+the `.resume` sidecar records the cycle and the step the generation stopped
+before (`cycle`, `step`), and the next time the slot airs it opens on that
+step. A block with a `restart` pool has no rotation to carry across the stop,
+so it still ends on a cycle boundary.
 
 **State.** Each slot continues where it stopped the last time a schedule
 placed it: pool rotation is keyed by pool name, which must be unique across

@@ -80,7 +80,7 @@ pub struct ChannelConfig {
 
     /// How far ahead of live the schedule is materialized. This is also what
     /// bounds a single generation, whichever shape the channel is: a pattern
-    /// whose pools would take years to drain stops at the cycle boundary that
+    /// whose pools would take years to drain stops at the visit boundary that
     /// covers this span (#140), and a flat `entries` list longer than the span
     /// stops at the item that covers it and resumes there next time (#118). So
     /// an edit to the channel file shows up on air within roughly this long.

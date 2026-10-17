@@ -674,7 +674,7 @@ impl PoolRuntime<'_> {
     }
 
     /// This pool's state to persist for the next window.
-    fn to_resume(&self, cycle: u64) -> PoolResume {
+    fn to_resume(&self, cycle: u64, step: usize) -> PoolResume {
         // Where each series left off is NOT recorded here — the play-history
         // ledger already holds it, and the cursor this pool resumed from was a
         // projection of that. Writing it a second time would be the duplicate
@@ -683,6 +683,11 @@ impl PoolRuntime<'_> {
             // A `restart` pool ignores its resume state, so it records none.
             cycle: if self.cfg.advance == Advance::Resume {
                 cycle
+            } else {
+                0
+            },
+            step: if self.cfg.advance == Advance::Resume {
+                step
             } else {
                 0
             },
@@ -840,14 +845,15 @@ pub(crate) fn mix_seed(a: u64, b: u64) -> u64 {
 /// with no explicit `cycles` runs until its largest pool drains once, and 51
 /// pools of films drain over about eleven years, so one pass of the generator
 /// booked a channel through 2037 and no later tick ever revisited it (#140).
-/// With it, the walk stops at the first cycle boundary past the span, so the
-/// overshoot is one cycle instead of a decade. `None` leaves the walk
+/// With it, the walk stops at the first boundary past the span, so the
+/// overshoot is bounded instead of a decade. `None` leaves the walk
 /// unbounded, which is what an explicit `cycles` and the stateless
 /// [`crate::resolve::resolve_channel`] entry point both want.
 ///
-/// Nothing new is persisted to make this work: the walk already stops on a
-/// cycle boundary and already hands back each pool's rotation, so the next
-/// generation resumes from where this one stopped exactly as it does today.
+/// The walk stops at the first visit boundary past the span, so the overshoot
+/// is one visit. It hands back each pool's rotation and the `(cycle, step)` it
+/// stopped before, so the next generation resumes mid-cycle without replaying
+/// the steps already aired.
 /// What one block's pool walk produced — shared by [`build`] (the pattern
 /// walk) and `sequence::build` (#291), which return the identical shape.
 #[derive(Debug)]
@@ -991,19 +997,36 @@ pub fn build(
         .map(|r| r.cycle)
         .max()
         .unwrap_or(0);
-    let mut walked = first_cycle;
-    for cycle in (first_cycle..).take(cycles) {
-        // Checked between cycles, never inside one: a cycle is the unit the
-        // pattern was written in ("1 movie, then 3 episodes"), and cutting one
-        // in half would air a fragment of the shape and leave the pools parked
-        // mid-pattern. So the last cycle is allowed to finish and overrun the
-        // window by its own length — the same bargain `pattern_catch_up`
-        // already strikes when it emits a whole generation past the target.
-        if budget.is_some_and(|fill| laid >= fill) {
-            break;
-        }
-        walked = cycle + 1;
-        for (step_idx, step) in pattern.iter().enumerate() {
+    // The step of `first_cycle` the previous generation stopped before, from
+    // the same pool that holds `first_cycle`.
+    let first_step = pools
+        .iter()
+        .filter(|p| p.advance == Advance::Resume)
+        .filter_map(|p| state.resume.pool(&p.name))
+        .filter(|r| r.cycle == first_cycle)
+        .map(|r| r.step)
+        .max()
+        .unwrap_or(0);
+    // The window may end at any visit boundary, not only at a cycle's: what
+    // airs at the boundary still finishes, but the walk does not go on to the
+    // rest of the cycle, which on a long pattern ("1 film, then 2-4 episodes")
+    // started the next slot hours late. That needs every pool to resume, since
+    // the next generation picks the cycle up at a step and a `restart` pool
+    // would start over under it; a block holding one stops between cycles.
+    let stop_at_visit = pools.iter().all(|p| p.advance == Advance::Resume);
+    // Where the next generation opens: the visit the walk stopped before, or
+    // the start of the cycle after the last one it finished.
+    let mut stopped_at = (first_cycle, first_step);
+    'walk: for cycle in (first_cycle..).take(cycles) {
+        let skip = if cycle == first_cycle { first_step } else { 0 };
+        for (step_idx, step) in pattern.iter().enumerate().skip(skip) {
+            stopped_at = (cycle, step_idx);
+            // A budgeted walk is over once it has laid what was asked for.
+            // Between cycles that always ends it; inside one, only when the
+            // block can resume at a step.
+            if (step_idx == 0 || stop_at_visit) && budget.is_some_and(|fill| laid >= fill) {
+                break 'walk;
+            }
             let idx = *by_name
                 .get(step.pool.as_str())
                 .ok_or_else(|| format!("pattern step names unknown pool {:?}", step.pool))?;
@@ -1068,12 +1091,9 @@ pub fn build(
                     );
                 }
             }
-            // A rewind to here regenerates from the first step of the cycle
-            // this records. Mid-cycle, the rotation has already moved past
-            // this cycle's earlier steps, so it records the next cycle rather
-            // than replaying this one's rolls over an advanced rotation.
-            let resume_at = if step_idx == 0 { cycle } else { cycle + 1 };
-            let before = pools_resume(&runtimes, resume_at);
+            // A rewind to here regenerates from this visit, with the rotation
+            // as it stands before it and the rolls this visit would have made.
+            let before = pools_resume(&runtimes, cycle, step_idx);
             let drawn = runtimes[idx].visit(step.take, step.from, &roll)?;
             progress.extend(std::iter::repeat_n(before, drawn.len()));
             if measure {
@@ -1184,6 +1204,7 @@ pub fn build(
             }
             out.extend(drawn);
         }
+        stopped_at = (cycle + 1, 0);
     }
 
     for rt in &runtimes {
@@ -1202,7 +1223,7 @@ pub fn build(
         }
     }
 
-    let resume_out = pools_resume(&runtimes, walked);
+    let resume_out = pools_resume(&runtimes, stopped_at.0, stopped_at.1);
     progress.push(resume_out.clone());
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
@@ -1298,7 +1319,7 @@ fn rollover<'a>(
     // rotation and lap — is exactly the "previous" a rolled-over pool opens
     // from, so the same seat rule serves a rollover between generations and
     // one inside a generation.
-    let prev = rt.to_resume(0);
+    let prev = rt.to_resume(0, 0);
     let fresh = pool_runtime(
         catalog,
         cfg,
@@ -1325,12 +1346,12 @@ fn rollover<'a>(
     Ok(())
 }
 
-/// Every pool's resume state as the walk stands now, `cycle` being the cycle a
-/// generation resuming from here starts at.
-fn pools_resume(runtimes: &[PoolRuntime], cycle: u64) -> BTreeMap<String, PoolResume> {
+/// Every pool's resume state as the walk stands now, `cycle` and `step` being
+/// the pattern position a generation resuming from here starts at.
+fn pools_resume(runtimes: &[PoolRuntime], cycle: u64, step: usize) -> BTreeMap<String, PoolResume> {
     runtimes
         .iter()
-        .map(|rt| (rt.cfg.name.clone(), rt.to_resume(cycle)))
+        .map(|rt| (rt.cfg.name.clone(), rt.to_resume(cycle, step)))
         .collect()
 }
 
@@ -1878,7 +1899,7 @@ fn picked_extras_for(
 /// so shorter pools repeat under their own `wrap` while the longest plays out.
 ///
 /// This is a **ceiling, not the count that runs.** When [`build`] is given a
-/// `fill` span it stops the walk at the first cycle boundary that covers it,
+/// `fill` span it stops the walk at the first visit boundary that covers it,
 /// which is what keeps a 51-pool channel from laying down eleven years in one
 /// pass (#140). Draining once is only what happens when nobody said how much
 /// airtime was wanted.
@@ -3333,6 +3354,7 @@ mod tests {
                 lap: Vec::new(),
                 next: Some("show:inv".into()),
                 cycle: 0,
+                step: 0,
             },
         );
         // The ledger remembers an airing whose entry has since left the
@@ -3958,6 +3980,56 @@ mod tests {
                 "mov-01", "mov-02", "mov-03", "mov-04", "mov-05", "mov-06", "mov-07", "mov-08",
             ],
             "the seam repeated or skipped: {first:?} then {second:?}",
+        );
+    }
+
+    /// A slot boundary is honoured at the next visit, not the next cycle
+    /// (etv-station-8qml). A cycle of two one-hour visits against a three-hour
+    /// window stops after the third visit, mid-cycle; the next generation
+    /// carries on with the cycle's second visit instead of replaying its first.
+    #[test]
+    fn a_window_ends_at_the_next_visit_and_the_cycle_resumes_there() {
+        let cat = hourly_movies(24);
+        let three_hours = Some(Duration::from_secs(3 * 3600));
+        let walk = |state: &GenerationState| {
+            let mut movies = movies_pool();
+            movies.advance = Advance::Resume;
+            let built = build(
+                &cat,
+                &[movies],
+                &[],
+                &[step("movies", 1), step("movies", 1)],
+                None,
+                None,
+                state,
+                &crate::variety::Variety::fixed(0),
+                time::OffsetDateTime::UNIX_EPOCH,
+                test_env(),
+                three_hours,
+            )
+            .expect("pattern builds");
+            (built.ids, built.resume)
+        };
+
+        let (first, pools) = walk(&GenerationState::empty());
+        assert_eq!(first, vec!["mov-01", "mov-02", "mov-03"]);
+        let held = &pools["movies"];
+        assert_eq!((held.cycle, held.step), (1, 1), "stopped before visit 2");
+
+        let mut resume = ResumeMap::new();
+        resume.pools = pools;
+        let state = GenerationState {
+            resume,
+            cursor: first.iter().map(|id| (id.clone(), id.clone())).collect(),
+            tail: first.clone(),
+        };
+        let (second, pools) = walk(&state);
+        assert_eq!(second, vec!["mov-04", "mov-05", "mov-06"]);
+        let held = &pools["movies"];
+        assert_eq!(
+            (held.cycle, held.step),
+            (3, 0),
+            "a whole cycle ends at step 0"
         );
     }
 

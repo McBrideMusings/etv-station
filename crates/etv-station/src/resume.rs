@@ -200,6 +200,13 @@ pub struct PoolResume {
     /// replaying the first cycle's draws every time (etv-station-pwzv).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cycle: u64,
+    /// The pattern step of `cycle` the next generation opens on. Zero except
+    /// where a generation stopped at a slot or window boundary partway through
+    /// a cycle: the cycle's earlier steps already aired and the rotation has
+    /// moved past them, so the next generation carries on from this step
+    /// rather than replaying them.
+    #[serde(default, skip_serializing_if = "is_zero_step")]
+    pub step: usize,
     /// [`crate::variety::Dice::list_key`] of the list `next` points into, or
     /// `None` when nothing about this pool rotates. A different key next time
     /// means a rollover: `next` belongs to a list that no longer exists.
@@ -215,6 +222,10 @@ pub struct PoolResume {
 }
 
 fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_step(n: &usize) -> bool {
     *n == 0
 }
 
