@@ -213,8 +213,8 @@ impl DurationCache {
                     && entry.streams.is_some()
                 {
                     stats.from_cache += 1;
-                    let d = clamp_to_config(Duration::from_secs_f64(entry.duration_secs), item);
-                    return Ok(d);
+                    let probed = trusted_probe(Duration::from_secs_f64(entry.duration_secs), item);
+                    return Ok(clamp_to_config(probed, item));
                 }
 
                 let (probed, streams) = ffprobe_media(&local_path).await?;
@@ -228,7 +228,7 @@ impl DurationCache {
                 );
                 self.dirty = true;
                 stats.from_probe += 1;
-                Ok(clamp_to_config(probed, item))
+                Ok(clamp_to_config(trusted_probe(probed, item), item))
             }
         }
     }
@@ -256,6 +256,30 @@ fn config_duration(item: &ResolvedItem) -> Result<Duration, StationError> {
         });
     }
     Ok(out_p - in_p)
+}
+
+/// A probed length more than this many times the catalog's own runtime for the
+/// same file is a bad container header, not a long film.
+const PROBE_OVERRUN_FACTOR: u32 = 2;
+
+/// The catalog's runtime when the probe claims the file is over
+/// [`PROBE_OVERRUN_FACTOR`] times longer than it; the probe otherwise. The
+/// cache keeps the raw probe, so this runs on every use and a catalog update
+/// takes effect without re-probing.
+fn trusted_probe(probed: Duration, item: &ResolvedItem) -> Duration {
+    match item.catalog_duration {
+        Some(catalog) if !catalog.is_zero() && probed > catalog * PROBE_OVERRUN_FACTOR => {
+            tracing::warn!(
+                event = "duration.probe_rejected",
+                item = %item.id,
+                probed_secs = probed.as_secs_f64(),
+                catalog_secs = catalog.as_secs_f64(),
+                "probed length is over {PROBE_OVERRUN_FACTOR}x the catalog runtime; using the catalog's",
+            );
+            catalog
+        }
+        _ => probed,
+    }
 }
 
 fn clamp_to_config(probed: Duration, item: &ResolvedItem) -> Duration {
@@ -653,6 +677,25 @@ mod tests {
                 mtime_secs: 1,
                 duration_secs: 10.0,
             },
+        );
+    }
+
+    #[test]
+    fn a_probe_far_over_the_catalog_runtime_is_rejected() {
+        let mut item = local_item("father-christmas", "/m/x.mkv");
+        item.catalog_duration = Some(Duration::from_secs(5040));
+        assert_eq!(
+            trusted_probe(Duration::from_secs(85_452), &item),
+            Duration::from_secs(5040)
+        );
+        assert_eq!(
+            trusted_probe(Duration::from_secs(5100), &item),
+            Duration::from_secs(5100)
+        );
+        item.catalog_duration = None;
+        assert_eq!(
+            trusted_probe(Duration::from_secs(85_452), &item),
+            Duration::from_secs(85_452)
         );
     }
 
