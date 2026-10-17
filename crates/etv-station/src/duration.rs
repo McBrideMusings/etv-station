@@ -212,6 +212,12 @@ impl DurationCache {
                     && entry.mtime_secs == mtime_secs
                     && entry.streams.is_some()
                 {
+                    if let Some(reason) = entry.streams.as_deref().and_then(unairable_reason) {
+                        return Err(StationError::Ffprobe {
+                            path: local_path,
+                            reason: reason.into(),
+                        });
+                    }
                     stats.from_cache += 1;
                     let probed = trusted_probe(Duration::from_secs_f64(entry.duration_secs), item);
                     return Ok(clamp_to_config(probed, item));
@@ -339,6 +345,13 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         }
     };
 
+    parse_probe(path, &stdout)
+}
+
+/// Turn ffprobe's JSON into a length and streams, refusing a file that cannot
+/// air: no readable container duration, or no video stream. A file with no
+/// picture would otherwise fill its slot with silence or a stale frame.
+fn parse_probe(path: &Path, stdout: &[u8]) -> Result<(Duration, Vec<StreamInfo>), StationError> {
     #[derive(Deserialize)]
     struct ProbeOut {
         format: ProbeFormat,
@@ -350,20 +363,45 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         duration: Option<String>,
     }
 
-    let probe: ProbeOut = serde_json::from_slice(&stdout).map_err(|e| StationError::Ffprobe {
+    let fail = |reason: String| StationError::Ffprobe {
         path: path.to_path_buf(),
-        reason: format!("parse json: {e}"),
-    })?;
-    let secs_str = probe.format.duration.ok_or_else(|| StationError::Ffprobe {
-        path: path.to_path_buf(),
-        reason: "format.duration missing".into(),
-    })?;
-    let secs: f64 = secs_str.parse().map_err(|e| StationError::Ffprobe {
-        path: path.to_path_buf(),
-        reason: format!("duration not a float: {e}"),
-    })?;
-    let streams = probe.streams.iter().map(ProbeStream::to_info).collect();
+        reason,
+    };
+    let probe: ProbeOut =
+        serde_json::from_slice(stdout).map_err(|e| fail(format!("parse json: {e}")))?;
+    let streams: Vec<StreamInfo> = probe.streams.iter().map(ProbeStream::to_info).collect();
+    if let Some(reason) = unairable_reason(&streams) {
+        tracing::warn!(
+            event = "duration.probe_unairable",
+            path = %path.display(),
+            stream_kinds = ?streams.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            format_duration = ?probe.format.duration,
+            reason,
+            "ffprobe read the file but it cannot air"
+        );
+        return Err(fail(reason.into()));
+    }
+    let secs_str = probe
+        .format
+        .duration
+        .ok_or_else(|| fail("format.duration missing".into()))?;
+    let secs: f64 = secs_str
+        .parse()
+        .map_err(|e| fail(format!("duration not a float: {e}")))?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return Err(fail(format!("duration not positive: {secs_str}")));
+    }
     Ok((Duration::from_secs_f64(secs), streams))
+}
+
+/// Why a probed file cannot air, if it cannot. Applies to cached probes too, so
+/// a file cached before this check existed is refused on its next use.
+fn unairable_reason(streams: &[StreamInfo]) -> Option<&'static str> {
+    if streams.iter().any(|s| s.kind == StreamKind::Video) {
+        None
+    } else {
+        Some("no video stream")
+    }
 }
 
 /// One entry of `ffprobe -show_streams`, as far as the track selector reads it.
@@ -457,6 +495,25 @@ mod tests {
       {"index":3,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle",
        "disposition":{"default":0,"forced":1},"tags":{"language":"und"}}
     ]"#;
+
+    #[test]
+    fn a_probe_with_no_video_stream_is_unairable() {
+        // Engaging Father Christmas (2017): one audio stream, format duration N/A.
+        let audio_only = br#"{"format":{"duration":"85452.0"},"streams":[{"index":0,"codec_type":"audio","codec_name":"eac3"}]}"#;
+        let err = parse_probe(Path::new("/m/a.mkv"), audio_only).unwrap_err();
+        assert_eq!(
+            err.unreadable_media().map(|(_, r)| r),
+            Some("no video stream")
+        );
+
+        let no_duration = br#"{"format":{"duration":"N/A"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}"#;
+        assert!(parse_probe(Path::new("/m/a.mkv"), no_duration).is_err());
+
+        let ok = br#"{"format":{"duration":"60.5"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}"#;
+        let (len, streams) = parse_probe(Path::new("/m/a.mkv"), ok).unwrap();
+        assert_eq!(len, Duration::from_secs_f64(60.5));
+        assert_eq!(streams.len(), 1);
+    }
 
     #[test]
     fn ffprobe_streams_map_to_the_fields_the_rules_match() {
