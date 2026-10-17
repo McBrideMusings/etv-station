@@ -1628,7 +1628,8 @@ Watch state comes from the granted datastore's whole `plays` table
 (`watched_units_for`, plex-db-ex#60), not from `ctx.history`, which is the
 newest 1000 Tautulli rows and would call a film watched two years ago unseen.
 A pool with no `ctx.account_id` — a pooled channel — partitions on what the
-*house* has played, which is the closest true answer available to it. On a
+*house* has played, which is the closest true answer available to it; the
+script logs a `score.log` line saying so each generation. On a
 `unit: show` pool the partition keys on the series, matching the unit ranked.
 
 **`unusual_weight`** divides the score by `1 + unusual_weight × house cosine`,
@@ -1643,8 +1644,8 @@ vector's magnitude, so useful values are small. Measured on
 `002-for-pierce`, watching for the failure mode where titles the account's own
 taste says nothing about float up purely because the house dislikes them:
 `0.05`–`0.25` are clean, `0.5` puts 8 such titles in 42 picks, `1.0` puts 22
-in 43. It means nothing on a pooled channel, where the taste vector already is
-the house vector.
+in 43. On a pooled channel the taste vector already is the house vector, so a
+nonzero value there fails the generation with an error instead of doing nothing.
 
 Every pick's audit detail carries `house_score`, `unusual_weight` and `seen`,
 and the verdict names the half the pick came from — so `admin audit` says

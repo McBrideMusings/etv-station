@@ -200,6 +200,19 @@ ENV XDG_CACHE_HOME=/data/cache \
     ETV_BIND_ADDRESS=0.0.0.0 \
     ETV_PORT=8409
 
+# Which etv-station commit this image was built from. The base image's own
+# revision/source labels describe the ErsatzTV-ffmpeg image, so these replace
+# them. The values come from `tools/build-image.sh` (--build-arg); an image
+# built without them reads `unknown` and `tools/image-age.sh` reports it
+# unstamped. The ENV copies are what ersatztv serves at /build.json.
+ARG ETV_STATION_REVISION=unknown
+ARG ETV_STATION_CREATED=unknown
+LABEL org.opencontainers.image.revision=$ETV_STATION_REVISION \
+      org.opencontainers.image.created=$ETV_STATION_CREATED \
+      org.opencontainers.image.source=https://github.com/McBrideMusings/etv-station
+ENV ETV_STATION_REVISION=$ETV_STATION_REVISION \
+    ETV_STATION_CREATED=$ETV_STATION_CREATED
+
 EXPOSE 8409
 
 # Drop to the non-root user. The bind-mounted /config and /data must be
