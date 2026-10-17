@@ -24,6 +24,14 @@ for three orchestrate rounds.
 ./tools/verify-all.sh test         # just tests, still both
 ```
 
+The taste-lab Review page is plain HTML with an inline script that no cargo test loads.
+Run its load check after any edit to `crates/etv-station/src/bin/taste_lab_review.html`:
+
+```bash
+node tools/review-page-check.js crates/etv-station/src/bin/taste_lab_review.html
+# expect: review page script loads without error
+```
+
 The script is the only place the command list lives — `CLAUDE.md` and `admin.toml`
 (`admin test` / `admin vet` / `admin fmt`) call it rather than repeating it. Each
 tree gets its own documented commands: the vendored one adds `--locked`, taken
