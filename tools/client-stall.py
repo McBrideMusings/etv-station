@@ -116,7 +116,9 @@ def stalled(client, now, newest):
     gap = now - client.last_ts
     if gap <= STALL_SECS or now - client.last_m3u8 >= POLL_SECS:
         return None
-    if newest is None or newest[0] <= client.last_index:
+    # Equal means nothing new. Lower means the session restarted and its
+    # numbering began again, which is still something the client could fetch.
+    if newest is None or newest[0] == client.last_index:
         return None
     return gap
 
@@ -186,7 +188,9 @@ def follow(path):
             yield None
             continue
         line = handle.readline()
-        yield line if line else None
+        # A write caught half-way has no newline yet; drop it rather than
+        # parse a truncated row.
+        yield line if line.endswith("\n") else None
 
 
 def main():
@@ -238,6 +242,11 @@ def self_test():
     if run(frozen, 95, (855, "live000855.ts")):
         failures.append("reported a stall while the server had nothing new")
 
+    # Server restarted underneath the client: numbering dropped below its last.
+    out = run(frozen, 95, (3, "live000003.ts"))
+    if len(out) != 1 or "behind=-852" not in out[0][2]:
+        failures.append(f"frozen client after a restart not reported: {out}")
+
     # Client stopped polling too: it left, it did not freeze.
     left = [row(0, "10.0.0.5", 52888, "/session/10/live000855.ts"),
             row(5, "10.0.0.5", 52889, "/session/10/live.m3u8")]
@@ -256,7 +265,7 @@ if __name__ == "__main__":
         bad = self_test()
         for line in bad:
             print("FAIL", line)
-        print("self-test:", "FAIL" if bad else "ok (4 cases)")
+        print("self-test:", "FAIL" if bad else "ok (5 cases)")
         sys.exit(1 if bad else 0)
     try:
         sys.exit(main())
