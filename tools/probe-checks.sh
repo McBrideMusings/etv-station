@@ -25,6 +25,10 @@
 #       Fails if <body> is empty or is not valid XML (xmllint --noout).
 #   probe_check_xmltv_channel_present <body>
 #       Fails if <body> lacks a <channel id= element.
+#   probe_check_ui_health <body>
+#       Fails if <body> (the web UI's GET /api/health JSON) is empty, lacks
+#       "ok":true, or carries no numeric tunable_channels (0 is fine: a
+#       lavfi-only lineup has nothing to tune).
 #   probe_check_xmltv_coverage_all <body> <min_days>
 #       Fails unless every <channel id=…> in <body> has at least one
 #       <programme> whose stop time is >= <min_days> days from now.
@@ -51,6 +55,23 @@ probe_check_master_playlist() {
   fi
   if ! printf '%s\n' "$body" | grep -q "session/${channel}/live.m3u8"; then
     echo "channel $channel master playlist does not contain /session/${channel}/live.m3u8"
+    return 1
+  fi
+  return 0
+}
+
+probe_check_ui_health() {
+  local body="$1"
+  if [ -z "$body" ]; then
+    echo "web UI /api/health returned no body"
+    return 1
+  fi
+  if ! printf '%s' "$body" | grep -Eq '"ok": *true'; then
+    echo "web UI /api/health is not ok: $body"
+    return 1
+  fi
+  if ! printf '%s' "$body" | grep -Eq '"tunable_channels": *[0-9]'; then
+    echo "web UI /api/health has no numeric tunable_channels: $body"
     return 1
   fi
   return 0
