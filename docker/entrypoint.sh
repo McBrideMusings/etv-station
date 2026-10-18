@@ -300,8 +300,18 @@ log "serving on ${ETV_BIND_ADDRESS:-0.0.0.0}:${ETV_PORT:-8409}"
 # crash must never take the stack down — only a dead daemon or a dead
 # ETV-next does that. No separate install step and no host cron: this loop
 # starts with the container, exactly like the two diagnostics above it.
+#
+# The first probe waits for the server to pass the probe's master playlist and
+# XMLTV coverage checks (soak-probe.sh --wait-ready), up to ETV_STARTUP_TIMEOUT.
+# On timeout it probes anyway, so a server that never comes up is still recorded
+# as failing; the wait's own outcome is logged below.
 if [ "$diag_ready" -eq 1 ]; then
     (
+        if SOAK_PROBE_READY_TIMEOUT="$ETV_STARTUP_TIMEOUT" /usr/local/bin/soak-probe.sh --wait-ready; then
+            log "soak probe: server ready, first probe starting"
+        else
+            log "WARNING: soak probe: server not ready after ${ETV_STARTUP_TIMEOUT}s — probing anyway"
+        fi
         while true; do
             ETV_DIAG_DIR="$diag_dir" /usr/local/bin/soak-probe.sh || true
             sleep "$SOAK_PROBE_INTERVAL_SECS"

@@ -19,6 +19,34 @@ pub enum PathResolveError {
     NonUtf8 { pointer: String, path: PathBuf },
 }
 
+/// Raised by [`resolve_path`] when a path cannot be resolved.
+#[derive(Error, Debug)]
+pub enum ResolveError {
+    /// The path starts with a bare `~` component but the home directory is
+    /// unknown, so the tilde cannot be expanded.
+    #[error("unable to expand tilde in path {0}")]
+    TildeExpand(String),
+}
+
+/// Expands a leading `~` and joins a relative result onto `base_dir`,
+/// canonicalizing it when the target exists.
+///
+/// Fails only when a bare leading `~` cannot be expanded. A component that
+/// merely begins with `~` (`~otheruser`, `~backup`) is never expanded and is
+/// not an error: it is an ordinary directory name.
+pub fn resolve_path(base_dir: &Path, raw: &str) -> Result<PathBuf, ResolveError> {
+    let expanded = expand_tilde(raw).ok_or_else(|| ResolveError::TildeExpand(raw.to_string()))?;
+
+    Ok(if expanded.is_relative() {
+        base_dir
+            .join(&expanded)
+            .canonicalize()
+            .unwrap_or_else(|_| base_dir.join(&expanded))
+    } else {
+        expanded
+    })
+}
+
 pub fn resolve_relative_paths(
     value: &mut Value,
     base_dir: &Path,
@@ -28,15 +56,17 @@ pub fn resolve_relative_paths(
         if let Some(Value::String(s)) = value.pointer_mut(pointer)
             && !s.is_empty()
         {
-            let expanded = expand_tilde(&s).unwrap_or(Path::new(s).to_path_buf());
-
-            let resolved: PathBuf = if expanded.is_relative() {
-                base_dir
-                    .join(&expanded)
-                    .canonicalize()
-                    .unwrap_or_else(|_| base_dir.join(&expanded))
-            } else {
-                expanded
+            // A tilde that cannot be expanded keeps the raw value as a plain
+            // relative path; callers that must refuse it use `resolve_path`.
+            let resolved = match resolve_path(base_dir, s) {
+                Ok(resolved) => resolved,
+                Err(ResolveError::TildeExpand(_)) => {
+                    let raw = Path::new(s.as_str());
+                    base_dir
+                        .join(raw)
+                        .canonicalize()
+                        .unwrap_or_else(|_| base_dir.join(raw))
+                }
             };
 
             match resolved.to_string_lossy() {
@@ -84,6 +114,21 @@ mod tests {
                 .to_str()
                 .unwrap()
         );
+    }
+
+    /// A bare `~` expands to the home directory; a component that only begins
+    /// with `~` is an ordinary relative name joined onto `base_dir`.
+    #[test]
+    fn resolve_path_expands_bare_tilde_but_not_tilde_prefixed_names() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let home = resolve_path(dir.path(), "~/x").unwrap();
+        assert!(home.is_absolute());
+        assert!(!home.starts_with(dir.path()));
+        assert!(home.ends_with("x"));
+
+        let named = resolve_path(dir.path(), "~backup/x").unwrap();
+        assert_eq!(named, dir.path().join("~backup/x"));
     }
 
     /// A base_dir containing invalid UTF-8 bytes forces `to_string_lossy`
