@@ -49,11 +49,13 @@
 
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use time::OffsetDateTime;
 
+use crate::cancel::Cancel;
 use crate::catalog::identity::{canonical_path, derive_entry_id, is_blank_guid_value};
 use crate::catalog::model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
 use crate::catalog::{Catalog, CatalogError};
@@ -77,6 +79,9 @@ pub enum PlexIngestError {
     Parse(String),
     #[error("catalog: {0}")]
     Catalog(#[from] CatalogError),
+    /// The daemon asked for shutdown mid-pass; nothing was written.
+    #[error("cancelled by shutdown")]
+    Cancelled,
 }
 
 /// Everything the ingest needs to reach a Plex server, resolved from the
@@ -690,13 +695,14 @@ pub fn ingest(
     since: Option<i64>,
     plex: &PlexEnv,
     artwork_dir: Option<&Path>,
+    cancel: &Arc<Cancel>,
 ) -> Result<PlexIngestStats, PlexIngestError> {
     // The delta cursor is taken before the first fetch: an item Plex stamps
     // while the fetches run is then at or after the cursor, so the next delta
     // re-reads it instead of losing it between the passes. Re-reading an item is
     // harmless; `write_pass` upserts.
     let started = OffsetDateTime::now_utc().unix_timestamp();
-    let client = PlexClient::new(plex);
+    let client = PlexClient::new(plex, Arc::clone(cancel));
     let items = client.fetch_all(since)?;
     // The collection children fetch is the slow half — one sequential request
     // per collection. Log between the stages so a stall is attributable.
@@ -738,6 +744,7 @@ pub fn ingest(
     // simply retries anything it didn't get to on the next ingest pass.
     if let Some(dir) = artwork_dir {
         client.fetch_and_cache_artwork(catalog, &items, dir);
+        client.check_cancelled()?;
     }
 
     Ok(stats)
@@ -1159,21 +1166,33 @@ struct PlexClient {
     path_from: String,
     path_to: String,
     agent: ureq::Agent,
+    /// Checked before every request, so a shutdown stops a pass between
+    /// requests instead of after the whole library has been read.
+    cancel: Arc<Cancel>,
 }
 
 impl PlexClient {
-    fn new(plex: &PlexEnv) -> Self {
+    fn new(plex: &PlexEnv, cancel: Arc<Cancel>) -> Self {
         Self {
             base_url: plex.base_url.clone(),
             token: plex.token.clone(),
             path_from: plex.path_from.clone(),
             path_to: plex.path_to.clone(),
             agent: ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build(),
+            cancel,
         }
     }
 
     fn translate(&self, p: &str) -> String {
         translate_path(p, &self.path_from, &self.path_to)
+    }
+
+    fn check_cancelled(&self) -> Result<(), PlexIngestError> {
+        if self.cancel.is_cancelled() {
+            Err(PlexIngestError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     /// The shared request builder behind [`Self::get`] and [`Self::get_paged`]
@@ -1197,6 +1216,7 @@ impl PlexClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> Result<T, PlexIngestError> {
+        self.check_cancelled()?;
         self.request(endpoint, params)
             .call()
             .map_err(|e| PlexIngestError::Http(e.to_string()))?
@@ -1214,6 +1234,7 @@ impl PlexClient {
         start: i64,
         size: i64,
     ) -> Result<T, PlexIngestError> {
+        self.check_cancelled()?;
         self.request(endpoint, params)
             .set("X-Plex-Container-Start", &start.to_string())
             .set("X-Plex-Container-Size", &size.to_string())
@@ -1519,6 +1540,9 @@ impl PlexClient {
     /// pass (its `artwork_source_key` was never updated to match).
     fn fetch_and_cache_artwork(&self, catalog: &Catalog, items: &[PlexItem], dir: &Path) {
         for item in items {
+            if self.cancel.is_cancelled() {
+                return;
+            }
             let Some(thumb) = item.thumb.as_deref() else {
                 continue;
             };
@@ -1674,7 +1698,8 @@ impl PlexClient {
 /// `crate::daemon::SharedHistory` to translate a `single_user` channel's
 /// account into Plex's own id space, which [`PlexAccount`]'s doc explains.
 pub fn fetch_accounts(plex: &PlexEnv) -> Result<Vec<PlexAccount>, PlexIngestError> {
-    let resp: AccountsResp = PlexClient::new(plex).get("/accounts", &[])?;
+    let resp: AccountsResp =
+        PlexClient::new(plex, Arc::new(Cancel::default())).get("/accounts", &[])?;
     Ok(valid_accounts(resp.media_container.account))
 }
 
@@ -4362,6 +4387,7 @@ mod tests {
             path_from: "/media".into(),
             path_to: "/data/media".into(),
             agent: ureq::AgentBuilder::new().build(),
+            cancel: Arc::new(Cancel::default()),
         };
         assert_eq!(
             client.translate("/media/Movies/A.mkv"),
@@ -4522,7 +4548,7 @@ mod tests {
             path_to: String::new(),
         };
         let cat = Catalog::open_in_memory().unwrap();
-        ingest(&cat, &[], None, &plex, None).unwrap();
+        ingest(&cat, &[], None, &plex, None, &Arc::new(Cancel::default())).unwrap();
 
         let first = first_request_at.load(Ordering::SeqCst);
         let cursor = cat.last_plex_ingest().unwrap().unwrap();

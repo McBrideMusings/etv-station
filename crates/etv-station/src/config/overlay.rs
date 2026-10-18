@@ -104,47 +104,47 @@ pub struct OverlayExtend {
     pub graphics: Vec<etv_overlay::overlay_spec::GraphicSpec>,
 }
 
-/// The wire shape [`OverlayDecl`] is read through. Separate from the public
-/// enum so `Clear` can be the bare string `clear` while the other two are maps,
-/// which a derived untagged enum cannot express on a unit variant directly.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum DeclRepr {
-    Keyword(Keyword),
-    File { file: PathBuf },
-    // Before `Inline`: an extend is a map, and `OverlaySpec`'s required
-    // width/height/framerate are what stop the two from matching each other,
-    // but only if the narrower shape is tried first.
-    Extend { extend: Box<OverlayExtend> },
-    Inline(Box<OverlaySpec>),
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Keyword {
-    Clear,
-}
+const SHAPES: &str = "`overlay:` must be `clear`, a `{file: <path>}` reference, an \
+     `{extend: {graphics: [...]}}` addition to the level above, or an inline \
+     spec with at least `width`, `height` and `framerate`";
 
 impl<'de> Deserialize<'de> for OverlayDecl {
+    /// Dispatches on the value's shape by hand rather than through an untagged
+    /// enum: untagged discards the inner error of the arm that was closest, so a
+    /// misspelt field inside an `extend` surfaced as the generic list of shapes.
+    /// Once the shape is known, the arm's own error is what the author needs.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Untagged's own error is "data did not match any variant", which names
-        // none of the three shapes an author could have meant. Replacing it
-        // costs one match arm and is the difference between a usable error and
-        // a hunt through the file.
-        DeclRepr::deserialize(deserializer)
-            .map(|repr| match repr {
-                DeclRepr::Keyword(Keyword::Clear) => OverlayDecl::Clear,
-                DeclRepr::File { file } => OverlayDecl::File(file),
-                DeclRepr::Extend { extend } => OverlayDecl::Extend(extend),
-                DeclRepr::Inline(spec) => OverlayDecl::Inline(spec),
-            })
-            .map_err(|_| {
-                de::Error::custom(
-                    "`overlay:` must be `clear`, a `{file: <path>}` reference, an \
-                     `{extend: {graphics: [...]}}` addition to the level above, or an inline \
-                     spec with at least `width`, `height` and `framerate`",
-                )
-            })
+        let value = serde_norway::Value::deserialize(deserializer)?;
+        let inner = |what: &str, e: serde_norway::Error| {
+            de::Error::custom(format!("`overlay: {what}` is invalid: {e}"))
+        };
+        match &value {
+            serde_norway::Value::String(word) if word == "clear" => Ok(OverlayDecl::Clear),
+            serde_norway::Value::Mapping(map) if map.contains_key("file") => {
+                #[derive(Deserialize)]
+                struct FileRef {
+                    file: PathBuf,
+                }
+                serde_norway::from_value::<FileRef>(value)
+                    .map(|r| OverlayDecl::File(r.file))
+                    .map_err(|e| inner("{file: …}", e))
+            }
+            serde_norway::Value::Mapping(map) if map.contains_key("extend") => {
+                #[derive(Deserialize)]
+                struct ExtendRef {
+                    extend: Box<OverlayExtend>,
+                }
+                serde_norway::from_value::<ExtendRef>(value)
+                    .map(|r| OverlayDecl::Extend(r.extend))
+                    .map_err(|e| inner("{extend: …}", e))
+            }
+            serde_norway::Value::Mapping(_) => serde_norway::from_value::<OverlaySpec>(value)
+                .map(|spec| OverlayDecl::Inline(Box::new(spec)))
+                .map_err(|e| {
+                    de::Error::custom(format!("{SHAPES}; as an inline spec it failed: {e}"))
+                }),
+            _ => Err(de::Error::custom(SHAPES)),
+        }
     }
 }
 
@@ -460,6 +460,24 @@ mod tests {
             .to_string();
         assert!(err.contains("clear"), "{err}");
         assert!(err.contains("file"), "{err}");
+    }
+
+    /// The real inner error must reach the author: an `extend` written with the
+    /// old `layers:` key is rejected for that field, not for its overall shape.
+    #[test]
+    fn an_extend_with_a_wrong_field_reports_that_field() {
+        #[derive(Debug, Deserialize)]
+        struct Holder {
+            #[allow(dead_code)]
+            overlay: OverlayDecl,
+        }
+        let err = serde_norway::from_str::<Holder>(
+            "overlay:\n  extend:\n    layers:\n      - type: image\n        path: logo.png\n",
+        )
+        .expect_err("`layers` belongs under a graphic, not directly under extend")
+        .to_string();
+        assert!(err.contains("layers"), "{err}");
+        assert!(err.contains("extend"), "{err}");
     }
 
     // ---- the cascade -------------------------------------------------------

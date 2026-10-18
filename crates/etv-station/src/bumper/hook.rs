@@ -838,6 +838,7 @@ fn probe_media(path: &Path) -> Result<Option<serde_json::Value>, String> {
         crate::ffprobe::Bounded::Done {
             success: true,
             stdout,
+            ..
         } => stdout,
         crate::ffprobe::Bounded::Done { .. } => return Ok(None),
         crate::ffprobe::Bounded::TimedOut => {

@@ -285,22 +285,30 @@ mod tests {
         let watch = PhaseWatch::new();
         let handle = spawn(Arc::clone(&watch), path.clone());
 
-        // Enter a budgeted phase and stay there past its budget.
+        // Enter a budgeted phase and stay there past its budget. Heartbeats
+        // arrive on the watchdog thread's schedule, which a loaded machine can
+        // delay, so poll until one reports the stall, up to a generous deadline.
         watch.enter(Phase::WriteFifo);
-        thread::sleep(Duration::from_millis(1600));
-
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains(r#""phase":"write_fifo""#), "got: {body}");
-        let age: u64 = body
-            .split(r#""phase_age_ms":"#)
-            .nth(1)
-            .and_then(|s| s.split(',').next())
-            .and_then(|s| s.parse().ok())
-            .expect("phase_age_ms present");
-        assert!(
-            age >= 1000,
-            "expected the stall to be visible, got age {age}ms"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let body = std::fs::read_to_string(&path).unwrap_or_default();
+            let age: Option<u64> = body
+                .split(r#""phase_age_ms":"#)
+                .nth(1)
+                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.parse().ok());
+            let stalled = body.contains(r#""phase":"write_fifo""#);
+            if let (true, Some(age)) = (stalled, age)
+                && age >= 1000
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no stalled heartbeat within 30s, last body: {body}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
 
         watch.stop();
         handle.join().unwrap();

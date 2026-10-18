@@ -6,7 +6,7 @@
 # without a restart.
 #
 # Usage:
-#   ./tools/overlay-watch.sh 054-dragon-ball                    # bare name -> deploy/appdata/channels/<name>
+#   ./tools/overlay-watch.sh 054-dragon-ball                    # bare name -> the deploy/appdata channel declaring `name:`
 #   ./tools/overlay-watch.sh deploy/appdata/channels/054-dragon-ball
 #   ./tools/overlay-watch.sh examples/channels/diehard.yaml      # dev-side flat channel file
 #   INTERVAL=4 ./tools/overlay-watch.sh 010-pierce       # cycle even tighter
@@ -18,16 +18,29 @@
 set -u
 
 CHANNEL="${1:?usage: overlay-watch.sh <channel path, or a bare deploy/appdata channel name>}"
-# A bare name with no path separator is shorthand for the deploy/appdata
-# layout (the common case, typed by hand); anything with a "/" in it — a
-# deploy/appdata dir or an examples/channels/*.yaml file — is used as-is.
+# A bare name with no path separator is a channel's declared `name:` (the
+# identity the station and overlay-extract.py use, #414), looked up across the
+# deploy/appdata layout; anything with a "/" in it — a deploy/appdata dir or an
+# examples/channels/*.yaml file — is used as-is.
+declared_name() {
+  sed -nE 's/^name:[[:space:]]*["'"'"']?([^"'"'"'#]*[^"'"'"'#[:space:]])["'"'"']?[[:space:]]*(#.*)?$/\1/p' "$1" | head -n 1
+}
 case "$CHANNEL" in
   */*) CHANNEL_DIR="$CHANNEL" ;;
-  *) CHANNEL_DIR="deploy/appdata/channels/${CHANNEL}" ;;
+  *)
+    CHANNEL_DIR="deploy/appdata/channels/${CHANNEL}"
+    for f in deploy/appdata/channels/*/channel.yaml; do
+      [ -f "$f" ] || continue
+      if [ "$(declared_name "$f")" = "$CHANNEL" ]; then
+        CHANNEL_DIR="$(dirname "$f")"
+        break
+      fi
+    done
+    ;;
 esac
 
 if [ ! -e "$CHANNEL_DIR" ]; then
-  echo "no such channel path: $CHANNEL_DIR" >&2
+  echo "no channel declares name: $CHANNEL, and no such path: $CHANNEL_DIR" >&2
   exit 1
 fi
 if [ -d "$CHANNEL_DIR" ]; then

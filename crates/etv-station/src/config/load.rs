@@ -266,8 +266,11 @@ fn expand_categories(
 ///
 /// The name keys the channel's play history and its output folder, so two
 /// channels sharing one would interleave their airings rows and fight over one
-/// folder's sidecars. Distinct names give distinct `{output_base}/{name}`
-/// folders, so the name check is also the output-folder check.
+/// folder's sidecars. Names compare case-insensitively: on macOS or an
+/// SMB-mounted `output_base`, `{output_base}/Foo` and `{output_base}/foo` are
+/// one folder. Distinct names under that comparison give distinct
+/// `{output_base}/{name}` folders, so the name check is also the output-folder
+/// check.
 ///
 /// Runs after every individual channel has already loaded successfully,
 /// because a collision is a property of the whole roster, not of any one
@@ -294,7 +297,7 @@ fn reject_collisions(channels: &mut Vec<LoadedChannel>) -> Vec<DroppedChannel> {
     );
     for (idx, reason) in colliding(
         channels,
-        |c| c.name.clone(),
+        |c| c.name.to_lowercase(),
         |name, paths| {
             tracing::error!(
                 event = "channel.name_collision",
@@ -1852,6 +1855,26 @@ mod tests {
         let station = load_with_env(&station_path, &no_env).expect("station still loads");
         let names: Vec<&str> = station.channels.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["c"]);
+    }
+
+    /// Names differing only in case share one folder on a case-insensitive
+    /// filesystem, so they collide too.
+    #[test]
+    fn names_differing_only_in_case_both_drop_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_path = write_min_station(
+            dir.path(),
+            &[
+                ("a.yaml", &channel_body(Some(1), Some("Foo"))),
+                ("b.yaml", &channel_body(Some(2), Some("foo"))),
+                ("c.yaml", &channel_body(Some(3), Some("c"))),
+            ],
+        );
+
+        let station = load_with_env(&station_path, &no_env).expect("station still loads");
+        let names: Vec<&str> = station.channels.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["c"]);
+        assert_eq!(dropped_files(&station), ["a.yaml", "b.yaml"]);
     }
 
     /// Both collision checks read the full roster: a channel whose name

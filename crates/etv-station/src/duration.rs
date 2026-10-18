@@ -365,11 +365,18 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         crate::ffprobe::Bounded::Done {
             success: true,
             stdout,
+            ..
         } => stdout,
-        crate::ffprobe::Bounded::Done { .. } => {
+        crate::ffprobe::Bounded::Done { stderr, .. } => {
+            let stderr = String::from_utf8_lossy(&stderr);
+            let stderr = stderr.trim();
             return Err(StationError::Ffprobe {
                 path: path.to_path_buf(),
-                reason: "non-zero exit".into(),
+                reason: if stderr.is_empty() {
+                    "non-zero exit".into()
+                } else {
+                    format!("non-zero exit: {stderr}")
+                },
             });
         }
         crate::ffprobe::Bounded::TimedOut => {
