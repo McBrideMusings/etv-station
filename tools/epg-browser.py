@@ -759,6 +759,7 @@ def build_app(host: str):
             # than thrash.
             self._audit_summary_key: tuple[str, str] | None = None
             self._audit_summary: tuple[str, str | None] | None = None
+            self._audit_summary_error: str | None = None
             # (name, text) per row from the last successful _load_programmes
             # build — the cheapest rebuild is the one that never touches the
             # widget tree because the resolved output is byte-identical to
@@ -1350,11 +1351,13 @@ def build_app(host: str):
             if programme is None or self.selected_channel is None:
                 self._audit_summary_key = None
                 self._audit_summary = None
+                self._audit_summary_error = None
                 return
             key = (self.selected_channel, programme.start.isoformat())
             if key == self._audit_summary_key:
                 return
             self._audit_summary_key = key
+            self._audit_summary_error = None
             cached = self.audit_summary_cache.get(key)
             if cached is not None:
                 self._audit_summary = cached
@@ -1378,8 +1381,7 @@ def build_app(host: str):
             number -> name map, then the per-channel audit report), reused
             rather than duplicated. Runs off the event loop thread so the
             main pane's own render never blocks on it; a failure here just
-            leaves the summary empty rather than surfacing an error — the
-            full trail on `d` is where errors get explained."""
+            shows the failure message in the pane instead of an empty summary."""
             worker = get_current_worker()
             try:
                 if self.channel_name_by_number is None:
@@ -1401,7 +1403,7 @@ def build_app(host: str):
                 raw_audit = item.get("audit", []) if isinstance(item, dict) else []
                 classification_line = render_classification(raw_audit).splitlines()[0]
                 overlay_spec = item.get("overlay_spec") if isinstance(item, dict) else None
-                overlay_text = None
+                overlay_text = "this channel draws no overlay here"
                 if overlay_spec is not None:
                     # Show the result's text whether or not the dump-text run
                     # succeeded — a failure string ("etv-overlay binary not
@@ -1414,13 +1416,21 @@ def build_app(host: str):
                 summary = (classification_line, overlay_text)
                 self.audit_summary_cache[key] = summary
                 self.call_from_thread(self._apply_audit_summary, key, summary)
-            except RuntimeError:
-                return  # fetch failed — the pane just stays quiet for this item
+            except RuntimeError as exc:
+                if not worker.is_cancelled:
+                    self.call_from_thread(self._apply_audit_summary_error, key, str(exc))
+
+        def _apply_audit_summary_error(self, key: tuple[str, str], message: str) -> None:
+            if key != self._audit_summary_key:
+                return  # highlight moved again before this landed — stale
+            self._audit_summary_error = message
+            self.refresh_detail()
 
         def _apply_audit_summary(self, key: tuple[str, str], summary: tuple[str, str | None]) -> None:
             if key != self._audit_summary_key:
                 return  # highlight moved again before this landed — stale
             self._audit_summary = summary
+            self._audit_summary_error = None
             self.refresh_detail()
 
         def refresh_detail(self) -> None:
@@ -1493,6 +1503,9 @@ def build_app(host: str):
                             lines.append(f"  classification: {escape(classification_line)}")
                             if overlay_text:
                                 lines.append(f"  overlay: {escape(overlay_text)}")
+                        elif self._audit_summary_error is not None:
+                            lines.append("")
+                            lines.append(f"  [red]audit summary unavailable:[/red] {escape(self._audit_summary_error)}")
             body.update("\n".join(lines))
 
         def action_open_vlc(self) -> None:
