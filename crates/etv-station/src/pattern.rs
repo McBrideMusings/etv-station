@@ -595,7 +595,7 @@ impl PoolRuntime<'_> {
         // A range is decided once per visit, so a `rotate = "slot"` visit
         // sizes its slots from the same roll a `rotate = "visit"` draw does.
         let take = resolve_take(take, roll);
-        if take == Take::Count(0) || self.is_dry() {
+        if take == Draw::Count(0) || self.is_dry() {
             return Ok(Vec::new());
         }
         match self.cfg.rotate {
@@ -608,7 +608,10 @@ impl PoolRuntime<'_> {
             // so the one item each slot asks for was never the step's own
             // `take`.
             Rotate::Slot => {
-                let n = take.bounds().map_or(1, |(n, _)| n);
+                let n = match take {
+                    Draw::Count(n) => n,
+                    Draw::All => 1,
+                };
                 if n > MAX_TAKE {
                     return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
                 }
@@ -617,7 +620,7 @@ impl PoolRuntime<'_> {
                     if self.is_dry() {
                         break;
                     }
-                    out.extend(self.serve(Take::Count(1), from, roll, slot as u64, channel)?);
+                    out.extend(self.serve(Draw::Count(1), from, roll, slot as u64, channel)?);
                 }
                 Ok(out)
             }
@@ -634,7 +637,7 @@ impl PoolRuntime<'_> {
     /// (see the comment in `visit`).
     fn serve(
         &mut self,
-        want: Take,
+        want: Draw,
         from: TakeFrom,
         roll: &RollKey,
         nonce: u64,
@@ -656,10 +659,9 @@ impl PoolRuntime<'_> {
         // whatever the step wrote.
         let take = match (override_take, want, first) {
             (Some(n), _, _) => n,
-            (None, Take::Count(n), _) => n,
-            (None, Take::Range { .. }, _) => unreachable!("visit resolves a range to a count"),
-            (None, Take::All, Some(si)) => self.series[si].remaining(),
-            (None, Take::All, None) => return Ok(Vec::new()),
+            (None, Draw::Count(n), _) => n,
+            (None, Draw::All, Some(si)) => self.series[si].remaining(),
+            (None, Draw::All, None) => return Ok(Vec::new()),
         };
         // Guard only the authored/typed-in arms: the plugin per-entry override
         // and the step's own count. `take = "all"` is bounded by the pools'
@@ -668,7 +670,7 @@ impl PoolRuntime<'_> {
             (Some(n), _) if n > MAX_TAKE => {
                 return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
             }
-            (None, Take::Count(n)) if n > MAX_TAKE => {
+            (None, Draw::Count(n)) if n > MAX_TAKE => {
                 return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
             }
             _ => {}
@@ -1430,7 +1432,7 @@ pub fn build(
                 detail.insert("source".into(), serde_json::Value::String(pool_source(cfg)));
                 detail.insert(
                     "take".into(),
-                    serde_json::Value::String(describe_take(resolve_take(step.take, &roll))),
+                    serde_json::Value::String(describe_draw(resolve_take(step.take, &roll))),
                 );
                 detail.insert(
                     "from".into(),
@@ -1736,16 +1738,25 @@ fn pool_source(cfg: &Pool) -> String {
     }
 }
 
+/// What a visit draws once its step's `take` is resolved: a range has already
+/// become a count, so `serve` cannot be handed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Draw {
+    Count(usize),
+    All,
+}
+
 /// A range is decided once per visit, from the visit's roll; a count or `all`
 /// passes through. `visit` and the `select` audit stage both read it, so the
 /// size the audit prints is the size the visit drew.
-fn resolve_take(take: Take, roll: &RollKey) -> Take {
+fn resolve_take(take: Take, roll: &RollKey) -> Draw {
     match take {
         Take::Range { min, max } => {
             let spread = (max.saturating_sub(min) + 1) as u64;
-            Take::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
+            Draw::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
         }
-        fixed => fixed,
+        Take::Count(n) => Draw::Count(n),
+        Take::All => Draw::All,
     }
 }
 
@@ -1754,11 +1765,10 @@ fn resolve_take(take: Take, roll: &RollKey) -> Take {
 /// Not `{:?}`. That printed `Count(2)` and `All` — Rust type names leaking into
 /// a report a human reads, naming a variant nobody outside this crate has any
 /// reason to know.
-fn describe_take(take: Take) -> String {
-    match take {
-        Take::Count(n) => n.to_string(),
-        Take::Range { min, max } => format!("{min}-{max}"),
-        Take::All => "all".into(),
+fn describe_draw(draw: Draw) -> String {
+    match draw {
+        Draw::Count(n) => n.to_string(),
+        Draw::All => "all".into(),
     }
 }
 
@@ -2682,8 +2692,8 @@ mod tests {
     /// `Start`, which name a type nobody outside this crate has cause to know.
     #[test]
     fn the_select_detail_describers_leak_no_type_names() {
-        assert_eq!(describe_take(Take::Count(2)), "2");
-        assert_eq!(describe_take(Take::All), "all");
+        assert_eq!(describe_draw(Draw::Count(2)), "2");
+        assert_eq!(describe_draw(Draw::All), "all");
         for from in [TakeFrom::Start, TakeFrom::End, TakeFrom::Random] {
             let rendered = describe_take_from(from);
             assert!(
