@@ -24,8 +24,13 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How a bounded run ended.
 pub enum Bounded {
-    /// The process exited before the deadline.
-    Done { success: bool, stdout: Vec<u8> },
+    /// The process exited before the deadline. `stderr` is what it wrote there,
+    /// for the caller to put in an error message.
+    Done {
+        success: bool,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
     /// The deadline passed; the process was killed.
     TimedOut,
 }
@@ -45,6 +50,14 @@ pub async fn run_bounded_async(args: Vec<OsString>) -> std::io::Result<Bounded> 
         .map_err(std::io::Error::other)?
 }
 
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
 fn run_program(
     program: &OsString,
     args: &[OsString],
@@ -54,21 +67,19 @@ fn run_program(
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
-    let mut pipe = child.stdout.take().expect("stdout was piped");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        buf
-    });
+    let reader = drain(child.stdout.take().expect("stdout was piped"));
+    let err_reader = drain(child.stderr.take().expect("stderr was piped"));
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             let stdout = reader.join().unwrap_or_default();
+            let stderr = err_reader.join().unwrap_or_default();
             return Ok(Bounded::Done {
                 success: status.success(),
                 stdout,
+                stderr,
             });
         }
         if Instant::now() >= deadline {
@@ -79,7 +90,7 @@ fn run_program(
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
-            // The reader ends once the killed child's pipe closes; a process
+            // The readers end once the killed child's pipe closes; a process
             // stuck in the kernel may keep it open, so do not join it.
             return Ok(Bounded::TimedOut);
         }
@@ -113,7 +124,9 @@ mod tests {
         )
         .unwrap();
         match out {
-            Bounded::Done { success, stdout } => {
+            Bounded::Done {
+                success, stdout, ..
+            } => {
                 assert!(success);
                 assert_eq!(stdout, b"hi\n");
             }
