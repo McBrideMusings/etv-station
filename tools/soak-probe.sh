@@ -55,6 +55,26 @@ STATE_FILE="${ETV_DIAG_DIR}/soak-probe.state"
 FAILURE_DIR="${ETV_DIAG_DIR}/soak-probe-failures"
 XMLTV_SAMPLE_DIR="${ETV_DIAG_DIR}/xmltv-samples"
 
+# --wait-ready: record nothing, return 0 once the master playlist and XMLTV
+# coverage checks below would pass, or 1 after SOAK_PROBE_READY_TIMEOUT seconds
+# (default 180). docker/entrypoint.sh runs it before the first probe.
+if [ "${1:-}" = "--wait-ready" ]; then
+  deadline=$((SECONDS + ${SOAK_PROBE_READY_TIMEOUT:-180}))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    master_body="$(curl -fsS --max-time 5 "${BASE_URL}/channel/${SOAK_PROBE_CHANNEL}.m3u8" 2>/dev/null || true)"
+    xmltv_body="$(curl -fsS --max-time 5 "${BASE_URL}/xmltv.xml" 2>/dev/null || true)"
+    if probe_check_master_playlist "$master_body" "$SOAK_PROBE_CHANNEL" >/dev/null \
+      && [ -n "$xmltv_body" ] \
+      && probe_check_xmltv_coverage_all "$xmltv_body" "$SOAK_PROBE_MIN_COVERAGE_DAYS" >/dev/null; then
+      echo "soak-probe: server ready after ${SECONDS}s of waiting"
+      exit 0
+    fi
+    sleep 5
+  done
+  echo "soak-probe: server not ready after ${SOAK_PROBE_READY_TIMEOUT:-180}s"
+  exit 1
+fi
+
 mkdir -p "$ETV_DIAG_DIR" "$FAILURE_DIR" "$XMLTV_SAMPLE_DIR" 2>/dev/null || {
   echo "soak-probe: cannot create $ETV_DIAG_DIR — nowhere to record a result" >&2
   exit 2
