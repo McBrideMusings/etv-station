@@ -101,25 +101,6 @@ struct Cli {
     resolve: Option<String>,
 }
 
-fn expand_env(raw: &str) -> Result<String, String> {
-    let mut out = String::new();
-    let mut rest = raw;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| format!("unterminated ${{ in {raw:?}"))?;
-        let var = &after[..end];
-        let val = std::env::var(var)
-            .map_err(|_| format!("env var `{var}` referenced by {raw:?} is not set"))?;
-        out.push_str(&val);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
 fn main() -> Result<(), String> {
     let cli = Cli::parse();
 
@@ -170,7 +151,7 @@ fn main() -> Result<(), String> {
             let grant = pool_cfg.datastores.first().ok_or_else(|| {
                 format!("pool {:?} declares no datastores; pass --plexdb", cli.pool)
             })?;
-            PathBuf::from(expand_env(&grant.path)?)
+            PathBuf::from(config::expand_process_env(&grant.path)?)
         }
     };
     let datastore_name = pool_cfg
@@ -233,7 +214,7 @@ fn main() -> Result<(), String> {
     )
     .map_err(|e| format!("clone pool: {e}"))?;
     for ds in &mut pool_for_profile.datastores {
-        ds.path = expand_env(&ds.path)?;
+        ds.path = config::expand_process_env(&ds.path)?;
     }
     cache
         .prepare_profile(&catalog, &pool_for_profile, &channel_dir)

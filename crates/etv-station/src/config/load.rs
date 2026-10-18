@@ -679,6 +679,16 @@ fn expand_env(input: &str, ctx: &Path, env: EnvLookup<'_>) -> Result<String, Con
     Ok(out)
 }
 
+/// Expand every `${VAR}` in `raw` from the process environment, for tools that
+/// read a raw config (`read_channel`) and need a datastore path resolved the
+/// way [`load`] resolves it. The error is the bare message, without a path.
+pub fn expand_process_env(raw: &str) -> Result<String, String> {
+    expand_env(raw, Path::new(""), &process_env).map_err(|e| match e {
+        ConfigError::Validation { message, .. } => message,
+        other => other.to_string(),
+    })
+}
+
 /// Read and deserialize a single channel config file, picking TOML or YAML by
 /// extension. Raw parse only — does not splice block references or expand
 /// `${VAR}` in item sources (that happens inside [`load`]). Useful for tests and
