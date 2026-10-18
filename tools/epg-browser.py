@@ -1506,6 +1506,9 @@ def build_app(host: str):
                         elif self._audit_summary_error is not None:
                             lines.append("")
                             lines.append(f"  [red]audit summary unavailable:[/red] {escape(self._audit_summary_error)}")
+                        elif chan.number is None:
+                            lines.append("")
+                            lines.append("  [dim]no dial number to resolve against the audit tool[/dim]")
             body.update("\n".join(lines))
 
         def action_open_vlc(self) -> None:
