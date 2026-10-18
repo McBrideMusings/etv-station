@@ -1528,13 +1528,15 @@ fn resolve_pool_block_items(
         resume: _,
         progress,
         metadata,
+        audits,
         guides: pool_guides,
         tracks: pool_tracks,
         lists: _,
     } = build;
     let (mut items, mut steps): (Vec<ResolvedItem>, Vec<Step>) = ids
         .iter()
-        .map(|id| {
+        .zip(audits)
+        .map(|(id, audit)| {
             // The pool rung (#289) sits between the block and the item: a
             // drawn id whose pool authored its own `guide:` sees that ahead
             // of the pre-merged block ∘ channel default, exactly like an
@@ -1545,6 +1547,10 @@ fn resolve_pool_block_items(
                 item.map(|mut item| {
                     // The pool rung of the track-selection cascade (#261).
                     item.tracks = pool_tracks.get(id).cloned();
+                    // A plugin pool's metadata blob (#166) is the id's, but the
+                    // draw's trail is this airing's own (#405).
+                    item.metadata = metadata.get(id).cloned();
+                    crate::pattern::attach_audit(&mut item.metadata, audit);
                     item
                 })
             })
@@ -1555,13 +1561,6 @@ fn resolve_pool_block_items(
         .enumerate()
         .filter_map(|(seq, item)| item.map(|item| (item, Step::Pool { block: idx, seq })))
         .unzip();
-    // A plugin pool's metadata blob (#166), attached after the catalog
-    // lookup above so it lands on the airing even though `catalog_item`
-    // itself has no pool/plugin context to draw one from. Empty for a block
-    // whose plugin(s) only ever returned bare ids.
-    for item in &mut items {
-        item.metadata = metadata.get(&item.id).cloned();
-    }
     // Skipping happens before the truncate, so an unplayable row normally
     // costs nothing — the next playable item slides up into its place. The
     // one case it cannot cover is the draw handing back exactly `n` ids and
