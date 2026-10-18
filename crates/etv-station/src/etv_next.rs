@@ -421,17 +421,9 @@ pub fn render_channels(
     // Drop any previously generated channel files so a shrunk roster (or the
     // legacy un-numbered channel.json) can't leave orphans behind.
     remove_stale_channel_files(&opts.out_dir)?;
-    if let Some(dir) = opts.artwork_dir.as_deref() {
-        let logos = Path::new(dir).join(LOGO_DIR);
-        if logos.exists() {
-            fs::remove_dir_all(&logos).map_err(|source| RenderError::Io {
-                path: logos.clone(),
-                source,
-            })?;
-        }
-    }
 
     let mut lineup_channels = Vec::with_capacity(channels.len());
+    let mut logo_files = Vec::new();
     for channel_render in channels {
         let number = channel_render.number;
         let folder = &channel_render.folder;
@@ -524,12 +516,14 @@ pub fn render_channels(
             "config": format!("./channel{number}.json"),
         });
         if let Some(src) = &channel_render.logo
-            && let Some(url) = publish_logo(src, opts.artwork_dir.as_deref(), number)?
+            && let Some(file) = publish_logo(src, &opts.out_dir, number)?
         {
-            entry["logo"] = Value::String(url);
+            entry["logo"] = Value::String(format!("./{LOGO_DIR}/{file}"));
+            logo_files.push(file);
         }
         lineup_channels.push(entry);
     }
+    remove_stale_logos(&opts.out_dir, &logo_files)?;
 
     let mut lineup = serde_json::json!({
         "server": {
@@ -557,36 +551,20 @@ pub fn render_channels(
     })
 }
 
-/// The folder under the artwork cache that holds channel logos. The station
-/// owns it outright and rebuilds it on every render, so a removed channel or a
-/// dropped `logo:` leaves nothing behind.
+/// The folder beside `lineup.json` that holds channel logos. The lineup names
+/// each file relative to itself, and ETV-next serves it at
+/// `/logo/{number}.{ext}`, so everything a render produces stays inside the
+/// folder it was given.
 const LOGO_DIR: &str = "channel-logos";
 
-/// Copy a channel's `logo:` image into the artwork cache and return the URL
-/// ETV-next serves it at, or `None` when it cannot be published.
+/// Copy a channel's `logo:` image to `<out_dir>/channel-logos/<number>.<ext>`
+/// and return the file name, or `None` when it cannot be published.
 ///
-/// The URL is relative (`/artwork/...`), the same form programme artwork uses;
-/// ETV-next resolves it against the requesting host. It carries a content hash
-/// as a query string, because guide clients cache a channel icon by URL and
-/// would otherwise keep showing a replaced logo.
-///
-/// A missing artwork cache or an unreadable image is logged and the channel
-/// published without a logo rather than failing the render: a guide tile is
-/// not worth taking the lineup down for.
-fn publish_logo(
-    src: &Path,
-    artwork_dir: Option<&str>,
-    number: i64,
-) -> Result<Option<String>, RenderError> {
-    let Some(dir) = artwork_dir else {
-        tracing::warn!(
-            event = "lineup.logo.skipped",
-            channel = number,
-            logo = %src.display(),
-            reason = "no artwork cache (ETV_STATION_ARTWORK_CACHE unset), so ETV-next has nowhere to serve it from",
-        );
-        return Ok(None);
-    };
+/// Written to a temporary name and renamed into place, so ETV-next serving the
+/// previous image never reads a half-written one. An unreadable image is logged
+/// and the channel published without a logo rather than failing the render: a
+/// guide tile is not worth taking the lineup down for.
+fn publish_logo(src: &Path, out_dir: &Path, number: i64) -> Result<Option<String>, RenderError> {
     let bytes = match fs::read(src) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -604,28 +582,54 @@ fn publish_logo(
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_else(|| "png".to_string());
     let file = format!("{number}.{ext}");
-    let logos = Path::new(dir).join(LOGO_DIR);
+    let logos = out_dir.join(LOGO_DIR);
     fs::create_dir_all(&logos).map_err(|source| RenderError::Io {
         path: logos.clone(),
         source,
     })?;
     let dest = logos.join(&file);
-    fs::write(&dest, &bytes).map_err(|source| RenderError::Io {
+    let tmp = logos.join(format!(".{file}.tmp"));
+    fs::write(&tmp, &bytes).map_err(|source| RenderError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    fs::rename(&tmp, &dest).map_err(|source| RenderError::Io {
         path: dest.clone(),
         source,
     })?;
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(&bytes);
-    let version: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    let url = format!("/artwork/{LOGO_DIR}/{file}?v={version}");
     tracing::info!(
         event = "lineup.logo.published",
         channel = number,
         logo = %src.display(),
         dest = %dest.display(),
-        url = %url,
+        bytes = bytes.len(),
     );
-    Ok(Some(url))
+    Ok(Some(file))
+}
+
+/// Remove every file in `<out_dir>/channel-logos/` this render did not write,
+/// so a dropped `logo:` or a removed channel leaves nothing behind. Only stale
+/// files go: a logo still in use is never absent, not even for a moment.
+fn remove_stale_logos(out_dir: &Path, keep: &[String]) -> Result<(), RenderError> {
+    let logos = out_dir.join(LOGO_DIR);
+    let entries = match fs::read_dir(&logos) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(RenderError::Io {
+                path: logos,
+                source,
+            });
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !keep.contains(&name) {
+            let path = entry.path();
+            fs::remove_file(&path).map_err(|source| RenderError::Io { path, source })?;
+        }
+    }
+    Ok(())
 }
 
 /// Write the station-wide encoder into the normalization body's `video`
@@ -957,15 +961,17 @@ mod tests {
         assert_eq!(lineup["artwork"]["folder"], "/data/artwork");
     }
 
-    // #342: a channel's `logo:` is copied into the artwork cache and named in
-    // its lineup entry as a `/artwork` URL ETV-next can serve; a channel
-    // without one gets no `logo` key.
+    // #342: a channel's `logo:` is copied beside the lineup and named in its
+    // entry relative to the lineup; a channel without one gets no `logo` key,
+    // and a logo file from an earlier render that no channel names is removed.
     #[test]
-    fn a_channel_logo_is_published_into_the_artwork_cache_and_named_in_the_lineup() {
+    fn a_channel_logo_is_written_beside_the_lineup_and_named_in_it() {
         let dir = tempfile::tempdir().unwrap();
-        let artwork = dir.path().join("artwork");
         let src = dir.path().join("mark.PNG");
         fs::write(&src, b"not really a png").unwrap();
+        let stale = dir.path().join("channel-logos/9.png");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"old").unwrap();
         let channel = |number: i64, logo: Option<PathBuf>| ChannelRender {
             number,
             folder: PathBuf::from(format!("out/ch{number}")),
@@ -975,21 +981,21 @@ mod tests {
             show_bumpers: false,
             logo,
         };
-        let with = RenderOptions {
-            artwork_dir: Some(artwork.to_string_lossy().into_owned()),
-            ..opts(dir.path())
-        };
-        let rendered =
-            render_with_defaults(&[channel(1, Some(src)), channel(2, None)], &with, "id").unwrap();
+        let rendered = render_with_defaults(
+            &[channel(1, Some(src)), channel(2, None)],
+            &opts(dir.path()),
+            "id",
+        )
+        .unwrap();
         let lineup = read(&rendered.lineup_path);
 
-        let url = lineup["channels"][0]["logo"].as_str().unwrap();
-        assert!(url.starts_with("/artwork/channel-logos/1.png?v="), "{url}");
+        assert_eq!(lineup["channels"][0]["logo"], "./channel-logos/1.png");
         assert_eq!(
-            fs::read(artwork.join("channel-logos/1.png")).unwrap(),
+            fs::read(dir.path().join("channel-logos/1.png")).unwrap(),
             b"not really a png"
         );
         assert!(lineup["channels"][1].get("logo").is_none(), "{lineup}");
+        assert!(!stale.exists());
     }
 
     /// The whole point of the setting: one value reaches every channel, and

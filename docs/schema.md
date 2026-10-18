@@ -774,20 +774,22 @@ logo: logo-guide.png   # relative to this channel file's directory
 ```
 
 `logo:` is the channel's tile in a guide (#342). When ETV-next's config is
-rendered, the station copies the image into the artwork cache
-(`ETV_STATION_ARTWORK_CACHE`) as `channel-logos/<number>.<ext>` and names
-`/artwork/channel-logos/<number>.<ext>?v=<content hash>` as the lineup
-channel's `logo`. ETV-next resolves that against the requesting host and
-publishes it as the XMLTV `<channel><icon src>` and the M3U `tvg-logo`. The
-hash changes with the image, so a guide client that caches icons by URL picks
-up a new one.
+rendered, the station copies the image beside `lineup.json` as
+`channel-logos/<number>.<ext>` and names `./channel-logos/<number>.<ext>` as the
+lineup channel's `logo`. ETV-next serves that file at `/logo/<number>.<ext>`
+and publishes the URL, resolved against the requesting host, as the XMLTV
+`<channel><icon src>` and the M3U `tvg-logo`. The URL carries a `?v=` taken
+from the image's bytes, so a guide client that caches icons by URL picks up a
+new one. ETV-next reads the lineup when it starts, so a changed logo appears
+on the next container start.
 
 It is separate from the overlay: the on-screen mark is usually white on
 transparent, which disappears in a light-themed guide, so a channel commonly
-names a different image here. With no artwork cache configured, or an
-unreadable image, the channel is published without a logo and a
-`lineup.logo.skipped` WARN names the file and the reason. The station rebuilds
-`channel-logos/` on every render, so a dropped `logo:` leaves nothing behind.
+names a different image here. An unreadable image publishes the channel with
+no logo, and a `lineup.logo.skipped` WARN names the file and the reason. Each
+logo is written to a temporary name and renamed into place, and a render
+removes only the files no channel names any more, so a logo in use is never
+missing from the folder ETV-next serves.
 
 ### Composing blocks — `rule.blocks`
 
