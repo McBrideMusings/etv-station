@@ -820,8 +820,7 @@ mod tests {
     }
 
     // #187: the station only ever writes a path relative to this server's own
-    // root for programme artwork and channel logos (#342) — never a Plex URL,
-    // since a Plex URL is `X-Plex-Token` in disguise — and
+    // root (never a Plex URL — a Plex URL is `X-Plex-Token` in disguise), and
     // this is the resolution that turns it into something a guide reader
     // fetching from a different host can actually load. The absent-artwork
     // case (no `<icon>` at all) is already covered by `bare_item()` in the
@@ -838,7 +837,7 @@ mod tests {
             config: cfg_path.to_string_lossy().into_owned(),
             overlays: Vec::new(),
             tvg_id: None,
-            logo: Some("/artwork/channel-logos/1.png?v=ab12".into()),
+            logo: None,
             group: None,
         };
         let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
@@ -858,16 +857,48 @@ mod tests {
             xml.contains(r#"<icon src="http://viewer.example:8409/artwork/abc123.jpg"/>"#),
             "{xml}"
         );
-        assert!(
-            xml.contains(
-                r#"<icon src="http://viewer.example:8409/artwork/channel-logos/1.png?v=ab12"/>"#
-            ),
-            "{xml}"
-        );
         // The whole point of #187: never a Plex URL, and never the credential
         // that makes one work.
         assert!(!xml.contains("X-Plex-Token"), "{xml}");
         assert!(!xml.contains("plex.tv"), "{xml}");
+    }
+
+    // #342: a lineup `logo` naming a file beside the lineup is served by this
+    // server at /logo/{number}.{ext}, and the guide publishes that URL against
+    // the requesting host, with a `?v=` that changes when the image does.
+    #[tokio::test]
+    async fn a_file_logo_is_served_here_and_published_against_the_request_host() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("playout")).unwrap();
+        std::fs::create_dir(dir.path().join("channel-logos")).unwrap();
+        std::fs::write(dir.path().join("channel-logos/1.png"), b"png bytes").unwrap();
+        let cfg_path = dir.path().join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ersatztv::config::ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: Some("./channel-logos/1.png".into()),
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(channel.logo_file().unwrap()).unwrap(),
+            b"png bytes"
+        );
+        let xml = build_xmltv(
+            std::slice::from_ref(&channel),
+            &[],
+            "http://viewer.example:8409",
+        )
+        .unwrap();
+        assert!(
+            xml.contains(r#"<icon src="http://viewer.example:8409/logo/1.png?v="#),
+            "{xml}"
+        );
     }
 
     // `Some(Credits::default())` — every role list present but empty — is

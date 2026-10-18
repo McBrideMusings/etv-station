@@ -217,6 +217,9 @@ async fn run() -> Result<(), LineupError> {
                 // compressed media and gzipping them spends CPU per segment
                 // per viewer for nothing.
                 .layer(CompressionLayer::new())
+                // Channel logos named as files in the lineup (#342): an image,
+                // so registered after the compression layer like /artwork.
+                .route("/logo/{filename}", get(channel_logo))
                 .nest_service(
                     "/session",
                     ServiceBuilder::new()
@@ -534,6 +537,40 @@ async fn access_log(
     }
 
     response
+}
+
+/// `/logo/{number}.{ext}` — the image file the lineup named as that channel's
+/// logo. 404 for a channel whose logo is a URL, or that has none.
+async fn channel_logo(
+    Path(filename): Path<String>,
+    State(state): State<Arc<LineupState>>,
+) -> axum::response::Response {
+    let number = filename.split('.').next().unwrap_or_default();
+    let Some(file) = state
+        .channels
+        .iter()
+        .find(|c| c.number() == number)
+        .and_then(|c| c.logo_file())
+    else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = match file
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "image/png",
+    };
+    match tokio::fs::read(file).await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response(),
+        Err(e) => {
+            log::warn!("channel {number}: logo {} unreadable: {e}", file.display());
+            axum::http::StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 async fn fix_content_types(

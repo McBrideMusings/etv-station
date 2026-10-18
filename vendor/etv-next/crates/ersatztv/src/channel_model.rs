@@ -92,6 +92,7 @@ pub struct ChannelModel {
     tvg_id: String,
     playout_folder: PathBuf,
     logo: Option<String>,
+    logo_file: Option<PathBuf>,
     group: Option<String>,
     bandwidth_bps: u32,
     subtitle: SubtitleHint,
@@ -156,6 +157,8 @@ impl ChannelModel {
         let show_bumpers = hint.guide.show_bumpers;
 
         let playout_folder = read_playout_folder(&channel_config, &config_base).await?;
+        let (logo, logo_file) =
+            resolve_logo(parent, &channel.number, channel.logo.as_deref()).await;
 
         Ok(ChannelModel {
             number: channel.number.clone(),
@@ -167,7 +170,8 @@ impl ChannelModel {
                 .tvg_id
                 .unwrap_or_else(|| format!("ersatztv.{}", channel.number)),
             playout_folder,
-            logo: channel.logo.clone(),
+            logo,
+            logo_file,
             group: channel.group.clone(),
             bandwidth_bps,
             subtitle,
@@ -207,6 +211,12 @@ impl ChannelModel {
         self.logo.as_deref()
     }
 
+    /// The image file `/logo/{number}.{ext}` serves, when the lineup named a
+    /// file rather than a URL as this channel's logo.
+    pub fn logo_file(&self) -> Option<&Path> {
+        self.logo_file.as_deref()
+    }
+
     pub fn group(&self) -> Option<&str> {
         self.group.as_deref()
     }
@@ -239,6 +249,50 @@ impl ChannelModel {
 
     pub fn subtitle_language_name(&self) -> &str {
         self.subtitle.language.name.as_str()
+    }
+}
+
+/// A channel's lineup `logo`, as the URL the guide publishes and the file this
+/// server serves for it.
+///
+/// A value with a URL scheme (`https://…`) or a leading `/` is a URL already
+/// and passes through untouched, with no file. Anything else is an image file
+/// relative to the lineup's own folder: the server serves it at
+/// `/logo/{number}.{ext}` and publishes that path with a `?v=` taken from the
+/// file's bytes, because guide clients cache a channel icon by URL and would
+/// otherwise keep showing a replaced image. A file that cannot be read is
+/// logged and the channel goes out with no logo rather than not at all.
+async fn resolve_logo(
+    lineup_dir: &Path,
+    number: &str,
+    logo: Option<&str>,
+) -> (Option<String>, Option<PathBuf>) {
+    let Some(logo) = logo else {
+        return (None, None);
+    };
+    if logo.contains("://") || logo.starts_with('/') {
+        return (Some(logo.to_string()), None);
+    }
+    let file = lineup_dir.join(logo);
+    match tokio::fs::read(&file).await {
+        Ok(bytes) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            let ext = file
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_else(|| "png".to_string());
+            let url = format!("/logo/{number}.{ext}?v={:016x}", hasher.finish());
+            (Some(url), Some(file))
+        }
+        Err(e) => {
+            log::warn!(
+                "channel {number}: logo {} unreadable, publishing no logo: {e}",
+                file.display()
+            );
+            (None, None)
+        }
     }
 }
 
