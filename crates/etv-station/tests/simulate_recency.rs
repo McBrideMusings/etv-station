@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
 use etv_station::config::{
-    Advance, BlockInclude, ChannelConfig, Mode, PatternStep, Pool, RuleConfig, ScoringConfig, Take,
+    Advance, BlockInclude, ChannelConfig, Mode, NoRepeatWithin, PatternStep, Pool, RuleConfig,
+    ScoringConfig, Take,
 };
 use etv_station::simulate::simulate;
 use time::macros::datetime;
@@ -209,4 +210,158 @@ fn each_generation_is_asked_for_a_chunks_worth_of_items() {
 
     // 6h chunk / 5400s nominal item = 4, the daemon's `target_count`.
     assert_eq!(sim.generations[0].target_count, 4);
+}
+
+/// Ranks by id alone, ignoring `ctx.recent`, so every generation opens with the
+/// same title unless the pool's cursor or the seam's adjacency tail moves it.
+const ID_ORDER_PLUGIN: &str = r#"
+fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read"] }
+fn sources() { #{ movies: `item.type == "movie" || item.type == "episode"` } }
+fn pick(ctx) {
+    let ids = [];
+    for item in ctx.sets.movies { ids.push(item.entry_id); }
+    ids.sort(|a, b| if a < b { -1 } else if a > b { 1 } else { 0 });
+    #{ picks: ids, workspace: () }
+}
+fn audit(ctx, picks, workspace) { #{} }
+"#;
+
+fn write_id_order_plugin(dir: &tempfile::TempDir) -> PathBuf {
+    let path = dir.path().join("id-order.rhai");
+    std::fs::write(&path, ID_ORDER_PLUGIN).unwrap();
+    path
+}
+
+fn add_local_file(cat: &Catalog, e: &Entry) {
+    cat.upsert_entry(e).unwrap();
+    cat.add_source(&EntrySource {
+        source: Source::LocalFs,
+        source_id: format!("fs-{}", e.entry_id),
+        entry_id: e.entry_id.clone(),
+        playback_path: format!("/media/{}.mkv", e.entry_id),
+        last_seen: None,
+        missing_since: None,
+    })
+    .unwrap();
+}
+
+fn airing_ids(sim: &etv_station::simulate::Simulation) -> Vec<String> {
+    sim.generations
+        .iter()
+        .flat_map(|g| g.airings.iter().map(|a| a.id.clone()))
+        .collect()
+}
+
+/// A pool on `advance: resume` continues a show where the previous generation
+/// stopped. The ledger's cursor is keyed on the airing's `show_id`, which is
+/// what the pool's series looks up; seven episodes against a generation that
+/// is not a multiple of seven long makes a lookup miss restart at `e1`.
+#[test]
+fn advance_resume_continues_a_season_across_generations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = channel(&write_id_order_plugin(&dir));
+    cfg.rule.blocks[0].pools[0].advance = Advance::Resume;
+    let cat = Catalog::open_in_memory().unwrap();
+    const EPISODES: usize = 7;
+    for n in 1..=EPISODES {
+        let id = format!("e{n}");
+        let mut e = Entry::new(&id, "episode", &id, Source::Plex);
+        e.show_id = Some("show:x".into());
+        e.season = Some(1);
+        e.episode = Some(n as i64);
+        e.duration_ms = Some(30 * 60 * 1000);
+        add_local_file(&cat, &e);
+    }
+
+    let sim = simulate(
+        &cfg,
+        Path::new("channel.yaml"),
+        &cat,
+        None,
+        3,
+        datetime!(2026-01-01 00:00 UTC),
+        None,
+    )
+    .unwrap();
+
+    assert!(sim.generations.len() >= 2, "need a generation seam to test");
+    let aired = airing_ids(&sim);
+    let expected: Vec<String> = (0..aired.len())
+        .map(|i| format!("e{}", i % EPISODES + 1))
+        .collect();
+    assert_eq!(aired, expected, "the season must run on across generations");
+}
+
+/// The adjacency tail carries the last `adjacency_reach()` airings into the next
+/// generation, so `no_repeat_within` holds across the seam. Every generation
+/// ranks `m0` first; without the tail the one after a seam opens with it
+/// however recently it aired.
+#[test]
+fn adjacency_tail_holds_no_repeat_within_across_a_generation_seam() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = channel(&write_id_order_plugin(&dir));
+    const GAP: usize = 4;
+    cfg.rule.no_repeat_within = Some(NoRepeatWithin::Positions(GAP));
+    let cat = Catalog::open_in_memory().unwrap();
+    for n in 0..(GAP + 1) {
+        let id = format!("m{n}");
+        let mut e = Entry::new(&id, "movie", &id, Source::Plex);
+        e.duration_ms = Some(30 * 60 * 1000);
+        add_local_file(&cat, &e);
+    }
+
+    let sim = simulate(
+        &cfg,
+        Path::new("channel.yaml"),
+        &cat,
+        None,
+        3,
+        datetime!(2026-01-01 00:00 UTC),
+        None,
+    )
+    .unwrap();
+
+    assert!(sim.generations.len() >= 2, "need a generation seam to test");
+    let aired = airing_ids(&sim);
+    for (i, id) in aired.iter().enumerate() {
+        let from = i.saturating_sub(GAP);
+        assert!(
+            !aired[from..i].contains(id),
+            "{id} at position {i} repeats within {GAP}: {:?}",
+            &aired[from..=i]
+        );
+    }
+}
+
+/// Near the end of the window the remaining span is shorter than a chunk, so
+/// `target_count` drops from a chunk's worth to the floor of 1.
+#[test]
+fn target_count_shrinks_to_one_near_the_end_of_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = channel(&write_plugin(&dir));
+    cfg.scoring = Some(ScoringConfig {
+        nominal_item_secs: 5400,
+        ..ScoringConfig::default()
+    });
+    let cat = catalog();
+
+    let sim = simulate(
+        &cfg,
+        Path::new("channel.yaml"),
+        &cat,
+        None,
+        1,
+        datetime!(2026-01-01 00:00 UTC),
+        None,
+    )
+    .unwrap();
+
+    let counts: Vec<usize> = sim.generations.iter().map(|g| g.target_count).collect();
+    assert_eq!(counts[0], 4, "a full chunk: 6h / 5400s");
+    assert_eq!(
+        *counts.last().unwrap(),
+        1,
+        "less than one nominal item left: {counts:?}"
+    );
 }
