@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use etv_station::catalog::Catalog;
 use etv_station::catalog::reconcile_plexdb::{self, ReconcileReport};
 use etv_station::{audit_report, config, daemon, etv_next};
@@ -14,11 +14,15 @@ use tracing_subscriber::EnvFilter;
     about = "Playout JSON generator daemon for ErsatzTV-next"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to the top-level station config (TOML or YAML, by extension).
     ///
     /// Required by every mode except `--check-plugins`, which reads a
-    /// directory of scripts and nothing else.
-    #[arg(short, long)]
+    /// directory of scripts and nothing else, and `bumper-preview`, which
+    /// needs it only to look up a catalog `entry_id`.
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
     /// Log output format.
@@ -241,6 +245,55 @@ struct Cli {
     ui_plugins_dir: Option<PathBuf>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Resolve one bumper script on one gap without a station, and print the
+    /// playout items the scheduler would write for it (`--otio` prints the
+    /// OpenTimelineIO document instead). `admin bumper-watch` plays the same
+    /// result into VLC.
+    ///
+    /// A script that fails is an error here, not the black card the generator
+    /// substitutes: a preview exists to show the author what went wrong.
+    BumperPreview(BumperPreviewArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct BumperPreviewArgs {
+    /// The bumper plugin (`.rhai`) to run.
+    script: PathBuf,
+
+    /// Length of the gap to fill: `45s`, `1500ms`, `2m`.
+    #[arg(long)]
+    gap: String,
+
+    /// The item after the gap: a media file, or a catalog `entry_id` (which
+    /// needs `--config`). Omit it to preview a gap at the generation frontier.
+    #[arg(long, value_name = "PATH|ENTRY_ID")]
+    next: Option<String>,
+
+    /// The channel number `ctx.channel.number` reports; its name is
+    /// `channel-<N>`.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    channel: i64,
+
+    /// The channel framerate the solver rounds every boundary to.
+    #[arg(long, default_value_t = 30.0)]
+    fps: f64,
+
+    /// Directory a relative overlay script path in the timeline is resolved
+    /// against, so the printed `overlay.script` is absolute.
+    #[arg(long, value_name = "DIR")]
+    overlay_root: Option<PathBuf>,
+
+    /// Print the resolved timeline as OpenTimelineIO JSON instead of items.
+    #[arg(long, conflicts_with = "ndjson")]
+    otio: bool,
+
+    /// Print one playout item per line instead of one JSON array.
+    #[arg(long)]
+    ndjson: bool,
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum LogFormat {
     Pretty,
@@ -257,6 +310,10 @@ enum ReportFormat {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if let Some(Command::BumperPreview(args)) = &cli.command {
+        return bumper_preview(cli.config.as_deref(), args);
+    }
 
     // First, and before `--config` is even resolved: this is the one mode that
     // has no station config to resolve. It reads a directory of scripts, which
@@ -1398,6 +1455,96 @@ fn init_stderr_tracing() {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .try_init();
+}
+
+/// `etv-station bumper-preview`. Stdout carries only the items (or OTIO), so
+/// a caller can pipe it; the log goes to stderr.
+fn bumper_preview(config_path: Option<&Path>, args: &BumperPreviewArgs) -> ExitCode {
+    use etv_station::bumper::hook::ChannelInfo;
+    use etv_station::bumper::preview::{self, PreviewRequest};
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let fail = |msg: String| {
+        eprintln!("bumper-preview: {msg}");
+        ExitCode::from(1)
+    };
+
+    let gap_ms = match preview::parse_gap(&args.gap) {
+        Ok(ms) => ms,
+        Err(e) => return fail(e),
+    };
+    let next = match args.next.as_deref() {
+        None => None,
+        Some(spec) => {
+            let catalog = match config_path {
+                Some(path) if !std::path::Path::new(spec).is_file() => {
+                    match open_preview_catalog(path) {
+                        Ok(c) => Some(c),
+                        Err(e) => return fail(e),
+                    }
+                }
+                _ => None,
+            };
+            match preview::next_item(spec, catalog.as_ref()) {
+                Ok(m) => Some(m),
+                Err(e) => return fail(e),
+            }
+        }
+    };
+    let overlay_root = match args
+        .overlay_root
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+    {
+        Ok(p) => p,
+        Err(e) => return fail(format!("cannot read the working directory: {e}")),
+    };
+    let request = PreviewRequest {
+        script: &args.script,
+        gap_ms,
+        fps: args.fps,
+        next,
+        channel: ChannelInfo {
+            name: format!("channel-{}", args.channel),
+            number: args.channel,
+            ..ChannelInfo::default()
+        },
+        overlay_root: &overlay_root,
+        start: OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .unwrap_or_else(|_| OffsetDateTime::now_utc()),
+    };
+    match preview::preview(&request) {
+        Ok(p) => {
+            if args.otio {
+                println!("{}", p.otio());
+            } else if args.ndjson {
+                println!("{}", p.items_ndjson());
+            } else {
+                println!("{}", p.items_json());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// The catalog `--config` names, opened read-only, for `--next <entry_id>`.
+fn open_preview_catalog(config_path: &Path) -> Result<Catalog, String> {
+    let station = config::load_for_inspection(config_path).map_err(|e| e.to_string())?;
+    let path = station.station.catalog_path.ok_or_else(|| {
+        format!(
+            "{} sets no catalog_path (or ETV_STATION_CATALOG); cannot look up an entry_id",
+            config_path.display()
+        )
+    })?;
+    Catalog::open_readonly(&path).map_err(|e| format!("opening catalog {path}: {e}"))
 }
 
 fn init_tracing(format: LogFormat) {

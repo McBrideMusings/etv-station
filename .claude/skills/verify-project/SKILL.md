@@ -632,6 +632,28 @@ for f in sorted(glob.glob('deploy/appdata/channels/*/logo.png') + glob.glob('dep
 ffmpeg -y -i bad.png -pix_fmt rgba fixed.png   # the fix; alpha survives
 ```
 
+## Verifying `bumper-preview` and `bumper-watch`
+
+No station, catalog or Plex needed. Resolve a bumper on a gap and read the items:
+
+```sh
+cargo build -q -p etv-station -p etv-overlay
+./target/debug/etv-station bumper-preview examples/plugins/text-card-bumper.rhai --gap 45s | jq -c '.[] | [.id, .start, .finish, .overlay]'
+./target/debug/etv-station bumper-preview examples/plugins/text-card-bumper.rhai --gap 45s --otio | jq '.tracks.children[0].children | length'
+```
+
+Expect two items for the text-card bumper (a 2 s black, then a looped black card whose `overlay.script` is an absolute path), the first `start` to the last `finish` spanning exactly 45 s, and `2` from the OTIO count. A script that throws exits 1 with its message on stderr and nothing on stdout (the generator would air black; the preview must not).
+
+`bumper-watch` plays those items through `etv-overlay watch --item`, one process per item, into VLC. Prove it without VLC by standing in a capture script for it (`overlay-watch.sh` reads `$VLC`), then count the frames the card drew over:
+
+```sh
+VLC=<script that runs: cat > out.ts> ./tools/bumper-watch.sh examples/channels/lavfi-test.yaml <bumper.rhai> --gap 5s
+# after ~25 s, SIGINT the pipeline, then:
+ffmpeg -v error -i out.ts -vf "signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-" -an -f null - | grep YMAX | sort | uniq -c
+```
+
+Expect both a black count (`YMAX=16`) and a text-frame count (`YMAX=248` for white text). The `etv-overlay` log shows `overlay=None` for an item with `"overlay": "none"` and `overlay=Script { script: …card.rhai, vars: … }` for the card item. `admin overlay-watch <channel> --metadata '<json>'` is the same pipeline for a single looping background.
+
 ## Verifying the block card and pool labels
 
 A pool's `label:`/`advisory:` ride on every item it draws as
