@@ -1140,6 +1140,11 @@ pub struct BlockBuild {
     pub progress: Vec<BTreeMap<String, PoolResume>>,
     /// Flattened `entry_id -> metadata` from `ScoreCache::picked_extras`.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// The `select` audit blob of each draw, parallel to `ids`: `audits[k]` is
+    /// the trail of the draw that produced `ids[k]`, so an id drawn twice in
+    /// one block carries two trails, one per airing. `None` where a draw
+    /// recorded no stage.
+    pub audits: Vec<Option<serde_json::Value>>,
     /// This pool's own `guide:` per drawn `entry_id` (#289).
     pub guides: HashMap<String, GuideConfig>,
     /// This pool's own `tracks:` per drawn `entry_id` (#261), the pool rung of
@@ -1248,10 +1253,11 @@ pub fn build(
     let mut guide_out: HashMap<String, GuideConfig> = HashMap::new();
     // The same collision rule holds for the pool's `tracks:` rules.
     let mut tracks_out: HashMap<String, crate::config::TrackRules> = HashMap::new();
-    // Per-id audit blobs the walk builds as it draws, folded into the metadata
-    // map at the end. `Option<Value>` rather than `Value` so it plugs straight
-    // into `audit::push_stage`, which owns creating the blob.
-    let mut audit_out: HashMap<String, Option<serde_json::Value>> = HashMap::new();
+    // Per-draw audit blobs the walk builds as it draws, indexed by position in
+    // the drawn ids so an id drawn twice keeps one trail per airing.
+    // `Option<Value>` rather than `Value` so it plugs straight into
+    // `audit::push_stage`, which owns creating the blob.
+    let mut audit_out: Vec<Option<serde_json::Value>> = Vec::new();
     // Which pool drew each id — so an id two plugin pools both ranked carries
     // the record of the pool it actually aired from, not whichever of the two
     // a hash map happens to yield first.
@@ -1466,7 +1472,7 @@ pub fn build(
                         .find(|l| l.key == key)
                         .map(|l| &l.ids)
                 });
-                for id in &drawn {
+                for (n, id) in drawn.iter().enumerate() {
                     let mut detail = detail.clone();
                     let place = match ranked {
                         Some(ids) => ids.iter().position(|x| x == id).map(|i| (i, ids.len())),
@@ -1481,7 +1487,11 @@ pub fn build(
                         detail.insert("list_position".into(), (i + 1).into());
                         detail.insert("list_length".into(), len.into());
                     }
-                    let entry = audit_out.entry(id.clone()).or_insert(None);
+                    let at = out.len() + n;
+                    if audit_out.len() <= at {
+                        audit_out.resize(at + 1, None);
+                    }
+                    let entry = &mut audit_out[at];
                     crate::audit::push_stage(
                         entry,
                         "select",
@@ -1554,19 +1564,7 @@ pub fn build(
                 .map(|m| (id.clone(), m))
         })
         .collect();
-    // Fold each id's `pool` stage into the same blob a plugin pick's metadata
-    // lands in, so one item carries one `audit` array whatever produced it.
-    // A plugin pool's ranking record was written first, in `score`, so
-    // appending here keeps the array in the order the stages actually acted.
-    for (id, staged) in audit_out {
-        let Some(staged) = staged else { continue };
-        match metadata_out.get_mut(&id) {
-            Some(existing) => merge_audit_into(existing, staged),
-            None => {
-                metadata_out.insert(id, staged);
-            }
-        }
-    }
+    audit_out.resize(out.len(), None);
     for (id, idx) in labelled_by {
         stamp_pool_display(&mut metadata_out, id, runtimes[idx].cfg);
     }
@@ -1579,6 +1577,7 @@ pub fn build(
         resume: resume_out,
         progress,
         metadata: metadata_out,
+        audits: audit_out,
         guides: guide_out,
         tracks: tracks_out,
         lists,
@@ -1709,13 +1708,27 @@ pub(crate) fn stamp_pool_display(
     }
 }
 
+/// Lay one draw's `select` trail onto the item's metadata blob, after any
+/// `audit` records a plugin pick wrote first, so the array keeps the order the
+/// stages acted in.
+pub(crate) fn attach_audit(
+    metadata: &mut Option<serde_json::Value>,
+    staged: Option<serde_json::Value>,
+) {
+    let Some(staged) = staged else { return };
+    match metadata {
+        Some(existing) => merge_audit_into(existing, staged),
+        None => *metadata = Some(staged),
+    }
+}
+
 /// Append `staged`'s `audit` records onto `existing`'s, leaving every other
 /// key of both blobs alone.
 ///
 /// Needed because a plugin pool writes its ranking record into
-/// `picked_extras` during `score`, and the `pool` stage above is written
-/// later against the same id — two producers, one array, and a plain insert
-/// would drop whichever wrote first.
+/// `picked_extras` during `score`, and the `select` stage is written later
+/// against the same id — two producers, one array, and a plain insert would
+/// drop whichever wrote first.
 fn merge_audit_into(existing: &mut serde_json::Value, staged: serde_json::Value) {
     let Some(incoming) = staged.get("audit").and_then(|a| a.as_array()) else {
         return;
@@ -3520,8 +3533,9 @@ mod tests {
             built.metadata[movie]["pool_advisory"],
             "Contains loud noises"
         );
-        // The audit trail the walk already writes is still there beside it.
-        assert!(built.metadata[movie]["audit"].is_array());
+        // The audit trail the walk writes rides beside it, per draw.
+        let at = built.ids.iter().position(|i| i == movie).unwrap();
+        assert!(built.audits[at].as_ref().unwrap()["audit"].is_array());
 
         let episodes: Vec<_> = built
             .ids
@@ -3557,9 +3571,40 @@ mod tests {
             None,
         )
         .expect("pattern builds");
-        let blob = &built.metadata[&built.ids[0]];
-        assert!(blob.get("pool_label").is_none());
-        assert!(blob.get("pool_advisory").is_none());
+        let blob = built.metadata.get(&built.ids[0]);
+        assert!(blob.is_none_or(|b| b.get("pool_label").is_none()));
+        assert!(blob.is_none_or(|b| b.get("pool_advisory").is_none()));
+    }
+
+    /// An id the block draws twice keeps one `select` record per airing, not a
+    /// shared blob that describes both draws (#405).
+    #[test]
+    fn an_id_drawn_twice_carries_one_select_record_per_airing() {
+        let cat = catalog();
+        let built = build(
+            &cat,
+            &[movies_pool()],
+            &[],
+            &[step("movies", 1)],
+            Some(5),
+            None,
+            &GenerationState::empty(),
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
+            test_env(),
+            None,
+            None,
+        )
+        .expect("pattern builds");
+        assert_eq!(built.ids, vec!["mov-1", "mov-2", "mov-3", "mov-1", "mov-2"]);
+        assert_eq!(built.audits.len(), built.ids.len());
+        for (id, audit) in built.ids.iter().zip(&built.audits) {
+            let trail = audit.as_ref().expect("every draw is audited")["audit"]
+                .as_array()
+                .expect("audit is an array");
+            assert_eq!(trail.len(), 1, "{id}: one draw, one record");
+            assert_eq!(trail[0]["stage"], "select");
+        }
     }
 
     /// The headline acceptance criterion: `{movies take=1}, {shows take=3}`
