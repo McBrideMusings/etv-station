@@ -1401,7 +1401,7 @@ def build_app(host: str):
                 raw_audit = item.get("audit", []) if isinstance(item, dict) else []
                 classification_line = render_classification(raw_audit).splitlines()[0]
                 overlay_spec = item.get("overlay_spec") if isinstance(item, dict) else None
-                overlay_text = None
+                overlay_text = "this channel draws no overlay here"
                 if overlay_spec is not None:
                     # Show the result's text whether or not the dump-text run
                     # succeeded — a failure string ("etv-overlay binary not
