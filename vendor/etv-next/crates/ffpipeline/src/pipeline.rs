@@ -406,9 +406,21 @@ impl Pipeline {
             preferred_pixel_format,
         };
 
+        // loudnorm on a short digital-silence source (lavfi anullsrc) outputs NaN, which
+        // the AAC encoder rejects; silence has no loudness to normalize anyway.
+        let audio_is_silence_source = matches!(
+            &input_settings.audio_input.input_source,
+            InputSource::Lavfi(l) if l.params.contains("anullsrc")
+        );
+        let loudness = if audio_is_silence_source {
+            None
+        } else {
+            final_output_settings.audio.loudness.clone()
+        };
+
         let mut filters = vec![
             PipelineFilter::Audio(AudioFilter::LoudNorm {
-                settings: final_output_settings.audio.loudness.clone(),
+                settings: loudness,
                 sample_rate: final_output_settings.audio.sample_rate,
             }),
             PipelineFilter::Audio(AudioFilter::Resample),
@@ -1404,6 +1416,135 @@ mod tests {
         assert!(
             readrate_immediately_precedes_pipe,
             "expected -readrate 1.0 in the overlay input's own arg block, right before pipe:10; args: {args:?}"
+        );
+    }
+
+    /// `loudnorm` on a short `anullsrc` input outputs NaN and the AAC encoder
+    /// fails (ffmpeg exit 234). The chain for a silence source must carry no
+    /// `loudnorm`; a file-backed audio input with loudness on keeps it.
+    #[test]
+    fn loudnorm_is_skipped_for_an_anullsrc_audio_input_only() {
+        use time::OffsetDateTime;
+
+        use crate::frame_rate::FrameRate;
+        use crate::frame_size::FrameSize;
+        use crate::input::{InputSource, LavfiInputSource, LocalInputSource, ProbedInput};
+        use crate::output_format::OutputFormat;
+        use crate::output_settings::{AudioLoudnessSettings, AudioOutputSettings, ScalingMode};
+        use crate::probe::{
+            CodecType, ProbeResult, ProbeResultAudioStream, ProbeResultColorParams,
+            ProbeResultStream, ProbeResultVideoStream,
+        };
+
+        let args_for = |audio_source: InputSource| -> String {
+            let video_path = String::from("/media/movie.mkv");
+            let video_stream = ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
+                stream_index: 0,
+                codec: String::from("h264"),
+                codec_type: CodecType::Video,
+                profile: String::new(),
+                height: Some(1080),
+                width: Some(1920),
+                frame_rate: FrameRate::default(),
+                sample_aspect_ratio: Some(String::from("1:1")),
+                display_aspect_ratio: None,
+                pix_fmt: String::from("yuv420p"),
+                color_params: ProbeResultColorParams {
+                    color_range: None,
+                    color_space: None,
+                    color_transfer: None,
+                    color_primaries: None,
+                },
+                field_order: None,
+                language: None,
+            }));
+            let audio_stream = ProbeResultStream::Audio(ProbeResultAudioStream {
+                stream_index: 0,
+                codec: String::from("aac"),
+                channels: 2,
+            });
+            let probed = |source: InputSource, streams: Vec<ProbeResultStream>| ProbedInput {
+                input_source: source,
+                probe_result: ProbeResult {
+                    path: video_path.clone(),
+                    streams,
+                    duration: None,
+                    format_name: None,
+                },
+                in_point: Duration::ZERO,
+                out_point: Duration::from_secs(1),
+                stream_index: None,
+            };
+            let input_settings = InputSettings {
+                start: OffsetDateTime::UNIX_EPOCH,
+                audio_input: probed(audio_source, vec![audio_stream]),
+                video_input: probed(
+                    InputSource::Local(LocalInputSource {
+                        path: video_path.clone(),
+                    }),
+                    vec![video_stream],
+                ),
+                subtitle_input: None,
+                watermark_input: None,
+                overlay_input: None,
+                subtitle_language_tag: String::from("en"),
+            };
+            let output_settings = OutputSettings {
+                audio: AudioOutputSettings {
+                    format: Some(AudioFormat::Aac),
+                    bitrate: Some(Kbps(192)),
+                    buffer: Some(Kbps(384)),
+                    channels: Some(2),
+                    sample_rate: Some(Hz(48000)),
+                    loudness: Some(AudioLoudnessSettings::default()),
+                },
+                video_format: Some(VideoFormat::H264),
+                bit_depth: Some(8),
+                video_bitrate: Some(Kbps(5000)),
+                video_buffer: Some(Kbps(10000)),
+                video_size: Some(FrameSize {
+                    width: 1920,
+                    height: 1080,
+                }),
+                scaling_mode: ScalingMode::ScaleAndPad,
+                filter_options: VideoFilterOptions::default(),
+                deinterlace: false,
+                accel: None,
+                format: OutputFormat::Hls {
+                    playlist: String::from("/tmp/live.m3u8"),
+                    segment_template: String::from("/tmp/segment_%03d.ts"),
+                    troubleshoot: false,
+                },
+                pts_offset: None,
+                read_rate: ReadRate::Unthrottled,
+                frame_rate: None,
+                subtitle_mode: SubtitleMode::Convert,
+                fonts_folder: None,
+                subtitle_force_style: None,
+                reports_folder: None,
+                report_id: None,
+            };
+            let ffmpeg_info = FfmpegInfo::default();
+            let mut pipeline = Pipeline::full(&ffmpeg_info, input_settings, output_settings)
+                .expect("pipeline should build");
+            pipeline.optimize();
+            pipeline.args().join(" ")
+        };
+
+        let silence = args_for(InputSource::Lavfi(LavfiInputSource {
+            params: String::from("anullsrc=channel_layout=stereo:sample_rate=48000"),
+        }));
+        assert!(
+            !silence.contains("loudnorm"),
+            "an anullsrc audio input must not be loudnormed; args: {silence}"
+        );
+
+        let programme = args_for(InputSource::Local(LocalInputSource {
+            path: String::from("/media/movie.mkv"),
+        }));
+        assert!(
+            programme.contains("loudnorm=I="),
+            "a file-backed audio input keeps loudnorm; args: {programme}"
         );
     }
 }

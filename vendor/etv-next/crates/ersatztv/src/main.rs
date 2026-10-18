@@ -593,9 +593,10 @@ async fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> Strin
     result.push_str("#EXT-X-VERSION:6\n");
 
     // Only channels converting subtitles to WebVTT have a separate track to
-    // offer, and only when the schedule currently playing actually asks for
-    // one. `has_subtitle_track()` alone is the channel's static config — true
-    // for any Convert-mode channel regardless of whether any item ever names
+    // offer, and only when the item airing right now asks for one; an item
+    // elsewhere in the playout folder says nothing about the cue file this
+    // client is about to fetch. `has_subtitle_track()` alone is the channel's
+    // static config — true for any Convert-mode channel regardless of whether any item ever names
     // a subtitle selection. A channel whose items never opt into subtitles
     // (or haven't yet) would otherwise advertise a rendition that never gets
     // cues, and an old VLC (3.0.4, what iPlayTV on tvOS bundles) tears down
@@ -605,7 +606,11 @@ async fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> Strin
     // worker never stops serving `live_sub.m3u8` when Convert is set, so
     // whatever this check allows, the worker already provides.
     let has_subtitle_track = channel.has_subtitle_track()
-        && ersatztv_playout::playout::schedule_requests_subtitle(channel.playout_folder()).await;
+        && ersatztv_playout::playout::schedule_requests_subtitle(
+            channel.playout_folder(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .await;
 
     if has_subtitle_track {
         result.push_str(&format!(
