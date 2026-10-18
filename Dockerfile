@@ -167,7 +167,7 @@ COPY --from=builder /build/target/release/etv-overlay /usr/local/bin/etv-overlay
 COPY --from=etv-builder /build/vendor/etv-next/target/release/ersatztv /usr/local/bin/ersatztv
 COPY --from=etv-builder /build/vendor/etv-next/target/release/ersatztv-channel /usr/local/bin/ersatztv-channel
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py /usr/local/bin/
+COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py tools/client-stall.py /usr/local/bin/
 COPY --chmod=755 tools/probe-checks.sh tools/soak-probe.sh /usr/local/bin/
 COPY --chmod=755 tools/two-clock-capture.sh /usr/local/bin/
 # The ffmpeg probe ships IN THE IMAGE, not scp'd onto the host. It used to be

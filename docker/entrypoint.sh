@@ -220,6 +220,12 @@ if [ -n "${ETV_DIAG_CAPTURE:-}" ] \
         HLS_ROOT="${ETV_HLS_OUTPUT:-/data/hls}" LOG_FILE="$diag_dir/stream-events.log" \
             stream-watch.py &
         diag_pids+=($!)
+        # Reads the access log the capture above writes, so it lives behind the
+        # same switch: a client that polls live.m3u8 but stops taking segments
+        # while the server keeps publishing (#328).
+        ACCESS_LOG="$diag_dir/access.log" HLS_ROOT="${ETV_HLS_OUTPUT:-/data/hls}" \
+            LOG_FILE="$diag_dir/client-stall.log" client-stall.py &
+        diag_pids+=($!)
         log "diagnostics capturing to $diag_dir (ETV_DIAG_CAPTURE=${ETV_DIAG_CAPTURE})"
     else
         log "WARNING: ETV_DIAG_CAPTURE is set but $diag_dir is not writable — no capture"
