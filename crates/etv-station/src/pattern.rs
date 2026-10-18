@@ -1702,11 +1702,10 @@ pub(crate) fn stamp_pool_display(
 /// `audit` records a plugin pick wrote first, so the array keeps the order the
 /// stages acted in.
 ///
-/// Takes the records themselves rather than a staged blob, so there is no
-/// sibling key that could be dropped on the way in. Needed because a plugin
-/// pool writes its ranking record into `picked_extras` during `score`, and the
-/// `select` stage is written later against the same id — two producers, one
-/// array.
+/// Needed because a plugin pool writes its ranking record into
+/// `picked_extras` during `score`, and the `select` stage is written later
+/// against the same id — two producers, one array. Every other key of the blob
+/// is left alone.
 pub(crate) fn attach_audit(
     metadata: &mut Option<serde_json::Value>,
     records: Vec<serde_json::Value>,
@@ -3585,9 +3584,8 @@ mod tests {
         assert_eq!(built.ids, vec!["mov-1", "mov-2", "mov-3", "mov-1", "mov-2"]);
         assert_eq!(built.audits.len(), built.ids.len());
         for (id, audit) in built.ids.iter().zip(&built.audits) {
-            let trail = audit;
-            assert_eq!(trail.len(), 1, "{id}: one draw, one record");
-            assert_eq!(trail[0]["stage"], "select");
+            assert_eq!(audit.len(), 1, "{id}: one draw, one record");
+            assert_eq!(audit[0]["stage"], "select");
         }
     }
 
