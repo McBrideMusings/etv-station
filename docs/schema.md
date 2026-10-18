@@ -2503,8 +2503,16 @@ reads as `metadata.attribution`. `ctx.http` calls across the whole pass share on
 
 ### Pattern step `take` — how many items one visit draws
 
-A step in a block's `pattern:` is `{pool, take, from, chance}`. `take` has
-three forms:
+A step in a block's `pattern:` has four fields:
+
+| Field | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `pool` | yes | none | name of a pool declared in the same block's `pools:` |
+| `take` | yes | none | how many items one visit draws (forms below) |
+| `from` | no | `start` | where in the series the visit cuts its items |
+| `chance` | no | `1.0` | probability the step fires on a pass through the pattern |
+
+`take` has three forms:
 
 | Form | Example | One visit draws |
 | --- | --- | --- |
@@ -2529,6 +2537,28 @@ A range follows the same rules as a count wherever a count is checked:
 - Adjacency `constraints` size their seam for the widest cycle the range can
   produce: every range counted at `max` for the cycle length and at `min` for
   how often the pool is drawn.
+
+#### Pattern step `from` — where in the series a visit cuts
+
+`from` takes one of three values and defaults to `start`:
+
+| Value | One visit draws |
+| --- | --- |
+| `start` | the next `take` items from where the series left off: its resume point, or its top on a first visit. The only value that continues a series across visits |
+| `end` | the last `take` items of the series, in list order. The position is absolute and ignores the resume point, so every visit airs the same final episodes |
+| `random` | `take` consecutive items starting at a seeded random offset, in list order. Absolute like `end`, and re-rolled on every visit; a pinned `seed:` reproduces it |
+
+`from: end` is not `order: "episode:desc"`: the order sort would also air the
+episodes backwards, while `from` moves only the cut.
+
+#### Pattern step `chance` — a step that fires only some passes
+
+`chance` is a number from `0.0` to `1.0`, default `1.0`, which always fires. At
+`0.25` the step fires on about one pass in four. The roll comes from the channel
+`seed` and the step's position, so a pinned `seed:` reproduces the whole
+skip/fire sequence. A skipped step airs nothing and does not advance the pool's
+resume point. This differs from a `take` range, where the visit always airs and
+only its length varies.
 
 ### Pool `constraints` — spacing counted in a pool's own draw order
 
