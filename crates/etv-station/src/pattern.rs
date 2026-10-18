@@ -4037,6 +4037,90 @@ mod tests {
         );
     }
 
+    fn random_resume_pool(advance: Advance) -> Pool {
+        let mut p = shows_pool();
+        p.select = Select::Random;
+        p.advance = advance;
+        p
+    }
+
+    /// The cycle count a resuming pool records is the number of cycles walked
+    /// so far, across generations; a `restart` pool records none.
+    #[test]
+    fn a_resume_pool_records_its_cycle_and_a_restart_pool_records_zero() {
+        let cycle_after = |advance, state: &GenerationState| {
+            let (_, next) = build_with(
+                vec![random_resume_pool(advance)],
+                vec![step("shows", 1)],
+                Some(3),
+                state,
+                5,
+            );
+            next
+        };
+        let resume = cycle_after(Advance::Resume, &GenerationState::empty());
+        assert_eq!(resume.resume.pool("shows").unwrap().cycle, 3);
+        let again = cycle_after(Advance::Resume, &resume);
+        assert_eq!(again.resume.pool("shows").unwrap().cycle, 6);
+
+        let restart = cycle_after(Advance::Restart, &GenerationState::empty());
+        assert_eq!(restart.resume.pool("shows").unwrap().cycle, 0);
+    }
+
+    /// Rewinding restores the recorded cycle, so a regenerated span draws the
+    /// same random series as the span it replaces.
+    #[test]
+    fn rewind_restores_the_cycle_so_a_regenerated_span_reproduces_its_rolls() {
+        let pool = || random_resume_pool(Advance::Resume);
+        let (_, first) = build_with(
+            vec![pool()],
+            vec![step("shows", 1)],
+            Some(4),
+            &GenerationState::empty(),
+            34,
+        );
+        let start = time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(6);
+        let mut map = first.resume.clone();
+        map.checkpoint(start);
+        let (original, after) =
+            build_with(vec![pool()], vec![step("shows", 1)], Some(4), &first, 34);
+        assert_eq!(after.resume.pool("shows").unwrap().cycle, 8);
+
+        // Later generations push the live cycle further on…
+        map.pools = after.resume.pools.clone();
+        assert_eq!(map.rewind_to(start), Some(start));
+        assert_eq!(map.pool("shows").unwrap().cycle, 4);
+
+        // …and the rewound state regenerates the span identically.
+        let rewound = GenerationState {
+            resume: map,
+            ..first.clone()
+        };
+        let (regenerated, _) =
+            build_with(vec![pool()], vec![step("shows", 1)], Some(4), &rewound, 34);
+        assert_eq!(regenerated, original);
+    }
+
+    /// The cycle survives the sidecar's JSON, and a sidecar written before the
+    /// field existed loads as cycle 0.
+    #[test]
+    fn the_cycle_round_trips_through_json_and_an_old_sidecar_loads_as_zero() {
+        let (_, state) = build_with(
+            vec![random_resume_pool(Advance::Resume)],
+            vec![step("shows", 1)],
+            Some(3),
+            &GenerationState::empty(),
+            5,
+        );
+        let json = serde_json::to_string(&state.resume).unwrap();
+        let loaded: ResumeMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.pool("shows").unwrap().cycle, 3);
+
+        let old: PoolResume = serde_json::from_str(r#"{"next":"show:inv"}"#).unwrap();
+        assert_eq!(old.cycle, 0);
+        assert_eq!(old.next.as_deref(), Some("show:inv"));
+    }
+
     /// A seeded random selection reproduces exactly.
     #[test]
     fn select_random_is_reproducible_for_a_pinned_seed() {
