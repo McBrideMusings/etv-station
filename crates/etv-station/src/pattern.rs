@@ -6068,4 +6068,201 @@ fn audit(ctx, picks, workspace) { #{} }
         .unwrap();
         assert_eq!(built.lists.keys().collect::<Vec<_>>(), vec!["movies"]);
     }
+
+    // ---- the visit-boundary stop's edges (etv-station-8qml) --------------
+
+    /// What the daemon hands the next generation after `built`.
+    fn resumed_state(built: &BlockBuild) -> GenerationState {
+        let mut resume = ResumeMap::new();
+        resume.pools = built.resume.clone();
+        resume.lists = built.lists.clone();
+        GenerationState {
+            resume,
+            cursor: built
+                .ids
+                .iter()
+                .map(|id| (id.clone(), id.clone()))
+                .collect(),
+            tail: built.ids.clone(),
+            global_cursor: Default::default(),
+        }
+    }
+
+    fn walk_window(
+        cat: &Catalog,
+        pools: &[Pool],
+        pattern: &[PatternStep],
+        state: &GenerationState,
+        fill_hours: u64,
+    ) -> BlockBuild {
+        build(
+            cat,
+            pools,
+            &[],
+            pattern,
+            None,
+            None,
+            state,
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
+            test_env(),
+            Some(Duration::from_secs(fill_hours * 3600)),
+            None,
+        )
+        .expect("pattern builds")
+    }
+
+    /// The stop is checked before a step's chance roll, so a step that would
+    /// have been skipped still marks the boundary: generation one ends before
+    /// it, generation two skips it and carries on with the step after.
+    #[test]
+    fn a_chance_skipped_step_at_the_boundary_is_stepped_over_on_resume() {
+        let cat = hourly_movies(24);
+        let mut movies = movies_pool();
+        movies.advance = Advance::Resume;
+        let mut skipped = step("movies", 1);
+        skipped.chance = 0.0;
+        let pattern = [step("movies", 1), skipped, step("movies", 1)];
+
+        let first = walk_window(
+            &cat,
+            std::slice::from_ref(&movies),
+            &pattern,
+            &GenerationState::empty(),
+            1,
+        );
+        assert_eq!(first.ids, vec!["mov-01"]);
+        let held = &first.resume["movies"];
+        assert_eq!(
+            (held.cycle, held.step),
+            (0, 1),
+            "stopped before the skipped step"
+        );
+
+        let second = walk_window(
+            &cat,
+            std::slice::from_ref(&movies),
+            &pattern,
+            &resumed_state(&first),
+            1,
+        );
+        assert_eq!(
+            second.ids,
+            vec!["mov-02"],
+            "the skip drew nothing and ate no cursor"
+        );
+        let held = &second.resume["movies"];
+        assert_eq!((held.cycle, held.step), (1, 0));
+    }
+
+    /// A block holding a `restart` pool cannot resume at a step, so its window
+    /// ends only between cycles: a one-hour window still lays the whole
+    /// two-step cycle, and records the next cycle's start.
+    #[test]
+    fn a_block_with_a_restart_pool_stops_between_cycles() {
+        let cat = hourly_movies(24);
+        let mut movies = movies_pool();
+        movies.advance = Advance::Resume;
+        let mut alt = movies_pool();
+        alt.name = "alt".into();
+        let pattern = [step("movies", 1), step("alt", 1)];
+
+        let built = walk_window(&cat, &[movies, alt], &pattern, &GenerationState::empty(), 1);
+        assert_eq!(built.ids.len(), 2, "the whole cycle airs: {:?}", built.ids);
+        let held = &built.resume["movies"];
+        assert_eq!(
+            (held.cycle, held.step),
+            (1, 0),
+            "stopped on a cycle boundary"
+        );
+    }
+
+    /// A stored step beyond the end of the pattern, under a matching pattern
+    /// id, opens a cycle with no visits left rather than panicking or
+    /// replaying: the walk moves on to the next cycle and fills the window.
+    #[test]
+    fn a_stored_step_past_the_pattern_end_skips_to_the_next_cycle() {
+        let cat = hourly_movies(24);
+        let mut movies = movies_pool();
+        movies.advance = Advance::Resume;
+        let pattern = [step("movies", 1), step("movies", 1)];
+
+        let first = walk_window(
+            &cat,
+            std::slice::from_ref(&movies),
+            &pattern,
+            &GenerationState::empty(),
+            3,
+        );
+        let mut state = resumed_state(&first);
+        let held = state.resume.pools.get_mut("movies").unwrap();
+        held.step = 9;
+        held.pattern = Some(pattern_id(&pattern));
+
+        let second = walk_window(&cat, std::slice::from_ref(&movies), &pattern, &state, 3);
+        assert_eq!(second.ids, vec!["mov-04", "mov-05", "mov-06"]);
+        let held = &second.resume["movies"];
+        assert_eq!(
+            (held.cycle, held.step),
+            (3, 1),
+            "the empty cycle was counted"
+        );
+    }
+
+    /// A period rollover that lands on a visit of a mid-cycle resume re-ranks
+    /// the pool at that visit and keeps the cycle's place. Generation one ends
+    /// at 2026-01-03 00:00 before the cycle's second visit; generation two
+    /// opens there, so its first visit is the one that airs on the new day.
+    #[test]
+    fn a_rollover_during_a_mid_cycle_resume_reranks_at_that_visit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = restless_pool(dir.path());
+        pool.advance = Advance::Resume;
+        let variety = crate::variety::Variety::for_test(Some(every(1)), None);
+        let cat = film_catalog();
+        let pattern = [step("movies", 1), step("movies", 1)];
+        let go = |state: &GenerationState, start, hours: u64| {
+            build(
+                &cat,
+                std::slice::from_ref(&pool),
+                &[],
+                &pattern,
+                None,
+                None,
+                state,
+                &variety,
+                start,
+                test_env(),
+                Some(Duration::from_secs(hours * 3600)),
+                None,
+            )
+            .expect("pattern builds")
+        };
+
+        let first = go(
+            &GenerationState::empty(),
+            time::macros::datetime!(2026-01-02 23:00 UTC),
+            1,
+        );
+        assert_eq!(first.ids.len(), 1);
+        assert_eq!(first.resume["movies"].step, 1, "stopped mid-cycle");
+        let day1 = first.lists["movies"][0].clone();
+
+        let second = go(
+            &resumed_state(&first),
+            time::macros::datetime!(2026-01-03 00:00 UTC),
+            2,
+        );
+        let day2 = second.lists["movies"].last().unwrap();
+        assert_ne!(day2.key, day1.key, "the new day ranked a new list");
+        let lap: HashSet<&String> = first.ids.iter().collect();
+        let open = day2.ids.iter().position(|id| !lap.contains(id)).unwrap();
+        assert_eq!(
+            second.ids[0], day2.ids[open],
+            "the resumed visit opens the new list"
+        );
+        assert_eq!(second.ids.len(), 2);
+        let held = &second.resume["movies"];
+        assert_eq!((held.cycle, held.step), (1, 1), "the cycle kept its place");
+    }
 }
