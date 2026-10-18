@@ -363,22 +363,36 @@ pub fn resolve_channel_with_resume(
             window_start + time::Duration::seconds_f64(laid.as_secs_f64())
         };
         // The channel-wide repeat rule reads what aired before this block: the
-        // ledger's tail, then what earlier pattern and sequencer blocks of this
-        // generation already laid. An earlier entries block's span is not final
-        // yet — it is seated and cut below — so it is left out rather than
-        // counted with items that will never air.
+        // ledger's tail, then what earlier blocks of this generation already
+        // laid. An earlier entries span is seated and cut below, after every
+        // block has resolved, so it is read through the same window that cut
+        // will take — only the items that will air, not the whole list.
         let channel_aired: Vec<String> = match config.rule.no_repeat_within {
-            Some(_) if include.is_pattern() => state
-                .tail
-                .iter()
-                .cloned()
-                .chain(
-                    block_spans
-                        .iter()
-                        .filter(|(_, _, is_pattern)| *is_pattern)
-                        .flat_map(|&(start, end, _)| out[start..end].iter().map(|i| i.id.clone())),
-                )
-                .collect(),
+            Some(_) if include.is_pattern() => {
+                let mut aired: Vec<String> = state.tail.clone();
+                for &(start, end, is_pattern) in &block_spans {
+                    let span = &out[start..end];
+                    if is_pattern || span.is_empty() {
+                        aired.extend(span.iter().map(|i| i.id.clone()));
+                    } else {
+                        let (from, laid) = entries_window(
+                            span,
+                            state.resume.position,
+                            fill,
+                            catalog,
+                            nominal_item_runtime(config),
+                        );
+                        aired.extend(
+                            span.iter()
+                                .cycle()
+                                .skip(from)
+                                .take(laid)
+                                .map(|i| i.id.clone()),
+                        );
+                    }
+                }
+                aired
+            }
             _ => Vec::new(),
         };
         let channel_rule = config
@@ -1145,6 +1159,32 @@ fn items_covering(runtimes: &[Duration], fill: Duration) -> usize {
     runtimes.len().max(1)
 }
 
+/// Where an entries span is seated and how much of it is laid: `(start, laid)`,
+/// the list rotated left by `start` and truncated to its first `laid` items.
+/// [`cut_entries_window`] cuts with it, and the channel-wide repeat rule reads
+/// an earlier entries block through it, so both name the same items. `span`
+/// must not be empty.
+fn entries_window(
+    span: &[ResolvedItem],
+    position: usize,
+    fill: Option<Duration>,
+    catalog: Option<&Catalog>,
+    nominal: Duration,
+) -> (usize, usize) {
+    let total = span.len();
+    let start = position % total;
+    let laid = match fill {
+        Some(fill) => {
+            let mut runtimes = estimated_runtimes(span, catalog, nominal);
+            runtimes.rotate_left(start);
+            items_covering(&runtimes, fill)
+        }
+        // The stateless entry point wants the list whole.
+        None => total,
+    };
+    (start, laid)
+}
+
 /// Rotate-and-cut one contiguous span of `items` (and its parallel `limits` /
 /// `separate_fields` / `steps`) to seat it where the last generation left off
 /// and trim it to the airtime still wanted (#118) — used both for an
@@ -1180,19 +1220,10 @@ fn cut_entries_window(
     let mut span_fields: Vec<Option<String>> = separate_fields.drain(range.clone()).collect();
     steps.drain(range);
 
-    let start = position % total;
+    let (start, laid) = entries_window(&span_items, position, fill, catalog, nominal);
     span_items.rotate_left(start);
     span_limits.rotate_left(start);
     span_fields.rotate_left(start);
-
-    let laid = match fill {
-        Some(fill) => {
-            let runtimes = estimated_runtimes(&span_items, catalog, nominal);
-            items_covering(&runtimes, fill)
-        }
-        // The stateless entry point wants the list whole.
-        None => total,
-    };
     span_items.truncate(laid);
     span_limits.truncate(laid);
     span_fields.truncate(laid);
@@ -4152,6 +4183,91 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
         // entries cut living alongside it.
         assert!(resume.pool("movies").is_some());
         assert!(resume.pool("shows").is_some());
+    }
+
+    /// An entries block, then a one-cycle pattern block, under a channel-wide
+    /// `no_repeat_within` of ten positions.
+    fn entries_then_pattern_channel(entries: Vec<Entry>) -> ChannelConfig {
+        let entries_inc = include_with(entries);
+        let mut pattern_inc = interleave_block(crate::config::Advance::Restart);
+        pattern_inc.cycles = Some(1);
+        let mut cfg = channel(vec![entries_inc, pattern_inc]);
+        cfg.rule.no_repeat_within = Some(NoRepeatWithin::Positions(10));
+        cfg
+    }
+
+    fn movie_path_index() -> HashMap<String, String> {
+        HashMap::from([
+            ("/media/mov-1.mkv".to_string(), "mov-1".to_string()),
+            ("/media/mov-2.mkv".to_string(), "mov-2".to_string()),
+        ])
+    }
+
+    fn count_of(items: &[ResolvedItem], id: &str) -> usize {
+        items.iter().filter(|i| i.id == id).count()
+    }
+
+    /// The entries block lays `mov-1`, so the pattern block's movie draw moves
+    /// to `mov-2` instead of airing `mov-1` again minutes later.
+    #[test]
+    fn channel_repeat_rule_sees_an_earlier_entries_block_in_the_same_generation() {
+        let cat = interleave_catalog();
+        let cfg = entries_then_pattern_channel(vec![Entry::Item(Box::new(local_entry(
+            "/media/mov-1.mkv",
+        )))]);
+        let (items, _, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            Some(&movie_path_index()),
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            None,
+            t0(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            count_of(&items, "mov-1"),
+            1,
+            "mov-1 aired more than once: {ids:?}"
+        );
+        assert_eq!(
+            count_of(&items, "mov-2"),
+            1,
+            "pattern should draw mov-2: {ids:?}"
+        );
+    }
+
+    /// Only the items the entries window actually airs count: with a 30s window
+    /// over a two-item list, `mov-1` is cut, so the pattern block may draw it.
+    #[test]
+    fn channel_repeat_rule_ignores_entries_items_the_window_cuts() {
+        let cat = interleave_catalog();
+        let cfg = entries_then_pattern_channel(vec![
+            Entry::Item(Box::new(item_entry("x"))),
+            Entry::Item(Box::new(local_entry("/media/mov-1.mkv"))),
+        ]);
+        let (items, _, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            Some(&movie_path_index()),
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            Some(Duration::from_secs(30)),
+            t0(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            count_of(&items, "mov-1"),
+            1,
+            "pattern should draw mov-1: {ids:?}"
+        );
+        assert_eq!(count_of(&items, "lavfi:x"), 1, "{ids:?}");
     }
 
     /// The acceptance bar's second line: across two consecutive passes, the

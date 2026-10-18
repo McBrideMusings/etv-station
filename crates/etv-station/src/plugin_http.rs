@@ -199,6 +199,13 @@ pub(crate) mod tests {
                 body.len()
             );
             sock.write_all(reply.as_bytes()).unwrap();
+            // Close the way TCP intends: send FIN, then wait for the client to
+            // close its end. Dropping the socket outright lets the OS reset the
+            // connection if anything is still in flight, and a reset can
+            // overtake the response.
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+            while matches!(sock.read(&mut buf), Ok(n) if n > 0) {}
             request.lines().next().unwrap_or_default().to_string()
         });
         (url, handle)
