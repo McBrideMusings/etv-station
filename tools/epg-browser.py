@@ -617,10 +617,12 @@ def run_overlay_dump_text(overlay_spec: dict, programme: "Programme", next_title
     if not texts:
         suffix = f" ({sampled_at})" if sampled_at else ""
         return {"ok": True, "text": f"(no text layers drawn over this run{suffix})"}
-    lines = [
-        f"[{t.get('first_at', 0):.1f}s–{t.get('last_at', 0):.1f}s] {t.get('content', '')!r}"
-        for t in texts
-    ]
+    lines = []
+    for t in texts:
+        windows = t.get("windows", [])
+        spans = ", ".join(f"{a:.1f}s–{b:.1f}s" for a, b in windows)
+        noun = "window" if len(windows) == 1 else "windows"
+        lines.append(f"{t.get('content', '')!r}: {len(windows)} {noun} [{spans}]")
     if sampled_at:
         lines.append(f"({sampled_at})")
     return {"ok": True, "text": "\n".join(lines)}

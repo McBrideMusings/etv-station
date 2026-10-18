@@ -1070,13 +1070,18 @@ fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
 }
 
 /// One distinct text string an overlay script drew across the sampled run,
-/// and the window of sampled instants it occupied.
+/// and the contiguous runs of sampled instants it occupied.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct TextSpan {
     content: String,
-    first_at: f64,
-    last_at: f64,
+    /// `[start, end]` pairs, one per run of consecutive samples showing the
+    /// string. A caption that cycles on and off yields one window per
+    /// appearance; two appearances closer together than the sample interval
+    /// merge into one window.
+    windows: Vec<[f64; 2]>,
     sample_count: u32,
+    #[serde(skip)]
+    last_index: u32,
 }
 
 #[derive(serde::Serialize)]
@@ -1156,7 +1161,14 @@ fn collect_texts(
             };
             match spans.get_mut(content) {
                 Some(span) => {
-                    span.last_at = t;
+                    if span.last_index == i {
+                        // A second layer drawing the same string this sample.
+                    } else if span.last_index + 1 == i {
+                        span.windows.last_mut().expect("one window per span")[1] = t;
+                    } else {
+                        span.windows.push([t, t]);
+                    }
+                    span.last_index = i;
                     span.sample_count += 1;
                 }
                 None => {
@@ -1165,9 +1177,9 @@ fn collect_texts(
                         content.clone(),
                         TextSpan {
                             content: content.clone(),
-                            first_at: t,
-                            last_at: t,
+                            windows: vec![[t, t]],
                             sample_count: 1,
+                            last_index: i,
                         },
                     );
                 }
@@ -1312,13 +1324,42 @@ mod tests {
 
         assert_eq!(texts.len(), 1, "expected exactly one distinct string");
         assert_eq!(texts[0].content, "MOVIE TITLE");
-        assert_eq!(texts[0].first_at, 0.0);
+        assert_eq!(texts[0].windows.len(), 1);
+        assert_eq!(texts[0].windows[0][0], 0.0);
         assert!(
-            texts[0].last_at < 5.0,
-            "the title should only occupy the visible window, got last_at={}",
-            texts[0].last_at
+            texts[0].windows[0][1] < 5.0,
+            "the title should only occupy the visible window, got {:?}",
+            texts[0].windows
         );
         assert!(texts[0].sample_count >= 1);
+    }
+
+    /// The chyron fixture cycles every 12s and is visible for the first ~5s of
+    /// each cycle. Three cycles are three separate appearances of one string,
+    /// so the report must carry three windows, not one span from the first
+    /// sample to the last.
+    #[test]
+    fn dump_text_reports_one_window_per_disjoint_appearance() {
+        let spec = OverlaySpec::from_path(&fixture("fixtures/title_chyron.yaml")).unwrap();
+        let mut program = dump_program();
+        program.title = "MOVIE TITLE".to_string();
+
+        let texts = collect_texts(&spec, &program, 36.0, 36).unwrap();
+
+        assert_eq!(texts.len(), 1);
+        let windows = &texts[0].windows;
+        assert_eq!(windows.len(), 3, "got {windows:?}");
+        for (cycle, w) in windows.iter().enumerate() {
+            assert_eq!(
+                w[0],
+                12.0 * cycle as f64,
+                "window {cycle} start: {windows:?}"
+            );
+            assert!(
+                w[1] < 12.0 * cycle as f64 + 5.0,
+                "window {cycle} end: {windows:?}"
+            );
+        }
     }
 
     /// `now_and_next.rhai` (fixtures/channel_dynamic.yaml) draws "Now
@@ -1340,17 +1381,16 @@ mod tests {
             "expected now-playing and up-next both to appear"
         );
         assert_eq!(texts[0].content, "Now playing: The Office");
-        assert!(texts[0].first_at < texts[0].last_at || texts[0].sample_count == 1);
         assert!(
-            texts[0].last_at < 10.0,
-            "now-playing should only occupy the item's first 10s, got {}",
-            texts[0].last_at
+            texts[0].windows.last().unwrap()[1] < 10.0,
+            "now-playing should only occupy the item's first 10s, got {:?}",
+            texts[0].windows
         );
         assert_eq!(texts[1].content, "Up next: Seinfeld");
         assert!(
-            texts[1].first_at >= 20.0,
-            "up-next should only occupy the item's last 10s, got {}",
-            texts[1].first_at
+            texts[1].windows[0][0] >= 20.0,
+            "up-next should only occupy the item's last 10s, got {:?}",
+            texts[1].windows
         );
     }
 

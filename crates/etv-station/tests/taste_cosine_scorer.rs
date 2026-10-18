@@ -332,20 +332,31 @@ impl Scorer {
 /// enrichment at all. Catalog and store are built from one id list, so the two
 /// cannot drift apart.
 fn large_scorer(n_eligible: usize, n_ineligible: usize) -> Scorer {
-    let ids: Vec<String> = (0..n_eligible)
-        .map(|i| format!("el-{i:04}"))
-        .chain((0..n_ineligible).map(|i| format!("in-{i:04}")))
+    large_scorer_with(n_eligible, n_ineligible, |i| format!("in-{i:04}"))
+}
+
+/// `large_scorer` with the ineligible ids named by `ineligible_id`. Every
+/// score ties at 0.0 and the id breaks the tie, so the naming decides where
+/// the factless titles sit in the ranking.
+fn large_scorer_with(
+    n_eligible: usize,
+    n_ineligible: usize,
+    ineligible_id: impl Fn(usize) -> String,
+) -> Scorer {
+    let ids: Vec<(String, bool)> = (0..n_eligible)
+        .map(|i| (format!("el-{i:04}"), true))
+        .chain((0..n_ineligible).map(|i| (ineligible_id(i), false)))
         .collect();
-    let cat = catalog_of(ids.iter().map(String::as_str));
+    let cat = catalog_of(ids.iter().map(|(id, _)| id.as_str()));
     Scorer::new(&cat, |db| {
         let conn = empty_store(db);
-        for (i, id) in ids.iter().enumerate() {
+        for (i, (id, eligible)) in ids.iter().enumerate() {
             conn.execute(
                 "INSERT INTO items (item_id, type) VALUES (?1, 'movie')",
                 [id],
             )
             .unwrap();
-            if id.starts_with("el-") {
+            if *eligible {
                 conn.execute(
                     "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
                      VALUES (?1, 'keywords', 'keyword', ?2, 't')",
@@ -842,6 +853,37 @@ fn a_picks_near_misses_name_the_candidates_ranked_above_it() {
             );
         }
     }
+}
+
+/// #403: a near miss with no usable keyword facts must say so, not borrow the
+/// exploration-coin-flip reason that describes a candidate the script
+/// actually scored. Each factless id sorts directly after an eligible one, so
+/// an exploration pick has unplaced factless candidates ranked above it.
+#[test]
+fn a_near_miss_with_no_facts_says_so() {
+    let scorer = large_scorer_with(200, 200, |i| format!("el-{i:04}x"));
+    let picked = scorer.pick("movies", 42, 40, Some(0.5));
+
+    let mut factless = 0;
+    for p in &picked {
+        for nm in detail_of(p)["near_misses"].as_array().unwrap() {
+            let id = nm["id"].as_str().unwrap();
+            let reason = nm["reason"].as_str().unwrap();
+            if id.ends_with('x') && !reason.starts_with("already placed") {
+                factless += 1;
+                assert!(
+                    reason.starts_with("no usable keyword facts"),
+                    "{id} has no facts but was given: {reason}"
+                );
+            } else if !id.ends_with('x') {
+                assert!(
+                    !reason.starts_with("no usable keyword facts"),
+                    "{id} has facts but was told it has none: {reason}"
+                );
+            }
+        }
+    }
+    assert!(factless > 0, "fixture never produced a factless near miss");
 }
 
 /// #393's acceptance criterion: the near-miss list must not blow the

@@ -1048,6 +1048,8 @@ fn pick(ctx) {
             let cand = scored[nm_idx];
             let reason = if used[cand.id] != () {
                 "already placed by an earlier slot in this generation"
+            } else if !cand.eligible {
+                "no usable keyword facts: scored 0.0 with nothing to rank on, so no reason is known"
             } else {
                 "passed over: this slot drew the seeded exploration coin flip"
             };
