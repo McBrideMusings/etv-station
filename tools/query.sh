@@ -26,4 +26,7 @@ if [ -f .env ]; then
   source .env
   set +a
 fi
-exec cargo run --quiet -p etv-query-test -- query "$@"
+# No `--quiet`: on a cold target/ the build takes minutes, and cargo's
+# "Compiling ..." lines are the only sign it isn't hung.
+echo "query: building (minutes on a cold target/, seconds after)..." >&2
+exec cargo run -p etv-query-test -- query "$@"
