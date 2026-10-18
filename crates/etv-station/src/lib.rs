@@ -28,6 +28,7 @@ pub mod pattern;
 pub mod plugin_http;
 pub mod profile;
 pub mod reconcile;
+pub mod reset;
 pub mod resolve;
 pub mod resume;
 pub mod review;
