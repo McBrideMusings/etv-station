@@ -981,7 +981,11 @@ def build_app(host: str):
             now = datetime.now(timezone.utc)
             all_progs = programmes_for(self.programmes, self.selected_channel)
             if self.history:
-                horizon = now - timedelta(days=self.HISTORY_DAYS)
+                # Floored to the block grid: a horizon that tracks `now` to the
+                # second moves the "Start of retained EPG" row's text every
+                # tick, so _apply_programme_rows never sees an identical
+                # signature and rebuilds every row (#380).
+                horizon = self._floor_block(now - timedelta(days=self.HISTORY_DAYS), self.BLOCK_MINUTES)
                 progs_win = [p for p in all_progs if p.stop > horizon and p.start < now]
             else:
                 progs_win = [p for p in all_progs if p.stop > now]
