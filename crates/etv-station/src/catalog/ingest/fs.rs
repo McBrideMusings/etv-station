@@ -108,11 +108,10 @@ pub async fn ingest_roots(
     files.sort();
     files.dedup();
 
-    let mut probed: Vec<(PathBuf, Option<f64>)> = Vec::with_capacity(files.len());
-    for path in files {
-        let secs = ffprobe_seconds(&path).await;
-        probed.push((path, secs));
-    }
+    let probed = probe_concurrently(files, PROBE_CONCURRENCY, |path| async move {
+        ffprobe_seconds(&path).await
+    })
+    .await;
     // All writes in one transaction: a failure part-way rolls back, never
     // leaving a half-scanned catalog.
     //
@@ -213,6 +212,51 @@ pub fn ingest_files(
         stats.entries_marked_missing = catalog.mark_entries_missing_without_live_sources(stamp)?;
     }
     Ok(stats)
+}
+
+/// Probes in flight at once. A file on a stale mount costs the full
+/// [`crate::ffprobe::PROBE_TIMEOUT`]; run one at a time, N such files cost
+/// N × 10s of scan time.
+const PROBE_CONCURRENCY: usize = 8;
+
+/// Run `probe` over every file with at most `limit` in flight, returning the
+/// results in the order of `files` so the write pass stays deterministic.
+async fn probe_concurrently<F, Fut>(
+    files: Vec<PathBuf>,
+    limit: usize,
+    probe: F,
+) -> Vec<(PathBuf, Option<f64>)>
+where
+    F: Fn(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Option<f64>> + Send + 'static,
+{
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, path) in files.iter().cloned().enumerate() {
+        let gate = gate.clone();
+        let fut = probe(path);
+        set.spawn(async move {
+            let _permit = gate
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            (idx, fut.await)
+        });
+    }
+    let mut secs: Vec<Option<f64>> = vec![None; files.len()];
+    while let Some(done) = set.join_next().await {
+        // A panicked probe task leaves its file's duration unknown, the same
+        // as a failed probe.
+        match done {
+            Ok((idx, s)) => secs[idx] = s,
+            Err(e) => tracing::warn!(
+                event = "catalog.probe_task_failed",
+                error = %e,
+                "probe task panicked; its file keeps an unknown duration"
+            ),
+        }
+    }
+    files.into_iter().zip(secs).collect()
 }
 
 /// The file's stem as its title (`station-bumper-01.mp4` → `station-bumper-01`).
@@ -854,6 +898,41 @@ mod tests {
         // Two rows on the books, one of them missing — the moved-from path is
         // kept so the file moving back is a re-match, not a fresh entry.
         assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
+    }
+
+    /// 16 files that each take 200ms to probe finish in about two waves at a
+    /// limit of 8, not 16 serial waits, and results keep the input order.
+    #[tokio::test]
+    async fn probes_overlap_up_to_the_limit_and_keep_input_order() {
+        let files: Vec<PathBuf> = (0..16)
+            .map(|i| PathBuf::from(format!("/m/{i}.mp4")))
+            .collect();
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let out = probe_concurrently(files.clone(), 8, |path| {
+            let (in_flight, peak) = (in_flight.clone(), peak.clone());
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let n: f64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+                Some(n)
+            }
+        })
+        .await;
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            8,
+            "probes must overlap up to the limit and never beyond it"
+        );
+        assert_eq!(out.len(), 16);
+        for (i, (path, secs)) in out.iter().enumerate() {
+            assert_eq!(path, &files[i]);
+            assert_eq!(*secs, Some(i as f64));
+        }
     }
 
     #[test]
