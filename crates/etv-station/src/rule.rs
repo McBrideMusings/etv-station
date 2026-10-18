@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use ersatztv_playout::playout::{PlayoutItem, PlayoutItemTracks, ProgramMetadata, TrackSelection};
+use ersatztv_playout::playout::{
+    PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProgramMetadata, TrackSelection,
+};
 use time::OffsetDateTime;
 
 use crate::resolve::ResolvedItem;
@@ -200,15 +202,23 @@ fn build_playout_item(
     // A plugin pool's metadata blob (#166), carried untouched from
     // `ResolvedItem::metadata`, which always holds at least an `audit` trail.
     playout_item.metadata = item.metadata.clone();
-    playout_item.tracks = item.selected.and_then(playout_tracks);
+    playout_item.tracks = item
+        .selected
+        .as_ref()
+        .and_then(|selected| playout_tracks(selected, item));
     playout_item
 }
 
 /// The `tracks` block for a selection: the audio stream and the subtitle
 /// stream the station chose, as the integers ETV-next reads. A subtitle
 /// selection is also what makes ETV-next offer the channel's subtitle track,
-/// so an item with no subtitle chosen writes none.
-fn playout_tracks(selected: crate::resolve::SelectedTracks) -> Option<PlayoutItemTracks> {
+/// so an item with no subtitle chosen writes none. A sidecar subtitle names
+/// its own file as the track's source, cut with the item's in and out points
+/// so its cues line up with the picture.
+fn playout_tracks(
+    selected: &crate::resolve::SelectedTracks,
+    item: &ResolvedItem,
+) -> Option<PlayoutItemTracks> {
     let pick = |stream_index: Option<u32>| {
         stream_index.map(|i| TrackSelection {
             source: None,
@@ -216,7 +226,15 @@ fn playout_tracks(selected: crate::resolve::SelectedTracks) -> Option<PlayoutIte
         })
     };
     let audio = pick(selected.audio);
-    let subtitle = pick(selected.subtitle);
+    let mut subtitle = pick(selected.subtitle);
+    if let (Some(track), Some(path)) = (subtitle.as_mut(), &selected.subtitle_sidecar) {
+        let ms = |d: Duration| d.as_millis() as u64;
+        track.source = Some(PlayoutItemSource::local(
+            path.clone(),
+            item.in_point.map(ms),
+            item.out_point.map(ms),
+        ));
+    }
     if audio.is_none() && subtitle.is_none() {
         return None;
     }
@@ -254,6 +272,7 @@ mod tests {
         item.selected = Some(crate::resolve::SelectedTracks {
             audio: Some(2),
             subtitle: Some(5),
+            subtitle_sidecar: None,
         });
         let start = time::macros::datetime!(2026-04-13 00:00 UTC);
         let playout = build_playout_item(&item, start, start + time::Duration::minutes(1));
@@ -269,11 +288,42 @@ mod tests {
         item.selected = Some(crate::resolve::SelectedTracks {
             audio: Some(1),
             subtitle: None,
+            subtitle_sidecar: None,
         });
         let start = time::macros::datetime!(2026-04-13 00:00 UTC);
         let playout = build_playout_item(&item, start, start + time::Duration::minutes(1));
         assert!(!playout.requests_subtitle());
         assert_eq!(playout.tracks.unwrap().audio.unwrap().stream_index, Some(1));
+    }
+
+    #[test]
+    fn a_sidecar_subtitle_names_its_own_file_with_the_items_cut() {
+        let mut item = lavfi("a", 60);
+        item.in_point = Some(Duration::from_secs(30));
+        item.out_point = Some(Duration::from_secs(90));
+        item.selected = Some(crate::resolve::SelectedTracks {
+            audio: Some(1),
+            subtitle: Some(0),
+            subtitle_sidecar: Some("/media/Movie.en.srt".into()),
+        });
+        let start = time::macros::datetime!(2026-04-13 00:00 UTC);
+        let playout = build_playout_item(&item, start, start + time::Duration::minutes(1));
+        assert!(playout.requests_subtitle());
+        let subtitle = playout.tracks.unwrap().subtitle.unwrap();
+        assert_eq!(subtitle.stream_index, Some(0));
+        match subtitle.source.expect("sidecar source") {
+            ersatztv_playout::playout::PlayoutItemSource::Local {
+                path,
+                in_point_ms,
+                out_point_ms,
+                ..
+            } => {
+                assert_eq!(path, "/media/Movie.en.srt");
+                assert_eq!(in_point_ms, Some(30_000));
+                assert_eq!(out_point_ms, Some(90_000));
+            }
+            other => panic!("expected a local source, got {other:?}"),
+        }
     }
 
     #[test]

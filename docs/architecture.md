@@ -58,6 +58,16 @@ playlist announces it:
 With nothing configured, an item gets the first text subtitle stream its file
 lists. Audio is the file's default-flagged stream, or its first.
 
+**A subtitle file beside the media file counts when the file's own streams give
+none.** `Movie.srt`, `Movie.en.srt` and `Movie.en.forced.srt` (also `.ass`,
+`.ssa`, `.vtt`) beside `Movie.mp4` are each treated as a one-stream file and run
+through the same `subtitle` rules, ranked against each other by `prefer` order
+(file name breaks ties). The winner is written as `tracks.subtitle` with the sidecar as its own `source`, cut with the
+item's in and out points. The tags after the media file's name must be a
+language code or `forced`, `sdh`, `hi`, `cc`, `default`, so
+`Movie.Extended.en.srt` does not belong to `Movie.mp4`. The language comes from
+the tag; an untagged file has none and matches no `lang:` rule.
+
 **A picture subtitle is burned in only when a rule names it.** Blu-ray and DVD
 rips carry subtitles as pictures (`hdmv_pgs_subtitle`, `dvd_subtitle`), which
 cannot become WebVTT. If a rule selects one, ETV-next paints it into the video and

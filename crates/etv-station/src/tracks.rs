@@ -8,7 +8,7 @@
 //! skip a commentary track are all rules the config states.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -124,14 +124,7 @@ pub fn select(streams: &[StreamInfo], rules: &CompiledRules) -> Selection {
         .and_then(|p| streams.iter().find(|s| s.index == p.index))
         .and_then(|s| s.lang.as_deref());
 
-    let subtitles: Vec<&StreamInfo> = streams
-        .iter()
-        .filter(|s| s.kind == StreamKind::Subtitle)
-        .collect();
-    let subtitle_survivors = survivors(&subtitles, &rules.subtitle, audio_lang);
-    // No fallback for subtitles: an unconfigured picture subtitle must never be
-    // burned into a viewer's picture because nothing else matched.
-    let subtitle_pick = prefer(&subtitle_survivors, &rules.subtitle, audio_lang);
+    let subtitle_pick = select_subtitle(streams, rules, audio_lang);
 
     Selection {
         audio: audio_pick,
@@ -139,6 +132,126 @@ pub fn select(streams: &[StreamInfo], rules: &CompiledRules) -> Selection {
         audio_unmatched,
         audio_all_excluded,
     }
+}
+
+/// Choose among `streams`' subtitle streams. `audio_lang` is the language of
+/// the audio stream that will play, which `when:` conditions read.
+fn select_subtitle(
+    streams: &[StreamInfo],
+    rules: &CompiledRules,
+    audio_lang: Option<&str>,
+) -> Option<Pick> {
+    let subtitles: Vec<&StreamInfo> = streams
+        .iter()
+        .filter(|s| s.kind == StreamKind::Subtitle)
+        .collect();
+    let subtitle_survivors = survivors(&subtitles, &rules.subtitle, audio_lang);
+    // No fallback for subtitles: an unconfigured picture subtitle must never be
+    // burned into a viewer's picture because nothing else matched.
+    prefer(&subtitle_survivors, &rules.subtitle, audio_lang)
+}
+
+/// A subtitle file beside a media file, described as the one stream it holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sidecar {
+    pub path: String,
+    pub info: StreamInfo,
+}
+
+/// Extensions of text subtitle files ETV-next can convert to WebVTT, and the
+/// codec name each one's single stream reports.
+fn sidecar_codec(ext: &str) -> Option<&'static str> {
+    match ext {
+        "srt" => Some("subrip"),
+        "ass" | "ssa" => Some("ass"),
+        "vtt" => Some("webvtt"),
+        _ => None,
+    }
+}
+
+/// Read `file_name` as a sidecar of the media file whose name without
+/// extension is `media_stem`: `Movie.srt`, `Movie.en.srt`,
+/// `Movie.en.forced.srt`. Every dot-separated tag after the stem must be a
+/// language code or one of `forced`, `sdh`, `hi`, `cc`, `default`, so
+/// `Movie.Extended.mkv` does not claim `Movie.Extended.en.srt` for `Movie`.
+fn parse_sidecar(media_stem: &str, file_name: &str) -> Option<StreamInfo> {
+    let (base, ext) = file_name.rsplit_once('.')?;
+    let codec = sidecar_codec(&ext.to_ascii_lowercase())?;
+    let rest = base.strip_prefix(media_stem)?;
+    let tags = if rest.is_empty() {
+        ""
+    } else {
+        rest.strip_prefix('.')?
+    };
+
+    let mut info = StreamInfo {
+        index: 0,
+        kind: StreamKind::Subtitle,
+        codec: codec.into(),
+        lang: None,
+        title: (!tags.is_empty()).then(|| tags.to_string()),
+        channels: None,
+        default: false,
+        forced: false,
+    };
+    if tags.is_empty() {
+        return Some(info);
+    }
+    for tag in tags.split('.') {
+        match tag.to_ascii_lowercase().as_str() {
+            "forced" => info.forced = true,
+            "default" => info.default = true,
+            "sdh" | "hi" | "cc" => {}
+            t if info.lang.is_none() && is_language_tag(t) => info.lang = Some(t.into()),
+            _ => return None,
+        }
+    }
+    Some(info)
+}
+
+/// `en`, `eng`, `pt-br`, `zh-hans`.
+fn is_language_tag(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let primary = parts.next().unwrap_or("");
+    (2..=3).contains(&primary.len())
+        && primary.bytes().all(|b| b.is_ascii_lowercase())
+        && parts.all(|p| (2..=4).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// The subtitle files beside `media`, from the names in its directory
+/// (`siblings`, subtitle-extension files only), ordered by name.
+fn sidecars_among(media: &Path, siblings: &[String]) -> Vec<Sidecar> {
+    let Some(stem) = media.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let dir = media.parent().unwrap_or_else(|| Path::new(""));
+    let mut found: Vec<Sidecar> = siblings
+        .iter()
+        .filter_map(|name| {
+            parse_sidecar(stem, name).map(|info| Sidecar {
+                path: dir.join(name).to_string_lossy().into_owned(),
+                info,
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+/// The names of the subtitle files in `dir`. An unreadable directory has none:
+/// the media file was probed from it, so the item still plays.
+fn subtitle_file_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| {
+            name.rsplit_once('.')
+                .is_some_and(|(_, ext)| sidecar_codec(&ext.to_ascii_lowercase()).is_some())
+        })
+        .collect()
 }
 
 fn survivors<'a>(
@@ -207,6 +320,7 @@ pub fn assign(
     let mut tally = Tally::default();
     let mut by_block: HashMap<usize, Option<CompiledRules>> = HashMap::new();
     let mut by_rules: HashMap<String, Option<CompiledRules>> = HashMap::new();
+    let mut dirs: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
     for item in items.iter_mut() {
         let SourceConfig::Local { path } = &item.source else {
@@ -246,8 +360,34 @@ pub fn assign(
             continue;
         };
 
-        let selection = select(streams, compiled);
+        let mut selection = select(streams, compiled);
         let is_burned = burned(&selection, streams);
+
+        // No subtitle stream inside the file won: try the subtitle files
+        // beside it, under the same rules.
+        let mut sidecar = None;
+        if selection.subtitle.is_none() {
+            let dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+            let names = dirs
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| subtitle_file_names(dir));
+            let audio_lang = selection
+                .audio
+                .and_then(|p| streams.iter().find(|s| s.index == p.index))
+                .and_then(|s| s.lang.as_deref());
+            // Each sidecar gets a distinct position as its index so the
+            // `prefer` order ranks them against each other; the track written
+            // to the playout is always stream 0 of the chosen file.
+            let mut candidates = sidecars_among(Path::new(path), names);
+            for (position, candidate) in candidates.iter_mut().enumerate() {
+                candidate.info.index = position as u32;
+            }
+            let infos: Vec<StreamInfo> = candidates.iter().map(|c| c.info.clone()).collect();
+            if let Some(pick) = select_subtitle(&infos, compiled, audio_lang) {
+                sidecar = Some(candidates.swap_remove(pick.index as usize).path);
+                selection.subtitle = Some(Pick { index: 0, ..pick });
+            }
+        }
         tracing::debug!(
             event = "tracks.selected",
             channel = %channel,
@@ -255,6 +395,7 @@ pub fn assign(
             path = %path,
             audio = ?selection.audio,
             subtitle = ?selection.subtitle,
+            subtitle_sidecar = ?sidecar,
             burned = is_burned,
             streams = streams.len(),
             "chose this item's audio and subtitle streams",
@@ -295,6 +436,7 @@ pub fn assign(
         item.selected = Some(SelectedTracks {
             audio: selection.audio.map(|p| p.index),
             subtitle: selection.subtitle.map(|p| p.index),
+            subtitle_sidecar: sidecar,
         });
     }
     tally
@@ -531,7 +673,7 @@ mod tests {
     }
 
     fn picked(items: &[ResolvedItem]) -> (Option<u32>, Option<u32>) {
-        let s = items[0].selected.expect("selected");
+        let s = items[0].selected.as_ref().expect("selected");
         (s.audio, s.subtitle)
     }
 
@@ -570,8 +712,8 @@ mod tests {
         let mut items = vec![local_item(0, None), local_item(1, None)];
         let tally = assign(&mut items, &cache, &levels, "ch");
 
-        assert_eq!(items[0].selected.unwrap().subtitle, None);
-        assert_eq!(items[1].selected.unwrap().subtitle, Some(2));
+        assert_eq!(items[0].selected.as_ref().unwrap().subtitle, None);
+        assert_eq!(items[1].selected.as_ref().unwrap().subtitle, Some(2));
         assert_eq!((tally.items, tally.burned), (2, 1));
     }
 
@@ -643,6 +785,109 @@ mod tests {
         let streams = [audio(1, "eng", "", 2, true), sub(2, "eng", "dvb_subtitle")];
         assert_eq!(run("{}", &streams).subtitle, None);
         assert!(sub(3, "eng", "xsub").is_image());
+    }
+
+    #[test]
+    fn sidecar_names_read_language_and_flags() {
+        let s = parse_sidecar("Movie", "Movie.en.srt").unwrap();
+        assert_eq!(
+            (s.lang.as_deref(), s.codec.as_str()),
+            (Some("en"), "subrip")
+        );
+        let s = parse_sidecar("Movie", "Movie.eng.forced.SRT").unwrap();
+        assert_eq!((s.lang.as_deref(), s.forced), (Some("eng"), true));
+        let s = parse_sidecar("Movie", "Movie.srt").unwrap();
+        assert_eq!(s.lang, None);
+        assert_eq!(parse_sidecar("Movie", "Movie.ass").unwrap().codec, "ass");
+        assert_eq!(
+            parse_sidecar("Movie", "Movie.pt-br.vtt")
+                .unwrap()
+                .lang
+                .as_deref(),
+            Some("pt-br")
+        );
+    }
+
+    #[test]
+    fn a_longer_titles_subtitle_is_not_this_files_sidecar() {
+        assert!(parse_sidecar("Movie", "Movie.Extended.en.srt").is_none());
+        assert!(parse_sidecar("Movie", "Movie2.en.srt").is_none());
+        assert!(parse_sidecar("Movie", "Movie.en.mkv").is_none());
+        assert!(parse_sidecar("Movie", "Other.en.srt").is_none());
+    }
+
+    #[test]
+    fn a_sidecar_is_chosen_only_when_the_files_own_streams_gave_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("Movie.mp4");
+        std::fs::write(dir.path().join("Movie.en.srt"), "").unwrap();
+        std::fs::write(dir.path().join("Movie.fr.srt"), "").unwrap();
+        let path = media.to_string_lossy().into_owned();
+        let rules =
+            rules_of("subtitle: { inherit: false, prefer: [ { image: false, lang: '^en' } ] }");
+        let levels = Levels {
+            station: Some(&rules),
+            channel: None,
+            blocks: vec![None],
+        };
+        let item = |tracks| {
+            let mut i = local_item(0, tracks);
+            i.source = SourceConfig::Local { path: path.clone() };
+            i
+        };
+
+        let cache = DurationCache::with_streams(&path, vec![audio(1, "eng", "", 2, true)]);
+        let mut items = vec![item(None)];
+        let tally = assign(&mut items, &cache, &levels, "ch");
+        let sel = items[0].selected.as_ref().unwrap();
+        assert_eq!(sel.subtitle, Some(0));
+        assert_eq!(
+            sel.subtitle_sidecar.as_deref(),
+            Some(dir.path().join("Movie.en.srt").to_str().unwrap())
+        );
+        assert_eq!(tally.with_subtitle, 1);
+
+        // An embedded text track that matches wins; the sidecar is not used.
+        let cache = DurationCache::with_streams(
+            &path,
+            vec![audio(1, "eng", "", 2, true), sub(2, "eng", "subrip")],
+        );
+        let mut items = vec![item(None)];
+        assign(&mut items, &cache, &levels, "ch");
+        let sel = items[0].selected.as_ref().unwrap();
+        assert_eq!(
+            (sel.subtitle, sel.subtitle_sidecar.as_deref()),
+            (Some(2), None)
+        );
+
+        // `prefer` order ranks sidecars: a plain English file beats a forced one
+        // even though the forced file's name sorts first.
+        std::fs::write(dir.path().join("Movie.en.srt"), "").unwrap();
+        std::fs::write(dir.path().join("Movie.en.forced.srt"), "").unwrap();
+        let ranked = rules_of(
+            "subtitle: { inherit: false, prefer: [ { lang: '^en', forced: false }, { lang: '^en' } ] }",
+        );
+        let ranked_levels = Levels {
+            station: Some(&ranked),
+            channel: None,
+            blocks: vec![None],
+        };
+        let cache = DurationCache::with_streams(&path, vec![audio(1, "eng", "", 2, true)]);
+        let mut items = vec![item(None)];
+        assign(&mut items, &cache, &ranked_levels, "ch");
+        let sel = items[0].selected.as_ref().unwrap();
+        assert_eq!(
+            sel.subtitle_sidecar.as_deref(),
+            Some(dir.path().join("Movie.en.srt").to_str().unwrap())
+        );
+        std::fs::remove_file(dir.path().join("Movie.en.forced.srt")).unwrap();
+
+        // No rule matches the French file alone, so a lone `.fr.srt` is not offered.
+        std::fs::remove_file(dir.path().join("Movie.en.srt")).unwrap();
+        let cache = DurationCache::with_streams(&path, vec![audio(1, "eng", "", 2, true)]);
+        let mut items = vec![item(None)];
+        assign(&mut items, &cache, &levels, "ch");
+        assert_eq!(items[0].selected.as_ref().unwrap().subtitle, None);
     }
 
     #[test]
