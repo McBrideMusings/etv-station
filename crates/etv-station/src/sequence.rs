@@ -316,11 +316,13 @@ pub fn build(
         }
     }
 
+    let arranged_len = arranged.len();
     Ok(BlockBuild {
         ids: arranged,
         resume: resume_out,
         progress,
         metadata: metadata_out,
+        audits: vec![None; arranged_len],
         guides: guide_out,
         tracks: tracks_out,
         // Only this block's pools — see the same line in `pattern::build`.

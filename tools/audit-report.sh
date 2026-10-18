@@ -57,6 +57,9 @@ target="$user@$UNRAID_HOST"
 # `--list` is the machine form: one `name<TAB>label` line per channel, which is
 # what admin.toml's picker parses. Bare is the human form.
 #
+# A folder the station config no longer names is labelled "unconfigured" in
+# the second column; `--audit <name>` only resolves configured channels.
+#
 # `--list --format json` is a different machine form entirely: the number ->
 # name map the EPG TUI needs, which only the binary's own `--audit --list
 # --format json` can produce. Route that one straight to the container over
@@ -82,7 +85,19 @@ if [[ $# -eq 0 || ${1:-} == "--list" ]]; then
   # the one cheap fact that tells a channel with a full window apart from one
   # holding a single file, and it costs no extra round trip.
   if [[ ${1:-} == "--list" ]]; then
-    ssh "$target" "find '$ETV_STATION_DATA/playout' -mindepth 1 -maxdepth 1 -type d -exec sh -c 'printf \"%s\t%s chunk(s)\n\" \"\$(basename \"\$1\")\" \"\$(ls -1 \"\$1\"/*.json 2>/dev/null | wc -l | tr -d \" \")\"' _ {} \; 2>/dev/null | sort"
+    # A folder with chunks in it is listed whether or not the station config
+    # still names it, but `admin audit <name>` resolves names against the
+    # config only. So the label says which folders the config no longer has —
+    # the same roster `--list --format json` prints — and a retired folder
+    # still consuming the data volume stays visible.
+    configured=$(ssh "$target" "docker exec etv-station etv-station --config '$config' --audit --list" | cut -f2) || {
+      echo "audit: cannot read the configured channels from $target" >&2
+      exit 2
+    }
+    folders=$(ssh "$target" "find '$ETV_STATION_DATA/playout' -mindepth 1 -maxdepth 1 -type d -exec sh -c 'printf \"%s\t%s chunk(s)\n\" \"\$(basename \"\$1\")\" \"\$(ls -1 \"\$1\"/*.json 2>/dev/null | wc -l | tr -d \" \")\"' _ {} \; 2>/dev/null | sort") || exit 2
+    printf '%s\n' "$folders" | CONFIGURED="$configured" awk -F'\t' '
+      BEGIN { n = split(ENVIRON["CONFIGURED"], names, "\n"); for (i = 1; i <= n; i++) known[names[i]] = 1 }
+      { print ($1 in known) ? $0 : $0 ", unconfigured (admin audit refuses it)" }'
     exit 0
   fi
   echo "Channels with a schedule to audit:"
