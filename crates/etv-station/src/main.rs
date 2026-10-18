@@ -314,7 +314,7 @@ fn main() -> ExitCode {
         }
     };
 
-    runtime.block_on(async move {
+    let code = runtime.block_on(async move {
         let station = match config::load(config) {
             Ok(s) => s,
             Err(err) => {
@@ -353,7 +353,12 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         }
-    })
+    });
+    // Dropping the runtime would join its blocking threads, and a Plex ingest
+    // abandoned on shutdown can sit in a socket read for the whole HTTP
+    // timeout. Every task that matters was joined by `daemon::run`.
+    runtime.shutdown_background();
+    code
 }
 
 /// Load the station config and print each channel's `output_folder` verbatim,
