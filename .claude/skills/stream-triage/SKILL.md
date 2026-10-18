@@ -131,6 +131,31 @@ Anything under 4000ms is shorter than one HLS segment and should no longer
 happen — #339 gated the reburst on `remaining > REBURST_AT_LEAD`. A sliver
 reappearing means that gate regressed.
 
+## Step 2b — the published playlist clock
+
+The three clocks above can all read healthy while the screen is frozen. Between
+the encoder and the viewer sits the published playlist
+(`generate_playlist` in
+`vendor/etv-next/crates/ersatztv-channel/src/playlist_manager.rs`), and it can
+stop advancing while the encoder works ahead, the overlay feeds, and the viewer
+keeps polling. No exit 75 is logged for it.
+
+```sh
+ssh "$UNRAID_USER@$UNRAID_HOST" \
+  "docker exec etv-station sh -c 'curl -s http://127.0.0.1:8409/session/<N>/live.m3u8 | grep -m1 \".ts\"; ls /config/data/hls/<N>/*.ts | head -1; ls /config/data/hls/<N>/*.ts | tail -1'"
+```
+
+Three lines: served-first, disk-oldest, disk-newest. Compare their segment
+numbers:
+
+- **served-first == disk-oldest, disk-newest far ahead** → the window is pinned
+  to the tail of the backlog and the viewer is offered segments it already
+  played. Measured on channel 35: served-first `live000133`, disk-oldest
+  `live000133`, disk-newest `live000154` — 12 segments (48s) of encoded content
+  never offered.
+- **served-last within 2-3 segments of disk-newest** → the window is at the
+  live edge. Healthy.
+
 ## Step 3 — rule on which side stopped
 
 **There is nothing to arm.** The capture runs inside the container, started by
@@ -276,6 +301,10 @@ script reads whichever is present, so it works either side of that deploy.
   reasoning that the *writer* side behaves fine either way. That reasoning was
   sound and irrelevant: the failing case is the **main** input reaching EOF, not
   the secondary. See Step 3b.
+- **No exit 75 in the log does not mean the server is healthy.** The stall
+  detector measures `starved_for = now - last_segment_end`, which is deeply
+  negative whenever the encoder works ahead of the viewer. A playlist that stops
+  advancing while the encoder is healthy can never trip it. Run Step 2b.
 - **A short overlay hiccup is survivable.** The `resume` arm shows ffmpeg catches
   up fully after a pause. A freeze needs **≥60s of continuous silence** to trip
   the detector, so "it paused briefly at an item boundary" does not explain a
@@ -352,6 +381,10 @@ Read it for:
   automatically is #328.
 - **requests stop entirely, playlist included** → the client gave up; it will not
   come back without a re-tune.
+- **playlist polls back off before going silent** (observed: 5s → 18s → 32s →
+  nothing) → AppleCoreMedia is giving up on a playlist that is not advancing.
+  That is "client gave up", not "client never asked": the cause is upstream, so
+  run Step 2b.
 - **same segment requested repeatedly** → the client is retrying; the playlist
   moved under it (discontinuity) or the segment 404s.
 - **requests continue, latency climbs** → buffering, not a freeze. Look at
@@ -462,6 +495,7 @@ Work down; stop when one answers it.
 2. Does the container log show exit 75, and what is `consecutive failures`?
    Run `tools/attribute-stalls.sh` before theorising — most exit-75 kills are
    ffmpeg refusing to exit at the end of its item (Step 3b), not a freeze.
+   A quiet exit-75 log is not an all-clear: run Step 2b for the playlist clock.
 3. Did the client stop requesting, or keep retrying? (access log)
 4. What did `two-clock-capture` rule, if armed?
 5. Is `/mnt/user` under pressure, or are there disk errors in `dmesg`?
