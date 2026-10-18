@@ -105,6 +105,10 @@ pub struct RenderOptions {
     /// of truth, read independently by each process the way `ETV_HLS_OUTPUT`
     /// already is.
     pub artwork_dir: Option<String>,
+    /// `idle_grace_seconds` written into every `channelN.json`. Comes from the
+    /// station config, not the environment, so [`RenderOptions::from_env`]
+    /// leaves it `None` and [`render_with`] fills it in.
+    pub idle_grace_seconds: Option<u64>,
 }
 
 impl RenderOptions {
@@ -154,6 +158,7 @@ impl RenderOptions {
             out_dir,
             accel,
             artwork_dir: var("ETV_STATION_ARTWORK_CACHE"),
+            idle_grace_seconds: None,
         })
     }
 }
@@ -300,11 +305,15 @@ pub fn render_with(
         )?,
         DeviceIdSource::Fixed(id) => id.to_string(),
     };
+    let opts = RenderOptions {
+        idle_grace_seconds: station.station.idle_grace_seconds,
+        ..opts.clone()
+    };
     let rendered = render_channels(
         &channels,
         &station.station.ffmpeg,
         &station.station.normalization,
-        opts,
+        &opts,
         &device_id,
     )?;
     Ok(Rendered {
@@ -506,6 +515,10 @@ pub fn render_channels(
             "guide".to_string(),
             serde_json::json!({"show_bumpers": channel_render.show_bumpers}),
         );
+
+        if let Some(secs) = opts.idle_grace_seconds {
+            channel.insert("idle_grace_seconds".to_string(), Value::from(secs));
+        }
 
         let channel_path = opts.out_dir.join(format!("channel{number}.json"));
         write_json(&channel_path, &Value::Object(channel))?;
@@ -712,6 +725,7 @@ mod tests {
             out_dir: dir.to_path_buf(),
             accel: None,
             artwork_dir: None,
+            idle_grace_seconds: None,
         }
     }
 
@@ -938,6 +952,25 @@ mod tests {
             "playout folder must be absolute, got {folder}"
         );
         assert!(folder.ends_with("out/star-trek"));
+    }
+
+    #[test]
+    fn the_idle_grace_reaches_every_channel_and_unset_omits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let folders = [dir.path().join("a"), dir.path().join("b")];
+        let with = RenderOptions {
+            idle_grace_seconds: Some(300),
+            ..opts(dir.path())
+        };
+        render_with_defaults(&chans(&folders), &with, "test-device-id").unwrap();
+        for n in 1..=2 {
+            let body = read(&dir.path().join(format!("channel{n}.json")));
+            assert_eq!(body["idle_grace_seconds"], 300, "{body}");
+        }
+        let without = opts(dir.path());
+        render_with_defaults(&chans(&folders), &without, "test-device-id").unwrap();
+        let body = read(&dir.path().join("channel1.json"));
+        assert!(body.get("idle_grace_seconds").is_none(), "{body}");
     }
 
     // #187: unset by default (artwork caching is off), so the lineup carries

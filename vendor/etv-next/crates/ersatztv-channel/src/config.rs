@@ -30,6 +30,11 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<serde_json::Value>")]
     pub overlay: Option<OverlaySpec>,
+    /// Seconds a channel's worker stays warm after its last viewer's
+    /// heartbeat. Absent means [`ersatztv_core::HEARTBEAT_FILE_TIMEOUT`], which
+    /// is also the floor: a smaller value is raised to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_grace_seconds: Option<u64>,
 
     #[serde(skip)]
     expanded_playout_folder: PathBuf,

@@ -139,6 +139,14 @@ struct Cli {
     #[arg(long, value_name = "CHANNEL")]
     refresh_channel: Option<String>,
 
+    /// With `--refresh-channel`, pin the channel's `seed:` to N first and
+    /// reload the running daemon, so the regenerated future is a new shuffle.
+    /// Rewrites the `seed:` line in the channel's own YAML (the file that
+    /// declares the seed stays the record of it). Omit it to keep the seed and
+    /// rebuild the same schedule. Names one channel, never `all`.
+    #[arg(long, value_name = "N", requires = "refresh_channel")]
+    seed: Option<u64>,
+
     /// Read the named channel's chunk files, take the next `--next` items
     /// from now forward, and write a report naming each item, its audit
     /// trail, and the overlay config in effect for it, then exit. Named the
@@ -318,7 +326,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(target) = cli.refresh_channel.as_deref() {
-        return refresh_channel(config, target);
+        return refresh_channel(config, target, cli.seed);
     }
 
     if let Some(target) = cli.audit.as_deref() {
@@ -889,7 +897,7 @@ fn backfill_history(config_path: &Path, dry_run: bool) -> ExitCode {
 /// the playout folder use, the bare name is what a person says, and the number is
 /// what the guide and the TV show. A prefix that matches more than one channel
 /// is refused rather than guessed at.
-fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
+fn refresh_channel(config_path: &Path, target: &str, seed: Option<u64>) -> ExitCode {
     let station = match load_for("refresh-channel", config_path) {
         Ok(s) => s,
         Err(code) => return code,
@@ -906,6 +914,34 @@ fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
     if matched.is_empty() {
         eprintln!("refresh-channel: no channel matching {target:?}");
         return ExitCode::from(1);
+    }
+
+    if let Some(seed) = seed {
+        let [ch] = matched.as_slice() else {
+            eprintln!(
+                "refresh-channel: --seed names one channel; {target:?} matched {}",
+                matched.len()
+            );
+            return ExitCode::from(1);
+        };
+        let rewritten = std::fs::read_to_string(&ch.config_path)
+            .map_err(|e| format!("{}: {e}", ch.config_path.display()))
+            .and_then(|text| etv_station::reset::set_seed(&text, seed))
+            .and_then(|text| {
+                let tmp = ch.config_path.with_extension("yaml.seed-tmp");
+                std::fs::write(&tmp, text)
+                    .and_then(|()| std::fs::rename(&tmp, &ch.config_path))
+                    .map_err(|e| format!("{}: {e}", ch.config_path.display()))
+            });
+        if let Err(msg) = rewritten {
+            eprintln!("refresh-channel: {msg}");
+            return ExitCode::from(1);
+        }
+        println!(
+            "refresh-channel: {}: seed: {seed} in {}",
+            ch.name,
+            ch.config_path.display()
+        );
     }
 
     for ch in &matched {
@@ -927,6 +963,26 @@ fn refresh_channel(config_path: &Path, target: &str) -> ExitCode {
          boundary on its following pass",
         matched.len(),
     );
+    if seed.is_some() {
+        match etv_station::reset::signal_reload(&station.station.output_base) {
+            Ok(etv_station::reset::Reload::Signalled(pid)) => {
+                println!(
+                    "refresh-channel: sent SIGHUP to the daemon (pid {pid}); it reloads the new seed now"
+                );
+            }
+            Ok(etv_station::reset::Reload::NotRunning) => {
+                println!(
+                    "refresh-channel: no running daemon found; the new seed applies at its next start"
+                );
+            }
+            Err(msg) => {
+                eprintln!(
+                    "refresh-channel: {msg}; the new seed applies at the daemon's next reload"
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
     ExitCode::SUCCESS
 }
 

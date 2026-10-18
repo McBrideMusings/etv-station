@@ -605,6 +605,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `hooks` | no — default empty | list of [event hooks](#event-hooks) that run for the whole station |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
+| `idle_grace_seconds` | no — default `90` | seconds a channel's worker stays warm after its last viewer leaves, so surfing back to it skips the cold start. Written into every `channelN.json`; ETV-next's worker reads it. `90` is also the floor — a smaller value is raised to it, because the overlay renderer exits after 60s without a reader and must stay under the worker's lifetime. A warm channel keeps its ffmpeg encoding for nobody, so raise it only as far as the encoder has headroom. |
 
 **How the three ingest modes are chosen.** At startup the daemon compares the
 catalog's recorded last-ingest time against the two knobs above. Age below

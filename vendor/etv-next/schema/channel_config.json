@@ -6,8 +6,20 @@
     "ffmpeg": {
       "$ref": "#/$defs/FfmpegConfig"
     },
+    "idle_grace_seconds": {
+      "description": "Seconds a channel's worker stays warm after its last viewer's\nheartbeat. Absent means [`ersatztv_core::HEARTBEAT_FILE_TIMEOUT`], which\nis also the floor: a smaller value is raised to it.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
     "normalization": {
       "$ref": "#/$defs/NormalizationConfig"
+    },
+    "overlay": {
+      "description": "Live overlay composited over every item on this channel. Absent means\nthe channel has no overlay at all — the one place that decision is\nrecorded, so it cannot go stale the way a per-item copy did."
     },
     "playout": {
       "$ref": "#/$defs/PlayoutConfig"
