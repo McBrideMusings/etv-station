@@ -22,7 +22,7 @@
 //!   generation, not the load.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rhai::{Array, Dynamic, Map};
 use serde::{Deserialize, Serialize};
@@ -389,14 +389,28 @@ fn parse_item(raw: &str) -> Result<ItemRef, String> {
     ))
 }
 
+/// A pool's `profile_files` as `(path as written, resolved path)`, in list
+/// order. The one place the resolution rule lives: [`load`] reads these and the
+/// daemon's schedule fingerprint hashes them, so they cannot disagree.
+pub fn resolved_files<'a>(
+    pool: &'a Pool,
+    base_dir: &'a Path,
+) -> impl Iterator<Item = (&'a Path, PathBuf)> + 'a {
+    pool.profile_files.iter().map(move |file| {
+        (
+            file.as_path(),
+            crate::score::resolve_plugin_path(base_dir, file),
+        )
+    })
+}
+
 /// Read a pool's `profile_files` (in list order) then its inline `profile`,
 /// checking every entry. Paths are relative to `base_dir`, the channel config's
 /// directory.
 pub fn load(pool: &Pool, base_dir: &Path) -> Result<Vec<LoadedEntry>, String> {
     let mut out = Vec::new();
-    for file in &pool.profile_files {
+    for (file, path) in resolved_files(pool, base_dir) {
         let origin = file.display().to_string();
-        let path = crate::score::resolve_plugin_path(base_dir, file);
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("profile file {origin}: {e}"))?;
         let entries: Vec<ProfileEntry> =

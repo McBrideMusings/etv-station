@@ -2659,8 +2659,7 @@ fn hash_profile_files(channel: &LoadedChannel, hasher: &mut Sha256) {
         .unwrap_or_else(|| Path::new("."));
     for block in channel.config.rule.all_blocks() {
         for pool in &block.pools {
-            for file in &pool.profile_files {
-                let path = crate::score::resolve_plugin_path(base_dir, file);
+            for (_, path) in crate::profile::resolved_files(pool, base_dir) {
                 let path_bytes = path.to_string_lossy();
                 hasher.update((path_bytes.len() as u64).to_le_bytes());
                 hasher.update(path_bytes.as_bytes());
