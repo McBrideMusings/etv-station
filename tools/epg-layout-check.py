@@ -295,6 +295,63 @@ async def check(width: int, height: int) -> bool:
     return ok
 
 
+async def check_history_tick() -> bool:
+    """A 15s tick inside one 15-minute block must not rebuild history mode's
+    rows (#380). The fixture holds a programme older than HISTORY_DAYS, so the
+    window opens at the horizon — the edge that used to move with `now`."""
+    real_datetime = epgb.datetime
+    block = 15  # EpgBrowserApp.BLOCK_MINUTES
+    base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    base = base - timedelta(minutes=base.minute % block) + timedelta(minutes=3)
+    clock = {"now": base}
+
+    class _MovingDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    ok = True
+    try:
+        epgb.datetime = _MovingDatetime
+
+        def lineup(host):
+            # Shifted a minute back so no fixture programme starts between
+            # the two ticks — a new programme is a real change that should
+            # redraw.
+            channels, progs = fixture(base - timedelta(minutes=1))
+            progs.append(
+                epgb.Programme(
+                    channel_id="ersatztv.1",
+                    start=base - timedelta(days=8),
+                    stop=base - timedelta(hours=3),
+                    title="Older Than A Week",
+                )
+            )
+            return channels, progs
+
+        epgb.fetch_lineup = lineup
+        app = epgb.build_app("http://127.0.0.1:8409")
+        async with app.run_test(size=(MIN_WIDTH, MIN_HEIGHT)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            app.action_toggle_history()
+            await pilot.pause()
+            # One tick settles the highlight; the ticks after it are the steady state.
+            app._load_programmes(keep_selection=True, reason="tick")
+            await pilot.pause()
+            before = [id(i) for i in app.query("#programmes ListItem")]
+            clock["now"] = base + timedelta(seconds=15)
+            app._load_programmes(keep_selection=True, reason="tick")
+            await pilot.pause()
+            after = [id(i) for i in app.query("#programmes ListItem")]
+            good = len(before) > 1 and before == after
+            ok &= good
+            print(f"  {'tick rebuild':12} {len(before)} rows kept, same widgets: {before == after}  {'OK' if good else 'REBUILT'}")
+    finally:
+        epgb.datetime = real_datetime
+    return ok
+
+
 async def check_resize_debounce() -> bool:
     """A resize drag emits one event per intermediate width (#424) — assert
     that a burst of them, delivered with no pause in between, produces
@@ -445,6 +502,8 @@ def main() -> None:
     else:
         sizes = [(MIN_WIDTH, MIN_HEIGHT), (WIDE_WIDTH, WIDE_HEIGHT)]
         results = [asyncio.run(check(w, h)) for w, h in sizes]
+        print("=== history tick ===")
+        results.append(asyncio.run(check_history_tick()))
         print("=== resize debounce ===")
         results.append(asyncio.run(check_resize_debounce()))
         print("=== resize teardown ===")
