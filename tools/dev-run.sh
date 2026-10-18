@@ -19,6 +19,12 @@ if [ -f .env ]; then
   set +a
 fi
 
+# ETV_DEV_NO_EXTERNAL=1 (set by verify-integration.sh) drops the credentials .env
+# supplies, so a config that needs no Plex or Tautulli never contacts them.
+if [ "${ETV_DEV_NO_EXTERNAL:-0}" = "1" ]; then
+  unset PLEX_URL PLEX_TOKEN TAUTULLI_URL TAUTULLI_API_KEY
+fi
+
 : "${ETV_BIND_ADDRESS:=0.0.0.0}"
 : "${ETV_PORT:=8409}"
 export ETV_BIND_ADDRESS ETV_PORT
@@ -253,8 +259,19 @@ if [ "${#output_folders[@]}" -gt 0 ]; then
   wait_for_first_emit "${output_folders[@]}"
 fi
 
+# Ask cargo where the vendored workspace builds (CARGO_TARGET_DIR or a
+# build.target-dir in a parent .cargo/config.toml move it off vendor/etv-next/target).
+etv_target_dir="$(cargo metadata --format-version 1 --no-deps \
+  --manifest-path vendor/etv-next/Cargo.toml 2>/dev/null \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+ersatztv_bin="${etv_target_dir:-vendor/etv-next/target}/debug/ersatztv"
+if [ ! -x "$ersatztv_bin" ]; then
+  echo "[dev] $ersatztv_bin was not built; aborting" >&2
+  exit 1
+fi
+
 (
-  vendor/etv-next/target/debug/ersatztv examples/etv-next/lineup.json 2>&1 \
+  "$ersatztv_bin" examples/etv-next/lineup.json 2>&1 \
     | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 ) &
 
