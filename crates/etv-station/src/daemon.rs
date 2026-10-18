@@ -12,6 +12,7 @@ use tokio::select;
 use tokio::sync::Notify;
 use tracing::Instrument;
 
+use crate::cancel::Cancel;
 use crate::catalog::Catalog;
 use crate::catalog::ingest::plex::{PlexAccount, PlexEnv};
 use crate::config::{ChannelConfig, LoadedChannel, ScoringConfig, Station};
@@ -36,11 +37,20 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     let reload = Arc::new(Notify::new());
     // SIGUSR1 — "re-read the library now". See [`RefreshKind::Forced`].
     let refresh_now = Arc::new(Notify::new());
-    spawn_signal_listener(shutdown.clone(), reload.clone(), refresh_now.clone());
+    // SIGTERM/SIGINT also trip this, which is how a blocking Plex ingest — a
+    // pass that takes minutes — learns it should stop (`Signals::cancel`).
+    let cancel = Arc::new(Cancel::default());
+    spawn_signal_listener(
+        shutdown.clone(),
+        reload.clone(),
+        refresh_now.clone(),
+        cancel.clone(),
+    );
     let signals = Signals {
         shutdown,
         reload,
         refresh_now,
+        cancel,
     };
 
     // Each pass of this loop runs one "generation" of channel + overlay tasks
@@ -55,7 +65,14 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // takes the connection as an argument, so a test supplies `None` rather than
     // deleting the variables out of the process (#132).
     let plex = PlexEnv::from_env();
-    let catalog = open_and_ingest_catalog(&station, plex.as_ref()).await?;
+    let catalog = open_and_ingest_catalog(&station, plex.as_ref(), &signals.cancel).await?;
+    if signals.cancel.is_cancelled() {
+        tracing::info!(
+            event = "daemon.shutdown_during_startup_ingest",
+            "shutdown arrived before the first generation started; exiting",
+        );
+        return Ok(());
+    }
     // What the catalog was opened against — the catalog is opened once and NOT
     // reopened on reload (#96), so a later reload that changes these diverges.
     let opened_catalog_path = station.station.catalog_path.clone();
@@ -217,6 +234,10 @@ struct Signals {
     reload: Arc<Notify>,
     /// SIGUSR1 — refresh the catalog now, full pass. See [`RefreshKind::Forced`].
     refresh_now: Arc<Notify>,
+    /// Tripped by SIGTERM/SIGINT alongside `shutdown`. `shutdown` hands its one
+    /// permit to the generation loop; work that runs elsewhere (the Plex
+    /// ingest's blocking thread) watches this instead.
+    cancel: Arc<Cancel>,
 }
 
 /// Everything a channel loop needs that belongs to the *station* rather than to
@@ -818,6 +839,7 @@ fn plex_ingest_plan(
 async fn open_and_ingest_catalog(
     station: &Station,
     plex: Option<&PlexEnv>,
+    cancel: &Arc<Cancel>,
 ) -> Result<Option<Arc<CatalogInfo>>, StationError> {
     let Some(path) = station
         .station
@@ -828,8 +850,19 @@ async fn open_and_ingest_catalog(
         return Ok(None);
     };
 
-    let catalog =
-        ingest_catalog(station, plex, Catalog::open(path)?, RefreshKind::Scheduled).await?;
+    let Some(catalog) = ingest_catalog(
+        station,
+        plex,
+        Catalog::open(path)?,
+        RefreshKind::Scheduled,
+        cancel,
+    )
+    .await?
+    else {
+        // Shutdown abandoned the ingest and the handle went with it. The caller
+        // checks `cancel` and exits, so no path index is built.
+        return Ok(None);
+    };
     let identity_roots = &station.station.identity_roots;
 
     // Build the path-match index once, now that the catalog is fully ingested.
@@ -862,6 +895,7 @@ async fn refresh_catalog(
     station: &Station,
     plex: Option<&PlexEnv>,
     kind: RefreshKind,
+    cancel: &Arc<Cancel>,
 ) -> Result<(), StationError> {
     let Some(path) = station
         .station
@@ -871,7 +905,7 @@ async fn refresh_catalog(
     else {
         return Ok(());
     };
-    let catalog = ingest_catalog(station, plex, Catalog::open(path)?, kind).await?;
+    let catalog = ingest_catalog(station, plex, Catalog::open(path)?, kind, cancel).await?;
     drop(catalog);
     Ok(())
 }
@@ -888,12 +922,19 @@ async fn refresh_catalog(
 /// Called at startup by [`open_and_ingest_catalog`] and on every refresh tick
 /// by [`refresh_catalog`]. It is the only thing in this process that writes the
 /// catalog.
+///
+/// Returns `None` when `cancel` fired while the Plex pass was running: the
+/// blocking thread still owns the handle and is abandoned, not waited for (a
+/// stalled response would otherwise hold shutdown for the whole HTTP timeout).
+/// Nothing it wrote is partial — the write pass is one transaction — and the
+/// delta cursor does not advance, so the next start re-reads what it missed.
 async fn ingest_catalog(
     station: &Station,
     plex: Option<&PlexEnv>,
     catalog: Catalog,
     kind: RefreshKind,
-) -> Result<Catalog, StationError> {
+    cancel: &Arc<Cancel>,
+) -> Result<Option<Catalog>, StationError> {
     let mut catalog = catalog;
     let source_roots = &station.station.source_roots;
     let identity_roots = &station.station.identity_roots;
@@ -978,18 +1019,32 @@ async fn ingest_catalog(
                 let roots = identity_roots.clone();
                 let conn = plex.clone();
                 let artwork_dir_for_ingest = artwork_dir.clone();
-                let (returned, ingested) = tokio::task::spawn_blocking(move || {
+                let mode = if since.is_some() { "delta" } else { "full" };
+                let started = std::time::Instant::now();
+                let thread_cancel = cancel.clone();
+                let mut task = tokio::task::spawn_blocking(move || {
                     let result = crate::catalog::ingest::plex::ingest(
                         &catalog,
                         &roots,
                         since,
                         &conn,
                         artwork_dir_for_ingest.as_deref(),
+                        &thread_cancel,
                     );
                     (catalog, result)
-                })
-                .await
-                .expect("plex ingest task panicked");
+                });
+                let (returned, ingested) = select! {
+                    joined = &mut task => joined.expect("plex ingest task panicked"),
+                    _ = cancel.cancelled() => {
+                        tracing::warn!(
+                            event = "catalog.ingest.plex_cancelled",
+                            mode,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "shutdown during the plex ingest; abandoning the pass without waiting for it; a write in progress rolls back with the process and the next start re-reads the library",
+                        );
+                        return Ok(None);
+                    }
+                };
                 catalog = returned;
                 match ingested {
                     Ok(stats) => tracing::info!(
@@ -1002,6 +1057,14 @@ async fn ingest_catalog(
                         entries_marked_missing = stats.entries_marked_missing,
                         "plex catalog ingest complete",
                     ),
+                    Err(crate::catalog::ingest::plex::PlexIngestError::Cancelled) => {
+                        tracing::warn!(
+                            event = "catalog.ingest.plex_cancelled",
+                            mode,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "shutdown during the plex ingest; the pass stopped between requests",
+                        )
+                    }
                     Err(e) => {
                         tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing")
                     }
@@ -1032,7 +1095,7 @@ async fn ingest_catalog(
         }
     }
 
-    Ok(catalog)
+    Ok(Some(catalog))
 }
 
 /// Spawn one generation's channel + overlay tasks against `station`, run until a
@@ -1067,6 +1130,7 @@ async fn run_generation(
         shutdown,
         reload,
         refresh_now,
+        cancel,
     } = signals;
     let mut handles = Vec::new();
     let mut supervisor_handles = Vec::new();
@@ -1229,10 +1293,10 @@ async fn run_generation(
             _ = shutdown.notified() => break false,
             _ = reload.notified() => break true,
             _ = refresh_now.notified() => {
-                run_catalog_refresh(station, plex, RefreshKind::Forced).await;
+                run_catalog_refresh(station, plex, RefreshKind::Forced, cancel).await;
             }
             _ = tick(refresh.as_mut()) => {
-                run_catalog_refresh(station, plex, RefreshKind::Scheduled).await;
+                run_catalog_refresh(station, plex, RefreshKind::Scheduled, cancel).await;
             }
         }
     };
@@ -1347,8 +1411,13 @@ enum RefreshKind {
 
 /// One refresh tick: [`refresh_and_sweep`], then hand the memory it freed
 /// back to the kernel.
-async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>, kind: RefreshKind) {
-    refresh_and_sweep(station, plex, kind).await;
+async fn run_catalog_refresh(
+    station: &Station,
+    plex: Option<&PlexEnv>,
+    kind: RefreshKind,
+    cancel: &Arc<Cancel>,
+) {
+    refresh_and_sweep(station, plex, kind, cancel).await;
     // The refresh's temporary pile is freed by now but glibc keeps the pages;
     // without this RSS ratchets up a step per refresh until the host's OOM
     // watcher kills the daemon.
@@ -1366,13 +1435,18 @@ async fn run_catalog_refresh(station: &Station, plex: Option<&PlexEnv>, kind: Re
 ///
 /// The sweep runs after the ingest, in the same tick, because the ingest is
 /// what makes it worth running: it is the pass that just learned the new path.
-async fn refresh_and_sweep(station: &Station, plex: Option<&PlexEnv>, kind: RefreshKind) {
+async fn refresh_and_sweep(
+    station: &Station,
+    plex: Option<&PlexEnv>,
+    kind: RefreshKind,
+    cancel: &Arc<Cancel>,
+) {
     tracing::info!(
         event = "catalog.refresh_start",
         forced = kind == RefreshKind::Forced,
         "refreshing the catalog",
     );
-    if let Err(e) = refresh_catalog(station, plex, kind).await {
+    if let Err(e) = refresh_catalog(station, plex, kind, cancel).await {
         tracing::error!(
             event = "catalog.refresh_failed",
             error = %e,
@@ -1382,6 +1456,10 @@ async fn refresh_and_sweep(station: &Station, plex: Option<&PlexEnv>, kind: Refr
         // whatever the failed pass did commit is still worth reconciling
         // against. A partial ingest that renamed half the library should fix
         // the half it got.
+    }
+    // A station being told to stop has no business sweeping the playout.
+    if cancel.is_cancelled() {
+        return;
     }
 
     let Some(path) = station
@@ -1482,7 +1560,12 @@ fn rerender_etv_next(config_path: &Path, out_dir: PathBuf) {
 /// shutdown, SIGHUP requests a config reload, SIGUSR1 requests an immediate
 /// full catalog refresh. All notify the single waiter in `run` via
 /// `notify_one`, so a signal delivered before `run` parks is not lost.
-fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>, refresh_now: Arc<Notify>) {
+fn spawn_signal_listener(
+    shutdown: Arc<Notify>,
+    reload: Arc<Notify>,
+    refresh_now: Arc<Notify>,
+    cancel: Arc<Cancel>,
+) {
     use tokio::signal::unix::{SignalKind, signal};
 
     tokio::spawn(async move {
@@ -1513,11 +1596,13 @@ fn spawn_signal_listener(shutdown: Arc<Notify>, reload: Arc<Notify>, refresh_now
             select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!(event = "signal.shutdown", signal = "SIGINT", "ctrl-c received, shutting down");
+                    cancel.cancel();
                     shutdown.notify_one();
                     return;
                 }
                 _ = recv_signal(sigterm.as_mut()) => {
                     tracing::info!(event = "signal.shutdown", signal = "SIGTERM", "sigterm received, shutting down");
+                    cancel.cancel();
                     shutdown.notify_one();
                     return;
                 }
@@ -2659,8 +2744,7 @@ fn hash_profile_files(channel: &LoadedChannel, hasher: &mut Sha256) {
         .unwrap_or_else(|| Path::new("."));
     for block in channel.config.rule.all_blocks() {
         for pool in &block.pools {
-            for file in &pool.profile_files {
-                let path = crate::score::resolve_plugin_path(base_dir, file);
+            for (_, path) in crate::profile::resolved_files(pool, base_dir) {
                 let path_bytes = path.to_string_lossy();
                 hasher.update((path_bytes.len() as u64).to_le_bytes());
                 hasher.update(path_bytes.as_bytes());
@@ -5576,11 +5660,73 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         let (_dir, path) = write_station("UTC");
         let station = crate::config::load(&path).unwrap();
         assert!(
-            open_and_ingest_catalog(&station, None)
+            open_and_ingest_catalog(&station, None, &Arc::new(Cancel::default()))
                 .await
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// SIGTERM during a Plex ingest must end the ingest, not wait for it. A
+    /// fake Plex accepts the first request and never answers; the ingest sits
+    /// in that read until `HTTP_TIMEOUT` (300s) unless shutdown abandons it.
+    #[tokio::test]
+    async fn shutdown_during_a_stalled_plex_ingest_returns_promptly() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                // Keep the socket open and silent.
+                let _ = held_tx.send(stream);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let station_toml = format!(
+            "tz = \"UTC\"\noutput_base = {:?}\ncatalog_path = {:?}\nchannels = [\"channel.toml\"]\n\n[normalization.audio]\n[normalization.video]\n",
+            dir.path().join("out").to_string_lossy(),
+            db.to_string_lossy(),
+        );
+        std::fs::write(dir.path().join("station.toml"), station_toml).unwrap();
+        std::fs::write(dir.path().join("channel.toml"), CHANNEL_BODY).unwrap();
+        let station = crate::config::load(&dir.path().join("station.toml")).unwrap();
+        let plex = PlexEnv {
+            base_url,
+            token: "t".into(),
+            path_from: String::new(),
+            path_to: String::new(),
+        };
+
+        let cancel = Arc::new(Cancel::default());
+        let trip = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            trip.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let catalog = tokio::time::timeout(
+            Duration::from_secs(10),
+            open_and_ingest_catalog(&station, Some(&plex), &cancel),
+        )
+        .await
+        .expect("shutdown must not wait for the stalled plex response")
+        .unwrap();
+        assert!(catalog.is_none(), "an abandoned ingest yields no catalog");
+        assert!(cancel.is_cancelled());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+
+        // The abandoned blocking thread is still in its read; closing the
+        // socket lets it fail and finish so the test runtime can drop.
+        drop(held_rx.try_iter().collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -5604,7 +5750,9 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         // an ingest that read them itself would hit a live server. Nothing here
         // touches the process environment, so nothing races another test thread
         // reading it (#132).
-        let catalog = open_and_ingest_catalog(&station, None).await.unwrap();
+        let catalog = open_and_ingest_catalog(&station, None, &Arc::new(Cancel::default()))
+            .await
+            .unwrap();
         assert!(catalog.is_some());
         assert!(db.exists());
     }
