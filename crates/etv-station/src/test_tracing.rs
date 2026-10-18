@@ -14,15 +14,40 @@
 //! from then on the registered set never drops to one. `tracing-core` then
 //! always computes interest under its dispatcher lock, from every registered
 //! dispatcher, which includes every live capture subscriber on any thread.
-//! The pins register on the first capture, not at process start, so a thread
-//! already mid-registration on the unlocked path at that moment can still
-//! store a stale `never` after the pins' rebuild; it cannot happen afterwards.
+//! The pins register from a static initializer that the platform runs before
+//! `main`, so before the test harness spawns any thread and no thread can be
+//! mid-registration when they land. A platform without such a section falls
+//! back to pinning on the first capture, which leaves a one-time window for a
+//! thread already inside the unlocked path to store a stale `never`.
 //! Every test that captures events installs its subscriber through here.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::subscriber::{DefaultGuard, NoSubscriber};
 use tracing::{Dispatch, Subscriber};
+
+static PINNED_AT_START: AtomicBool = AtomicBool::new(false);
+
+/// Runs before `main` on the platforms named below, via the same linker
+/// section a C `__attribute__((constructor))` lands in.
+#[used]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android", target_os = "freebsd"),
+    unsafe(link_section = ".init_array")
+)]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func")
+)]
+#[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
+static PIN_AT_START: extern "C" fn() = {
+    extern "C" fn pin_at_start() {
+        pin_dispatchers();
+        PINNED_AT_START.store(true, Ordering::SeqCst);
+    }
+    pin_at_start
+};
 
 fn pin_dispatchers() {
     static PINNED: OnceLock<[Dispatch; 2]> = OnceLock::new();
@@ -67,6 +92,20 @@ mod tests {
 
     fn emit() {
         tracing::info!(event = "test_tracing.probe", "probe");
+    }
+
+    /// The pins are registered by the pre-`main` initializer, not by the first
+    /// capture: this test installs no capture and still finds them.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[test]
+    fn the_pins_are_registered_before_any_test_runs() {
+        assert!(super::PINNED_AT_START.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Another thread with no subscriber reaches the callsite first, while
