@@ -2,6 +2,7 @@
 //! segments, and [`timeline::fit`] resolves it onto a gap of known length.
 //! [`hook`] runs the plugin's `build(ctx)`.
 
+pub mod emit;
 pub mod hook;
 pub mod ledger;
 pub mod timeline;
