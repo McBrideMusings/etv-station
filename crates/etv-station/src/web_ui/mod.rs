@@ -2197,7 +2197,41 @@ fn render_review_still_serially(
     let _one_at_a_time = RENDER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    render_review_still(dir, id, still)
+    let jpeg = render_review_still(dir, id, still)?;
+    prune_still_dir(dir, STILL_DIR_MAX_FILES);
+    Ok(jpeg)
+}
+
+/// The most rendered stills the still directory keeps; the oldest go first.
+const STILL_DIR_MAX_FILES: usize = 200;
+
+/// Deletes the oldest files in `dir` until at most `max` remain, so the
+/// directory (the container's writable layer) stays bounded however many
+/// distinct stills reviews offer. A file that cannot be listed or removed is
+/// left; the next render tries again.
+fn prune_still_dir(dir: &Path, max: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((meta.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= max {
+        return;
+    }
+    files.sort();
+    for (_, path) in &files[..files.len() - max] {
+        if std::fs::remove_file(path).is_ok() {
+            tracing::debug!(event = "ui.still.pruned", path = %path.display(), "still: pruned");
+        }
+    }
 }
 
 fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<u8>, String> {
@@ -2295,6 +2329,27 @@ const REVIEW_HTML: &str = include_str!("review.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_still_dir_keeps_the_newest_max_files() {
+        let dir = std::env::temp_dir().join(format!("etv-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        for i in 0..10u64 {
+            let f = std::fs::File::create(dir.join(format!("{i}.jpg"))).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i))
+                .unwrap();
+        }
+        prune_still_dir(&dir, 4);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["6.jpg", "7.jpg", "8.jpg", "9.jpg"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn inline_index_follows_position_not_ctx_profile_order() {
