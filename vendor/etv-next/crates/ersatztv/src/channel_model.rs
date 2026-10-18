@@ -243,12 +243,9 @@ impl ChannelModel {
 }
 
 /// Resolves `playout.folder` the same way `ersatztv-channel` does: through
-/// `ersatztv_core::resolve_relative_paths`, which owns tilde-expansion and
-/// relative-path joining for both crates. This function does not reimplement
-/// any of that — it only turns the shared resolver's outcome into the errors
-/// below. `resolve_relative_paths` can itself fail, when the resolved path
-/// is not valid UTF-8; that failure is propagated as `LineupError::PathResolve`
-/// rather than silently writing a corrupted path back into the config.
+/// `ersatztv_core::resolve_path`, which owns tilde-expansion and
+/// relative-path joining for both crates. A tilde the resolver reports it
+/// could not expand becomes `LineupError::PlayoutFolderExpand`.
 async fn read_playout_folder(
     channel_config_path: &Path,
     body: &str,
@@ -265,32 +262,9 @@ async fn read_playout_folder(
             "failed to find parent of channel config",
         )))?;
 
-    let mut value = serde_json::json!({ "playout": { "folder": parsed.playout.folder } });
-    ersatztv_core::resolve_relative_paths(&mut value, parent, &["/playout/folder"])?;
-
-    let resolved = value
-        .pointer("/playout/folder")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let resolved_path = PathBuf::from(resolved);
-
-    // A resolved folder whose first component is still a bare `~` means the
-    // shared resolver's tilde-expansion silently gave up — its only failure
-    // mode is that the home directory can't be determined — and fell back to
-    // treating that segment as a plain path piece rather than erroring.
-    //
-    // The component must be *exactly* `~`, matching what expansion actually
-    // attempts: `simple_expand_tilde::expand_tilde` tests `Path::starts_with("~")`,
-    // which compares whole components. A directory legitimately named
-    // `~backup` is therefore never expanded, never fails, and must not be
-    // read as a failure just because its name opens with a tilde.
-    let raw_first_component = Path::new(&parsed.playout.folder).components().next();
-    let tilde_expand_failed = raw_first_component.is_some_and(|first| {
-        first.as_os_str() == "~" && resolved_path.components().any(|c| c == first)
-    });
-    if tilde_expand_failed {
-        return Err(LineupError::PlayoutFolderExpand(parsed.playout.folder));
-    }
+    let resolved_path = ersatztv_core::resolve_path(parent, &parsed.playout.folder).map_err(
+        |ersatztv_core::ResolveError::TildeExpand(raw)| LineupError::PlayoutFolderExpand(raw),
+    )?;
 
     tokio::fs::canonicalize(&resolved_path)
         .await
@@ -333,15 +307,8 @@ mod tests {
     // `~backup` — is never a candidate for expansion: the shared resolver's
     // crate tests `Path::starts_with("~")`, which compares whole components,
     // so only a bare `~` is ever replaced. Such a component surviving into
-    // the resolved path is therefore not evidence that expansion failed; it
-    // is just the directory's name.
-    //
-    // Reading it as a failure is a real bug that shipped and stopped the
-    // server from starting on a lineup whose only channel pointed at a real
-    // directory named `~backup` (etv-station#239, fixed in 0f837a8). What
-    // must happen instead is an ordinary resolve failure naming the path
-    // that was actually looked for. #247 tracks deleting the inference that
-    // makes this delicate.
+    // the resolved path is just the directory's name. A missing one is an
+    // ordinary resolve failure naming the path that was actually looked for.
     #[tokio::test]
     async fn a_name_that_merely_starts_with_a_tilde_is_not_a_failed_expansion() {
         let dir = tempfile::tempdir().unwrap();
@@ -380,8 +347,7 @@ mod tests {
     // A bare `~` is the one leading component the shared resolver's
     // tilde-expansion crate does replace, with the real home directory —
     // which every machine running this test has, so canonicalizing it
-    // always succeeds. This must never be misdiagnosed as a failed expand;
-    // it is the other half of the regression guard #247 is about.
+    // always succeeds, so it must not raise `PlayoutFolderExpand`.
     #[tokio::test]
     async fn expandable_tilde_does_not_raise_expand_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -399,16 +365,8 @@ mod tests {
     }
 
     // A literal directory named `~` that appears somewhere other than the
-    // first path component must never be mistaken for a failed tilde-expansion.
-    // The guard only checks whether the raw first component is exactly `~`
-    // — if it is, and the resolved path still contains a bare `~` component,
-    // then expansion failed. But a path like `movies/~/reruns` has a raw
-    // first component of `movies`, so the guard never fires, and the path
-    // should resolve normally as long as the directory exists.
-    //
-    // This test catches regressions that would loosen the guard to match any
-    // `~` component in the resolved path, rather than comparing only against
-    // the raw value's own first component.
+    // first path component is an ordinary directory name, not a tilde to
+    // expand: it resolves normally as long as the directory exists.
     #[tokio::test]
     async fn a_literal_tilde_directory_in_the_middle_resolves() {
         let dir = tempfile::tempdir().unwrap();
