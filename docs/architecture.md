@@ -66,12 +66,13 @@ file whose only subtitles are pictures plays without subtitles until a block or
 pool says `image: true`, usually with `when: { audio_lang_not: ... }` so only
 foreign-language films get them.
 
-**The subtitle rendition appears only when a scheduled item selected a subtitle**
-(ETV-next's `schedule_requests_subtitle`, #286). Old VLC (3.0.4, in iPlayTV on
-tvOS) drops the video the first time it reads an empty cue file, so a channel
-whose playout selects no subtitle advertises no track. On a channel that mixes
-subtitled and unsubtitled items the track exists throughout, with empty cues
-during the unsubtitled ones.
+**The subtitle rendition appears only when the item airing at tune-in selected a
+subtitle** (ETV-next's `schedule_requests_subtitle`, #286). Old VLC (3.0.4, in
+iPlayTV on tvOS) drops the video the first time it reads an empty cue file, so a
+tune-in during an item that selects no subtitle gets a playlist with no track,
+whatever other items the playout folder holds. The playlist is built once per
+tune-in, so a session that starts on a subtitled item and moves to an
+unsubtitled one keeps the track, with empty cues during the unsubtitled item.
 
 **`DEFAULT=YES` is per channel.** `normalization.subtitle.default_on` in
 `station.yaml` sets it for every channel, and a channel's own `subtitle:
