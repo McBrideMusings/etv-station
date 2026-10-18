@@ -39,6 +39,16 @@ pub fn push_stage(
     verdict: String,
     detail: Option<Value>,
 ) {
+    push_record(metadata, stage_record(stage, by, verdict, detail));
+}
+
+/// Build one stage record, the `#{ stage, by, verdict, detail }` shape.
+pub fn stage_record(
+    stage: &'static str,
+    by: String,
+    verdict: String,
+    detail: Option<Value>,
+) -> Value {
     debug_assert!(
         crate::score::KNOWN_STAGES.contains(&stage),
         "stage {stage:?} is not one of {:?}",
@@ -52,7 +62,12 @@ pub fn push_stage(
     if let Some(detail) = detail {
         record.insert("detail".into(), detail);
     }
+    Value::Object(record)
+}
 
+/// Push an already-built record onto `metadata`'s `audit` array, creating both
+/// if this is the item's first stage.
+pub fn push_record(metadata: &mut Option<Value>, record: Value) {
     let blob = metadata.get_or_insert_with(|| Value::Object(Map::new()));
     // A non-object metadata blob is a plugin returning something odd, which
     // `score` already refuses at pick time. Reached here it would mean the
@@ -65,7 +80,7 @@ pub fn push_stage(
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .expect("`audit` is always inserted as an array")
-        .push(Value::Object(record));
+        .push(record);
 }
 
 #[cfg(test)]
