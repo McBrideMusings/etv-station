@@ -271,9 +271,9 @@ ASCII only.
 
 A category is a keyword set plus its threshold, declared in a file outside any
 channel and referenced by name. `category("kung-fu")` in a pool `expr` (or a
-pool's `sources` expression) means `keyword_score([…the category's keywords…]) >=
-<its threshold>`, so it is a yes/no test that combines with `&&` and `||` like
-any other:
+pool's `sources` expression) means
+`keyword_score([…the category's keywords…]) >= <its threshold>`, so it is a
+yes/no test that combines with `&&` and `||` like any other:
 
 ```yaml
 # station.yaml
