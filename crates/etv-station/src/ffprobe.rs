@@ -24,8 +24,8 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How a bounded run ended.
 pub enum Bounded {
-    /// The process exited before the deadline. `stderr` is what it wrote there,
-    /// for the caller to put in an error message.
+    /// The process exited before the deadline. `stderr` is the last 4096 bytes
+    /// it wrote there, for the caller to put in an error message.
     Done {
         success: bool,
         stdout: Vec<u8>,
@@ -58,6 +58,32 @@ fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8
     })
 }
 
+/// Most of a child's stderr kept for an error message; the tail is where
+/// ffprobe puts the line that says why it failed.
+const STDERR_KEEP: usize = 4096;
+
+/// Read `pipe` to the end but keep only its last [`STDERR_KEEP`] bytes, so a
+/// file that makes ffprobe warn for megabytes cannot grow the buffer.
+fn drain_tail(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut tail: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            tail.extend_from_slice(&chunk[..n]);
+            if tail.len() > STDERR_KEEP {
+                tail.drain(..tail.len() - STDERR_KEEP);
+            }
+        }
+        tail
+    })
+}
+
 fn run_program(
     program: &OsString,
     args: &[OsString],
@@ -70,7 +96,7 @@ fn run_program(
         .stderr(Stdio::piped())
         .spawn()?;
     let reader = drain(child.stdout.take().expect("stdout was piped"));
-    let err_reader = drain(child.stderr.take().expect("stderr was piped"));
+    let err_reader = drain_tail(child.stderr.take().expect("stderr was piped"));
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -113,6 +139,26 @@ mod tests {
         .unwrap();
         assert!(matches!(out, Bounded::TimedOut));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stderr_keeps_only_its_tail() {
+        let out = run_program(
+            &OsString::from("sh"),
+            &[
+                OsString::from("-c"),
+                OsString::from("yes warning | head -c 1000000 >&2; echo LAST >&2"),
+            ],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        match out {
+            Bounded::Done { stderr, .. } => {
+                assert_eq!(stderr.len(), STDERR_KEEP);
+                assert!(stderr.ends_with(b"LAST\n"));
+            }
+            Bounded::TimedOut => panic!("timed out"),
+        }
     }
 
     #[test]
