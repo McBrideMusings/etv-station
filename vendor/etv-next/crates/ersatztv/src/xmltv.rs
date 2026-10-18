@@ -71,7 +71,7 @@ fn build_xmltv(
         w.write_event(Event::Start(tv)).map_err(xml_err)?;
 
         for channel in channels {
-            write_channel(&mut w, channel)?;
+            write_channel(&mut w, channel, base_url)?;
         }
 
         for (tvg_id, items) in sections {
@@ -122,7 +122,7 @@ fn programme_spans(
 /// #187), otherwise pass it through unchanged. A relative URL only ever comes
 /// from the station's own artwork cache; anything already absolute (e.g. a
 /// future source that publishes a full URL) is left exactly as given.
-fn resolve_icon_url(url: &str, base_url: &str) -> String {
+pub(crate) fn resolve_icon_url(url: &str, base_url: &str) -> String {
     if let Some(path) = url.strip_prefix('/') {
         format!("{base_url}/{path}")
     } else {
@@ -133,6 +133,7 @@ fn resolve_icon_url(url: &str, base_url: &str) -> String {
 fn write_channel<W: std::io::Write>(
     w: &mut Writer<W>,
     channel: &ChannelModel,
+    base_url: &str,
 ) -> Result<(), LineupError> {
     let mut elem = BytesStart::new("channel");
     // Must be the same string the M3U publishes as tvg-id — clients join the
@@ -154,8 +155,9 @@ fn write_channel<W: std::io::Write>(
     write_text_element(w, "display-name", channel.name())?;
 
     if let Some(logo) = channel.logo() {
+        let resolved = resolve_icon_url(logo, base_url);
         let mut icon = BytesStart::new("icon");
-        icon.push_attribute(("src", logo));
+        icon.push_attribute(("src", resolved.as_str()));
         w.write_event(Event::Empty(icon)).map_err(xml_err)?;
     }
 
@@ -818,7 +820,8 @@ mod tests {
     }
 
     // #187: the station only ever writes a path relative to this server's own
-    // root (never a Plex URL — a Plex URL is `X-Plex-Token` in disguise), and
+    // root for programme artwork and channel logos (#342) — never a Plex URL,
+    // since a Plex URL is `X-Plex-Token` in disguise — and
     // this is the resolution that turns it into something a guide reader
     // fetching from a different host can actually load. The absent-artwork
     // case (no `<icon>` at all) is already covered by `bare_item()` in the
@@ -835,7 +838,7 @@ mod tests {
             config: cfg_path.to_string_lossy().into_owned(),
             overlays: Vec::new(),
             tvg_id: None,
-            logo: None,
+            logo: Some("/artwork/channel-logos/1.png?v=ab12".into()),
             group: None,
         };
         let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
@@ -853,6 +856,12 @@ mod tests {
 
         assert!(
             xml.contains(r#"<icon src="http://viewer.example:8409/artwork/abc123.jpg"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<icon src="http://viewer.example:8409/artwork/channel-logos/1.png?v=ab12"/>"#
+            ),
             "{xml}"
         );
         // The whole point of #187: never a Plex URL, and never the credential

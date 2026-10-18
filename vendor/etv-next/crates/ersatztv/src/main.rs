@@ -615,6 +615,7 @@ async fn channel_playlist(
     for channel in &state.channels {
         let logo = channel
             .logo()
+            .map(|l| crate::xmltv::resolve_icon_url(l, &scheme_host))
             .map(|l| format!(" tvg-logo=\"{l}\""))
             .unwrap_or(String::new());
 
