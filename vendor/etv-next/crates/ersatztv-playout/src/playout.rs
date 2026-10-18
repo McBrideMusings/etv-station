@@ -796,6 +796,18 @@ mod schedule_requests_subtitle_tests {
     }
 
     #[tokio::test]
+    async fn item_covers_its_start_but_not_its_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let wants = item("wants-subs", true);
+        let (start, finish) = (wants.start, wants.finish);
+        write_chunk(dir.path(), "chunk.json", vec![wants]);
+
+        assert!(schedule_requests_subtitle(dir.path(), start).await);
+        assert!(!schedule_requests_subtitle(dir.path(), finish).await);
+        assert!(!schedule_requests_subtitle(dir.path(), start - time::Duration::seconds(1)).await);
+    }
+
+    #[tokio::test]
     async fn chunk_filename_outside_now_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let wants = item("wants-subs", true);
