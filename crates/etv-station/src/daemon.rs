@@ -5650,6 +5650,29 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         (dir, path)
     }
 
+    /// Deleting the trim call from `run_catalog_refresh` leaves RSS ratcheting up
+    /// a step per refresh (#7tj2) and nothing else failing.
+    #[tokio::test]
+    async fn every_refresh_kind_trims_memory_afterwards() {
+        let (_dir, path) = write_station("UTC");
+        let station = crate::config::load(&path).unwrap();
+        let cancel = Arc::new(Cancel::default());
+        let trims = || {
+            crate::memstat::TRIM_REASONS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| **r == "catalog_refresh")
+                .count()
+        };
+
+        let before = trims();
+        run_catalog_refresh(&station, None, RefreshKind::Scheduled, &cancel).await;
+        assert_eq!(trims(), before + 1, "a Scheduled refresh must trim");
+        run_catalog_refresh(&station, None, RefreshKind::Forced, &cancel).await;
+        assert_eq!(trims(), before + 2, "a Forced refresh must trim");
+    }
+
     #[tokio::test]
     async fn prepare_generation_accepts_valid_config() {
         let (_dir, path) = write_station("America/Chicago");

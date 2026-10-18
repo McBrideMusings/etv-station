@@ -95,25 +95,6 @@ struct Cli {
     port: u16,
 }
 
-fn expand_env(raw: &str) -> Result<String, String> {
-    let mut out = String::new();
-    let mut rest = raw;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| format!("unterminated ${{ in {raw:?}"))?;
-        let var = &after[..end];
-        let val = std::env::var(var)
-            .map_err(|_| format!("env var `{var}` referenced by {raw:?} is not set"))?;
-        out.push_str(&val);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
 /// A working copy of a real pool's config — everything but `profile` stays
 /// exactly what the channel author wrote. `Pool` derives `Deserialize` +
 /// `Serialize` but not `Clone` (it is not on `config::Pool`'s own type, and
@@ -465,7 +446,7 @@ fn build_pool_working(
     // working copy, is what makes a `keyword:` profile entry resolve instead
     // of failing to open a literal `${PLEXDB_SNAPSHOT_PATH}`.
     for ds in &mut pool_owned.datastores {
-        ds.path = expand_env(&ds.path)?;
+        ds.path = config::expand_process_env(&ds.path)?;
     }
     let first_grant = pool_owned
         .datastores

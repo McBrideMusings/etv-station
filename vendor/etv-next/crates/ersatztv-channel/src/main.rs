@@ -72,6 +72,14 @@ async fn write_exit_reason(output_folder: &Path, err: &ChannelError) {
     }
 }
 
+/// Write the exit reason for every error that exits non-zero; an idle timeout
+/// is a clean end of session and leaves no file.
+async fn write_exit_reason_if_failed(output_folder: &Path, err: &ChannelError) {
+    if exit_code(err) != 0 {
+        write_exit_reason(output_folder, err).await;
+    }
+}
+
 #[tokio::main]
 pub async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -88,13 +96,10 @@ pub async fn main() {
             _ => log::error!("{err}"),
         };
 
-        let code = exit_code(&err);
-        if code != 0
-            && let Some(output_folder) = &output_folder
-        {
-            write_exit_reason(output_folder, &err).await;
+        if let Some(output_folder) = &output_folder {
+            write_exit_reason_if_failed(output_folder, &err).await;
         }
-        std::process::exit(code);
+        std::process::exit(exit_code(&err));
     }
 }
 
@@ -172,5 +177,28 @@ mod tests {
     fn other_errors_exit_one() {
         let err = ChannelError::StreamFailure("test stream failure".into());
         assert_eq!(exit_code(&err), 1);
+    }
+
+    // `tools/channel-health.sh` shows this file's text as the cause of an exit.
+    // An idle timeout exits 0 and must leave nothing behind.
+    #[tokio::test]
+    async fn exit_reason_is_written_for_a_failure_and_skipped_for_idle_timeout() {
+        let failed = tempfile::tempdir().unwrap();
+        let err = ChannelError::StreamFailure("ffmpeg died".into());
+        write_exit_reason_if_failed(failed.path(), &err).await;
+        let text =
+            std::fs::read_to_string(failed.path().join(ersatztv_core::EXIT_REASON_FILE_NAME))
+                .unwrap();
+        assert_eq!(text, err.to_string());
+
+        let idle = tempfile::tempdir().unwrap();
+        let err = ChannelError::IdleTimeout("no viewers".into());
+        write_exit_reason_if_failed(idle.path(), &err).await;
+        assert!(
+            !idle
+                .path()
+                .join(ersatztv_core::EXIT_REASON_FILE_NAME)
+                .exists()
+        );
     }
 }

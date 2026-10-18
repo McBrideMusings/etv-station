@@ -147,4 +147,7 @@ if [ "${#fetch[@]}" -gt 0 ]; then
   }
 fi
 
-exec cargo run --quiet --bin taste-debug -- "${args[@]}"
+# No `--quiet`: on a cold target/ the build takes minutes, and cargo's
+# "Compiling ..." lines are the only sign it isn't hung.
+echo "taste-debug: building (minutes on a cold target/, seconds after)..." >&2
+exec cargo run --bin taste-debug -- "${args[@]}"

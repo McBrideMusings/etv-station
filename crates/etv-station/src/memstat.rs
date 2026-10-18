@@ -82,6 +82,13 @@ pub fn sample() -> Option<MemSample> {
     None
 }
 
+/// Every `reason` [`trim_and_log`] was called with, in call order. The `mem.trim`
+/// log line exists only where [`sample`] reads something and is emitted on a
+/// `spawn_blocking` thread, so a caller's test asserts on this instead.
+#[cfg(test)]
+pub(crate) static TRIM_REASONS: std::sync::Mutex<Vec<&'static str>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Hand the pages glibc malloc holds freed back to the kernel
 /// (`malloc_trim(0)`, every arena), and log a `mem.trim` line with the
 /// process's memory before and after.
@@ -93,6 +100,8 @@ pub fn sample() -> Option<MemSample> {
 /// each refresh ends. Does nothing on a platform where [`sample`] has nothing
 /// to read.
 pub fn trim_and_log(reason: &'static str) {
+    #[cfg(test)]
+    TRIM_REASONS.lock().unwrap().push(reason);
     let before = sample();
     let started = std::time::Instant::now();
     let released = release_free_pages();

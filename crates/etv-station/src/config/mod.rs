@@ -26,7 +26,8 @@ pub use entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, Query
 pub use filter::Filter;
 pub use hooks::{HookDecl, HookGrant, HookTrigger};
 pub use load::{
-    DroppedChannel, LoadedChannel, Station, load, load_for_inspection, read_channel, read_station,
+    DroppedChannel, LoadedChannel, Station, expand_process_env, load, load_for_inspection,
+    read_channel, read_station,
 };
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};
