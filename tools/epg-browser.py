@@ -470,10 +470,12 @@ def find_matching_audit_item(report: dict, start: datetime) -> dict | None:
 
 
 def render_classification(audit: object) -> str:
-    """The `select`-stage record's `detail.pool/source/take/from/expr`,
-    labelling the item by its pool. `audit` is `metadata.audit` verbatim from
-    the station (see split_audit's doc comment in
-    crates/etv-station/src/audit_report.rs) — not guaranteed to be a list."""
+    """A one-line verdict read off the `select`-stage record's
+    `detail.pool/source/take/from/expr`: which pool the item was drawn from and
+    how. The raw keys are not repeated here; render_audit_trail prints them in
+    full. `audit` is `metadata.audit` verbatim from the station (see
+    split_audit's doc comment in crates/etv-station/src/audit_report.rs) — not
+    guaranteed to be a list."""
     if not isinstance(audit, list):
         return f"the audit trail is malformed (not a list): {audit!r}"
     if not audit:
@@ -486,10 +488,20 @@ def render_classification(audit: object) -> str:
         return "no 'select' stage record in the audit trail — nothing classified this item"
     detail = select_record.get("detail")
     detail = detail if isinstance(detail, dict) else {}
-    lines = [f"pool: {detail.get('pool', '∅')}"]
-    for key in ("source", "take", "from", "expr"):
-        lines.append(f"{key}: {detail.get(key, '∅')}")
-    return "\n".join(lines)
+    verdict = f"drawn from pool \"{detail.get('pool', '∅')}\""
+    source = detail.get("source")
+    expr = detail.get("expr")
+    if source is not None and expr is not None:
+        verdict += f" by {source} ({expr})"
+    elif source is not None:
+        verdict += f" by {source}"
+    take = detail.get("take")
+    if take is not None:
+        verdict += f", take {take}"
+        origin = detail.get("from")
+        if origin is not None:
+            verdict += f" from {origin}"
+    return verdict
 
 
 def _fmt_scalar(value: object) -> str:
@@ -1447,7 +1459,7 @@ def build_app(host: str):
                 if worker.is_cancelled or item is None:
                     return
                 raw_audit = item.get("audit", []) if isinstance(item, dict) else []
-                classification_line = render_classification(raw_audit).splitlines()[0]
+                classification_line = render_classification(raw_audit)
                 overlay_spec = item.get("overlay_spec") if isinstance(item, dict) else None
                 overlay_text = "this channel draws no overlay here"
                 if overlay_spec is not None:
