@@ -90,13 +90,14 @@ snap_db() {
         fail=1
         return 1
     fi
-    if ! sqlite3 "$src" ".backup '$dest/$name'" 2>/dev/null; then
-        note "FAIL $name (.backup errored)"
+    local err
+    if ! err=$(sqlite3 "$src" ".backup '$dest/$name'" 2>&1); then
+        note "FAIL $name (.backup errored: ${err:-<no message>})"
         fail=1
         return 1
     fi
     local check
-    check=$(sqlite3 "$dest/$name" 'PRAGMA quick_check;' 2>/dev/null | head -1)
+    check=$(sqlite3 "$dest/$name" 'PRAGMA quick_check;' 2>&1 | head -1)
     if [ "$check" != "ok" ]; then
         note "FAIL $name (quick_check said: ${check:-<nothing>})"
         fail=1
@@ -112,10 +113,11 @@ copy_path() {
         fail=1
         return 1
     fi
-    if cp -a "$src" "$dest/$name" 2>/dev/null; then
+    local err
+    if err=$(cp -a "$src" "$dest/$name" 2>&1); then
         note "ok   $name"
     else
-        note "FAIL $name (copy errored)"
+        note "FAIL $name (copy errored: ${err:-<no message>})"
         fail=1
     fi
 }
