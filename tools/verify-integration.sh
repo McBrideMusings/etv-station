@@ -34,6 +34,8 @@ BASE_URL="http://127.0.0.1:${ETV_PORT}"
 LOG_FILE="tmp/verify-integration.log"
 BUILD_LOG="tmp/verify-integration-build.log"
 LINEUP_WAIT_SECS=120
+# Backstop for a dev-run that hangs; dev-run bounds its own waits well inside it.
+LAUNCH_WAIT_SECS=900
 CLEANUP_GRACE_SECS=10
 MASTER_WAIT_SECS=120
 SEGMENT_WAIT_SECS=10
@@ -139,10 +141,29 @@ OPEN_IINA=0 ./tools/dev-run.sh >"$LOG_FILE" 2>&1 &
 dev_run_pid=$!
 launched_at=$SECONDS
 
-# Wait for /channels.m3u to return 200. The deadline counts from the launch.
-# A dev-run that exited fails at once instead of running out the deadline. A
-# process-group failure is bash's setpgid refusal; it is harmless while the
-# stack comes up, so it is named as the likely cause only when the lineup does not.
+# The lineup cannot answer until dev-run.sh launches etv-next, which it does
+# after the station's startup catch-up (dev-run.sh wait_for_first_emit, bounded
+# there). That catch-up scales with machine load, so the lineup deadline counts
+# from dev-run's "launching etv-next" line, not from launch. A dev-run that
+# exited fails at once instead of running out a deadline. A process-group
+# failure is bash's setpgid refusal; it is harmless while the stack comes up, so
+# it is named as the likely cause only when the lineup does not.
+printf 'waiting for dev-run to launch etv-next...\n'
+while ! grep -qF '[dev] launching etv-next' "$LOG_FILE" 2>/dev/null; do
+  if ! kill -0 "$dev_run_pid" 2>/dev/null; then
+    fail "dev-run exited before launching etv-next; last lines of $LOG_FILE:"
+    tail -20 "$LOG_FILE" >&2
+    exit 1
+  fi
+  if [ $((SECONDS - launched_at)) -ge "$LAUNCH_WAIT_SECS" ]; then
+    fail "dev-run did not launch etv-next within ${LAUNCH_WAIT_SECS}s"
+    exit 1
+  fi
+  sleep 1
+done
+pass "dev-run launched etv-next ($((SECONDS - launched_at))s after launch)"
+launched_at=$SECONDS
+
 printf 'waiting for lineup...\n'
 while ! curl -fs -o /dev/null --max-time 2 "$BASE_URL/channels.m3u"; do
   if ! kill -0 "$dev_run_pid" 2>/dev/null; then
@@ -154,7 +175,7 @@ while ! curl -fs -o /dev/null --max-time 2 "$BASE_URL/channels.m3u"; do
     exit 1
   fi
   if [ $((SECONDS - launched_at)) -ge "$LINEUP_WAIT_SECS" ]; then
-    fail "lineup endpoint did not return 200 within ${LINEUP_WAIT_SECS}s of launch"
+    fail "lineup endpoint did not return 200 within ${LINEUP_WAIT_SECS}s of etv-next's launch"
     if grep -q 'setpgid.*Operation not permitted' "$LOG_FILE"; then
       fail "launch error: $(grep -m1 'setpgid.*Operation not permitted' "$LOG_FILE")"
     fi
@@ -162,7 +183,7 @@ while ! curl -fs -o /dev/null --max-time 2 "$BASE_URL/channels.m3u"; do
   fi
   sleep 1
 done
-pass "lineup endpoint ready ($((SECONDS - launched_at))s after launch)"
+pass "lineup endpoint ready ($((SECONDS - launched_at))s after etv-next launch)"
 
 # Fetch lineup and assert it contains channel/1.m3u8.
 printf 'verifying lineup content...\n'

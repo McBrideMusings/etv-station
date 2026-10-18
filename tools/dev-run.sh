@@ -258,6 +258,8 @@ wait_for_first_emit() {
 if [ "${#output_folders[@]}" -gt 0 ]; then
   wait_for_first_emit "${output_folders[@]}"
 fi
+# tools/verify-integration.sh starts its lineup clock on this line.
+echo "[dev] launching etv-next"
 
 # Ask cargo where the vendored workspace builds (CARGO_TARGET_DIR or a
 # build.target-dir in a parent .cargo/config.toml move it off vendor/etv-next/target).
