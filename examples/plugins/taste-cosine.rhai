@@ -1185,6 +1185,7 @@ fn pick(ctx) {
 
     for b in blocks {
         let stage = stages[b.uid];
+        let why = on_screen_why(ctx, stage);
         for id in b.ids {
             // The score, the specific on-profile keywords behind it, and
             // whether this slot came from the ranking or the seeded surprise
@@ -1192,21 +1193,23 @@ fn pick(ctx) {
             // explained rather than just trusted — never read back by
             // etv-station itself (ADR 0002: the score stays internal to the
             // plugin), only carried through untouched to the playout JSON.
-            out.push(#{
-                entry_id: id,
-                metadata: #{
-                    score: stage.score,
-                    on_profile_keywords: stage.on_profile,
-                    // Two floats, not the entry list: the profile entries
-                    // behind them are in the audit detail, where bytes are
-                    // budgeted for explanation. These are here so a reader of
-                    // the playout JSON alone can still see that the profile
-                    // moved a pick and which way.
-                    favor_score: stage.favor_score,
-                    disfavor_score: stage.disfavor_score,
-                    source: stage.source,
-                },
-            });
+            let metadata = #{
+                score: stage.score,
+                on_profile_keywords: stage.on_profile,
+                // Two floats, not the entry list: the profile entries
+                // behind them are in the audit detail, where bytes are
+                // budgeted for explanation. These are here so a reader of
+                // the playout JSON alone can still see that the profile
+                // moved a pick and which way.
+                favor_score: stage.favor_score,
+                disfavor_score: stage.disfavor_score,
+                source: stage.source,
+            };
+            if why != () {
+                metadata.why = why.line;
+                metadata.why_detail = why.detail;
+            }
+            out.push(#{ entry_id: id, metadata: metadata });
             // Keyed by the EMITTED entry_id, since audit() is handed the
             // picks array and looks each one up by that — an episode, not the
             // show it was ranked as.
@@ -1236,6 +1239,61 @@ fn top_keywords(words, weights, n) {
         if !out.contains(p.k) { out.push(p.k); }
     }
     out
+}
+
+// A short on-screen reason for a pick, for an overlay to draw — or () when
+// the pool asks for none. Written into the pick's metadata as `why` (the
+// line) and `why_detail` (the keywords under it); the station carries both
+// to the playout JSON untouched and never reads them.
+//
+// The wording is the pool's, from its `config:` block, so a channel phrases
+// each block its own way and this script holds no viewer-facing copy:
+//
+//   why                 the line for a ranked pick ("Nobody here has seen it")
+//   why_random          the line for an exploration draw (default: `why`)
+//   why_random_detail   what sits under it (default "picked at random")
+//
+// A ranked pick's detail is its two heaviest matching keywords, shortened:
+// " film" and " television series" come off the end, and a keyword longer
+// than three words is skipped — the long TMDB phrases ("laugh out loud
+// relationship entanglement") read as noise at a glance.
+fn on_screen_why(ctx, stage) {
+    let line = ctx.config["why"];
+    if line == () { return (); }
+    if stage.draw == "exploration" {
+        let random = ctx.config["why_random"];
+        let detail = ctx.config["why_random_detail"];
+        return #{
+            line: if random == () { line } else { random },
+            detail: if detail == () { "picked at random" } else { detail },
+        };
+    }
+    let words = [];
+    let weights = [];
+    for i in 0..stage.on_profile.len {
+        words.push(stage.on_profile[i]);
+        weights.push(stage.on_profile_w[i]);
+    }
+    for i in 0..stage.on_favor.len {
+        words.push(stage.on_favor[i].split("\x01")[1]);
+        weights.push(stage.on_favor_w[i]);
+    }
+    let short = [];
+    for k in top_keywords(words, weights, words.len) {
+        if short.len >= 2 { break; }
+        let k = k;
+        for suffix in [" television series", " tv series", " film"] {
+            if k.ends_with(suffix) { k = k.sub_string(0, k.len - suffix.len); }
+        }
+        if k.split(" ").len > 3 || k == "" || short.contains(k) { continue; }
+        short.push(k);
+    }
+    let detail = "";
+    for i in 0..short.len {
+        if i > 0 { detail += " · "; }
+        detail += short[i];
+    }
+    #{ line: line, detail: detail }
 }
 
 // The one sentence a viewer reads in the guide (etv-station-puhx): the

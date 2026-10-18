@@ -502,6 +502,76 @@ fn the_committed_example_plugin_runs_and_scores_correctly() {
     assert_eq!(mov_b_score, 0.0);
 }
 
+/// The on-screen reason (`config: { why: … }`): a ranked pick carries the
+/// pool's own line plus its matched keywords, an exploration draw carries the
+/// random wording, and a pool that sets no `why` writes neither key.
+#[test]
+fn a_pool_worded_why_reaches_each_picks_metadata() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let meta = |p: &PickedItem, key: &str| {
+        p.metadata
+            .as_ref()
+            .unwrap()
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+
+    let ranked = scorer.pick_for(
+        "movies",
+        0,
+        3,
+        Some(serde_json::json!({ "exploration_fraction": 0.0, "why": "Nobody here has seen it" })),
+        None,
+        &[],
+    );
+    let mov_d = ranked.iter().find(|p| p.id == "mov-d").unwrap();
+    assert_eq!(
+        meta(mov_d, "why").as_deref(),
+        Some("Nobody here has seen it")
+    );
+    assert_eq!(meta(mov_d, "why_detail").as_deref(), Some("time"));
+
+    let random = scorer.pick_for(
+        "movies",
+        0,
+        3,
+        Some(serde_json::json!({
+            "exploration_fraction": 1.0,
+            "why": "Nobody here has seen it",
+            "why_random": "Something different",
+        })),
+        None,
+        &[],
+    );
+    let explored: Vec<&PickedItem> = random
+        .iter()
+        .filter(|p| source_of(p) == Some("explore"))
+        .collect();
+    assert!(!explored.is_empty());
+    for p in explored {
+        assert_eq!(
+            meta(p, "why").as_deref(),
+            Some("Something different"),
+            "{}",
+            p.id
+        );
+        assert_eq!(
+            meta(p, "why_detail").as_deref(),
+            Some("picked at random"),
+            "{}",
+            p.id
+        );
+    }
+
+    let unworded = scorer.pick("movies", 0, 3, Some(0.0));
+    assert!(
+        unworded
+            .iter()
+            .all(|p| meta(p, "why").is_none() && meta(p, "why_detail").is_none())
+    );
+}
+
 /// `capabilities()` declares exactly the three things the sample channel
 /// grants (#167, #181) — a channel pool that grants fewer fails to load
 /// naming whichever is missing; that generic mechanism is covered by

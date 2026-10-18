@@ -767,6 +767,28 @@ channel(s):
   neither is silently preferred, and every other channel still serves. Both
   collision checks read the whole roster before either drops anything.
 
+### Channel logo — `logo:`
+
+```yaml
+logo: logo-guide.png   # relative to this channel file's directory
+```
+
+`logo:` is the channel's tile in a guide (#342). When ETV-next's config is
+rendered, the station copies the image into the artwork cache
+(`ETV_STATION_ARTWORK_CACHE`) as `channel-logos/<number>.<ext>` and names
+`/artwork/channel-logos/<number>.<ext>?v=<content hash>` as the lineup
+channel's `logo`. ETV-next resolves that against the requesting host and
+publishes it as the XMLTV `<channel><icon src>` and the M3U `tvg-logo`. The
+hash changes with the image, so a guide client that caches icons by URL picks
+up a new one.
+
+It is separate from the overlay: the on-screen mark is usually white on
+transparent, which disappears in a light-themed guide, so a channel commonly
+names a different image here. With no artwork cache configured, or an
+unreadable image, the channel is published without a logo and a
+`lineup.logo.skipped` WARN names the file and the reason. The station rebuilds
+`channel-logos/` on every render, so a dropped `logo:` leaves nothing behind.
+
 ### Composing blocks — `rule.blocks`
 
 Each entry under `rule.blocks` is a **block include** (`config/rule.rs`,
@@ -1677,6 +1699,29 @@ Every pick's audit detail carries `house_score`, `unusual_weight` and `seen`,
 and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
+
+#### `why` — an on-screen reason, worded by the pool
+
+Three more `config` keys give each pick a short reason an overlay can draw.
+The wording lives in the channel file, so each block says it its own way:
+
+```yaml
+- name: new-to-everyone
+  config:
+    seen: exclude
+    why: "Nobody here has seen it"        # a ranked pick
+    why_random: "Something different"     # an exploration draw (default: why)
+    why_random_detail: "picked at random" # under it (this is the default)
+```
+
+A pool that sets `why` writes two keys into each pick's playout `metadata`:
+`why`, the line, and `why_detail`, the text under it. A ranked pick's detail
+is its two heaviest matching keywords joined with ` · `, with ` film` and
+` television series` trimmed off and any keyword over three words skipped
+(`comedy · drama`); an exploration draw's is `why_random_detail`. A pool that
+sets no `why` writes neither. The station carries both keys through untouched
+and never reads them; `deploy/appdata/shared/corner-sequence.rhai` is one
+overlay that draws them.
 
 #### `ignore_keywords` — tags that describe packaging, not subject
 
