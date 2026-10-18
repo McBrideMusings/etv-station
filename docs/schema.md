@@ -761,7 +761,8 @@ channel(s):
   (`channel.load_failed`) is logged naming the config file and the missing
   field; the channel does not appear in the lineup, and every other channel
   still serves.
-- **Two channels declaring the same `name:` are both refused.** An ERROR
+- **Two channels declaring the same `name:` are both refused**, compared
+  ignoring case (`Foo` and `foo` share one folder on macOS and SMB). An ERROR
   (`channel.name_collision`) is logged naming both config files and the name;
   neither is silently preferred, and every other channel still serves. Both
   collision checks read the whole roster before either drops anything.
