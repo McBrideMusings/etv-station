@@ -781,11 +781,12 @@ impl HistoryDb {
         Ok(out)
     }
 
-    /// How many airings are on record for `channel`.
+    /// How many programme airings are on record for `channel`; bumper
+    /// segments are not counted.
     pub fn count(&self, channel: &str) -> Result<usize, HistoryError> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM airings WHERE channel = ?1",
+            "SELECT COUNT(*) FROM airings WHERE channel = ?1 AND kind = 'programme'",
             params![channel],
             |row| row.get(0),
         )?;
@@ -1259,6 +1260,8 @@ mod tests {
         assert_eq!(db.series_cursor("ch1").unwrap().len(), 1);
         assert_eq!(db.series_cursor("ch1").unwrap()["show-a"], "s1e2");
         assert_eq!(db.cross_channel_show_cursor().unwrap().len(), 1);
+        // Two programmes and two bumpers on record: only programmes count.
+        assert_eq!(db.count("ch1").unwrap(), 2);
     }
 
     #[test]
