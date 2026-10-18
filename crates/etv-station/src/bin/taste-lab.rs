@@ -1162,6 +1162,19 @@ fn enrich_audit(catalog: &Catalog, metadata: Option<&Value>) -> Option<Value> {
     Some(audit)
 }
 
+/// The `pool.profile` index an entry of `ctx.profile` edits: its 1-based
+/// `position` within the inline list, less one. `ctx.profile` omits
+/// `exclude`/`require` entries and lists `profile_files` entries first, so its
+/// own order is not `pool.profile`'s. A file entry has no `pool.profile` slot
+/// (the lab edits the working copy's inline list only), so its index is null.
+fn inline_index(entry: &serde_json::Map<String, Value>) -> Value {
+    let inline = entry.get("origin").and_then(Value::as_str) == Some("inline");
+    match entry.get("position").and_then(Value::as_u64) {
+        Some(pos) if inline && pos >= 1 => json!(pos - 1),
+        _ => Value::Null,
+    }
+}
+
 fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
     let Some(resolved) = cache.profile(pool_name) else {
         return json!({ "entries": [], "ignore_keywords": [], "exclusions": [] });
@@ -1169,11 +1182,11 @@ fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
     let entries: Vec<Value> = resolved
         .entries
         .iter()
-        .enumerate()
-        .map(|(i, dyn_entry)| {
+        .map(|dyn_entry| {
             let mut v = rhai::serde::from_dynamic::<Value>(dyn_entry).unwrap_or_else(|_| json!({}));
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("index".to_string(), json!(i));
+                let index = inline_index(obj);
+                obj.insert("index".to_string(), index);
             }
             v
         })
@@ -2243,6 +2256,21 @@ const REVIEW_HTML: &str = include_str!("taste_lab_review.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_index_follows_position_not_ctx_profile_order() {
+        let entry = |v: Value| v.as_object().unwrap().clone();
+        // Inline entry 3 in the file, though `exclude:` entries 1-2 and a
+        // file entry came before it in the list: slot 2 of `pool.profile`.
+        assert_eq!(
+            inline_index(&entry(json!({"origin": "inline", "position": 3}))),
+            json!(2)
+        );
+        assert_eq!(
+            inline_index(&entry(json!({"origin": "profile.yaml", "position": 1}))),
+            Value::Null
+        );
+    }
 
     #[test]
     fn lineup_keys_are_folder_names_when_distinct() {

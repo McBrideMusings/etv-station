@@ -550,6 +550,7 @@ pub fn resolve(
         m.insert("weight".into(), weight.into());
         m.insert("reference".into(), entry.written.clone().into());
         m.insert("origin".into(), entry.origin.clone().into());
+        m.insert("position".into(), (entry.position as i64).into());
         out.push(Dynamic::from_map(m));
     }
     let ignored = if ignore_keywords.is_empty() {

@@ -592,15 +592,9 @@ impl PoolRuntime<'_> {
         roll: &RollKey,
         channel: &mut ChannelHistory,
     ) -> Result<Vec<String>, String> {
-        // A range is decided once per visit, here, so a `rotate = "slot"` visit
+        // A range is decided once per visit, so a `rotate = "slot"` visit
         // sizes its slots from the same roll a `rotate = "visit"` draw does.
-        let take = match take {
-            Take::Range { min, max } => {
-                let spread = (max.saturating_sub(min) + 1) as u64;
-                Take::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
-            }
-            fixed => fixed,
-        };
+        let take = resolve_take(take, roll);
         if take == Take::Count(0) || self.is_dry() {
             return Ok(Vec::new());
         }
@@ -1438,7 +1432,7 @@ pub fn build(
                 detail.insert("source".into(), serde_json::Value::String(pool_source(cfg)));
                 detail.insert(
                     "take".into(),
-                    serde_json::Value::String(describe_take(step.take)),
+                    serde_json::Value::String(describe_take(resolve_take(step.take, &roll))),
                 );
                 detail.insert(
                     "from".into(),
@@ -1761,6 +1755,19 @@ fn pool_source(cfg: &Pool) -> String {
         format!("{} show group(s)", cfg.groups.len())
     } else {
         "unknown".into()
+    }
+}
+
+/// A range is decided once per visit, from the visit's roll; a count or `all`
+/// passes through. `visit` and the `select` audit stage both read it, so the
+/// size the audit prints is the size the visit drew.
+fn resolve_take(take: Take, roll: &RollKey) -> Take {
+    match take {
+        Take::Range { min, max } => {
+            let spread = (max.saturating_sub(min) + 1) as u64;
+            Take::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
+        }
+        fixed => fixed,
     }
 }
 
@@ -3605,6 +3612,67 @@ mod tests {
             assert_eq!(trail.len(), 1, "{id}: one draw, one record");
             assert_eq!(trail[0]["stage"], "select");
         }
+    }
+
+    /// A ranged `take` is audited as the size the visit rolled, not as the
+    /// range: each episode's `select` record names the length of its visit.
+    #[test]
+    fn a_ranged_take_is_audited_as_the_size_the_visit_rolled() {
+        let cat = catalog();
+        let built = build(
+            &cat,
+            &[movies_pool(), shows_pool()],
+            &[],
+            &[
+                step("movies", 1),
+                PatternStep {
+                    pool: "shows".into(),
+                    take: Take::Range { min: 2, max: 4 },
+                    from: TakeFrom::Start,
+                    chance: 1.0,
+                },
+            ],
+            Some(24),
+            None,
+            &GenerationState::empty(),
+            &crate::variety::Variety::fixed(7),
+            time::OffsetDateTime::UNIX_EPOCH,
+            test_env(),
+            None,
+            None,
+        )
+        .expect("pattern builds");
+        let mut visits: Vec<Vec<String>> = Vec::new();
+        for (id, audit) in built.ids.iter().zip(&built.audits) {
+            let detail = &audit.as_ref().expect("every draw is audited")["audit"][0]["detail"];
+            let take = detail["take"].as_str().expect("select records a take");
+            if id.starts_with("mov-") {
+                visits.push(Vec::new());
+            } else {
+                visits
+                    .last_mut()
+                    .expect("a movie opens every cycle")
+                    .push(take.to_string());
+            }
+        }
+        let mut sizes = Vec::new();
+        for takes in &visits {
+            if takes.is_empty() {
+                continue;
+            }
+            let rolled = takes.len().to_string();
+            assert!(
+                takes.iter().all(|t| *t == rolled),
+                "visit of {rolled}: {takes:?}"
+            );
+            sizes.push(takes.len());
+        }
+        sizes.sort_unstable();
+        sizes.dedup();
+        assert!(
+            sizes.len() > 1,
+            "a seeded run should roll more than one size: {sizes:?}"
+        );
     }
 
     /// The headline acceptance criterion: `{movies take=1}, {shows take=3}`
