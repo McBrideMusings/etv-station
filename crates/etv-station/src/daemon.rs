@@ -3466,11 +3466,16 @@ async fn pattern_catch_up(
             .collect();
         ctx.history_db.record(&channel.name, &records)?;
 
-        // `resume_out` carries only pool state; the checkpoint trail is the
-        // daemon's, so it rides across rather than being replaced.
+        // `resume_out` carries only pool state; the checkpoint trail and the
+        // regeneration fingerprint are the daemon's, so they ride across rather
+        // than being replaced. Dropping the fingerprint here left every saved
+        // sidecar without one, so the next startup could not tell a config edit
+        // from no edit and kept airing the old schedule.
         let checkpoints = std::mem::take(&mut resume.checkpoints);
+        let config_id = resume.config_id.take();
         resume = resume_out;
         resume.checkpoints = checkpoints;
+        resume.config_id = config_id;
         resume.prune_elapsed(now);
         resume.prune_lists();
         crate::resume::save(output, &resume).await?;
@@ -3511,11 +3516,10 @@ async fn pattern_catch_up(
 }
 
 /// Guards the property #308 exists for: the swap right above
-/// (`let checkpoints = std::mem::take(&mut resume.checkpoints); resume =
-/// resume_out; resume.checkpoints = checkpoints;`) is what keeps a
-/// generation's fingerprint alive across `resume = resume_out` — see
-/// `resume_fingerprint_survives_generation_tests` below. Move the
-/// fingerprint back onto `ResumeMap` and this swap silently drops it again.
+/// (`resume = resume_out`, with `checkpoints` and `config_id` carried across by
+/// hand) keeps a generation's fingerprint alive. A field added to `ResumeMap`
+/// that the daemon owns must be carried the same way, or the swap silently
+/// drops it.
 #[cfg(test)]
 mod resume_fingerprint_survives_generation_tests {
     use super::*;
@@ -3614,6 +3618,39 @@ order = "manual"
             output_folder: dir.path().to_path_buf(),
             config,
         }
+    }
+
+    /// The fingerprint stamped at startup must still be in the sidecar after the
+    /// catch-up generates: the next startup compares against it to see a config
+    /// edit.
+    #[tokio::test]
+    async fn the_fingerprint_survives_a_generation_into_the_sidecar() {
+        let dir = tempdir().unwrap();
+        let channel = ch_straddling(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = HistoryDb::open_in_memory().unwrap();
+        let mut catalog: Option<Catalog> = None;
+
+        let mut stamped = crate::resume::ResumeMap::new();
+        stamped.config_id = Some("fingerprint-under-test".into());
+        let resume = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            stamped,
+            "startup",
+        )
+        .await
+        .expect("a hermetic lavfi channel resolves cleanly");
+
+        assert_eq!(resume.config_id.as_deref(), Some("fingerprint-under-test"));
+        let (on_disk, _) = crate::resume::load(&channel.output_folder).await.unwrap();
+        assert_eq!(
+            on_disk.config_id.as_deref(),
+            Some("fingerprint-under-test"),
+            "the saved sidecar lost the fingerprint",
+        );
     }
 
     #[tokio::test]
