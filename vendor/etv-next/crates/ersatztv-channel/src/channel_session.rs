@@ -9,9 +9,9 @@ use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
 use ersatztv_channel::playback_events::{self, PlaybackEvent};
 use ersatztv_core::{
-    HEARTBEAT_FILE_NAME, LIVE_PLAYLIST_FILE_NAME, LIVE_SUBTITLE_PLAYLIST_FILE_NAME,
-    OVERLAY_WANTED_FILE_NAME, OVERLAY_WRITER_POLL_INTERVAL, OVERLAY_WRITER_TIMEOUT,
-    READY_FILE_NAME, new_run_folder_name,
+    HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT, LIVE_PLAYLIST_FILE_NAME,
+    LIVE_SUBTITLE_PLAYLIST_FILE_NAME, OVERLAY_WANTED_FILE_NAME, OVERLAY_WRITER_POLL_INTERVAL,
+    OVERLAY_WRITER_TIMEOUT, READY_FILE_NAME, new_run_folder_name,
 };
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
@@ -282,6 +282,9 @@ impl ChannelSession {
             run_folder.to_owned(),
             run_folder_name,
             ready_file.to_owned(),
+            channel_config
+                .idle_grace_seconds
+                .map_or(HEARTBEAT_FILE_TIMEOUT, Duration::from_secs),
             PlaylistManagerOutputFiles {
                 generated_playlist_file: generated_output_file,
                 generated_subtitle_playlist_file: generated_subtitle_output_file,

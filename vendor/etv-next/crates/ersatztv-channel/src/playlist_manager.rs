@@ -23,23 +23,18 @@ const PROGRAM_DATE_TIME_FORMAT: &[FormatItem<'static>] = format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
 );
 
-// 3 segments is the commonly cited floor for a live HLS playlist (e.g. AWS's
-// Kinesis Video Streams HLS docs state a live media playlist should carry a
-// minimum of 3 fragments) — Apple's own authoring spec doesn't appear to
-// enumerate an exact minimum. Was 4; on GPU-bound hardware, each segment here
-// costs close to SEGMENT_SECONDS of real tune-in wait (see TARGET_BUFFER in
-// ersatztv-channel), so this is the smallest change consistent with a real,
-// citable floor rather than an arbitrary cut.
+// One segment is enough to point a client at: `.ready` releases the server's
+// held `/channel/N.m3u8` request, and every second between the first segment
+// and the third is a second the viewer spends on a spinner (the cold request
+// was measured at 18-26s, etv-station-306). The playlist keeps growing behind
+// it, so a player that starts on one segment finds more on its next reload.
 //
-// Deliberately sits exactly at that floor rather than above it — considered
-// and rejected adding a cushion, since any number above the cited minimum is
-// back to an arbitrary guess, the thing this constant is trying to avoid. Not
-// a race: a segment only enters `self.segments` (below, in `update`) once its
-// `.ts` file exists on disk AND ffmpeg's own playlist has published a known
+// Not a race: a segment only enters `self.segments` (below, in `update`) once
+// its `.ts` file exists on disk AND ffmpeg's own playlist has published a known
 // EXTINF duration for it — ffmpeg doesn't emit that duration until the
 // segment is fully written, so `self.segments.len()` can never count a
-// partial one. The floor is thin by design, not by oversight.
-const MIN_SEGMENTS: usize = 3;
+// partial one.
+const MIN_SEGMENTS: usize = 1;
 
 /// How far the newest segment's end may fall behind wall clock — in multiples of
 /// the playlist's target duration — before a session that a viewer is actively
@@ -115,6 +110,8 @@ pub struct PlaylistManager {
     pts_offset: Option<PtsOffset>,
     subtitle_source: Option<SubtitleSource>,
 
+    /// How long after the last viewer's heartbeat the session stays up.
+    idle_grace: Duration,
     timeout: bool,
     stalled: bool,
 
@@ -148,6 +145,7 @@ impl PlaylistManager {
     /// sees has to keep climbing even though the process producing it did not
     /// survive. A missing or unreadable counter file means a genuinely new
     /// session and starts at zero.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         channel_start_time: OffsetDateTime,
         target_duration: u32,
@@ -155,6 +153,7 @@ impl PlaylistManager {
         segment_folder: PathBuf,
         run_folder_name: String,
         ready_file: PathBuf,
+        idle_grace: Duration,
         output_files: PlaylistManagerOutputFiles,
     ) -> PlaylistManager {
         let heartbeat_file = output_folder.join(HEARTBEAT_FILE_NAME);
@@ -221,6 +220,7 @@ impl PlaylistManager {
             segment_folder,
             run_folder_name,
             ready_file,
+            idle_grace: idle_grace.max(HEARTBEAT_FILE_TIMEOUT),
             heartbeat_file,
             sequence_file,
             generated_playlist_file: output_files.generated_playlist_file,
@@ -483,8 +483,12 @@ impl PlaylistManager {
         if self.heartbeat_file.exists() {
             let metadata = tokio::fs::metadata(&self.heartbeat_file).await?;
             let modified = metadata.modified()?;
-            self.timeout = modified.elapsed().unwrap_or(Duration::MAX) > HEARTBEAT_FILE_TIMEOUT;
-            viewer_is_watching = !self.timeout;
+            let age = modified.elapsed().unwrap_or(Duration::MAX);
+            self.timeout = age > self.idle_grace;
+            // A viewer is present only inside HEARTBEAT_FILE_TIMEOUT; the rest
+            // of the grace window is a warm channel nobody is watching, which
+            // the stall check below must not tear down.
+            viewer_is_watching = age <= HEARTBEAT_FILE_TIMEOUT;
         }
 
         // The heartbeat proves the worker process is alive and that a viewer is
@@ -869,6 +873,14 @@ mod tests {
     /// run folder name, which is fine — these tests build at most one manager
     /// alive at a time per directory, so nothing collides.
     async fn manager(dir: &Path, last_segment_end: OffsetDateTime) -> PlaylistManager {
+        manager_with_grace(dir, last_segment_end, HEARTBEAT_FILE_TIMEOUT).await
+    }
+
+    async fn manager_with_grace(
+        dir: &Path,
+        last_segment_end: OffsetDateTime,
+        idle_grace: Duration,
+    ) -> PlaylistManager {
         let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let run_folder_name = "r0000000000000-0000".to_owned();
         let segment_folder = dir.join(&run_folder_name);
@@ -885,6 +897,7 @@ mod tests {
             segment_folder,
             run_folder_name,
             dir.join(".ready"),
+            idle_grace,
             PlaylistManagerOutputFiles {
                 generated_playlist_file: file("live.m3u8"),
                 generated_subtitle_playlist_file: Some(file("live_sub.m3u8")),
@@ -898,6 +911,69 @@ mod tests {
         tokio::fs::write(dir.join(HEARTBEAT_FILE_NAME), b"")
             .await
             .unwrap();
+    }
+
+    /// A heartbeat last touched `age` ago.
+    async fn watched_until(dir: &Path, age: Duration) {
+        watch(dir).await;
+        let file = std::fs::File::options()
+            .write(true)
+            .open(dir.join(HEARTBEAT_FILE_NAME))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// etv-station-306: a viewer gone for 2 minutes is inside a 300s grace, so
+    /// the worker stays up — and, with nobody watching, a starved session is
+    /// not declared stalled either.
+    #[tokio::test]
+    async fn a_session_inside_its_grace_window_stays_warm() {
+        let dir = TempDir::new().unwrap();
+        watched_until(dir.path(), Duration::from_secs(120)).await;
+
+        let mut pm = manager_with_grace(
+            dir.path(),
+            OffsetDateTime::now_utc() - time::Duration::seconds(THRESHOLD_SECONDS + 5),
+            Duration::from_secs(300),
+        )
+        .await;
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), None);
+    }
+
+    #[tokio::test]
+    async fn a_session_past_its_grace_window_idles_out() {
+        let dir = TempDir::new().unwrap();
+        watched_until(dir.path(), Duration::from_secs(310)).await;
+
+        let mut pm = manager_with_grace(
+            dir.path(),
+            OffsetDateTime::now_utc(),
+            Duration::from_secs(300),
+        )
+        .await;
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), Some(SessionAbort::IdleTimeout));
+    }
+
+    /// A grace below the heartbeat timeout is raised to it, never honoured.
+    #[tokio::test]
+    async fn a_grace_below_the_heartbeat_timeout_is_raised_to_it() {
+        let dir = TempDir::new().unwrap();
+        watched_until(dir.path(), Duration::from_secs(60)).await;
+
+        let mut pm = manager_with_grace(
+            dir.path(),
+            OffsetDateTime::now_utc(),
+            Duration::from_secs(5),
+        )
+        .await;
+        pm.update().await.unwrap();
+
+        assert_eq!(pm.abort(), None);
     }
 
     #[tokio::test]
@@ -1143,6 +1219,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(persisted.next_media_sequence, published + segments_listed);
+    }
+
+    #[tokio::test]
+    async fn ready_is_written_at_the_first_segment_and_not_before() {
+        let dir = TempDir::new().unwrap();
+        watch(dir.path()).await;
+
+        let mut pm = manager(dir.path(), OffsetDateTime::now_utc()).await;
+        pm.update().await.unwrap();
+        assert!(!dir.path().join(".ready").exists(), "no segment yet");
+
+        push_segments(&mut pm, 1);
+        pm.update().await.unwrap();
+        assert!(dir.path().join(".ready").exists(), "one segment is enough");
     }
 
     /// The freeze this guards: the session encodes ahead of wall clock, so the
