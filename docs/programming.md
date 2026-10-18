@@ -20,9 +20,7 @@ listed with the reason and left out of the total. Every grade threshold below
 is **unsourced** unless it cites a source: it is the line this page draws, not
 an industry standard. `crates/etv-station/src/review.rs` computes them.
 
-The keys named below are documented in the [config schema](/schema), except
-`chance` and `from` on a pattern step, which the schema page does not cover yet;
-`crates/etv-station/src/config/pool.rs` defines both.
+The keys named below are documented in the [config schema](/schema).
 Every YAML example is a fragment. `pools:`, `pattern:` and `sequencer:` sit
 inside one entry of `rule.blocks` or one `rule.slots` entry, and `slots:` and
 `schedules:` sit under `rule:`, as the first example shows in full.

@@ -492,6 +492,46 @@ def render_classification(audit: object) -> str:
     return "\n".join(lines)
 
 
+def _fmt_scalar(value: object) -> str:
+    """A float trimmed to 4 decimals with trailing zeros dropped; anything
+    else as str()."""
+    if isinstance(value, float):
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def _render_detail_value(key: str, value: object, indent: int) -> list[str]:
+    """`key: value` lines for one `detail` entry at `indent` spaces. A dict or
+    a list of dicts becomes an indented block per element, keyed by whatever
+    fields it carries; a bare list stays comma-separated on one line (the
+    pane wraps it). Generic over keys: nothing here knows a field name."""
+    pad = " " * indent
+    if isinstance(value, dict):
+        if not value:
+            return [f"{pad}{key}: (none)"]
+        lines = [f"{pad}{key}:"]
+        for k, v in value.items():
+            lines.extend(_render_detail_value(k, v, indent + 4))
+        return lines
+    if isinstance(value, list) and value and all(isinstance(e, dict) for e in value):
+        lines = [f"{pad}{key}:"]
+        for element in value:
+            first = True
+            for k, v in element.items():
+                sub = _render_detail_value(k, v, indent + 4)
+                marker = f"{pad}  - "
+                if first:
+                    sub[0] = marker + sub[0].lstrip()
+                    first = False
+                lines.extend(sub)
+            if first:
+                lines.append(f"{pad}  - (empty)")
+        return lines
+    if isinstance(value, list):
+        return [f"{pad}{key}: " + (", ".join(_fmt_scalar(e) for e in value) or "(none)")]
+    return [f"{pad}{key}: {_fmt_scalar(value)}"]
+
+
 def render_audit_trail(audit: object) -> str:
     """Every record in `audit`, in order — `stage`/`by`/`verdict` then each
     `detail` key indented, generically: no key name is hard-coded here, so an
@@ -512,7 +552,7 @@ def render_audit_trail(audit: object) -> str:
         detail = record.get("detail")
         if isinstance(detail, dict):
             for key, value in detail.items():
-                lines.append(f"    {key}: {value}")
+                lines.extend(_render_detail_value(key, value, 4))
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
@@ -981,7 +1021,11 @@ def build_app(host: str):
             now = datetime.now(timezone.utc)
             all_progs = programmes_for(self.programmes, self.selected_channel)
             if self.history:
-                horizon = now - timedelta(days=self.HISTORY_DAYS)
+                # Floored to the block grid: a horizon that tracks `now` to the
+                # second moves the "Start of retained EPG" row's text every
+                # tick, so _apply_programme_rows never sees an identical
+                # signature and rebuilds every row (#380).
+                horizon = self._floor_block(now - timedelta(days=self.HISTORY_DAYS), self.BLOCK_MINUTES)
                 progs_win = [p for p in all_progs if p.stop > horizon and p.start < now]
             else:
                 progs_win = [p for p in all_progs if p.stop > now]
