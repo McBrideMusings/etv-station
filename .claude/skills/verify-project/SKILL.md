@@ -221,6 +221,27 @@ the daemon consumes it on its next tick — it does not rewrite playout itself,
 because the daemon owns those files. A marker that is still there a minute later
 means the daemon is not ticking.
 
+## Verifying a seed reset against a live daemon (#142)
+
+`--refresh-channel <ch> --seed N` rewrites `seed:` in the channel's YAML, marks the
+channel, and SIGHUPs the daemon through `<output_base>/.etv-station.pid`. Boot the
+no-Plex config from a scratch copy (absolute `output_base`, absolute overlay path), wait
+for `chunk.write`, then:
+
+```bash
+./target/debug/etv-station --config <scratch>/station.yaml --refresh-channel test --seed 777
+grep -E 'signal.reload|resume.refresh' <daemon log>
+grep '^seed' <scratch>/channels/lavfi-test.yaml
+```
+
+Look for: `sent SIGHUP to the daemon (pid …)`, `event="signal.reload"` then
+`event="resume.refresh"`, `seed: 777` in the YAML, and the pid file gone after the daemon
+stops. Observed 2026-10-18: 480 `chunk.write` lines before, reload and refresh 52ms apart.
+`cargo test -p etv-station --lib a_forced_refresh_rebuilds_the_same_schedule` is the
+same-seed identity proof. On prod the YAML edit lands inside the container only; copy the
+seed into `deploy/appdata/channels/<ch>/channel.yaml` or the next `admin deploy files`
+reverts it.
+
 ## Verifying a partial wipe re-airs nothing (#378)
 
 Every wipe — a refresh, a coverage heal, the window sweep — cuts at an item

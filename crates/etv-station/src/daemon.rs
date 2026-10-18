@@ -52,6 +52,18 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         refresh_now,
         cancel,
     };
+    // `--refresh-channel --seed` reloads this daemon by SIGHUP through this file.
+    let _pid_file = match crate::reset::PidFile::write(&station.station.output_base) {
+        Ok(f) => Some(f),
+        Err(error) => {
+            tracing::warn!(
+                event = "pidfile.write_failed",
+                %error,
+                "could not write the pid file; `--refresh-channel --seed` cannot reload this daemon",
+            );
+            None
+        }
+    };
 
     // Each pass of this loop runs one "generation" of channel + overlay tasks
     // against the current config. SIGHUP re-reads the config from disk and
@@ -4057,6 +4069,67 @@ take = 2
             output_folder: dir.path().to_path_buf(),
             config,
         }
+    }
+
+    /// #142: a forced refresh of the same config rebuilds the same future. The
+    /// airing item and everything before it stay, and the regenerated span
+    /// lays down the identical items at the identical instants.
+    #[tokio::test]
+    async fn a_forced_refresh_rebuilds_the_same_schedule() {
+        let dir = tempdir().unwrap();
+        let channel = ch_pattern(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = HistoryDb::open_in_memory().unwrap();
+        let mut catalog = Some(pattern_catalog());
+
+        let mut resume = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            crate::resume::ResumeMap::new(),
+            "startup",
+        )
+        .await
+        .unwrap();
+        let before = airings_on_disk(&channel.output_folder).await;
+
+        let mut files = scan::scan_output_folder(&channel.output_folder)
+            .await
+            .unwrap();
+        files.sort_by_key(|f| f.start);
+        let at = files[1].start + time::Duration::minutes(30);
+        refresh_forward(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut resume,
+            at,
+            "forced",
+        )
+        .await
+        .unwrap();
+        let mid = airings_on_disk(&channel.output_folder).await;
+        assert!(
+            mid.len() < before.len(),
+            "the refresh must have removed the future ({} -> {})",
+            before.len(),
+            mid.len(),
+        );
+
+        pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            resume,
+            "roll",
+        )
+        .await
+        .unwrap();
+        let after = airings_on_disk(&channel.output_folder).await;
+        assert_eq!(
+            before, after,
+            "same config, same catalog: the same schedule"
+        );
     }
 
     /// The pattern half of #378, through the daemon's own checkpoint loop:
