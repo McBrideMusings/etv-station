@@ -180,17 +180,44 @@ mod tests {
         assert!(s.rss_kb > 0 && s.in_use_bytes > 0 && s.threads >= 1);
     }
 
+    /// How many of `pages` are backed by physical memory. Each element is a
+    /// page index (address / page size); the answer comes from
+    /// `/proc/self/pagemap`, whose 8-byte entry per page has bit 63 set when
+    /// the page is present.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn resident_pages(pagemap: &std::fs::File, pages: &[u64]) -> usize {
+        use std::os::unix::fs::FileExt;
+        pages
+            .iter()
+            .filter(|&&page| {
+                let mut entry = [0u8; 8];
+                pagemap.read_exact_at(&mut entry, page * 8).unwrap();
+                u64::from_ne_bytes(entry) >> 63 == 1
+            })
+            .count()
+    }
+
     /// The catalog refresh allocates on a tokio worker, so its pile lands in a
     /// non-main arena. Free a 128 MB pile made on another thread, keeping the
     /// last block so the heap top stays pinned (glibc's own free-time trim then
     /// releases nothing), and require the trim to give most of it back.
+    ///
+    /// The fall is counted over the pile's own pages, not process RSS: other
+    /// tests allocate on parallel threads, and their growth would mask it.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn trim_releases_a_pile_freed_inside_a_non_main_arena() {
         const BLOCK: usize = 1024;
         const BLOCKS: usize = 128 * 1024;
         let held = std::thread::spawn(|| {
+            // SAFETY: `sysconf` takes a name constant and reads no memory.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
             let mut pile: Vec<Vec<u8>> = (0..BLOCKS).map(|_| vec![1u8; BLOCK]).collect();
+            let mut pages: Vec<u64> = pile
+                .iter()
+                .map(|block| block.as_ptr() as u64 / page_size)
+                .collect();
+            pages.dedup();
             let last = pile.pop().unwrap();
             drop(pile);
             let before = sample().unwrap();
@@ -198,12 +225,15 @@ mod tests {
                 before.free_held_bytes > (BLOCKS * BLOCK / 2) as u64,
                 "the freed pile should still be held: {before:?}",
             );
+            let pagemap = std::fs::File::open("/proc/self/pagemap").unwrap();
+            let resident_before = resident_pages(&pagemap, &pages);
             assert!(release_free_pages(), "malloc_trim released nothing");
-            let after = sample().unwrap();
-            let fell_kb = before.rss_kb.saturating_sub(after.rss_kb);
+            let resident_after = resident_pages(&pagemap, &pages);
+            let fell_kb = resident_before.saturating_sub(resident_after) as u64 * page_size / 1024;
             assert!(
                 fell_kb > 64 * 1024,
-                "rss fell only {fell_kb} kB: before {before:?} after {after:?}",
+                "the pile's resident pages fell only {fell_kb} kB \
+                 ({resident_before} -> {resident_after} pages)",
             );
             last
         })
