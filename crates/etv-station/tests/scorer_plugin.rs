@@ -116,6 +116,7 @@ async fn assert_one_file_across_the_chunk(
 /// A one-pool, one-step pattern channel whose pool draws from `plugin`.
 fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
     ChannelConfig {
+        logo: None,
         temperature: None,
         subtitle: None,
         tracks: None,

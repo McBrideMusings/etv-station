@@ -93,6 +93,7 @@ fn audit(ctx, picks, workspace) { #{} }
 
 fn plugin_channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
+        logo: None,
         temperature: None,
         subtitle: None,
         tracks: None,

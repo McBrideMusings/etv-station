@@ -320,6 +320,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
 /// logic.
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
+        logo: None,
         temperature: None,
         subtitle: None,
         tracks: None,

@@ -2251,6 +2251,7 @@ mod tests {
 
     fn channel(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            logo: None,
             temperature: None,
             subtitle: None,
             tracks: None,

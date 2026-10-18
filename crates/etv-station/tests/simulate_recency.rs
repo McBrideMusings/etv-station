@@ -72,6 +72,7 @@ fn write_plugin(dir: &tempfile::TempDir) -> PathBuf {
 
 fn channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
+        logo: None,
         temperature: None,
         subtitle: None,
         tracks: None,

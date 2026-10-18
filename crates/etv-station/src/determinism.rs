@@ -280,6 +280,7 @@ mod tests {
 
     fn base_channel(rule: RuleConfig, scoring: Option<ScoringConfig>) -> ChannelConfig {
         ChannelConfig {
+            logo: None,
             temperature: None,
             subtitle: None,
             tracks: None,

@@ -239,6 +239,9 @@ pub struct ChannelRender {
     /// List bumper items as their own guide rows (`guide.show_bumpers`),
     /// already resolved: the channel's own value, else the station's.
     pub show_bumpers: bool,
+    /// The channel's `logo:` image (#342), already resolved against its
+    /// config file's directory. `None` publishes no logo.
+    pub logo: Option<PathBuf>,
 }
 
 /// Where [`render_with`] gets the tuner identity it publishes.
@@ -280,6 +283,11 @@ pub fn render_with(
             overlay: crate::daemon::load_overlay_playout_spec(ch),
             subtitle_default_on: ch.config.subtitle.as_ref().and_then(|s| s.default_on),
             show_bumpers: resolve_show_bumpers(ch.config.guide.as_ref(), &station.station.guide),
+            logo: ch
+                .config
+                .logo
+                .as_ref()
+                .map(|l| config_dir(&ch.config_path).join(l)),
         })
         .collect();
     // The station config is the only place the tuner identity can come from,
@@ -413,6 +421,15 @@ pub fn render_channels(
     // Drop any previously generated channel files so a shrunk roster (or the
     // legacy un-numbered channel.json) can't leave orphans behind.
     remove_stale_channel_files(&opts.out_dir)?;
+    if let Some(dir) = opts.artwork_dir.as_deref() {
+        let logos = Path::new(dir).join(LOGO_DIR);
+        if logos.exists() {
+            fs::remove_dir_all(&logos).map_err(|source| RenderError::Io {
+                path: logos.clone(),
+                source,
+            })?;
+        }
+    }
 
     let mut lineup_channels = Vec::with_capacity(channels.len());
     for channel_render in channels {
@@ -501,11 +518,17 @@ pub fn render_channels(
         let channel_path = opts.out_dir.join(format!("channel{number}.json"));
         write_json(&channel_path, &Value::Object(channel))?;
 
-        lineup_channels.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "number": number.to_string(),
             "name": display,
             "config": format!("./channel{number}.json"),
-        }));
+        });
+        if let Some(src) = &channel_render.logo
+            && let Some(url) = publish_logo(src, opts.artwork_dir.as_deref(), number)?
+        {
+            entry["logo"] = Value::String(url);
+        }
+        lineup_channels.push(entry);
     }
 
     let mut lineup = serde_json::json!({
@@ -532,6 +555,77 @@ pub fn render_channels(
         device_id: device_id.to_string(),
         dropped: Vec::new(),
     })
+}
+
+/// The folder under the artwork cache that holds channel logos. The station
+/// owns it outright and rebuilds it on every render, so a removed channel or a
+/// dropped `logo:` leaves nothing behind.
+const LOGO_DIR: &str = "channel-logos";
+
+/// Copy a channel's `logo:` image into the artwork cache and return the URL
+/// ETV-next serves it at, or `None` when it cannot be published.
+///
+/// The URL is relative (`/artwork/...`), the same form programme artwork uses;
+/// ETV-next resolves it against the requesting host. It carries a content hash
+/// as a query string, because guide clients cache a channel icon by URL and
+/// would otherwise keep showing a replaced logo.
+///
+/// A missing artwork cache or an unreadable image is logged and the channel
+/// published without a logo rather than failing the render: a guide tile is
+/// not worth taking the lineup down for.
+fn publish_logo(
+    src: &Path,
+    artwork_dir: Option<&str>,
+    number: i64,
+) -> Result<Option<String>, RenderError> {
+    let Some(dir) = artwork_dir else {
+        tracing::warn!(
+            event = "lineup.logo.skipped",
+            channel = number,
+            logo = %src.display(),
+            reason = "no artwork cache (ETV_STATION_ARTWORK_CACHE unset), so ETV-next has nowhere to serve it from",
+        );
+        return Ok(None);
+    };
+    let bytes = match fs::read(src) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                event = "lineup.logo.skipped",
+                channel = number,
+                logo = %src.display(),
+                reason = %e,
+            );
+            return Ok(None);
+        }
+    };
+    let ext = src
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| "png".to_string());
+    let file = format!("{number}.{ext}");
+    let logos = Path::new(dir).join(LOGO_DIR);
+    fs::create_dir_all(&logos).map_err(|source| RenderError::Io {
+        path: logos.clone(),
+        source,
+    })?;
+    let dest = logos.join(&file);
+    fs::write(&dest, &bytes).map_err(|source| RenderError::Io {
+        path: dest.clone(),
+        source,
+    })?;
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(&bytes);
+    let version: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let url = format!("/artwork/{LOGO_DIR}/{file}?v={version}");
+    tracing::info!(
+        event = "lineup.logo.published",
+        channel = number,
+        logo = %src.display(),
+        dest = %dest.display(),
+        url = %url,
+    );
+    Ok(Some(url))
 }
 
 /// Write the station-wide encoder into the normalization body's `video`
@@ -717,6 +811,7 @@ mod tests {
             .map(|(i, folder)| ChannelRender {
                 subtitle_default_on: None,
                 show_bumpers: false,
+                logo: None,
                 number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name: None,
@@ -734,6 +829,7 @@ mod tests {
             .map(|(i, (folder, display_name))| ChannelRender {
                 subtitle_default_on: None,
                 show_bumpers: false,
+                logo: None,
                 number: (i + 1) as i64,
                 folder: folder.clone(),
                 display_name,
@@ -859,6 +955,41 @@ mod tests {
         let rendered = render_with_defaults(&chans(&folders), &with, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert_eq!(lineup["artwork"]["folder"], "/data/artwork");
+    }
+
+    // #342: a channel's `logo:` is copied into the artwork cache and named in
+    // its lineup entry as a `/artwork` URL ETV-next can serve; a channel
+    // without one gets no `logo` key.
+    #[test]
+    fn a_channel_logo_is_published_into_the_artwork_cache_and_named_in_the_lineup() {
+        let dir = tempfile::tempdir().unwrap();
+        let artwork = dir.path().join("artwork");
+        let src = dir.path().join("mark.PNG");
+        fs::write(&src, b"not really a png").unwrap();
+        let channel = |number: i64, logo: Option<PathBuf>| ChannelRender {
+            number,
+            folder: PathBuf::from(format!("out/ch{number}")),
+            display_name: None,
+            overlay: None,
+            subtitle_default_on: None,
+            show_bumpers: false,
+            logo,
+        };
+        let with = RenderOptions {
+            artwork_dir: Some(artwork.to_string_lossy().into_owned()),
+            ..opts(dir.path())
+        };
+        let rendered =
+            render_with_defaults(&[channel(1, Some(src)), channel(2, None)], &with, "id").unwrap();
+        let lineup = read(&rendered.lineup_path);
+
+        let url = lineup["channels"][0]["logo"].as_str().unwrap();
+        assert!(url.starts_with("/artwork/channel-logos/1.png?v="), "{url}");
+        assert_eq!(
+            fs::read(artwork.join("channel-logos/1.png")).unwrap(),
+            b"not really a png"
+        );
+        assert!(lineup["channels"][1].get("logo").is_none(), "{lineup}");
     }
 
     /// The whole point of the setting: one value reaches every channel, and
@@ -1011,6 +1142,7 @@ mod tests {
             ChannelRender {
                 subtitle_default_on: None,
                 show_bumpers: false,
+                logo: None,
                 number: 1,
                 folder: PathBuf::from("out/hbo"),
                 display_name: None,
@@ -1027,6 +1159,7 @@ mod tests {
             ChannelRender {
                 subtitle_default_on: None,
                 show_bumpers: false,
+                logo: None,
                 number: 2,
                 folder: PathBuf::from("out/plain"),
                 display_name: None,
@@ -1070,6 +1203,7 @@ mod tests {
             overlay: None,
             subtitle_default_on,
             show_bumpers: false,
+            logo: None,
         };
         let channels = vec![channel(1, None), channel(2, Some(false))];
         render_channels(&channels, &ffmpeg(), &station_on, &opts(dir.path()), "id").unwrap();
@@ -1110,6 +1244,7 @@ mod tests {
             overlay: None,
             subtitle_default_on: None,
             show_bumpers,
+            logo: None,
         };
         let channels = vec![channel(1, true), channel(2, false)];
         render_with_defaults(&channels, &opts(dir.path()), "id").unwrap();
@@ -1134,6 +1269,7 @@ mod tests {
             overlay: None,
             subtitle_default_on: None,
             show_bumpers: false,
+            logo: None,
         }];
         render_with_defaults(&channels, &opts(dir.path()), "id").unwrap();
         let channel = read(&dir.path().join("channel1.json"));

@@ -87,6 +87,16 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 
+    /// The channel's logo in guides and lineups (#342): an image file,
+    /// relative to this config file's directory. The station copies it into
+    /// the artwork cache ETV-next serves at `/artwork` and names that URL as
+    /// the lineup's channel `logo`, which ETV-next publishes as the XMLTV
+    /// `<channel><icon>` and the M3U `tvg-logo`. Independent of `overlay:` —
+    /// the on-screen mark and the guide tile are often different images.
+    /// `None` publishes no logo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<PathBuf>,
+
     /// Channel-level `guide:` defaults (#158) — the least specific of the
     /// three cascade levels (channel → block → item, most specific wins).
     /// `None` (no `guide:` block at all) is not "no guide text": every item
