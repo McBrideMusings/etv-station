@@ -1,5 +1,5 @@
 //! One overlay frame, rendered on demand rather than streamed: what
-//! `etv-overlay render-still` writes to a PNG, and what taste-lab's Review view
+//! `etv-overlay render-still` writes to a PNG, and what the web UI's Review view
 //! lays over a frame of the airing a tune-in sample lands on. Both go through
 //! [`render_rgba`], so the still a reviewer looks at and the frame the running
 //! overlay process draws come from the same engine and the same renderer.

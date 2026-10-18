@@ -41,6 +41,7 @@ The common operations:
 ```sh
 ./tools/dev-run.sh                       # run station daemon + ETV-next together (integration test)
 ./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
+./tools/station-ui.sh                    # run ONLY the station web UI (Review + tuning pages, `etv-station --serve-ui`, :4747)
 ./tools/verify-integration.sh            # smoke test: start dev stack, probe HTTP endpoints, verify clean shutdown
 ./tools/verify-all.sh                    # test + clippy + fmt --check in BOTH workspaces
 ./tools/verify-all.sh test|lint|fmt-check  # one read-only check, still across both workspaces

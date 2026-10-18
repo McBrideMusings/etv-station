@@ -1,4 +1,4 @@
-//! The numbers behind taste-lab's channel Review view: how deep a channel's
+//! The numbers behind the web UI's channel Review view: how deep a channel's
 //! schedule runs before it repeats, how its airtime splits between films and
 //! series, and what a viewer tuning in at random would land on.
 //!

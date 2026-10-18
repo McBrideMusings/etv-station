@@ -23,7 +23,7 @@ about = "The etv-station daemon's lifecycle: config load and reload, history.db,
 about = "Channel configs under deploy/appdata/channels and examples/channels, and the programming review of them."
 
 [labels.tooling]
-about = "Developer tools: taste-lab, taste-debug, admin.toml tasks, tools/ scripts, tests, verify-project."
+about = "Developer tools: the web UI, taste-debug, admin.toml tasks, tools/ scripts, tests, verify-project."
 
 [labels.ops]
 about = "Deploying and running it: Dockerfile, the Unraid container, backups, host config, remote diagnostics."
@@ -44,7 +44,7 @@ about = "A value in a database or playout file is wrong or inconsistent."
 about = "An HTTP endpoint or a CLI/plugin contract other code depends on."
 
 [labels.ui]
-about = "How a screen looks: taste-lab pages, the EPG TUI, overlay visuals."
+about = "How a screen looks: the web UI pages, the EPG TUI, overlay visuals."
 
 [labels.ux]
 about = "How a person moves through a tool or the channel lineup to get something done."

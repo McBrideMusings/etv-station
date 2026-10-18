@@ -213,7 +213,7 @@ fn rfc3339(t: OffsetDateTime) -> String {
 
 /// Split `metadata` into its `audit` value and the rest of the blob with the
 /// `audit` key removed — the one reader of an item's audit trail, shared by
-/// this report's JSON and taste-lab's Review view. `None` metadata, and metadata that is not an object,
+/// this report's JSON and the web UI's Review view. `None` metadata, and metadata that is not an object,
 /// render as an empty audit array and a `null` metadata object — the JSON
 /// equivalent of [`render_audit_trail`]'s "unexplained" line.
 ///

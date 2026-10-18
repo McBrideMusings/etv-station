@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keeps the local copies tools/taste-debug.sh and tools/taste-lab.sh read under
+# Keeps the local copies tools/taste-debug.sh and tools/station-ui.sh read under
 # tmp/claude/scratchpad/taste-debug/ in step with the Unraid host's
 # /mnt/user/appdata/etv-station/data/.
 #

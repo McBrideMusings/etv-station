@@ -1251,7 +1251,7 @@ impl Catalog {
 /// wrapping it in `%…%`, so a query containing `%` or `_` searches for that
 /// literal text instead of matching everything (or an unintended single
 /// character). `pub` so a caller running its own `LIKE` query against a
-/// sibling store — `taste-lab`'s plexdb `keyword_forms` search, which this
+/// sibling store — the web UI's plexdb `keyword_forms` search, which this
 /// module has no accessor for — escapes the same way instead of a second,
 /// possibly-drifting copy of this rule.
 pub fn like_escape(raw: &str) -> String {

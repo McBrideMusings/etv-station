@@ -207,7 +207,7 @@ fn main() -> Result<(), String> {
     // A pool profile with no `keyword:` entry never took this path before
     // (`prepare_profile` skips a pool with nothing to resolve), so this went
     // unnoticed until a real channel's pool first authored one. Same fix as
-    // taste-lab.rs: a JSON-round-trip clone (`Pool` has no `Clone`) with the
+    // web_ui/mod.rs: a JSON-round-trip clone (`Pool` has no `Clone`) with the
     // grant path already expanded.
     let mut pool_for_profile: config::Pool = serde_json::from_value(
         serde_json::to_value(pool_cfg).map_err(|e| format!("clone pool: {e}"))?,

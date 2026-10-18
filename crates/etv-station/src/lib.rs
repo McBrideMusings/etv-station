@@ -44,3 +44,4 @@ pub mod tune_in_still;
 pub mod tz;
 pub mod value_fmt;
 pub mod variety;
+pub mod web_ui;

@@ -923,7 +923,7 @@ claims an instant.
 `event="calendar.select"` with the window start, the station `tz`, the slot and
 schedule that won (empty for the any-time blocks), and `cut`, the instant the
 generation stopped. Each airing's `block` index counts `rule.blocks` first,
-then `rule.slots` in name order; taste-lab's Review names a slot block by its
+then `rule.slots` in name order; the web UI's Review names a slot block by its
 slot name when it has no `program.title`.
 
 Worked samples: `examples/samples/seasonal.yaml` (dated slots) and
@@ -1017,7 +1017,7 @@ climb through one period and start over at a rollover. `taste-cosine.rhai`'s
 own stage adds `score_rank` (where the pick stood by score alone) beside `rank`
 (where the temperature put it). The daemon logs `variety.ranked` each time a
 pool ranks a period's list and `variety.rollover` when one rolls over
-mid-generation. taste-lab's review API carries all of it per airing as
+mid-generation. the web UI's review API carries all of it per airing as
 `ranking`.
 
 **Why an inherited number is salted.** Nothing in the seeded draw mixes in
@@ -2039,7 +2039,7 @@ reproduces and the next period's differs.
 
 How much a given number moves depends on how scores spread in the pool. On
 034 SyFy's films pools, whose candidate sets run to hundreds of titles, a
-14-day taste-lab review put the median pick at score rank 7 at `0.1`, 15 at
+14-day web UI review put the median pick at score rank 7 at `0.1`, 15 at
 `0.25`, and 21 at `0.5`.
 
 #### `ctx.account_id` — the account a personal channel ranks against (#278, ADR 0005)

@@ -514,7 +514,7 @@ rule:
   temperature above 0, the order of the whole list. At temperature 0 a new
   seed changes only the exploration picks.
 - Temperature is measured, not guessed. On 034 SyFy's films pools, a 14-day
-  taste-lab review put the median pick at score rank 7 at `0.1`, 15 at
+  web UI review put the median pick at score rank 7 at `0.1`, 15 at
   `0.25`, and 21 at `0.5`. At `0.5`, 15 of 91 films came from below rank 100.
   Run the Review view at two or three values and read the titles.
 - A shows pool usually wants `temperature: 0`. A new list there swaps which

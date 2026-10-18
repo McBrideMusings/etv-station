@@ -293,6 +293,34 @@ run_logged ersatztv "$ETV_NEXT_DIR/lineup.json"
 etv_pid=$!
 log "serving on ${ETV_BIND_ADDRESS:-0.0.0.0}:${ETV_PORT:-8409}"
 
+# 4b. The station's web UI (`etv-station --serve-ui`): the Review and tuning
+# pages, on its own port. Same non-fatal shape as the diagnostics: its loop's
+# pid goes in diag_pids so shutdown() reaps it, and it is never in the
+# `wait -n` recognized set, so a crashed UI is restarted here and never takes
+# the stream down. It starts after ETV-next so a schedule replay never competes
+# with the first generation, and it runs at nice 19 so a replay only gets CPU
+# the channels' transcodes leave idle — it uses one core at most either way.
+# On a first boot catalog.db does not exist until the daemon's ingest creates
+# it; the UI exits on the missing file and this loop retries until it is there.
+# shutdown() signals only this loop's subshell, so the subshell forwards it to
+# the server (nice execs into etv-station, so $! is the server itself).
+(
+    ui_pid=
+    trap 'trap - EXIT; [ -n "$ui_pid" ] && kill -TERM "$ui_pid" 2>/dev/null; exit 0' TERM INT
+    while true; do
+        run_logged nice -n 19 etv-station --config "$ETV_STATION_CONFIG" \
+            --log-format "$ETV_LOG_FORMAT" --serve-ui \
+            --ui-bind "${ETV_UI_BIND:-0.0.0.0}" --ui-port "${ETV_UI_PORT:-4747}"
+        ui_pid=$!
+        wait "$ui_pid"
+        log "WARNING: web UI exited (status $?); restarting in 10s"
+        sleep 10 &
+        wait $!
+    done
+) &
+diag_pids+=($!)
+log "web UI starting on ${ETV_UI_BIND:-0.0.0.0}:${ETV_UI_PORT:-4747}"
+
 # 5. Soak-test probe loop (#297): a third background process, same non-fatal
 # shape as the diagnostics above — its pid goes into diag_pids so shutdown()
 # reaps it, but it is never assigned to station_pid/etv_pid, so it is never

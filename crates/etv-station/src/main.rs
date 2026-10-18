@@ -203,6 +203,34 @@ struct Cli {
     /// `admin plugin-check` does exactly that, over ssh, in this image.
     #[arg(long, value_name = "DIR")]
     check_plugins: Option<PathBuf>,
+
+    /// Serve the station's web UI (the Review and tuning pages) instead of
+    /// running the daemon. It reads `--config`'s lineup and `catalog_path`
+    /// (after `ETV_STATION_CATALOG`) and writes nothing to either. The
+    /// container entrypoint runs this beside the daemon and ETV-next.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "list_folders", "list_hooks", "dump_overlay", "render_etv_next",
+            "check_config", "check_determinism", "reconcile_plexdb",
+            "backfill_history", "refresh_channel", "audit", "check_plugins",
+        ]
+    )]
+    serve_ui: bool,
+
+    /// Address `--serve-ui` listens on. The container sets `0.0.0.0`.
+    #[arg(long, requires = "serve_ui", default_value = "127.0.0.1")]
+    ui_bind: std::net::IpAddr,
+
+    /// Port `--serve-ui` listens on.
+    #[arg(long, requires = "serve_ui", default_value_t = 4747)]
+    ui_port: u16,
+
+    /// Score each pool with its namesake script in this directory instead of
+    /// the deployed one its `plugin:` names — `tools/station-ui.sh` points it
+    /// at this checkout's `examples/plugins/` to tune an in-development script.
+    #[arg(long, requires = "serve_ui", value_name = "DIR")]
+    ui_plugins_dir: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -270,6 +298,11 @@ fn main() -> ExitCode {
     if cli.check_config {
         init_tracing(cli.log_format);
         return check_config(config);
+    }
+
+    if cli.serve_ui {
+        init_tracing(cli.log_format);
+        return serve_ui(config, cli.ui_bind, cli.ui_port, cli.ui_plugins_dir);
     }
 
     if let Some(channel) = cli.check_determinism.as_deref() {
@@ -576,6 +609,45 @@ fn resolve_overlay_for(config_path: &Path, channel_name: &str) -> Result<String,
         ));
     };
     serde_norway::to_string(&spec).map_err(|e| format!("serializing the resolved overlay: {e}"))
+}
+
+/// `--serve-ui`: resolve the catalog from the station config, then serve
+/// until killed. Exits non-zero only when it cannot start.
+fn serve_ui(
+    config_path: &Path,
+    bind: std::net::IpAddr,
+    port: u16,
+    plugins_dir: Option<PathBuf>,
+) -> ExitCode {
+    let station = match config::load_for_inspection(config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(event = "ui.config_error", error = %err, "failed to load configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(catalog) = station.station.catalog_path else {
+        tracing::error!(
+            event = "ui.config_error",
+            config = %config_path.display(),
+            "the station config sets no catalog_path (or ETV_STATION_CATALOG); the web UI needs one"
+        );
+        return ExitCode::FAILURE;
+    };
+    let options = etv_station::web_ui::Options {
+        station: config_path.to_path_buf(),
+        catalog: PathBuf::from(catalog),
+        plugins_dir,
+        bind,
+        port,
+    };
+    match etv_station::web_ui::serve(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!(event = "ui.start_failed", error = %err, "web UI failed to start");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Render ETV-next's config from the station config and exit. Progress goes to

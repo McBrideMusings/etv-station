@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>taste-lab · Review</title>
+<title>etv-station · Review</title>
 <style>
   :root {
     color-scheme: light;
@@ -231,7 +231,7 @@ async function load(channel, days, push) {
     return;
   }
   if (data.load_error) {
-    document.title = `taste-lab · ${data.channel}`;
+    document.title = `etv-station · ${data.channel}`;
     $('report').innerHTML = `<header class="mast"><div><h1>${esc(data.channel)}</h1>
       <div class="sub">${esc(data.config_path)}</div></div></header>
       <h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
@@ -274,7 +274,7 @@ function subline(a) {
 }
 
 function render(d) {
-  document.title = `taste-lab · ${d.number} ${d.display_name || d.name}`;
+  document.title = `etv-station · ${d.number} ${d.display_name || d.name}`;
   const colors = poolColor(d);
   markRepeats(d);
   const tz = d.tz;

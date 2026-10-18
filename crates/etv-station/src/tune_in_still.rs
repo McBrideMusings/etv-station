@@ -1,4 +1,4 @@
-//! A tune-in sample as a picture, for taste-lab's Review view: the frame of
+//! A tune-in sample as a picture, for the web UI's Review view: the frame of
 //! the airing on screen at that moment, scaled onto the channel's canvas, with
 //! the channel's resolved overlay drawn over it by [`etv_overlay::still`] — the
 //! engine and renderer the channel's overlay process runs, not a second one.

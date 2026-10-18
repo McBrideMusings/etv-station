@@ -76,7 +76,7 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
 }
 
 /// Load a station config for a read-only tool off the deploy host — today,
-/// taste-lab's Review view, which steps through the lineup on a laptop.
+/// the web UI's Review view, which steps through the lineup on a laptop.
 ///
 /// Unset `${VAR}` references resolve to a placeholder instead of failing the
 /// load. The daemon must never do this: an unset media root there would mean

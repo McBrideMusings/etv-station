@@ -198,7 +198,8 @@ ENV XDG_CACHE_HOME=/data/cache \
     ETV_STATION_ARTWORK_CACHE=/data/artwork \
     ETV_HLS_OUTPUT=/data/hls \
     ETV_BIND_ADDRESS=0.0.0.0 \
-    ETV_PORT=8409
+    ETV_PORT=8409 \
+    ETV_UI_PORT=4747
 
 # Which etv-station commit this image was built from. The base image's own
 # revision/source labels describe the ErsatzTV-ffmpeg image, so these replace
@@ -213,7 +214,10 @@ LABEL org.opencontainers.image.revision=$ETV_STATION_REVISION \
 ENV ETV_STATION_REVISION=$ETV_STATION_REVISION \
     ETV_STATION_CREATED=$ETV_STATION_CREATED
 
-EXPOSE 8409
+# 8409: ETV-next (playlist, guide, HLS). 4747: the station's web UI
+# (`etv-station --serve-ui`, started by the entrypoint), no auth of its own —
+# front it with your own proxy.
+EXPOSE 8409 4747
 
 # Drop to the non-root user. The bind-mounted /config and /data must be
 # readable/writable by uid 1000; if the host volume is owned by a different uid,

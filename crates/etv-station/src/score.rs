@@ -1448,7 +1448,7 @@ impl ScoreCache {
             // changes nothing observable for the daemon's own one-call-per-pool-
             // per-generation usage. It matters for a caller that calls this more
             // than once for the same pool within one `ScoreCache`'s lifetime
-            // (`taste-lab`, tuning a profile down to nothing): without it, a
+            // (the web UI, tuning a profile down to nothing): without it, a
             // stale non-empty resolution from an earlier call would keep
             // answering [`Self::profile`] forever, even after the pool's own
             // profile emptied back out.
@@ -2195,7 +2195,7 @@ fn compile_and_resolve(
 /// The CEL expressions a pool will actually score against — its own
 /// `sources:` table when it wrote one, otherwise its script's own
 /// `sources()` — for a caller that only wants to show or explain them, never
-/// score with them (`taste-lab`'s pool inspector and [`resolve_source_ids`]).
+/// score with them (the web UI's pool inspector and [`resolve_source_ids`]).
 /// Recompiles the script fresh each call rather than sharing [`ScoreCache`]'s
 /// compiled-AST cache: cheap, and it keeps a read-only caller from taking a
 /// `&mut ScoreCache`.

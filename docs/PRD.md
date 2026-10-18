@@ -23,7 +23,7 @@ Therefore anyone running ETV-next must produce playout JSON externally. The bund
 ## Non-goals
 
 - **Library management.** No NFO scraping, no online metadata providers, no media DB. Items are declared explicitly in config; the operator is responsible for accurate paths and metadata. (If they want richer metadata, that's another program upstream of this one.)
-- **Real-time control plane.** v1 is config-file driven, not network-driven. No web UI, no REST API, no live-event injection endpoint. Config edits + reload signal are sufficient for v1.
+- **Real-time control plane.** v1 is config-file driven, not network-driven. No live-event injection endpoint, and nothing on the network changes config. The station's web UI (`etv-station --serve-ui`, port 4747) changes no config: a channel's Review, and taste-profile tuning whose edits stay in that process's memory. Config edits + reload signal are sufficient for v1.
 - **Encoding decisions.** This program never invokes ffmpeg for encoding, never renders frames. It only reads media metadata it needs to produce playout entries (e.g. duration via `ffprobe`). Track selection / normalization / hwaccel are ETV-next's job to *execute* — the station owns the typed `ffmpeg:`/`normalization:` profile it hands ETV-next (see Architecture below), but never runs an encoder itself.
 - **Modifying ETV-next.** Station work does not change `vendor/etv-next/` as a side-effect. If a schema change is needed, that's a deliberate, separately committed change to the vendored tree.
 
@@ -85,11 +85,12 @@ docker run -d --name etv-station \
   -v /mnt/user/appdata/etv-station/data:/data \    # playout JSON, HLS working set, catalog cache
   -v /mnt/user/media/library:/media:ro \           # the library, for ffprobe and playback
   -p 8419:8409 \
+  -p 4747:4747 \
   -e PLEX_URL=... -e PLEX_TOKEN=... \
   etv-station:latest
 ```
 
-The image is built from this repo's `Dockerfile`: one builder stage for the station workspace, one for the vendored ETV-next workspace, and a runtime stage on ErsatzTV's own ffmpeg image carrying `etv-station`, `etv-overlay`, `ersatztv`, and `ersatztv-channel`. `docker/entrypoint.sh` renders ETV-next's config from `station.yaml`, creates every channel's playout folder, then runs both processes.
+The image is built from this repo's `Dockerfile`: one builder stage for the station workspace, one for the vendored ETV-next workspace, and a runtime stage on ErsatzTV's own ffmpeg image carrying `etv-station`, `etv-overlay`, `ersatztv`, and `ersatztv-channel`. `docker/entrypoint.sh` renders ETV-next's config from `station.yaml`, creates every channel's playout folder, then runs both processes, plus the station's web UI (`etv-station --serve-ui` on port 4747, at `nice -n 19`). The web UI has no auth of its own; the operator fronts it with their own proxy.
 
 Key properties:
 - The playout folder is a plain directory inside the container that the daemon writes and ETV-next reads. Lock-free producer/consumer; the OS guarantees atomicity for `rename(2)`.

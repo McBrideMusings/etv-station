@@ -366,7 +366,7 @@ mod tests {
     }
 
     /// The dice are a pure function of config and instant: asking twice gives
-    /// the same answer, which is the whole of taste-lab's before/after.
+    /// the same answer, which is the whole of the web UI's before/after.
     #[test]
     fn the_same_instant_draws_the_same_dice() {
         let spec = rotate_seed(2, None);

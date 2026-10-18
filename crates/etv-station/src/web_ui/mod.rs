@@ -1,13 +1,18 @@
-//! taste-lab: iteratively tune a pool's taste-profile weights against real
-//! data (etv-station-sctf.8) — a dev tool, not part of the daemon, same
-//! category as `taste-debug`. Serves a small local web UI over
-//! `score::{ScoreCache, pick}`, the real scoring path (ADR-0020): a channel
-//! picker, live keyword/genre/item search, and one unified schedule
-//! (etv-station-sctf.9) that re-scores in place as a profile entry is added,
-//! reweighted, or removed — no file write, no process restart.
+//! The station's web UI, served by `etv-station --serve-ui`: a Review page
+//! per channel (its upcoming schedule, turnover and depth, scores) and a tuning
+//! page that iterates a pool's taste-profile weights against real data
+//! (etv-station-sctf.8). It runs over `score::{ScoreCache, pick}`, the real
+//! scoring path (ADR-0020): a channel picker, live keyword/genre/item search,
+//! and one unified schedule (etv-station-sctf.9) that re-scores in place as a
+//! profile entry is added, reweighted, or removed — no file write, no process
+//! restart. Nothing it does writes to the station's config or data; profile
+//! edits live in this process's memory and stills render under the OS temp
+//! directory. Scoring runs the pool's real plugin with its granted
+//! capabilities, so a tuning request can make the `exec`/`http` calls that
+//! plugin is granted, exactly as a generation would.
 //!
 //! The schedule is the daemon's, replayed ([`simulate_schedule`], built on
-//! `etv_station::simulate`): the same generation loop, the same
+//! `crate::simulate`): the same generation loop, the same
 //! `ctx.target_count` per generation, and each generation's airings fed
 //! forward as the next one's `ctx.recent`, so a scorer's repeat suppression
 //! shows up in the schedule as it does on air. A pool's own ranked list (the
@@ -19,19 +24,16 @@
 //! pattern took whole) renders as ONE schedule entry (a "visit"), not one row
 //! per episode; the grouping is read off the catalog's `show_id`.
 //!
-//! A throwaway spike (etv-station-sctf.1's follow-up, deleted per the spike
-//! lifecycle) proved the scoring shape works end to end against real
-//! production data, and surfaced two real bugs that are this tool's actual
-//! scope:
+//! Two properties shape the server:
 //!
 //! - **Perf.** Against the real ~11,634-movie catalog, a debug build's
-//!   `pick()` took 15-22s, called twice per edit (~40s per weight tweak).
-//!   `ScoreCache::prepare`'s `sources:` resolution already caches correctly
-//!   across edits within one process; two `pick()` calls per edit did not,
-//!   and cost the most. Fixed two ways: this bin must be run `--release`
-//!   (`tools/taste-lab.sh` does), and [`score_pool`] below runs `pick()`
-//!   exactly once per pool per edit, only for the pool an edit actually
-//!   touched — every other pool's cached ranking is untouched.
+//!   `pick()` takes 15-22s, so run a release build (`tools/station-ui.sh`
+//!   does), and [`score_pool`] below runs `pick()` exactly once per pool per
+//!   edit, only for the pool an edit actually touched — every other pool's
+//!   cached ranking is untouched. Requests are served one at a time on one
+//!   thread, and the replay is single-threaded, so the UI uses at most one
+//!   core however many browsers are open; the container also runs it at
+//!   `nice 19` so the channels' transcodes always come first.
 //! - **Fidelity.** The pool's own real `sources:` (or, absent one, its
 //!   script's own default `sources()`) is always what gets scored against —
 //!   never `sources: None`'s silent whole-library substitute. Achieved by
@@ -40,59 +42,47 @@
 //!   `plugin`/`sources`/`capabilities`/`datastores`/`config` all stay
 //!   exactly what the channel author wrote.
 //!
-//! The plugin script scored against defaults to this checkout's
-//! `examples/plugins/<name>.rhai` — the in-development script — rather than
-//! the pool's own (gitignored, possibly stale) deployed copy; `POST
-//! /api/select`'s `use_deployed_plugin: true` reaches the deployed one
-//! explicitly.
+//! The channels it offers are the station config's lineup, and `POST
+//! /api/select` refuses any other path: the server listens on the network in
+//! the container, with no auth of its own.
 //!
-//! Usage:
-//!   cargo run --release --bin taste-lab -- --catalog <path>
-//! then open http://127.0.0.1:<port>/ (default port 4747). Each pool's own
-//! plexdb path comes from its `datastores:` grant, not a CLI flag — set
-//! `PLEXDB_SNAPSHOT_PATH` (or whatever env var the grant references) before
-//! running. `tools/taste-lab.sh` wraps this with channel discovery and the
-//! local catalog/plexdb cache
-//! `tools/taste-debug.sh` already uses.
+//! The plugin script scored against is the pool's own deployed one, unless
+//! [`Options::plugins_dir`] names a directory of in-development scripts —
+//! `tools/station-ui.sh` points it at this checkout's `examples/plugins/` —
+//! in which case the pool's script is looked up there by file name, and `POST
+//! /api/select`'s `use_deployed_plugin: true` reaches the deployed one.
+//!
+//! Each pool's plexdb path comes from its `datastores:` grant, not a flag —
+//! set `PLEXDB_SNAPSHOT_PATH` (or whatever env var the grant references).
+//! `GET /api/health` returns what this process was started with.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::Parser;
-use etv_station::catalog::{Catalog, Entry as CatalogEntry, TagNs, like_escape};
-use etv_station::config::{self, DatastoreGrant, Pool};
-use etv_station::profile::ProfileEntry;
-use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
-use etv_station::tautulli::{self, HistoryScope};
-use etv_station::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
+use crate::catalog::{Catalog, Entry as CatalogEntry, TagNs, like_escape};
+use crate::config::{self, DatastoreGrant, Pool};
+use crate::profile::ProfileEntry;
+use crate::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
+use crate::tautulli::{self, HistoryScope};
+use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
-#[derive(Parser, Debug)]
-#[command(about = "Local web UI for iteratively tuning a plugin pool's taste profile")]
-struct Cli {
-    /// The station's catalog sqlite database.
-    #[arg(long)]
-    catalog: PathBuf,
-
-    /// Real channels live here — `<dir>/*/channel.yaml`.
-    #[arg(long, default_value = "deploy/appdata/channels")]
-    channels_dir: PathBuf,
-
-    /// The in-development plugin scripts a channel's own `plugin:` path is
-    /// mapped onto by default (see module docs).
-    #[arg(long, default_value = "examples/plugins")]
-    examples_plugins_dir: PathBuf,
-
-    /// The station config whose lineup the Review view steps through
-    /// (`/review`), in its own order.
-    #[arg(long, default_value = "deploy/appdata/station.yaml")]
-    station: PathBuf,
-
-    /// Where to listen.
-    #[arg(long, default_value_t = 4747)]
-    port: u16,
+/// How [`serve`] was started. `etv-station --serve-ui` builds this from its
+/// flags and the station config.
+pub struct Options {
+    /// The station config whose lineup both pages step through, in its order.
+    pub station: PathBuf,
+    /// The station's catalog sqlite database, opened read-only.
+    pub catalog: PathBuf,
+    /// In-development plugin scripts a pool's `plugin:` is looked up in by
+    /// file name (see module docs). `None` scores with the deployed scripts.
+    pub plugins_dir: Option<PathBuf>,
+    /// Address to listen on: loopback locally, `0.0.0.0` in the container.
+    pub bind: IpAddr,
+    pub port: u16,
 }
 
 /// A working copy of a real pool's config — everything but `profile` stays
@@ -115,8 +105,8 @@ struct PlanStep {
     has_plugin: bool,
 }
 
-/// One channel this tool found under `--channels-dir` with at least one
-/// plugin-backed pattern pool.
+/// One lineup channel with at least one plugin-backed pattern pool — the
+/// channels the tuning page offers.
 struct DiscoveredChannel {
     channel_path: PathBuf,
     channel_name: String,
@@ -146,35 +136,27 @@ fn pattern_plan(channel: &config::ChannelConfig) -> Vec<PlanStep> {
     out
 }
 
-fn discover_channels(channels_dir: &Path) -> Vec<DiscoveredChannel> {
+/// Every channel in the station's lineup, in lineup order, that loads and has
+/// a plugin-backed pattern pool. Re-read on every call, so a channel edit
+/// shows without a restart.
+fn discover_channels(station_path: &Path) -> Result<Vec<DiscoveredChannel>, String> {
+    let station = config::load_for_inspection(station_path)
+        .map_err(|e| format!("load {}: {e}", station_path.display()))?;
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(channels_dir) else {
-        return out;
-    };
-    let mut dirs: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-    dirs.sort();
-    for dir in dirs {
-        let channel_path = dir.join("channel.yaml");
-        if !channel_path.is_file() {
-            continue;
-        }
-        let Ok(channel) = config::read_channel(&channel_path) else {
+    for channel_path in &station.lineup {
+        let Ok(channel) = config::read_channel(channel_path) else {
             continue;
         };
         if !pattern_plan(&channel).iter().any(|s| s.has_plugin) {
             continue;
         }
-        let channel_name = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         out.push(DiscoveredChannel {
-            channel_path,
-            channel_name,
+            channel_path: channel_path.clone(),
+            channel_name: channel_key(channel_path),
             display_name: channel.display_name.clone(),
         });
     }
-    out
+    Ok(out)
 }
 
 /// One plugin-backed pool referenced by the selected channel's pattern —
@@ -225,43 +207,70 @@ struct Session {
 
 struct AppState {
     catalog: Catalog,
-    channels_dir: PathBuf,
-    examples_plugins_dir: PathBuf,
+    options: Options,
     cache: ScoreCache,
     session: Option<Session>,
     review: ReviewState,
 }
 
-fn main() -> Result<(), String> {
-    let cli = Cli::parse();
-    if !cfg!(debug_assertions) {
-        // fine — release build, the whole point of this tool.
-    } else {
-        eprintln!(
-            "taste-lab: running a debug build. score::pick() takes 15-22s per call against \
-             the real catalog in debug — run `cargo run --release --bin taste-lab` instead \
-             (tools/taste-lab.sh does this for you)."
+/// Listen on `options.bind:options.port` and serve until the process ends.
+/// Fails only when the catalog cannot be opened or the port cannot be bound.
+pub fn serve(options: Options) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        tracing::warn!(
+            event = "ui.debug_build",
+            "running a debug build: score::pick() takes 15-22s per call against the real \
+             catalog — use a release build (tools/station-ui.sh does)"
         );
     }
 
-    let catalog = Catalog::open_readonly(&cli.catalog).map_err(|e| e.to_string())?;
+    let catalog = Catalog::open_readonly(&options.catalog)
+        .map_err(|e| format!("open catalog {}: {e}", options.catalog.display()))?;
+    let server = tiny_http::Server::http((options.bind, options.port))
+        .map_err(|e| format!("bind {}:{}: {e}", options.bind, options.port))?;
+    tracing::info!(
+        event = "ui.listen",
+        bind = %options.bind,
+        port = options.port,
+        station = %options.station.display(),
+        catalog = %options.catalog.display(),
+        plugins_dir = ?options.plugins_dir,
+        "web UI listening"
+    );
+
     let mut state = AppState {
         catalog,
-        channels_dir: cli.channels_dir,
-        examples_plugins_dir: cli.examples_plugins_dir,
         cache: ScoreCache::default(),
         session: None,
-        review: ReviewState::new(cli.station),
+        review: ReviewState::new(options.station.clone()),
+        options,
     };
-
-    let server = tiny_http::Server::http(("127.0.0.1", cli.port))
-        .map_err(|e| format!("bind 127.0.0.1:{}: {e}", cli.port))?;
-    println!("taste-lab: http://127.0.0.1:{}/", cli.port);
-
     for request in server.incoming_requests() {
         handle(&mut state, request);
     }
     Ok(())
+}
+
+/// `GET /api/health`: what this process serves from, and whether the station
+/// config still loads — the state query `admin status` and the gate read.
+/// 503 when the station config does not load, so a status check that reads
+/// only the code sees a broken config as down.
+fn api_health(state: &AppState) -> (u16, Value) {
+    let o = &state.options;
+    let channels = discover_channels(&o.station);
+    let status = if channels.is_ok() { 200 } else { 503 };
+    let body = json!({
+        "ok": channels.is_ok(),
+        "station": o.station.display().to_string(),
+        "catalog": o.catalog.display().to_string(),
+        "plugins_dir": o.plugins_dir.as_ref().map(|p| p.display().to_string()),
+        "bind": o.bind.to_string(),
+        "port": o.port,
+        "tunable_channels": channels.as_ref().map(Vec::len).ok(),
+        "error": channels.err(),
+        "revision": std::env::var("ETV_STATION_REVISION").ok(),
+    });
+    (status, body)
 }
 
 fn handle(state: &mut AppState, mut request: tiny_http::Request) {
@@ -277,6 +286,7 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
         let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
     }
 
+    let began = std::time::Instant::now();
     let result: Result<(u16, Value), String> = match (&method, path.as_str()) {
         (tiny_http::Method::Get, "/") => {
             respond_html(request, INDEX_HTML);
@@ -286,12 +296,13 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
             respond_html(request, REVIEW_HTML);
             return;
         }
+        (tiny_http::Method::Get, "/api/health") => Ok(api_health(state)),
         (tiny_http::Method::Get, "/api/review") => api_review(state, &query),
         (tiny_http::Method::Get, "/api/review/still") => {
             serve_review_still(state, request, &query);
             return;
         }
-        (tiny_http::Method::Get, "/api/channels") => Ok((200, api_channels(state))),
+        (tiny_http::Method::Get, "/api/channels") => api_channels(state),
         (tiny_http::Method::Post, "/api/select") => api_select(state, &body),
         (tiny_http::Method::Post, "/api/profile/add") => api_profile_add(state, &body),
         (tiny_http::Method::Post, "/api/profile/update") => api_profile_update(state, &body),
@@ -310,6 +321,16 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
         Ok((status, body)) => (status, body),
         Err(e) => (400, json!({"error": e})),
     };
+    let error = body.get("error").and_then(|e| e.as_str());
+    tracing::info!(
+        event = "ui.request",
+        method = %method,
+        path = %path,
+        status,
+        error,
+        ms = began.elapsed().as_millis() as u64,
+        "request served"
+    );
     respond_json(request, status, &body);
 }
 
@@ -372,8 +393,8 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn api_channels(state: &AppState) -> Value {
-    let channels = discover_channels(&state.channels_dir);
+fn api_channels(state: &AppState) -> Result<(u16, Value), String> {
+    let channels = discover_channels(&state.options.station)?;
     let list: Vec<Value> = channels
         .iter()
         .map(|c| {
@@ -384,7 +405,7 @@ fn api_channels(state: &AppState) -> Value {
             })
         })
         .collect();
-    json!({ "channels": list })
+    Ok((200, json!({ "channels": list })))
 }
 
 #[derive(serde::Deserialize)]
@@ -399,8 +420,8 @@ struct SelectRequest {
 }
 
 /// Build the working copy of one plugin-backed pool named by a pattern step —
-/// resolves which plugin script to score against (deployed vs. this
-/// checkout's `examples/plugins/`, see module docs), expands its datastore
+/// resolves which plugin script to score against (deployed, or its namesake
+/// in [`Options::plugins_dir`], see module docs), expands its datastore
 /// grant's env references, and clones the pool so profile edits never touch
 /// the real `channel.yaml`.
 fn build_pool_working(
@@ -419,13 +440,14 @@ fn build_pool_working(
         channel_dir.join(plugin)
     };
 
-    let plugin_path = if use_deployed_plugin {
-        deployed_path.clone()
-    } else {
-        let basename = deployed_path
-            .file_name()
-            .ok_or_else(|| format!("plugin path {} has no file name", deployed_path.display()))?;
-        state.examples_plugins_dir.join(basename)
+    let plugin_path = match &state.options.plugins_dir {
+        Some(dir) if !use_deployed_plugin => {
+            let basename = deployed_path.file_name().ok_or_else(|| {
+                format!("plugin path {} has no file name", deployed_path.display())
+            })?;
+            dir.join(basename)
+        }
+        _ => deployed_path.clone(),
     };
     if !plugin_path.is_file() {
         return Err(format!(
@@ -459,7 +481,7 @@ fn build_pool_working(
     // depends only on the plugin script and the pool's own `sources:`,
     // neither of which changes for the rest of this session.
     let sources_effective =
-        etv_station::score::effective_sources(&plugin_path, pool_owned.sources.as_ref()).ok();
+        crate::score::effective_sources(&plugin_path, pool_owned.sources.as_ref()).ok();
 
     Ok(PoolWorking {
         pool: pool_owned,
@@ -477,6 +499,17 @@ fn api_select(state: &mut AppState, body: &str) -> Result<(u16, Value), String> 
         serde_json::from_str(body).map_err(|e| format!("bad request body: {e}"))?;
 
     let channel_path = PathBuf::from(&req.channel_path);
+    // Only a lineup channel: the path comes from the browser, and the server
+    // is reachable over the network with no auth of its own.
+    if !discover_channels(&state.options.station)?
+        .iter()
+        .any(|c| c.channel_path == channel_path)
+    {
+        return Err(format!(
+            "{:?} is not a tunable channel in this station's lineup",
+            req.channel_path
+        ));
+    }
     let channel = config::read_channel(&channel_path).map_err(|e| e.to_string())?;
     let channel_dir = channel_path
         .parent()
@@ -633,7 +666,7 @@ fn api_profile_add(state: &mut AppState, body: &str) -> Result<(u16, Value), Str
     // same check `profile::load` runs at real config load, so a bad entry
     // fails here with the same message a channel author would see, not a
     // stranger one out of `pick()`.
-    etv_station::profile::check(&req.entry).map_err(|e| format!("profile entry {e}"))?;
+    crate::profile::check(&req.entry).map_err(|e| format!("profile entry {e}"))?;
 
     let session = state
         .session
@@ -811,12 +844,12 @@ fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
         },
     ])?;
 
-    let full = etv_station::score::pick(
+    let full = crate::score::pick(
         &state.cache,
         &plugin_path,
         pw.pool.sources.as_ref(),
         &inputs,
-        etv_station::variety::Dice::fixed(0),
+        crate::variety::Dice::fixed(0),
         pool_name,
         Some(&full_config),
         grant,
@@ -904,7 +937,7 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
     // here as they do on air.
     let tz = config::load_for_inspection(&state.review.station_path)
         .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))
-        .and_then(|st| etv_station::tz::parse(&st.station.tz).map_err(|e| e.to_string()))?;
+        .and_then(|st| crate::tz::parse(&st.station.tz).map_err(|e| e.to_string()))?;
     let result = simulate_schedule(&state.catalog, session, tz);
     let session = state.session.as_mut().expect("checked above");
     match result {
@@ -919,7 +952,7 @@ fn resimulate(state: &mut AppState) -> Result<(), String> {
     }
 }
 
-/// Run the daemon's generation loop ([`etv_station::simulate::simulate`]) over
+/// Run the daemon's generation loop ([`crate::simulate::simulate`]) over
 /// the channel as `channel.yaml` writes it, with each plugin pool replaced by
 /// its live-edited working copy — so a profile weight changed in the UI
 /// changes what every later generation draws, and the pool's repeat
@@ -966,7 +999,7 @@ fn simulate_schedule(
         .collect();
 
     let start = time::OffsetDateTime::now_utc();
-    let sim = etv_station::simulate::simulate(
+    let sim = crate::simulate::simulate(
         &config,
         &session.channel_path,
         catalog,
@@ -1300,7 +1333,7 @@ fn api_tautulli_users() -> Result<(u16, Value), String> {
 // the lineup, seeded tune-in samples and a day-by-day guide. It reads the
 // channel exactly as `channel.yaml` writes it (its own plugin scripts, no
 // working-copy profile), reloaded on every request so an edit to the file
-// shows on the next reload. The numbers are `etv_station::review`'s.
+// shows on the next reload. The numbers are `crate::review`'s.
 // ---------------------------------------------------------------------------
 
 /// Days the Review view simulates when a request names none, and the most it
@@ -1347,7 +1380,7 @@ impl ReviewState {
             stills: HashMap::new(),
             // One directory per build of this binary, so a rebuilt renderer
             // never serves a still the previous one drew.
-            still_dir: std::env::temp_dir().join("taste-lab-stills").join(
+            still_dir: std::env::temp_dir().join("etv-station-ui-stills").join(
                 std::env::current_exe()
                     .and_then(|p| p.metadata())
                     .and_then(|m| m.modified())
@@ -1448,7 +1481,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .iter()
         .find(|d| d.config_path == *config_path)
     {
-        eprintln!("taste-lab review: {key} failed to load: {}", dropped.reason);
+        tracing::warn!(event = "ui.review.load_failed", channel = %key, reason = %dropped.reason, "review: channel failed to load");
         return Ok((
             200,
             json!({
@@ -1466,17 +1499,17 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .find(|c| c.config_path == *config_path)
         .ok_or_else(|| format!("{key} is in the lineup but neither loaded nor dropped"))?;
 
-    let tz = etv_station::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
-    let start = etv_station::tz::local_midnight_at_or_before(time::OffsetDateTime::now_utc(), tz);
+    let tz = crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
+    let start = crate::tz::local_midnight_at_or_before(time::OffsetDateTime::now_utc(), tz);
     let mut day_starts = vec![start];
     for _ in 0..days {
         let last = *day_starts.last().expect("non-empty");
-        day_starts.push(etv_station::tz::add_chunk(last, 24, tz));
+        day_starts.push(crate::tz::add_chunk(last, 24, tz));
     }
     let end = *day_starts.last().expect("non-empty");
 
     let account_id = review_account_id(&mut state.review, lc)?;
-    let sim = etv_station::simulate::simulate(
+    let sim = crate::simulate::simulate(
         &lc.config,
         &lc.config_path,
         &state.catalog,
@@ -1499,8 +1532,8 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         })
         .collect();
     let mut entries: HashMap<String, Option<CatalogEntry>> = HashMap::new();
-    let mut airings: Vec<etv_station::review::ReviewAiring> = Vec::new();
-    let mut simulated: Vec<&etv_station::simulate::SimulatedAiring> = Vec::new();
+    let mut airings: Vec<crate::review::ReviewAiring> = Vec::new();
+    let mut simulated: Vec<&crate::simulate::SimulatedAiring> = Vec::new();
     for a in sim.generations.iter().flat_map(|g| &g.airings) {
         // Every airing, past the span's end too, so the last one in the span
         // still has a successor for its tune-in still's NEXT card. Airings
@@ -1513,7 +1546,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         let entry = entries
             .entry(a.id.clone())
             .or_insert_with(|| state.catalog.entry(&a.id).ok().flatten());
-        airings.push(etv_station::review::ReviewAiring {
+        airings.push(crate::review::ReviewAiring {
             id: a.id.clone(),
             title: entry
                 .as_ref()
@@ -1597,7 +1630,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         .collections_for_many(&ids)
         .map_err(|e| e.to_string())?;
     let audits: Vec<Value> = (0..airings.len())
-        .map(|i| etv_station::audit_report::split_audit(simulated[i].metadata.as_ref()).0)
+        .map(|i| crate::audit_report::split_audit(simulated[i].metadata.as_ref()).0)
         .collect();
     let passed_over: Vec<String> = audits
         .iter()
@@ -1658,15 +1691,18 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         })
         .collect();
 
-    eprintln!(
-        "taste-lab review: {key} days={days} generations={} airings={} overlap_channels={} {}ms",
-        sim.generations.len(),
-        airings.len(),
-        review["overlap"]["channels"]
+    tracing::info!(
+        event = "ui.review",
+        channel = %key,
+        days,
+        generations = sim.generations.len(),
+        airings = airings.len(),
+        overlap_channels = review["overlap"]["channels"]
             .as_array()
             .map(Vec::len)
             .unwrap_or(0),
-        began.elapsed().as_millis()
+        ms = began.elapsed().as_millis() as u64,
+        "review: schedule replayed"
     );
 
     let mut out = review;
@@ -1783,7 +1819,7 @@ fn channel_fingerprint(
     {
         return Ok(ids.clone());
     }
-    let ids = etv_station::resolve::resolve_channel_fingerprint_ids(
+    let ids = crate::resolve::resolve_channel_fingerprint_ids(
         &lc.config,
         &lc.config_path,
         &[],
@@ -1921,12 +1957,12 @@ fn build_review(
     state: &mut AppState,
     station: &config::Station,
     lc: &config::LoadedChannel,
-    airings: &[etv_station::review::ReviewAiring],
-    simulated: &[&etv_station::simulate::SimulatedAiring],
+    airings: &[crate::review::ReviewAiring],
+    simulated: &[&crate::simulate::SimulatedAiring],
     start: time::OffsetDateTime,
     end: time::OffsetDateTime,
 ) -> Result<Value, String> {
-    use etv_station::review;
+    use crate::review;
 
     let days = (end - start).as_seconds_f64() / 86_400.0;
     let first_repeat = review::first_repeat(airings, start, |_| true)
@@ -2026,7 +2062,7 @@ fn build_review(
         airings,
         start,
         end,
-        tz: etv_station::tz::parse(&station.station.tz).map_err(|e| e.to_string())?,
+        tz: crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?,
         random_order_pools: &random_order_pools,
         episode_counts: &episode_counts,
     })
@@ -2077,8 +2113,8 @@ fn review_seed(
     lc: &config::LoadedChannel,
     at: time::OffsetDateTime,
 ) -> u64 {
-    let tz = etv_station::tz::parse(&station.station.tz).unwrap_or(time_tz::timezones::db::UTC);
-    etv_station::variety::Variety::new(&lc.config, tz)
+    let tz = crate::tz::parse(&station.station.tz).unwrap_or(time_tz::timezones::db::UTC);
+    crate::variety::Variety::new(&lc.config, tz)
         .dice(at, None)
         .seed
 }
@@ -2141,10 +2177,27 @@ fn serve_review_still(state: &AppState, request: tiny_http::Request, query: &str
         return;
     };
     let dir = state.review.still_dir.clone();
-    std::thread::spawn(move || match render_review_still(&dir, &id, &still) {
-        Ok(jpeg) => respond_jpeg(request, jpeg),
-        Err(e) => respond_json(request, 500, &json!({ "error": e })),
-    });
+    std::thread::spawn(
+        move || match render_review_still_serially(&dir, &id, &still) {
+            Ok(jpeg) => respond_jpeg(request, jpeg),
+            Err(e) => respond_json(request, 500, &json!({ "error": e })),
+        },
+    );
+}
+
+/// One still renders at a time, whatever the number of request threads
+/// waiting: a Review page asks for every sample's still at once, and each
+/// render is an ffmpeg reading the media array the channels transcode from.
+fn render_review_still_serially(
+    dir: &Path,
+    id: &str,
+    still: &TuneInStill,
+) -> Result<Vec<u8>, String> {
+    static RENDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = RENDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    render_review_still(dir, id, still)
 }
 
 fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<u8>, String> {
@@ -2152,28 +2205,33 @@ fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<
     let served = still
         .render_cached(Path::new("ffmpeg"), dir, id)
         .inspect_err(|e| {
-            eprintln!(
-                "taste-lab still: {id} FAILED media={} at={:.1}s: {e}",
-                still.media.display(),
-                still.at_secs
+            tracing::warn!(
+                event = "ui.still.failed",
+                id,
+                media = %still.media.display(),
+                at_secs = still.at_secs,
+                error = %e,
+                "still: render failed"
             )
         })?;
     let (jpeg, rendered) = match served {
         StillJpeg::Cached(jpeg) => {
-            eprintln!("taste-lab still: {id} cached");
+            tracing::debug!(event = "ui.still.cached", id, "still: served from cache");
             return Ok(jpeg);
         }
         StillJpeg::Rendered(jpeg, rendered) => (jpeg, rendered),
     };
-    eprintln!(
-        "taste-lab still: {id} media={} at={:.1}s title={:?} next_title={:?} overlay_time={:?} shows_next={} {}ms",
-        still.media.display(),
-        still.at_secs,
-        still.program.title,
-        still.program.next_title,
-        rendered.overlay_time,
-        rendered.shows_next,
-        began.elapsed().as_millis()
+    tracing::info!(
+        event = "ui.still.rendered",
+        id,
+        media = %still.media.display(),
+        at_secs = still.at_secs,
+        title = ?still.program.title,
+        next_title = ?still.program.next_title,
+        overlay_time = ?rendered.overlay_time,
+        shows_next = rendered.shows_next,
+        ms = began.elapsed().as_millis() as u64,
+        "still: rendered"
     );
     Ok(jpeg)
 }
@@ -2231,8 +2289,8 @@ fn comparable_numbers(review: &Value) -> Vec<(String, Value)> {
     out
 }
 
-const INDEX_HTML: &str = include_str!("taste_lab_ui.html");
-const REVIEW_HTML: &str = include_str!("taste_lab_review.html");
+const INDEX_HTML: &str = include_str!("index.html");
+const REVIEW_HTML: &str = include_str!("review.html");
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>taste-lab</title>
+<title>etv-station · Tune</title>
 <style>
   body { font-family: -apple-system, sans-serif; margin: 16px; color: #111; }
   h1 { font-size: 18px; }
@@ -151,7 +151,7 @@
 </style>
 </head>
 <body>
-<h1>taste-lab</h1>
+<h1>etv-station</h1>
 <div id="status" class="muted"></div>
 
 <section>
@@ -205,7 +205,7 @@ let lastResult = null;
 let selectedEntryKey = null;
 
 // A schedule entry's identity across a re-score — never its array index.
-// simulate_schedule (taste-lab.rs) replays the whole schedule from scratch on
+// simulate_schedule (web_ui/mod.rs) replays the whole schedule from scratch on
 // every score, and a weight edit made from inside the open inspector can
 // change every later generation's picks — the entry that used to be at index
 // 4 is not guaranteed to still be the same pick. (generation, block_index,
@@ -241,7 +241,7 @@ function setLoading(isLoading) {
 
 // Never throws on a well-formed error response (`{error, ...}` — the server
 // still fills in pools/schedule on a partial scoring failure, see
-// rescore_and_respond in taste-lab.rs) — only on something actually broken
+// rescore_and_respond in web_ui/mod.rs) — only on something actually broken
 // (network failure, non-JSON body). Callers check `data.error` themselves so
 // descriptive fields render alongside the error instead of being lost.
 async function api(method, path, body) {
@@ -384,7 +384,7 @@ function renderPools(pools, focus) {
       </div>
       <div class="pool-field">
         <h2>config:${pool.config_authored ? '' : ' <span class="default-tag">(none written)</span>'}</h2>
-        <div class="field-hint">Extra settings this pool passes to the plugin — what each one does is up to the plugin, not taste-lab.</div>
+        <div class="field-hint">Extra settings this pool passes to the plugin — what each one does is up to the plugin, not etv-station.</div>
         <div class="${pool.config_authored ? '' : 'kv-default'}">${renderKv(pool.config)}</div>
       </div>
       <div class="pool-field">
@@ -449,7 +449,7 @@ function renderPools(pools, focus) {
 
 // `focus` is null when this pool isn't the one a selected entry drew from —
 // plain rows, no highlighting. When set, a picked or near-missed id can be
-// outside the `CANDIDATES_SHOWN` cap taste-lab.rs applies (a low-ranked
+// outside the `CANDIDATES_SHOWN` cap web_ui/mod.rs applies (a low-ranked
 // near-miss on a huge pool, most often); those rows simply aren't in this
 // list to highlight, same as any other candidate past the cap.
 function renderCandidatesTable(tbody, candidates, focus) {
@@ -602,7 +602,7 @@ function renderNearMisses(nearMisses) {
 // Matches an audit detail's `profile_entries` (kind/reference/weight, no
 // index — see taste-cosine.rhai's audit()) back to the pool's own resolved
 // `profile.entries` (which DOES carry `index`, see profile_json in
-// taste-lab.rs) so the inspector can edit the exact entry that moved this
+// web_ui/mod.rs) so the inspector can edit the exact entry that moved this
 // pick, without the server having to thread an index through the plugin
 // boundary.
 function findEditableIndex(poolName, kind, reference) {
@@ -729,7 +729,7 @@ function focusForEntry(entry) {
 
 // Renders whatever the payload carries. On a partial scoring failure the
 // server still sends pools/schedule for whatever DID score (see
-// rescore_and_respond in taste-lab.rs) — those sections render as-is and the
+// rescore_and_respond in web_ui/mod.rs) — those sections render as-is and the
 // error banner takes over status, rather than the page going blank.
 //
 // This is also the single re-render path for every user action that can

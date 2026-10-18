@@ -24,11 +24,11 @@ for three orchestrate rounds.
 ./tools/verify-all.sh test         # just tests, still both
 ```
 
-The taste-lab Review page is plain HTML with an inline script that no cargo test loads.
-Run its load check after any edit to `crates/etv-station/src/bin/taste_lab_review.html`:
+The web UI's Review page is plain HTML with an inline script that no cargo test loads.
+Run its load check after any edit to `crates/etv-station/src/web_ui/review.html`:
 
 ```bash
-node tools/review-page-check.js crates/etv-station/src/bin/taste_lab_review.html
+node tools/review-page-check.js crates/etv-station/src/web_ui/review.html
 # expect: review page script loads without error
 ```
 
@@ -321,11 +321,11 @@ cargo test -p etv-station --lib pattern::tests::a_rollover    # lands on the fir
 cargo test -p etv-station --test taste_cosine_scorer temperature
 ```
 
-**The surface is taste-lab's review**, which carries per airing a `ranking`
+**The surface is the web UI's review**, which carries per airing a `ranking`
 object: the `seed`/`temperature` the visit drew with, `seed_period`, and
 `list_position` of `list_length` in that period's ranked list. Copy the real
 appdata to scratch (never edit `deploy/appdata` from a worktree), set the
-channel rotating, and run taste-lab on it:
+channel rotating, and run the web UI on it:
 
 ```bash
 SIM=$(~/.claude/tools/repo-slug --path)/sim && mkdir -p "$SIM"
@@ -335,9 +335,9 @@ cp examples/plugins/taste-cosine.rhai "$SIM/appdata/plugins/"
 # temperature: 0.5, films pools advance: resume, shows pools temperature: 0
 set -a; . /Users/pierce/Projects/etv-station/.env; set +a
 export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/plexdb.snapshot.db
-cargo run --release --bin taste-lab -- \
-  --catalog /Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/catalog.db \
-  --station "$SIM/appdata/station.yaml" --port <PORT>
+export ETV_STATION_CATALOG=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/catalog.db
+cargo run --release --bin etv-station -- \
+  --config "$SIM/appdata/station.yaml" --serve-ui --ui-port <PORT>
 curl -s 'http://127.0.0.1:<PORT>/api/review?channel=034-syfy&days=14' > a.json   # twice: a.json, b.json
 ```
 
@@ -351,7 +351,7 @@ film aired in an earlier period, not a broken walk.
 
 **Prod's 034 `channel.yaml` overlay block does not parse on this code** (as of
 2026-10-15: "`overlay:` must be `clear`, a `{file: <path>}` reference…"), so a
-taste-lab run of the real file reports a `load_error`. Delete the `overlay:`
+web UI run of the real file reports a `load_error`. Delete the `overlay:`
 block from the scratch copy; the schedule does not read it.
 
 At the daemon, `event="variety.ranked" pool=… list=…` logs once per pool per
@@ -920,7 +920,7 @@ unplaced slot, two overlapping ranges in one schedule, `"02-30"`, a span
 mixing `MM-DD` and `YYYY-MM-DD`, and `cycles:` on any block of a channel with
 schedules each print `channel.load_failed` naming the schedule, slot or block.
 
-For a real channel, run taste-lab's Review (the `programming` skill) and
+For a real channel, run the web UI's Review (the `programming` skill) and
 count airings per local day and pool. Review always starts today and caps at
 50 days, so a date further out needs a scratch copy of the channel with its
 `dates:` moved into range.
@@ -987,6 +987,30 @@ marks its phase, a watchdog thread writes `overlay.heartbeat` beside the fifo
 once a second and logs `overlay.phase_stall` on a 1/2/4/8s backoff. Cost in the
 frame loop is two relaxed atomic stores per phase.
 
+## Verifying the web UI (`etv-station --serve-ui`)
+
+The container starts it from `docker/entrypoint.sh` beside the daemon and ETV-next,
+on `0.0.0.0:4747` at `nice -n 19`. Its state query is `GET /api/health`: station,
+catalog, plugins dir, bind, port, tunable-channel count, revision; 503 when the
+station config does not load. Every request logs `event="ui.request"` with status
+and ms; a review logs `ui.review` with its generation count and ms.
+
+Locally: `./tools/station-ui.sh` (`admin tools ui`), then
+`curl -s http://127.0.0.1:4747/api/health`. In the image, with no media and no Plex,
+copy `examples/` to a scratch `config/`, mount `crates/etv-overlay/fixtures` at
+`/crates/etv-overlay/fixtures` (the lavfi channel's overlay names it by a `../../`
+path), and run with `-e ETV_STATION_CONFIG=/config/station-test.yaml -p 14747:4747`.
+Look for, observed 2026-10-18 on a native build: health 200 within 2s of start,
+`<title>etv-station · Review</title>` at `/review`, `/channels.m3u` still 200 on
+8409, and `docker exec <ctr> ps -eo pid,ni,args` showing the `--serve-ui` process
+at NI 19 while the daemon and `ersatztv` sit at 0. After `docker kill -s TERM`, the
+`--serve-ui` process is gone within 3s. `POST /api/select` with a path outside the
+lineup answers 400 "is not a tunable channel in this station's lineup".
+
+A 14-day review of 034-syfy takes ~166s (2026-10-18) and the server answers nothing
+else meanwhile; that is the replay's cost, identical on the pre-move binary, not a
+hang.
+
 ## Verifying the channel-wide repeat rule (`rule.no_repeat_within`)
 
-`cargo test -p etv-station --lib a_channel_rule` covers spacing across pools, the ledger-tail seam, and the forced fallback. At the surface, run taste-lab Review on a scratch channel whose pools overlap — three `select: random` pools over one expression — once without the key and once with `rule: { no_repeat_within: "7d" }`, then compare `first_repeat.days` and the smallest gap between two airings of the same `entry_id` in `airings`. Observed 2026-10-17 on 14 days of Animation films: 0.15 days without the rule, 7.0 days with it. At the daemon, `event="channel_repeat.applied"` logs `blocked`/`forced` per generation, and `constraints.unsatisfied scope=channel` means the rule could not hold.
+`cargo test -p etv-station --lib a_channel_rule` covers spacing across pools, the ledger-tail seam, and the forced fallback. At the surface, run the web UI's Review on a scratch channel whose pools overlap — three `select: random` pools over one expression — once without the key and once with `rule: { no_repeat_within: "7d" }`, then compare `first_repeat.days` and the smallest gap between two airings of the same `entry_id` in `airings`. Observed 2026-10-17 on 14 days of Animation films: 0.15 days without the rule, 7.0 days with it. At the daemon, `event="channel_repeat.applied"` logs `blocked`/`forced` per generation, and `constraints.unsatisfied scope=channel` means the rule could not hold.

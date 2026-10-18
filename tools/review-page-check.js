@@ -1,16 +1,16 @@
-// Runs each inline script of the taste-lab Review page to the end of its top-level load,
+// Runs each inline script of the web UI Review page to the end of its top-level load,
 // in one vm context whose DOM is a stub that accepts any access. Exits 1 with the thrown
 // error when a load throws. `node --check` only parses, so it passes a script that throws
 // on load; this runs it. The stub is a load check, not a sandbox: the page is repo content.
 //
-// Usage: node tools/review-page-check.js <path to taste_lab_review.html>
+// Usage: node tools/review-page-check.js <path to review.html>
 
 const fs = require('fs');
 const vm = require('vm');
 
 const file = process.argv[2];
 if (!file) {
-  console.log('usage: node tools/review-page-check.js <path to taste_lab_review.html>');
+  console.log('usage: node tools/review-page-check.js <path to review.html>');
   process.exit(2);
 }
 const html = fs.readFileSync(file, 'utf8');
@@ -39,7 +39,7 @@ ctx.globalThis = ctx;
 const context = vm.createContext(ctx);
 blocks.forEach((src, i) => {
   try {
-    vm.runInContext(src, context, { filename: `taste_lab_review.html script ${i + 1}` });
+    vm.runInContext(src, context, { filename: `review.html script ${i + 1}` });
   } catch (e) {
     console.log(`review page script ${i + 1} throws on load: ${e.name}: ${e.message}`);
     process.exit(1);

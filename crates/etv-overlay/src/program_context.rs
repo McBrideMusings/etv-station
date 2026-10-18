@@ -342,7 +342,7 @@ impl ProgramContext {
     /// followed by an item whose `program` is `next`, read exactly as
     /// [`ProgramContextSource::current_at`] reads them out of a chunk file.
     /// For a caller holding the programs in memory rather than on disk
-    /// (taste-lab's tune-in stills). A value that is not a `program` object
+    /// (the web UI's tune-in stills). A value that is not a `program` object
     /// reads as no program at all.
     pub fn from_playout_programs(
         now: Option<&serde_json::Value>,
