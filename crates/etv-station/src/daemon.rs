@@ -1420,8 +1420,13 @@ async fn run_catalog_refresh(
     refresh_and_sweep(station, plex, kind, cancel).await;
     // The refresh's temporary pile is freed by now but glibc keeps the pages;
     // without this RSS ratchets up a step per refresh until the host's OOM
-    // watcher kills the daemon.
-    crate::memstat::trim_and_log("catalog_refresh");
+    // watcher kills the daemon. `malloc_trim` walks every arena and blocks for
+    // as long as the heap is big, so it runs off the async workers.
+    if let Err(err) =
+        tokio::task::spawn_blocking(|| crate::memstat::trim_and_log("catalog_refresh")).await
+    {
+        tracing::warn!(event = "mem.trim_failed", error = %err, "memory trim task failed");
+    }
 }
 
 /// Re-ingest the catalog, then sweep the already-written playout JSON so it
