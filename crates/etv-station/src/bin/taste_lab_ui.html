@@ -481,12 +481,14 @@ function renderProfileTable(tbody, poolName, profile) {
     weightInput.step = '0.1';
     weightInput.style.width = '70px';
     weightInput.value = entry.weight;
+    weightInput.disabled = entry.index === null;
     weightInput.addEventListener('change', () => updateWeight(poolName, entry.index, parseFloat(weightInput.value)));
     const weightTd = document.createElement('td');
     weightTd.appendChild(weightInput);
 
     const removeBtn = document.createElement('button');
     removeBtn.textContent = 'remove';
+    removeBtn.disabled = entry.index === null;
     removeBtn.addEventListener('click', () => removeEntry(poolName, entry.index));
     const removeTd = document.createElement('td');
     removeTd.appendChild(removeBtn);
