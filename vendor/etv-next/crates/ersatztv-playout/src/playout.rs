@@ -650,18 +650,20 @@ pub async fn from_file(path: &str) -> Result<PlayoutLoadResult, PlayoutError> {
     Ok(PlayoutLoadResult { playout })
 }
 
-/// Whether any playout chunk file (`{start}_{finish}.json`) currently sitting
-/// in `folder` contains an item that names a subtitle track selection.
+/// Whether the item airing at `now` names a subtitle track selection, read
+/// from the playout chunk files (`{start}_{finish}.json`) sitting in `folder`.
 ///
 /// This is the shared fact both the master-playlist decision (`ersatztv`,
 /// which channel/HTTP-request the client's player at) and the channel's own
 /// subtitle production (`ersatztv-channel`, the worker that actually plays
 /// the schedule) can independently derive from the exact same source of
 /// truth — the playout JSON directory — without either process having to
-/// signal the other. A folder that can't be read, or contains no files that
-/// parse, reports `false` rather than erroring, matching how a channel with
-/// nothing scheduled yet behaves: nothing has asked for subtitles.
-pub async fn schedule_requests_subtitle(folder: &Path) -> bool {
+/// signal the other. Only the item covering `now` counts: an item hours away,
+/// or already aired, says nothing about the cue file the client is about to
+/// fetch. A folder that can't be read, or contains no file covering `now`,
+/// reports `false` rather than erroring, matching how a channel with nothing
+/// scheduled yet behaves: nothing has asked for subtitles.
+pub async fn schedule_requests_subtitle(folder: &Path, now: OffsetDateTime) -> bool {
     let mut entries = match tokio::fs::read_dir(folder).await {
         Ok(entries) => entries,
         Err(_) => return false,
@@ -670,6 +672,17 @@ pub async fn schedule_requests_subtitle(folder: &Path) -> bool {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        // A chunk whose filename says it doesn't cover `now` can't hold the
+        // airing item; skip the parse. A name that doesn't parse is read anyway.
+        if let Some((start, finish)) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(parse_playout_filename)
+            && (now < start || now >= finish)
+        {
             continue;
         }
 
@@ -682,7 +695,7 @@ pub async fn schedule_requests_subtitle(folder: &Path) -> bool {
                 .playout
                 .items
                 .iter()
-                .any(PlayoutItem::requests_subtitle)
+                .any(|item| item.start <= now && now < item.finish && item.requests_subtitle())
         {
             return true;
         }
@@ -755,31 +768,54 @@ mod schedule_requests_subtitle_tests {
     }
 
     #[tokio::test]
-    async fn true_when_any_chunk_file_has_an_item_requesting_subtitles() {
+    async fn true_when_the_airing_item_requests_subtitles() {
         let dir = tempfile::tempdir().unwrap();
-        write_chunk(
-            dir.path(),
-            "chunk.json",
-            vec![item("no-subs", false), item("wants-subs", true)],
-        );
+        let wants = item("wants-subs", true);
+        let now = wants.start + time::Duration::minutes(1);
+        write_chunk(dir.path(), "chunk.json", vec![wants]);
 
-        assert!(schedule_requests_subtitle(dir.path()).await);
+        assert!(schedule_requests_subtitle(dir.path(), now).await);
     }
 
     #[tokio::test]
-    async fn false_when_no_item_in_any_chunk_file_requests_subtitles() {
+    async fn false_when_the_airing_item_has_no_subtitles_but_another_item_does() {
         let dir = tempfile::tempdir().unwrap();
-        write_chunk(dir.path(), "chunk.json", vec![item("no-subs", false)]);
+        let plain = item("no-subs", false);
+        let now = plain.start + time::Duration::minutes(1);
+        let mut later = item("wants-subs", true);
+        later.start = plain.finish;
+        later.finish = plain.finish + time::Duration::minutes(5);
+        write_chunk(dir.path(), "chunk.json", vec![plain, later]);
+        // A separate chunk in the past that requested subtitles.
+        let mut past = item("past-subs", true);
+        past.start = now - time::Duration::hours(2);
+        past.finish = now - time::Duration::hours(1);
+        write_chunk(dir.path(), "past.json", vec![past]);
 
-        assert!(!schedule_requests_subtitle(dir.path()).await);
+        assert!(!schedule_requests_subtitle(dir.path(), now).await);
+    }
+
+    #[tokio::test]
+    async fn chunk_filename_outside_now_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let wants = item("wants-subs", true);
+        let now = wants.start + time::Duration::minutes(1);
+        write_chunk(
+            dir.path(),
+            "2000-01-01T00:00:00.000000000Z_2000-01-02T00:00:00.000000000Z.json",
+            vec![wants],
+        );
+
+        assert!(!schedule_requests_subtitle(dir.path(), now).await);
     }
 
     #[tokio::test]
     async fn false_when_folder_is_empty_or_missing() {
         let dir = tempfile::tempdir().unwrap();
+        let now = OffsetDateTime::now_utc();
 
-        assert!(!schedule_requests_subtitle(dir.path()).await);
-        assert!(!schedule_requests_subtitle(&dir.path().join("does-not-exist")).await);
+        assert!(!schedule_requests_subtitle(dir.path(), now).await);
+        assert!(!schedule_requests_subtitle(&dir.path().join("does-not-exist"), now).await);
     }
 }
 
