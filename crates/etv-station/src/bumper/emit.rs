@@ -119,8 +119,13 @@ pub fn emit_timeline(
         // gets a `tracks.audio` override when the segment asks for a bed or
         // silence.
         let own_graph = matches!(seg.segment.source, SegmentSource::Still { .. });
-        for item in &mut items[first..] {
-            if !own_graph && let Some(audio) = audio_override(seg, resolved.bed.as_ref()) {
+        let parts = items.len() - first;
+        for (n, item) in items[first..].iter_mut().enumerate() {
+            let len_ms = (item.finish - item.start).whole_milliseconds() as u64;
+            let edges = (n == 0, n + 1 == parts);
+            if !own_graph
+                && let Some(audio) = audio_override(seg, resolved.bed.as_ref(), len_ms, edges)
+            {
                 item.tracks = Some(PlayoutItemTracks {
                     audio: Some(TrackSelection {
                         source: Some(audio),
@@ -215,12 +220,22 @@ fn rational(ms: u64, fps: f64) -> serde_json::Value {
 }
 
 /// The `tracks.audio` source for a non-Still segment, or `None` for its own audio.
-fn audio_override(seg: &ResolvedSegment, bed: Option<&AudioSource>) -> Option<PlayoutItemSource> {
+///
+/// A looped clip is several items and each is its own ffmpeg input, so a bed
+/// restarts at every seam (one audio track per item). The fade-in is kept to
+/// the first item and the fade-out to the last, each timed to that item's
+/// own length.
+fn audio_override(
+    seg: &ResolvedSegment,
+    bed: Option<&AudioSource>,
+    len_ms: u64,
+    (first, last): (bool, bool),
+) -> Option<PlayoutItemSource> {
     match seg.segment.audio {
         SegmentAudio::Own => None,
         SegmentAudio::Mute => Some(PlayoutItemSource::lavfi(SILENCE.to_string())),
         SegmentAudio::Bed => Some(PlayoutItemSource::lavfi(match bed {
-            Some(bed) => bed_graph(bed, seg.duration_ms),
+            Some(bed) => bed_graph(bed, len_ms, first, last),
             None => SILENCE.to_string(),
         })),
     }
@@ -240,7 +255,7 @@ const SILENCE: &str = "anullsrc=channel_layout=stereo:sample_rate=48000";
 /// to the channel rate.
 fn still_graph(image: &Path, fps: f64, seg: &ResolvedSegment, bed: Option<&AudioSource>) -> String {
     let audio = match (seg.segment.audio, bed) {
-        (SegmentAudio::Bed, Some(bed)) => bed_graph(bed, seg.duration_ms),
+        (SegmentAudio::Bed, Some(bed)) => bed_graph(bed, seg.duration_ms, true, true),
         _ => SILENCE.to_string(),
     };
     format!(
@@ -252,16 +267,16 @@ fn still_graph(image: &Path, fps: f64, seg: &ResolvedSegment, bed: Option<&Audio
 
 /// `amovie` with the bed's gain and fades. The bed loops so a segment longer
 /// than the file keeps sound; the item's own span ends it.
-fn bed_graph(bed: &AudioSource, duration_ms: u64) -> String {
+fn bed_graph(bed: &AudioSource, duration_ms: u64, first: bool, last: bool) -> String {
     let mut graph = format!(
         "amovie={}:loop=0,volume={}dB",
         quote_filter_arg(&bed.path.to_string_lossy()),
         bed.gain_db,
     );
-    if bed.fade_in_ms > 0 {
+    if first && bed.fade_in_ms > 0 {
         graph.push_str(&format!(",afade=t=in:st=0:d={}", seconds(bed.fade_in_ms)));
     }
-    if bed.fade_out_ms > 0 {
+    if last && bed.fade_out_ms > 0 {
         let at = duration_ms.saturating_sub(bed.fade_out_ms);
         graph.push_str(&format!(
             ",afade=t=out:st={}:d={}",
@@ -294,6 +309,14 @@ fn seconds(ms: u64) -> String {
 }
 
 fn format_fps(fps: f64) -> String {
+    // NTSC rates are n*1000/1001; a rounded decimal would drift from the
+    // channel's exact rate over a long Still.
+    for n in [24u32, 30, 48, 60] {
+        let exact = f64::from(n) * 1000.0 / 1001.0;
+        if (fps - exact).abs() < 0.005 {
+            return format!("{}/1001", n * 1000);
+        }
+    }
     if fps.fract() == 0.0 {
         format!("{}", fps as u64)
     } else {
@@ -608,6 +631,54 @@ mod tests {
         assert_eq!(video.len(), 3);
         assert_eq!(video[1]["media_reference"]["target_url"], "/m/a.mkv");
         assert_eq!(video[1]["source_range"]["start_time"]["value"], 150.0);
+    }
+
+    #[test]
+    fn a_bed_under_a_looped_clip_fades_in_once_and_out_once_per_item_length() {
+        let mut clip = seg(
+            "clip",
+            SegmentSource::Clip {
+                path: "/m/a.mkv".into(),
+                in_ms: 0,
+                out_ms: 3_000,
+            },
+            Dur::Fixed(8_000),
+        );
+        clip.loop_ = true;
+        clip.audio = SegmentAudio::Bed;
+        let items = emit(
+            &Timeline {
+                segments: vec![clip],
+                bed: Some(bed()),
+            },
+            8_000,
+        );
+        let graph = |i: &PlayoutItem| match i
+            .tracks
+            .as_ref()
+            .unwrap()
+            .audio
+            .as_ref()
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+        {
+            PlayoutItemSource::Lavfi { params, .. } => params.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(graph(&items[0]).contains("afade=t=in") && !graph(&items[0]).contains("t=out"));
+        assert!(!graph(&items[1]).contains("afade"));
+        assert!(
+            graph(&items[2]).contains("afade=t=out:st=1:d=1") && !graph(&items[2]).contains("t=in")
+        );
+    }
+
+    #[test]
+    fn ntsc_rates_are_exact_fractions() {
+        assert_eq!(format_fps(29.97), "30000/1001");
+        assert_eq!(format_fps(23.976), "24000/1001");
+        assert_eq!(format_fps(25.0), "25");
     }
 
     #[test]
