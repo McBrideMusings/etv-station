@@ -1028,3 +1028,92 @@ mod get_multi_variant_tests {
         assert_eq!(stamp.created, "unknown");
     }
 }
+
+// `tools/channel-health.sh` reads `.channels[]`, `.failed`, `.retry_in_secs`
+// and `.last_failure.{at,cause}` off this endpoint; renaming one of them
+// breaks the sweep without any compile error.
+#[cfg(test)]
+mod channel_health_report_tests {
+    use ersatztv::config::ChannelConfig;
+
+    use super::*;
+
+    async fn lineup_with_channel(dir: &std::path::Path) -> Arc<LineupState> {
+        std::fs::create_dir(dir.join("playout")).unwrap();
+        let cfg_path = dir.join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: None,
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir, cfg).await.unwrap();
+        Arc::new(LineupState {
+            channels: vec![channel],
+            active: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
+            device_id: String::new(),
+        })
+    }
+
+    async fn report(state: &Arc<LineupState>) -> serde_json::Value {
+        let response = channel_health_report(State(state.clone()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn healthy_channel_reports_every_key_the_sweep_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = lineup_with_channel(dir.path()).await;
+
+        let json = report(&state).await;
+
+        let row = &json["channels"][0];
+        assert_eq!(row["number"], "1");
+        assert_eq!(row["name"], "ETV 1");
+        assert_eq!(row["active"], false);
+        assert_eq!(row["consecutive_failures"], 0);
+        assert_eq!(row["failed"], false);
+        assert_eq!(row["retry_in_secs"], 0);
+        assert!(row["last_failure"].is_null());
+    }
+
+    #[tokio::test]
+    async fn failed_channel_rounds_retry_up_and_names_its_last_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = lineup_with_channel(dir.path()).await;
+        {
+            let mut health = state.health.lock().await;
+            for _ in 0..3 {
+                health.record_exit(
+                    "1",
+                    true,
+                    true,
+                    Duration::from_secs(3),
+                    Instant::now(),
+                    "no segments".to_owned(),
+                );
+            }
+        }
+
+        let json = report(&state).await;
+
+        // The third failure sets a 30s guard; microseconds have passed by the
+        // time the handler reads it, so a floor would report 29.
+        let row = &json["channels"][0];
+        assert_eq!(row["consecutive_failures"], 3);
+        assert_eq!(row["failed"], true);
+        assert_eq!(row["retry_in_secs"], 30);
+        assert_eq!(row["last_failure"]["cause"], "no segments");
+        assert!(row["last_failure"]["at"].is_string());
+    }
+}
