@@ -172,7 +172,13 @@ pub fn ingest_files(
                 file_title(path),
                 Source::LocalFs,
             );
-            entry.duration_ms = duration_secs.map(|s| (s * 1000.0) as i64);
+            // `None` means this pass learned nothing (timeout on a stale mount,
+            // unreadable file), not that the file has no length: keep the length
+            // an earlier scan recorded rather than wiping it.
+            entry.duration_ms = match duration_secs {
+                Some(s) => Some((s * 1000.0) as i64),
+                None => catalog.entry(&entry_id)?.and_then(|e| e.duration_ms),
+            };
             catalog.upsert_entry(&entry)?;
             stats.entries_written += 1;
         }
@@ -258,6 +264,7 @@ async fn ffprobe_seconds(path: &Path) -> Option<f64> {
         crate::ffprobe::Bounded::Done {
             success: true,
             stdout,
+            ..
         } => stdout,
         crate::ffprobe::Bounded::Done { .. } => return None,
         crate::ffprobe::Bounded::TimedOut => {
@@ -301,6 +308,21 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_failed_probe_keeps_the_recorded_duration_and_the_row_live() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let path = "/data/media/a.mp4";
+        ingest_files(&cat, &[file(path, 90.0)], &roots, true).unwrap();
+        age_fs_rows(&cat);
+        let id = cat.all_sources().unwrap()[0].entry_id.clone();
+
+        ingest_files(&cat, &[(PathBuf::from(path), None)], &roots, true).unwrap();
+
+        assert_eq!(cat.entry(&id).unwrap().unwrap().duration_ms, Some(90_000));
+        assert_eq!(fs_paths(&cat), vec![path.to_string()]);
     }
 
     /// Every `local_fs` path the catalog would still play — missing rows are

@@ -42,16 +42,17 @@ CACHE_DIR="tmp/claude/scratchpad/taste-debug"
 DEFAULT_CATALOG="$CACHE_DIR/catalog.db"
 DEFAULT_PLEXDB="$CACHE_DIR/plexdb.snapshot.db"
 
-# name (channel dir name, numeric prefix stripped) -> path, one per
+# name (the channel's declared `name:`, numeric prefix stripped) -> path, one per
 # plugin-backed channel. Discovered by grepping for `plugin:` rather than
-# hand-listed, so 001-for-you/ becomes `for-you`, 045-endless/ becomes
+# hand-listed, so a channel declaring `name: 001-for-you` becomes `for-you`, 045-endless/ becomes
 # `endless`, and a future plugin channel needs no edit here.
 plugin_channels_tsv() {
   local f stem
   for f in "$CHANNELS_DIR"/*/channel.yaml; do
     [ -f "$f" ] || continue
     grep -q "plugin:" "$f" || continue
-    stem="$(basename "$(dirname "$f")" | sed -E 's/^[0-9]+-//')"
+    stem="$(sed -nE 's/^name:[[:space:]]*["'"'"']?([^"'"'"'#]*[^"'"'"'#[:space:]])["'"'"']?[[:space:]]*(#.*)?$/\1/p' "$f" | head -n 1 | sed -E 's/^[0-9]+-//')"
+    [ -n "$stem" ] || continue
     printf '%s\t%s\n' "$stem" "$f"
   done
 }

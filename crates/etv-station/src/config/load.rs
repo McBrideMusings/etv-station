@@ -266,8 +266,11 @@ fn expand_categories(
 ///
 /// The name keys the channel's play history and its output folder, so two
 /// channels sharing one would interleave their airings rows and fight over one
-/// folder's sidecars. Distinct names give distinct `{output_base}/{name}`
-/// folders, so the name check is also the output-folder check.
+/// folder's sidecars. Names compare case-insensitively: on macOS or an
+/// SMB-mounted `output_base`, `{output_base}/Foo` and `{output_base}/foo` are
+/// one folder. Distinct names under that comparison give distinct
+/// `{output_base}/{name}` folders, so the name check is also the output-folder
+/// check.
 ///
 /// Runs after every individual channel has already loaded successfully,
 /// because a collision is a property of the whole roster, not of any one
@@ -294,7 +297,7 @@ fn reject_collisions(channels: &mut Vec<LoadedChannel>) -> Vec<DroppedChannel> {
     );
     for (idx, reason) in colliding(
         channels,
-        |c| c.name.clone(),
+        |c| c.name.to_lowercase(),
         |name, paths| {
             tracing::error!(
                 event = "channel.name_collision",
@@ -1579,53 +1582,65 @@ mod tests {
         assert!(out.is_empty(), "out = {out:?}");
     }
 
-    /// Captures `event = "config.unknown_keys"` warnings emitted during `f`,
-    /// pairing the event name with the `keys` field's rendered value. Mirrors
-    /// `validate.rs`'s `capture_datastore_age_events` — `keys` is a `%`-
-    /// (Display-)formatted `String`, which tracing records via
-    /// `record_debug`, not `record_str`.
-    fn capture_unknown_keys_events<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    /// Captures every tracing event emitted during `f` as its fields, keyed by
+    /// field name. Mirrors `validate.rs`'s `capture_datastore_age_events` — a
+    /// `%`-(Display-)formatted field, such as `keys`, `path` or `error`, is
+    /// recorded via `record_debug` and stored as its Display text; a plain
+    /// string field, such as `event`, arrives via `record_str`.
+    fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<HashMap<String, String>>) {
         use std::sync::{Arc, Mutex};
 
         use tracing::field::{Field, Visit};
         use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
         #[derive(Default)]
-        struct FieldVisitor {
-            event: String,
-            keys: Option<String>,
-        }
+        struct FieldVisitor(HashMap<String, String>);
         impl Visit for FieldVisitor {
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "keys" {
-                    self.keys = Some(format!("{value:?}"));
-                }
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
             }
             fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "event" {
-                    self.event = value.to_string();
-                }
+                self.0.insert(field.name().to_string(), value.to_string());
             }
         }
 
-        struct CaptureUnknownKeys(Arc<Mutex<Vec<String>>>);
-        impl<S: tracing::Subscriber> Layer<S> for CaptureUnknownKeys {
+        struct CaptureEvents(Arc<Mutex<Vec<HashMap<String, String>>>>);
+        impl<S: tracing::Subscriber> Layer<S> for CaptureEvents {
             fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
                 let mut visitor = FieldVisitor::default();
                 event.record(&mut visitor);
-                if visitor.event == "config.unknown_keys"
-                    && let Some(keys) = visitor.keys
-                {
-                    self.0.lock().unwrap().push(keys);
-                }
+                self.0.lock().unwrap().push(visitor.0);
             }
         }
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(CaptureUnknownKeys(Arc::clone(&seen)));
+        let subscriber = tracing_subscriber::registry().with(CaptureEvents(Arc::clone(&seen)));
         let result = crate::test_tracing::with_default(subscriber, f);
         let events = seen.lock().unwrap().clone();
         (result, events)
+    }
+
+    /// The fields of every captured event named `event`, in emit order.
+    fn events_named<'a>(
+        events: &'a [HashMap<String, String>],
+        event: &str,
+    ) -> Vec<&'a HashMap<String, String>> {
+        events
+            .iter()
+            .filter(|fields| fields.get("event").map(String::as_str) == Some(event))
+            .collect()
+    }
+
+    /// Captures `event = "config.unknown_keys"` warnings emitted during `f`,
+    /// pairing the event name with the `keys` field's rendered value.
+    fn capture_unknown_keys_events<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let (result, events) = capture_events(f);
+        let keys = events_named(&events, "config.unknown_keys")
+            .into_iter()
+            .filter_map(|fields| fields.get("keys").cloned())
+            .collect();
+        (result, keys)
     }
 
     /// End-to-end proof, through the real `read_channel` entry point: a typo
@@ -1761,10 +1776,24 @@ mod tests {
             ],
         );
 
-        let station = load_with_env(&station_path, &no_env).expect("station still loads");
+        let (station, events) = capture_events(|| load_with_env(&station_path, &no_env));
+        let station = station.expect("station still loads");
         assert_eq!(station.channels.len(), 1, "only b.yaml should load");
         assert_eq!(station.channels[0].name, "b");
         assert_eq!(dropped_files(&station), ["a.yaml"]);
+
+        let failed = events_named(&events, "channel.load_failed");
+        assert_eq!(failed.len(), 1, "events = {events:?}");
+        assert!(
+            failed[0]["path"].ends_with("/a.yaml"),
+            "path = {}",
+            failed[0]["path"]
+        );
+        assert!(
+            failed[0]["error"].contains("missing field `number`"),
+            "error = {}",
+            failed[0]["error"]
+        );
     }
 
     /// #263 rule 2: two channels declaring the same number both drop out;
@@ -1781,7 +1810,8 @@ mod tests {
             ],
         );
 
-        let station = load_with_env(&station_path, &no_env).expect("station still loads");
+        let (station, events) = capture_events(|| load_with_env(&station_path, &no_env));
+        let station = station.expect("station still loads");
         assert_eq!(station.channels.len(), 1, "only c.yaml should survive");
         assert_eq!(station.channels[0].name, "c");
         assert_eq!(station.channels[0].config.number, 2);
@@ -1790,6 +1820,20 @@ mod tests {
             station.dropped[0]
                 .reason
                 .starts_with("number 1 is declared by")
+        );
+
+        let collisions = events_named(&events, "channel.number_collision");
+        assert_eq!(collisions.len(), 1, "events = {events:?}");
+        assert_eq!(collisions[0]["number"], "1");
+        assert!(
+            collisions[0]["paths"].contains("a.yaml"),
+            "paths = {}",
+            collisions[0]["paths"]
+        );
+        assert!(
+            collisions[0]["paths"].contains("b.yaml"),
+            "paths = {}",
+            collisions[0]["paths"]
         );
     }
 
@@ -1830,9 +1874,23 @@ mod tests {
             ],
         );
 
-        let station = load_with_env(&station_path, &no_env).expect("station still loads");
+        let (station, events) = capture_events(|| load_with_env(&station_path, &no_env));
+        let station = station.expect("station still loads");
         let names: Vec<&str> = station.channels.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["b"], "a.yaml has no name: and must not load");
+
+        let failed = events_named(&events, "channel.load_failed");
+        assert_eq!(failed.len(), 1, "events = {events:?}");
+        assert!(
+            failed[0]["path"].ends_with("/a.yaml"),
+            "path = {}",
+            failed[0]["path"]
+        );
+        assert!(
+            failed[0]["error"].contains("missing field `name`"),
+            "error = {}",
+            failed[0]["error"]
+        );
     }
 
     /// #414 rule 2: two channels declaring the same name both drop out —
@@ -1849,9 +1907,44 @@ mod tests {
             ],
         );
 
+        let (station, events) = capture_events(|| load_with_env(&station_path, &no_env));
+        let station = station.expect("station still loads");
+        let names: Vec<&str> = station.channels.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["c"]);
+
+        let collisions = events_named(&events, "channel.name_collision");
+        assert_eq!(collisions.len(), 1, "events = {events:?}");
+        assert_eq!(collisions[0]["name"], "shared");
+        assert!(
+            collisions[0]["paths"].contains("a.yaml"),
+            "paths = {}",
+            collisions[0]["paths"]
+        );
+        assert!(
+            collisions[0]["paths"].contains("b.yaml"),
+            "paths = {}",
+            collisions[0]["paths"]
+        );
+    }
+
+    /// Names differing only in case share one folder on a case-insensitive
+    /// filesystem, so they collide too.
+    #[test]
+    fn names_differing_only_in_case_both_drop_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_path = write_min_station(
+            dir.path(),
+            &[
+                ("a.yaml", &channel_body(Some(1), Some("Foo"))),
+                ("b.yaml", &channel_body(Some(2), Some("foo"))),
+                ("c.yaml", &channel_body(Some(3), Some("c"))),
+            ],
+        );
+
         let station = load_with_env(&station_path, &no_env).expect("station still loads");
         let names: Vec<&str> = station.channels.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["c"]);
+        assert_eq!(dropped_files(&station), ["a.yaml", "b.yaml"]);
     }
 
     /// Both collision checks read the full roster: a channel whose name

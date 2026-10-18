@@ -5,6 +5,7 @@ pub mod audit_report;
 pub mod backfill;
 pub mod bumper;
 pub mod calendar;
+pub mod cancel;
 pub mod catalog;
 pub mod channel_card;
 pub mod config;

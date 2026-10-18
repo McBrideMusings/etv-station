@@ -25,9 +25,19 @@ fi
 : "${ETV_BIND_ADDRESS:=0.0.0.0}"
 export ETV_BIND_ADDRESS ETV_PORT
 
+# The test config needs nothing external. dev-run.sh re-sources .env itself, so
+# this flag, not an unset here, keeps a Plex URL from starting a full library
+# ingest before the station rolls its first channel.
+export ETV_DEV_NO_EXTERNAL=1
+
 BASE_URL="http://127.0.0.1:${ETV_PORT}"
 LOG_FILE="tmp/verify-integration.log"
-SESSION_WAIT_SECS=30
+BUILD_LOG="tmp/verify-integration-build.log"
+LINEUP_WAIT_SECS=120
+# Backstop for a dev-run that hangs; dev-run bounds its own waits well inside it.
+LAUNCH_WAIT_SECS=900
+CLEANUP_GRACE_SECS=10
+MASTER_WAIT_SECS=120
 SEGMENT_WAIT_SECS=10
 
 # Use a minimal test configuration that doesn't require external resources
@@ -74,20 +84,30 @@ require() {
   }
 }
 
-# Cleanup: kill the dev-run process group and check for orphans.
+# Cleanup: TERM the dev-run process group and give dev-run its own teardown
+# (it TERMs, waits 1s, then KILLs each child group) time to finish before
+# escalating. Killing sooner would take dev-run down mid-teardown and leave
+# its children, such as a station that ignores TERM, running.
 cleanup() {
   trap - EXIT INT TERM HUP
-  local pids
+  local pids pid waited=0
   pids=$(jobs -p)
-  if [ -n "$pids" ]; then
+  [ -z "$pids" ] && return
+  for pid in $pids; do
+    kill -TERM -- "-$pid" 2>/dev/null || true
+  done
+  while [ "$waited" -lt "$CLEANUP_GRACE_SECS" ]; do
+    local alive=0
     for pid in $pids; do
-      kill -TERM -- "-$pid" 2>/dev/null || true
+      kill -0 "$pid" 2>/dev/null && alive=1
     done
+    [ "$alive" -eq 0 ] && break
     sleep 1
-    for pid in $pids; do
-      kill -KILL -- "-$pid" 2>/dev/null || true
-    done
-  fi
+    waited=$((waited + 1))
+  done
+  for pid in $pids; do
+    kill -KILL -- "-$pid" 2>/dev/null || true
+  done
 }
 
 trap cleanup EXIT INT TERM HUP
@@ -99,24 +119,71 @@ mkdir -p tmp
 
 printf '%s verifying integration at %s\n' "$(bold '==>')" "$BASE_URL"
 
+# Build every binary the stack runs before the clock starts. A cold cargo build,
+# or a wait on cargo's package-cache lock, can take minutes; none of it belongs
+# in the lineup deadline.
+printf 'building dev stack binaries...\n'
+# One cargo invocation per package, as dev-run.sh runs them: a combined
+# invocation unifies features differently and leaves dev-run rebuilding.
+if ! cargo build -q -p etv-overlay >"$BUILD_LOG" 2>&1 \
+  || ! cargo build -q -p etv-station --bin etv-station >>"$BUILD_LOG" 2>&1 \
+  || ! cargo build -q --manifest-path vendor/etv-next/Cargo.toml \
+    --bin ersatztv --bin ersatztv-channel >>"$BUILD_LOG" 2>&1; then
+  fail "building the dev stack binaries failed; last lines of $BUILD_LOG:"
+  tail -20 "$BUILD_LOG" >&2
+  exit 1
+fi
+
 # Start dev-run.sh in background with OPEN_IINA=0 to suppress window open.
 # Capture combined output to a log file for diagnostics.
 printf 'launching dev stack...\n'
 OPEN_IINA=0 ./tools/dev-run.sh >"$LOG_FILE" 2>&1 &
 dev_run_pid=$!
+launched_at=$SECONDS
 
-# Wait for /channels.m3u to return 200 (bounded, up to SESSION_WAIT_SECS).
-printf 'waiting for lineup...\n'
-waited=0
-while ! curl -fsS -o /dev/null --max-time 2 "$BASE_URL/channels.m3u"; do
-  sleep 1
-  waited=$((waited + 1))
-  if [ "$waited" -ge "$SESSION_WAIT_SECS" ]; then
-    fail "lineup endpoint did not return 200 within ${SESSION_WAIT_SECS}s"
+# The lineup cannot answer until dev-run.sh launches etv-next, which it does
+# after the station's startup catch-up (dev-run.sh wait_for_first_emit, bounded
+# there). That catch-up scales with machine load, so the lineup deadline counts
+# from dev-run's "launching etv-next" line, not from launch. A dev-run that
+# exited fails at once instead of running out a deadline. A process-group
+# failure is bash's setpgid refusal; it is harmless while the stack comes up, so
+# it is named as the likely cause only when the lineup does not.
+printf 'waiting for dev-run to launch etv-next...\n'
+while ! grep -qF '[dev] launching etv-next' "$LOG_FILE" 2>/dev/null; do
+  if ! kill -0 "$dev_run_pid" 2>/dev/null; then
+    fail "dev-run exited before launching etv-next; last lines of $LOG_FILE:"
+    tail -20 "$LOG_FILE" >&2
     exit 1
   fi
+  if [ $((SECONDS - launched_at)) -ge "$LAUNCH_WAIT_SECS" ]; then
+    fail "dev-run did not launch etv-next within ${LAUNCH_WAIT_SECS}s"
+    exit 1
+  fi
+  sleep 1
 done
-pass "lineup endpoint ready (${waited}s)"
+pass "dev-run launched etv-next ($((SECONDS - launched_at))s after launch)"
+launched_at=$SECONDS
+
+printf 'waiting for lineup...\n'
+while ! curl -fs -o /dev/null --max-time 2 "$BASE_URL/channels.m3u"; do
+  if ! kill -0 "$dev_run_pid" 2>/dev/null; then
+    fail "dev-run exited before the lineup came up; last lines of $LOG_FILE:"
+    if grep -q 'setpgid.*Operation not permitted' "$LOG_FILE"; then
+      fail "launch error: $(grep -m1 'setpgid.*Operation not permitted' "$LOG_FILE")"
+    fi
+    tail -20 "$LOG_FILE" >&2
+    exit 1
+  fi
+  if [ $((SECONDS - launched_at)) -ge "$LINEUP_WAIT_SECS" ]; then
+    fail "lineup endpoint did not return 200 within ${LINEUP_WAIT_SECS}s of etv-next's launch"
+    if grep -q 'setpgid.*Operation not permitted' "$LOG_FILE"; then
+      fail "launch error: $(grep -m1 'setpgid.*Operation not permitted' "$LOG_FILE")"
+    fi
+    exit 1
+  fi
+  sleep 1
+done
+pass "lineup endpoint ready ($((SECONDS - launched_at))s after etv-next launch)"
 
 # Fetch lineup and assert it contains channel/1.m3u8.
 printf 'verifying lineup content...\n'
@@ -134,7 +201,20 @@ pass "lineup contains channel/1.m3u8"
 
 # Fetch /channel/1.m3u8 — assert 200, starts with #EXTM3U, contains /session/1/live.m3u8.
 printf 'verifying channel master playlist...\n'
-master_body="$(curl -fsS "$BASE_URL/channel/1.m3u8" || true)"
+# ETV-next answers 503 until the channel's first ffmpeg run is up; seeking into
+# a lavfi source on a busy machine takes longer than its 30s answer window, so
+# retry until a deadline rather than judging the first attempt.
+master_body=""
+master_started=$SECONDS
+while [ -z "$master_body" ] && [ $((SECONDS - master_started)) -lt "$MASTER_WAIT_SECS" ]; do
+  if ! kill -0 "$dev_run_pid" 2>/dev/null; then
+    fail "dev-run exited before channel 1 answered; last lines of $LOG_FILE:"
+    tail -20 "$LOG_FILE" >&2
+    exit 1
+  fi
+  master_body="$(curl -fs --max-time 40 "$BASE_URL/channel/1.m3u8" || true)"
+  [ -n "$master_body" ] || sleep 1
+done
 check_or_die "master playlist starts with #EXTM3U and contains /session/1/live.m3u8" \
   probe_check_master_playlist "$master_body" 1
 
