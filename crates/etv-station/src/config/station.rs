@@ -184,6 +184,13 @@ pub struct StationConfig {
     /// Station-wide guide settings; a channel's `guide:` overrides them.
     #[serde(default)]
     pub guide: StationGuide,
+
+    /// Seconds a channel's worker stays warm after its last viewer leaves, so
+    /// channel-surfing back skips the cold start. Written to every rendered
+    /// `channelN.json`. Unset means ETV-next's own 90s, which is also the
+    /// floor: a smaller value is raised to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_grace_seconds: Option<u64>,
 }
 
 /// The station-level `guide:` block.

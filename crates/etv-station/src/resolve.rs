@@ -129,10 +129,13 @@ pub struct ResolvedItem {
 
 /// The audio and subtitle streams chosen for one item, as indexes into the
 /// file ETV-next plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedTracks {
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
+    /// A subtitle file beside the media file (`Movie.en.srt`). When set,
+    /// `subtitle` is a stream index inside that file, not inside the media.
+    pub subtitle_sidecar: Option<String>,
 }
 
 impl ResolvedItem {

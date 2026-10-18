@@ -1705,6 +1705,7 @@ mod tests {
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
+            idle_grace_seconds: None,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         let msg = format!("{err}");
@@ -1733,6 +1734,7 @@ mod tests {
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
+            idle_grace_seconds: None,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
@@ -1762,6 +1764,7 @@ mod tests {
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
+            idle_grace_seconds: None,
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("America/Atlantis"), "err = {err}");
@@ -1789,6 +1792,7 @@ mod tests {
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
+            idle_grace_seconds: None,
         };
         assert!(validate_station(&dummy_path(), &s).is_err());
     }
