@@ -322,7 +322,7 @@ pub fn build(
         resume: resume_out,
         progress,
         metadata: metadata_out,
-        audits: vec![None; arranged_len],
+        audits: vec![Vec::new(); arranged_len],
         guides: guide_out,
         tracks: tracks_out,
         // Only this block's pools — see the same line in `pattern::build`.

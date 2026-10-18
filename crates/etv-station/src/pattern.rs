@@ -595,7 +595,7 @@ impl PoolRuntime<'_> {
         // A range is decided once per visit, so a `rotate = "slot"` visit
         // sizes its slots from the same roll a `rotate = "visit"` draw does.
         let take = resolve_take(take, roll);
-        if take == Take::Count(0) || self.is_dry() {
+        if take == Draw::Count(0) || self.is_dry() {
             return Ok(Vec::new());
         }
         match self.cfg.rotate {
@@ -608,7 +608,10 @@ impl PoolRuntime<'_> {
             // so the one item each slot asks for was never the step's own
             // `take`.
             Rotate::Slot => {
-                let n = take.bounds().map_or(1, |(n, _)| n);
+                let n = match take {
+                    Draw::Count(n) => n,
+                    Draw::All => 1,
+                };
                 if n > MAX_TAKE {
                     return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
                 }
@@ -617,7 +620,7 @@ impl PoolRuntime<'_> {
                     if self.is_dry() {
                         break;
                     }
-                    out.extend(self.serve(Take::Count(1), from, roll, slot as u64, channel)?);
+                    out.extend(self.serve(Draw::Count(1), from, roll, slot as u64, channel)?);
                 }
                 Ok(out)
             }
@@ -634,7 +637,7 @@ impl PoolRuntime<'_> {
     /// (see the comment in `visit`).
     fn serve(
         &mut self,
-        want: Take,
+        want: Draw,
         from: TakeFrom,
         roll: &RollKey,
         nonce: u64,
@@ -656,10 +659,9 @@ impl PoolRuntime<'_> {
         // whatever the step wrote.
         let take = match (override_take, want, first) {
             (Some(n), _, _) => n,
-            (None, Take::Count(n), _) => n,
-            (None, Take::Range { .. }, _) => unreachable!("visit resolves a range to a count"),
-            (None, Take::All, Some(si)) => self.series[si].remaining(),
-            (None, Take::All, None) => return Ok(Vec::new()),
+            (None, Draw::Count(n), _) => n,
+            (None, Draw::All, Some(si)) => self.series[si].remaining(),
+            (None, Draw::All, None) => return Ok(Vec::new()),
         };
         // Guard only the authored/typed-in arms: the plugin per-entry override
         // and the step's own count. `take = "all"` is bounded by the pools'
@@ -668,7 +670,7 @@ impl PoolRuntime<'_> {
             (Some(n), _) if n > MAX_TAKE => {
                 return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
             }
-            (None, Take::Count(n)) if n > MAX_TAKE => {
+            (None, Draw::Count(n)) if n > MAX_TAKE => {
                 return Err(format!("take = {n} exceeds the maximum of {MAX_TAKE}"));
             }
             _ => {}
@@ -1134,11 +1136,11 @@ pub struct BlockBuild {
     pub progress: Vec<BTreeMap<String, PoolResume>>,
     /// Flattened `entry_id -> metadata` from `ScoreCache::picked_extras`.
     pub metadata: HashMap<String, serde_json::Value>,
-    /// The `select` audit blob of each draw, parallel to `ids`: `audits[k]` is
-    /// the trail of the draw that produced `ids[k]`, so an id drawn twice in
-    /// one block carries two trails, one per airing. `None` where a draw
+    /// The `select` audit records of each draw, parallel to `ids`: `audits[k]`
+    /// is the trail of the draw that produced `ids[k]`, so an id drawn twice in
+    /// one block carries two trails, one per airing. Empty where a draw
     /// recorded no stage.
-    pub audits: Vec<Option<serde_json::Value>>,
+    pub audits: Vec<Vec<serde_json::Value>>,
     /// This pool's own `guide:` per drawn `entry_id` (#289).
     pub guides: HashMap<String, GuideConfig>,
     /// This pool's own `tracks:` per drawn `entry_id` (#261), the pool rung of
@@ -1247,11 +1249,9 @@ pub fn build(
     let mut guide_out: HashMap<String, GuideConfig> = HashMap::new();
     // The same collision rule holds for the pool's `tracks:` rules.
     let mut tracks_out: HashMap<String, crate::config::TrackRules> = HashMap::new();
-    // Per-draw audit blobs the walk builds as it draws, indexed by position in
+    // Per-draw audit records the walk builds as it draws, indexed by position in
     // the drawn ids so an id drawn twice keeps one trail per airing.
-    // `Option<Value>` rather than `Value` so it plugs straight into
-    // `audit::push_stage`, which owns creating the blob.
-    let mut audit_out: Vec<Option<serde_json::Value>> = Vec::new();
+    let mut audit_out: Vec<Vec<serde_json::Value>> = Vec::new();
     // Which pool drew each id — so an id two plugin pools both ranked carries
     // the record of the pool it actually aired from, not whichever of the two
     // a hash map happens to yield first.
@@ -1432,7 +1432,7 @@ pub fn build(
                 detail.insert("source".into(), serde_json::Value::String(pool_source(cfg)));
                 detail.insert(
                     "take".into(),
-                    serde_json::Value::String(describe_take(resolve_take(step.take, &roll))),
+                    serde_json::Value::String(describe_draw(resolve_take(step.take, &roll))),
                 );
                 detail.insert(
                     "from".into(),
@@ -1483,16 +1483,14 @@ pub fn build(
                     }
                     let at = out.len() + n;
                     if audit_out.len() <= at {
-                        audit_out.resize(at + 1, None);
+                        audit_out.resize(at + 1, Vec::new());
                     }
-                    let entry = &mut audit_out[at];
-                    crate::audit::push_stage(
-                        entry,
+                    audit_out[at].push(crate::audit::stage_record(
                         "select",
                         by.clone(),
                         verdict.clone(),
                         Some(serde_json::Value::Object(detail)),
-                    );
+                    ));
                 }
             }
             for id in &drawn {
@@ -1558,7 +1556,7 @@ pub fn build(
                 .map(|m| (id.clone(), m))
         })
         .collect();
-    audit_out.resize(out.len(), None);
+    audit_out.resize(out.len(), Vec::new());
     for (id, idx) in labelled_by {
         stamp_pool_display(&mut metadata_out, id, runtimes[idx].cfg);
     }
@@ -1702,39 +1700,21 @@ pub(crate) fn stamp_pool_display(
     }
 }
 
-/// Lay one draw's `select` trail onto the item's metadata blob, after any
+/// Lay one draw's `select` records onto the item's metadata blob, after any
 /// `audit` records a plugin pick wrote first, so the array keeps the order the
 /// stages acted in.
-pub(crate) fn attach_audit(
-    metadata: &mut Option<serde_json::Value>,
-    staged: Option<serde_json::Value>,
-) {
-    let Some(staged) = staged else { return };
-    match metadata {
-        Some(existing) => merge_audit_into(existing, staged),
-        None => *metadata = Some(staged),
-    }
-}
-
-/// Append `staged`'s `audit` records onto `existing`'s, leaving every other
-/// key of both blobs alone.
 ///
 /// Needed because a plugin pool writes its ranking record into
 /// `picked_extras` during `score`, and the `select` stage is written later
-/// against the same id — two producers, one array, and a plain insert would
-/// drop whichever wrote first.
-fn merge_audit_into(existing: &mut serde_json::Value, staged: serde_json::Value) {
-    let Some(incoming) = staged.get("audit").and_then(|a| a.as_array()) else {
-        return;
-    };
-    let Some(obj) = existing.as_object_mut() else {
-        return;
-    };
-    obj.entry("audit")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-        .as_array_mut()
-        .expect("`audit` is always inserted as an array")
-        .extend(incoming.iter().cloned());
+/// against the same id — two producers, one array. Every other key of the blob
+/// is left alone.
+pub(crate) fn attach_audit(
+    metadata: &mut Option<serde_json::Value>,
+    records: Vec<serde_json::Value>,
+) {
+    for record in records {
+        crate::audit::push_record(metadata, record);
+    }
 }
 
 /// Where a pool's candidates came from, for the `select` stage's `detail`.
@@ -1758,16 +1738,25 @@ fn pool_source(cfg: &Pool) -> String {
     }
 }
 
+/// What a visit draws once its step's `take` is resolved: a range has already
+/// become a count, so `serve` cannot be handed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Draw {
+    Count(usize),
+    All,
+}
+
 /// A range is decided once per visit, from the visit's roll; a count or `all`
 /// passes through. `visit` and the `select` audit stage both read it, so the
 /// size the audit prints is the size the visit drew.
-fn resolve_take(take: Take, roll: &RollKey) -> Take {
+fn resolve_take(take: Take, roll: &RollKey) -> Draw {
     match take {
         Take::Range { min, max } => {
             let spread = (max.saturating_sub(min) + 1) as u64;
-            Take::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
+            Draw::Count(min + (roll.u64_at(TAKE_STRIDE) % spread) as usize)
         }
-        fixed => fixed,
+        Take::Count(n) => Draw::Count(n),
+        Take::All => Draw::All,
     }
 }
 
@@ -1776,11 +1765,10 @@ fn resolve_take(take: Take, roll: &RollKey) -> Take {
 /// Not `{:?}`. That printed `Count(2)` and `All` — Rust type names leaking into
 /// a report a human reads, naming a variant nobody outside this crate has any
 /// reason to know.
-fn describe_take(take: Take) -> String {
-    match take {
-        Take::Count(n) => n.to_string(),
-        Take::Range { min, max } => format!("{min}-{max}"),
-        Take::All => "all".into(),
+fn describe_draw(draw: Draw) -> String {
+    match draw {
+        Draw::Count(n) => n.to_string(),
+        Draw::All => "all".into(),
     }
 }
 
@@ -2704,8 +2692,8 @@ mod tests {
     /// `Start`, which name a type nobody outside this crate has cause to know.
     #[test]
     fn the_select_detail_describers_leak_no_type_names() {
-        assert_eq!(describe_take(Take::Count(2)), "2");
-        assert_eq!(describe_take(Take::All), "all");
+        assert_eq!(describe_draw(Draw::Count(2)), "2");
+        assert_eq!(describe_draw(Draw::All), "all");
         for from in [TakeFrom::Start, TakeFrom::End, TakeFrom::Random] {
             let rendered = describe_take_from(from);
             assert!(
@@ -3542,7 +3530,7 @@ mod tests {
         );
         // The audit trail the walk writes rides beside it, per draw.
         let at = built.ids.iter().position(|i| i == movie).unwrap();
-        assert!(built.audits[at].as_ref().unwrap()["audit"].is_array());
+        assert!(!built.audits[at].is_empty());
 
         let episodes: Vec<_> = built
             .ids
@@ -3606,11 +3594,8 @@ mod tests {
         assert_eq!(built.ids, vec!["mov-1", "mov-2", "mov-3", "mov-1", "mov-2"]);
         assert_eq!(built.audits.len(), built.ids.len());
         for (id, audit) in built.ids.iter().zip(&built.audits) {
-            let trail = audit.as_ref().expect("every draw is audited")["audit"]
-                .as_array()
-                .expect("audit is an array");
-            assert_eq!(trail.len(), 1, "{id}: one draw, one record");
-            assert_eq!(trail[0]["stage"], "select");
+            assert_eq!(audit.len(), 1, "{id}: one draw, one record");
+            assert_eq!(audit[0]["stage"], "select");
         }
     }
 
@@ -3644,7 +3629,7 @@ mod tests {
         .expect("pattern builds");
         let mut visits: Vec<Vec<String>> = Vec::new();
         for (id, audit) in built.ids.iter().zip(&built.audits) {
-            let detail = &audit.as_ref().expect("every draw is audited")["audit"][0]["detail"];
+            let detail = &audit[0]["detail"];
             let take = detail["take"].as_str().expect("select records a take");
             if id.starts_with("mov-") {
                 visits.push(Vec::new());
