@@ -1761,7 +1761,13 @@ class _TimingRecorder:
     line immediately for anything at or above `threshold_secs` (default
     50ms) so a slow session yields a short file rather than a full
     transcript, and keeps running per-(kind, name) totals for the exit
-    summary."""
+    summary.
+
+    Elapsed times are exclusive, not inclusive: a Textual dispatch awaits its
+    children's dispatches, so wall-clock around each one counts the same
+    instant in every open frame. `frame()` instead charges each instant to
+    the most recently opened frame still open, so the totals add up to no
+    more than the session's wall clock."""
 
     def __init__(self, path: str, threshold_secs: float = 0.05) -> None:
         self.threshold_secs = threshold_secs
@@ -1772,10 +1778,33 @@ class _TimingRecorder:
         # a uniform one, so it is annotated as a bare list rather than
         # list[float], which the int count would make untrue.
         self._totals: dict[tuple[str, str], list] = {}
+        self._open: list[list[float]] = []  # open frames' [exclusive_secs]
+        self._mark = 0.0  # last instant charged to the top open frame
         self._fh.write(
             f"# epg-browser timing started {datetime.now(timezone.utc).isoformat()} "
             f"threshold={threshold_secs * 1000:.0f}ms\n"
         )
+
+    def begin(self) -> list[float]:
+        """Open a frame; the time since the last mark goes to its parent."""
+        now = time.perf_counter()
+        if self._open:
+            self._open[-1][0] += now - self._mark
+        self._mark = now
+        frame = [0.0]
+        self._open.append(frame)
+        return frame
+
+    def end(self, frame: list[float]) -> float:
+        """Close a frame and return its exclusive seconds. Frames of
+        concurrent coroutines can close out of order, so it is removed by
+        identity rather than popped."""
+        now = time.perf_counter()
+        if self._open:
+            self._open[-1][0] += now - self._mark
+        self._mark = now
+        self._open = [f for f in self._open if f is not frame]
+        return frame[0]
 
     def record(
         self, elapsed_secs: float, kind: str, name: str, extra: str = "", force: bool = False
@@ -1802,7 +1831,7 @@ class _TimingRecorder:
             slowest = sorted(self._events, key=lambda e: e[0], reverse=True)[:20]
             for elapsed_secs, kind, name, extra in slowest:
                 self._fh.write(f"{elapsed_secs * 1000:8.1f}ms  {kind:8s} {name:30s}{extra}\n")
-            self._fh.write("\n# --- totals per message type ---\n")
+            self._fh.write("\n# --- totals per message type (exclusive of nested dispatches) ---\n")
             by_total = sorted(self._totals.items(), key=lambda kv: kv[1][1], reverse=True)
             for (kind, name), (count, total_secs) in by_total:
                 avg_ms = (total_secs / count) * 1000 if count else 0.0
@@ -1826,11 +1855,11 @@ def install_timing(recorder: _TimingRecorder) -> None:
     orig_dispatch_message = MessagePump._dispatch_message
 
     async def timed_dispatch_message(self, message):
-        start = time.perf_counter()
+        frame = recorder.begin()
         try:
             return await orig_dispatch_message(self, message)
         finally:
-            elapsed = time.perf_counter() - start
+            elapsed = recorder.end(frame)
             recorder.record(elapsed, "message", type(message).__name__, f" widget={type(self).__name__}")
 
     MessagePump._dispatch_message = timed_dispatch_message
@@ -1838,11 +1867,11 @@ def install_timing(recorder: _TimingRecorder) -> None:
     orig_display = App._display
 
     def timed_display(self, screen, renderable):
-        start = time.perf_counter()
+        frame = recorder.begin()
         try:
             return orig_display(self, screen, renderable)
         finally:
-            elapsed = time.perf_counter() - start
+            elapsed = recorder.end(frame)
             # ChopsUpdate.chops (a per-line map of screen fragments) is the
             # honest proxy for how many tty bytes a repaint actually wrote —
             # a full non-chopped render (LayoutUpdate, or None) has no chops.
