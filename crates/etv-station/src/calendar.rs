@@ -25,6 +25,14 @@ pub enum OnAir<'a> {
         slot: &'a str,
         index: usize,
         schedule: &'a str,
+        /// Set when `slot` is a rotation: the unix time its placement began.
+        /// Two placements of one rotation are two changes, so a generation
+        /// stops where one ends and the next draws its own member.
+        placement: Option<i64>,
+        /// Set once the rotation has drawn ([`Calendar::on_air_drawn`]): the
+        /// rotation the schedule placed, with `slot` and `index` naming the
+        /// member that airs in its place.
+        rotation: Option<&'a str>,
     },
 }
 
@@ -34,7 +42,18 @@ impl OnAir<'_> {
     fn same_block(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::AnyTime, Self::AnyTime) => true,
-            (Self::Slot { index: a, .. }, Self::Slot { index: b, .. }) => a == b,
+            (
+                Self::Slot {
+                    index: a,
+                    placement: pa,
+                    ..
+                },
+                Self::Slot {
+                    index: b,
+                    placement: pb,
+                    ..
+                },
+            ) => a == b && pa == pb,
             _ => false,
         }
     }
@@ -64,18 +83,70 @@ impl<'a> Calendar<'a> {
         let local = at.to_timezone(self.tz);
         let minute = u16::from(local.hour()) * 60 + u16::from(local.minute());
         for schedule in &self.order {
-            if let Some(slot) = schedule.slot_at(local.date(), minute) {
+            if let Some((slot, range, start_day)) = schedule.hit_at(local.date(), minute) {
                 // Validation guarantees every placed slot exists.
                 if let Some(index) = self.rule.slot_index(slot) {
+                    let rotation = self.rule.slots.get(slot).is_some_and(|b| b.is_rotation());
+                    let placement = rotation.then(|| {
+                        let begins = time::Time::from_hms(
+                            (range.start / 60) as u8,
+                            (range.start % 60) as u8,
+                            0,
+                        )
+                        .unwrap_or(time::Time::MIDNIGHT);
+                        crate::tz::to_utc_assume_local(start_day, begins, self.tz).unix_timestamp()
+                    });
                     return OnAir::Slot {
                         slot,
                         index,
                         schedule: &schedule.name,
+                        placement,
+                        rotation: None,
                     };
                 }
             }
         }
         OnAir::AnyTime
+    }
+
+    /// [`Self::on_air`] with any rotation drawn down to the member that airs:
+    /// the answer names the member in `slot` and `index`, and the rotation the
+    /// schedule placed in `rotation`. The draws land in `rotations`.
+    pub fn on_air_drawn(
+        &self,
+        at: OffsetDateTime,
+        seed_at: &dyn Fn(OffsetDateTime) -> u64,
+        rotations: &mut std::collections::BTreeMap<String, crate::resume::RotationResume>,
+    ) -> (OnAir<'a>, Option<crate::rotation::Drawn>) {
+        let rule: &'a RuleConfig = self.rule;
+        match self.on_air(at) {
+            OnAir::Slot {
+                slot,
+                schedule,
+                placement: Some(start),
+                ..
+            } => {
+                let drawn = crate::rotation::resolve(rule, slot, start, seed_at, rotations);
+                let leaf = drawn.leaf();
+                // Validation guarantees every member exists.
+                let (leaf, index) = rule
+                    .slots
+                    .get_key_value(leaf)
+                    .and_then(|(name, _)| Some((name.as_str(), rule.slot_index(name)?)))
+                    .expect("a drawn member is a declared slot");
+                (
+                    OnAir::Slot {
+                        slot: leaf,
+                        index,
+                        schedule,
+                        placement: Some(start),
+                        rotation: Some(slot),
+                    },
+                    Some(drawn),
+                )
+            }
+            other => (other, None),
+        }
     }
 
     /// The first whole minute after `from`, and before `until`, at which a
@@ -179,7 +250,9 @@ schedules:
             OnAir::Slot {
                 slot: "marathon",
                 index: 2,
-                schedule: "holiday"
+                schedule: "holiday",
+                placement: None,
+                rotation: None,
             }
         );
         assert_eq!(
@@ -187,7 +260,9 @@ schedules:
             OnAir::Slot {
                 slot: "cartoons",
                 index: 1,
-                schedule: "weekend"
+                schedule: "weekend",
+                placement: None,
+                rotation: None,
             }
         );
         assert_eq!(cal.on_air(datetime!(2026-12-26 15:00 UTC)), OnAir::AnyTime);

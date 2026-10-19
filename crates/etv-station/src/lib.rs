@@ -32,6 +32,7 @@ pub mod reset;
 pub mod resolve;
 pub mod resume;
 pub mod review;
+pub mod rotation;
 pub mod rule;
 pub mod scan;
 pub mod score;

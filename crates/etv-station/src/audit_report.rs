@@ -178,6 +178,17 @@ pub fn render(channel: &str, generated_at: OffsetDateTime, items: &[ReportItem])
 /// `overlay.json` already holds it, or `null` — never an invented identity
 /// string, since `OverlaySpec` itself carries no id, name or path.
 pub fn render_json(channel: &str, generated_at: OffsetDateTime, items: &[ReportItem]) -> String {
+    render_json_with(channel, generated_at, items, serde_json::Value::Null)
+}
+
+/// [`render_json`] plus a `rotations` key holding the rotation preview
+/// ([`crate::rotation::rows_json`]), present only when it has rows.
+pub fn render_json_with(
+    channel: &str,
+    generated_at: OffsetDateTime,
+    items: &[ReportItem],
+    rotations: serde_json::Value,
+) -> String {
     let rendered_items: Vec<serde_json::Value> = items
         .iter()
         .map(|item| {
@@ -194,11 +205,14 @@ pub fn render_json(channel: &str, generated_at: OffsetDateTime, items: &[ReportI
         })
         .collect();
 
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "channel": channel,
         "generated_at": rfc3339(generated_at),
         "items": rendered_items,
     });
+    if rotations.as_array().is_some_and(|rows| !rows.is_empty()) {
+        report["rotations"] = rotations;
+    }
     serde_json::to_string_pretty(&report).expect("report JSON is built entirely from owned data")
 }
 

@@ -11,7 +11,7 @@ use super::filter::Filter;
 use super::mode::Mode;
 use super::order::Order;
 use super::overlay::OverlayDecl;
-use super::pool::{PatternStep, Pool};
+use super::pool::{PatternStep, Pool, Select};
 use super::schedule::Schedule;
 use crate::guide::GuideConfig;
 
@@ -198,9 +198,33 @@ pub struct BlockInclude {
     /// `entries` list, never to an interleaved pool draw. See [`Filter`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
+
+    /// Rotation form (etv-station-xm8p.1): the member slots this slot draws
+    /// one from per placement. A rotation airs no content of its own, so it
+    /// is exclusive with every body field; `select`, `order`, `weight` and
+    /// `constraints.no_repeat_within` mean on it what they mean on a pool
+    /// choosing among series. See [`crate::rotation`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<String>,
+
+    /// Rotation form: which member the next placement draws. Unset is
+    /// `round_robin`, as on a pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select: Option<Select>,
+
+    /// Rotation form, `select: random` only: a member's relative chance.
+    /// A member not listed weighs 1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub weight: BTreeMap<String, f64>,
 }
 
 impl BlockInclude {
+    /// Whether this slot draws one of `slots` per placement instead of airing
+    /// a body of its own.
+    pub fn is_rotation(&self) -> bool {
+        !self.slots.is_empty()
+    }
+
     /// The block's resolved entries. Valid only after [`super::load::load`] has
     /// spliced a path-form body into `entries`.
     pub fn entries(&self) -> &[Entry] {

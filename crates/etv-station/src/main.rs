@@ -1195,10 +1195,29 @@ fn audit(
         }
     };
 
+    let rotations = match etv_station::tz::parse(&station.station.tz) {
+        Ok(tz) => etv_station::rotation::preview_channel(
+            &channel.config,
+            tz,
+            &etv_station::rotation::read_rotations(&channel.output_folder),
+            now,
+            next,
+        ),
+        Err(_) => Vec::new(),
+    };
     let (report, extension) = match format {
-        ReportFormat::Text => (audit_report::render(&channel.name, now, &items), "txt"),
+        ReportFormat::Text => (
+            audit_report::render(&channel.name, now, &items)
+                + etv_station::rotation::render_text(&rotations).as_str(),
+            "txt",
+        ),
         ReportFormat::Json => (
-            audit_report::render_json(&channel.name, now, &items),
+            audit_report::render_json_with(
+                &channel.name,
+                now,
+                &items,
+                etv_station::rotation::rows_json(&rotations),
+            ),
             "json",
         ),
     };

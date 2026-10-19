@@ -978,8 +978,88 @@ generation stopped. Each airing's `block` index counts `rule.blocks` first,
 then `rule.slots` in name order; the web UI's Review names a slot block by its
 slot name when it has no `program.title`.
 
-Worked samples: `examples/samples/seasonal.yaml` (dated slots) and
-`examples/samples/adult-swim.yaml` (nightly and Saturday slots).
+Worked samples: `examples/samples/seasonal.yaml` (dated slots),
+`examples/samples/adult-swim.yaml` (nightly and Saturday slots) and
+`examples/samples/rotation.yaml` (a rotation slot).
+
+#### A slot of slots — rotating among members
+
+A slot may list other slots with `slots:` instead of a body. Each placement of it
+by a schedule draws **one member** and airs that member for the placement's whole
+range.
+
+```yaml
+rule:
+  slots:
+    prime:
+      slots: [jackie-chan, carpenter, kung-fu, star-wars, trek, lotr, sketch]
+      select: random               # or round_robin (the default)
+      weight: { kung-fu: 2 }       # random only; a member not listed weighs 1
+      constraints: { no_repeat_within: 7d }
+    jackie-chan: { pools: [...], pattern: [...] }
+    # ...one slot per member
+  schedules:
+    - name: prime
+      hours: { "19..23": prime }
+```
+
+| Key | Meaning |
+|---|---|
+| `slots` | The members, each a `rule.slots` entry. A member may itself list `slots:`; the draw descends until it reaches a slot with a body. A member need not be placed by a schedule. |
+| `select` | `round_robin` (default) visits every member once per cycle; `random` draws one by weight. |
+| `order` | `round_robin` only. `random` reshuffles the members every cycle from the channel seed; unset keeps the written order. |
+| `weight` | `random` only. Member name → relative chance, above 0. A member not listed weighs 1. |
+| `constraints.no_repeat_within` | A member just drawn does not come back within N placements (`3`) or a span of time (`7d`), measured from one draw's placement start to the next. The only `constraints` key a rotation reads. |
+
+`select`, `order`, `weight` and `no_repeat_within` are the words a pool uses to
+choose among series, with the same meaning; a rotation adds no selection
+vocabulary.
+
+**A placement is one range on one day.** `"19..23"` on Tuesday is one placement
+and the same range on Wednesday is the next; two ranges naming the same rotation
+are two placements. The rotation draws once per placement, so a generation that
+opens partway through an evening airs the member the evening's first generation
+drew. A generation also stops where a placement ends, even when the next
+placement is the same rotation, so back-to-back placements each get a draw.
+
+**The draw is reproducible.** It is a function of the config, the channel seed at
+the placement's start, the rotation's name and its state in the `.resume`
+sidecar, so a rerun, a restart that reloads the sidecar and the Review
+simulation draw the same member.
+
+**State.** The sidecar's `rotations` map is keyed by the rotation's slot name. It
+holds the `round_robin` cycle number, the members drawn in the current cycle, and
+the most recent draws, each stamped with the start of the placement it was drawn
+for. A placement found in that record has drawn already and keeps its member,
+which is how a restart, a generation opening mid-placement and the rotation
+preview all agree with what was generated ahead of the clock. Each member keeps
+its own state exactly as if a schedule placed it directly: an entries member its
+`slot_positions` entry, a pool member its pool rotation. Per-item checkpoints
+carry `rotations` too, so a rewind keeps the draws.
+
+**When `no_repeat_within` leaves no member.** The member drawn longest ago airs,
+and the generation logs `event="rotation.relaxed"` at WARN.
+
+**Load errors.** All of these fail the channel's load, naming the slot: a slot
+that contains itself directly or through a chain of rotations, a member `rule.slots`
+does not declare, a member listed twice, a slot with both `slots:` and `pools:`
+(or `entries:`, `pattern:`, `sequencer:`), `weight` without `select: random`,
+`order` without `select: round_robin`, a weight that is not above 0, a rotation
+under `rule.blocks`, and `select` or `weight` on a slot that lists no `slots:`.
+
+**Observing it.** `calendar.select` carries `slot` (the member that airs),
+`rotation` (the slot the schedule placed) and `draws`, one entry per rotation on
+the way down: the member, `round_robin`'s cursor position or `random`'s draw, and
+any member `no_repeat_within` passed over. An airing's `block` index is the
+member's, so the Review labels it with the member.
+
+**Rotation preview.** The next placements of every scheduled rotation and the
+member each will draw are read from the sidecar without running a generation.
+The Review JSON carries them under `rotations` (14 placements per rotation), and
+`etv-station --audit <channel> --next N` prints N placements per rotation after
+the schedule, or adds a `rotations` array to `--format json`. Each row is
+`{rotation, schedule, start, member, airs, reason}`; `airs` differs from `member`
+when the member is itself a rotation.
 
 ### Seed and temperature
 

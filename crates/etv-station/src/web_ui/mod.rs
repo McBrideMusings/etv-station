@@ -1461,6 +1461,9 @@ fn file_mtime(path: &Path) -> Result<std::time::SystemTime, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// How many upcoming placements per rotation the Review JSON previews.
+const ROTATION_PREVIEW_PLACEMENTS: usize = 14;
+
 fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String> {
     let began = std::time::Instant::now();
     let params = parse_query(query);
@@ -1743,6 +1746,16 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
     obj.insert("lineup".into(), lineup_json);
     obj.insert("since_last".into(), json!(since_last_json));
     obj.insert("notices".into(), json!(notices));
+    obj.insert(
+        "rotations".into(),
+        crate::rotation::rows_json(&crate::rotation::preview_channel(
+            &lc.config,
+            tz,
+            &crate::rotation::read_rotations(&lc.output_folder),
+            time::OffsetDateTime::now_utc(),
+            ROTATION_PREVIEW_PLACEMENTS,
+        )),
+    );
     obj.insert("airings".into(), json!(airings_json));
     obj.insert("items".into(), json!(items));
     obj.insert("titles".into(), json!(titles));

@@ -209,6 +209,16 @@ fn validate_channel_with_plex(
             message: format!("{label}: {message}"),
         };
 
+        if include.is_rotation() {
+            validate_rotation(&channel.rule, idx, include, &bad)?;
+            continue;
+        }
+        if include.select.is_some() || !include.weight.is_empty() {
+            return Err(bad(
+                "`select` and `weight` choose among `slots`, and this block lists none".into(),
+            ));
+        }
+
         // Checked before the pattern/entries split: `[constraints]` applies to
         // either kind of block, so this must not sit on one branch only. On a
         // pattern block it is the default its pools inherit (#115) rather than a
@@ -270,6 +280,7 @@ fn validate_channel_with_plex(
         }
     }
 
+    validate_rotation_cycles(path, &channel.rule)?;
     validate_schedules(path, &channel.rule)?;
     validate_channel_repeat(path, &channel.rule)?;
 
@@ -1349,6 +1360,127 @@ fn validate_channel_repeat(path: &Path, rule: &super::RuleConfig) -> Result<(), 
     Ok(())
 }
 
+/// A rotation slot (etv-station-xm8p.1) draws one of its member `slots` per
+/// placement. It airs no body of its own, so every body field is refused, and
+/// its selection keys must be ones the chosen `select` reads.
+fn validate_rotation(
+    rule: &super::RuleConfig,
+    idx: usize,
+    include: &BlockInclude,
+    bad: &dyn Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    use super::pool::Select;
+    if idx < rule.blocks.len() {
+        return Err(bad(
+            "`slots` makes a rotation, which a schedule places; declare it under `rule.slots`"
+                .into(),
+        ));
+    }
+    for (field, present) in [
+        ("entries", !include.entries.is_empty()),
+        ("pools", !include.pools.is_empty()),
+        ("pattern", !include.pattern.is_empty()),
+        ("sequencer", include.sequencer.is_some()),
+    ] {
+        if present {
+            return Err(bad(format!(
+                "sets both `slots:` and `{field}:`; a rotation draws a member slot and airs no body of its own"
+            )));
+        }
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for member in &include.slots {
+        if !rule.slots.contains_key(member) {
+            return Err(bad(format!(
+                "lists member {member:?}, which `rule.slots` does not declare"
+            )));
+        }
+        if !seen.insert(member.as_str()) {
+            return Err(bad(format!("lists member {member:?} twice")));
+        }
+    }
+    let select = include.select.unwrap_or_default();
+    if !include.weight.is_empty() {
+        if include.select != Some(Select::Random) {
+            return Err(bad("sets `weight` without `select: random`".into()));
+        }
+        for (member, w) in &include.weight {
+            if !seen.contains(member.as_str()) {
+                return Err(bad(format!(
+                    "weights {member:?}, which is not one of its `slots`"
+                )));
+            }
+            if !w.is_finite() || *w <= 0.0 {
+                return Err(bad(format!(
+                    "weights {member:?} at {w}; a weight is a number above 0"
+                )));
+            }
+        }
+    }
+    if let Some(order) = &include.order {
+        if select != Select::RoundRobin {
+            return Err(bad("sets `order` without `select: round_robin`".into()));
+        }
+        if !matches!(order, super::Order::Random) {
+            return Err(bad(
+                "`order` on a rotation is `random` (a seeded shuffle per cycle) or unset".into(),
+            ));
+        }
+    }
+    if let Some(c) = &include.constraints
+        && (c.separate_by.is_some() || c.separate_min_gap.is_some())
+    {
+        return Err(bad(
+            "a rotation takes only `constraints.no_repeat_within`".into()
+        ));
+    }
+    Ok(())
+}
+
+/// A rotation may list another rotation, but never itself, directly or through
+/// a chain. Reports the chain, starting at the slot that closes the loop.
+fn validate_rotation_cycles(path: &Path, rule: &super::RuleConfig) -> Result<(), ConfigError> {
+    fn visit<'a>(
+        rule: &'a super::RuleConfig,
+        name: &'a str,
+        stack: &mut Vec<&'a str>,
+        done: &mut HashSet<&'a str>,
+    ) -> Option<String> {
+        if let Some(at) = stack.iter().position(|s| *s == name) {
+            let mut chain: Vec<&str> = stack[at..].to_vec();
+            chain.push(name);
+            return Some(format!(
+                "slot {name:?} contains itself: {}",
+                chain.join(" -> ")
+            ));
+        }
+        if done.contains(name) {
+            return None;
+        }
+        stack.push(name);
+        if let Some(block) = rule.slots.get(name) {
+            for member in &block.slots {
+                if let Some(err) = visit(rule, member, stack, done) {
+                    return Some(err);
+                }
+            }
+        }
+        stack.pop();
+        done.insert(name);
+        None
+    }
+    let mut done = HashSet::new();
+    for name in rule.slots.keys() {
+        if let Some(message) = visit(rule, name, &mut Vec::new(), &mut done) {
+            return Err(ConfigError::Validation {
+                path: path.to_path_buf(),
+                message,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// `rule.schedules` and `rule.slots` (ADR 0004): every schedule names
 /// itself uniquely, places at least one range, places only slots that exist,
 /// and never places two slots over the same minute; every slot is placed by
@@ -1407,8 +1539,15 @@ fn validate_schedules(path: &Path, rule: &super::RuleConfig) -> Result<(), Confi
             }
         }
     }
+    // A member of a rotation airs when the rotation draws it, so a schedule
+    // need not place it.
+    let drawn: HashSet<&str> = rule
+        .slots
+        .values()
+        .flat_map(|b| b.slots.iter().map(String::as_str))
+        .collect();
     for name in rule.slots.keys() {
-        if !placed.contains(name.as_str()) {
+        if !placed.contains(name.as_str()) && !drawn.contains(name.as_str()) {
             return Err(bad(format!(
                 "slot {name:?} is placed by no schedule, so it would never air"
             )));
@@ -1462,6 +1601,9 @@ mod tests {
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
+            slots: Vec::new(),
+            select: None,
+            weight: Default::default(),
             align: None,
             min_fill: None,
             fill: Vec::new(),
@@ -3542,5 +3684,123 @@ fn audit(ctx, picks, workspace) { #{} }"#,
         let err = validate_channel(&dummy_path(), &cfg).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("empty"), "msg = {msg}");
+    }
+
+    // ---- rotation slots (etv-station-xm8p.1) --------------------------------
+
+    /// A channel with any-time block plus slots `a`, `b` (one item each) and a
+    /// rotation `prime` over them, placed 19..23. `edit` adjusts the rule.
+    fn rotation_channel(edit: impl FnOnce(&mut RuleConfig)) -> ChannelConfig {
+        let mut c = channel_with(vec![inline_block(vec![item_entry("any")])]);
+        c.rule
+            .slots
+            .insert("a".into(), inline_block(vec![item_entry("a")]));
+        c.rule
+            .slots
+            .insert("b".into(), inline_block(vec![item_entry("b")]));
+        let mut prime = inline_block(vec![]);
+        prime.slots = vec!["a".into(), "b".into()];
+        prime.order = None;
+        c.rule.slots.insert("prime".into(), prime);
+        c.rule.schedules =
+            serde_norway::from_str(r#"[{name: nightly, hours: {"19..23": prime}}]"#).unwrap();
+        edit(&mut c.rule);
+        c
+    }
+
+    fn rotation_error(edit: impl FnOnce(&mut RuleConfig)) -> String {
+        let err = validate_channel(&dummy_path(), &rotation_channel(edit)).unwrap_err();
+        format!("{err}")
+    }
+
+    #[test]
+    fn a_rotation_over_declared_slots_validates_and_its_members_need_no_schedule() {
+        validate_channel(&dummy_path(), &rotation_channel(|_| {})).unwrap();
+    }
+
+    #[test]
+    fn a_rotation_that_lists_itself_is_refused_naming_the_slot() {
+        let msg = rotation_error(|r| {
+            r.slots.get_mut("prime").unwrap().slots.push("prime".into());
+        });
+        assert!(msg.contains("slot \"prime\" contains itself"), "{msg}");
+    }
+
+    #[test]
+    fn a_rotation_that_contains_itself_through_a_chain_is_refused() {
+        let msg = rotation_error(|r| {
+            let mut loop_back = inline_block(vec![]);
+            loop_back.order = None;
+            loop_back.slots = vec!["prime".into()];
+            r.slots.insert("again".into(), loop_back);
+            r.slots.get_mut("prime").unwrap().slots.push("again".into());
+        });
+        assert!(msg.contains("contains itself"), "{msg}");
+        assert!(msg.contains("prime") && msg.contains("again"), "{msg}");
+    }
+
+    #[test]
+    fn a_member_rule_slots_does_not_declare_is_refused_naming_the_slot() {
+        let msg = rotation_error(|r| {
+            r.slots.get_mut("prime").unwrap().slots.push("ghost".into());
+        });
+        assert!(msg.contains("slot \"prime\""), "{msg}");
+        assert!(msg.contains("\"ghost\""), "{msg}");
+    }
+
+    #[test]
+    fn slots_and_pools_on_one_slot_are_refused_naming_the_slot() {
+        let msg = rotation_error(|r| {
+            r.slots.get_mut("prime").unwrap().pools = vec![pool("movies")];
+        });
+        assert!(msg.contains("slot \"prime\""), "{msg}");
+        assert!(msg.contains("`slots:` and `pools:`"), "{msg}");
+    }
+
+    #[test]
+    fn weight_without_select_random_is_refused_naming_the_slot() {
+        let msg = rotation_error(|r| {
+            r.slots
+                .get_mut("prime")
+                .unwrap()
+                .weight
+                .insert("a".into(), 2.0);
+        });
+        assert!(msg.contains("slot \"prime\""), "{msg}");
+        assert!(msg.contains("`weight` without `select: random`"), "{msg}");
+    }
+
+    #[test]
+    fn order_without_select_round_robin_is_refused_naming_the_slot() {
+        let msg = rotation_error(|r| {
+            let p = r.slots.get_mut("prime").unwrap();
+            p.select = Some(Select::Random);
+            p.order = Some(Order::Random);
+        });
+        assert!(msg.contains("slot \"prime\""), "{msg}");
+        assert!(
+            msg.contains("`order` without `select: round_robin`"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn weight_and_order_are_accepted_with_the_select_that_reads_them() {
+        validate_channel(
+            &dummy_path(),
+            &rotation_channel(|r| {
+                let p = r.slots.get_mut("prime").unwrap();
+                p.select = Some(Select::Random);
+                p.weight.insert("a".into(), 2.0);
+            }),
+        )
+        .unwrap();
+        validate_channel(
+            &dummy_path(),
+            &rotation_channel(|r| {
+                r.slots.get_mut("prime").unwrap().order = Some(Order::Random);
+            }),
+        )
+        .unwrap();
     }
 }

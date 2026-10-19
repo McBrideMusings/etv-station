@@ -288,17 +288,49 @@ pub fn resolve_channel_with_resume(
     // last one ends.
     let schedule_tz = scoring.tz.unwrap_or(time_tz::timezones::db::UTC);
     let calendar = crate::calendar::Calendar::new(&config.rule, schedule_tz);
-    let on_air = calendar.as_ref().map(|c| c.on_air(window_start));
+    // A rotation slot draws its member for the placement here, once, before
+    // anything is laid; a generation that opens mid-placement reads the draw
+    // back from the sidecar instead of making a second one.
+    let mut rotations = state.resume.rotations.clone();
+    let seed_at = |at: OffsetDateTime| variety.dice(at, None).seed;
+    let (on_air, drawn) = match &calendar {
+        Some(c) => {
+            let (on_air, drawn) = c.on_air_drawn(window_start, &seed_at, &mut rotations);
+            (Some(on_air), drawn)
+        }
+        None => (None, None),
+    };
     let mut fill = fill;
     if let (Some(cal), Some(on_air)) = (&calendar, on_air) {
         let cut = fill.and_then(|f| cal.next_change(window_start, window_start + f));
         if let Some(cut) = cut {
             fill = Some((cut - window_start).unsigned_abs());
         }
-        let (slot, schedule) = match on_air {
-            crate::calendar::OnAir::Slot { slot, schedule, .. } => (slot, schedule),
-            crate::calendar::OnAir::AnyTime => ("", ""),
+        let (slot, schedule, rotation) = match on_air {
+            crate::calendar::OnAir::Slot {
+                slot,
+                schedule,
+                rotation,
+                ..
+            } => (slot, schedule, rotation.unwrap_or("")),
+            crate::calendar::OnAir::AnyTime => ("", "", ""),
         };
+        let draws: String = drawn
+            .iter()
+            .flat_map(|d| &d.chain)
+            .map(|step| format!("{} -> {}: {}", step.rotation, step.member, step.describe()))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if drawn.iter().flat_map(|d| &d.chain).any(|step| step.relaxed) {
+            tracing::warn!(
+                event = "rotation.relaxed",
+                channel = %path.display(),
+                window_start = %window_start,
+                rotation = rotation,
+                draws = %draws,
+                "no_repeat_within left no eligible member; the least recently drawn one airs",
+            );
+        }
         tracing::info!(
             event = "calendar.select",
             channel = %path.display(),
@@ -306,6 +338,8 @@ pub fn resolve_channel_with_resume(
             tz = time_tz::TimeZone::name(schedule_tz),
             slot = slot,
             schedule = schedule,
+            rotation = rotation,
+            draws = %draws,
             cut = ?cut,
             "schedule decided which block airs this generation",
         );
@@ -673,6 +707,7 @@ pub fn resolve_channel_with_resume(
             &mut resume_out,
             &mut progress,
             config,
+            &rotations,
         );
     }
     if let Some(annotate) = &config.annotate {
@@ -718,6 +753,7 @@ fn carry_unaired_state(
     resume_out: &mut ResumeMap,
     progress: &mut [Progress],
     config: &ChannelConfig,
+    rotations: &BTreeMap<String, crate::resume::RotationResume>,
 ) {
     // Only state the current config can still read: a pool or slot renamed
     // or removed since drops out here rather than riding the sidecar forever.
@@ -771,6 +807,23 @@ fn carry_unaired_state(
             *position = before.resume.position;
         }
     };
+    // Rotation draws, like every other block's state, ride the end state and
+    // every checkpoint; one a config edit made unreadable drops out.
+    let kept: BTreeMap<String, crate::resume::RotationResume> = rotations
+        .iter()
+        .filter(|(name, _)| {
+            config
+                .rule
+                .slots
+                .get(*name)
+                .is_some_and(|b| b.is_rotation())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    resume_out.rotations = kept.clone();
+    for p in progress.iter_mut() {
+        p.rotations = kept.clone();
+    }
     place(&mut resume_out.position, &mut resume_out.slot_positions);
     for p in progress.iter_mut() {
         place(&mut p.position, &mut p.slot_positions);
@@ -847,6 +900,7 @@ fn progress_per_item(
             pools,
             position: seat.map_or(position_without_entries, |s| s.position(entries_aired)),
             slot_positions: BTreeMap::new(),
+            rotations: BTreeMap::new(),
         });
         match *step {
             Step::Pool { block, seq } => pool_aired[block] = pool_aired[block].max(seq + 1),
@@ -2439,6 +2493,9 @@ mod tests {
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
+            slots: Vec::new(),
+            select: None,
+            weight: Default::default(),
             align: None,
             min_fill: None,
             fill: Vec::new(),
@@ -4787,5 +4844,87 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
             checkpoints(&progress),
             [6, 7, 8, 9, 0, 1].map(|n| (9, Some(n))).to_vec()
         );
+    }
+
+    // ---- rotation slots (etv-station-xm8p.1) --------------------------------
+
+    /// Slot `prime` rotates over `m0..m2` (one ten-minute item each), placed
+    /// 20:00-21:00 every day; the any-time list is `a0..a9`.
+    fn rotation_channel() -> ChannelConfig {
+        let one = |id: &str| include_with(vec![Entry::Item(Box::new(item_entry_secs(id, 600)))]);
+        let mut c = scheduled_channel();
+        c.rule.slots.clear();
+        for m in ["m0", "m1", "m2"] {
+            c.rule.slots.insert(m.into(), one(m));
+        }
+        let mut prime = include_with(vec![]);
+        prime.order = None;
+        prime.slots = vec!["m0".into(), "m1".into(), "m2".into()];
+        c.rule.slots.insert("prime".into(), prime);
+        c.rule.schedules =
+            serde_norway::from_str(r#"[{name: nightly, hours: {"20..21": prime}}]"#).unwrap();
+        c
+    }
+
+    fn rotation_generation(
+        state: &GenerationState,
+        at: OffsetDateTime,
+    ) -> (Vec<String>, ResumeMap, Vec<Progress>) {
+        let (items, next, progress) = resolve_channel_with_resume(
+            &rotation_channel(),
+            path(),
+            &[],
+            None,
+            None,
+            state,
+            &Default::default(),
+            Some(Duration::from_secs(86_400)),
+            at,
+        )
+        .unwrap();
+        let ids = items
+            .into_iter()
+            .map(|i| i.id.trim_start_matches("lavfi:").to_string())
+            .collect();
+        (ids, next, progress)
+    }
+
+    #[test]
+    fn consecutive_placements_draw_the_members_in_turn_and_survive_a_reload() {
+        let mut state = GenerationState::empty();
+        let mut aired = Vec::new();
+        for day in 14..20u8 {
+            let at = time::Date::from_calendar_date(2026, time::Month::October, day)
+                .unwrap()
+                .with_hms(20, 0, 0)
+                .unwrap()
+                .assume_utc();
+            let (ids, next, progress) = rotation_generation(&state, at);
+            aired.push(ids[0].clone());
+            // Every per-item checkpoint carries the draw, so a rewind keeps it.
+            assert!(progress.iter().all(|p| p.rotations.contains_key("prime")));
+            // The sidecar written to disk and read back is the same state.
+            let json = serde_json::to_string(&next).unwrap();
+            state.resume = serde_json::from_str(&json).unwrap();
+        }
+        assert_eq!(aired, ["m0", "m1", "m2", "m0", "m1", "m2"]);
+    }
+
+    #[test]
+    fn a_generation_opening_mid_placement_airs_the_member_already_drawn() {
+        let mut state = GenerationState::empty();
+        let start = time::macros::datetime!(2026-10-14 20:00 UTC);
+        let (first, next, _) = rotation_generation(&state, start);
+        assert_eq!(first[0], "m0");
+        state.resume = next;
+        let (later, after, _) =
+            rotation_generation(&state, time::macros::datetime!(2026-10-14 20:30 UTC));
+        assert_eq!(later[0], "m0", "the same placement keeps its draw");
+        assert_eq!(after.rotations["prime"].recent.len(), 1);
+        // The next evening is a new placement and draws the next member.
+        state.resume = after;
+        let (next_day, _, _) =
+            rotation_generation(&state, time::macros::datetime!(2026-10-15 20:00 UTC));
+        assert_eq!(next_day[0], "m1");
     }
 }

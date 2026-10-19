@@ -3186,6 +3186,7 @@ fn align_fill(
         pools: end_state.pools.clone(),
         position: end_state.position,
         slot_positions: end_state.slot_positions.clone(),
+        rotations: end_state.rotations.clone(),
     };
     fill_gaps(&env, laid, skip, start, fill_leading, &end_progress)
 }

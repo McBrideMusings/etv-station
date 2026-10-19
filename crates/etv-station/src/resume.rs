@@ -74,6 +74,13 @@ pub struct ResumeMap {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slot_positions: BTreeMap<String, usize>,
 
+    /// Where each rotation slot (`slots:` on a `rule.slots` entry) stands,
+    /// by slot name: the member its current placement drew, the round-robin
+    /// cycle, and the recent draws `no_repeat_within` reads. See
+    /// [`crate::rotation`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rotations: BTreeMap<String, RotationResume>,
+
     /// The scheduling state at each not-yet-aired item boundary, oldest first.
     ///
     /// Forward materialization otherwise makes a pattern channel's emitted
@@ -175,6 +182,8 @@ pub struct Checkpoint {
     pub position: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slot_positions: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rotations: BTreeMap<String, RotationResume>,
 }
 
 /// The scheduling state a generation would leave behind had it stopped after
@@ -185,6 +194,34 @@ pub struct Progress {
     pub pools: BTreeMap<String, PoolResume>,
     pub position: usize,
     pub slot_positions: BTreeMap<String, usize>,
+    pub rotations: BTreeMap<String, RotationResume>,
+}
+
+/// One rotation slot's resume state (etv-station-xm8p.1). Everything a draw
+/// reads that the config and the channel seed do not already say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationResume {
+    /// `round_robin`: how many full passes over the members have completed.
+    /// Keys the seeded shuffle of `order: random`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cycle: u64,
+    /// `round_robin`: the members already drawn in the current pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drawn: Vec<String>,
+    /// The latest draws, oldest first, each stamped with the start of the
+    /// placement it was drawn for. A placement found here has drawn already
+    /// and keeps its member; the same list is what `no_repeat_within`
+    /// measures against and what "least recently drawn" falls back to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<RotationDraw>,
+}
+
+/// One member drawn at the start of one placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationDraw {
+    pub member: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
 }
 
 /// One pool's resume state.
@@ -260,6 +297,7 @@ impl ResumeMap {
             pools: BTreeMap::new(),
             position: 0,
             slot_positions: BTreeMap::new(),
+            rotations: BTreeMap::new(),
             checkpoints: Vec::new(),
             config_id: None,
             lists: BTreeMap::new(),
@@ -271,7 +309,10 @@ impl ResumeMap {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty() && self.position == 0 && self.slot_positions.is_empty()
+        self.pools.is_empty()
+            && self.position == 0
+            && self.slot_positions.is_empty()
+            && self.rotations.is_empty()
     }
 
     /// Record the state entering a generation that begins at `start`, along
@@ -284,6 +325,7 @@ impl ResumeMap {
             pools: self.pools.clone(),
             position: self.position,
             slot_positions: self.slot_positions.clone(),
+            rotations: self.rotations.clone(),
         });
     }
 
@@ -296,7 +338,8 @@ impl ResumeMap {
             && (last.start >= start
                 || (last.pools == progress.pools
                     && last.position == progress.position
-                    && last.slot_positions == progress.slot_positions))
+                    && last.slot_positions == progress.slot_positions
+                    && last.rotations == progress.rotations))
         {
             return;
         }
@@ -305,6 +348,7 @@ impl ResumeMap {
             pools: progress.pools.clone(),
             position: progress.position,
             slot_positions: progress.slot_positions.clone(),
+            rotations: progress.rotations.clone(),
         });
     }
 
@@ -354,6 +398,7 @@ impl ResumeMap {
         self.pools = cp.pools;
         self.position = cp.position;
         self.slot_positions = cp.slot_positions;
+        self.rotations = cp.rotations;
         self.checkpoints.truncate(idx);
         Some(cp.start)
     }
@@ -573,6 +618,7 @@ mod tests {
             pools: pools_with(next),
             position,
             slot_positions: BTreeMap::new(),
+            rotations: BTreeMap::new(),
         };
         map.checkpoint_at(at(1), &step("e1", 1));
         map.checkpoint_at(at(2), &step("e1", 1));

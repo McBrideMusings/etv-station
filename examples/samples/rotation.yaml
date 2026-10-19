@@ -1,0 +1,79 @@
+# Sample — Rotation: a prime-time slot that draws one of three member slots per evening.
+#
+# rule.slots.prime: lists `slots:` instead of a body, so each placement of it
+# draws one member and airs that member for the whole range. `select`, `order`,
+# `weight` and `constraints.no_repeat_within` mean what they mean on a pool.
+#   select: round_robin  — every member once per cycle, in written order.
+#   order: random        — reshuffle each cycle from the channel seed.
+#   no_repeat_within: 1  — a member never airs on two evenings running, even across
+#                          the reshuffle between cycles.
+#   select: random       — a weighted draw; `weight: { trek: 2 }` doubles trek.
+#
+# rule.schedules.prime: places the rotation over 19:00-23:00 every day. Three
+# evenings in a row air three different members; the Review view and
+# `etv-station --audit` list which member airs on each upcoming placement.
+#
+# Runs on lavfi test patterns, so it needs no catalog. Registered in
+# examples/station.yaml via the `samples/*.yaml` glob.
+number: 51
+name: rotation
+display_name: "Rotation"
+window_days: 1
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - program:
+        title: "Daytime"
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "30m"
+          source:
+            kind: lavfi
+            params: "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=330 [out1]"
+
+  slots:
+    prime:
+      slots: [kung-fu, trek, sketch]
+      select: round_robin
+      order: random
+      constraints: { no_repeat_within: 1 }   # a reshuffle never opens on last evening's member
+
+    kung-fu:
+      program:
+        title: "Kung Fu Night"
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "30m"
+          source:
+            kind: lavfi
+            params: "smptebars=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+
+    trek:
+      program:
+        title: "Trek Night"
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "30m"
+          source:
+            kind: lavfi
+            params: "testsrc2=size=1280x720:rate=30 [out0]; sine=frequency=550 [out1]"
+
+    sketch:
+      program:
+        title: "Sketch Night"
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "30m"
+          source:
+            kind: lavfi
+            params: "color=c=navy:size=1280x720:rate=30 [out0]; sine=frequency=660 [out1]"
+
+  schedules:
+    - name: prime
+      hours: { "19..23": prime }

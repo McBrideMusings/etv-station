@@ -595,7 +595,8 @@ fn resolve_blocks(
             || include.duplicates.is_some()
             || !include.entries.is_empty()
             || !include.pools.is_empty()
-            || !include.pattern.is_empty();
+            || !include.pattern.is_empty()
+            || !include.slots.is_empty();
         match (has_path, has_inline) {
             (true, true) => {
                 return Err(ConfigError::Validation {

@@ -65,7 +65,7 @@ pub fn chunk_boundary_at_or_before(
     boundary
 }
 
-fn to_utc_assume_local(date: Date, time: Time, tz: &'static Tz) -> OffsetDateTime {
+pub(crate) fn to_utc_assume_local(date: Date, time: Time, tz: &'static Tz) -> OffsetDateTime {
     let naive = date.with_time(time).assume_utc();
     let offset = tz.get_offset_primary().to_utc();
     let approx = naive - Duration::seconds(offset.whole_seconds() as i64);

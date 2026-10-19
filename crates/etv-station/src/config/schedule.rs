@@ -53,15 +53,27 @@ impl Schedule {
     /// A range that wraps past midnight belongs to the day it starts on, so
     /// `"21..02"` on a Friday-only schedule covers Saturday 01:00.
     pub fn slot_at(&self, date: Date, minute: u16) -> Option<&str> {
+        self.hit_at(date, minute).map(|(slot, _, _)| slot)
+    }
+
+    /// Like [`Self::slot_at`], plus the range that matched and the local day
+    /// it starts on — the identity of one placement of the slot.
+    pub fn hit_at(&self, date: Date, minute: u16) -> Option<(&str, ClockRange, Date)> {
         let today = self.matches_day(date);
         let yesterday = date.previous_day().is_some_and(|d| self.matches_day(d));
         self.hours.iter().find_map(|(range, slot)| {
-            let hit = if range.wraps() {
-                (today && minute >= range.start) || (yesterday && minute < range.end)
+            let start_day = if range.wraps() {
+                if today && minute >= range.start {
+                    Some(date)
+                } else if yesterday && minute < range.end {
+                    date.previous_day()
+                } else {
+                    None
+                }
             } else {
-                today && minute >= range.start && minute < range.end
+                (today && minute >= range.start && minute < range.end).then_some(date)
             };
-            hit.then_some(slot.as_str())
+            start_day.map(|d| (slot.as_str(), *range, d))
         })
     }
 }
