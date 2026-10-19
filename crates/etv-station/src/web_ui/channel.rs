@@ -104,6 +104,8 @@ pub(super) struct ReviewState {
     candidate_digests: HashMap<PathBuf, (std::time::SystemTime, std::time::Instant, String)>,
     /// Projections, filled by a worker thread so no request waits on one.
     pub(super) sims: Arc<projection::SimCache>,
+    /// Graphics renders, filled by a worker thread so no request waits on one.
+    pub(super) renders: super::graphics::RenderQueue,
 }
 
 /// How long a channel's candidate digest is reused.
@@ -130,6 +132,12 @@ impl ReviewState {
                     .parent()
                     .map(|p| p.join("ui-projections"))
                     .unwrap_or_else(|| std::env::temp_dir().join("etv-station-ui-projections")),
+            ),
+            renders: super::graphics::RenderQueue::new(
+                catalog_path
+                    .parent()
+                    .map(|p| p.join("ui-renders"))
+                    .unwrap_or_else(|| std::env::temp_dir().join("etv-station-ui-renders")),
             ),
             candidate_digests: HashMap::new(),
             station_path,

@@ -43,16 +43,12 @@ The common operations:
 ```sh
 ./tools/dev-run.sh                       # run station daemon + ETV-next together (integration test)
 ./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
-./tools/station-ui.sh                    # run ONLY the station web dashboard (`etv-station --serve-ui`, :4747; tools/ui-get.sh reads its JSON)
+./tools/station-ui.sh                    # run ONLY the station web dashboard (`etv-station --serve-ui`, :4747; tools/ui-get.sh reads its JSON); Channels › Graphics renders a channel's overlay and bumper scripts
 ./tools/verify-integration.sh            # smoke test: start dev stack, probe HTTP endpoints, verify clean shutdown
 ./tools/verify-all.sh                    # test + clippy + fmt --check in BOTH workspaces
 ./tools/verify-all.sh test|lint|fmt-check  # one read-only check, still across both workspaces
 ./tools/verify-all.sh fmt                # rustfmt both workspaces — WRITES files
 bun run docs:dev                         # serve VitePress docs on http://localhost:5193
-./tools/overlay-test.sh                  # render a Vello overlay onto a bumper fixture and open the mp4
-./tools/overlay-still.sh                 # render a single overlay frame to PNG and open it
-admin tools overlay-watch <channel-dir>  # live isolated overlay preview in VLC, hot-reloads on save; --metadata '<json>' previews a card
-admin tools bumper-watch <channel> <script> --gap 45s   # play a bumper script on a gap into VLC (etv-station bumper-preview resolves it)
 admin verify accel                       # prove channels encode on the GPU, not silently on the CPU
 admin backup                             # snapshot history.db / catalog.db / .device_id on the host
 admin audit <channel> [--next N]         # why each upcoming item is on a channel's schedule

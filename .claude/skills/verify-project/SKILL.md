@@ -567,17 +567,27 @@ minutes, not seconds. That is the repair working, not a hang.
 
 ## Verifying a graphics overlay actually reaches the screen
 
-**Fastest check: `admin overlay-watch <channel-dir>`** — no station, no
-ETV-next, no Plex. Loops a background fixture through the real Vello+Rhai
-render and streams it into VLC, hot-reloading on every save to the channel's
-overlay (or the shared file it references). Defaults to a 10x time scale so a
-multi-minute animation cycle (e.g. `title-chyron.rhai`) plays out in seconds.
-This is the right first stop for anything overlay-shaped — layout, color, a
-new script, an animation — and the only one of these that doesn't need a real
-channel or a real stream. Reach for the rest of this section only once the
-isolated render looks right and you need to confirm it survives contact with
-the real station (a script reading real `title`/`item_elapsed`, real PNG
-decode, the fifo/process-supervision path).
+**Fastest check: Channels › Graphics** (`tools/station-ui.sh`, then
+`#/channels/<ch>/graphics`) — no ETV-next, no Plex stream. It renders the channel's
+overlay script as a still or a short clip with the real fonts and logo, and a
+bumper script on a chosen gap, with the station's own renderer. A saved script
+changes its mtime, so the next request misses the cache and re-renders. Drive it
+without the page through `tools/ui-get.sh`:
+
+```sh
+tools/ui-get.sh /api/channels/<ch>/graphics
+curl -s -XPOST localhost:4747/api/channels/<ch>/graphics/render -d '{"kind":"still","script":"<abs path from the list>","at":2}'
+tools/ui-get.sh /api/renders/<render>
+```
+
+Expect the still's `width`/`height` to equal the channel's output size, a clip or
+bumper's `duration` to match `ffprobe`, and a render of a script that throws to
+answer `state: "failed"` with the binary's stderr in `log`. Every render logs one
+`ui.render` event (kind, script, inputs with mtimes, `cache=hit|miss`, ms,
+outcome). Reach for the rest of this section only once the isolated render looks
+right and you need to confirm it survives contact with the real station (a script
+reading real `title`/`item_elapsed`, real PNG decode, the fifo/process-supervision
+path).
 
 The overlay spec lives on the **channel**, in `channel{N}.json` — never on a
 playout item. Check the render first, because it is instant and needs no stream:
@@ -592,7 +602,7 @@ python3 -c "import json;print(json.load(open('tmp/claude/render/channel1.json'))
 A channel with an overlay prints its own `fifo_path`; a channel without prints
 `None`. Two channels printing the *same* fifo path is a bug — each writes its own.
 
-- Scorer-supplied data reaches an overlay: run `cargo test -p etv-overlay --lib metadata` and expect `script_reads_a_key_out_of_metadata`, `missing_metadata_is_an_empty_map` and `nested_metadata_is_an_array_of_maps` to pass. These feed `ProgramContext.metadata` and read it back through the Rhai scope, which is the only surface that tells scorer data from a script default (`admin overlay-watch` renders against a fixture with no plugin behind it).
+- Scorer-supplied data reaches an overlay: run `cargo test -p etv-overlay --lib metadata` and expect `script_reads_a_key_out_of_metadata`, `missing_metadata_is_an_empty_map` and `nested_metadata_is_an_array_of_maps` to pass. These feed `ProgramContext.metadata` and read it back through the Rhai scope, which is the only surface that tells scorer data from a script default (Channels › Graphics renders against stand-in footage with no plugin behind it).
 
 **Only a real frame proves it.** The spec reaching ffmpeg does not mean anything
 was drawn: the overlay process is spawned on demand and can crash after ffmpeg
@@ -630,7 +640,7 @@ for f in sorted(glob.glob('deploy/appdata/channels/*/logo.png') + glob.glob('dep
 ffmpeg -y -i bad.png -pix_fmt rgba fixed.png   # the fix; alpha survives
 ```
 
-## Verifying `bumper-preview` and `bumper-watch`
+## Verifying `bumper-preview` and the Graphics bumper render
 
 No station, catalog or Plex needed. Resolve a bumper on a gap and read the items:
 
@@ -651,15 +661,7 @@ The trailer bumper (`examples/plugins/trailer-bumper.rhai`) is checked against t
 
 Expect, for a film with a Plex trailer, an `http` item whose `uri` starts `{{PLEX_URL}}/` and ends `X-Plex-Token={{PLEX_TOKEN}}` (the real token never appears), `out_point_ms` equal to the trailer's length (Rush Hour: `88000`), then a black item to the end of the gap; `upcoming` gives one `http` item per distinct film, nearest first. A film with no Plex id or no trailer exits 1 with `build() returned an empty timeline`, which in the fill pass makes it draw the next entry. With `RUST_LOG=info` stderr carries `trailer: item=… found=… len_ms=…` and, per trailer, a `bumper.http_source` line with the host.
 
-`bumper-watch` plays those items through `etv-overlay watch --item`, one process per item, into VLC. Prove it without VLC by standing in a capture script for it (`overlay-watch.sh` reads `$VLC`), then count the frames the card drew over:
-
-```sh
-VLC=<script that runs: cat > out.ts> ./tools/bumper-watch.sh examples/channels/lavfi-test.yaml <bumper.rhai> --gap 5s
-# after ~25 s, SIGINT the pipeline, then:
-ffmpeg -v error -i out.ts -vf "signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-" -an -f null - | grep YMAX | sort | uniq -c
-```
-
-Expect both a black count (`YMAX=16`) and a text-frame count (`YMAX=248` for white text). The `etv-overlay` log shows `overlay=None` for an item with `"overlay": "none"` and `overlay=Script { script: …card.rhai, vars: … }` for the card item. `admin overlay-watch <channel> --metadata '<json>'` is the same pipeline for a single looping background.
+Channels › Graphics plays those items through `etv-overlay watch --item`, one process per item, and joins them into one mp4. Prove it from the API: `POST /api/channels/<ch>/graphics/render` with `{"kind":"bumper","script":"<abs path>","gap":"8s"}`, then `tools/ui-get.sh /api/renders/<render>` and expect `duration` of `8.0` (agreeing with `ffprobe` on the file under the `ui-renders` directory beside the catalog) and a `log` that names each `etv-overlay watch` invocation. A script that throws gives `state: "failed"` with its message in `log`.
 
 ## Verifying the block card and pool labels
 

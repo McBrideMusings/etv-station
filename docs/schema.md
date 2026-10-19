@@ -1480,8 +1480,7 @@ a change from a labelled neighbour: in a pattern of `films x1, bumpers x1` where
 only `films` is labelled, every film follows a bumper and draws the card. Set
 `announce_after_unlabelled: false` to compare only against a labelled previous
 item; the card then does not land on a block that follows unlabelled
-programming, and the interval card is the only one there. Preview it with
-`METADATA='{"pool_label":"The Zombies Block"}' PREV_METADATA='{"pool_label":"The Kaiju Block"}' ITEM_ELAPSED=2 admin overlay-watch <channel>`.
+programming, and the interval card is the only one there. Preview the overlay in Channels › Graphics.
 
 ### Rating badge
 

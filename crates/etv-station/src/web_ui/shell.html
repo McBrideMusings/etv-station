@@ -235,6 +235,15 @@
   .player .now { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
   .player .x { float: right; }
   .insp .err { margin-top: 8px; }
+  /* Graphics: a list of scripts beside the result of the last render. */
+  .gscripts { min-height: 0; overflow: auto; }
+  .gscripts section { margin-bottom: 14px; }
+  .grow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 6px 0; border-top: 1px solid var(--line); }
+  .grow .gname { flex: 1 1 240px; min-width: 0; }
+  .grow .gpath { overflow-wrap: anywhere; }
+  .grow input { background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 2px 5px; width: 5em; }
+  .grow input.ggap { width: 6em; }
+  .gmedia { display: block; width: 100%; background: #000; aspect-ratio: 16 / 9; object-fit: contain; border: 1px solid var(--line); }
   #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
 </head>
@@ -255,6 +264,7 @@
       <nav class="subtabs" aria-label="Channel views">
         <a id="subSchedule" href="#">Schedule</a>
         <a id="subPattern" href="#">Pattern</a>
+        <a id="subGraphics" href="#">Graphics</a>
       </nav>
       <span id="position" class="muted"></span>
       <span class="spacer"></span>
@@ -289,7 +299,7 @@ let current = null;   // the last channel review payload
 let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
-// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern}?project=Nd`,
+// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern|graphics}?project=Nd`,
 // `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
 function parseRoute() {
   const [path, qs] = location.hash.replace(/^#/, '').split('?');
@@ -299,7 +309,7 @@ function parseRoute() {
   return {
     tab,
     channel: tab === 'channels' && parts[1] ? decodeURIComponent(parts[1]) : null,
-    view: parts[2] === 'pattern' ? 'pattern' : 'schedule',
+    view: ['pattern', 'graphics'].includes(parts[2]) ? parts[2] : 'schedule',
     project: ['1d', '3d', '7d', '14d'].includes(q.get('project')) ? q.get('project') : null,
   };
 }
@@ -430,6 +440,9 @@ function markRoute(r) {
   $('lineupSelect').hidden = r.tab !== 'channels';
   $('toolbar').hidden = r.tab !== 'channels';
   setControls(r.project, false);
+  // Project ahead belongs to the schedule; Graphics has no projection to ask for.
+  const projecting = r.tab === 'channels' && r.view !== 'graphics';
+  for (const id of ['projState', 'projLabel', 'projBtns', 'projClear']) $(id).hidden = !projecting;
   if (r.tab !== 'channels' || !lineup) return;
   const project = r.project;
   for (const a of $('lineup').querySelectorAll('a')) {
@@ -437,7 +450,7 @@ function markRoute(r) {
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
-  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern']]) {
+  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern'], ['subGraphics', 'graphics']]) {
     $(id).href = channelHash(r.channel, view, project);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
@@ -467,14 +480,124 @@ async function route() {
   }
   markRoute(r);
   stopPlayer();
+  if (r.tab !== 'channels' || r.view !== 'graphics') { gSeq++; renderSeq++; }
   if (r.tab === 'guide') { loadSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
   if (r.tab !== 'channels') { loadSeq++; guideSeq++; shown = null; renderEmpty(r.tab); return; }
   if (!r.channel) return;
   guideSeq++;
+  if (r.view === 'graphics') { loadSeq++; shown = null; current = null; loadGraphics(r.channel); return; }
   const key = `${r.channel}|${r.project}`;
   if (shown === key && current) { draw(r.view); return; }
   shown = key;
   await load(r.channel, r.project, r.view);
+}
+
+// Channels › Graphics: the overlay and bumper scripts the channel names, each rendered on request.
+// A render is queued (POST), then asked for again every GRAPHICS_POLL_MS until it is done or failed.
+const GRAPHICS_POLL_MS = 2000;
+let gSeq = 0;      // a newer Graphics load or render supersedes an older one still polling
+let renderSeq = 0; // a newer render request supersedes the one still polling
+
+async function loadGraphics(channel) {
+  const seq = ++gSeq;
+  document.title = `etv-station · ${channel} · Graphics`;
+  $('state').textContent = '';
+  $('report').classList.remove('loading');
+  $('report').innerHTML = '<div class="muted">Loading the channel’s scripts…</div>';
+  let data;
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/graphics`);
+    data = await res.json();
+    if (!res.ok) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
+  } catch (e) {
+    data = { error: String(e) };
+  }
+  if (seq !== gSeq) return;
+  if (data.error) {
+    $('report').innerHTML = `<header class="mast"><h1>${esc(channel)}</h1></header>
+      <h2>Graphics could not be listed</h2><div class="error">${esc(data.error)}</div>`;
+    return;
+  }
+  if (data.load_error) {
+    $('report').innerHTML = `<header class="mast"><div><h1>${esc(data.channel)}</h1>
+      <div class="sub">${esc(data.config_path)}</div></div></header>
+      <h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
+    return;
+  }
+  drawGraphics(data);
+}
+
+function drawGraphics(d) {
+  const canvas = d.canvas ? `${d.canvas.width}×${d.canvas.height}` : 'no overlay canvas';
+  const overlayRows = d.overlays.map((o) => `<div class="grow" data-script="${esc(o.script)}">
+      <div class="gname"><b>${esc(o.name)}</b><div class="muted gpath">${esc(o.script)}</div></div>
+      <label class="muted">at <input type="number" class="gat" min="0" max="3600" step="0.5" value="0"> s</label>
+      <button type="button" data-kind="still">Still</button>
+      <button type="button" data-kind="clip">Clip</button></div>`).join('');
+  const bumperRows = d.bumpers.map((b) => {
+    const range = [b.min_gap && `min ${b.min_gap}`, b.max_gap && `max ${b.max_gap}`].filter(Boolean).join(', ');
+    return `<div class="grow" data-script="${esc(b.script)}">
+      <div class="gname"><b>${esc(b.name)}</b><div class="muted gpath">${esc(b.script)}${range ? ` · ${esc(range)}` : ''}</div></div>
+      <label class="muted">gap <input type="text" class="ggap" size="6" value="${esc(d.default_gap)}"></label>
+      <button type="button" data-kind="bumper">Render</button></div>`;
+  }).join('');
+  $('report').innerHTML = `<header class="mast"><div><h1>${esc(d.channel)}</h1>
+      <div class="sub">Graphics · rendered with the station's renderer at ${esc(canvas)}</div></div></header>
+    <div class="layout"><div class="gscripts">
+      <section><h2>Overlays</h2>${overlayRows || '<p class="muted">This channel’s overlay names no script.</p>'}</section>
+      <section><h2>Bumpers</h2>${bumperRows || '<p class="muted">This channel’s blocks have no <code>fill:</code> bumper scripts.</p>'}</section>
+    </div><aside class="rail"><section class="insp" id="gresult"><p class="muted">Pick Still, Clip or Render. Renders run one at a time and are kept until a script or config they read changes.</p></section></aside></div>`;
+  for (const btn of $('report').querySelectorAll('.grow button')) {
+    btn.addEventListener('click', () => {
+      const row = btn.closest('.grow');
+      const body = { kind: btn.dataset.kind, script: row.dataset.script };
+      if (body.kind === 'still') body.at = Number(row.querySelector('.gat').value) || 0;
+      if (body.kind === 'bumper') body.gap = row.querySelector('.ggap').value.trim();
+      requestRender(d.channel, body, row.querySelector('b').textContent);
+    });
+  }
+}
+
+async function requestRender(channel, body, name) {
+  const seq = ++renderSeq;
+  const panel = $('gresult');
+  const title = `<h3>${esc(name)} · ${esc(body.kind)}</h3>`;
+  const fail = (what, log) => {
+    if (seq !== renderSeq) return;
+    panel.innerHTML = `${title}<div class="error">${esc(what)}</div>${log ? `<h4>Renderer output</h4><div class="error">${esc(log)}</div>` : ''}`;
+  };
+  panel.innerHTML = `${title}<div class="muted"><span class="spinner"></span>Queuing…</div>`;
+  let id;
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/graphics/render`, { method: 'POST', body: JSON.stringify(body) });
+    const data = await res.json();
+    if (!res.ok && res.status !== 202) { fail(`HTTP ${res.status}: ${data.error || 'no error message'}`); return; }
+    id = data.render;
+  } catch (e) { fail(String(e)); return; }
+  const began = Date.now();
+  for (;;) {
+    let res, data;
+    try {
+      res = await fetch(`/api/renders/${encodeURIComponent(id)}`);
+      data = await res.json();
+    } catch (e) { fail(String(e)); return; }
+    if (seq !== renderSeq) return;
+    if (!res.ok && res.status !== 202) { fail(`HTTP ${res.status}: ${data.error || 'no error message'}`); return; }
+    if (data.state === 'failed') { fail(data.error, data.log); return; }
+    if (data.state === 'done') { showRender(panel, title, data); return; }
+    panel.innerHTML = `${title}<div class="muted"><span class="spinner"></span>Rendering… (asked again every ${GRAPHICS_POLL_MS / 1000}s) ${Math.round((Date.now() - began) / 1000)}s</div>`;
+    await new Promise((r) => setTimeout(r, GRAPHICS_POLL_MS));
+    if (seq !== renderSeq) return;
+  }
+}
+
+function showRender(panel, title, r) {
+  const media = r.kind === 'still'
+    ? `<img class="gmedia" src="${esc(r.url)}" alt="${esc(r.kind)} of ${esc(r.script)}">`
+    : `<video class="gmedia" src="${esc(r.url)}" controls autoplay muted loop playsinline></video>`;
+  const facts = [`${r.width}×${r.height}`, r.duration == null ? null : `${Number(r.duration).toFixed(2)} s`].filter(Boolean).join(' · ');
+  panel.innerHTML = `${title}${media}<div class="meta"><span>${esc(facts)}</span></div>
+    <details><summary class="muted">Renderer output</summary><div class="error">${esc(r.log || '(none)')}</div></details>`;
 }
 
 function poolColor(d) {

@@ -90,8 +90,7 @@ struct Cli {
     /// (`036-the-academy`), not by number. Exits non-zero if no such channel
     /// exists or the channel resolves to no overlay at all.
     ///
-    /// This exists so `tools/overlay-extract.py` (and so `admin overlay-watch`)
-    /// can preview the real cascade instead of reimplementing it. Since ADR
+    /// This exists so a preview can show the real cascade instead of reimplementing it. Since ADR
     /// 0008 a channel may declare only `overlay: {extend: …}`, which carries no
     /// geometry and means nothing without the station-level spec above it — so
     /// a preview that reads the channel file alone can no longer resolve one.
@@ -249,8 +248,8 @@ struct Cli {
 enum Command {
     /// Resolve one bumper script on one gap without a station, and print the
     /// playout items the scheduler would write for it (`--otio` prints the
-    /// OpenTimelineIO document instead). `admin bumper-watch` plays the same
-    /// result into VLC.
+    /// OpenTimelineIO document instead). Channels › Graphics renders the same
+    /// result.
     ///
     /// A script that fails is an error here, not the black card the generator
     /// substitutes: a preview exists to show the author what went wrong.

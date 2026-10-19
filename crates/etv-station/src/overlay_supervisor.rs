@@ -364,7 +364,7 @@ fn spawn_overlay(ctx: &OverlayContext) -> std::io::Result<Child> {
         .spawn()
 }
 
-fn overlay_binary_path() -> PathBuf {
+pub(crate) fn overlay_binary_path() -> PathBuf {
     if let Ok(path) = std::env::var("ETV_OVERLAY_BIN") {
         return PathBuf::from(path);
     }

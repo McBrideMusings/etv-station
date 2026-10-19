@@ -1,5 +1,5 @@
 //! Resolve one bumper script on one gap without a station: the engine behind
-//! `etv-station bumper-preview` and `admin bumper-watch`.
+//! `etv-station bumper-preview` and Channels › Graphics.
 //!
 //! It runs the same three steps the generator will — [`hook::build`],
 //! [`timeline::fit`], [`emit::emit_timeline`] — so what it prints is what the

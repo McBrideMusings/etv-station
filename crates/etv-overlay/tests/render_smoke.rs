@@ -524,7 +524,7 @@ fn per_layer_invisible_layer_does_not_render() {
 /// repeating interval, animating `offset_x` rather than toggling visibility.
 /// Exercised against the real fixture file (not a copy) so a script edit that
 /// breaks the cycle math fails here rather than only being caught by eye in
-/// `admin overlay-watch`.
+/// Channels › Graphics.
 #[test]
 fn title_chyron_slides_holds_then_slides_back_on_a_repeating_interval() {
     let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

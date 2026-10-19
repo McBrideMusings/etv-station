@@ -77,13 +77,13 @@ Done when every `schedule`, `log` and error-card finding has a cause line.
 | Subtitles | a foreign-language item carries subtitles, or the reason it cannot | `subtitles` findings. Station-wide `tracks.subtitle.inherit: false` turns them off on every channel because iPlayTV freezes on a subtitle track (etv-station-j4dw); report the foreign titles the channel draws as the consequence |
 | Overlay graphics | every card renders, reads, and fits; assets exist | Render it (below) and look at every image |
 | Logo | on-screen bug present and legible; guide logo sent | the stills; `logo` findings (`tvg-logo`, XMLTV `<icon>`; set by the channel's `logo:`) |
-| Bumpers | each `fill:` script fills a gap without error | a block with `fill:` only: `./target/debug/etv-station bumper-preview --gap 45s <script>` per script; `admin tools bumper-watch` to watch one |
+| Bumpers | each `fill:` script fills a gap without error | a block with `fill:` only: `./target/debug/etv-station bumper-preview --gap 45s <script>` per script; `POST /api/channels/<ch>/graphics/render {"kind":"bumper","script":…,"gap":"45s"}` (or Channels › Graphics) renders one to an mp4 |
 | Stream | not failing, not stalling, encoding on the GPU | `health` fact; `tools/attribute-stalls.sh --channel <N>`; `admin verify accel` |
 
 **Render the overlay** with an item that really airs:
 
 ```sh
-uv run tools/overlay-extract.py deploy/appdata/channels/<folder> --out <scratch>/ov.yaml
+./target/debug/etv-station --config deploy/appdata/station.yaml --dump-overlay <channel name> > <scratch>/ov.yaml
 ffmpeg -v error -y -ss 600 -i "<local copy of the file>" -frames:v 1 -vf scale=1280:720 <scratch>/bg.png
 ./target/debug/etv-overlay render-still --config <scratch>/ov.yaml --output <scratch>/ov-t<T>.png --time <T> \
   --title … --sub-title … --season … --episode … --year … --content-rating … --next-title …

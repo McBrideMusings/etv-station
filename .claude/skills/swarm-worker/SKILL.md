@@ -19,7 +19,6 @@ Every one of these runs through `H`:
 - `./tools/dev-run.sh`, `./tools/verify-integration.sh` — they build both etv-next binaries and
   the daemon, and run ffmpeg.
 - `./tools/dev-station.sh` — builds and runs only the station daemon.
-- `./tools/overlay-test.sh`, `./tools/overlay-still.sh` — Vello render plus ffmpeg encode.
 - `bun install`, `bun run docs:build`.
 
 Run the full `./tools/verify-all.sh` once per round of edits, not after each file.

@@ -68,8 +68,7 @@
 //
 // Config (all optional, via the spec's `config:`):
 //   interval_secs     — seconds from one cycle's start to the next
-//                        (default 300; `admin overlay-watch` overrides this
-//                        to a few seconds so the cycle is watchable)
+//                        (default 300; a preview can override this)
 //   hold_secs         — seconds each card sits fully visible (default 4.5)
 //   rise_secs         — how long a card takes to arrive (default 0.45)
 //   fall_secs         — how long it takes to leave (default 0.35)

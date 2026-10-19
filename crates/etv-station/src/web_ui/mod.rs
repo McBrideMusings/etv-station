@@ -20,7 +20,10 @@
 //! lineup. Requests are served one at a time on one thread; simulations run on
 //! `projection`'s worker thread and stills on their own threads, and the
 //! container runs the whole process at `nice 19` so the channels' transcodes
-//! always come first. `GET /api/health` returns what this process was started
+//! always come first. A channel's Graphics page renders its overlay and bumper
+//! scripts the same way (`graphics`): `GET /api/channels/{ch}/graphics` lists
+//! them, `POST /api/channels/{ch}/graphics/render` queues a render on its own
+//! worker, and `GET /api/renders/{render}` answers 202 until it lands. `GET /api/health` returns what this process was started
 //! with, including the ETV-next URL the Guide reads from (`ETV_NEXT_URL`). `GET
 //! /api/airings/{airing}/audit` returns the stored audit record of one real
 //! airing, which is how the Guide answers "why is this on" (`airing`).
@@ -29,6 +32,7 @@
 
 mod airing;
 mod channel;
+mod graphics;
 mod lineup;
 mod projection;
 mod real;
@@ -47,6 +51,9 @@ use crate::tautulli::{self, HistoryScope};
 use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use airing::api_airing_audit;
 use channel::{ReviewState, api_channel_review, still_reply};
+use graphics::{
+    api_channel_graphics, api_graphics_render, api_render, render_file, respond_render_file,
+};
 use lineup::api_lineup;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -159,6 +166,8 @@ enum Reply {
     /// A tune-in still a review offered under this id, rendered on its own
     /// thread by [`channel::respond_still`].
     Still(String, Box<TuneInStill>),
+    /// A finished Graphics render's PNG or mp4.
+    RenderFile(PathBuf, &'static str),
 }
 
 fn handle(state: &mut AppState, mut request: tiny_http::Request) {
@@ -174,12 +183,20 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
         let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
     }
 
+    let range = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Range"))
+        .map(|h| h.value.to_string());
     let began = std::time::Instant::now();
     match dispatch(state, &method, &path, &query, &body) {
         Reply::Html(html) => respond_html(request, html),
         Reply::Script(js) => respond_script(request, js),
         Reply::Still(id, still) => {
             channel::respond_still(state.review.still_dir.clone(), id, *still, request)
+        }
+        Reply::RenderFile(path, content_type) => {
+            respond_render_file(request, &path, content_type, range.as_deref())
         }
         Reply::Json(status, body) => {
             let error = body.get("error").and_then(|e| e.as_str());
@@ -215,6 +232,32 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         {
             return json_reply(api_channel_review(state, &percent_decode(key), query));
         }
+        if let Some(key) = path
+            .strip_prefix("/api/channels/")
+            .and_then(|rest| rest.strip_suffix("/graphics"))
+        {
+            return json_reply(api_channel_graphics(state, &percent_decode(key)));
+        }
+        if let Some(id) = path
+            .strip_prefix("/api/renders/")
+            .and_then(|rest| rest.strip_suffix("/file"))
+        {
+            return match render_file(state, &percent_decode(id)) {
+                Some((file, content_type)) => Reply::RenderFile(file, content_type),
+                None => Reply::Json(404, json!({"error": format!("no finished render {id:?}")})),
+            };
+        }
+        if let Some(id) = path.strip_prefix("/api/renders/") {
+            let (status, body) = api_render(state, &percent_decode(id));
+            return Reply::Json(status, body);
+        }
+    }
+    if *method == Method::Post
+        && let Some(key) = path
+            .strip_prefix("/api/channels/")
+            .and_then(|rest| rest.strip_suffix("/graphics/render"))
+    {
+        return json_reply(api_graphics_render(state, &percent_decode(key), body));
     }
     let result = match (method, path) {
         (Method::Get, "/") => return Reply::Html(SHELL_HTML),
@@ -589,6 +632,170 @@ mod tests {
             after["projection"]["changed"],
             serde_json::json!(["config"])
         );
+    }
+
+    /// The fixture channel with an inline overlay naming one script and a
+    /// block that fills gaps with one bumper script, both written beside the
+    /// channel file.
+    fn graphics_fixture() -> Fixture {
+        let f = fixture();
+        let dir = f.dir.path().join("channels/a");
+        let card = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../etv-overlay/fixtures/scripts/text_card.rhai");
+        std::fs::copy(card, dir.join("card.rhai")).unwrap();
+        std::fs::write(
+            dir.join("bumper.rhai"),
+            "fn hooks() { [\"bumper\"] }\n\
+             fn build(ctx) { let t = timeline(); \
+             t.push(segment().black().name(\"x\").flex(3.0, 15.0, 1).looped()); t }\n",
+        )
+        .unwrap();
+        let channel = FIXTURE_CHANNEL
+            .replace(
+                "rule:\n",
+                "overlay:\n  width: 640\n  height: 360\n  framerate: 30\n  graphics:\n    - script: card.rhai\nrule:\n",
+            )
+            .replace(
+                "- mode: all\n",
+                "- mode: all\n      align: 30m\n      fill:\n        - script: bumper.rhai\n",
+            );
+        std::fs::write(dir.join("channel.yaml"), channel).unwrap();
+        f
+    }
+
+    fn post_render(state: &mut AppState, body: Value) -> (u16, Value) {
+        match dispatch(
+            state,
+            &Method::Post,
+            "/api/channels/a/graphics/render",
+            "",
+            &body.to_string(),
+        ) {
+            Reply::Json(status, body) => (status, body),
+            _ => panic!("render did not answer JSON"),
+        }
+    }
+
+    #[test]
+    fn graphics_lists_the_overlay_and_bumper_scripts_the_channel_names() {
+        let mut f = graphics_fixture();
+        let (status, body) = get_json(&mut f.state, "/api/channels/a/graphics");
+        assert_eq!(status, 200, "{body}");
+        let dir = f.dir.path().join("channels/a");
+        let name = |list: &str| body[list][0]["name"].as_str().unwrap().to_string();
+        assert_eq!(name("overlays"), "card.rhai");
+        assert_eq!(name("bumpers"), "bumper.rhai");
+        assert!(
+            body["overlays"][0]["script"]
+                .as_str()
+                .unwrap()
+                .ends_with("channels/a/card.rhai"),
+            "{body}"
+        );
+        assert!(Path::new(body["bumpers"][0]["script"].as_str().unwrap()).starts_with(&dir));
+        assert_eq!(body["canvas"], json!({"width": 640, "height": 360}));
+    }
+
+    #[test]
+    fn a_channel_naming_no_scripts_lists_none() {
+        let mut f = fixture();
+        let (status, body) = get_json(&mut f.state, "/api/channels/a/graphics");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["overlays"], json!([]));
+        assert_eq!(body["bumpers"], json!([]));
+    }
+
+    #[test]
+    fn a_render_of_a_script_the_channel_does_not_name_is_refused() {
+        let mut f = graphics_fixture();
+        let (status, body) = post_render(
+            &mut f.state,
+            json!({"kind": "still", "script": "/etc/passwd"}),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("not an overlay script")
+        );
+        let bumper = f.dir.path().join("channels/a/card.rhai");
+        let (status, body) = post_render(
+            &mut f.state,
+            json!({"kind": "bumper", "script": bumper.display().to_string()}),
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _) = post_render(&mut f.state, json!({"kind": "gif", "script": "x"}));
+        assert_eq!(status, 400);
+        let script = f.dir.path().join("channels/a/bumper.rhai");
+        let (status, body) = post_render(
+            &mut f.state,
+            json!({"kind": "bumper", "script": script.display().to_string(), "gap": "soon"}),
+        );
+        assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn saving_a_script_asks_for_a_new_render_and_an_unchanged_one_is_served_from_disk() {
+        let mut f = graphics_fixture();
+        let script = f.dir.path().join("channels/a/card.rhai");
+        let ask =
+            serde_json::json!({"kind": "still", "script": script.display().to_string(), "at": 2.0});
+
+        let (status, first) = post_render(&mut f.state, ask.clone());
+        assert_eq!(status, 202, "{first}");
+        let id = first["render"].as_str().unwrap().to_string();
+
+        // The same request names the same render while it is pending or kept.
+        let (_, again) = post_render(&mut f.state, ask.clone());
+        assert_eq!(again["render"], id.as_str());
+
+        // A finished render on disk is a cache hit with no new work.
+        let dir = f.state.review.renders.dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.png")), b"png").unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            json!({"kind": "still", "script": "x", "file": format!("{id}.png"),
+                   "width": 640, "height": 360, "duration": null, "log": ""})
+            .to_string(),
+        )
+        .unwrap();
+        let (status, hit) = post_render(&mut f.state, ask.clone());
+        assert_eq!(status, 200, "{hit}");
+        assert_eq!(hit["cached"], true);
+        assert_eq!(hit["render"], id.as_str());
+        let (status, done) = match dispatch(
+            &mut f.state,
+            &Method::Get,
+            &format!("/api/renders/{id}"),
+            "",
+            "",
+        ) {
+            Reply::Json(status, body) => (status, body),
+            _ => panic!("render did not answer JSON"),
+        };
+        assert_eq!(status, 200, "{done}");
+        assert_eq!(done["state"], "done");
+        assert_eq!(done["width"], 640);
+        assert_eq!(done["url"], format!("/api/renders/{id}/file"));
+
+        // Saving the script changes a file the render reads: a different render.
+        let file = std::fs::File::options().write(true).open(&script).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        let (status, fresh) = post_render(&mut f.state, ask);
+        assert_eq!(status, 202, "{fresh}");
+        assert_ne!(fresh["render"], id.as_str());
+    }
+
+    #[test]
+    fn an_unknown_or_path_shaped_render_id_is_a_404() {
+        let mut f = graphics_fixture();
+        for id in ["still-0000", "..%2Fx"] {
+            let (status, body) = get_json(&mut f.state, &format!("/api/renders/{id}"));
+            assert_eq!(status, 404, "{body}");
+        }
     }
 
     #[test]
