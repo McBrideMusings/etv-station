@@ -594,6 +594,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }

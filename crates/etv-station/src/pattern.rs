@@ -1898,22 +1898,12 @@ pub(crate) fn resolve_pool_sources(
             }
             (None, Some(plugin), false) => {
                 let path = score_env.resolve_path(plugin);
-                // The profile first: its `exclude: true` entries name the ids
-                // `prepare` drops from the sets (etv-station-sctf.7).
-                score_cache
-                    .prepare_profile(catalog, cfg, score_env.base_dir)
-                    .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
                 // `cfg.sources` (#210) replaces whatever the script's own
-                // `sources()` declares, and with the exclusions is the cache
-                // key — so two pools naming this script resolve together only
-                // when they asked for the same candidates.
+                // `sources()` declares, and with the profile's exclusions is
+                // the cache key — so two pools naming this script resolve
+                // together only when they asked for the same candidates.
                 score_cache
-                    .prepare(
-                        catalog,
-                        &path,
-                        cfg.sources.as_ref(),
-                        &score_cache.narrowing(&cfg.name),
-                    )
+                    .prepare_pool(catalog, cfg, &path, score_env.base_dir)
                     .map_err(|m| format!("pool {:?}: {m}", cfg.name))?;
                 pool_ids.push(None);
             }
@@ -2800,6 +2790,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -2965,6 +2956,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -3269,6 +3261,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -4524,6 +4517,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }
@@ -4982,6 +4976,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -5804,6 +5799,7 @@ fn audit(ctx, picks, workspace) { #{} }
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }

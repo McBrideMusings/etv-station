@@ -29,6 +29,7 @@ fn dragonball_catalog(skip: Option<(i64, i64)>) -> Catalog {
             playback_path: format!("/media/{id}.mkv"),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
     };

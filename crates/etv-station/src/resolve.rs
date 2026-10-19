@@ -2160,15 +2160,22 @@ pub(crate) const MAX_CATALOG_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
 /// the old one is marked. Picking by source alone would hand the player the
 /// path that no longer exists roughly half the time, sorted by filename.
 ///
+/// **An airable live row beats an unairable one** for the same reason: a
+/// local-fs file ffprobe rejected must not shadow a good Plex-authored source
+/// on the same entry.
+///
 /// The last two arms exist so an entry whose rows are *all* missing still
 /// yields a path: the caller is then patching or error-carding a playout file
 /// and wants to know what it used to point at, not `None`.
 pub fn pick_playback_source(sources: &[EntrySource]) -> Option<&EntrySource> {
     let live = |s: &&EntrySource| s.missing_since.is_none();
+    let airable = |s: &&EntrySource| live(s) && s.unairable_reason.is_none();
     let local = |s: &&EntrySource| s.source == crate::catalog::Source::LocalFs;
     sources
         .iter()
-        .find(|s| local(s) && live(s))
+        .find(|s| local(s) && airable(s))
+        .or_else(|| sources.iter().find(airable))
+        .or_else(|| sources.iter().find(|s| local(s) && live(s)))
         .or_else(|| sources.iter().find(live))
         .or_else(|| sources.iter().find(local))
         .or_else(|| sources.first())
@@ -3097,6 +3104,7 @@ mod tests {
                 playback_path: format!("/media/lotr/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }
@@ -3380,6 +3388,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }
@@ -3820,6 +3829,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };

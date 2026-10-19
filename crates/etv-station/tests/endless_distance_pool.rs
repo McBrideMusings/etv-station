@@ -105,9 +105,7 @@ fn run_full(
 ) -> Vec<PickedItem> {
     let script = plugin_path();
     let mut cache = ScoreCache::default();
-    cache
-        .prepare(cat, &script, None, &Default::default())
-        .unwrap();
+    cache.prepare_unprofiled(cat, &script, None).unwrap();
 
     let granted = GrantedCapabilities::from_names(&["catalog_read".to_string()])
         .with_datastores(&[DatastoreGrant {

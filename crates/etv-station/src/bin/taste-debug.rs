@@ -218,17 +218,7 @@ fn main() -> Result<(), String> {
         ds.path = config::expand_process_env(&ds.path)?;
     }
     cache
-        .prepare_profile(&catalog, &pool_for_profile, &channel_dir)
-        .map_err(|e| format!("profile: {e}"))?;
-    // After the profile: its `exclude: true` entries name the ids `prepare`
-    // drops from the sets.
-    cache
-        .prepare(
-            &catalog,
-            &script_path,
-            pool_cfg.sources.as_ref(),
-            &cache.narrowing(&cli.pool),
-        )
+        .prepare_pool(&catalog, &pool_for_profile, &script_path, &channel_dir)
         .map_err(|e| format!("prepare: {e}"))?;
     if let Some(profile) = cache.profile(&cli.pool) {
         print_profile(profile);

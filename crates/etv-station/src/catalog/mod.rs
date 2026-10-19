@@ -209,8 +209,9 @@ impl Catalog {
     /// skipped** (ADR 0006). `missing_since IS NULL` is added unconditionally
     /// and is not expressible in the CEL — a config author cannot ask for
     /// missing entries, because there is nothing to play behind one. An entry
-    /// with a live source the filesystem ingest found unairable
-    /// ([`Self::set_source_unairable`]) is skipped the same way.
+    /// whose every live source the filesystem ingest found unairable
+    /// ([`Self::set_source_unairable`]) is skipped the same way; one with a
+    /// live airable source stays, and plays from it.
     ///
     /// Nothing else gains the filter. `no_repeat_within` spacing in
     /// [`crate::constrain`] still counts a missing entry's past airings (they
@@ -1131,7 +1132,7 @@ impl Catalog {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since \
+                "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since, unairable_reason \
                  FROM entry_sources WHERE entry_id IN ({placeholders}) \
                  ORDER BY entry_id, source, source_id"
             );
@@ -1146,7 +1147,7 @@ impl Catalog {
     /// Provenance rows for an entry, ordered by source then id.
     pub fn sources_for(&self, entry_id: &str) -> Result<Vec<EntrySource>, CatalogError> {
         let mut stmt = self.conn.prepare(
-            "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since
+            "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since, unairable_reason
              FROM entry_sources WHERE entry_id = ?1 ORDER BY source, source_id",
         )?;
         collect_sources(&mut stmt, params![entry_id])
@@ -1157,7 +1158,7 @@ impl Catalog {
     /// for path-match inherit.
     pub fn all_sources(&self) -> Result<Vec<EntrySource>, CatalogError> {
         let mut stmt = self.conn.prepare(
-            "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since
+            "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since, unairable_reason
              FROM entry_sources ORDER BY source, source_id",
         )?;
         collect_sources(&mut stmt, [])
@@ -1347,7 +1348,7 @@ pub fn like_escape(raw: &str) -> String {
 }
 
 /// Run a prepared `entry_sources` query (columns in the canonical `source,
-/// source_id, entry_id, playback_path, last_seen, missing_since` order) and map the result set
+/// source_id, entry_id, playback_path, last_seen, missing_since, unairable_reason` order) and map the result set
 /// into typed [`EntrySource`] rows. Rows are collected before parsing so the
 /// `source` discriminator's parse error can surface as a [`CatalogError`].
 fn collect_sources(
@@ -1363,12 +1364,21 @@ fn collect_sources(
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
         .map(
-            |(source, source_id, entry_id, playback_path, last_seen, missing_since)| {
+            |(
+                source,
+                source_id,
+                entry_id,
+                playback_path,
+                last_seen,
+                missing_since,
+                unairable_reason,
+            )| {
                 Ok(EntrySource {
                     source: source.parse().map_err(|m| CatalogError::BadRow {
                         field: "source",
@@ -1379,18 +1389,24 @@ fn collect_sources(
                     playback_path,
                     last_seen,
                     missing_since,
+                    unairable_reason,
                 })
             },
         )
         .collect()
 }
 
-/// The `resolve_query` predicate that drops an entry with a live source whose
-/// file ffprobe found unairable. A source marked missing keeps its reason but
-/// no longer counts: the file behind it is not the one a channel would play.
-const UNAIRABLE_FILTER: &str = "NOT EXISTS (SELECT 1 FROM entry_sources s \
+/// The `resolve_query` predicate that drops an entry whose every live source
+/// is one ffprobe found unairable. An entry that also has a live airable source
+/// stays: [`crate::resolve::pick_playback_source`] plays that one. A source
+/// marked missing keeps its reason but no longer counts: the file behind it is
+/// not the one a channel would play.
+const UNAIRABLE_FILTER: &str = "NOT (EXISTS (SELECT 1 FROM entry_sources s \
      WHERE s.entry_id = entries.entry_id AND s.unairable_reason IS NOT NULL \
-     AND s.missing_since IS NULL)";
+     AND s.missing_since IS NULL) \
+     AND NOT EXISTS (SELECT 1 FROM entry_sources a \
+     WHERE a.entry_id = entries.entry_id AND a.unairable_reason IS NULL \
+     AND a.missing_since IS NULL))";
 
 /// Column list for `entries`, in the order [`row_to_entry`] reads.
 const ENTRY_COLS: &str = "entry_id, type, title, title_sort, show, show_id, season, episode, \
@@ -1596,6 +1612,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: Some("2026-08-16T00:00:00Z".into()),
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
             c.add_external_id(ExternalNs::Imdb, id, "movie", id)
@@ -1722,6 +1739,7 @@ mod tests {
             playback_path: "/plex/dune.mkv".into(),
             last_seen: Some("2026-07-10T00:00:00Z".into()),
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         c.add_source(&EntrySource {
@@ -1731,6 +1749,7 @@ mod tests {
             playback_path: "/Volumes/media/dune.mkv".into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         let sources = c.sources_for("imdb:tt1").unwrap();
@@ -1858,6 +1877,7 @@ mod tests {
             playback_path: "/x".into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         c.add_tag("id1", TagNs::Genre, "Sci-Fi").unwrap();
@@ -2132,5 +2152,56 @@ mod tests {
 
         let hits = c.search_tag_values(TagNs::Genre, "heist", 10).unwrap();
         assert_eq!(hits, vec!["Heist"]);
+    }
+
+    /// An entry with a good Plex source and an fs source ffprobe rejected still
+    /// airs — from the Plex file. Only an entry with no airable live source is
+    /// dropped from the pool.
+    #[test]
+    fn an_unairable_source_excludes_the_entry_only_when_no_airable_source_remains() {
+        let c = cat();
+        let src = |entry: &str, source: Source, id: &str, path: &str| EntrySource {
+            source,
+            source_id: id.into(),
+            entry_id: entry.into(),
+            playback_path: path.into(),
+            last_seen: None,
+            missing_since: None,
+            unairable_reason: None,
+        };
+        for id in ["both", "bad_only", "plex_only"] {
+            c.upsert_entry(&Entry::new(id, "movie", id, Source::Plex))
+                .unwrap();
+        }
+        c.add_source(&src("both", Source::Plex, "plex-both", "/plex/both.mkv"))
+            .unwrap();
+        c.add_source(&src(
+            "both",
+            Source::LocalFs,
+            "/fs/both.mkv",
+            "/fs/both.mkv",
+        ))
+        .unwrap();
+        c.add_source(&src(
+            "bad_only",
+            Source::LocalFs,
+            "/fs/bad.mkv",
+            "/fs/bad.mkv",
+        ))
+        .unwrap();
+        c.add_source(&src("plex_only", Source::Plex, "plex-p", "/plex/p.mkv"))
+            .unwrap();
+        for id in ["/fs/both.mkv", "/fs/bad.mkv"] {
+            c.set_source_unairable(Source::LocalFs, id, Some("no video stream"))
+                .unwrap();
+        }
+
+        let mut got = c.resolve_query("item.title != ''").unwrap();
+        got.sort();
+        assert_eq!(got, vec!["both", "plex_only"]);
+
+        let sources = c.sources_for("both").unwrap();
+        let picked = crate::resolve::pick_playback_source(&sources).unwrap();
+        assert_eq!(picked.playback_path, "/plex/both.mkv");
     }
 }

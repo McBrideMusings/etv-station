@@ -1405,8 +1405,9 @@ impl ScoreCache {
     /// them. [`pick`] must be handed the same value, since the two together are
     /// the cache key.
     ///
-    /// `narrowing` is [`Self::narrowing`] for the pool, so a pool with a
-    /// profile runs [`Self::prepare_profile`] first. Every id it does not keep
+    /// `narrowing` is [`Self::narrowing`] for the pool, which is why callers go
+    /// through [`Self::prepare_pool`], the one place that resolves the profile
+    /// before the sets. Every id it does not keep
     /// is dropped from each resolved set before the set is built, so the
     /// script never sees an excluded title, or one a `require` entry did not
     /// match, in `ctx.sets` (etv-station-sctf.7). [`pick`] reads the same
@@ -1420,7 +1421,7 @@ impl ScoreCache {
     /// a scorer that took six minutes to rank a library held the station's only
     /// database connection for all six of them and every other channel queued
     /// behind it.
-    pub fn prepare(
+    fn prepare(
         &mut self,
         catalog: &Catalog,
         script_path: &Path,
@@ -1440,6 +1441,35 @@ impl ScoreCache {
         Ok(())
     }
 
+    /// Resolve `pool`'s profile, then its script's sets under the profile's
+    /// exclusions, in the one order that is correct: [`Self::narrowing`] is
+    /// empty until the profile is resolved, so a caller that resolved the sets
+    /// first would get unfiltered candidates with no error. `script_path` is
+    /// the pool's `plugin` already resolved to a path; the pool's own `sources`
+    /// table (#210) is read from `pool`.
+    pub fn prepare_pool(
+        &mut self,
+        catalog: &Catalog,
+        pool: &crate::config::Pool,
+        script_path: &Path,
+        base_dir: &Path,
+    ) -> Result<(), String> {
+        self.prepare_profile(catalog, pool, base_dir)?;
+        let narrowing = self.narrowing(&pool.name);
+        self.prepare(catalog, script_path, pool.sources.as_ref(), &narrowing)
+    }
+
+    /// Resolve a script's sets for one with no pool behind it (a fixture, a
+    /// harness): no profile, so nothing is excluded or required.
+    pub fn prepare_unprofiled(
+        &mut self,
+        catalog: &Catalog,
+        script_path: &Path,
+        sources: Option<&PoolSources>,
+    ) -> Result<(), String> {
+        self.prepare(catalog, script_path, sources, &Default::default())
+    }
+
     /// Load and resolve `pool`'s taste profile and `ignore_keywords` against
     /// the catalog, for [`pick`] to hand over as `ctx.profile` and
     /// `ctx.ignore_keywords`. Touches the catalog, so it belongs to the same
@@ -1452,7 +1482,7 @@ impl ScoreCache {
     /// opened fresh here exactly as [`GrantedCapabilities::with_datastores`]
     /// does for [`pick`], for the same reason: a `Reader::open` is one file
     /// open plus one `SELECT`, cheap enough to redo rather than cache.
-    pub fn prepare_profile(
+    fn prepare_profile(
         &mut self,
         catalog: &Catalog,
         pool: &crate::config::Pool,
@@ -3624,6 +3654,7 @@ fn audit(ctx, picks, workspace) { #{} }
             playback_path: "/x".into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         let mut cache = ScoreCache::default();

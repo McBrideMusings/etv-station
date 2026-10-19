@@ -820,17 +820,7 @@ fn score_pool(state: &mut AppState, pool_name: &str) -> Result<(), String> {
 
     state
         .cache
-        .prepare_profile(&state.catalog, &pw.pool, &channel_dir)
-        .map_err(|e| format!("profile: {e}"))?;
-    let excluded = state.cache.narrowing(pool_name);
-    state
-        .cache
-        .prepare(
-            &state.catalog,
-            &plugin_path,
-            pw.pool.sources.as_ref(),
-            &excluded,
-        )
+        .prepare_pool(&state.catalog, &pw.pool, &plugin_path, &channel_dir)
         .map_err(|e| format!("prepare: {e}"))?;
 
     let now = std::time::SystemTime::now()

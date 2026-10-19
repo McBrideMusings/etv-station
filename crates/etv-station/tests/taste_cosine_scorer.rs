@@ -151,6 +151,7 @@ fn add(cat: &Catalog, id: &str, kind: &str) {
         playback_path: format!("/media/{id}.mkv"),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 }
@@ -212,7 +213,7 @@ impl Scorer {
         // the catalog, `pick` below ranks what it found.
         let mut cache = ScoreCache::default();
         cache
-            .prepare(cat, &script, sources.as_ref(), &Default::default())
+            .prepare_unprofiled(cat, &script, sources.as_ref())
             .unwrap();
         Self {
             _dir: dir,
@@ -644,6 +645,7 @@ fn an_episode_with_no_show_id_never_reaches_a_shows_pool() {
         playback_path: "/media/orphan.mkv".into(),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 
@@ -1295,6 +1297,7 @@ fn add_episode(cat: &Catalog, show_id: &str, season: i64, episode: i64) {
         playback_path: format!("/media/{id}.mkv"),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 }
@@ -2008,25 +2011,15 @@ impl Scorer {
     /// `profile:` list exactly as a channel would author it — resolved the
     /// way the daemon resolves it, before `pick`.
     fn with_profile(mut self, cat: &Catalog, pool: &str, profile_yaml: &str) -> Self {
-        let pool: etv_station::config::Pool = serde_norway::from_str(&format!(
+        let mut pool: etv_station::config::Pool = serde_norway::from_str(&format!(
             "name: {pool}\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
              profile:\n{profile_yaml}",
             db = self.db.display(),
         ))
         .unwrap();
+        pool.sources = self.sources.clone();
         self.cache
-            .prepare_profile(cat, &pool, self._dir.path())
-            .unwrap();
-        // The profile's exclusions are part of what `prepare` resolves, so
-        // the sets are resolved again under them — as the daemon resolves a
-        // profiled pool, profile first.
-        self.cache
-            .prepare(
-                cat,
-                &self.script,
-                self.sources.as_ref(),
-                &self.cache.narrowing(&pool.name),
-            )
+            .prepare_pool(cat, &pool, &self.script, self._dir.path())
             .unwrap();
         self
     }

@@ -304,6 +304,13 @@ pub struct EntrySource {
     /// of a hole. Read sites that pick a file to play must prefer a live row —
     /// see [`crate::resolve::pick_playback_source`].
     pub missing_since: Option<String>,
+    /// Why the file behind this row cannot air (ffprobe found no usable
+    /// stream or duration), `None` = airable or not yet probed. Read back from
+    /// the catalog; [`Catalog::add_source`](crate::catalog::Catalog::add_source)
+    /// never writes it, [`Catalog::set_source_unairable`](crate::catalog::Catalog::set_source_unairable)
+    /// does. A row that carries a reason is never picked to play while an
+    /// airable live row exists — see [`crate::resolve::pick_playback_source`].
+    pub unairable_reason: Option<String>,
 }
 
 /// A Plex collection. Membership + order live in `collection_items`.

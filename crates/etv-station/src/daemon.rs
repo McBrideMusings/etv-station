@@ -4174,6 +4174,7 @@ order = "manual"
                 playback_path: format!("/nonexistent/etv-378/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
