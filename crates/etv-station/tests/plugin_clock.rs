@@ -124,6 +124,9 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                 entries: Vec::new(),
                 fallback: None,
                 filter: None,
+                align: None,
+                min_fill: None,
+                fill: Vec::new(),
                 mode: Mode::All,
                 order: Default::default(),
                 pools: vec![Pool {

@@ -11,7 +11,7 @@
 //!     //               comes before the next programme is chosen)
 //!     // ctx.prev    — item map for the programme before the gap, or ()
 //!     // ctx.channel — #{ name, number, logo, vocabulary }
-//!     // ctx.rng     — seeded from (channel, next.entry_id, air_date)
+//!     // ctx.rng     — seeded from (channel, next.entry_id, air_date, draw)
 //!     let t = timeline();
 //!     t.push(segment().black().fixed(2.0));
 //!     t
@@ -113,6 +113,10 @@ pub struct BumperInput {
     pub channel: ChannelInfo,
     /// `YYYY-MM-DD` the gap airs on, in the station's time zone.
     pub air_date: String,
+    /// Which draw of a chained gap this is, 0 for the first. Mixed into
+    /// `ctx.rng`'s seed from the second draw on, so back-to-back bumpers from
+    /// one script do not repeat each other's random picks.
+    pub draw: u32,
     /// Capabilities the channel granted this script; `ctx.probe`,
     /// `ctx.read`, `ctx.http` and `ctx.exec` error unless their name is here.
     pub granted: Vec<String>,
@@ -309,11 +313,11 @@ fn ctx_map(input: &BumperInput) -> Result<Dynamic, String> {
             .into(),
     );
 
-    let rng = Rng::new(rng_seed(
-        &input.channel.name,
-        entry_id.as_deref(),
-        &input.air_date,
-    ));
+    let mut seed = rng_seed(&input.channel.name, entry_id.as_deref(), &input.air_date);
+    if input.draw > 0 {
+        seed = crate::pattern::mix_seed(seed, u64::from(input.draw));
+    }
+    let rng = Rng::new(seed);
     let mut ctx = Map::new();
     ctx.insert("gap_ms".into(), (input.gap_ms as i64).into());
     ctx.insert("next".into(), item(&input.next));
@@ -1190,6 +1194,7 @@ mod tests {
                 vocabulary: vec!["alpha".into(), "beta".into(), "gamma".into()],
             },
             air_date: "2026-10-17".into(),
+            draw: 0,
             granted: Vec::new(),
             history: None,
         }

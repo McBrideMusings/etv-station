@@ -575,6 +575,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 
@@ -607,6 +608,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -632,6 +634,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -653,6 +656,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 
@@ -732,6 +736,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         };
         let err = cache.resolve_all(vec![bad]).await.unwrap_err();
         assert!(matches!(err, StationError::MissingField { .. }));
