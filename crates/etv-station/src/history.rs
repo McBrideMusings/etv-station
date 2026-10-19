@@ -92,9 +92,8 @@ pub struct PlayRecord {
     /// again and the channel would show the same error card on repeat. The
     /// slot genuinely was broadcast, so the series genuinely advanced.
     ///
-    /// What it must NOT do is count as *watched*: the taste scorer reads these
-    /// rows to learn what has been seen recently, and nobody saw this film.
-    /// [`HistoryDb::tail`] filters on this flag.
+    /// [`HistoryDb::tail`] counts it too: a title whose file cannot be read
+    /// must still be damped by recency, or it is drawn again every generation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub error_card: bool,
 
@@ -620,18 +619,16 @@ impl HistoryDb {
     /// answer as one that doesn't. Equal starts resolve to the later
     /// insertion.
     ///
-    /// Airings that showed an error card are left out. Both callers ask this
-    /// question about content the viewer actually saw — the adjacency seam
-    /// ("don't repeat what just played") and the scorer's recency input — and
-    /// a slot that showed a "file not found" card played none of the film it
-    /// was meant to. [`HistoryDb::series_cursor`] deliberately does the
-    /// opposite and counts them, because the series still advanced past that
-    /// item.
+    /// Airings that showed an error card are included, like
+    /// [`HistoryDb::series_cursor`]. The adjacency seam and the scorer's
+    /// recency input both ask what the schedule already spent a slot on; a
+    /// title whose file cannot be read would otherwise keep its rank and be
+    /// drawn again every generation, each time costing a slot of error card.
     pub fn tail(&self, channel: &str, n: usize) -> Result<Vec<String>, HistoryError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT entry_id FROM airings
-             WHERE channel = ?1 AND error_card = 0 AND kind = 'programme'
+             WHERE channel = ?1 AND kind = 'programme'
              ORDER BY start_ns DESC, id DESC
              LIMIT ?2",
         )?;
@@ -999,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn error_card_airings_count_for_the_cursor_but_not_the_tail() {
+    fn error_card_airings_count_for_the_cursor_and_the_tail() {
         let db = HistoryDb::open_in_memory().unwrap();
         db.record(
             "ch1",
@@ -1021,8 +1018,8 @@ mod tests {
             db.series_cursor("ch1").unwrap().get("show:got").unwrap(),
             "got-e2"
         );
-        // Nobody saw it, so it is not in what the scorer/seam consider "aired".
-        assert_eq!(db.tail("ch1", 2).unwrap(), vec!["got-e1"]);
+        // The slot was spent on it, so the scorer/seam see it as aired.
+        assert_eq!(db.tail("ch1", 2).unwrap(), vec!["got-e1", "got-e2"]);
     }
 
     #[test]

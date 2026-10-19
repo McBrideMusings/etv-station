@@ -7,12 +7,12 @@
 //   line_gap   seconds between lines (default: the first 60% of the item,
 //              split evenly)
 //   font_size  pixels (default 40)
-//   font_family  default Inter, the bundled family, which has the bold face
+//   font_family  default sans-serif, the OS sans-serif; a family from the station's `fonts:` list may be named instead
 let v = if vars.lines != () { vars } else { config };
 let lines = v.lines ?? [];
 let n = lines.len();
 let size = v.font_size ?? 40.0;
-let family = v.font_family ?? "Inter";
+let family = v.font_family ?? "sans-serif";
 let gap = v.line_gap ?? (if item_duration > 0.0 && n > 0 { item_duration * 0.6 / n } else { 1.5 });
 
 let text = "";

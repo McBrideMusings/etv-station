@@ -3,6 +3,8 @@
 //! lays over a frame of the airing a tune-in sample lands on. Both go through
 //! [`render_rgba`], so the still a reviewer looks at and the frame the running
 //! overlay process draws come from the same engine and the same renderer.
+use std::path::PathBuf;
+
 use crate::overlay_spec::{OverlayKind, OverlaySpec};
 use crate::program_context::ProgramContext;
 use crate::rhai_engine::RhaiEngine;
@@ -20,16 +22,19 @@ const NEXT_TITLE_PROBE: &str = "\u{E000}next";
 
 /// Render `spec` at script time `time` against `program`, as the raw frame
 /// bytes the overlay process would write to its fifo: `spec.width *
-/// spec.height` pixels in `spec.pixel_format`.
+/// spec.height` pixels in `spec.pixel_format`. `fonts` are the station's
+/// `fonts:` entries, registered the way the overlay process registers them.
 pub fn render_rgba(
     spec: &OverlaySpec,
     time: f64,
     program: &ProgramContext,
+    fonts: &[PathBuf],
 ) -> anyhow::Result<Vec<u8>> {
     let engine = RhaiEngine::for_spec(spec)?;
     let frame_index = (time * spec.framerate.max(1) as f64) as u64;
     let state = engine.evaluate(time, frame_index, program);
-    let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
+    let mut renderer =
+        VelloRenderer::new_with_fonts(spec.width, spec.height, spec.pixel_format, fonts)?;
     renderer.render_frame(&state)
 }
 

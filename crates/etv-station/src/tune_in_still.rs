@@ -60,6 +60,8 @@ pub struct TuneInStill {
     /// What the overlay process draws during the airing's block, or `None`.
     pub overlay: Option<OverlaySpec>,
     pub program: ProgramContext,
+    /// The station's `fonts:` entries, registered for the overlay render.
+    pub fonts: Vec<PathBuf>,
 }
 
 /// What [`TuneInStill::render`] drew.
@@ -100,6 +102,7 @@ impl TuneInStill {
         remap: &MediaRemap,
         overlays: &ChannelOverlays,
         video: &VideoNormalizationConfig,
+        fonts: &[PathBuf],
         at: Neighbours<'_>,
         into: Duration,
     ) -> Result<Self, Unavailable> {
@@ -140,6 +143,7 @@ impl TuneInStill {
             canvas,
             overlay,
             program: program_context(prev, airing, next, into),
+            fonts: fonts.to_vec(),
         })
     }
 
@@ -190,6 +194,12 @@ impl TuneInStill {
             self.at_secs, self.canvas.0, self.canvas.1
         ));
         h.update(format!("{:?}", self.program));
+        for font in etv_overlay::fonts::expand(&self.fonts).unwrap_or_default() {
+            h.update(font.to_string_lossy().as_bytes());
+            if let Ok(meta) = std::fs::metadata(&font) {
+                h.update(format!("|{}", meta.len()));
+            }
+        }
         if let Some(spec) = &self.overlay {
             h.update(serde_json::to_vec(spec).unwrap_or_default());
             let scripts = spec.graphics.iter().filter_map(|g| g.script.as_ref());
@@ -227,7 +237,7 @@ impl TuneInStill {
             let moment = etv_overlay::still::lookahead_moment(spec, &self.program)
                 .map_err(|e| format!("overlay script: {e}"))?;
             let t = moment.unwrap_or(0.0);
-            let rgba = etv_overlay::still::render_rgba(spec, t, &self.program)
+            let rgba = etv_overlay::still::render_rgba(spec, t, &self.program, &self.fonts)
                 .map_err(|e| format!("overlay render: {e}"))?;
             overlay_frame = Some((spec, rgba));
             rendered = RenderedStill {
@@ -430,6 +440,7 @@ mod tests {
             remap,
             overlays,
             &video(size),
+            &[],
             Neighbours {
                 prev: None,
                 airing: &now,
@@ -609,6 +620,7 @@ mod tests {
             canvas,
             overlay,
             program: ProgramContext::unknown(),
+            fonts: Vec::new(),
         }
     }
 
@@ -720,6 +732,7 @@ mod tests {
             canvas: (64, 36),
             overlay: Some(spec),
             program: ProgramContext::unknown(),
+            fonts: Vec::new(),
         };
         let before = still.digest();
         std::fs::write(&logo, b"two").unwrap();

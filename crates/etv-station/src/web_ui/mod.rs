@@ -2180,6 +2180,7 @@ fn offer_still(
         &MediaRemap::from_env(),
         &lc.overlays,
         &station.station.normalization.video,
+        &station.station.fonts,
         at,
         into,
     ) {

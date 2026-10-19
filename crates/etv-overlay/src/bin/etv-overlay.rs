@@ -90,6 +90,11 @@ const _: () = assert!(
 #[command(name = "etv-overlay")]
 #[command(about = "Vello+Rhai overlay renderer for Velo phase B spike")]
 struct Cli {
+    /// A font file, or a directory of `.ttf`/`.otf`/`.ttc` files, whose
+    /// families text layers may name. Repeatable. The OS sans-serif is the
+    /// fallback for any family nothing provides.
+    #[arg(long = "font", global = true)]
+    fonts: Vec<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -346,7 +351,7 @@ fn main() -> anyhow::Result<()> {
             output,
             time,
             program,
-        } => render_still(config, output, time, program),
+        } => render_still(config, output, time, program, &cli.fonts),
         Cmd::Run {
             input,
             config,
@@ -354,7 +359,7 @@ fn main() -> anyhow::Result<()> {
             fifo,
             ffmpeg,
             keep_fifo,
-        } => run_with_ffmpeg(input, config, output, fifo, ffmpeg, keep_fifo),
+        } => run_with_ffmpeg(input, config, output, fifo, ffmpeg, keep_fifo, &cli.fonts),
         Cmd::Watch {
             input,
             item,
@@ -363,13 +368,15 @@ fn main() -> anyhow::Result<()> {
             ffmpeg,
             time_scale,
             program,
-        } => watch(input, item, config, fifo, ffmpeg, time_scale, program),
+        } => watch(
+            input, item, config, fifo, ffmpeg, time_scale, program, &cli.fonts,
+        ),
         Cmd::Pipe {
             fifo,
             create_fifo,
             ready_file,
             playout_folder,
-        } => pipe_to_fifo(fifo, create_fifo, ready_file, playout_folder),
+        } => pipe_to_fifo(fifo, create_fifo, ready_file, playout_folder, &cli.fonts),
         Cmd::DumpText {
             spec,
             program,
@@ -406,9 +413,10 @@ fn render_still(
     output: PathBuf,
     time: f64,
     program: PreviewProgram,
+    fonts: &[PathBuf],
 ) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&config)?;
-    let frame = etv_overlay::still::render_rgba(&spec, time, &program_context_for(program))?;
+    let frame = etv_overlay::still::render_rgba(&spec, time, &program_context_for(program), fonts)?;
     write_png(&output, spec.width, spec.height, &frame)?;
     tracing::info!(path = %output.display(), "wrote still frame");
     Ok(())
@@ -454,6 +462,7 @@ fn run_with_ffmpeg(
     fifo: Option<PathBuf>,
     ffmpeg_bin: Option<PathBuf>,
     keep_fifo: bool,
+    fonts: &[PathBuf],
 ) -> anyhow::Result<()> {
     let spec = OverlaySpec::from_path(&config)?;
     let fifo_path = fifo.unwrap_or_else(|| default_fifo_path("run"));
@@ -515,7 +524,8 @@ fn run_with_ffmpeg(
     ) {
         return Ok(());
     }
-    let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
+    let mut renderer =
+        VelloRenderer::new_with_fonts(spec.width, spec.height, spec.pixel_format, fonts)?;
     let engine = RhaiEngine::for_spec(&spec)?;
 
     let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
@@ -647,6 +657,7 @@ impl WatchItem {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn watch(
     input: Option<PathBuf>,
     item: Option<serde_json::Value>,
@@ -655,6 +666,7 @@ fn watch(
     ffmpeg_bin: Option<PathBuf>,
     time_scale: f64,
     preview: PreviewProgram,
+    fonts: &[PathBuf],
 ) -> anyhow::Result<()> {
     let mut spec = OverlaySpec::from_path(&config)?;
     let base_geometry = spec.geometry();
@@ -757,7 +769,8 @@ fn watch(
     ) {
         return Ok(());
     }
-    let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
+    let mut renderer =
+        VelloRenderer::new_with_fonts(spec.width, spec.height, spec.pixel_format, fonts)?;
     let mut engine = RhaiEngine::for_spec(&spec)?;
     let explicit_metadata = preview.metadata.is_some();
     let mut program = program_context_for(preview);
@@ -914,6 +927,7 @@ fn pipe_to_fifo(
     create_fifo: bool,
     ready_file: Option<PathBuf>,
     playout_folder: PathBuf,
+    fonts: &[PathBuf],
 ) -> anyhow::Result<()> {
     die_with_parent()?;
     // The station's `prepare_generation` writes `overlay.json` for every
@@ -958,7 +972,8 @@ fn pipe_to_fifo(
     // guarantees ffmpeg can't read a partial frame during cold-start: nothing
     // hits the pipe until we have a complete RGBA buffer ready to write.
     // See https://github.com/McBrideMusings/etv-station/issues/54.
-    let mut renderer = VelloRenderer::new(base.width, base.height, base.pixel_format)?;
+    let mut renderer =
+        VelloRenderer::new_with_fonts(base.width, base.height, base.pixel_format, fonts)?;
     let mut active_spec = timeline_source.spec_at(OffsetDateTime::now_utc()).cloned();
     let mut engine = build_engine_for(active_spec.as_ref())?;
     let mut item_engine = ItemOverlayEngine::default();

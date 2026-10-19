@@ -327,6 +327,7 @@ mod tests {
                 normalization: crate::config::station::empty_normalization_for_test(),
                 guide: Default::default(),
                 idle_grace_seconds: None,
+                fonts: vec![],
             },
             channels: vec![LoadedChannel {
                 overlays: Default::default(),

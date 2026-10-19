@@ -191,6 +191,15 @@ pub struct StationConfig {
     /// floor: a smaller value is raised to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_grace_seconds: Option<u64>,
+
+    /// Fonts overlay text may name, beyond the OS's own: font files, or
+    /// directories whose `.ttf`/`.otf`/`.ttc` files all count, resolved
+    /// relative to the station config's directory. Station-wide — every
+    /// overlay process registers every listed font. A family no listed font
+    /// provides renders in the OS sans-serif. A path that does not exist or is
+    /// not a font fails the load. No font ships in the binary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fonts: Vec<PathBuf>,
 }
 
 /// The station-level `guide:` block.
