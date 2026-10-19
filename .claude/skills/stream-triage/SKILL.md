@@ -1,6 +1,6 @@
 ---
 name: stream-triage
-description: "Diagnose a channel that froze, buffered, or stuttered for a real viewer — reading the server's three clocks (viewer, ffmpeg, overlay) and the tvOS client's logs. Use for 'the stream froze', 'it's buffering', 'channel N is stuck', or any playback complaint from a device."
+description: "Diagnose a channel that froze, buffered, or stuttered for a real viewer — reading the server's clocks (viewer, ffmpeg, overlay, published playlist) and the tvOS client's logs. Use for 'the stream froze', 'it's buffering', 'channel N is stuck', or any playback complaint from a device."
 user_invocable: true
 ---
 
