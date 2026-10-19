@@ -33,10 +33,11 @@
 //! so [`PlexClient::fetch_labels`] instead walks each section's label list
 //! and, per label, asks for its members directly — the same
 //! list-then-fetch-members shape [`PlexClient::fetch_collections`] already
-//! uses. A label carries no `updatedAt` to delta against, so every ingest
+//! uses. A label carries no `updatedAt` to delta against, so a full ingest
 //! pass fetches every label's complete current membership and
 //! [`ingest_labels`] reconciles the whole `label` namespace wholesale rather
-//! than per entry.
+//! than per entry. A delta pass fetches no labels and leaves the stored ones
+//! untouched (#207).
 //!
 //! [`ingest`] takes a `since` cursor: when set, each section is asked
 //! only for records with `updatedAt>=since` and a collection whose own
@@ -649,7 +650,7 @@ pub struct LabelIngestStats {
 /// [`ingest_items`] reconciles per entry because each item's own record
 /// carries its current values, a label cannot be reconciled that way: Plex's
 /// bulk listing never carries `Label`, so nothing visits "this entry's
-/// labels" as a unit. Instead every ingest pass fetches every label's
+/// labels" as a unit. Instead every full ingest pass fetches every label's
 /// *complete* current membership (see [`PlexClient::fetch_labels`]) and this
 /// function clears the whole `label` namespace before writing that pass back
 /// — the wholesale reconcile, taken one level up from per-entry because the
@@ -717,21 +718,32 @@ pub fn ingest(
         collections = collections.len(),
         "fetched collections; fetching labels next",
     );
-    // Labels carry no `updatedAt` to delta against (#136), so this is not
-    // gated on `since` — every pass fetches every label's complete current
-    // membership. See `ingest_labels`' doc comment for why that is what makes
-    // its wholesale-clear reconcile correct.
-    let labels = client.fetch_labels()?;
-    tracing::info!(
-        event = "catalog.ingest.plex_labels_fetched",
-        labels = labels.len(),
-        "fetched labels; writing to the catalog",
-    );
+    // Labels carry no `updatedAt` to delta against (#136), so a fetch is only
+    // correct when complete: `ingest_labels` clears the whole namespace first.
+    // A delta pass therefore skips labels altogether (#207) and leaves the
+    // stored ones alone; the next full sweep reconciles them, so a label change
+    // lags by up to `full_sweep_after_secs`, as a deleted collection does. That
+    // includes a label on an item that first appears in a delta.
+    let labels = if since.is_none() {
+        let labels = client.fetch_labels()?;
+        tracing::info!(
+            event = "catalog.ingest.plex_labels_fetched",
+            labels = labels.len(),
+            "fetched labels; writing to the catalog",
+        );
+        Some(labels)
+    } else {
+        tracing::info!(
+            event = "catalog.ingest.plex_labels_skipped",
+            "delta pass; keeping stored labels until the next full sweep",
+        );
+        None
+    };
     let stats = write_pass(
         catalog,
         &items,
         &collections,
-        &labels,
+        labels.as_deref(),
         identity_roots,
         since,
         started,
@@ -765,7 +777,7 @@ fn write_pass(
     catalog: &Catalog,
     items: &[PlexItem],
     collections: &[ParsedCollection],
-    labels: &[ParsedLabel],
+    labels: Option<&[ParsedLabel]>,
     identity_roots: &[String],
     since: Option<i64>,
     started: i64,
@@ -775,7 +787,11 @@ fn write_pass(
     let prune_absent = since.is_none();
     catalog.in_transaction(|c| {
         let mut stats = ingest_items(c, items, identity_roots)?;
-        ingest_labels(c, labels)?;
+        // `None` is a delta pass that did not fetch labels; clearing the
+        // namespace on it would erase every label.
+        if let Some(labels) = labels {
+            ingest_labels(c, labels)?;
+        }
         ingest_collections(c, collections, prune_absent)?;
         // Reconcile *item* deletions, the same contract `ingest_collections`
         // has had all along and the fs ingester has had since #144. A title
@@ -1647,9 +1663,9 @@ impl PlexClient {
     ///
     /// A label carries no `updatedAt`, unlike a collection, so there is no
     /// analogue of `fetch_collections`' `since` skip: every call re-fetches
-    /// every label's complete current membership. That is deliberate — see
-    /// [`ingest_labels`]' doc comment for why the wholesale reconcile depends
-    /// on this fetch always being complete, never delta'd.
+    /// every label's complete current membership. [`ingest`] therefore calls
+    /// it on full passes only (#207) — see [`ingest_labels`]' doc comment for
+    /// why the wholesale reconcile depends on this fetch never being delta'd.
     ///
     /// Verified directly against the live server (#136): the same label list
     /// comes back for every section regardless of its `key` — Plex's labels
@@ -2191,9 +2207,9 @@ mod tests {
         };
 
         let cat = Catalog::open_in_memory().unwrap();
-        write_pass(&cat, &items, &[], &[], &roots, None, 1).unwrap();
+        write_pass(&cat, &items, &[], Some(&[]), &roots, None, 1).unwrap();
         age_plex_rows(&cat);
-        let delta = write_pass(&cat, &items[..2], &[], &[], &roots, Some(1), 2).unwrap();
+        let delta = write_pass(&cat, &items[..2], &[], None, &roots, Some(1), 2).unwrap();
         assert_eq!(delta.sources_marked_missing, 0);
         assert_eq!(delta.entries_marked_missing, 0);
         assert_eq!(live(&cat), 4, "a delta pass must prune nothing");
@@ -2204,7 +2220,7 @@ mod tests {
             "a delta must not advance the full-pass timestamp"
         );
 
-        let full = write_pass(&cat, &items[..2], &[], &[], &roots, None, 3).unwrap();
+        let full = write_pass(&cat, &items[..2], &[], Some(&[]), &roots, None, 3).unwrap();
         assert_eq!(full.sources_marked_missing, 2);
         assert_eq!(full.entries_marked_missing, 2);
         assert_eq!(live(&cat), 2);
@@ -4266,6 +4282,35 @@ mod tests {
             cat.tags_for("imdb:tt-y", TagNs::Label).unwrap().is_empty(),
             "a label removed upstream must not survive a re-ingest"
         );
+    }
+
+    /// A delta pass fetches no labels (#207), so it must leave the stored ones
+    /// alone; only a full pass, which fetched them all, reconciles the namespace.
+    #[test]
+    fn delta_pass_keeps_labels_and_full_pass_reconciles_them() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = vec!["/data/media".to_string()];
+        let item = movie(
+            "plex-y",
+            "/data/media/movies/Y.mkv",
+            &[(ExternalNs::Imdb, "tt-y")],
+        );
+        let christmas = [ParsedLabel {
+            name: "Christmas".into(),
+            member_rating_keys: vec!["plex-y".into()],
+        }];
+        let items = [item];
+        write_pass(&cat, &items, &[], Some(&christmas), &roots, None, 1).unwrap();
+
+        write_pass(&cat, &items, &[], None, &roots, Some(1), 2).unwrap();
+        assert_eq!(
+            cat.tags_for("imdb:tt-y", TagNs::Label).unwrap(),
+            vec!["Christmas".to_string()],
+            "a delta pass must not erase labels it never fetched"
+        );
+
+        write_pass(&cat, &items, &[], Some(&[]), &roots, None, 3).unwrap();
+        assert!(cat.tags_for("imdb:tt-y", TagNs::Label).unwrap().is_empty());
     }
 
     #[test]
