@@ -216,7 +216,7 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     check_plugins: Option<PathBuf>,
 
-    /// Serve the station's web dashboard (`/`, plus the Tune page) instead of
+    /// Serve the station's web dashboard (`/`) instead of
     /// running the daemon. It reads `--config`'s lineup and `catalog_path`
     /// (after `ETV_STATION_CATALOG`) and writes nothing to either. The
     /// container entrypoint runs this beside the daemon and ETV-next.

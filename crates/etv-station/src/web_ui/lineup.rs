@@ -3,37 +3,23 @@
 
 use super::*;
 
-/// One `pattern:` step of a channel — which pool it draws from and whether
-/// that pool is scored by a plugin (has a `plugin:`), which is what makes its
-/// taste profile editable. A channel with any such step is `scored` in the
-/// lineup.
-pub(super) struct PlanStep {
-    pub(super) block_index: usize,
-    pub(super) pool_name: String,
-    pub(super) has_plugin: bool,
-}
-
-/// Every `pattern:` step across `channel`'s blocks, in block-then-pattern order.
-pub(super) fn pattern_plan(channel: &config::ChannelConfig) -> Vec<PlanStep> {
-    let mut out = Vec::new();
-    for (block_index, block) in channel.rule.all_blocks().enumerate() {
-        if !block.is_pattern() {
-            continue;
-        }
-        for step in &block.pattern {
-            let has_plugin = block
-                .pools
-                .iter()
-                .find(|p| p.name == step.pool)
-                .is_some_and(|p| p.plugin.is_some());
-            out.push(PlanStep {
-                block_index,
-                pool_name: step.pool.clone(),
-                has_plugin,
-            });
-        }
-    }
-    out
+/// Whether a `pattern:` step of `channel` draws from a pool scored by a plugin
+/// (a pool with a `plugin:`), which is what gives it a taste profile to edit.
+/// Such a channel is `scored` in the lineup.
+pub(super) fn has_scorer(channel: &config::ChannelConfig) -> bool {
+    channel
+        .rule
+        .all_blocks()
+        .filter(|b| b.is_pattern())
+        .any(|block| {
+            block.pattern.iter().any(|step| {
+                block
+                    .pools
+                    .iter()
+                    .find(|p| p.name == step.pool)
+                    .is_some_and(|p| p.plugin.is_some())
+            })
+        })
 }
 
 /// A channel's folder name (`034-syfy`).
@@ -86,7 +72,7 @@ pub(super) fn api_lineup(state: &AppState) -> Result<(u16, Value), String> {
                 "channel": key,
                 "number": loaded.map(|c| c.config.number),
                 "display_name": loaded.and_then(|c| c.config.display_name.clone()),
-                "scored": loaded.is_some_and(|c| pattern_plan(&c.config).iter().any(|s| s.has_plugin)),
+                "scored": loaded.is_some_and(|c| has_scorer(&c.config)),
                 "error": error,
             })
         })

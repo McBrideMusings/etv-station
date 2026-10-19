@@ -6,10 +6,11 @@
 # asks again every 15s until the projection arrives, never returning the 202.
 #
 # Usage:
-#   tools/ui-get.sh <path> [--prod]
+#   tools/ui-get.sh [-X METHOD] [-d JSON] <path> [--prod]
 #   tools/ui-get.sh /api/lineup
 #   tools/ui-get.sh '/api/channels/034-syfy/review?project=3d'
 #   tools/ui-get.sh /api/health --prod
+#   tools/ui-get.sh -X POST -d '{}' /api/channels/001-for-you/drafts
 #
 # Local is http://127.0.0.1:${ETV_UI_PORT:-4747} (tools/station-ui.sh). --prod
 # is ${ETV_UI_PROD_URL}, else http://${UNRAID_HOST}:4747, read from .env.
@@ -20,16 +21,21 @@
 # runs out.
 set -euo pipefail
 
-usage() { echo "usage: tools/ui-get.sh <path> [--prod]" >&2; exit 2; }
+usage() { echo "usage: tools/ui-get.sh [-X METHOD] [-d JSON] <path> [--prod]" >&2; exit 2; }
 
 path=""
 prod=0
-for arg in "$@"; do
-  case "$arg" in
+method="GET"
+data=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --prod) prod=1 ;;
+    -X) [ $# -ge 2 ] || usage; method="$2"; shift ;;
+    -d) [ $# -ge 2 ] || usage; data="$2"; shift ;;
     -h|--help) usage ;;
-    *) [ -z "$path" ] || usage; path="$arg" ;;
+    *) [ -z "$path" ] || usage; path="$1" ;;
   esac
+  shift
 done
 [ -n "$path" ] || usage
 case "$path" in /*) ;; *) path="/$path" ;; esac
@@ -64,7 +70,9 @@ body="$(mktemp)"
 trap 'rm -f "$body"' EXIT
 deadline=$(( $(date +%s) + ${ETV_UI_WAIT:-900} ))
 while :; do
-  if ! status="$(curl -sS --max-time 60 -o "$body" -w '%{http_code}' "$base$path")"; then
+  curl_args=(-sS --max-time 600 -X "$method" -o "$body" -w '%{http_code}')
+  [ -z "$data" ] || curl_args+=(-H 'Content-Type: application/json' -d "$data")
+  if ! status="$(curl "${curl_args[@]}" "$base$path")"; then
     echo "ui-get: cannot reach $base$path" >&2
     exit 2
   fi

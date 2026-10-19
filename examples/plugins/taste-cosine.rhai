@@ -118,7 +118,7 @@ fn exploration_fraction(ctx) { tunable(ctx, "exploration_fraction", 0.2).to_floa
 // How many candidates ranked immediately above a pick get named in that
 // pick's audit trail as near misses (#393). Bounded by the script, not the
 // station — overridable per pool via `config:` like every other tunable
-// here. A full candidate dump stays taste-debug's job; this is just enough
+// here. A full candidate dump is Channels > Pools in the web dashboard; this is just enough
 // to answer "what did this beat" without growing the chunk file per item.
 fn near_miss_limit(ctx) { tunable(ctx, "near_miss_limit", 3).to_int() }
 

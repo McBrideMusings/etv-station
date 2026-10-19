@@ -558,7 +558,7 @@ impl SimCache {
             .find(|c| c.config_path == req.config_path)
             .ok_or_else(|| format!("{} is no longer in the lineup", req.channel))?;
         let tz = crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
-        let account_id = super::tune::channel_account_id(&lc.config)?;
+        let account_id = super::pools::channel_account_id(&lc.config)?;
         let ledger = Ledger::seeded(
             req.tail.clone(),
             req.cursor.clone(),

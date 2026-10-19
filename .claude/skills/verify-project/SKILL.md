@@ -25,12 +25,11 @@ for three orchestrate rounds.
 ```
 
 The web UI's pages are plain HTML with an inline script that no cargo test loads.
-Run the load check after any edit to `crates/etv-station/src/web_ui/shell.html` or `tune.html`:
+Run the load check after any edit to `crates/etv-station/src/web_ui/shell.html`:
 
 ```bash
 node tools/ui-page-check.js crates/etv-station/src/web_ui/shell.html
-node tools/ui-page-check.js crates/etv-station/src/web_ui/tune.html
-# expect: dashboard page script loads without error, once per page
+# expect: dashboard page script loads without error
 ```
 
 The script is the only place the command list lives — `CLAUDE.md` and `admin.toml`
@@ -61,6 +60,15 @@ for that airing's stored audit record; the HTTP-seam test is
 To see the Guide against a running stack: start `./tools/dev-run.sh` (ETV-next on 8409), start
 `./tools/station-ui.sh`, open `http://127.0.0.1:4747/#/guide`. Stop ETV-next and reload to see
 the error-upstream state, which names the URLs tried.
+
+Clicking a channel name in the Guide plays `{base}/channel/{n}.m3u8` in a player in the rail: native
+HLS where `canPlayType('application/vnd.apple.mpegurl')` answers (Safari, recent Chrome), otherwise
+hls.js from `GET /assets/hls.min.js` (embedded in the binary, test
+`web_ui::tests::the_embedded_hls_script_is_served_from_the_dashboard`). A manifest 404 shows
+"Cannot play <url> / Network error: HTTP 404 …" under the video. With no stack running, a stand-in
+server answering `/api/health`, `/channels.m3u`, `/xmltv.xml`, `/assets/hls.min.js` and
+`/channel/{n}.m3u8` (an `ffmpeg -f hls` testsrc) exercises the page; to force the hls.js path in a
+browser with native HLS, override `HTMLMediaElement.prototype.canPlayType` to return `''` first.
 
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
@@ -341,8 +349,8 @@ cp examples/plugins/taste-cosine.rhai "$SIM/appdata/plugins/"
 # in $SIM/appdata/channels/034-syfy/channel.yaml: seed: { rotate: 2d },
 # temperature: 0.5, films pools advance: resume, shows pools temperature: 0
 set -a; . /Users/pierce/Projects/etv-station/.env; set +a
-export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/plexdb.snapshot.db
-export ETV_STATION_CATALOG=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/catalog.db
+export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/station-cache/plexdb.snapshot.db
+export ETV_STATION_CATALOG=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/station-cache/catalog.db
 cargo run --release --bin etv-station -- \
   --config "$SIM/appdata/station.yaml" --serve-ui --ui-port <PORT>
 ETV_UI_PORT=<PORT> tools/ui-get.sh '/api/channels/034-syfy/review?project=14d' > a.json   # twice: a.json, b.json
@@ -1060,8 +1068,8 @@ Look for, observed 2026-10-18 on a native build: health 200 within 2s of start,
 `<title>etv-station</title>` at `/`, `/channels.m3u` still 200 on
 8409, and `docker exec <ctr> ps -eo pid,ni,args` showing the `--serve-ui` process
 at NI 19 while the daemon and `ersatztv` sit at 0. After `docker kill -s TERM`, the
-`--serve-ui` process is gone within 3s. `POST /api/select` with a path outside the
-lineup answers 400 "is not a tunable channel in this station's lineup".
+`--serve-ui` process is gone within 3s. `GET /api/channels/nope/pools` answers 404 "no
+channel".
 
 **The dashboard** is one page at `/`: tabs (Channels, Guide, Health) and, on
 Channels, a lineup rail fed by `GET /api/lineup` (every lineup channel in
@@ -1074,10 +1082,32 @@ then screenshot, light and dark: a channel's Schedule populated, its Pattern, th
 pending state (a fresh channel while the worker is busy), a 404 key
 (`#/channels/nope/schedule` shows "The review could not be built"), Guide and
 Health (each "Not built yet"), and the page at 400px wide (the rail folds into a
-picker). `/tune` still serves the Tune page. After restarting the server on a new
+picker). After restarting the server on a new
 build, load `about:blank` before the dashboard URL: a navigation that changes only
 the hash keeps the old page's script running, so every screenshot after it shows
 the previous build.
+
+**Channels › Pools** is `#/channels/{ch}/pools?draft=ID`, answered by
+`GET /api/channels/{ch}/pools?draft=ID`. Drive it with `tools/ui-get.sh` (it takes `-X` and `-d`):
+
+```bash
+tools/ui-get.sh /api/channels/034-syfy/pools | jq '.pools|keys'        # non-scored channel: every pool, sources and config, no ranking
+tools/ui-get.sh /api/channels/001-for-you/pools | jq '.pools.movies.ranking[:3]'
+D=$(tools/ui-get.sh -X POST -d '{}' /api/channels/001-for-you/drafts | jq -r .draft)
+tools/ui-get.sh -X POST -d '{"op":"add","pool":"movies","entry":{"keyword":"<kw>","weight":3}}' /api/channels/001-for-you/drafts/$D/edits | jq '.pools.movies.ranking[:3]'
+tools/ui-get.sh "/api/channels/001-for-you/drafts/$D/yaml?pool=movies"   # the edited profile:
+tools/ui-get.sh -X DELETE /api/channels/001-for-you/drafts/$D
+```
+
+Look for: the edited ranking differs from the deployed one and its items carry
+`movement`; the YAML holds the added entry; the log file holds one `ui.draft.edit`
+line per edit with the draft id, pool, op, entry and `top_ranks`; a request naming
+the discarded draft answers 404. Screenshot, light and dark: no draft, a draft with
+edits (draft bar, movement column), the pending state while a ranking runs (the
+"Ranking…" line; a pool ranks in 10-22s on the real catalog), and an error-server
+state (`#/channels/001-for-you/pools?draft=gone` first shows the 404 notice, then the
+deployed pools). The Tautulli account choice lists users only when `TAUTULLI_URL`
+and `TAUTULLI_API_KEY` are set.
 
 A review answers from the channel's real airings with no simulation: `GET /api/channels/{ch}/review`
 is 200 at once (observed 2026-10-19 on a fixture station: 12 ms), every airing `projected: false`,

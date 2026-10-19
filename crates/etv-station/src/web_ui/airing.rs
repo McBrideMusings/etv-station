@@ -216,8 +216,7 @@ mod tests {
 
         let state = AppState {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
-            cache: ScoreCache::default(),
-            session: None,
+            pools: PoolState::default(),
             review: ReviewState::new(
                 station_path.clone(),
                 PathBuf::from("/nonexistent/catalog.db"),
