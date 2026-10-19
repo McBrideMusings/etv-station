@@ -33,8 +33,12 @@ pub fn records(
                 SegmentSource::Still { image_path } => {
                     (image_path.display().to_string(), None, None)
                 }
-                SegmentSource::Render { path, .. } | SegmentSource::Pending { path, .. } => {
-                    (path.display().to_string(), None, None)
+                SegmentSource::Render { path, .. } => (path.display().to_string(), None, None),
+                // The stand-in is what airs unless the swap runs first;
+                // `reconcile::swap_pending_playout` then points the row at the
+                // real file.
+                SegmentSource::Pending { stand_in, .. } => {
+                    (stand_in.display().to_string(), None, None)
                 }
             };
             PlayRecord {
@@ -102,5 +106,24 @@ mod tests {
         assert_eq!(rows[1].start, start + time::Duration::milliseconds(5_000));
         assert_eq!(rows[1].source.as_deref(), Some("color=c=black"));
         assert_eq!(rows[1].in_ms, None);
+    }
+
+    #[test]
+    fn a_pending_segment_is_recorded_under_its_stand_in() {
+        let timeline = Timeline {
+            segments: vec![segment(
+                "title",
+                SegmentSource::Pending {
+                    path: "/r/real.mp4".into(),
+                    stand_in: "/r/stand.mp4".into(),
+                },
+                3_000,
+            )],
+            bed: None,
+        };
+        let resolved = fit(&timeline, 3_000, 24.0).unwrap();
+        let start = datetime!(2026-10-17 20:00 UTC);
+        let rows = records(&resolved, start, start, "bumper.rhai");
+        assert_eq!(rows[0].source.as_deref(), Some("/r/stand.mp4"));
     }
 }

@@ -1330,6 +1330,7 @@ async fn run_generation(
             _ = pending_swap.tick() => {
                 crate::reconcile::swap_pending_playout(
                     &station.channels,
+                    history_db,
                     OffsetDateTime::now_utc(),
                     crate::duration::media_len_ms,
                 )
