@@ -453,7 +453,7 @@ pub(super) fn api_channel_review(
 }
 
 /// A movie as `Title (Year)`, an episode as `Show S01E02 · Title`.
-fn airing_label(e: &CatalogEntry) -> String {
+pub(super) fn airing_label(e: &CatalogEntry) -> String {
     match (&e.show, e.season, e.episode) {
         (Some(show), Some(s), Some(ep)) => format!("{show} S{s:02}E{ep:02} · {}", e.title),
         (Some(show), _, _) => format!("{show} · {}", e.title),

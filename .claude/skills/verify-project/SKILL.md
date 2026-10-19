@@ -53,29 +53,14 @@ two schedules match and the test panics with "the two passes matched". Observed
 2026-08-20 passing and failing on back-to-back runs of the identical tree. Re-run
 it; if it is the only failure, the tree is green.
 
-`tools/epg-browser.py` is Python, so `verify-all.sh` never touches it. `admin
-test` runs `tools/epg-layout-check.py` alongside the cargo trees: it drives the
-real TUI under Textual's headless driver against fixture data (no network, no
-station) and fails if any pane spills past the terminal edge, or if the detail
-pane is too narrow for the widest line in the app (the full stream URL). With no
-arguments it checks both layouts — 80x24, where the detail pane is a bottom row,
-and 160x45, where it is a right-hand column. Run it at another size with `uv run
-tools/epg-layout-check.py 128 40`. The switch is at
-`EpgBrowserApp.WIDE_COLUMNS = 129`: three side-by-side panes need 34 channels +
-40 minimum programmes + 55 detail before nothing clips, so anything narrower
-stacks.
-
-`admin epg`'s action must stay `kind = "shell-passthrough"` with `interactive =
-true`. That is the only action kind that hands the child this terminal's stdin
-and stdout directly. It was `kind = "interactive-shell"` until 2026-08-21, which
-launches with `stdout=subprocess.PIPE` and ignores `interactive` entirely — the
-flag is only read by the shell-passthrough factory. `shutil.get_terminal_size()`
-then saw no tty and returned its 80x24 fallback, so the TUI composited a 24-row
-frame into a 45-row pane and the rows below its footer kept a stale copy of an
-earlier frame. Measured in a 120x45 pty: the piped path reports `isatty=False,
-size=(80, 24)`; the passthrough path reports `isatty=True, size=(120, 45)`. If
-the TUI ever renders duplicated or half-height again, check that kind first —
-`epg-layout-check.py` cannot see this, since it never touches a terminal.
+The dashboard's Guide tab reads ETV-next's `/channels.m3u` and `/xmltv.xml` in the browser
+(base URL: `ETV_NEXT_URL` from `GET /api/health`'s `etv_next_url`, else the page's host on
+port 8409). Clicking a programme asks `GET /api/airings/{number}.{start unix seconds}/audit`
+for that airing's stored audit record; the HTTP-seam test is
+`web_ui::airing::tests::the_endpoint_returns_the_stored_record_for_a_known_airing_and_404s_an_unknown_one`.
+To see the Guide against a running stack: start `./tools/dev-run.sh` (ETV-next on 8409), start
+`./tools/station-ui.sh`, open `http://127.0.0.1:4747/#/guide`. Stop ETV-next and reload to see
+the error-upstream state, which names the URLs tried.
 
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
@@ -517,11 +502,14 @@ media type and Plex reports the bare number.
 any season/episode on it is a defect:
 
 ```sh
-uv run tools/epg-browser.py channel ersatztv.6
+curl -s "$ETV_NEXT_URL/xmltv.xml" \
+  | xmllint --xpath 'count(//programme[@channel="ersatztv.6"][episode-num or sub-title])' -
 ```
 
-Look for: no programme with a non-null `season` or `episode`, and no `sub_title`.
-One is enough to fail.
+Look for: `0`, no programme on that channel with an `episode-num` or `sub-title`.
+Anything above zero fails. (`ETV_NEXT_URL` is the Guide's base URL, the one
+`GET /api/health` reports as `etv_next_url`; the channel id is the one in that
+XMLTV's `<channel id>`.)
 
 **Then ask the catalog directly.** This is the invariant, and it is one query —
 the entry a rating key is pinned to is pinned for life (ADR 0009), so a merge

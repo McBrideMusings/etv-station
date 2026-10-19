@@ -110,6 +110,46 @@ pub async fn upcoming(
     Ok(items)
 }
 
+/// The item that starts within the whole second `second` (`second` through
+/// `second + 1s`), read from the chunk files that cover it — past or future.
+///
+/// XMLTV, and so the guide, names a programme's start to the whole second while
+/// a chunk file keeps microseconds (`rfc3339` below), so the match is on the
+/// second. `overlay_spec` is left `None`: a caller that wants it reads
+/// [`upcoming`].
+pub async fn item_at(
+    output_folder: &Path,
+    second: OffsetDateTime,
+) -> Result<Option<ReportItem>, StationError> {
+    let next = second + time::Duration::SECOND;
+    for file in scan::scan_output_folder(output_folder).await? {
+        if file.start >= next || file.finish <= second {
+            continue;
+        }
+        let Some(playout) = read_chunk_playout(&file.path).await? else {
+            continue;
+        };
+        for item in playout.items {
+            if item.start < second || item.start >= next {
+                continue;
+            }
+            let title = item
+                .program
+                .as_ref()
+                .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
+            return Ok(Some(ReportItem {
+                id: item.id,
+                start: item.start,
+                finish: item.finish,
+                title,
+                metadata: item.metadata,
+                overlay_spec: None,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// Read and parse one chunk file, treating "it is gone" as a normal outcome
 /// rather than a failure.
 ///
