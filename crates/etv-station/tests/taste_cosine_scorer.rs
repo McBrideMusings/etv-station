@@ -2568,3 +2568,241 @@ fn a_why_line_can_name_a_title_watched_inside_the_window() {
         Some(serde_json::json!("contact"))
     );
 }
+
+// ---------------------------------------------------------------------------
+// `walk` builds the pool by walking tags out from seed tags.
+// ---------------------------------------------------------------------------
+
+/// A tag network around `kung fu`: its strongest neighbours are `martial art`
+/// (shared 30, df 100, weight 0.3) and `shaolin` (shared 10, df 20, weight
+/// 0.5); `heist` (shared 5, df 5, weight 1.0) is a third neighbour. `wuxia`
+/// is a second seed with one neighbour, `swordplay` (shared 8, df 16, weight
+/// 0.5).
+///
+/// Titles: `w-seed` carries the seed; `w-two` carries `shaolin` and
+/// `martial art` and no seed; `w-one` carries only `martial art`; `w-heist`
+/// carries only `heist`; `w-wuxia` carries the second seed. Account 42 played
+/// `w-played`, which carries every tag, so each keyword has a taste weight.
+fn write_walk_fixture(path: &Path) {
+    let conn = empty_store(path);
+    conn.execute_batch(
+        "CREATE TABLE tag_network (
+             kind TEXT NOT NULL, value TEXT NOT NULL, df INTEGER NOT NULL,
+             x REAL NOT NULL, y REAL NOT NULL, PRIMARY KEY (kind, value)
+         );
+         CREATE TABLE tag_network_edge (
+             kind TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL,
+             shared INTEGER NOT NULL, PRIMARY KEY (kind, a, b)
+         );
+         INSERT INTO tag_network (kind, value, df, x, y) VALUES
+             ('movie', 'kung fu', 120, 0, 0), ('movie', 'martial art', 100, 0, 0),
+             ('movie', 'shaolin', 20, 0, 0), ('movie', 'heist', 5, 0, 0),
+             ('movie', 'wuxia', 40, 0, 0), ('movie', 'swordplay', 16, 0, 0);
+         INSERT INTO tag_network_edge (kind, a, b, shared) VALUES
+             ('movie', 'kung fu', 'martial art', 30), ('movie', 'kung fu', 'shaolin', 10),
+             ('movie', 'heist', 'kung fu', 5), ('movie', 'swordplay', 'wuxia', 8);
+         INSERT INTO items (item_id, type) VALUES
+             ('w-seed', 'movie'), ('w-two', 'movie'), ('w-one', 'movie'),
+             ('w-heist', 'movie'), ('w-wuxia', 'movie'), ('w-played', 'movie');
+         INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+             ('h1', 'w-played', 42, 1700000000);",
+    )
+    .unwrap();
+    for (id, kws) in [
+        ("w-seed", &["kung fu"][..]),
+        ("w-two", &["shaolin", "martial art"]),
+        ("w-one", &["martial art"]),
+        ("w-heist", &["heist"]),
+        ("w-wuxia", &["wuxia"]),
+        (
+            "w-played",
+            &["kung fu", "shaolin", "martial art", "heist", "wuxia"],
+        ),
+    ] {
+        for kw in kws {
+            conn.execute(
+                "INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) \
+                 VALUES (?1, 'keywords', 'keyword', ?2, 't')",
+                rusqlite::params![id, kw],
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn walk_scorer() -> Scorer {
+    Scorer::new(
+        &catalog_of(["w-seed", "w-two", "w-one", "w-heist", "w-wuxia"]),
+        write_walk_fixture,
+    )
+}
+
+fn walk_ids(scorer: &Scorer, walk: serde_json::Value) -> Vec<String> {
+    let mut v: Vec<String> = pick_config(scorer, serde_json::json!({ "walk": walk }))
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_walk_reaches_a_title_that_carries_related_tags_but_not_the_seed() {
+    let ids = walk_ids(
+        &walk_scorer(),
+        serde_json::json!({ "seeds": ["kung fu"], "neighbours": 2, "min_tags": 2 }),
+    );
+    assert_eq!(
+        ids,
+        ["w-seed", "w-two"],
+        "w-two has no `kung fu` but both related tags; w-one has one, w-heist is not in the top 2"
+    );
+}
+
+#[test]
+fn min_tags_gates_a_title_with_no_seed() {
+    let scorer = walk_scorer();
+    let ids = walk_ids(
+        &scorer,
+        serde_json::json!({ "seeds": ["kung fu"], "neighbours": 2, "min_tags": 1 }),
+    );
+    assert_eq!(ids, ["w-one", "w-seed", "w-two"]);
+    let ids = walk_ids(
+        &scorer,
+        serde_json::json!({ "seeds": ["kung fu"], "neighbours": 3, "min_tags": 1 }),
+    );
+    assert_eq!(
+        ids,
+        ["w-heist", "w-one", "w-seed", "w-two"],
+        "a wider walk makes `heist` a related tag"
+    );
+}
+
+#[test]
+fn the_score_is_taste_times_closeness_and_the_audit_names_the_walk() {
+    let picked = pick_config(
+        &walk_scorer(),
+        serde_json::json!({
+            "walk": { "seeds": ["kung fu"], "neighbours": 2, "min_tags": 1 }
+        }),
+    );
+    let by_id = |id: &str| picked.iter().find(|p| p.id == id).unwrap();
+
+    // Closeness: a seed match is 1; `w-one` carries `martial art` (0.3) of a
+    // 0.5 denominator (the heaviest related weight, shaolin); `w-two` carries
+    // 0.8, capped at 1.
+    for (id, closeness) in [("w-seed", 1.0), ("w-two", 1.0), ("w-one", 0.6)] {
+        let d = detail_of(by_id(id));
+        assert_close(
+            d["walk"]["closeness"].as_f64().unwrap(),
+            closeness,
+            &format!("{id} closeness"),
+        );
+        assert_close(
+            detail_f64(by_id(id), "base_score"),
+            detail_f64(by_id(id), "taste_weight")
+                * detail_f64(by_id(id), "taste_score")
+                * closeness,
+            &format!("{id} base_score = taste x closeness"),
+        );
+    }
+
+    let seed = &detail_of(by_id("w-seed"))["walk"];
+    assert_eq!(seed["seeds_matched"], serde_json::json!(["kung fu"]));
+    let one = &detail_of(by_id("w-one"))["walk"];
+    assert_eq!(one["seeds_matched"], serde_json::json!([]));
+    assert_eq!(
+        one["tags"],
+        serde_json::json!([{ "tag": "martial art", "weight": 0.3 }])
+    );
+    let guide = by_id("w-seed").metadata.as_ref().unwrap()["audit"][0]["guide"]
+        .as_str()
+        .unwrap();
+    assert!(guide.contains("kung fu"), "{guide}");
+}
+
+#[test]
+fn a_seed_missing_from_the_network_is_skipped_and_the_walk_continues() {
+    let ids = walk_ids(
+        &walk_scorer(),
+        serde_json::json!({ "seeds": ["no such tag", "wuxia"], "neighbours": 2, "min_tags": 2 }),
+    );
+    assert_eq!(ids, ["w-wuxia"], "the remaining seed still walks");
+}
+
+#[test]
+fn a_malformed_walk_block_is_refused() {
+    for bad in [
+        serde_json::json!("kung fu"),
+        serde_json::json!({ "seeds": [] }),
+        serde_json::json!({ "seeds": ["kung fu"], "min_tags": 0 }),
+    ] {
+        let err = walk_scorer()
+            .try_pick_for(
+                "movies",
+                0,
+                10,
+                Some(serde_json::json!({ "walk": bad })),
+                Some(42),
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("config.walk"), "{err}");
+    }
+}
+
+#[test]
+fn a_walk_on_a_shows_pool_reads_the_show_network_and_the_shows_keywords() {
+    let scorer = Scorer::new(&shows_catalog(), |db| {
+        let conn = empty_store(db);
+        conn.execute_batch(
+            "CREATE TABLE tag_network (
+                 kind TEXT NOT NULL, value TEXT NOT NULL, df INTEGER NOT NULL,
+                 x REAL NOT NULL, y REAL NOT NULL, PRIMARY KEY (kind, value)
+             );
+             CREATE TABLE tag_network_edge (
+                 kind TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL,
+                 shared INTEGER NOT NULL, PRIMARY KEY (kind, a, b)
+             );
+             INSERT INTO tag_network (kind, value, df, x, y) VALUES
+                 ('show', 'wuxia', 3, 0, 0), ('show', 'swordplay', 4, 0, 0),
+                 ('movie', 'wuxia', 40, 0, 0), ('movie', 'heist', 5, 0, 0);
+             INSERT INTO tag_network_edge (kind, a, b, shared) VALUES
+                 ('show', 'swordplay', 'wuxia', 3), ('movie', 'heist', 'wuxia', 5);
+             INSERT INTO items (item_id, type) VALUES
+                 ('sh-a', 'show'), ('sh-b', 'show'), ('sh-c', 'show');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('sh-a', 'keywords', 'keyword', 'wuxia', 't'),
+                 ('sh-b', 'keywords', 'keyword', 'swordplay', 't'),
+                 ('sh-c', 'keywords', 'keyword', 'heist', 't');",
+        )
+        .unwrap();
+    });
+    let config = serde_json::json!({
+        "unit": "show", "exploration_fraction": 0.0,
+        "walk": { "seeds": ["wuxia"], "neighbours": 5, "min_tags": 1 }
+    });
+    let inputs = ScoreInputs {
+        target_count: 16,
+        ..Default::default()
+    };
+    let picked = pick(
+        &scorer.cache,
+        &scorer.script,
+        None,
+        &inputs,
+        etv_station::variety::Dice::fixed(0),
+        "shows",
+        Some(&config),
+        grant(&scorer.db),
+    )
+    .unwrap();
+    let mut shows: Vec<&str> = picked.iter().map(|p| &p.id[..4]).collect();
+    shows.dedup();
+    shows.sort();
+    assert_eq!(
+        shows,
+        ["sh-a", "sh-b"],
+        "sh-b walks in on the show network's `swordplay`; the movie network's `heist` does not reach sh-c"
+    );
+}

@@ -1776,6 +1776,38 @@ value is the show's.
 Audit detail carries `seen_boosted` (bool) and `rating: { source, value }`
 (null on a pool with no `rating:`).
 
+#### `walk` — build the pool by walking tags out from seed tags
+
+```yaml
+config:
+  walk: { seeds: [kung fu, wuxia], neighbours: 12, min_tags: 2 }
+```
+
+A themed pool that lists a collection or matches one keyword misses titles on
+the same theme that never carry that keyword. `walk` finds them through the tag
+network of the plex-db-ex store (`ds.tag_neighbours`), on the movie network for
+`unit: movie` and the show network for `unit: show` / `season`.
+
+- **Related tags** are each seed's `neighbours` strongest neighbours (default
+  12), by shared-title count. A related tag weighs `shared / df`: the share of
+  that tag's own titles that also carry the seed, so a common tag such as
+  `drama` weighs almost nothing. A tag related to two seeds keeps its larger
+  weight. A seed is never its own related tag.
+- **A title is a candidate** when it carries a seed, or at least `min_tags`
+  related tags (default 2). Every other title leaves the pool before ranking.
+- **Closeness** multiplies the taste score. It is 1 for a title carrying a seed;
+  otherwise the summed weight of the related tags it carries divided by the sum
+  of the `min_tags` heaviest related weights, capped at 1.
+- A seed with no neighbours on the network logs once per generation and the walk
+  continues with the remaining seeds. `seeds` must be non-empty; `neighbours`
+  and `min_tags` must be 1 or more.
+
+The pool must grant the `taste` datastore, as `taste-cosine` already requires.
+Audit detail carries `walk: { seeds, seeds_matched, tags: [{ tag, weight }],
+closeness }` (null on a pool with no `walk:`), and the guide line ends
+"walking out from kung fu, wuxia" unless the theme is long enough to push the
+line past 120 characters, when it is left off.
+
 #### `why` — an on-screen reason, worded by the pool
 
 Three more `config` keys give each pick a short reason an overlay can draw.
