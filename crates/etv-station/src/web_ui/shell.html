@@ -7,7 +7,7 @@
 <style>
   :root {
     color-scheme: light;
-    --bg: #ffffff; --fg: #16181d; --muted: #6b7079; --line: #dfe2e7; --panel: #f6f7f9;
+    --bg: #ffffff; --fg: #16181d; --muted: #5f6670; --line: #dfe2e7; --panel: #f6f7f9;
     --accent: #3d4fd1; --bar: #3d4fd1; --bar-open: #9aa3b1; --track: #e9ebef;
     --warn-bg: #fff6d8; --warn-fg: #6b4e00; --err-bg: #fde8e8; --err-fg: #8a1414;
     --ink-bg: #16181d; --ink-fg: #ffffff;
@@ -35,7 +35,7 @@
 
   /* The dashboard frame: a tab bar, then on Channels the lineup beside the channel's page. */
   .tabs { display: flex; align-items: center; gap: 4px; padding: 8px 20px; border-bottom: 1px solid var(--line); background: var(--panel); flex: none; }
-  .tabs .brand { font-weight: 800; margin-right: 12px; }
+  .tabs .brand { font-weight: 800; margin-right: 12px; white-space: nowrap; }
   .tabs a { padding: 4px 12px; border-radius: 3px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 13px; }
   .tabs a[aria-current="page"] { background: var(--bg); color: var(--fg); box-shadow: inset 0 0 0 1px var(--line); }
   .tabs a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
