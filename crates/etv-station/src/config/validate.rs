@@ -2926,6 +2926,7 @@ fn capabilities() { [] }
             min_gap: None,
             max_gap: None,
             capabilities: vec![],
+            config: None,
         };
         let check = |align: Option<Align>, fill: Vec<FillEntry>| -> Result<(), String> {
             let mut block = inline_block(vec![]);

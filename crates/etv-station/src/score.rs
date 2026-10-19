@@ -2341,6 +2341,27 @@ pub(crate) fn load_items(catalog: &Catalog, ids: &[String]) -> Result<Array, Str
     Ok(out)
 }
 
+/// Add `source_ids` to one item map from [`load_items`]: a map from each
+/// source that still lists the entry (`plex`, `local_fs`) to that source's own
+/// id for it, so a script can address the entry in the source's API. Kept off
+/// [`load_items`] itself because a scorer's whole-library sets never read it.
+pub(crate) fn add_source_ids(catalog: &Catalog, item: &mut Map) -> Result<(), String> {
+    let Some(entry_id) = item
+        .get("entry_id")
+        .and_then(|v| v.clone().into_string().ok())
+    else {
+        return Ok(());
+    };
+    let mut ids = Map::new();
+    for src in catalog.sources_for(&entry_id).map_err(|e| e.to_string())? {
+        if src.missing_since.is_none() {
+            ids.insert(src.source.as_str().into(), src.source_id.into());
+        }
+    }
+    item.insert("source_ids".into(), Dynamic::from_map(ids));
+    Ok(())
+}
+
 /// Absent columns arrive as `()`, Rhai's unit — so a script can test them with
 /// `item.year == ()` rather than having to know a sentinel value.
 fn insert_opt_str(m: &mut Map, key: &str, value: Option<String>) {

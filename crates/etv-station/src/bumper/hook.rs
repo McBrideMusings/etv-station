@@ -10,6 +10,10 @@
 //!     //               the generation frontier (the last gap of a generation
 //!     //               comes before the next programme is chosen)
 //!     // ctx.prev    — item map for the programme before the gap, or ()
+//!     // ctx.upcoming — item maps of the programmes after ctx.next, nearest
+//!     //               first, or [] (the ones already laid; a gap near the end
+//!     //               of a generation sees few)
+//!     // ctx.config  — the `config:` of the block's `fill:` entry, or #{}
 //!     // ctx.channel — #{ name, number, logo, vocabulary }
 //!     // ctx.rng     — seeded from (channel, next.entry_id, air_date, draw)
 //!     let t = timeline();
@@ -33,7 +37,11 @@
 //!   folder (up to [`READ_LIMIT_BYTES`]), or `()` when it does not exist. A path
 //!   that resolves outside that folder is an error.
 //! - `http` — `ctx.http(url, method, body)` makes one HTTP call through
-//!   [`crate::plugin_http::call`] and returns the response body as text. A
+//!   [`crate::plugin_http::call`] and returns the response body as text.
+//!   `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the URL are filled from the
+//!   station's environment, so the script reaches Plex without holding the
+//!   token. A fourth argument, a map of header names to values, adds request
+//!   headers: `ctx.http(url, "GET", "", #{ Accept: "application/json" })`. A
 //!   4xx/5xx, a transport failure, or no response within
 //!   [`crate::plugin_http::GENERATION_TIMEOUT`] is an error. `parse_json(text)`
 //!   turns the body into maps and arrays and needs no grant.
@@ -110,6 +118,12 @@ pub struct BumperInput {
     /// ([`crate::score::load_items`]); `None` at the generation frontier.
     pub next: Option<Map>,
     pub prev: Option<Map>,
+    /// The programmes after `next` in the schedule being laid, nearest first,
+    /// as item maps; empty at the frontier or when `next` is the last one.
+    pub upcoming: Vec<Map>,
+    /// The `config:` the block's `fill:` entry gave this script, verbatim;
+    /// `None` becomes an empty map in `ctx.config`.
+    pub config: Option<serde_json::Value>,
     pub channel: ChannelInfo,
     /// `YYYY-MM-DD` the gap airs on, in the station's time zone.
     pub air_date: String,
@@ -322,6 +336,24 @@ fn ctx_map(input: &BumperInput) -> Result<Dynamic, String> {
     ctx.insert("gap_ms".into(), (input.gap_ms as i64).into());
     ctx.insert("next".into(), item(&input.next));
     ctx.insert("prev".into(), item(&input.prev));
+    ctx.insert(
+        "upcoming".into(),
+        input
+            .upcoming
+            .iter()
+            .cloned()
+            .map(Dynamic::from_map)
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    ctx.insert(
+        "config".into(),
+        match &input.config {
+            Some(value) => rhai::serde::to_dynamic(value)
+                .map_err(|e| format!("the script's config is not representable in Rhai: {e}"))?,
+            None => Dynamic::from_map(Map::new()),
+        },
+    );
     ctx.insert("channel".into(), Dynamic::from_map(channel));
     ctx.insert("rng".into(), Dynamic::from(rng));
     Ok(Dynamic::from_map(ctx))
@@ -519,6 +551,7 @@ impl SegmentBuilder {
                 SegmentSource::Lavfi { .. } => "lavfi",
                 SegmentSource::Still { .. } => "still",
                 SegmentSource::Render { .. } => "render",
+                SegmentSource::Http { .. } => "http",
             };
             format!("{kind}{index}")
         });
@@ -660,10 +693,17 @@ impl Host {
         Ok(text.map(Dynamic::from).unwrap_or(Dynamic::UNIT))
     }
 
-    fn http(&self, url: &str, method: &str, body: &str) -> RhaiResult<String> {
+    fn http(&self, url: &str, method: &str, body: &str, headers: Map) -> RhaiResult<String> {
         self.require("http")?;
+        let headers = headers
+            .into_iter()
+            .map(|(k, v)| match v.into_string() {
+                Ok(v) => Ok((k.to_string(), v)),
+                Err(_) => err(format!("ctx.http(): header {k:?} must be a string")),
+            })
+            .collect::<RhaiResult<Vec<_>>>()?;
         Ok(self.budget.within("ctx.http()", |timeout| {
-            crate::plugin_http::call(url, method, body, timeout)
+            crate::plugin_http::call_with(url, method, body, &headers, timeout)
         })?)
     }
 
@@ -917,7 +957,16 @@ fn bumper_engine(host: Host) -> rhai::Engine {
     let h = host.clone();
     engine.register_fn(
         "http",
-        move |_ctx: &mut Map, url: &str, method: &str, body: &str| h.http(url, method, body),
+        move |_ctx: &mut Map, url: &str, method: &str, body: &str| {
+            h.http(url, method, body, Map::new())
+        },
+    );
+    let h = host.clone();
+    engine.register_fn(
+        "http",
+        move |_ctx: &mut Map, url: &str, method: &str, body: &str, headers: Map| {
+            h.http(url, method, body, headers)
+        },
     );
     engine.register_fn(
         "exec",
@@ -1048,6 +1097,32 @@ fn bumper_engine(host: Host) -> rhai::Engine {
                 },
             )
         })
+        .register_fn(
+            "http",
+            |s: &mut SegmentBuilder,
+             url: &str,
+             in_ms: i64,
+             out_ms: i64|
+             -> RhaiResult<SegmentBuilder> {
+                let (in_ms, out_ms) = (
+                    int_to_ms(in_ms, "http() in_ms")?,
+                    int_to_ms(out_ms, "http() out_ms")?,
+                );
+                if out_ms <= in_ms {
+                    return err(format!(
+                        "http(): out_ms {out_ms} is not after in_ms {in_ms}"
+                    ));
+                }
+                s.set_source(
+                    "http",
+                    SegmentSource::Http {
+                        url: url.to_string(),
+                        in_ms,
+                        out_ms,
+                    },
+                )
+            },
+        )
         .register_fn("render", |s: &mut SegmentBuilder, path: &str| {
             s.set_source(
                 "render",
@@ -1196,6 +1271,8 @@ mod tests {
             air_date: "2026-10-17".into(),
             draw: 0,
             granted: Vec::new(),
+            upcoming: Vec::new(),
+            config: None,
             history: None,
         }
     }
@@ -1593,6 +1670,8 @@ fn build(ctx) {
 }"#,
         );
         let input = BumperInput {
+            upcoming: Vec::new(),
+            config: None,
             history: Some(ledger_with_a_programme_and_two_bumpers()),
             ..input(None)
         };
@@ -1637,5 +1716,201 @@ fn build(ctx) {
         );
         let built = build(&path, &input(None)).unwrap();
         assert_eq!(built.timeline.segments[0].duration, Duration::Fixed(1_000));
+    }
+
+    /// One Plex stand-in for every trailer test, on a free local port. It
+    /// answers a film's extras by rating key (any other path is a 404), and
+    /// `PLEX_URL` / `PLEX_TOKEN` point at it, as they would in the container.
+    fn plex() -> &'static str {
+        use std::io::{Read, Write};
+        static PLEX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PLEX.get_or_init(|| {
+            let routes: Vec<(&str, String)> = vec![
+                (
+                    "/library/metadata/11960/extras",
+                    extras(
+                        "trailer",
+                        "/services/iva/assets/7788/video.mp4?fmt=4&bitrate=750",
+                        88_000,
+                    ),
+                ),
+                ("/library/metadata/1/extras", extras("clip", "/c.mp4", 90_000)),
+                ("/library/metadata/2/extras", extras("trailer", "/t.mp4", 3_000)),
+                ("/library/metadata/21/extras", extras("trailer", "/a.mp4", 60_000)),
+                ("/library/metadata/22/extras", extras("trailer", "/b.mp4", 60_000)),
+                ("/library/metadata/23/extras", extras("trailer", "/c.mp4", 60_000)),
+            ];
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut sock) = stream else { return };
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.split('?').next())
+                        .unwrap_or("")
+                        .to_string();
+                    let (status, body) = match routes.iter().find(|(p, _)| *p == path) {
+                        Some((_, body)) => ("200 OK", body.clone()),
+                        None => ("404 Not Found", String::new()),
+                    };
+                    let _ = write!(
+                        sock,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            // Only these tests read these two names, and they run once.
+            unsafe {
+                std::env::set_var("PLEX_URL", &url);
+                std::env::set_var("PLEX_TOKEN", "t0k");
+            }
+            url
+        })
+    }
+
+    fn extras(subtype: &str, part_key: &str, duration_ms: i64) -> String {
+        serde_json::json!({ "MediaContainer": { "Metadata": [{
+            "subtype": subtype,
+            "duration": duration_ms,
+            "Media": [{ "duration": duration_ms, "Part": [{ "key": part_key }] }],
+        }] } })
+        .to_string()
+    }
+
+    fn movie(id: &str, plex_key: Option<&str>) -> Map {
+        let mut m = Map::new();
+        m.insert("entry_id".into(), id.to_string().into());
+        m.insert("title".into(), format!("Film {id}").into());
+        m.insert("type".into(), "movie".into());
+        if let Some(key) = plex_key {
+            let mut ids = Map::new();
+            ids.insert("plex".into(), key.to_string().into());
+            m.insert("source_ids".into(), Dynamic::from_map(ids));
+        }
+        m
+    }
+
+    fn trailer_input(mode: &str, gap_ms: u64, next: Map, upcoming: Vec<Map>) -> BumperInput {
+        plex();
+        BumperInput {
+            gap_ms,
+            next: Some(next),
+            upcoming,
+            config: Some(serde_json::json!({ "mode": mode })),
+            granted: vec!["http".into()],
+            ..input(None)
+        }
+    }
+
+    fn trailer_script() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/trailer-bumper.rhai")
+    }
+
+    #[test]
+    fn a_trailer_bumper_in_next_mode_airs_the_nexts_trailer_over_an_up_next_card() {
+        validate_script(&trailer_script(), &["http".into()]).unwrap();
+        let input = trailer_input("next", 120_000, movie("rush", Some("11960")), vec![]);
+        let built = build(&trailer_script(), &input).unwrap();
+        let first = &built.timeline.segments[0];
+        // The url keeps its placeholders: the token is in no playout file.
+        assert_eq!(
+            first.source,
+            SegmentSource::Http {
+                url: "{{PLEX_URL}}/services/iva/assets/7788/video.mp4?fmt=4&bitrate=750&X-Plex-Token={{PLEX_TOKEN}}".into(),
+                in_ms: 0,
+                out_ms: 88_000,
+            }
+        );
+        let card = first.overlay.as_ref().unwrap();
+        assert_eq!(card.vars["title"], serde_json::json!("Film rush"));
+        assert_eq!(card.vars["word"], serde_json::json!("Up next"));
+
+        let resolved = super::super::timeline::fit(&built.timeline, 120_000, 30.0).unwrap();
+        let items = super::super::emit::emit_timeline(
+            &resolved,
+            &super::super::emit::EmitContext {
+                channel: "t",
+                fps: 30.0,
+                overlay_root: Path::new("/o"),
+            },
+            OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        );
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["source"]["source_type"], "http");
+        assert_eq!(json["source"]["out_point_ms"], 88_000);
+        assert!(
+            !json.to_string().contains("t0k"),
+            "the token reached the playout"
+        );
+        let span: i128 = items
+            .iter()
+            .map(|i| (i.finish - i.start).whole_milliseconds())
+            .sum();
+        assert_eq!(span, 120_000);
+    }
+
+    #[test]
+    fn a_trailer_bumper_returns_nothing_when_there_is_no_trailer() {
+        let empty = |next: Map| {
+            matches!(
+                build(
+                    &trailer_script(),
+                    &trailer_input("next", 120_000, next, vec![])
+                ),
+                Err(BumperError::Empty { .. })
+            )
+        };
+        assert!(
+            empty(movie("only-a-clip", Some("1"))),
+            "a clip is not a trailer"
+        );
+        assert!(
+            empty(movie("too-short", Some("2"))),
+            "a 3s trailer is under the minimum"
+        );
+        assert!(
+            empty(movie("unknown-to-plex", Some("99"))),
+            "a 404 from Plex"
+        );
+        assert!(empty(movie("no-plex-id", None)), "an entry with no Plex id");
+    }
+
+    #[test]
+    fn a_trailer_bumper_in_upcoming_mode_airs_each_film_once_nearest_first() {
+        let upcoming = vec![
+            movie("b", Some("22")),
+            movie("a", Some("21")),
+            movie("c", Some("23")),
+        ];
+        let urls = |gap_ms: u64| -> Vec<String> {
+            let input = trailer_input("upcoming", gap_ms, movie("a", Some("21")), upcoming.clone());
+            let built = build(&trailer_script(), &input).unwrap();
+            let resolved = super::super::timeline::fit(&built.timeline, gap_ms, 30.0).unwrap();
+            assert_eq!(resolved.total_ms(), gap_ms);
+            built
+                .timeline
+                .segments
+                .iter()
+                .filter_map(|s| match &s.source {
+                    SegmentSource::Http { url, .. } => Some(
+                        url.trim_start_matches("{{PLEX_URL}}")
+                            .split('?')
+                            .next()
+                            .unwrap()
+                            .to_string(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(urls(400_000), ["/a.mp4", "/b.mp4", "/c.mp4"]);
+        // A 70s gap holds one whole trailer and the start of the next.
+        assert_eq!(urls(70_000), ["/a.mp4", "/b.mp4"]);
     }
 }
