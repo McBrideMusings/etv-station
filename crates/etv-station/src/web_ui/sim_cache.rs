@@ -12,7 +12,8 @@
 //! A result is valid for one [`SimKey`] (channel file, days, start date) and
 //! one [`Fingerprint`]: the mtimes of the channel file, every `.rhai` script
 //! its config names, and the catalog (with its WAL). An edit to any of them
-//! makes the next lookup miss.
+//! makes the next lookup miss. A script a plugin imports, `station.yaml` and
+//! the plexdb snapshot are not in the fingerprint.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -68,6 +69,8 @@ struct Inner {
     /// Channels a request asked for, next to simulate first.
     wanted: VecDeque<SimKey>,
     running: Option<SimKey>,
+    /// Why the worker stopped for good; every lookup that misses reports it.
+    dead: Option<String>,
 }
 
 pub struct SimCache {
@@ -173,6 +176,9 @@ impl SimCache {
             return Lookup::Ready(sim);
         }
         let mut g = self.lock();
+        if let Some(why) = &g.dead {
+            return Lookup::Failed(why.clone());
+        }
         if g.running.as_ref() != Some(key) {
             g.wanted.retain(|k| k != key);
             g.wanted.push_front(key.clone());
@@ -283,6 +289,7 @@ impl SimCache {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(event = "ui.sim.catalog_failed", error = %e, "simulation worker: catalog did not open");
+                self.lock().dead = Some(format!("the simulation worker has no catalog: {e}"));
                 return;
             }
         };
@@ -371,15 +378,19 @@ impl SimCache {
         let result = account.and_then(|account_id| {
             let start =
                 time::OffsetDateTime::from_unix_timestamp(key.start).map_err(|e| e.to_string())?;
-            crate::simulate::simulate(
-                &lc.config,
-                &lc.config_path,
-                catalog,
-                account_id,
-                key.days,
-                start,
-                Some(tz),
-            )
+            // A panicking plugin fails this channel, not the worker.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::simulate::simulate(
+                    &lc.config,
+                    &lc.config_path,
+                    catalog,
+                    account_id,
+                    key.days,
+                    start,
+                    Some(tz),
+                )
+            }))
+            .unwrap_or_else(|_| Err("the simulation panicked; see the log".to_string()))
         });
         tracing::info!(
             event = "ui.sim.done",
