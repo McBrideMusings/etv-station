@@ -373,20 +373,40 @@ enum ProbeRun {
 }
 
 async fn ffprobe_stdout(path: &Path) -> ProbeRun {
-    let args: Vec<std::ffi::OsString> = [
+    classify_probe(
+        path,
+        crate::ffprobe::run_bounded_async(probe_args(path)).await,
+    )
+}
+
+/// [`ffprobe_stdout`] for a caller that is not async.
+fn ffprobe_stdout_blocking(path: &Path) -> ProbeRun {
+    classify_probe(
+        path,
+        crate::ffprobe::run_bounded(&probe_args(path), crate::ffprobe::PROBE_TIMEOUT),
+    )
+}
+
+fn probe_args(path: &Path) -> Vec<std::ffi::OsString> {
+    [
         "-v",
         "error",
         "-print_format",
         "json",
         "-show_format",
         "-show_streams",
+        "-protocol_whitelist",
+        "file",
         "-i",
     ]
     .iter()
     .map(Into::into)
     .chain([path.as_os_str().to_owned()])
-    .collect();
-    let outcome = match crate::ffprobe::run_bounded_async(args).await {
+    .collect()
+}
+
+fn classify_probe(path: &Path, outcome: std::io::Result<crate::ffprobe::Bounded>) -> ProbeRun {
+    let outcome = match outcome {
         Ok(o) => o,
         Err(e) => {
             return ProbeRun::NoAnswer(StationError::FfprobeUnavailable {
@@ -430,6 +450,46 @@ async fn ffprobe_stdout(path: &Path) -> ProbeRun {
     };
 
     ProbeRun::Output(stdout)
+}
+
+type MediaLenMemo = HashMap<PathBuf, (i64, u64, u64)>;
+
+static MEDIA_LEN_MEMO: std::sync::Mutex<Option<MediaLenMemo>> = std::sync::Mutex::new(None);
+
+/// A media file's length in ms, for a caller that is not async (the bumper
+/// emit). The same ffprobe call and parser as the schedule's durations. A
+/// length is remembered per path while the file's mtime and size hold, so a
+/// file is probed once however many segments use it; a failed probe is not
+/// remembered. `None` when ffprobe cannot be run, times out or rejects the file.
+pub fn media_len_ms(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64);
+    let size = meta.len();
+    if let Some(&(m, s, ms)) = MEDIA_LEN_MEMO
+        .lock()
+        .ok()?
+        .as_ref()
+        .and_then(|memo| memo.get(path))
+        && m == mtime
+        && s == size
+    {
+        return Some(ms);
+    }
+    let ProbeRun::Output(stdout) = ffprobe_stdout_blocking(path) else {
+        return None;
+    };
+    let (duration, _) = parse_probe(path, &stdout).ok()?;
+    let ms = duration.as_millis() as u64;
+    MEDIA_LEN_MEMO
+        .lock()
+        .ok()?
+        .get_or_insert_with(HashMap::new)
+        .insert(path.to_path_buf(), (mtime, size, ms));
+    Some(ms)
 }
 
 /// What a catalog ingest learned from probing one file.
@@ -581,6 +641,34 @@ mod tests {
     use super::*;
     use crate::config::SourceConfig;
     use crate::resolve::ResolvedItem;
+
+    #[test]
+    fn media_len_is_remembered_until_the_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.bin");
+        std::fs::write(&path, b"12345").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        MEDIA_LEN_MEMO
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(path.clone(), (mtime, meta.len(), 7_250));
+
+        // A hit answers from the memo; the file is not valid media, so a
+        // probe would return None.
+        assert_eq!(media_len_ms(&path), Some(7_250));
+        assert_eq!(media_len_ms(&path), Some(7_250));
+
+        // A changed size misses the memo and probes the invalid file.
+        std::fs::write(&path, b"123456789").unwrap();
+        assert_eq!(media_len_ms(&path), None);
+    }
 
     /// What ffprobe prints for a Matroska file with an English text track and
     /// a Japanese stereo track; tag keys keep the container's own case.

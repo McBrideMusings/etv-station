@@ -47,37 +47,6 @@ pub struct EmitContext<'a> {
     pub media_len_ms: &'a dyn Fn(&Path) -> Option<u64>,
 }
 
-/// Length of `path` in ms from `ffprobe`'s container duration, or `None` when
-/// ffprobe cannot be run, times out, rejects the file or reports no duration.
-pub fn probe_len_ms(path: &Path) -> Option<u64> {
-    let args: Vec<std::ffi::OsString> = [
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "csv=p=0",
-        "-protocol_whitelist",
-        "file",
-        "-i",
-    ]
-    .iter()
-    .map(Into::into)
-    .chain([path.as_os_str().to_owned()])
-    .collect();
-    match crate::ffprobe::run_bounded(&args, crate::ffprobe::PROBE_TIMEOUT) {
-        Ok(crate::ffprobe::Bounded::Done {
-            success: true,
-            stdout,
-            ..
-        }) => {
-            let secs: f64 = String::from_utf8_lossy(&stdout).trim().parse().ok()?;
-            (secs.is_finite() && secs >= 0.0).then(|| (secs * 1000.0).floor() as u64)
-        }
-        _ => None,
-    }
-}
-
 /// Push one Local item playing `path` from `in_ms` for `duration_ms`. When the
 /// file ends sooner, the item is cut at the file's end and a black item
 /// (`#pad`) covers the rest.
