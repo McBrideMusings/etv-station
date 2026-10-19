@@ -304,7 +304,7 @@ pub fn ingest_items(
     identity_roots: &[String],
 ) -> Result<PlexIngestStats, PlexIngestError> {
     let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
-    let index = super::canonical_index(catalog, &roots)?;
+    let mut index = super::canonical_index(catalog, &roots)?;
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok();
@@ -331,6 +331,27 @@ pub fn ingest_items(
             }
             None => derive_entry_id(&item.external_ids, &canonical),
         };
+
+        // FS-first, several files, one GUID (#100): the FS scan minted an `fs:`
+        // entry per file, and this item resolved by GUID onto a sibling's entry,
+        // so the entry its own file belongs to is a second one for the same
+        // title. Fold it in. Only an `fs:` entry with no Plex row is
+        // folded — that is an FS placeholder; anything else is a separate
+        // identity decision this pass does not own.
+        if let Some(stale) = index.get(&canonical).cloned()
+            && stale != entry_id
+            && stale.starts_with("fs:")
+            && !catalog
+                .sources_for(&stale)?
+                .iter()
+                .any(|s| s.source == Source::Plex)
+        {
+            tracing::info!(loser = %stale, survivor = %entry_id, "plex ingest folded an fs entry into its GUID entry");
+            catalog.merge_entry(&stale, &entry_id, now.as_deref().unwrap_or_default())?;
+            for target in index.values_mut().filter(|t| **t == stale) {
+                *target = entry_id.clone();
+            }
+        }
 
         // Plex is authoritative when it HAS a value, but must not erase a column a
         // prior FS scan populated (notably the ffprobe'd duration) by overwriting
@@ -2763,6 +2784,66 @@ mod tests {
         let item = movie("plex-2", "/data/media/home/clip.mkv", &[]);
         ingest_items(&cat, &[item], &["/data/media".into()]).unwrap();
         assert!(cat.all_entry_ids().unwrap()[0].starts_with("fs:"));
+    }
+
+    /// #100: a 4K + 1080p pair is FS-scanned before Plex, so each file has its
+    /// own `fs:` entry. Plex then reports both under one GUID. The second file's
+    /// entry must fold into the first's, leaving one entry that owns both files.
+    #[test]
+    fn fs_first_files_sharing_a_guid_end_on_one_entry() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        crate::catalog::ingest::fs::ingest_files(
+            &cat,
+            &[
+                (
+                    std::path::PathBuf::from("/data/media/movies/Die Hard/1080p.mkv"),
+                    Some(120.0),
+                ),
+                (
+                    std::path::PathBuf::from("/data/media/4k/Die Hard/2160p.mkv"),
+                    Some(120.0),
+                ),
+            ],
+            &roots,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
+
+        let hd = movie(
+            "1001",
+            "/data/media/movies/Die Hard/1080p.mkv",
+            &[(ExternalNs::Imdb, "tt0095016")],
+        );
+        let uhd = movie(
+            "1002",
+            "/data/media/4k/Die Hard/2160p.mkv",
+            &[(ExternalNs::Imdb, "tt0095016")],
+        );
+        ingest_items(&cat, &[hd, uhd], &roots).unwrap();
+
+        // Exactly one entry is live and owns all four provenance rows (two
+        // local_fs, two plex); the other is kept, marked missing (ADR 0006).
+        let ids = cat.all_entry_ids().unwrap();
+        assert_eq!(ids.len(), 2, "entries: {ids:?}");
+        let live: Vec<&String> = ids
+            .iter()
+            .filter(|id| cat.entry(id).unwrap().unwrap().missing_since.is_none())
+            .collect();
+        assert_eq!(live.len(), 1, "live: {live:?}");
+        assert_eq!(cat.sources_for(live[0]).unwrap().len(), 4);
+        assert_eq!(cat.all_sources().unwrap().len(), 4);
+
+        // Re-ingesting changes nothing.
+        let hd = movie(
+            "1001",
+            "/data/media/movies/Die Hard/1080p.mkv",
+            &[(ExternalNs::Imdb, "tt0095016")],
+        );
+        ingest_items(&cat, &[hd], &roots).unwrap();
+        assert_eq!(cat.all_entry_ids().unwrap(), ids);
+        assert_eq!(cat.sources_for(live[0]).unwrap().len(), 4);
     }
 
     #[test]
