@@ -1,0 +1,43 @@
+# Dragon Ball in-universe watch order, declared once so any channel can play it.
+#
+# Each entry has an explicit `position`; the order is the positions, not the
+# line order. Gaps are deliberate: a film slotted in later takes a free number
+# between its neighbours without renumbering the rest. An episode is named by
+# show + season + episode, a standalone film by title (+ year). Every entry must
+# match exactly one catalog item, or the channel naming this chronology fails to
+# resolve and says which entry missed.
+#
+# Season order rather than `absolute_episode`: this library's Dragon Ball is not
+# filed under an absolute-order agent, so Plex reports no `absoluteIndex` (#47).
+# Season 1 is 13 episodes and season 2 is 15, the same 1-28 run.
+name: dragonball
+entries:
+  - {position: 10, show: "Dragon Ball", season: 1, episode: 1}
+  - {position: 20, show: "Dragon Ball", season: 1, episode: 2}
+  - {position: 30, show: "Dragon Ball", season: 1, episode: 3}
+  - {position: 40, show: "Dragon Ball", season: 1, episode: 4}
+  - {position: 50, show: "Dragon Ball", season: 1, episode: 5}
+  - {position: 60, show: "Dragon Ball", season: 1, episode: 6}
+  - {position: 70, show: "Dragon Ball", season: 1, episode: 7}
+  - {position: 80, show: "Dragon Ball", season: 1, episode: 8}
+  - {position: 90, show: "Dragon Ball", season: 1, episode: 9}
+  - {position: 100, show: "Dragon Ball", season: 1, episode: 10}
+  - {position: 110, show: "Dragon Ball", season: 1, episode: 11}
+  - {position: 120, show: "Dragon Ball", season: 1, episode: 12}
+  - {position: 130, show: "Dragon Ball", season: 1, episode: 13}
+  - {position: 140, title: "Dragon Ball: Curse of the Blood Rubies", year: 1986}
+  - {position: 150, show: "Dragon Ball", season: 2, episode: 1}
+  - {position: 160, show: "Dragon Ball", season: 2, episode: 2}
+  - {position: 170, show: "Dragon Ball", season: 2, episode: 3}
+  - {position: 180, show: "Dragon Ball", season: 2, episode: 4}
+  - {position: 190, show: "Dragon Ball", season: 2, episode: 5}
+  - {position: 200, show: "Dragon Ball", season: 2, episode: 6}
+  - {position: 210, show: "Dragon Ball", season: 2, episode: 7}
+  - {position: 220, show: "Dragon Ball", season: 2, episode: 8}
+  - {position: 230, show: "Dragon Ball", season: 2, episode: 9}
+  - {position: 240, show: "Dragon Ball", season: 2, episode: 10}
+  - {position: 250, show: "Dragon Ball", season: 2, episode: 11}
+  - {position: 260, show: "Dragon Ball", season: 2, episode: 12}
+  - {position: 270, show: "Dragon Ball", season: 2, episode: 13}
+  - {position: 280, show: "Dragon Ball", season: 2, episode: 14}
+  - {position: 290, show: "Dragon Ball", season: 2, episode: 15}

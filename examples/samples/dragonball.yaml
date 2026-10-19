@@ -1,23 +1,17 @@
 # Sample S4 — Dragon Ball, full chronological order.
 #
-# The hardest authored-order case: a *manual*-order block whose entries mix
-# `query` (resolved against the catalog) and an inline `item`, woven into one
-# curated watch order. The block plays the ENTRIES in authored order; each
-# `query` entry carries its OWN `order`, sorting its resolved episodes internally
-# before they take their place in the sequence:
+# The hardest authored-order case: a watch order that weaves a film into the
+# middle of a series, which nothing in the catalog can derive. The order lives in
+# its own file, examples/chronologies/dragonball.yaml, declared in the station's
+# `chronologies:` list and referenced here by name — so a second channel wanting
+# the same order names it too, and an edit to the order never touches a channel.
 #
-#   season 1  (episode:asc)  →  a movie  →  season 2  (episode:asc)
-#
-# Ordering is by `season`/`episode` rather than the anime-friendly franchise-wide
-# `absolute_episode` (Plex `absoluteIndex`, promoted by the ingester — #47),
-# because Plex only reports `absoluteIndex` for shows filed under an
-# absolute-order agent, and this library's Dragon Ball is not one: its episode
-# metadata carries no such attribute, so the column is empty for every episode
-# and a query on it resolves to nothing. Season order reaches the same watch
-# order here — season 1 is 13 episodes and season 2 is 15, the same 1–28 run.
+# The block plays the chronology's entries in position order (`manual` keeps
+# them as resolved): season 1, the film, season 2. Every entry must match one
+# catalog item, or the channel fails to resolve naming the entry.
 #
 # Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
-# dev-run serves it live. Being a query channel it resolves to nothing
+# dev-run serves it live. Being a catalog channel it resolves to nothing
 # unless the station's `catalog_path` points at a populated catalog. Its
 # resolution is also proven by the `dragonball_sample` acceptance test.
 number: 9
@@ -35,21 +29,5 @@ rule:
         title: "Dragon Ball: Chronological"
         categories: ["Series", "Anime"]
       entries:
-        # First TV arc, in franchise-episode order.
-        - kind: query
-          query: 'item.show == "Dragon Ball" && item.season == 1'
-          order: "episode:asc"
-
-        # A film slotted into the timeline between the arcs — inline, by hand.
-        - kind: item
-          source:
-            kind: local
-            path: "${ETV_TEST_MEDIA_DIR}/movies/Dragon Ball Curse of the Blood Rubies (1986) {imdb-tt0142251}/Dragon.Ball.Curse.of.the.Blood.Rubies.1986.WEBDL-1080p.x265.AAC[JA+EN].[EN].Radarr.mkv"
-          program:
-            title: "Dragon Ball: Curse of the Blood Rubies"
-            year: 1986
-
-        # Second TV arc, continuing the franchise-episode order.
-        - kind: query
-          query: 'item.show == "Dragon Ball" && item.season == 2'
-          order: "episode:asc"
+        - kind: chronology
+          name: dragonball
