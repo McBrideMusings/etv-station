@@ -124,7 +124,13 @@ pub fn emit_timeline(
                 in_ms,
                 out_ms,
             } => {
-                let window = out_ms.saturating_sub(*in_ms);
+                let mut window = out_ms.saturating_sub(*in_ms);
+                if seg.segment.loop_
+                    && let Some(len) = (ctx.media_len_ms)(path)
+                {
+                    // A repeat cannot run past the file's end.
+                    window = window.min(len.saturating_sub(*in_ms));
+                }
                 if !(seg.segment.loop_ && window > 0 && seg.duration_ms > window) {
                     push_local_padded(
                         &mut items,
@@ -559,6 +565,46 @@ mod tests {
         assert_eq!(
             (items[2].finish - items[0].start).whole_milliseconds(),
             8_000
+        );
+    }
+
+    #[test]
+    fn a_looping_clip_shorter_than_its_out_point_repeats_at_the_file_length() {
+        let mut clip = seg(
+            "clip",
+            SegmentSource::Clip {
+                path: "/m/a.mkv".into(),
+                in_ms: 1_000,
+                out_ms: 20_000,
+            },
+            Dur::Fixed(10_000),
+        );
+        clip.loop_ = true;
+        let resolved = fit(
+            &Timeline {
+                segments: vec![clip],
+                bed: None,
+            },
+            10_000,
+            30.0,
+        )
+        .unwrap();
+        let ctx = EmitContext {
+            media_len_ms: &|_| Some(5_000),
+            ..ctx()
+        };
+        let items = emit_timeline(&resolved, &ctx, start());
+        let outs: Vec<Option<u64>> = items
+            .iter()
+            .map(|i| match i.source.as_ref().unwrap() {
+                PlayoutItemSource::Local { out_point_ms, .. } => *out_point_ms,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(outs, vec![Some(5_000), Some(5_000), Some(3_000)]);
+        assert_eq!(
+            (items[2].finish - items[0].start).whole_milliseconds(),
+            10_000
         );
     }
 
