@@ -983,6 +983,7 @@ async fn ingest_catalog(
             sources = stats.sources_written,
             sources_marked_missing = stats.sources_marked_missing,
             entries_marked_missing = stats.entries_marked_missing,
+            files_unairable = stats.files_unairable,
             "local-fs catalog ingest complete",
         ),
         Err(e) => {
