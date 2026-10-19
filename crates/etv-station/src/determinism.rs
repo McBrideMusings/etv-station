@@ -31,7 +31,7 @@ use crate::score::ScoreInputs;
 
 /// Hint handed to a scorer plugin as `ctx.target_count`. The check has no
 /// `from`/`target` chunk to size one from (unlike a real generation tick —
-/// see `daemon::target_count`), so it uses a fixed, generous value: enough
+/// see `generation::target_count`), so it uses a fixed, generous value: enough
 /// for an ordinary pool, and it is only a hint a script may ignore.
 const TARGET_COUNT_HINT: usize = 500;
 

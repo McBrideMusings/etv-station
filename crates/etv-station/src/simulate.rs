@@ -5,19 +5,13 @@
 //!
 //! The loop is the daemon's own (`daemon::pattern_catch_up`): on each roll tick
 //! the window's target moves to `now + window_days`, and while the schedule is
-//! covered only up to `from < target` the resolver runs again. Each run gets
-//!
-//! - `ctx.target_count` from [`crate::daemon::target_count`] — the same function
-//!   the daemon calls, so a chunk's worth of items, not a library's worth;
-//! - `ctx.recent` from what earlier generations aired, newest last, capped at
-//!   `scoring.recent_depth`, episodes included — a scorer's repeat suppression
-//!   sees exactly what it would see in production;
-//! - the pool rotation, the per-series cursor and the adjacency tail those
-//!   earlier generations left behind.
-//!
-//! The resolver ([`crate::resolve::resolve_channel_with_resume`]) is the real
-//! one, so the pattern engine's pool rotation, `advance: resume` and the
-//! drained-pool refill all run as they do on air. What is not modelled: file
+//! covered only up to `from < target` it runs another generation. Each one is
+//! [`crate::generation::generate`], the step the daemon calls, reading an
+//! in-memory ledger of what earlier generations aired in place of the
+//! `airings` table — so `ctx.target_count`, `ctx.recent`, the per-series
+//! cursor, the adjacency tail and the pool rotation are what they would be in
+//! production, and the pattern engine's `advance: resume` and drained-pool
+//! refill run as they do on air. What is not modelled: file
 //! probing (an item's length is the catalog's `duration_ms`, or the channel's
 //! `nominal_item_secs` when the catalog has none), error cards, the Tautulli
 //! feed behind `ctx.history`, the station's identity roots and path index (a manual `local`
@@ -40,15 +34,10 @@ use time::{Duration, OffsetDateTime};
 
 use crate::catalog::Catalog;
 use crate::config::{ChannelConfig, ScoringConfig};
-use crate::daemon::{render_guide, target_count, window_duration};
-use crate::resolve::resolve_channel_with_resume;
-use crate::resume::{GenerationState, ResumeMap};
-use crate::score::ScoreInputs;
-
-/// Bounds one simulated tick's catch-up, like the daemon's own
-/// `MAX_GENERATIONS_PER_TICK`. A channel that lays nothing forward would
-/// otherwise never reach its target.
-const MAX_GENERATIONS_PER_TICK: usize = 512;
+use crate::daemon::{render_guide, window_duration};
+use crate::errors::StationError;
+use crate::generation::{AiringsLedger, GenerationEnv, MAX_GENERATIONS_PER_TICK, generate};
+use crate::resume::ResumeMap;
 
 /// One scheduled airing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -93,6 +82,10 @@ struct Ledger {
     /// `series_key -> last aired entry_id`, where the key is the show, or the
     /// entry itself for a movie (`HistoryDb::series_cursor`).
     cursor: BTreeMap<String, String>,
+    /// `show_id -> last aired entry_id`, movies excluded
+    /// (`HistoryDb::cross_channel_show_cursor`). The simulated channel is the
+    /// only one on air, so this is its own airings.
+    show_cursor: BTreeMap<String, String>,
 }
 
 impl Ledger {
@@ -102,12 +95,25 @@ impl Ledger {
             show_id.unwrap_or(entry_id).to_string(),
             entry_id.to_string(),
         );
+        if let Some(show_id) = show_id {
+            self.show_cursor
+                .insert(show_id.to_string(), entry_id.to_string());
+        }
+    }
+}
+
+impl AiringsLedger for Ledger {
+    fn series_cursor(&self) -> Result<BTreeMap<String, String>, StationError> {
+        Ok(self.cursor.clone())
     }
 
-    /// The last `n` airings, oldest first (`HistoryDb::tail`).
-    fn tail(&self, n: usize) -> Vec<String> {
+    fn global_cursor(&self) -> Result<BTreeMap<String, String>, StationError> {
+        Ok(self.show_cursor.clone())
+    }
+
+    fn tail(&self, n: usize) -> Result<Vec<String>, StationError> {
         let skip = self.entry_ids.len().saturating_sub(n);
-        self.entry_ids[skip..].to_vec()
+        Ok(self.entry_ids[skip..].to_vec())
     }
 }
 
@@ -126,11 +132,6 @@ pub fn simulate(
     start: OffsetDateTime,
     tz: Option<&'static time_tz::Tz>,
 ) -> Result<Simulation, String> {
-    let recent_depth = config
-        .scoring
-        .as_ref()
-        .map(|s| s.recent_depth)
-        .unwrap_or_else(|| ScoringConfig::default().recent_depth);
     let nominal = std::time::Duration::from_secs(u64::from(
         config
             .scoring
@@ -154,6 +155,16 @@ pub fn simulate(
 
     while now < end {
         let target = now + window;
+        let env = GenerationEnv {
+            config,
+            config_path,
+            identity_roots: &[],
+            path_index: None,
+            history: Default::default(),
+            account_id,
+            tz,
+            now,
+        };
         let mut this_tick = 0;
         while from < target {
             if this_tick >= MAX_GENERATIONS_PER_TICK {
@@ -161,35 +172,10 @@ pub fn simulate(
             }
             this_tick += 1;
 
-            let state = GenerationState {
-                resume: resume.clone(),
-                cursor: ledger.cursor.clone(),
-                tail: ledger.tail(config.adjacency_reach()),
-                global_cursor: ledger.cursor.clone(),
-            };
-            let scoring = ScoreInputs {
-                target_count: target_count(config, from, target),
-                recent: ledger.tail(recent_depth),
-                now: now.unix_timestamp(),
-                account_id,
-                tz,
-                ..Default::default()
-            };
-            let (mut items, resume_out, _progress) = resolve_channel_with_resume(
-                config,
-                config_path,
-                &[],
-                None,
-                Some(catalog),
-                &state,
-                &scoring,
-                Some((target - from).unsigned_abs()),
-                from,
-            )
-            .map_err(|e| e.to_string())?;
-
-            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-            let show_ids = catalog.show_ids_for(&ids).map_err(|e| e.to_string())?;
+            let generation = generate(&env, Some(catalog), &ledger, &resume, from, target)
+                .map_err(|e| e.to_string())?;
+            let mut items = generation.items;
+            let show_ids = generation.show_ids;
 
             let lengths: Vec<std::time::Duration> = items
                 .iter()
@@ -235,15 +221,69 @@ pub fn simulate(
             generations.push(SimulatedGeneration {
                 index: generations.len(),
                 from,
-                target_count: scoring.target_count,
+                target_count: generation.target_count,
                 airings,
             });
-            resume = resume_out;
-            resume.prune_lists();
+            resume.adopt(generation.resume, now);
             from += span;
         }
         now += roll;
     }
 
     Ok(Simulation { start, generations })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generation::ChannelLedger;
+    use crate::history::{HistoryDb, PlayRecord};
+
+    /// The simulator's ledger stands in for the `airings` table, so every
+    /// projection `generate` reads must answer what the table answers after the
+    /// same airings — a movie included, which the cross-channel cursor leaves
+    /// out.
+    #[test]
+    fn in_memory_ledger_projects_like_the_airings_table() {
+        let airings = [
+            ("ep1", Some("show-a")),
+            ("movie", None),
+            ("ep2", Some("show-a")),
+            ("other", Some("show-b")),
+        ];
+        let db = HistoryDb::open_in_memory().unwrap();
+        let mut ledger = Ledger::default();
+        let start = OffsetDateTime::UNIX_EPOCH;
+        let records: Vec<PlayRecord> = airings
+            .iter()
+            .enumerate()
+            .map(|(i, (entry, show))| {
+                ledger.record(entry, *show);
+                PlayRecord {
+                    entry_id: entry.to_string(),
+                    show_id: show.map(str::to_string),
+                    start: start + Duration::hours(i as i64),
+                    played_at: start,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        db.record("ch", &records).unwrap();
+        let table = ChannelLedger {
+            db: &db,
+            channel: "ch",
+        };
+
+        assert_eq!(
+            ledger.series_cursor().unwrap(),
+            table.series_cursor().unwrap()
+        );
+        assert_eq!(
+            ledger.global_cursor().unwrap(),
+            table.global_cursor().unwrap()
+        );
+        for n in [0, 2, 10] {
+            assert_eq!(ledger.tail(n).unwrap(), table.tail(n).unwrap(), "tail({n})");
+        }
+    }
 }

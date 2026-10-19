@@ -384,6 +384,23 @@ impl ResumeMap {
         self.lists.retain(|_, kept| !kept.is_empty());
     }
 
+    /// Take `next` — a generation's pool state after its last item — as the
+    /// state to continue from, then prune as of `now`.
+    ///
+    /// The resolver's map carries only pool state; the checkpoint trail and the
+    /// regeneration fingerprint are the daemon's, so they ride across rather
+    /// than being replaced. The saved sidecar needs the fingerprint so the next
+    /// startup can tell a config edit from no edit (#308).
+    pub fn adopt(&mut self, next: ResumeMap, now: OffsetDateTime) {
+        let checkpoints = std::mem::take(&mut self.checkpoints);
+        let config_id = self.config_id.take();
+        *self = next;
+        self.checkpoints = checkpoints;
+        self.config_id = config_id;
+        self.prune_elapsed(now);
+        self.prune_lists();
+    }
+
     /// Drop checkpoints for item boundaries that have already aired — their
     /// content is a record now, not something to regenerate.
     pub fn prune_elapsed(&mut self, now: OffsetDateTime) {

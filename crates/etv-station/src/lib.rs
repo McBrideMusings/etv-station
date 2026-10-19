@@ -18,6 +18,7 @@ pub mod error_card;
 pub mod errors;
 pub mod etv_next;
 pub mod ffprobe;
+pub mod generation;
 pub mod guide;
 pub mod history;
 pub mod hooks;

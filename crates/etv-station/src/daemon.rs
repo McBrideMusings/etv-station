@@ -15,11 +15,14 @@ use tracing::Instrument;
 use crate::cancel::Cancel;
 use crate::catalog::Catalog;
 use crate::catalog::ingest::plex::{PlexAccount, PlexEnv};
-use crate::config::{ChannelConfig, LoadedChannel, ScoringConfig, Station};
+use crate::config::{LoadedChannel, Station};
 use crate::duration::DurationCache;
 use crate::emit::emit_window;
 use crate::errors::{ConfigError, StationError};
 use crate::etv_next;
+use crate::generation::{
+    ChannelLedger, Generation, GenerationEnv, MAX_GENERATIONS_PER_TICK, generate,
+};
 use crate::history::HistoryDb;
 use crate::overlay_supervisor;
 use crate::scan;
@@ -1963,6 +1966,7 @@ where
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+    use crate::config::ChannelConfig;
     use ersatztv_playout::playout::{Playout, PlayoutItem};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2162,10 +2166,6 @@ mod supervisor_tests {
         }
     }
 }
-
-/// Bound on how many generations one catch-up will chain before giving up, so
-/// a pathological config (a sequence with no wall-clock length) can't spin.
-const MAX_GENERATIONS_PER_TICK: usize = 512;
 
 /// Delete emitted playout files that begin at or after `from`, leaving anything
 /// already airing or aired in place. Returns how many were removed.
@@ -2372,6 +2372,7 @@ async fn regen_floor(
 #[cfg(test)]
 mod regen_floor_tests {
     use super::*;
+    use crate::config::ChannelConfig;
     use crate::rule::Sequential;
     use tempfile::tempdir;
     use time::macros::datetime;
@@ -3121,36 +3122,6 @@ async fn forward_channel_loop(
     }
 }
 
-/// Generate and emit forward until the window through `now + window_days` is
-/// covered, chaining one generation into the next through the resume map.
-/// Hint a scorer plugin about how many items this generation needs.
-///
-/// Sized to **one chunk**, not to the whole remaining window. A generation lays
-/// the plugin's returned list end-to-end, so a hint covering a 30-day window
-/// would push a single generation to materialize the entire month in one pass.
-/// Near the end of the window the remaining span is smaller than a chunk, and
-/// that smaller span wins.
-///
-/// Clamped at both ends: at least one item, so a nearly-covered window still
-/// asks for something rather than handing a plugin a target of zero, and capped
-/// so no configuration can ask a plugin to rank an entire library.
-pub(crate) fn target_count(
-    config: &ChannelConfig,
-    from: OffsetDateTime,
-    target: OffsetDateTime,
-) -> usize {
-    const MAX: i64 = 500;
-    let per_item = config
-        .scoring
-        .as_ref()
-        .map(|s| s.nominal_item_secs)
-        .unwrap_or_else(|| ScoringConfig::default().nominal_item_secs)
-        .max(1) as i64;
-    let chunk = i64::from(config.chunk_hours) * 3600;
-    let remaining = (target - from).whole_seconds().max(0);
-    remaining.min(chunk).div_euclid(per_item).clamp(1, MAX) as usize
-}
-
 /// Run the align/fill pass over one generation's schedule. A channel with no
 /// aligned block gets its schedule back unchanged. The bumper scripts read the
 /// airings ledger through `ctx.airings`; the rows for what they place come back
@@ -3240,7 +3211,9 @@ fn align_fill(
     fill_gaps(&env, laid, skip, start, fill_leading, &end_progress)
 }
 
-/// Returns the map to carry into the next tick.
+/// Generate and emit forward until the window through `now + window_days` is
+/// covered, chaining one generation ([`generate`]) into the next through the
+/// resume map. Returns the map to carry into the next tick.
 async fn pattern_catch_up(
     channel: &LoadedChannel,
     ctx: StationContext<'_>,
@@ -3379,14 +3352,22 @@ async fn pattern_catch_up(
     // for the same reason (`scoring.explain`).
     let explain_wanted = channel.config.explains_why();
 
-    // How deep a recently-aired tail this channel's scorer sees. Read once —
-    // it cannot change inside a tick.
-    let recent_depth = channel
-        .config
-        .scoring
-        .as_ref()
-        .map(|s| s.recent_depth)
-        .unwrap_or_else(|| ScoringConfig::default().recent_depth);
+    let env = GenerationEnv {
+        config: &channel.config,
+        config_path: &channel.config_path,
+        identity_roots: ctx.identity_roots,
+        path_index: ctx.catalog.map(|info| &info.path_index),
+        history,
+        account_id,
+        // The station's configured tz — a sequencer block (#169) reads this to
+        // place its pools against the local clock (ADR 0004).
+        tz: Some(ctx.tz),
+        now,
+    };
+    let ledger = ChannelLedger {
+        db: ctx.history_db,
+        channel: &channel.name,
+    };
 
     // Computed at most once per call, not once per generation: every
     // generation this call chains together shares the same catalog, config,
@@ -3418,72 +3399,18 @@ async fn pattern_catch_up(
         // Where each series left off comes from the play-history store, not
         // from a cursor of the sidecar's own (#70): one table, projected on
         // demand via an indexed query, never a whole-file read.
-        let state = crate::resume::GenerationState {
-            resume: resume.clone(),
-            cursor: ctx.history_db.series_cursor(&channel.name)?,
-            global_cursor: ctx.history_db.cross_channel_show_cursor()?,
-            tail: ctx
-                .history_db
-                .tail(&channel.name, channel.config.adjacency_reach())?,
-        };
-
-        // Sized to one chunk, not to the whole remaining window: the generation
-        // lays whatever the plugin returns end-to-end, so asking for a month's
-        // worth would make a single generation try to cover the month.
-        let scoring = crate::score::ScoreInputs {
-            target_count: target_count(&channel.config, from, target),
-            history: Arc::clone(&history),
-            recent: ctx.history_db.tail(&channel.name, recent_depth)?,
-            now: now.unix_timestamp(),
-            // The station's configured tz — a sequencer block (#169) reads
-            // this to place its pools against the local clock (ADR 0004).
-            tz: Some(ctx.tz),
-            account_id,
-        };
-
-        // This channel's own reader, borrowed for the synchronous resolve and
-        // released at the end of the block. Nothing else can be waiting on it —
-        // it belongs to this task alone — so however long a scorer plugin takes
-        // in here, no other channel is affected.
         //
-        // The borrow stays inside the block deliberately: a `&Catalog` held
-        // across the `.await`s further down would make this task's future
-        // non-`Send` and it would not compile at the `tokio::spawn`.
-        let (items, resume_out, progress, show_ids) = {
-            let reader = catalog.as_ref();
-            let (items, resume_out, progress) = crate::resolve::resolve_channel_with_resume(
-                &channel.config,
-                &channel.config_path,
-                ctx.identity_roots,
-                ctx.catalog.map(|info| &info.path_index),
-                reader,
-                &state,
-                &scoring,
-                // How much airtime is still missing, and what bounds one
-                // generation. A pattern block with no authored `cycles` stops
-                // once it has laid this much down rather than running its pools
-                // to the end — eleven years in one pass on a 51-pool channel
-                // (#140) — and a flat `entries` channel cuts its authored list
-                // here and resumes at that position next time rather than
-                // laying all 950 items and idling for a month (#118). The loop
-                // condition guarantees this is positive.
-                Some((target - from).unsigned_abs()),
-                // The absolute instant this generation begins airing at — a
-                // sequencer block (#169) reads it as `ctx.window.from`, so a
-                // sequencer script asks "what hour does this generation start"
-                // rather than "what hour is it while the daemon happens to be
-                // computing this".
-                from,
-            )?;
-            // The ledger needs each airing's show, and only the catalog knows
-            // it. One query for the whole generation rather than one per item.
-            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-            let show_ids = match reader {
-                Some(cat) => cat.show_ids_for(&ids)?,
-                None => HashMap::new(),
-            };
-            (items, resume_out, progress, show_ids)
-        };
+        // This channel's own catalog reader is borrowed for the synchronous
+        // resolve only. Nothing else can be waiting on it — it belongs to this
+        // task alone — so however long a scorer plugin takes in there, no other
+        // channel is affected.
+        let Generation {
+            items,
+            resume: resume_out,
+            progress,
+            show_ids,
+            ..
+        } = generate(&env, catalog.as_ref(), &ledger, &resume, from, target)?;
 
         // No "the channel ran out" branch: every series loops, so a pattern
         // channel cannot play itself empty. An empty resolve means an empty
@@ -3734,18 +3661,7 @@ async fn pattern_catch_up(
         }));
         ctx.history_db.record(&channel.name, &records)?;
 
-        // `resume_out` carries only pool state; the checkpoint trail and the
-        // regeneration fingerprint are the daemon's, so they ride across rather
-        // than being replaced. Dropping the fingerprint here left every saved
-        // sidecar without one, so the next startup could not tell a config edit
-        // from no edit and kept airing the old schedule.
-        let checkpoints = std::mem::take(&mut resume.checkpoints);
-        let config_id = resume.config_id.take();
-        resume = resume_out;
-        resume.checkpoints = checkpoints;
-        resume.config_id = config_id;
-        resume.prune_elapsed(now);
-        resume.prune_lists();
+        resume.adopt(resume_out, now);
         crate::resume::save(output, &resume).await?;
         from += span;
         generations += 1;
@@ -3783,14 +3699,15 @@ async fn pattern_catch_up(
     Ok(resume)
 }
 
-/// Guards the property #308 exists for: the swap right above
-/// (`resume = resume_out`, with `checkpoints` and `config_id` carried across by
-/// hand) keeps a generation's fingerprint alive. A field added to `ResumeMap`
-/// that the daemon owns must be carried the same way, or the swap silently
-/// drops it.
+/// The swap in `pattern_catch_up` ([`crate::resume::ResumeMap::adopt`], with
+/// `checkpoints` and `config_id` carried across by hand) keeps a generation's
+/// fingerprint alive (#308). A field
+/// added to `ResumeMap` that the daemon owns must be carried the same way, or
+/// the swap silently drops it.
 #[cfg(test)]
 mod resume_fingerprint_survives_generation_tests {
     use super::*;
+    use crate::config::ChannelConfig;
     use tempfile::tempdir;
 
     fn ctx<'a>(
