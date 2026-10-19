@@ -198,6 +198,50 @@ fn genre_bucket() { "genres" }
 // read as unseen and land in the discovery half.
 fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
 
+// A multiplier on the final score of every title in the same watched set `seen`
+// partitions on: this account's plays on a `single_user` channel, the house's
+// on a pooled one. 1.0 is off. Unlike `seen: only`, it leans toward played
+// titles without dropping the unplayed ones. It multiplies the score after
+// recency damping, so a played title overtakes an unplayed one scoring up to
+// `seen_boost` times higher.
+// Refused at 0 or below: a zero would erase every played title.
+fn seen_boost(ctx) {
+    let b = tunable(ctx, "seen_boost", 1.0).to_float();
+    if b <= 0.0 { throw "config.seen_boost must be above 0, got " + b; }
+    b
+}
+
+// An optional cutoff on one mdblist rating source, `rating: { source:
+// letterboxd, min: 6.5 }` with `min`, `max`, or both. Values are on each
+// source's own scale (letterboxd 0-10, tomatoes 0-100), read from the
+// `ratings` enrichment namespace where the fact's key is the source name. A
+// title with no value from that source is dropped from a rated pool. Returns
+// () when the pool sets no `rating:`.
+fn rating_cutoff(ctx) {
+    let r = ctx.config["rating"];
+    if r == () { return (); }
+    if type_of(r) != "map" || r.source == () || type_of(r.source) != "string" {
+        throw "config.rating must be a map with a string `source`, e.g. { source: letterboxd, min: 6.5 }";
+    }
+    if r.min == () && r.max == () {
+        throw "config.rating needs a `min`, a `max`, or both";
+    }
+    #{
+        source: r.source,
+        min: if r.min == () { () } else { r.min.to_float() },
+        max: if r.max == () { () } else { r.max.to_float() },
+    }
+}
+
+// The number in a ratings fact's value, or () when it does not parse.
+fn rating_number(v) {
+    if type_of(v) == "i64" || type_of(v) == "f64" { return v.to_float(); }
+    let n = ();
+    try { n = v.parse_float(); } catch { n = (); }
+    // NaN compares false against every bound, so it would pass a cutoff.
+    if n != () && n != n { () } else { n }
+}
+
 // How far back a watched title may be cited as the reason for a pick (#319),
 // in days. `ctx.history` is the newest 1000 rows with no age bound, so without
 // this a title the house watched eleven months ago could be named as the
@@ -472,7 +516,8 @@ fn pick(ctx) {
     // the house's set is the closest true answer rather than a guess.
     let mode = seen_mode(ctx);
     let watched = #{};
-    if mode != "any" {
+    let boost = seen_boost(ctx);
+    if mode != "any" || boost != 1.0 {
         let ids = if ctx.account_id != () {
             ds.watched_units_for(ctx.account_id)
         } else {
@@ -585,6 +630,36 @@ fn pick(ctx) {
             let d = aired[id];
             if d != () { unit_recency[id] = d; }
         }
+    }
+
+    // The rating cutoff (`config.rating`): one bulk fetch of the `ratings`
+    // namespace for every unit, then drop whichever has no value from the
+    // source or one outside [min, max]. A shows pool's units are show ids,
+    // which is where the ratings live. The surviving value rides along for the
+    // audit.
+    let cutoff = rating_cutoff(ctx);
+    let rating_of = #{};
+    if cutoff != () {
+        let ratings = ds.enrichment_for_many(units, "ratings");
+        let kept_units = [];
+        for u in units {
+            let facts = ratings[u];
+            let val = ();
+            if facts != () {
+                for f in facts {
+                    if f.key == cutoff.source {
+                        let n = rating_number(f.value);
+                        if n != () { val = n; break; }
+                    }
+                }
+            }
+            if val == () { continue; }
+            if cutoff.min != () && val < cutoff.min { continue; }
+            if cutoff.max != () && val > cutoff.max { continue; }
+            rating_of[u] = val;
+            kept_units.push(u);
+        }
+        units = kept_units;
     }
 
     // Every unit's id, gathered once so enrichment can be fetched in a
@@ -868,8 +943,11 @@ fn pick(ctx) {
         let base_score = (alpha * taste_score + favor_score) / (1.0 + gamma * house_score + disfavor_score);
         let aired_rank = unit_recency[id];
         let factor = recency_factor(aired_rank, half_life);
-        let score = base_score * factor;
+        let seen_boosted = boost != 1.0 && watched[id] != ();
+        let score = base_score * factor * (if seen_boosted { boost } else { 1.0 });
         scored.push(#{
+            seen_boosted: seen_boosted,
+            rating: if cutoff == () { () } else { #{ source: cutoff.source, value: rating_of[id] } },
             id: id,
             score: score,
             base_score: base_score,
@@ -1178,6 +1256,8 @@ fn pick(ctx) {
             house_score: row.house_score,
             unusual_weight: gamma,
             seen: mode,
+            seen_boosted: row.seen_boosted,
+            rating: row.rating,
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
@@ -1473,6 +1553,8 @@ fn audit(ctx, picks, workspace) {
                 house_score: r.house_score,
                 unusual_weight: r.unusual_weight,
                 seen: r.seen,
+                seen_boosted: r.seen_boosted,
+                rating: r.rating,
                 recency_factor: r.recency_factor,
                 aired_rank: r.aired_rank,
                 // The series this entry was ranked as, on a shows pool.
