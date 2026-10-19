@@ -198,6 +198,50 @@ fn genre_bucket() { "genres" }
 // read as unseen and land in the discovery half.
 fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
 
+// A multiplier on the final score of every title in the same watched set `seen`
+// partitions on: this account's plays on a `single_user` channel, the house's
+// on a pooled one. 1.0 is off. Unlike `seen: only`, it leans toward played
+// titles without dropping the unplayed ones. It multiplies the score after
+// recency damping, so a played title overtakes an unplayed one scoring up to
+// `seen_boost` times higher.
+// Refused at 0 or below: a zero would erase every played title.
+fn seen_boost(ctx) {
+    let b = tunable(ctx, "seen_boost", 1.0).to_float();
+    if b <= 0.0 { throw "config.seen_boost must be above 0, got " + b; }
+    b
+}
+
+// An optional cutoff on one mdblist rating source, `rating: { source:
+// letterboxd, min: 6.5 }` with `min`, `max`, or both. Values are on each
+// source's own scale (letterboxd 0-10, tomatoes 0-100), read from the
+// `ratings` enrichment namespace where the fact's key is the source name. A
+// title with no value from that source is dropped from a rated pool. Returns
+// () when the pool sets no `rating:`.
+fn rating_cutoff(ctx) {
+    let r = ctx.config["rating"];
+    if r == () { return (); }
+    if type_of(r) != "map" || r.source == () || type_of(r.source) != "string" {
+        throw "config.rating must be a map with a string `source`, e.g. { source: letterboxd, min: 6.5 }";
+    }
+    if r.min == () && r.max == () {
+        throw "config.rating needs a `min`, a `max`, or both";
+    }
+    #{
+        source: r.source,
+        min: if r.min == () { () } else { r.min.to_float() },
+        max: if r.max == () { () } else { r.max.to_float() },
+    }
+}
+
+// The number in a ratings fact's value, or () when it does not parse.
+fn rating_number(v) {
+    if type_of(v) == "i64" || type_of(v) == "f64" { return v.to_float(); }
+    let n = ();
+    try { n = v.parse_float(); } catch { n = (); }
+    // NaN compares false against every bound, so it would pass a cutoff.
+    if n != () && n != n { () } else { n }
+}
+
 // How far back a watched title may be cited as the reason for a pick (#319),
 // in days. `ctx.history` is the newest 1000 rows with no age bound, so without
 // this a title the house watched eleven months ago could be named as the
@@ -235,6 +279,30 @@ fn unusual_weight(ctx) { tunable(ctx, "unusual_weight", 0.0).to_float() }
 // library: enough that a channel does not cycle the same three shows, few
 // enough that the 13th-ranked show has to earn its way up.
 fn show_count(ctx) { tunable(ctx, "show_count", 12).to_int() }
+
+// `config.walk`: build the pool by walking tags out from seed tags, or () when
+// the pool does not ask for it. `seeds` are the tags a title can carry to be a
+// candidate outright; `neighbours` is how many of each seed's strongest
+// neighbours on the tag network count as related tags (default 12); `min_tags`
+// is how many related tags a title with no seed must carry (default 2).
+fn walk_config(ctx) {
+    let w = ctx.config["walk"];
+    if w == () { return (); }
+    if type_of(w) != "map" || type_of(w["seeds"]) != "array" || w["seeds"].len == 0 {
+        throw "config.walk must be a map with a non-empty `seeds` list, e.g. { seeds: [kung fu, wuxia], neighbours: 12, min_tags: 2 }";
+    }
+    let seeds = [];
+    for s in w["seeds"] {
+        if type_of(s) != "string" { throw "config.walk.seeds must be tag names, got " + s; }
+        let s = s.to_lower();
+        if !seeds.contains(s) { seeds.push(s); }
+    }
+    let neighbours = if w["neighbours"] == () { 12 } else { w["neighbours"].to_int() };
+    let min_tags = if w["min_tags"] == () { 2 } else { w["min_tags"].to_int() };
+    if neighbours < 1 { throw "config.walk.neighbours must be 1 or more, got " + neighbours; }
+    if min_tags < 1 { throw "config.walk.min_tags must be 1 or more, got " + min_tags; }
+    #{ seeds: seeds, neighbours: neighbours, min_tags: min_tags }
+}
 
 // The datastore grant name this script reaches for (#181). A channel names
 // its own grant under the pool's `datastores:`; this is this script's half
@@ -472,7 +540,8 @@ fn pick(ctx) {
     // the house's set is the closest true answer rather than a guess.
     let mode = seen_mode(ctx);
     let watched = #{};
-    if mode != "any" {
+    let boost = seen_boost(ctx);
+    if mode != "any" || boost != 1.0 {
         let ids = if ctx.account_id != () {
             ds.watched_units_for(ctx.account_id)
         } else {
@@ -587,6 +656,36 @@ fn pick(ctx) {
         }
     }
 
+    // The rating cutoff (`config.rating`): one bulk fetch of the `ratings`
+    // namespace for every unit, then drop whichever has no value from the
+    // source or one outside [min, max]. A shows pool's units are show ids,
+    // which is where the ratings live. The surviving value rides along for the
+    // audit.
+    let cutoff = rating_cutoff(ctx);
+    let rating_of = #{};
+    if cutoff != () {
+        let ratings = ds.enrichment_for_many(units, "ratings");
+        let kept_units = [];
+        for u in units {
+            let facts = ratings[u];
+            let val = ();
+            if facts != () {
+                for f in facts {
+                    if f.key == cutoff.source {
+                        let n = rating_number(f.value);
+                        if n != () { val = n; break; }
+                    }
+                }
+            }
+            if val == () { continue; }
+            if cutoff.min != () && val < cutoff.min { continue; }
+            if cutoff.max != () && val > cutoff.max { continue; }
+            rating_of[u] = val;
+            kept_units.push(u);
+        }
+        units = kept_units;
+    }
+
     // Every unit's id, gathered once so enrichment can be fetched in a
     // single bulk call before the loop below (plex-db-ex#40) — #172 measured
     // the per-candidate alternative at 101 million steps and 6m34s on an
@@ -594,6 +693,84 @@ fn pick(ctx) {
     // rather than 74,815 episode ids, since an episode carries no keywords
     // of its own.
     let enrichment = ds.enrichment_for_many(units, ns);
+
+    // THE TAG WALK (`config.walk`). The related tags are each seed's strongest
+    // `neighbours` neighbours on the tag network, weighted by shared/df: the
+    // share of the neighbour's own titles that also carry the seed, so a tag
+    // that is merely common weighs little. A tag related to several seeds keeps
+    // its largest weight. A title stays a candidate when it carries a seed, or
+    // at least `min_tags` related tags; everything else drops here, before the
+    // document-frequency pass, so the pool's idf reads the walked pool.
+    //
+    // closeness is 1 for a seed match; otherwise the related tags the title
+    // carries, summed, over the sum of the `min_tags` heaviest related weights,
+    // capped at 1 — carrying the strongest `min_tags` tags is a full match.
+    // `walked` keeps each survivor's closeness and the tags behind it, for the
+    // score and the audit.
+    let walk = walk_config(ctx);
+    let walked = #{};
+    if walk != () {
+        let net_kind = if unit_kind == "movie" { "movie" } else { "show" };
+        let related = #{};
+        let known_seeds = #{};
+        for s in walk.seeds { known_seeds[s] = true; }
+        for s in walk.seeds {
+            let near = ds.tag_neighbours(net_kind, s);
+            if near.len == 0 {
+                log("pool " + ctx.pool + ": walk seed \"" + s + "\" is not in the " + net_kind + " tag network — walking from the remaining seeds");
+                continue;
+            }
+            let taken = 0;
+            for n in near {
+                if taken >= walk.neighbours { break; }
+                if known_seeds[n.tag] != () { continue; }
+                taken += 1;
+                let w = n["shared"].to_float() / n.df.to_float();
+                let cur = related[n.tag];
+                if cur == () || w > cur { related[n.tag] = w; }
+            }
+        }
+        let top = related.values();
+        top.sort(|a, b| if a > b { -1 } else if a < b { 1 } else { 0 });
+        let denom = 0.0;
+        for i in 0..walk.min_tags {
+            if i < top.len { denom += top[i]; }
+        }
+        let kept_units = [];
+        for u in units {
+            let facts = enrichment[u];
+            if facts == () { continue; }
+            let seeds_matched = [];
+            let tags = [];
+            let total = 0.0;
+            for f in facts {
+                if f.namespace != ns { continue; }
+                if known_seeds[f.value] != () {
+                    if !seeds_matched.contains(f.value) { seeds_matched.push(f.value); }
+                } else if related[f.value] != () {
+                    let already = false;
+                    for t in tags { if t.tag == f.value { already = true; break; } }
+                    if already { continue; }
+                    tags.push(#{ tag: f.value, weight: related[f.value] });
+                    total += related[f.value];
+                }
+            }
+            if seeds_matched.len == 0 && tags.len < walk.min_tags { continue; }
+            let closeness = 1.0;
+            if seeds_matched.len == 0 {
+                closeness = if denom > 0.0 { total / denom } else { 1.0 };
+                if closeness > 1.0 { closeness = 1.0; }
+            }
+            tags.sort(|a, b| {
+                if a.weight > b.weight { -1 } else if a.weight < b.weight { 1 }
+                else if a.tag < b.tag { -1 } else if a.tag > b.tag { 1 }
+                else { 0 }
+            });
+            walked[u] = #{ seeds: walk.seeds, seeds_matched: seeds_matched, tags: tags, closeness: closeness };
+            kept_units.push(u);
+        }
+        units = kept_units;
+    }
 
     // One account's taste vector when the channel is `single_user`-scoped
     // (#278) and the station resolved that account's id; the house's pooled
@@ -865,11 +1042,17 @@ fn pick(ctx) {
         // assumes. A disfavor-only profile can push a score toward zero but
         // never past it. `gamma` is scale-free for the same reason — it is a
         // ratio against 1.0 rather than against the house vector's magnitude.
-        let base_score = (alpha * taste_score + favor_score) / (1.0 + gamma * house_score + disfavor_score);
+        let walk_row = walked[id];
+        let base_score = (alpha * taste_score + favor_score) / (1.0 + gamma * house_score + disfavor_score)
+            * (if walk_row == () { 1.0 } else { walk_row.closeness });
         let aired_rank = unit_recency[id];
         let factor = recency_factor(aired_rank, half_life);
-        let score = base_score * factor;
+        let seen_boosted = boost != 1.0 && watched[id] != ();
+        let score = base_score * factor * (if seen_boosted { boost } else { 1.0 });
         scored.push(#{
+            walk: walk_row,
+            seen_boosted: seen_boosted,
+            rating: if cutoff == () { () } else { #{ source: cutoff.source, value: rating_of[id] } },
             id: id,
             score: score,
             base_score: base_score,
@@ -1178,6 +1361,9 @@ fn pick(ctx) {
             house_score: row.house_score,
             unusual_weight: gamma,
             seen: mode,
+            seen_boosted: row.seen_boosted,
+            walk: row.walk,
+            rating: row.rating,
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
@@ -1424,6 +1610,18 @@ fn guide_line(r, candidate_count) {
         }
         line += " (" + joined + ")";
     }
+    if r.walk != () {
+        let theme = "";
+        for i in 0..r.walk.seeds.len {
+            if i > 0 { theme += ", "; }
+            theme += r.walk.seeds[i];
+        }
+        let tail = ", walking out from " + theme;
+        // The guide refuses a line over 200 characters. The 120 leaves the
+        // `seen` suffix room; a theme that would not fit is left off rather
+        // than cut mid-word.
+        if line.len + tail.len <= 120 { line += tail; }
+    }
     if r.seen == "only" {
         line += ", one you've watched before";
     } else if r.seen == "exclude" {
@@ -1473,6 +1671,13 @@ fn audit(ctx, picks, workspace) {
                 house_score: r.house_score,
                 unusual_weight: r.unusual_weight,
                 seen: r.seen,
+                seen_boosted: r.seen_boosted,
+                // The tag walk behind this pick (`config.walk`), or () on a
+                // pool without one: the seeds, which of them the title
+                // carries, the related tags it carries with their weights, and
+                // the closeness the score was multiplied by.
+                walk: r.walk,
+                rating: r.rating,
                 recency_factor: r.recency_factor,
                 aired_rank: r.aired_rank,
                 // The series this entry was ranked as, on a shows pool.

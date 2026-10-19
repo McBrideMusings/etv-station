@@ -26,6 +26,9 @@ pub fn records(
                     in_ms,
                     out_ms,
                 } => (path.display().to_string(), Some(*in_ms), Some(*out_ms)),
+                SegmentSource::Http { url, in_ms, out_ms } => {
+                    (url.clone(), Some(*in_ms), Some(*out_ms))
+                }
                 SegmentSource::Lavfi { params } => (params.clone(), None, None),
                 SegmentSource::Still { image_path } => {
                     (image_path.display().to_string(), None, None)

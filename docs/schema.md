@@ -107,6 +107,7 @@ fill:
     min_gap: 5s                      # optional: only while the remaining gap is at least this
     max_gap: 15s                     # optional: only while the remaining gap is at most this
     capabilities: []                 # what the script's capabilities() declares, exactly
+    config: { mode: next }           # optional: handed to the script verbatim as ctx.config
 ```
 
 After a generation's programmes are laid out and probed, and before they are cut
@@ -1834,6 +1835,60 @@ and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
+#### `seen_boost` and `rating` — lean toward played titles, cut on a rating
+
+```yaml
+config:
+  seen_boost: 1.5                          # multiplier on titles in the account's plays; 1.0 = off
+  rating: { source: letterboxd, min: 6.5 } # or max:, or both
+```
+
+**`seen_boost`** multiplies the final score (after recency damping) of every
+title in the watched set `seen:` partitions on: the account's plays on a
+`single_user` channel, the house's on a pooled one. Unlike `seen: only` it keeps
+unplayed titles in the pool. It must be above 0.
+
+**`rating`** keeps titles whose value from one mdblist source lies within
+`[min, max]`, read from the `ratings` enrichment namespace (the fact's key is
+the source name). Values use the source's own scale: letterboxd 0–10, tomatoes
+0–100. A title with no value from that source is dropped. On a shows pool the
+value is the show's.
+
+Audit detail carries `seen_boosted` (bool) and `rating: { source, value }`
+(null on a pool with no `rating:`).
+
+#### `walk` — build the pool by walking tags out from seed tags
+
+```yaml
+config:
+  walk: { seeds: [kung fu, wuxia], neighbours: 12, min_tags: 2 }
+```
+
+A themed pool that lists a collection or matches one keyword misses titles on
+the same theme that never carry that keyword. `walk` finds them through the tag
+network of the plex-db-ex store (`ds.tag_neighbours`), on the movie network for
+`unit: movie` and the show network for `unit: show` / `season`.
+
+- **Related tags** are each seed's `neighbours` strongest neighbours (default
+  12), by shared-title count. A related tag weighs `shared / df`: the share of
+  that tag's own titles that also carry the seed, so a common tag such as
+  `drama` weighs almost nothing. A tag related to two seeds keeps its larger
+  weight. A seed is never its own related tag.
+- **A title is a candidate** when it carries a seed, or at least `min_tags`
+  related tags (default 2). Every other title leaves the pool before ranking.
+- **Closeness** multiplies the taste score. It is 1 for a title carrying a seed;
+  otherwise the summed weight of the related tags it carries divided by the sum
+  of the `min_tags` heaviest related weights, capped at 1.
+- A seed with no neighbours on the network logs once per generation and the walk
+  continues with the remaining seeds. `seeds` must be non-empty; `neighbours`
+  and `min_tags` must be 1 or more.
+
+The pool must grant the `taste` datastore, as `taste-cosine` already requires.
+Audit detail carries `walk: { seeds, seeds_matched, tags: [{ tag, weight }],
+closeness }` (null on a pool with no `walk:`), and the guide line ends
+"walking out from kung fu, wuxia" unless the theme is long enough to push the
+line past 120 characters, when it is left off.
+
 #### `why` — an on-screen reason, worded by the pool
 
 Three more `config` keys give each pick a short reason an overlay can draw.
@@ -2021,7 +2076,7 @@ A plugin declares its hooks and the station wires only the declared ones
 |---|---|
 | `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
 | `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-a-plugin-arranges-the-block-itself). |
-| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps; `next` is `()` at the generation frontier), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`), `read` (`ctx.read(path)`, a file in its own folder), `http` (`ctx.http(url, method, body)`, the same call and 10-second limit a pool's `http` has) and `exec` (`ctx.exec(program, args)` -> `#{ code, stdout, stderr }`, no stdin, killed and an error after 10 seconds; a nonzero `code` is the script's to read); `ctx.http` and `ctx.exec` together may spend 30 seconds per `build()` call, after which each further call errors at once, naming the budget; each must be both declared and granted. `parse_json(text)` needs no grant. |
+| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps, each with `source_ids`, a map from source (`plex`, `local_fs`) to that source's id for the entry; `next` is `()` at the generation frontier), `upcoming` (item maps of the programmes after `next` in the schedule being laid, nearest first, at most 12; `[]` at the frontier), `config` (the fill entry's `config:`, or `#{}`), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `http(url, in_ms, out_ms)` (a remote file ETV-next fetches; `{{VAR}}` in the url is expanded by ETV-next at play time, so a token stays out of the playout file), `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`), `read` (`ctx.read(path)`, a file in its own folder), `http` (`ctx.http(url, method, body)` or `ctx.http(url, method, body, #{ Accept: "application/json" })`, the same call and 10-second limit a pool's `http` has; `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the url are filled from the station's environment, so a script reaches Plex without holding the token) and `exec` (`ctx.exec(program, args)` -> `#{ code, stdout, stderr }`, no stdin, killed and an error after 10 seconds; a nonzero `code` is the script's to read); `ctx.http` and `ctx.exec` together may spend 30 seconds per `build()` call, after which each further call errors at once, naming the budget; each must be both declared and granted. `parse_json(text)` needs no grant. |
 
 A script may declare any of them. The declaration lives in the script, not in
 the channel config, so swapping one scorer for another needs no YAML edit.
@@ -2099,7 +2154,7 @@ opened only by name:
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched; `ctx.entry_id_for(source, id)` — the `entry_id` the catalog filed under that `(source, source_id)` provenance row (`source` is `"plex"` or `"local_fs"`), or `()` when none matches, so a script joining its own external history (a Tautulli `rating_key`) resolves it without the daemon owning the join (ADR 0014) | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
 | `http` | `ctx.http(url, method, body)` — one HTTP call returning the response body as text; a 4xx/5xx, a transport failure or 10 seconds without a response is an error; one `pick()` call's `ctx.http` calls together may spend 30 seconds, after which each further call errors at once, naming the budget (ADR 0014) | `"http"` |
-| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
+| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `tag_neighbours`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411; `tag_neighbours(kind, tag)` returns `[#{ tag, shared, df }]` — the tags co-occurring with `tag` on the plex-db-ex tag network, ordered by `shared` descending; read `shared` as `n["shared"]`, since `shared` is a reserved word in Rhai; etv-station-xm8p.2); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
 
 Unlike `hooks()`, `capabilities()` is optional — a script with no such function
 declares nothing, which is the right answer for a plugin that only reads the

@@ -67,15 +67,84 @@ impl Budget {
     }
 }
 
+/// The environment variables a plugin may name as `{{NAME}}` in a
+/// [`call`]'s URL: where the station reaches Plex. The value is substituted
+/// here, in the station, so a script can reach Plex without ever holding the
+/// token; the response is the script's to read.
+pub const URL_ENV: &[&str] = &["PLEX_URL", "PLEX_TOKEN"];
+
+/// `url` with each `{{NAME}}` for a [`URL_ENV`] name replaced by that
+/// variable's value. Any other `{{...}}` is left as written. A named variable
+/// that is unset or empty is an error naming it, never a request to a
+/// half-built URL.
+fn expand_url(url: &str) -> Result<String, String> {
+    expand_url_with(url, |name| std::env::var(name).ok())
+}
+
+fn expand_url_with(url: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = url.to_string();
+    for name in URL_ENV {
+        let token = format!("{{{{{name}}}}}");
+        if !out.contains(&token) {
+            continue;
+        }
+        let value = lookup(name)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{name} is not set, but the url names {token}"))?;
+        out = out.replace(&token, &value);
+    }
+    // The token goes only to the host the station itself reaches Plex at, so a
+    // script cannot send it elsewhere by writing a different host in the url.
+    let token = "{{PLEX_TOKEN}}";
+    if url.contains(token) {
+        let plex = lookup("PLEX_URL").unwrap_or_default();
+        if host_of(&out) != host_of(&plex) {
+            return Err(format!(
+                "the url names {token} but its host is not the PLEX_URL host"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The host `url` reaches, for a log line: `{{PLEX_URL}}` is filled in (left
+/// as written when unset), and the credentials, path and query are dropped.
+pub fn display_host(url: &str) -> String {
+    let plex = std::env::var("PLEX_URL").unwrap_or_default();
+    let shown = if plex.is_empty() {
+        url.to_string()
+    } else {
+        url.replace("{{PLEX_URL}}", &plex)
+    };
+    host_of(&shown).to_string()
+}
+
 /// `method` `url` with `body` (sent only when non-empty), returning the
 /// response body as text. A 4xx/5xx status, a transport failure and a timeout
-/// are all errors.
+/// are all errors. `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in `url` are filled from
+/// the environment ([`URL_ENV`]).
 pub fn call(url: &str, method: &str, body: &str, timeout: Duration) -> Result<String, String> {
+    call_with(url, method, body, &[], timeout)
+}
+
+/// [`call`] with request headers, each a `(name, value)` pair (for example
+/// `Accept: application/json`, which Plex needs to answer in JSON).
+pub fn call_with(
+    url: &str,
+    method: &str,
+    body: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+) -> Result<String, String> {
+    let url = expand_url(url)?;
+    let url = url.as_str();
     let method = method.to_uppercase();
     let host = host_of(url);
     let started = Instant::now();
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
-    let req = agent.request(&method, url);
+    let req = headers
+        .iter()
+        .fold(agent.request(&method, url), |req, (k, v)| req.set(k, v));
     let resp = if body.is_empty() {
         req.call()
     } else {
@@ -147,7 +216,7 @@ pub fn parse_json(text: &str) -> Result<Dynamic, Box<EvalAltResult>> {
 }
 
 /// The host part of `url`, without scheme, credentials, path or query.
-fn host_of(url: &str) -> &str {
+pub fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     authority.rsplit_once('@').map_or(authority, |(_, h)| h)
@@ -280,6 +349,30 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("parse_json()")
         );
+    }
+
+    #[test]
+    fn a_url_names_plex_by_placeholder_and_nothing_else() {
+        let env = |name: &str| match name {
+            "PLEX_URL" => Some("http://plex.lan:32400".to_string()),
+            "PLEX_TOKEN" => Some("tok".to_string()),
+            _ => None,
+        };
+        let got = expand_url_with(
+            "{{PLEX_URL}}/x?X-Plex-Token={{PLEX_TOKEN}}&o={{OTHER}}",
+            env,
+        );
+        assert_eq!(
+            got.unwrap(),
+            "http://plex.lan:32400/x?X-Plex-Token=tok&o={{OTHER}}"
+        );
+        let elsewhere =
+            expand_url_with("https://evil.example/c?t={{PLEX_TOKEN}}", env).unwrap_err();
+        assert!(elsewhere.contains("not the PLEX_URL host"), "{elsewhere}");
+        let e = expand_url_with("{{PLEX_URL}}/x", |_| None).unwrap_err();
+        assert!(e.contains("PLEX_URL is not set"), "{e}");
+        let empty = expand_url_with("{{PLEX_TOKEN}}", |_| Some(String::new())).unwrap_err();
+        assert!(empty.contains("PLEX_TOKEN is not set"), "{empty}");
     }
 
     #[test]

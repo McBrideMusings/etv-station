@@ -13,7 +13,13 @@
 //! drops a column a consumer reads fails that consumer's **build**, not a
 //! runtime string-built query.
 //!
-//! **No ranking policy lives here, and there is no constant to tune.**
+//! **The Frame index.** Opened with a `frames.db` path, a [`Reader`] searches Shots
+//! ([`Reader::search_shots`], [`Reader::draw`]); a phrase it has not seen goes to
+//! the caller's encoder and is kept in the caller's [`PhraseCache`] (ADR-0026), the
+//! only file this crate writes. The score formula and the 0.5 default negative
+//! weight are the published contract (docs/schema.md), not policy a consumer tunes.
+//!
+//! **No other ranking policy lives here, and there is no constant to tune.**
 //! [`Reader::taste_vector_for`] computes the Layer 2 rollup — each watched
 //! title weighed by `sqrt(seasons watched)`, split across its attributes —
 //! and nothing more. plex-db-ex#13 asked who owns the recency half-life,
@@ -48,7 +54,9 @@
 
 mod error;
 mod model;
+mod phrase;
 mod schema;
+mod search;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -56,8 +64,13 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 
 pub use error::ReaderError;
-pub use model::{CollectionMembership, Edge, EnrichmentFact, TasteAttribute, TasteVector};
-pub use schema::{SUPPORTED_READER_SHAPE, check_store};
+pub use model::{
+    CollectionMembership, Edge, EnrichmentFact, TagNeighbour, TasteAttribute, TasteVector,
+};
+pub use phrase::{MAX_UNUSED_DAYS, PhraseCache};
+pub use schema::{SUPPORTED_FRAMES_VERSION, SUPPORTED_READER_SHAPE, check_frames, check_store};
+pub use search::{Capabilities, Search, ShotHit, ShotSearch};
+pub use url::Url;
 
 /// A title watched less than half a season contributes nothing. Hu, Koren &
 /// Volinsky (ICDM 2008) §6, applied to seasons rather than whole programmes:
@@ -81,9 +94,35 @@ type AttributesByItem = BTreeMap<String, Vec<AttributeKey>>;
 /// with this exact constant and proves a write against it fails.
 const OPEN_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY;
 
+/// Registers the `sqlite-vec` extension for every connection this process opens
+/// afterwards, once. Reading `frame_vec` needs it; nothing else does.
+mod search_extension {
+    use std::sync::Once;
+
+    static LOAD: Once = Once::new();
+
+    pub fn load() {
+        LOAD.call_once(|| unsafe {
+            // SAFETY: `sqlite3_vec_init` is the extension entry point SQLite
+            // documents for `sqlite3_auto_extension`; the cast only restates its
+            // signature as the callback type.
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut std::os::raw::c_char,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> std::os::raw::c_int,
+            >(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        });
+    }
+}
+
 /// The whole of the spelling rule this crate applies: lowercase, trim, collapse
 /// whitespace runs to one space.
-fn normalize_surface(surface: &str) -> String {
+pub(crate) fn normalize_surface(surface: &str) -> String {
     surface
         .to_lowercase()
         .split_whitespace()
@@ -91,27 +130,56 @@ fn normalize_surface(surface: &str) -> String {
         .join(" ")
 }
 
-/// A read-only handle on a `plexdb.db` store.
+/// A read-only handle on a `plexdb.db` store, and optionally on the Frame index
+/// beside it.
 #[derive(Debug)]
 pub struct Reader {
     conn: Connection,
+    /// Whether `frames.db` is attached as the `frames` schema.
+    frames: bool,
+    phrases: Option<PhraseCache>,
 }
 
 impl Reader {
-    /// Open the store at `path` read-only.
+    /// Open the store at `snapshot` read-only, and attach `frames` (ADR-0024)
+    /// read-only when one is given.
     ///
     /// Fails loudly — never lazily, never as a missing-column panic later —
-    /// if the file is absent, is not a plexdb store, or is a schema version
-    /// this build does not understand.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, ReaderError> {
-        let path = path.as_ref();
+    /// if either file is absent, is not what it claims to be, or is a schema
+    /// version this build does not understand. `phrases` is where a search keeps
+    /// the vectors of phrases it has embedded (ADR-0026); it is the only file
+    /// this crate ever writes, and a Reader opened without one can read
+    /// everything except search.
+    pub fn open(
+        snapshot: impl AsRef<Path>,
+        frames: Option<&Path>,
+        phrases: Option<PhraseCache>,
+    ) -> Result<Self, ReaderError> {
+        let path = snapshot.as_ref();
+        if frames.is_some() {
+            search_extension::load();
+        }
         let conn =
             Connection::open_with_flags(path, OPEN_FLAGS).map_err(|source| ReaderError::Open {
                 path: path.to_path_buf(),
                 source,
             })?;
         schema::check_store(&conn, path)?;
-        Ok(Self { conn })
+        if let Some(frames) = frames {
+            // A plain-path ATTACH on a read-only connection opens the file
+            // read-only too; `check_frames` proves it by reading the version.
+            conn.execute("ATTACH DATABASE ?1 AS frames", (frames.to_string_lossy(),))
+                .map_err(|source| ReaderError::FramesOpen {
+                    path: frames.to_path_buf(),
+                    source,
+                })?;
+            schema::check_frames(&conn, frames)?;
+        }
+        Ok(Self {
+            conn,
+            frames: frames.is_some(),
+            phrases,
+        })
     }
 
     /// Every enrichment fact recorded for `item_id` under `namespace`, in
@@ -258,14 +326,14 @@ impl Reader {
         Ok(rows)
     }
 
-    /// The display name a person gave the stored `keyword` in Plex TVX
+    /// The display name a person gave the stored `keyword` in Plex DB-EX
     /// (`keyword_names`, ADR-0021), for showing that keyword to a person in place
     /// of its spelling. `None`, not an error, for a keyword nobody named.
     /// `keyword` is matched exactly: it is a stored value, not a spelling.
     ///
     /// Only for display: never compare, score or count by it. A merge group's
     /// label is the reader's to choose, since which pairs count as merged is the
-    /// reader's threshold; Plex TVX shows the kept keyword's name, else the newest
+    /// reader's threshold; Plex DB-EX shows the kept keyword's name, else the newest
     /// name any member has.
     pub fn display_name(&self, keyword: &str) -> Result<Option<String>, ReaderError> {
         let name = self
@@ -315,6 +383,35 @@ impl Reader {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
             .query_map((item_id, edge_type), Self::edge_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The tags that share titles with `tag` on the precomputed tag network
+    /// of `kind` (`"movie"` or `"show"`), strongest tie first.
+    ///
+    /// The network keeps an edge only when it is among either tag's strongest
+    /// co-tags, so this is the stored neighbourhood, not every co-occurring
+    /// tag. `tag` is matched exactly, as the network stores it. Ties on
+    /// `shared` break by tag, for a deterministic result. Empty, not an error,
+    /// for a tag the network does not hold.
+    pub fn tag_neighbours(&self, kind: &str, tag: &str) -> Result<Vec<TagNeighbour>, ReaderError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.value, e.shared, n.df \
+             FROM tag_network_edge e \
+             JOIN tag_network n \
+               ON n.kind = e.kind AND n.value = CASE WHEN e.a = ?2 THEN e.b ELSE e.a END \
+             WHERE e.kind = ?1 AND (e.a = ?2 OR e.b = ?2) \
+             ORDER BY e.shared DESC, n.value",
+        )?;
+        let rows = stmt
+            .query_map((kind, tag), |row| {
+                Ok(TagNeighbour {
+                    tag: row.get(0)?,
+                    shared: row.get(1)?,
+                    df: row.get(2)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -738,7 +835,7 @@ mod tests {
             }
         }
 
-        let reader = Reader::open(file.path()).expect("open the minimal store");
+        let reader = Reader::open(file.path(), None, None).expect("open the minimal store");
         reader
             .conn
             .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 3);

@@ -3163,6 +3163,15 @@ fn align_fill(
                 .next()
                 .and_then(|d| d.try_cast::<rhai::Map>())
         {
+            let mut map = map;
+            if let Err(e) = crate::score::add_source_ids(cat, &mut map) {
+                tracing::warn!(
+                    event = "bumper.source_ids",
+                    entry_id = %item.id,
+                    error = %e,
+                    "could not read an entry's source ids for a bumper script"
+                );
+            }
             return map;
         }
         let mut map = rhai::Map::new();

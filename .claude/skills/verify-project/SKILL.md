@@ -644,6 +644,15 @@ cargo build -q -p etv-station -p etv-overlay
 
 Expect two items for the text-card bumper (a 2 s black, then a looped black card whose `overlay.script` is an absolute path), the first `start` to the last `finish` spanning exactly 45 s, and `2` from the OTIO count. A script that throws exits 1 with its message on stderr and nothing on stdout (the generator would air black; the preview must not).
 
+The trailer bumper (`examples/plugins/trailer-bumper.rhai`) is checked against the real Plex, using a catalog that holds the film (`ETV_STATION_CATALOG`) and `PLEX_URL` / `PLEX_TOKEN` in the environment:
+
+```sh
+./target/debug/etv-station --config examples/station.yaml bumper-preview examples/plugins/trailer-bumper.rhai --gap 2m --next <entry_id> --script-config '{"mode":"next"}' | jq -c '.[] | [.source.source_type, .source.uri, .source.out_point_ms]'
+./target/debug/etv-station --config examples/station.yaml bumper-preview examples/plugins/trailer-bumper.rhai --gap 8m --next <id> --upcoming <id2> --upcoming <id3> --script-config '{"mode":"upcoming"}' | jq -c '.[] | [.source.source_type, .source.out_point_ms]'
+```
+
+Expect, for a film with a Plex trailer, an `http` item whose `uri` starts `{{PLEX_URL}}/` and ends `X-Plex-Token={{PLEX_TOKEN}}` (the real token never appears), `out_point_ms` equal to the trailer's length (Rush Hour: `88000`), then a black item to the end of the gap; `upcoming` gives one `http` item per distinct film, nearest first. A film with no Plex id or no trailer exits 1 with `build() returned an empty timeline`, which in the fill pass makes it draw the next entry. With `RUST_LOG=info` stderr carries `trailer: item=… found=… len_ms=…` and, per trailer, a `bumper.http_source` line with the host.
+
 `bumper-watch` plays those items through `etv-overlay watch --item`, one process per item, into VLC. Prove it without VLC by standing in a capture script for it (`overlay-watch.sh` reads `$VLC`), then count the frames the card drew over:
 
 ```sh

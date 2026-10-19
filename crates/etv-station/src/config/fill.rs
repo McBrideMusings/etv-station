@@ -93,6 +93,11 @@ pub struct FillEntry {
     /// `capabilities()` declares.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+
+    /// Handed to the script verbatim as `ctx.config`; the station reads
+    /// nothing out of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
 }
 
 fn one() -> u32 {
