@@ -715,6 +715,7 @@ fn serve_ui(
         plugins_dir,
         bind,
         port,
+        health: etv_station::web_ui::HealthSources::from_env(),
     };
     match etv_station::web_ui::serve(options) {
         Ok(()) => ExitCode::SUCCESS,

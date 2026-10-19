@@ -783,12 +783,13 @@ channel 1 (Test Pattern Channel) is no longer failed: a run of 102s exited witho
 ```
 
 Then `curl -D - http://127.0.0.1:8409/channel/1.m3u8` answers `503` and
-`retry-after: 30`, and `tools/channel-health.sh` prints the channel as `FAILED`
-and exits 1. Against prod: `admin channel-health`.
+`retry-after: 30`, and `tools/ui-get.sh /api/health/channels` shows the channel
+with `failed: true` and `retry_in_secs` counting down. Against prod: add `--prod`.
 
 ## Verifying hardware encoding (#258)
 
-`admin verify-accel` — read-only, over ssh, touches no container.
+`tools/ui-get.sh /api/health/channels` (add `--prod` for the deployed station) —
+read-only, touches no container. The Health tab shows the same answer.
 
 **Codec name proves nothing here.** A software encode and a VAAPI encode both
 produce H.264, so `ffprobe` on a segment reports `h264` either way, and ETV-next
@@ -800,22 +801,25 @@ thing that separates them, which is why the check reads
 - `libx264` is **absent** — its presence is the fallback fingerprint
 - the configured render node (`/dev/dri/renderD128`) appears in the argv
 
-Expected values are read from `deploy/unraid-template.xml`, so the check asserts
-the host matches the repo rather than asking the host what it's set to.
+The expected encoder comes from the station's own `ETV_ACCEL` and
+`ETV_VAAPI_DEVICE`, the variables the channel configs are rendered from, so the
+verdict asserts ffmpeg did what the station asked.
 
 **It reads the ffmpeg probe's argv logs.** The probe ships in the image
 (`Dockerfile`) and is wired by `ffmpeg.ffmpeg_path` in
 `deploy/appdata/station.yaml`, so it is always on — there is no re-apply step and
-no host-side copy. A run reporting "no ffmpeg-argv-ch*.log found" means no
+no host-side copy. A channel with verdict `NONE` (no argv log) means no
 channel has transcoded since the container last started, not that the probe is
 missing: the log is only written when a transcode begins, and only a channel
 someone is watching transcodes at all.
 
 A `STALE` verdict means the same thing in miniature — that channel's newest argv
-is older than `STALE_DAYS` (3), so it proves the GPU worked then, not now. Tune
+is older than 3 days, so it proves the GPU worked then, not now. Tune
 in to the channel and re-run for a current answer.
 
-Locally, against a `admin dev` run: `tools/verify-accel.sh --local <diag-dir>`.
+Locally, start `tools/station-ui.sh` with `ETV_DIAG_DIR=<diag-dir>`, `ETV_ACCEL` and
+`ETV_VAAPI_DEVICE` set, then read `/api/health/channels`. A verdict is logged as
+`ui.health_verdict` with the argv log line it rests on.
 
 ## Verifying no sub-segment transcodes (#339)
 
@@ -846,7 +850,7 @@ resuming the same item from 2026-08-21 20:31:18.460403686 +00:00:00
 ```
 
 The check reads **every** invocation in each `ffmpeg-argv-ch<N>.log`, not just
-the newest — a sliver is rare, and verify-accel's newest-block-only approach
+the newest — a sliver is rare, and the Health tab's newest-block-only verdict
 would miss all three of the ones above. The segment length comes from each
 invocation's own `-hls_time`, because it is a compile-time constant
 (`SEGMENT_SECONDS` in `vendor/etv-next/crates/ffpipeline/src/pipeline.rs:36`) and

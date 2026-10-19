@@ -190,6 +190,8 @@
   .overlap-row summary { cursor: pointer; }
   .overlap-row .titles { margin: 4px 0 2px 16px; font-size: 12px; color: var(--muted); }
   .old { color: var(--muted); }
+  td.v-fail { background: var(--err-bg); color: var(--err-fg); }
+  td.v-stale { background: var(--warn-bg); color: var(--warn-fg); }
   .changed .new { font-weight: 650; }
 
   @media (max-width: 900px) {
@@ -440,14 +442,74 @@ function markRoute(r) {
   if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
 
-// Health has no content yet: say so rather than show an empty frame.
-function renderEmpty(tab) {
-  current = null;
+// ---- Health: each channel's encoder verdict, ETV-next's failure state and its last stall. Read-only.
+let healthSeq = 0;
+const VERDICT_WORDS = { PASS: 'Passing', FAIL: 'Failing', STALE: 'Stale', NONE: 'No transcode recorded' };
+const utcOf = (iso) => (iso || '').replace('T', ' ').replace(/(\.\d+)?Z$/, '') + ' UTC';
+const ageOf = (secs) => secs == null ? '—' : secs < 3600 ? `${Math.round(secs / 60)}m` : secs < 172800 ? `${Math.round(secs / 3600)}h` : `${Math.round(secs / 86400)}d`;
+// A time as UTC and station-local, e.g. "2026-10-19 19:18 UTC (3:18pm EDT)".
+function bothClocks(iso, tz) {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return esc(iso || '—');
+  if (!tz) return esc(utcOf(new Date(ms).toISOString().slice(0, 16) + 'Z'));
+  const local = new Date(ms).toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', timeZoneName: 'short', month: 'short', day: 'numeric' });
+  return `${esc(utcOf(new Date(ms).toISOString().slice(0, 16) + 'Z'))} <span class="muted">(${esc(local)})</span>`;
+}
+
+async function loadHealth() {
+  const seq = ++healthSeq;
+  const began = Date.now();
   document.title = 'etv-station · Health';
   $('state').textContent = '';
   $('report').classList.remove('loading');
-  $('report').innerHTML = `<div class="empty"><h1>Health</h1>
-    <p class="muted">Not built yet. It will show each channel's encoder, failures and last stall.</p></div>`;
+  $('report').innerHTML = `<div class="gtool"><strong>Health</strong></div><div id="hstate"></div>`;
+  const tick = () => { if ($('hstate')) $('hstate').innerHTML = `<span class="spinner"></span>Reading channel health… (${Math.round((Date.now() - began) / 1000)}s)`; };
+  tick();
+  const timer = setInterval(tick, 1000);
+  let build = {}, data;
+  try {
+    const [h, c] = await Promise.all([fetch('/api/health'), fetch('/api/health/channels')]);
+    build = await h.json().catch(() => ({}));
+    data = await c.json().catch(() => ({}));
+    if (!c.ok) data = { error: `HTTP ${c.status}: ${data.error || 'no error message'}` };
+  } catch (e) {
+    data = { error: String(e.message || e) };
+  } finally {
+    clearInterval(timer);
+  }
+  if (seq !== healthSeq) return;
+  const head = `<div class="gtool"><strong>Health</strong><span class="muted">revision ${esc(build.revision || 'unknown')} · built ${build.build_time && build.build_time !== 'unknown' ? bothClocks(build.build_time, data.tz) : 'unknown'}</span>
+    <button type="button" id="healthReload">Reload</button></div>`;
+  if (data.error) {
+    $('report').innerHTML = head + `<div class="error">${esc(data.error)}</div>`;
+  } else {
+    $('report').innerHTML = head + drawHealth(data);
+  }
+  $('healthReload').addEventListener('click', loadHealth);
+}
+
+function drawHealth(d) {
+  const upstream = d.upstream
+    ? `<div class="error">ETV-next is unreachable or answered badly, so failure state is missing below.\nTried ${esc(d.upstream.url)}\n${esc(d.upstream.error)}</div>` : '';
+  const expected = d.expected && d.expected.encoder
+    ? `<p class="muted">Expected encoder: ${esc(d.expected.encoder)}${d.expected.vaapi_device ? ` on ${esc(d.expected.vaapi_device)}` : ''}.</p>`
+    : `<p class="muted">No hardware encoder is configured (ETV_ACCEL), so every transcode counts as software.</p>`;
+  const rows = d.channels.map((c) => {
+    const e = c.encoder;
+    const cls = e.verdict === 'FAIL' ? 'v-fail' : e.verdict === 'STALE' ? 'v-stale' : '';
+    const fail = c.failures == null ? '—'
+      : c.failed ? `failed, ${c.retry_in_secs > 0 ? `503 for ${c.retry_in_secs}s more` : 'retry open'}${c.last_failure ? ` — ${esc(c.last_failure.cause)}` : ''}`
+      : c.failures > 0 ? `${c.failures} consecutive` : 'none';
+    const stall = c.last_stall
+      ? `${bothClocks(c.last_stall.at, d.tz)}${c.last_stall.recovered ? ' <span class="muted">(recovered)</span>' : ' <span class="muted">(not recovered)</span>'}`
+      : '<span class="muted">none logged</span>';
+    return `<tr><td class="num">${esc(c.channel)}</td><td>${esc(c.name || c.key)}</td>
+      <td class="${cls}" title="${esc(e.reason)}">${esc(VERDICT_WORDS[e.verdict] || e.verdict)}${e.verdict === 'PASS' || e.verdict === 'NONE' ? '' : ` — ${esc(e.reason)}`}</td>
+      <td>${fail}</td><td>${stall}</td><td class="num">${esc(ageOf(c.argv_log_age_secs))}</td></tr>`;
+  }).join('');
+  const diag = d.diag && !d.diag.readable
+    ? `<div class="notice">The diag folder ${esc(d.diag.dir || '(unset)')} cannot be read, so no channel has an argv log or stall history here (ETV_DIAG_DIR).</div>` : '';
+  return `${upstream}${diag}${expected}<table class="health"><thead><tr><th class="num">Channel</th><th>Name</th><th>Encoder</th><th>Failures</th><th>Last stall</th><th class="num">Argv log age</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 let shown = null;   // the channel and projection the report holds, so a sub-tab switch redraws without refetching
@@ -459,10 +521,10 @@ async function route() {
     if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.project)); return; }
   }
   markRoute(r);
-  if (r.tab === 'guide') { loadSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
-  if (r.tab !== 'channels') { loadSeq++; guideSeq++; shown = null; renderEmpty(r.tab); return; }
+  if (r.tab === 'guide') { loadSeq++; healthSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
+  if (r.tab === 'health') { loadSeq++; guideSeq++; shown = null; current = null; loadHealth(); return; }
   if (!r.channel) return;
-  guideSeq++;
+  guideSeq++; healthSeq++;
   const key = `${r.channel}|${r.project}`;
   if (shown === key && current) { draw(r.view); return; }
   shown = key;

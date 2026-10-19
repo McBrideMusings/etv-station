@@ -228,6 +228,7 @@ mod tests {
                 plugins_dir: None,
                 bind: IpAddr::from([127, 0, 0, 1]),
                 port: 0,
+                health: HealthSources::default(),
             },
         };
         (state, lc.config.number)

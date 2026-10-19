@@ -23,10 +23,13 @@
 //! always come first. `GET /api/health` returns what this process was started
 //! with, including the ETV-next URL the Guide reads from (`ETV_NEXT_URL`). `GET
 //! /api/airings/{airing}/audit` returns the stored audit record of one real
-//! airing, which is how the Guide answers "why is this on" (`airing`).
+//! airing, which is how the Guide answers "why is this on" (`airing`). `GET
+//! /api/health/channels` is the Health tab: each channel's encoder verdict,
+//! ETV-next's failure state and its last stall (`health`).
 
 mod airing;
 mod channel;
+mod health;
 mod lineup;
 mod projection;
 mod real;
@@ -45,6 +48,8 @@ use crate::tautulli::{self, HistoryScope};
 use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use airing::api_airing_audit;
 use channel::{ReviewState, api_channel_review, still_reply};
+pub use health::HealthSources;
+use health::api_health_channels;
 use lineup::api_lineup;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -68,6 +73,8 @@ pub struct Options {
     /// Address to listen on: loopback locally, `0.0.0.0` in the container.
     pub bind: IpAddr,
     pub port: u16,
+    /// Where `GET /api/health/channels` reads from (`health`).
+    pub health: HealthSources,
 }
 
 struct AppState {
@@ -142,6 +149,7 @@ fn api_health(state: &AppState) -> (u16, Value) {
         "tunable_channels": channels.as_ref().map(Vec::len).ok(),
         "error": channels.err(),
         "revision": std::env::var("ETV_STATION_REVISION").ok(),
+        "build_time": std::env::var("ETV_STATION_CREATED").ok().filter(|t| !t.is_empty()),
         "etv_next_url": std::env::var("ETV_NEXT_URL").ok().filter(|u| !u.is_empty()),
     });
     (status, body)
@@ -215,6 +223,7 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         (Method::Get, "/") => return Reply::Html(SHELL_HTML),
         (Method::Get, "/tune") => return Reply::Html(TUNE_HTML),
         (Method::Get, "/api/health") => Ok(api_health(state)),
+        (Method::Get, "/api/health/channels") => api_health_channels(state),
         (Method::Get, "/api/lineup") => api_lineup(state),
         (Method::Get, "/api/channels") => api_channels(state),
         (Method::Post, "/api/select") => api_select(state, body),
@@ -321,6 +330,7 @@ mod tests {
                 plugins_dir: None,
                 bind: IpAddr::from([127, 0, 0, 1]),
                 port: 0,
+                health: HealthSources::default(),
             },
         }
     }
@@ -330,6 +340,61 @@ mod tests {
             Reply::Json(status, body) => (status, body),
             _ => panic!("{path} did not answer JSON"),
         }
+    }
+
+    /// The Health endpoint over a diag folder: a software argv fails, a
+    /// passing block four days old is stale, and an unreachable ETV-next is
+    /// named under `upstream` without losing the encoder verdicts.
+    #[test]
+    fn health_judges_each_channels_newest_argv_block() {
+        let mut state = example_state();
+        let station =
+            config::load_for_inspection(&state.options.station).expect("example station loads");
+        let numbers: Vec<i64> = station.channels.iter().map(|c| c.config.number).collect();
+        assert!(
+            numbers.len() >= 3,
+            "the example lineup should have several channels"
+        );
+        let diag = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = |ago: time::Duration| {
+            (now - ago)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let write = |n: i64, at: String, encoder: &str| {
+            std::fs::write(
+                diag.path().join(format!("ffmpeg-argv-ch{n}.log")),
+                format!(
+                    "=== {at} pid=1 channel={n}\nargv_begin\n-c:v\n{encoder}\n-vaapi_device\n/dev/dri/renderD128\nargv_end\n"
+                ),
+            )
+            .unwrap();
+        };
+        write(numbers[0], stamp(time::Duration::minutes(5)), "libx264");
+        write(numbers[1], stamp(time::Duration::days(4)), "h264_vaapi");
+        write(numbers[2], stamp(time::Duration::minutes(5)), "h264_vaapi");
+        state.options.health = HealthSources {
+            diag_dir: Some(diag.path().to_path_buf()),
+            etv_next_url: "http://127.0.0.1:1".into(),
+            accel: Some("vaapi".into()),
+            vaapi_device: Some("/dev/dri/renderD128".into()),
+        };
+        let (status, body) = get_json(&mut state, "/api/health/channels");
+        assert_eq!(status, 200, "{body}");
+        let verdict = |n: i64| {
+            body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["channel"] == n)
+                .map(|c| c["encoder"]["verdict"].as_str().unwrap().to_string())
+                .unwrap()
+        };
+        assert_eq!(verdict(numbers[0]), "FAIL");
+        assert_eq!(verdict(numbers[1]), "STALE");
+        assert_eq!(verdict(numbers[2]), "PASS");
+        assert_eq!(body["upstream"]["url"], "http://127.0.0.1:1");
     }
 
     #[test]
@@ -475,6 +540,7 @@ mod tests {
                 plugins_dir: None,
                 bind: IpAddr::from([127, 0, 0, 1]),
                 port: 0,
+                health: HealthSources::default(),
             },
         };
         state.review.sims.spawn();
