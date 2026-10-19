@@ -573,6 +573,52 @@ impl Catalog {
         Ok(())
     }
 
+    /// Fold `loser` into `survivor` (#100).
+    ///
+    /// Two entries that turn out to name one title — a GUID-less FS scan minted
+    /// one per file, then Plex reported both files under one GUID — are one
+    /// entry afterwards. Provenance, external-id, tag and collection rows are
+    /// repointed, and the loser is marked missing at `stamp`, not deleted: its
+    /// `entry_id` is a join key for the play-history ledger, which has no
+    /// foreign key to cascade through (ADR 0006). Airings already recorded in
+    /// `history.db` under the loser's id stay under it; this function only
+    /// touches the catalog. With no live source left the loser is
+    /// unschedulable, which is all "merged away" needs to mean. The survivor's
+    /// own columns are untouched.
+    pub fn merge_entry(
+        &self,
+        loser: &str,
+        survivor: &str,
+        stamp: &str,
+    ) -> Result<(), CatalogError> {
+        if loser == survivor {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE entry_sources SET entry_id = ?2 WHERE entry_id = ?1",
+            params![loser, survivor],
+        )?;
+        self.conn.execute(
+            "UPDATE entry_external_ids SET entry_id = ?2 WHERE entry_id = ?1",
+            params![loser, survivor],
+        )?;
+        // OR IGNORE: a row the survivor already holds wins; the loser's copy
+        // is dropped with it when the loser is eventually deleted.
+        self.conn.execute(
+            "UPDATE OR IGNORE tags SET entry_id = ?2 WHERE entry_id = ?1",
+            params![loser, survivor],
+        )?;
+        self.conn.execute(
+            "UPDATE OR IGNORE collection_items SET entry_id = ?2 WHERE entry_id = ?1",
+            params![loser, survivor],
+        )?;
+        self.conn.execute(
+            "UPDATE entries SET missing_since = ?2 WHERE entry_id = ?1",
+            params![loser, stamp],
+        )?;
+        Ok(())
+    }
+
     /// Add a tag. Idempotent on `(entry_id, namespace, value)`.
     pub fn add_tag(
         &self,
