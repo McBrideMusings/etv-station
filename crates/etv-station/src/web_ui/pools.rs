@@ -40,6 +40,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Drafts the server keeps at once.
 const MAX_DRAFTS: usize = 8;
+/// Cached baselines kept before the cache is emptied.
+const MAX_BASELINES: usize = 64;
 /// How long a draft may sit untouched before it is dropped.
 const DRAFT_IDLE: Duration = Duration::from_secs(60 * 60);
 /// How many of a pool's ranked items the response carries — a movies pool
@@ -147,7 +149,7 @@ pub(super) struct PoolState {
     drafts: Drafts,
     baselines: HashMap<BaselineKey, Arc<Baseline>>,
     /// A channel's default Plex account, once resolved (Tautulli is asked once).
-    accounts: HashMap<String, Option<i64>>,
+    accounts: HashMap<String, (SystemTime, Option<i64>)>,
 }
 
 impl PoolState {
@@ -279,11 +281,14 @@ pub(super) fn channel_account_id(channel: &config::ChannelConfig) -> Result<Opti
 }
 
 fn default_account(state: &mut AppState, key: &str, loc: &Located) -> Result<Option<i64>, String> {
-    if let Some(id) = state.pools.accounts.get(key) {
+    let stamp = mtime(&loc.config_path);
+    if let Some((at, id)) = state.pools.accounts.get(key)
+        && *at == stamp
+    {
         return Ok(*id);
     }
     let id = channel_account_id(&loc.channel)?;
-    state.pools.accounts.insert(key.to_string(), id);
+    state.pools.accounts.insert(key.to_string(), (stamp, id));
     Ok(id)
 }
 
@@ -458,7 +463,10 @@ fn baseline(
     scorer: &Scorer,
     account_id: Option<i64>,
 ) -> Result<Arc<Baseline>, String> {
-    let stamp = (mtime(&loc.config_path), mtime(&scorer.plugin_path));
+    let stamp = (
+        mtime(&loc.config_path),
+        mtime(&scorer.plugin_path).max(mtime(&scorer.plexdb_path)),
+    );
     let cache_key = (key.to_string(), scorer.pool.name.clone(), account_id);
     if let Some(b) = state.pools.baselines.get(&cache_key)
         && b.stamp == stamp
@@ -489,6 +497,10 @@ fn baseline(
         ms = began.elapsed().as_millis() as u64,
         "pool ranked with its deployed profile"
     );
+    // The account comes from the client, so the cache is bounded.
+    if state.pools.baselines.len() >= MAX_BASELINES {
+        state.pools.baselines.clear();
+    }
     state.pools.baselines.insert(cache_key, Arc::clone(&built));
     Ok(built)
 }

@@ -1004,20 +1004,26 @@ function showEditError(message) {
 
 // One profile edit: starts the draft on the first one, posts the edit, and redraws every pool from the answer.
 async function editDraft(op, pool, entry) {
-  const { channel } = poolsCtx;
+  const ctx = poolsCtx;
+  const seq = poolsSeq;
+  const { channel } = ctx;
+  // The ranking takes seconds; a channel or tab switched meanwhile owns the page, and this answer is dropped.
+  const stale = () => seq !== poolsSeq || ctx !== poolsCtx;
   showEditError('');
   const acct = $('acctSel') && $('acctSel').value;
   setPoolsBusy(true, 'Re-ranking');
   try {
     if (!poolsCtx.draft) {
       const made = await apiJson('POST', `/api/channels/${enc(channel)}/drafts`, acct ? { account: Number(acct) } : {});
+      if (stale()) return;
       if (made.error) { setPoolsBusy(false); showEditError(made.error); return; }
-      poolsCtx.draft = made.draft;
+      ctx.draft = made.draft;
       // The draft id goes in the URL without a navigation, so this tab keeps it across a reload.
       history.replaceState(null, '', channelHash(channel, 'pools', null, made.draft));
       markRoute(parseRoute());
     }
-    const data = await apiJson('POST', `/api/channels/${enc(channel)}/drafts/${enc(poolsCtx.draft)}/edits`, { op, pool, entry });
+    const data = await apiJson('POST', `/api/channels/${enc(channel)}/drafts/${enc(ctx.draft)}/edits`, { op, pool, entry });
+    if (stale()) return;
     setPoolsBusy(false);
     if (data.error) {
       if (data.status === 404) {
@@ -1025,10 +1031,12 @@ async function editDraft(op, pool, entry) {
         location.replace(channelHash(channel, 'pools'));
         return;
       }
+      // The draft exists now, so the bar shows it even though this edit was refused.
+      drawPools();
       showEditError(data.error);
       return;
     }
-    poolsCtx.data = data;
+    ctx.data = data;
     drawPools();
   } catch (e) {
     setPoolsBusy(false);
