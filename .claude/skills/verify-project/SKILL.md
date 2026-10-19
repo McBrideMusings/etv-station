@@ -1050,9 +1050,17 @@ at NI 19 while the daemon and `ersatztv` sit at 0. After `docker kill -s TERM`, 
 `--serve-ui` process is gone within 3s. `POST /api/select` with a path outside the
 lineup answers 400 "is not a tunable channel in this station's lineup".
 
-A 14-day review of 034-syfy takes ~166s (2026-10-18) and the server answers nothing
-else meanwhile; that is the replay's cost, identical on the pre-move binary, not a
-hang.
+A review's simulation runs on a worker thread (`sim_cache`), not the request thread.
+`GET /api/review` answers 202 `{"pending": true}` until the worker has the channel
+(the page polls every second), then 200 from the cache; `/api/health` stays
+responsive meanwhile and carries `sim_cache: {in_memory, queued, running}`. The
+worker fills the lineup in `station.yaml` order and runs a requested channel next
+(it does not interrupt one in progress). Each finish logs `ui.sim.done` with ms; a
+served review logs `ui.review` with `sim_source="cache"`. Observed 2026-10-18 on a
+debug build over a 3-channel lineup: 034-syfy 14 days simulated in 958s, 041-cartoons
+in 101s, and both served from the cache afterwards in 2s and 11s. Results persist
+under `$TMPDIR/etv-station-ui-sims/<build>/`; touching the channel file, a `.rhai`
+script it names, or the catalog makes the next request queue a fresh simulation.
 
 ## Verifying the channel-wide repeat rule (`rule.no_repeat_within`)
 

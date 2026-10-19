@@ -167,6 +167,8 @@
   <a href="/">← Tuning view</a>
   <button id="prevBtn" type="button">← Previous channel</button>
   <button id="nextBtn" type="button">Next channel →</button>
+  <label for="picker" class="muted">Channel</label>
+  <select id="picker"></select>
   <span id="position" class="muted"></span>
   <span class="spacer"></span>
   <label for="days">Days shown</label>
@@ -188,6 +190,8 @@ const GUIDE_OPEN_HOUR = 12;
 
 let current = null;   // the last /api/review payload
 let lineup = { prev: null, next: null };
+let shownKey = null;   // the lineup key the picker last confirmed
+let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
 function params() {
   const p = new URLSearchParams(location.search);
@@ -209,19 +213,29 @@ async function load(channel, days, push) {
   if (push) history.pushState(null, '', `/review?${q}`);
   $('state').innerHTML = '<span class="spinner"></span>Simulating…';
   $('report').classList.add('loading');
-  for (const b of [$('prevBtn'), $('nextBtn'), $('applyDays')]) b.disabled = true;
+  for (const b of [$('prevBtn'), $('nextBtn'), $('applyDays'), $('picker')]) b.disabled = true;
+  const seq = ++loadSeq;
   let data;
   try {
-    const res = await fetch(`/api/review?${q}`);
-    data = await res.json();
+    // A 202 means the worker is still simulating this channel; ask again.
+    for (;;) {
+      const res = await fetch(`/api/review?${q}`);
+      data = await res.json();
+      if (!data.pending) break;
+      await new Promise((r) => setTimeout(r, 1000));
+      if (seq !== loadSeq) return;
+    }
   } catch (e) {
     data = { error: String(e) };
   }
+  if (seq !== loadSeq) return;
   $('report').classList.remove('loading');
   $('applyDays').disabled = false;
+  $('picker').disabled = false;
   if (data.lineup) lineup = data.lineup;
   $('prevBtn').disabled = !lineup.prev;
   $('nextBtn').disabled = !lineup.next;
+  fillPicker(data);
   $('position').textContent = data.lineup ? `${data.lineup.position} of ${data.lineup.total} in station.yaml order` : '';
   if (data.days) $('days').value = data.days;
   $('state').textContent = '';
@@ -241,6 +255,20 @@ async function load(channel, days, push) {
   for (const a of data.airings) Object.assign(a, data.items[a.id]);
   current = data;
   render(data);
+}
+
+// The picker lists every lineup entry as "number · display name"; a channel that failed to load shows its key.
+function fillPicker(data) {
+  const sel = $('picker');
+  const list = data.lineup && data.lineup.channels;
+  // No lineup in the response (an error): put the picker back on the channel the page still shows.
+  if (!list) { if (shownKey) sel.value = shownKey; return; }
+  sel.innerHTML = list.map((c) => {
+    const name = c.number == null ? c.key : `${c.number} · ${c.display_name || c.key}`;
+    return `<option value="${esc(c.key)}">${esc(name)}</option>`;
+  }).join('');
+  const here = list[data.lineup.position - 1];
+  if (here) { sel.value = here.key; shownKey = here.key; }
 }
 
 function poolColor(d) {
@@ -584,6 +612,7 @@ document.addEventListener('scroll', () => {
 
 $('prevBtn').addEventListener('click', () => lineup.prev && load(lineup.prev, $('days').value, true));
 $('nextBtn').addEventListener('click', () => lineup.next && load(lineup.next, $('days').value, true));
+$('picker').addEventListener('change', () => load($('picker').value, $('days').value, true));
 $('applyDays').addEventListener('click', () => load(current ? current.channel : params().channel, $('days').value, true));
 $('days').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('applyDays').click(); });
 window.addEventListener('popstate', () => { const p = params(); load(p.channel, p.days, false); });
