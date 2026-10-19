@@ -425,12 +425,13 @@ pub fn preview_channel(
 
 /// The rotation state a channel's `.resume` sidecar holds, or none when there
 /// is no readable sidecar — the preview of a channel that has never run starts
-/// every rotation at its first member.
+/// every rotation at its first member. A sidecar [`crate::resume::load`] would
+/// discard (unparseable, other version) yields none, the same as the rest of
+/// the resume state.
 pub fn read_rotations(output_folder: &std::path::Path) -> BTreeMap<String, RotationResume> {
     std::fs::read(crate::resume::sidecar_path(output_folder))
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<crate::resume::ResumeMap>(&bytes).ok())
-        .map(|map| map.rotations)
+        .map(|bytes| crate::resume::parse(&bytes).0.rotations)
         .unwrap_or_default()
 }
 
@@ -485,6 +486,20 @@ pub fn render_text(rows: &[PreviewRow]) -> String {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn read_rotations_honours_the_sidecar_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = crate::resume::sidecar_path(dir.path());
+        let current = crate::resume::ResumeMap::new().version;
+        let body = |version: u32| {
+            format!(r#"{{"version":{version},"rotations":{{"prime":{{"cycle":3}}}}}}"#)
+        };
+        std::fs::write(&sidecar, body(current)).unwrap();
+        assert_eq!(read_rotations(dir.path())["prime"].cycle, 3);
+        std::fs::write(&sidecar, body(current + 1)).unwrap();
+        assert!(read_rotations(dir.path()).is_empty());
+    }
 
     fn rule(yaml: &str) -> RuleConfig {
         serde_norway::from_str(yaml).unwrap()

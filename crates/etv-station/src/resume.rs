@@ -470,16 +470,22 @@ pub async fn load(output_folder: &Path) -> Result<(ResumeMap, ResumeLoad), Stati
         Err(source) => return Err(StationError::Io { path, source }),
     };
 
-    match serde_json::from_slice::<ResumeMap>(&bytes) {
-        Ok(map) if map.version == CURRENT_VERSION => Ok((map, ResumeLoad::Loaded)),
-        Ok(map) => Ok((
+    Ok(parse(&bytes))
+}
+
+/// Parse sidecar bytes, applying the version check. The one parser behind
+/// [`load`] and every synchronous reader of the sidecar.
+pub fn parse(bytes: &[u8]) -> (ResumeMap, ResumeLoad) {
+    match serde_json::from_slice::<ResumeMap>(bytes) {
+        Ok(map) if map.version == CURRENT_VERSION => (map, ResumeLoad::Loaded),
+        Ok(map) => (
             ResumeMap::new(),
             ResumeLoad::Discarded(format!(
                 "sidecar version {} is not {CURRENT_VERSION}",
                 map.version
             )),
-        )),
-        Err(e) => Ok((ResumeMap::new(), ResumeLoad::Discarded(e.to_string()))),
+        ),
+        Err(e) => (ResumeMap::new(), ResumeLoad::Discarded(e.to_string())),
     }
 }
 
