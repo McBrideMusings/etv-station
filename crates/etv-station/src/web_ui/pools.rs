@@ -671,13 +671,22 @@ pub(super) fn draft_edits(
     id: &str,
 ) -> Result<super::projection::DraftEdits, String> {
     let d = state.pools.drafts.touch(key, id)?;
+    let profiles = d
+        .profiles
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let account_id = d.account_id;
+    // An account that cannot be resolved differs from any chosen one, so the
+    // draft still scores for the account it names.
+    let channel_account_id = match require(state, key)? {
+        Ok(loc) => default_account(state, key, &loc).ok().flatten(),
+        Err(_) => None,
+    };
     Ok(super::projection::DraftEdits {
-        profiles: d
-            .profiles
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        account_id: d.account_id,
+        profiles,
+        account_id,
+        channel_account_id,
     })
 }
 
@@ -1285,6 +1294,18 @@ mod tests {
         body["draft"].as_str().unwrap().to_string()
     }
 
+    /// A draft that names no account, so it scores for the channel's own.
+    fn open_channel_account_draft(state: &mut AppState, channel: &str) -> String {
+        let (status, body) = call(
+            state,
+            Method::Post,
+            &format!("/api/channels/{channel}/drafts"),
+            "",
+        );
+        assert_eq!(status, 200, "{body}");
+        body["draft"].as_str().unwrap().to_string()
+    }
+
     fn add_desert(state: &mut AppState, draft: &str) -> (u16, Value) {
         call(
             state,
@@ -1552,13 +1573,41 @@ mod tests {
             "the draft window is the deployed window"
         );
 
-        // A draft with no edit is the deployed schedule: nothing changed.
-        let idle = open_draft(&mut f.state, "foryou");
+        // A draft with no edit and the channel's own account is the deployed
+        // schedule: nothing changed.
+        let idle = open_channel_account_draft(&mut f.state, "foryou");
         let same = graded(
             &mut f.state,
             &format!("/api/channels/foryou/review?draft={idle}&project=3d"),
         );
         assert_eq!(same["diff"]["changed_airings"], json!([]));
+    }
+
+    #[test]
+    fn an_account_only_draft_is_scored_for_that_account() {
+        let mut f = fixture();
+        let own = open_channel_account_draft(&mut f.state, "foryou");
+        let other = open_draft(&mut f.state, "foryou");
+        let own_body = graded(
+            &mut f.state,
+            &format!("/api/channels/foryou/review?draft={own}&project=1d"),
+        );
+        let other_body = graded(
+            &mut f.state,
+            &format!("/api/channels/foryou/review?draft={other}&project=1d"),
+        );
+        assert_eq!(
+            own_body["draft"]["projection"]["key"], own_body["deployed"]["projection"]["key"],
+            "the channel's own account with no edit is the deployed projection"
+        );
+        assert_ne!(
+            other_body["draft"]["projection"]["key"], other_body["deployed"]["projection"]["key"],
+            "a different account is its own projection"
+        );
+        assert_ne!(
+            other_body["draft"]["projection"]["inputs"]["draft"],
+            other_body["deployed"]["projection"]["inputs"]["draft"]
+        );
     }
 
     #[test]
