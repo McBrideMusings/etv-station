@@ -77,7 +77,7 @@ pub struct Simulation {
 /// `airings` table (`history::HistoryDb`), holding only what the generation
 /// inputs project from it.
 #[derive(Default)]
-struct Ledger {
+pub struct Ledger {
     entry_ids: Vec<String>,
     /// `series_key -> last aired entry_id`, where the key is the show, or the
     /// entry itself for a movie (`HistoryDb::series_cursor`).
@@ -89,6 +89,21 @@ struct Ledger {
 }
 
 impl Ledger {
+    /// A ledger that already holds a channel's real airings: the last
+    /// `tail` entry ids and the two cursors, as the `airings` table
+    /// projects them.
+    pub fn seeded(
+        entry_ids: Vec<String>,
+        cursor: BTreeMap<String, String>,
+        show_cursor: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            entry_ids,
+            cursor,
+            show_cursor,
+        }
+    }
+
     fn record(&mut self, entry_id: &str, show_id: Option<&str>) {
         self.entry_ids.push(entry_id.to_string());
         self.cursor.insert(
@@ -117,8 +132,14 @@ impl AiringsLedger for Ledger {
     }
 }
 
+/// Bump this whenever a change to the simulator or the generation step it
+/// calls could change what a given input airs, or the [`Simulation`] shape:
+/// it is one of the inputs a cached projection is keyed on, so a bump makes
+/// every cached projection miss.
+pub const SIMULATOR_REVISION: u32 = 1;
+
 /// Run the daemon's generation loop for `days` days of ticks starting at
-/// `start`, and return every generation it laid down.
+/// `start` from a fresh channel, and return every generation it laid down.
 ///
 /// `config_path` is the channel file's path: relative `plugin:` paths resolve
 /// against its directory, as they do in the daemon. `tz` is the station's
@@ -131,6 +152,35 @@ pub fn simulate(
     days: u32,
     start: OffsetDateTime,
     tz: Option<&'static time_tz::Tz>,
+) -> Result<Simulation, String> {
+    simulate_from(
+        config,
+        config_path,
+        catalog,
+        account_id,
+        days,
+        start,
+        tz,
+        Ledger::default(),
+        ResumeMap::new(),
+    )
+}
+
+/// [`simulate`] continuing a real channel: `start` is the instant its
+/// published schedule ends, `ledger` holds the airings before it and `resume`
+/// is the daemon's `.resume` state there, so the first generation is the one
+/// the daemon would lay down next.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_from(
+    config: &ChannelConfig,
+    config_path: &Path,
+    catalog: &Catalog,
+    account_id: Option<i64>,
+    days: u32,
+    start: OffsetDateTime,
+    tz: Option<&'static time_tz::Tz>,
+    mut ledger: Ledger,
+    mut resume: ResumeMap,
 ) -> Result<Simulation, String> {
     let nominal = std::time::Duration::from_secs(u64::from(
         config
@@ -147,8 +197,6 @@ pub fn simulate(
     let window = window_duration(config.window_days);
     let end = start + Duration::days(i64::from(days));
 
-    let mut ledger = Ledger::default();
-    let mut resume = ResumeMap::new();
     let mut generations: Vec<SimulatedGeneration> = Vec::new();
     let mut from = start;
     let mut now = start;

@@ -354,7 +354,7 @@ export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratc
 export ETV_STATION_CATALOG=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/catalog.db
 cargo run --release --bin etv-station -- \
   --config "$SIM/appdata/station.yaml" --serve-ui --ui-port <PORT>
-ETV_UI_PORT=<PORT> tools/ui-get.sh '/api/channels/034-syfy/review?days=14' > a.json   # twice: a.json, b.json
+ETV_UI_PORT=<PORT> tools/ui-get.sh '/api/channels/034-syfy/review?project=14d' > a.json   # twice: a.json, b.json
 ```
 
 Look for, per films pool: `list_position` 1, 2, … inside one `seed_period`
@@ -1072,9 +1072,9 @@ lineup answers 400 "is not a tunable channel in this station's lineup".
 Channels, a lineup rail fed by `GET /api/lineup` (every lineup channel in
 `station.yaml` order: `channel` key, `number`, `display_name`, `scored`, and
 `error` for one that failed to load; logs `ui.lineup`). The view lives in the
-hash and mirrors the API: `#/channels/{ch}/schedule|pattern?days=N` is answered by
-`GET /api/channels/{ch}/review?days=N`; a key not in the lineup is a 404. Run
-`tools/ui-get.sh /api/lineup` and `tools/ui-get.sh '/api/channels/<key>/review?days=3'`,
+hash and mirrors the API: `#/channels/{ch}/schedule|pattern?project=Nd` is answered by
+`GET /api/channels/{ch}/review?project=Nd`; a key not in the lineup is a 404. Run
+`tools/ui-get.sh /api/lineup` and `tools/ui-get.sh '/api/channels/<key>/review?project=3d'`,
 then screenshot, light and dark: a channel's Schedule populated, its Pattern, the
 pending state (a fresh channel while the worker is busy), a 404 key
 (`#/channels/nope/schedule` shows "The review could not be built"), Guide and
@@ -1084,17 +1084,20 @@ build, load `about:blank` before the dashboard URL: a navigation that changes on
 the hash keeps the old page's script running, so every screenshot after it shows
 the previous build.
 
-A review's simulation runs on a worker thread (`sim_cache`), not the request thread.
-`GET /api/channels/{ch}/review` answers 202 `{"pending": true}` until the worker has the channel
-(the page polls every second), then 200 from the cache; `/api/health` stays
-responsive meanwhile and carries `sim_cache: {in_memory, queued, running}`. The
-worker fills the lineup in `station.yaml` order and runs a requested channel next
-(it does not interrupt one in progress). Each finish logs `ui.sim.done` with ms; a
-served review logs `ui.review` with `sim_source="cache"`. Observed 2026-10-18 on a
-debug build over a 3-channel lineup: 034-syfy 14 days simulated in 958s, 041-cartoons
-in 101s, and both served from the cache afterwards in 2s and 11s. Results persist
-under `$TMPDIR/etv-station-ui-sims/<build>/`; touching the channel file, a `.rhai`
-script it names, or the catalog makes the next request queue a fresh simulation.
+A review answers from the channel's real airings with no simulation: `GET /api/channels/{ch}/review`
+is 200 at once (observed 2026-10-19 on a fixture station: 12 ms), every airing `projected: false`,
+`span.label` "real only". `?project=1d|3d|7d|14d` adds that many days simulated from the frontier
+on a worker thread (`projection`): 202 with the real review and `pending: true` until it lands (the
+page keeps the real schedule up beside a spinner and asks again every second), then 200 with
+`projected: true` airings, `span.projected_until` = frontier + N days and `projection.key`. Repeat
+the request: the key and airings are identical, and touching only `catalog.db`'s mtime leaves the
+key alone; editing `channel.yaml` changes it and `projection.changed` reads `["config"]`.
+Results persist in `ui-projections/` beside the catalog (they survive a deploy). Each finish logs
+`ui.projection.done` with ms and `changed`; a served review logs `ui.review`. `/api/health` carries
+`projections: {in_memory, queued, running}`. The Schedule's screenshots (real, projecting,
+projected, projection-changed; light and dark) can be taken against a fixture station:
+a scratch binary that writes a catalog, a `station.yaml` and one chunk file is enough, since
+the real side needs only the chunk files.
 
 ## Verifying the channel-wide repeat rule (`rule.no_repeat_within`)
 
