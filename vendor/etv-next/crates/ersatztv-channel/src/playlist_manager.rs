@@ -341,13 +341,14 @@ impl PlaylistManager {
     pub async fn update(&mut self) -> Result<(), ChannelError> {
         // scan for segments on disk, inside this run's own segment folder
         let mut new_segment_files: VecDeque<String> = VecDeque::new();
+        let held: HashSet<&str> = self.segments.iter().map(|s| s.path.as_str()).collect();
         let mut entries = tokio::fs::read_dir(&self.segment_folder).await?;
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Some(file_name) = entry.file_name().to_str()
                 && file_name.ends_with(".ts")
             {
                 let uri = format!("{}/{file_name}", self.run_folder_name);
-                if !self.segments.iter().any(|s| s.path == uri) {
+                if !held.contains(uri.as_str()) {
                     new_segment_files.push_back(file_name.to_owned());
                 }
             }
