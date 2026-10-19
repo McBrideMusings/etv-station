@@ -117,8 +117,8 @@ pub struct PlayoutItem {
     /// Whether the channel's loudness normalization applies to this item.
     /// Absent means the channel's `normalize_loudness` setting decides;
     /// `false` skips the loudnorm filter for this item only, so a producer
-    /// that set an audio level on purpose keeps it. `true` does not turn
-    /// normalization on for a channel that has it off.
+    /// that set an audio level on purpose keeps it. `true` applies it to this
+    /// item even when the channel has it off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normalize_loudness: Option<bool>,
 }

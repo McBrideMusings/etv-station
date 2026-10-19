@@ -2353,7 +2353,7 @@ mod loudness_tests {
     }
 
     #[test]
-    fn item_true_does_not_enable_loudnorm_on_a_channel_with_it_off() {
+    fn item_true_applies_loudnorm_whatever_the_channel_says() {
         let opted_in = item(r#", "normalize_loudness": true"#);
         assert!(item_loudness(&opted_in, &channel_audio(true)).is_some());
         assert!(item_loudness(&opted_in, &channel_audio(false)).is_some());
