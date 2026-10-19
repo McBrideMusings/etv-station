@@ -28,7 +28,7 @@
 # only honest source for what a given invocation was held to is the `-hls_time`
 # that invocation was actually given.
 #
-# Unlike tools/verify-accel.sh this reads EVERY invocation in each log, not just
+# Unlike the Health tab's encoder verdict this reads EVERY invocation in each log, not just
 # the newest: a sliver is a rare event, and checking only the last spawn would
 # miss all three of the ones above.
 #
@@ -54,7 +54,7 @@ dim()    { printf '\033[2m%s\033[0m' "$1"; }
 
 # Whole logs, not a tail: tools/ffmpeg-probe.sh caps each at ~2000 lines, so the
 # file is already bounded and a sliver can sit anywhere in it. One ssh round trip
-# for every channel, as in verify-accel.sh, and for the same reason.
+# for every channel, as the Health tab does, and for the same reason.
 #
 # shellcheck disable=SC2016  # $DIAG is expanded by the remote/local sh, not here
 collect_argv() {

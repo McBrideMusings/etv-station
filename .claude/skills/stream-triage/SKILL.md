@@ -99,9 +99,10 @@ count as a failure, an idle exit with nobody watching included, so it does not
 prove a viewer was served.
 
 Every channel's count, failed flag, seconds left on the 503 guard and last cause
-are on `GET /health/channels.json`. `tools/channel-health.sh [base-url]` lists
-the unhealthy ones and exits 1 if any is failed (`admin channel-health` points
-it at the deployed station; `--all` lists every channel).
+are on `GET /health/channels.json`. The station's
+`GET /api/health/channels` (the dashboard's Health tab) lists every channel with
+that state beside its encoder verdict and last stall: `tools/ui-get.sh
+/api/health/channels --prod`.
 
 A respawn resets `EXT-X-MEDIA-SEQUENCE` and bumps `EXT-X-DISCONTINUITY-SEQUENCE`.
 Many clients do not survive that even when the server is healthy again, so
