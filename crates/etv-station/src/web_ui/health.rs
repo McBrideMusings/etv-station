@@ -40,7 +40,8 @@ const STALL_LOG_TAIL_BYTES: u64 = 1 << 20;
 pub struct HealthSources {
     /// The diag folder (`ETV_DIAG_DIR`, else `/data/diag`) holding `ffmpeg-argv-ch<N>.log` and `stream-events.log`.
     pub diag_dir: Option<PathBuf>,
-    /// ETV-next's origin, for `/health/channels.json`.
+    /// The in-container ETV-next (`127.0.0.1:$ETV_PORT`), read for `/health/channels.json`.
+    /// Never `ETV_NEXT_URL`, which is the origin the browser uses and may not resolve from inside the container.
     pub etv_next_url: String,
     /// `ETV_ACCEL`: the hardware backend channels are expected to encode with.
     pub accel: Option<String>,
@@ -50,17 +51,18 @@ pub struct HealthSources {
 
 impl HealthSources {
     pub fn from_env() -> Self {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |k: &str| lookup(k).filter(|v| !v.is_empty());
         let port = var("ETV_PORT").unwrap_or_else(|| "8409".into());
         Self {
             // The container's diag folder, which `tools/ffmpeg-probe.sh` and the entrypoint default to.
             diag_dir: Some(PathBuf::from(
                 var("ETV_DIAG_DIR").unwrap_or_else(|| "/data/diag".into()),
             )),
-            etv_next_url: var("ETV_NEXT_URL")
-                .unwrap_or_else(|| format!("http://127.0.0.1:{port}"))
-                .trim_end_matches('/')
-                .to_string(),
+            etv_next_url: format!("http://127.0.0.1:{port}"),
             accel: var("ETV_ACCEL"),
             vaapi_device: var("ETV_VAAPI_DEVICE"),
         }
@@ -370,6 +372,40 @@ pub(super) fn api_health_channels(state: &AppState) -> Result<(u16, Value), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_upstream_read_ignores_the_browser_facing_url() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let n = conn.read(&mut req).unwrap();
+            let body = r#"{"channels":[{"number":"7","state":"failed"}]}"#;
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8_lossy(&req[..n]).into_owned()
+        });
+        let sources = HealthSources::from_lookup(|k| match k {
+            "ETV_NEXT_URL" => Some("https://example.invalid/iptv".into()),
+            "ETV_PORT" => Some(port.to_string()),
+            _ => None,
+        });
+        assert_eq!(sources.etv_next_url, format!("http://127.0.0.1:{port}"));
+        let failures = read_failures(&sources.etv_next_url).unwrap();
+        assert_eq!(failures[&7]["state"], "failed");
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("GET /health/channels.json")
+        );
+    }
 
     fn vaapi() -> HealthSources {
         HealthSources {
