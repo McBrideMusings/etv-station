@@ -461,7 +461,13 @@ pub(super) fn api_graphics_render(
     let spec_yaml =
         serde_norway::to_string(&spec).map_err(|e| format!("serializing the overlay: {e}"))?;
 
+    let footage = if kind == Kind::Clip {
+        find_footage(state, &station, lc)
+    } else {
+        None
+    };
     let mut paths: Vec<PathBuf> = vec![state.options.station.clone(), lc.config_path.clone()];
+    paths.extend(footage.iter().map(|f| f.path.clone()));
     paths.extend(script_inputs);
     paths.extend(station.station.fonts.iter().cloned());
     paths.push(crate::overlay_supervisor::overlay_binary_path());
@@ -495,34 +501,30 @@ pub(super) fn api_graphics_render(
     );
 
     let queue = &state.review.renders;
-    if read_meta(&queue.dir, &id).is_some() {
-        tracing::info!(
-            event = "ui.render",
-            render = %id,
-            kind = kind.name(),
-            channel = key,
-            script = %script.display(),
-            inputs = %inputs_text(&inputs),
-            cache = "hit",
-            ms = 0u64,
-            outcome = "ok",
-            "render served from cache"
-        );
-        return Ok((200, json!({ "render": id, "cached": true })));
-    }
     {
         let mut jobs = queue.jobs.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(jobs.get(&id), Some(JobState::Pending(_))) {
             return Ok((202, json!({ "render": id, "cached": false })));
         }
+        if read_meta(&queue.dir, &id).is_some() {
+            jobs.remove(&id);
+            tracing::info!(
+                event = "ui.render",
+                render = %id,
+                kind = kind.name(),
+                channel = key,
+                script = %script.display(),
+                inputs = %inputs_text(&inputs),
+                cache = "hit",
+                ms = 0u64,
+                outcome = "ok",
+                "render served from cache"
+            );
+            return Ok((200, json!({ "render": id, "cached": true })));
+        }
         jobs.insert(id.clone(), JobState::Pending(Instant::now()));
     }
 
-    let footage = if kind == Kind::Clip {
-        find_footage(state, &station, lc)
-    } else {
-        None
-    };
     let job = Job {
         id: id.clone(),
         kind,
@@ -539,12 +541,16 @@ pub(super) fn api_graphics_render(
         fonts: station.station.fonts.clone(),
         inputs,
     };
-    state
-        .review
-        .renders
-        .tx
-        .send(job)
-        .map_err(|_| "the render worker has stopped".to_string())?;
+    if state.review.renders.tx.send(job).is_err() {
+        state
+            .review
+            .renders
+            .jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        return Err("the render worker has stopped".to_string());
+    }
     Ok((202, json!({ "render": id, "cached": false })))
 }
 
@@ -614,26 +620,37 @@ pub(super) fn api_render(state: &AppState, id: &str) -> (u16, Value) {
         return (404, json!({ "error": format!("no render {id:?}") }));
     }
     let queue = &state.review.renders;
-    if let Some(mut meta) = read_meta(&queue.dir, id) {
-        meta["state"] = json!("done");
-        meta["render"] = json!(id);
-        meta["url"] = json!(format!("/api/renders/{id}/file"));
-        return (200, meta);
+    // The job map before the sidecar: the worker writes the sidecar and then
+    // drops the job, so a render is never in neither.
+    {
+        let jobs = queue.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        match jobs.get(id) {
+            Some(JobState::Pending(since)) => {
+                return (
+                    202,
+                    json!({
+                        "state": "pending",
+                        "render": id,
+                        "elapsed_secs": since.elapsed().as_secs(),
+                    }),
+                );
+            }
+            Some(JobState::Failed { error, log }) => {
+                return (
+                    200,
+                    json!({ "state": "failed", "render": id, "error": error, "log": log }),
+                );
+            }
+            None => {}
+        }
     }
-    let jobs = queue.jobs.lock().unwrap_or_else(|p| p.into_inner());
-    match jobs.get(id) {
-        Some(JobState::Pending(since)) => (
-            202,
-            json!({
-                "state": "pending",
-                "render": id,
-                "elapsed_secs": since.elapsed().as_secs(),
-            }),
-        ),
-        Some(JobState::Failed { error, log }) => (
-            200,
-            json!({ "state": "failed", "render": id, "error": error, "log": log }),
-        ),
+    match read_meta(&queue.dir, id) {
+        Some(mut meta) => {
+            meta["state"] = json!("done");
+            meta["render"] = json!(id);
+            meta["url"] = json!(format!("/api/renders/{id}/file"));
+            (200, meta)
+        }
         None => (
             404,
             json!({ "error": format!("no render {id:?}; it may have been asked for before a restart") }),
@@ -657,9 +674,24 @@ pub(super) fn render_file(state: &AppState, id: &str) -> Option<(PathBuf, &'stat
     Some((dir.join(file), content_type))
 }
 
-/// Answers a file request, honouring one `Range: bytes=a-b` so a browser can
-/// seek in a clip.
+/// Answers a file request on its own thread, so a slow viewer holds up its
+/// own download and not the dashboard. Honours one `Range: bytes=a-b` (or
+/// `bytes=-n`) so a browser can seek in a clip.
 pub(super) fn respond_render_file(
+    request: tiny_http::Request,
+    path: &Path,
+    content_type: &str,
+    range: Option<&str>,
+) {
+    let (path, content_type, range) = (
+        path.to_path_buf(),
+        content_type.to_string(),
+        range.map(str::to_string),
+    );
+    std::thread::spawn(move || serve_render_file(request, &path, &content_type, range.as_deref()));
+}
+
+fn serve_render_file(
     request: tiny_http::Request,
     path: &Path,
     content_type: &str,
@@ -681,16 +713,20 @@ pub(super) fn respond_render_file(
     };
     let span = range.and_then(|r| {
         let (a, b) = r.strip_prefix("bytes=")?.split_once('-')?;
+        if a.is_empty() {
+            let n: u64 = b.parse().ok()?;
+            return Some(Some((len.saturating_sub(n), len.checked_sub(1)?)));
+        }
         let start: u64 = a.parse().ok()?;
         let end: u64 = if b.is_empty() {
             len.checked_sub(1)?
         } else {
             b.parse().ok()?
         };
-        (start <= end && start < len).then_some((start, end.min(len - 1)))
+        Some((start <= end && start < len).then_some((start, end.min(len - 1))))
     });
     let response = match span {
-        Some((start, end)) => {
+        Some(Some((start, end))) => {
             let n = end - start + 1;
             let _ = file.seek(SeekFrom::Start(start));
             tiny_http::Response::new(
@@ -706,6 +742,14 @@ pub(super) fn respond_render_file(
             )
             .boxed()
         }
+        Some(None) => tiny_http::Response::new(
+            tiny_http::StatusCode(416),
+            vec![header("Content-Range", &format!("bytes */{len}"))],
+            std::io::empty(),
+            Some(0),
+            None,
+        )
+        .boxed(),
         None => tiny_http::Response::new(
             tiny_http::StatusCode(200),
             vec![
@@ -756,7 +800,8 @@ fn run_step(
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", program.to_string_lossy()))?;
     let mut pipe = child.stderr.take().expect("stderr was piped");
-    let reader = std::thread::spawn(move || {
+    let (tail_tx, tail_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
         let mut tail: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 4096];
         while let Ok(n) = pipe.read(&mut chunk) {
@@ -768,7 +813,7 @@ fn run_step(
                 tail.drain(..tail.len() - LOG_TAIL_BYTES);
             }
         }
-        String::from_utf8_lossy(&tail).into_owned()
+        let _ = tail_tx.send(String::from_utf8_lossy(&tail).into_owned());
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -794,10 +839,18 @@ fn run_step(
                     timeout.as_secs()
                 ));
             }
-            Err(e) => break Err(format!("wait for {name}: {e}")),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("wait for {name}: {e}"));
+            }
         }
     };
-    log.push_str(&strip_ansi(&reader.join().unwrap_or_default()));
+    // A grandchild that outlives the kill can hold the pipe open; the worker must not wait on it.
+    let stderr = tail_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
+    log.push_str(&strip_ansi(&stderr));
     if !log.ends_with('\n') {
         log.push('\n');
     }

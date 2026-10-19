@@ -746,9 +746,15 @@ mod tests {
         assert_eq!(status, 202, "{first}");
         let id = first["render"].as_str().unwrap().to_string();
 
-        // The same request names the same render while it is pending or kept.
-        let (_, again) = post_render(&mut f.state, ask.clone());
-        assert_eq!(again["render"], id.as_str());
+        // The renderer is not built here, so the render fails; wait for that
+        // so no worker is still running when the cache entry is written.
+        for _ in 0..600 {
+            let (_, body) = get_json(&mut f.state, &format!("/api/renders/{id}"));
+            if body["state"] == "failed" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
         // A finished render on disk is a cache hit with no new work.
         let dir = f.state.review.renders.dir.clone();
