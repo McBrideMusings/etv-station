@@ -843,7 +843,7 @@ function patternWords(blocks) {
     const body = b.sequencer ? `sequencer ${b.sequencer}`
       : b.steps.length ? `${stepsWords(b.steps)}, repeating`
       : b.pools.length ? `pools ${b.pools.join(', ')}`
-      : `${b.entries} fixed entries`;
+      : `${b.entries} fixed ${b.entries === 1 ? 'entry' : 'entries'}`;
     return `${b.name}: ${body}${b.placed.length ? ` — airs ${b.placed.join('; ')}` : ''}`;
   }).join('; ');
 }
@@ -870,7 +870,7 @@ function patternPanel(d, colors) {
     if (b.sequencer) rows = `<p class="muted">Sequencer ${esc(b.sequencer)} over pools ${esc(b.pools.join(', '))}.</p>`;
     else if (b.steps.length) rows = stepsTable(b.steps);
     else if (b.pools.length) rows = `<table class="steps"><tbody>${b.pools.map((p) => `<tr>${poolCells(p)}</tr>`).join('')}</tbody></table>`;
-    else rows = `<p class="muted">${b.entries} fixed entries.</p>`;
+    else rows = `<p class="muted">${b.entries} fixed ${b.entries === 1 ? 'entry' : 'entries'}.</p>`;
     const placed = b.placed.length ? `<p class="muted">Airs ${esc(b.placed.join('; '))}.</p>` : '';
     return `<h4>${esc(b.name)}</h4>${placed}${rows}`;
   }).join('');
