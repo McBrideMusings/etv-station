@@ -2,9 +2,10 @@
 //! at `/` with a tab bar (Channels, Guide, Health) and, on Channels, a rail of
 //! every lineup channel. A channel's Schedule is its review — the upcoming
 //! schedule simulated as the daemon would run it, its depth, overlap and
-//! programming grades, and why each airing is on it (`channel`). The rail is
-//! the lineup in `station.yaml` order (`lineup`). The Tune page at `/tune`
-//! (`tune`) edits a pool's taste profile live.
+//! programming grades, and why each airing is on it (`channel`); its Pools
+//! lists every pool with its sources, config, taste profile and ranking, and
+//! lets a person try profile edits in a draft (`pools`). The rail is the
+//! lineup in `station.yaml` order (`lineup`).
 //!
 //! The page's routes and the API's use the same nouns in the same order: the
 //! page's `#/channels/{ch}/schedule` is answered by
@@ -12,9 +13,9 @@
 //! endpoint. `{ch}` is the channel's lineup key, percent-encoded when it holds
 //! a `/`.
 //!
-//! Nothing here writes to the station's config or data: Tune's profile edits
-//! live in this process's memory, stills and simulations cache under the OS
-//! temp directory. The server listens on the network in the container with no
+//! Nothing here writes to the station's config or data: a draft's profile
+//! edits live in this process's memory, stills and simulations cache under the
+//! OS temp directory. The server listens on the network in the container with no
 //! auth of its own, so every channel a request names is checked against the
 //! lineup. Requests are served one at a time on one thread; simulations run on
 //! `sim_cache`'s worker thread and stills on their own threads, and the
@@ -24,8 +25,8 @@
 
 mod channel;
 mod lineup;
+mod pools;
 mod sim_cache;
-mod tune;
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -40,14 +41,13 @@ use crate::tautulli::{self, HistoryScope};
 use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use channel::{ReviewState, api_channel_review, still_reply};
 use lineup::api_lineup;
+use pools::{
+    PoolState, api_draft_discard, api_draft_edit, api_draft_open, api_pools, api_search_item,
+    api_search_keyword, api_search_tag, api_tautulli_users, draft_yaml, scored_channel_count,
+};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use tiny_http::Method;
-use tune::{
-    Session, api_channels, api_profile_add, api_profile_remove, api_profile_update,
-    api_search_item, api_search_keyword, api_search_tag, api_select, api_tautulli_users,
-    discover_channels,
-};
 
 /// How [`serve`] was started. `etv-station --serve-ui` builds this from its
 /// flags and the station config.
@@ -57,7 +57,7 @@ pub struct Options {
     /// The station's catalog sqlite database, opened read-only.
     pub catalog: PathBuf,
     /// In-development plugin scripts a pool's `plugin:` is looked up in by
-    /// file name (see `tune`). `None` scores with the deployed scripts.
+    /// file name (see `pools`). `None` scores with the deployed scripts.
     pub plugins_dir: Option<PathBuf>,
     /// Address to listen on: loopback locally, `0.0.0.0` in the container.
     pub bind: IpAddr,
@@ -67,8 +67,7 @@ pub struct Options {
 struct AppState {
     catalog: Catalog,
     options: Options,
-    cache: ScoreCache,
-    session: Option<Session>,
+    pools: PoolState,
     review: ReviewState,
 }
 
@@ -101,8 +100,7 @@ pub fn serve(options: Options) -> Result<(), String> {
     review.sims.spawn(channel::DEFAULT_REVIEW_DAYS);
     let mut state = AppState {
         catalog,
-        cache: ScoreCache::default(),
-        session: None,
+        pools: PoolState::default(),
         review,
         options,
     };
@@ -118,7 +116,7 @@ pub fn serve(options: Options) -> Result<(), String> {
 /// only the code sees a broken config as down.
 fn api_health(state: &AppState) -> (u16, Value) {
     let o = &state.options;
-    let channels = discover_channels(&o.station);
+    let channels = scored_channel_count(&o.station);
     let status = if channels.is_ok() { 200 } else { 503 };
     let sims = state.review.sims.stats();
     let body = json!({
@@ -133,7 +131,8 @@ fn api_health(state: &AppState) -> (u16, Value) {
         "plugins_dir": o.plugins_dir.as_ref().map(|p| p.display().to_string()),
         "bind": o.bind.to_string(),
         "port": o.port,
-        "tunable_channels": channels.as_ref().map(Vec::len).ok(),
+        "tunable_channels": channels.as_ref().ok(),
+        "drafts": state.pools.draft_count(),
         "error": channels.err(),
         "revision": std::env::var("ETV_STATION_REVISION").ok(),
     });
@@ -145,6 +144,8 @@ fn api_health(state: &AppState) -> (u16, Value) {
 enum Reply {
     Json(u16, Value),
     Html(&'static str),
+    /// A pool's profile as YAML, pasted into a `channel.yaml` by hand.
+    Yaml(String),
     /// A tune-in still a review offered under this id, rendered on its own
     /// thread by [`channel::respond_still`].
     Still(String, Box<TuneInStill>),
@@ -166,6 +167,7 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
     let began = std::time::Instant::now();
     match dispatch(state, &method, &path, &query, &body) {
         Reply::Html(html) => respond_html(request, html),
+        Reply::Yaml(text) => respond_yaml(request, text),
         Reply::Still(id, still) => {
             channel::respond_still(state.review.still_dir.clone(), id, *still, request)
         }
@@ -187,27 +189,41 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
 
 /// The router. A handler's `Err` is a 400 naming why.
 fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body: &str) -> Reply {
-    if *method == Method::Get {
-        if let Some(id) = path.strip_prefix("/api/stills/") {
-            return still_reply(state, &percent_decode(id));
-        }
-        if let Some(key) = path
-            .strip_prefix("/api/channels/")
-            .and_then(|rest| rest.strip_suffix("/review"))
-        {
-            return json_reply(api_channel_review(state, &percent_decode(key), query));
+    if *method == Method::Get
+        && let Some(id) = path.strip_prefix("/api/stills/")
+    {
+        return still_reply(state, &percent_decode(id));
+    }
+    if let Some(rest) = path.strip_prefix("/api/channels/") {
+        let segments: Vec<String> = rest.split('/').map(percent_decode).collect();
+        let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+        match (method, segments.as_slice()) {
+            (Method::Get, [key, "review"]) => {
+                return json_reply(api_channel_review(state, key, query));
+            }
+            (Method::Get, [key, "pools"]) => return json_reply(api_pools(state, key, query)),
+            (Method::Post, [key, "drafts"]) => {
+                return json_reply(api_draft_open(state, key, body));
+            }
+            (Method::Post, [key, "drafts", id, "edits"]) => {
+                return json_reply(api_draft_edit(state, key, id, body));
+            }
+            (Method::Get, [key, "drafts", id, "yaml"]) => {
+                return match draft_yaml(state, key, id, query) {
+                    Ok(text) => Reply::Yaml(text),
+                    Err((status, error)) => Reply::Json(status, json!({ "error": error })),
+                };
+            }
+            (Method::Delete, [key, "drafts", id]) => {
+                return json_reply(api_draft_discard(state, key, id));
+            }
+            _ => {}
         }
     }
     let result = match (method, path) {
         (Method::Get, "/") => return Reply::Html(SHELL_HTML),
-        (Method::Get, "/tune") => return Reply::Html(TUNE_HTML),
         (Method::Get, "/api/health") => Ok(api_health(state)),
         (Method::Get, "/api/lineup") => api_lineup(state),
-        (Method::Get, "/api/channels") => api_channels(state),
-        (Method::Post, "/api/select") => api_select(state, body),
-        (Method::Post, "/api/profile/add") => api_profile_add(state, body),
-        (Method::Post, "/api/profile/update") => api_profile_update(state, body),
-        (Method::Post, "/api/profile/remove") => api_profile_remove(state, body),
         (Method::Get, "/api/search/keyword") => api_search_keyword(state, query),
         (Method::Get, "/api/search/tag") => api_search_tag(state, query),
         (Method::Get, "/api/search/item") => api_search_item(state, query),
@@ -241,6 +257,14 @@ fn respond_jpeg(request: tiny_http::Request, body: Vec<u8>) {
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..])
         .expect("static header");
     let response = tiny_http::Response::from_data(body).with_header(header);
+    let _ = request.respond(response);
+}
+
+fn respond_yaml(request: tiny_http::Request, body: String) {
+    let header =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/yaml; charset=utf-8"[..])
+            .expect("static header");
+    let response = tiny_http::Response::from_string(body).with_header(header);
     let _ = request.respond(response);
 }
 
@@ -287,7 +311,6 @@ fn percent_decode(s: &str) -> String {
 }
 
 const SHELL_HTML: &str = include_str!("shell.html");
-const TUNE_HTML: &str = include_str!("tune.html");
 
 #[cfg(test)]
 mod tests {
@@ -299,8 +322,7 @@ mod tests {
         let station = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/station.yaml");
         AppState {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
-            cache: ScoreCache::default(),
-            session: None,
+            pools: PoolState::default(),
             review: ReviewState::new(station.clone(), PathBuf::from("/nonexistent/catalog.db")),
             options: Options {
                 station,

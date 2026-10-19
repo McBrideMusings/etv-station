@@ -9,8 +9,8 @@
 # answer "which channels have one" and exit 0 rather than a usage error, which
 # takes a branch admin.toml's `run` string cannot express.
 #
-# WHAT IT DELIBERATELY DOES NOT NEED. `taste-debug` is the counterexample this
-# exists to avoid: it runs locally, so it needs a local copy of catalog.db and
+# WHAT IT DELIBERATELY DOES NOT NEED. A tool that re-scores pools locally is the
+# counterexample this exists to avoid: it needs a local copy of catalog.db and
 # the plexdb snapshot, and its most common outcome on a dev Mac is a message
 # telling you to scp two databases. `--audit` reads chunk JSON and nothing else
 # — no catalog, no plexdb snapshot, no plugin evaluation (ADR 0011) — so this

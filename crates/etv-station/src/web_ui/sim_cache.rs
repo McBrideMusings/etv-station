@@ -458,7 +458,7 @@ impl SimCache {
         let channel_mtime = fp.get(1).and_then(|(_, m)| *m);
         let account = match accounts.get(&lc.config_path) {
             Some((m, id)) if *m == channel_mtime => Ok(*id),
-            _ => super::tune::channel_account_id(&lc.config).inspect(|id| {
+            _ => super::pools::channel_account_id(&lc.config).inspect(|id| {
                 accounts.insert(lc.config_path.clone(), (channel_mtime, *id));
             }),
         };

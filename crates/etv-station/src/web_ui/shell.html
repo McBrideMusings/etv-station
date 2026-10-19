@@ -11,6 +11,7 @@
     --accent: #3d4fd1; --bar: #3d4fd1; --bar-open: #9aa3b1; --track: #e9ebef;
     --warn-bg: #fff6d8; --warn-fg: #6b4e00; --err-bg: #fde8e8; --err-fg: #8a1414;
     --ink-bg: #16181d; --ink-fg: #ffffff;
+    --up: #1a7f37; --down: #b42318;
     --ppm: 1.15px;   /* guide height per minute of airtime */
     --col: 138px;    /* guide width per day */
   }
@@ -21,6 +22,7 @@
       --accent: #8e9cff; --bar: #8e9cff; --bar-open: #5c6370; --track: #262a32;
       --warn-bg: #3a3014; --warn-fg: #f2d98a; --err-bg: #3d1c1c; --err-fg: #ffb4b4;
       --ink-bg: #e6e8ec; --ink-fg: #121418;
+      --up: #5fd07a; --down: #ff8f85;
     }
   }
   * { box-sizing: border-box; }
@@ -193,6 +195,35 @@
     .gwrap { height: 70vh; }
     .rail { overflow: visible; }
   }
+  /* Pools: one section per pool; the draft bar sits above them. */
+  .draftbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 10px; margin-bottom: 8px;
+    background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 3px; position: sticky; top: 0; z-index: 5; }
+  .draftbar.idle { border-left-color: var(--line); }
+  .draftbar .spacer { flex: 1; }
+  select, input[type=text] { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 2px 6px; }
+  .poolsec { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 10px; }
+  .poolsec > summary { cursor: pointer; padding: 6px 10px; background: var(--panel); display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+  .poolsec .chip { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 2px; }
+  .pgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 20px; padding: 8px 10px 10px; }
+  .pfield { min-width: 0; }
+  .pfield.wide { grid-column: 1 / -1; }
+  .pfield h4 { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 4px; }
+  .pfield h4 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  dl.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1px 10px; margin: 0; font-size: 12px; }
+  dl.kv dt { color: var(--muted); }
+  dl.kv dd { margin: 0; font-family: ui-monospace, monospace; font-size: 11.5px; overflow-wrap: anywhere; }
+  table.ptable input.w { width: 70px; }
+  .addrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+  .addrow input.aw { width: 60px; }
+  .searchbox { position: relative; }
+  .sugg { position: absolute; z-index: 6; left: 0; top: 100%; min-width: 220px; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--line); }
+  .sugg div { padding: 3px 8px; cursor: pointer; }
+  .sugg div:hover { background: var(--panel); }
+  .rank-scroll { max-height: 360px; overflow: auto; border: 1px solid var(--line); }
+  .rank-scroll thead th { position: sticky; top: 0; background: var(--bg); }
+  .mv { font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; }
+  .mv.up { color: var(--up); } .mv.down { color: var(--down); } .mv.new, .mv.same { color: var(--muted); }
+  #yamlOut pre { margin: 4px 0 8px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; overflow: auto; font-size: 12px; }
   #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
 </head>
@@ -202,8 +233,6 @@
   <a id="tabChannels" href="#/channels">Channels</a>
   <a id="tabGuide" href="#/guide">Guide</a>
   <a id="tabHealth" href="#/health">Health</a>
-  <span class="spacer" style="flex:1"></span>
-  <a href="/tune">Tune</a>
 </nav>
 <div class="app" id="app">
   <nav class="lineup" id="lineup" aria-label="Channels"><div class="lstate muted">Loading the lineup…</div></nav>
@@ -213,12 +242,15 @@
       <nav class="subtabs" aria-label="Channel views">
         <a id="subSchedule" href="#">Schedule</a>
         <a id="subPattern" href="#">Pattern</a>
+        <a id="subPools" href="#">Pools</a>
       </nav>
       <span id="position" class="muted"></span>
       <span class="spacer"></span>
-      <label for="days">Days shown</label>
-      <input type="number" id="days" min="1" max="60" value="14">
-      <button id="applyDays" type="button">Re-simulate</button>
+      <span id="daysCtl" class="toolbar" style="margin:0">
+        <label for="days">Days shown</label>
+        <input type="number" id="days" min="1" max="60" value="14">
+        <button id="applyDays" type="button">Re-simulate</button>
+      </span>
     </div>
     <div id="state" class="muted"></div>
     <div id="report"></div>
@@ -242,7 +274,7 @@ let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
 // The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern}?days=N`,
-// `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
+// `#/channels/{key}/pools?draft=ID`, `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
 function parseRoute() {
   const [path, qs] = location.hash.replace(/^#/, '').split('?');
   const parts = path.split('/').filter(Boolean);
@@ -251,12 +283,16 @@ function parseRoute() {
   return {
     tab,
     channel: tab === 'channels' && parts[1] ? decodeURIComponent(parts[1]) : null,
-    view: parts[2] === 'pattern' ? 'pattern' : 'schedule',
+    view: ['pattern', 'pools'].includes(parts[2]) ? parts[2] : 'schedule',
     days: q.get('days'),
+    draft: q.get('draft'),
   };
 }
-function channelHash(channel, view, days) {
-  return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${days ? `?days=${days}` : ''}`;
+function channelHash(channel, view, days, draft) {
+  const q = [];
+  if (days && view !== 'pools') q.push(`days=${days}`);
+  if (draft && view === 'pools') q.push(`draft=${encodeURIComponent(draft)}`);
+  return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${q.length ? `?${q.join('&')}` : ''}`;
 }
 
 function fmt(ts, tz, opts) {
@@ -364,13 +400,14 @@ function markRoute(r) {
   $('toolbar').hidden = r.tab !== 'channels';
   if (r.tab !== 'channels' || !lineup) return;
   const days = $('days').value;
+  $('daysCtl').hidden = r.view === 'pools';
   for (const a of $('lineup').querySelectorAll('a')) {
     a.href = channelHash(a.dataset.key, r.view, days);
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
-  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern']]) {
-    $(id).href = channelHash(r.channel, view, days);
+  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern'], ['subPools', 'pools']]) {
+    $(id).href = channelHash(r.channel, view, days, r.draft);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
   const i = lineup.findIndex((c) => c.channel === r.channel);
@@ -401,8 +438,10 @@ async function route() {
   }
   if (r.days) $('days').value = r.days;
   markRoute(r);
-  if (r.tab !== 'channels') { loadSeq++; shown = null; renderEmpty(r.tab); return; }
+  if (r.tab !== 'channels') { loadSeq++; poolsSeq++; shown = null; renderEmpty(r.tab); return; }
   if (!r.channel) return;
+  if (r.view === 'pools') { shown = null; await loadPools(r.channel, r.draft); return; }
+  poolsSeq++;
   const key = `${r.channel}|${$('days').value}`;
   if (shown === key && current) { draw(r.view); return; }
   shown = key;
@@ -757,6 +796,264 @@ document.addEventListener('scroll', () => {
   const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.blk');
   if (focused) showTip(focused); else hideTip();
 }, true);
+
+// ---- Channels › Pools: every pool's sources, config, profile and ranking; profile edits live in a per-tab draft ----
+
+const enc = encodeURIComponent;
+let poolsCtx = null;     // { channel, draft, data } for the Pools page on screen
+let poolsSeq = 0;        // a newer load supersedes an older one still waiting
+let poolsNotice = '';    // one line shown above the pools after a draft expired
+let accountsLoaded = null;  // GET /api/tautulli/users: the list, or null when Tautulli is not configured
+
+// A failed request is { error: 'HTTP <status>: <the server's error>', status }; anything else is the body.
+async function apiJson(method, path, body) {
+  const opts = { method };
+  if (body !== undefined) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+  try {
+    const res = await fetch(path, opts);
+    let data;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok) return { error: `HTTP ${res.status}: ${data.error || 'no error message'}`, status: res.status };
+    return data;
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+const poolTitle = (c) => (c.show ? `${c.show} — ` : '') + c.title + (c.year ? ` (${c.year})` : '');
+
+function setPoolsBusy(on, what) {
+  $('report').classList.toggle('loading', on);
+  if (!on) { $('state').textContent = ''; return; }
+  const began = Date.now();
+  const paint = () => { $('state').innerHTML = `<span class="spinner"></span>${esc(what)}… (${Math.round((Date.now() - began) / 1000)}s)`; };
+  paint();
+  const timer = setInterval(() => { if (!$('report').classList.contains('loading')) clearInterval(timer); else paint(); }, 1000);
+}
+
+async function loadPools(channel, draft) {
+  const seq = ++poolsSeq;
+  loadSeq++;   // a schedule poll still running for the old view stops
+  current = null;
+  $('report').innerHTML = '';
+  setPoolsBusy(true, `Ranking ${channel}'s pools`);
+  const data = await apiJson('GET', `/api/channels/${enc(channel)}/pools${draft ? `?draft=${enc(draft)}` : ''}`);
+  if (seq !== poolsSeq) return;
+  setPoolsBusy(false);
+  if (data.status === 404 && draft) {
+    // The draft expired or the server restarted: show the deployed pools and say so.
+    poolsNotice = `Draft ${draft} is gone (it expired, was discarded, or the server restarted). Showing the deployed pools.`;
+    location.replace(channelHash(channel, 'pools'));
+    return;
+  }
+  poolsCtx = { channel, draft: draft || null, data };
+  drawPools();
+}
+
+async function loadAccounts() {
+  if (accountsLoaded !== null) return accountsLoaded;
+  const data = await apiJson('GET', '/api/tautulli/users');
+  accountsLoaded = data.error ? [] : data.results;
+  return accountsLoaded;
+}
+
+function kvHtml(v) {
+  if (v === null || v === undefined) return '<span class="muted">—</span>';
+  if (Array.isArray(v)) return v.length ? v.map((x) => `<div>${kvHtml(x)}</div>`).join('') : '<span class="muted">(empty)</span>';
+  if (typeof v === 'object') {
+    const keys = Object.keys(v);
+    if (!keys.length) return '<span class="muted">(empty)</span>';
+    return `<dl class="kv">${keys.map((k) => `<dt>${esc(k)}</dt><dd>${kvHtml(v[k])}</dd>`).join('')}</dl>`;
+  }
+  return esc(typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(3) : v);
+}
+
+const KINDS = ['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'studio', 'content_rating', 'item', 'set'];
+const SEARCHABLE = ['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'item'];
+
+function movementHtml(item) {
+  if (!('movement' in item)) return '';
+  if (item.movement === null) return '<span class="mv new" title="not in the deployed ranking">new</span>';
+  if (item.movement > 0) return `<span class="mv up" title="was #${item.was}">▲ ${item.movement}</span>`;
+  if (item.movement < 0) return `<span class="mv down" title="was #${item.was}">▼ ${-item.movement}</span>`;
+  return '<span class="mv same" title="same place">—</span>';
+}
+
+function poolHtml(name, p, draft, openIt) {
+  const head = `<summary><b>${esc(name)}</b> <span class="chip">${p.scored ? 'scored by plugin' : 'not scored'}</span>
+    ${p.scored ? `<span class="muted">${p.ranking_count} ranked${p.edited ? ' · edited in this draft' : ''}</span>` : ''}</summary>`;
+  const sources = `<div class="pfield"><h4>sources${p.scored && !p.sources_authored ? ' <span class="muted">(the plugin\'s own default)</span>' : ''}</h4>${kvHtml(p.sources)}</div>`;
+  const config = `<div class="pfield"><h4>config${p.config_authored ? '' : ' <span class="muted">(none written)</span>'}</h4>${kvHtml(p.config)}</div>`;
+  if (!p.scored) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}</div></details>`;
+  if (p.error) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}</div>
+    <div class="error">${esc(p.error)}</div></details>`;
+
+  const entries = p.profile.entries.map((e) => `<tr>
+      <td><input type="number" step="0.1" class="w" value="${esc(e.weight)}" data-index="${e.index ?? ''}" ${e.index == null ? 'disabled title="from a profile file"' : ''}></td>
+      <td>${esc(e.kind || '')}</td><td>${esc(e.reference || '')}</td>
+      <td><button type="button" class="rm" data-index="${e.index ?? ''}" ${e.index == null ? 'disabled' : ''}>remove</button></td></tr>`).join('');
+  const excluded = p.profile.exclusions.length
+    ? `<div class="muted">excluded (read-only here): ${p.profile.exclusions.map((x) => esc(x.reference)).join(', ')}</div>` : '';
+  const profile = `<div class="pfield wide"><h4>profile <span class="muted">— weights this pool's score is tilted by</span></h4>
+    <table class="ptable"><thead><tr><th>weight</th><th>kind</th><th>reference</th><th></th></tr></thead>
+      <tbody>${entries || '<tr><td colspan="4" class="muted">(no entries)</td></tr>'}</tbody></table>
+    <div class="addrow"><select class="kind">${KINDS.map((k) => `<option>${k}</option>`).join('')}</select>
+      <span class="searchbox"><input type="text" class="val" placeholder="value (type to search)"><div class="sugg" hidden></div></span>
+      <input type="number" class="aw" value="1" step="0.1" title="weight"><button type="button" class="add">Add</button></div>${excluded}</div>`;
+  const rows = p.ranking.map((c) => `<tr><td class="num">${c.rank}</td><td>${esc(poolTitle(c))}</td>
+      <td>${movementHtml(c)}</td><td class="muted">${esc(c.audit ? c.audit.verdict : '')}</td></tr>`).join('');
+  const ranking = `<div class="pfield wide"><h4>ranking <span class="muted">— from the profile alone: one full pick, no airing history, no exploration${draft && p.edited ? '; movement is against the deployed ranking' : ''}</span></h4>
+    <div class="rank-scroll"><table class="rtable"><thead><tr><th class="num">#</th><th>title</th><th>${draft && p.edited ? 'moved' : ''}</th><th>verdict</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="4" class="muted">(nothing ranked)</td></tr>'}</tbody></table></div>
+    <div class="muted">showing ${p.ranking.length} of ${p.ranking_count}</div></div>`;
+  return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}${profile}${ranking}</div></details>`;
+}
+
+function drawPools() {
+  const { channel, draft, data } = poolsCtx;
+  document.title = `etv-station · ${channel} · Pools`;
+  const head = `<header class="mast"><div><h1>${esc(channel)}</h1><div class="sub">Pools${data.config_path ? ` · ${esc(data.config_path)}` : ''}</div></div></header>`;
+  if (data.error) {
+    $('report').innerHTML = `${head}<h2>The pools could not be built</h2><div class="error">${esc(data.error)}</div>`;
+    return;
+  }
+  if (data.load_error) {
+    $('report').innerHTML = `${head}<h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
+    return;
+  }
+  const anyScored = data.order.some((n) => data.pools[n].scored);
+  const edited = data.order.filter((n) => data.pools[n].edited);
+  let bar = '';
+  if (anyScored) {
+    if (draft) {
+      bar = `<div class="draftbar" id="draftbar"><b>Draft</b> <span id="editCount">${data.draft ? data.draft.edits : 0} edit${data.draft && data.draft.edits === 1 ? '' : 's'}</span>
+        <span class="muted">· account ${data.account_id == null ? 'all users' : esc(data.account_id)}</span><span class="spacer"></span>
+        <select id="copyPool" aria-label="Pool">${data.order.filter((n) => data.pools[n].scored).map((n) => `<option ${edited[0] === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+        <button type="button" id="copyYaml">Copy profile YAML</button><button type="button" id="discard">Discard</button></div>`;
+    } else {
+      bar = `<div class="draftbar idle" id="draftbar"><span class="muted">No draft. Your first profile edit starts one; it lives in this tab's URL and changes nothing on disk.</span>
+        <span class="spacer"></span><label for="acctSel">Account</label><select id="acctSel"><option value="">channel default</option></select></div>`;
+    }
+  }
+  $('report').innerHTML = `${head}${poolsNotice ? `<div class="notice">${esc(poolsNotice)}</div>` : ''}${bar}
+    <div id="editError" class="error" hidden></div><div id="yamlOut" hidden></div>
+    ${data.order.map((n) => poolHtml(n, data.pools[n], draft, !edited.length || data.pools[n].edited)).join('') || '<p class="muted">This channel has no pools.</p>'}`;
+  poolsNotice = '';
+  wirePools();
+  if (anyScored && !draft) populateAccounts();
+}
+
+async function populateAccounts() {
+  const users = await loadAccounts();
+  const sel = $('acctSel');
+  if (!sel) return;
+  for (const u of users) sel.insertAdjacentHTML('beforeend', `<option value="${esc(u.user_id)}">${esc(u.display_name)} (${esc(u.user_id)})</option>`);
+}
+
+function wirePools() {
+  for (const sec of document.querySelectorAll('.poolsec')) {
+    const pool = sec.dataset.pool;
+    for (const w of sec.querySelectorAll('input.w')) {
+      w.addEventListener('change', () => editDraft('update', pool, { index: Number(w.dataset.index), weight: parseFloat(w.value) }));
+    }
+    for (const b of sec.querySelectorAll('button.rm')) b.addEventListener('click', () => editDraft('remove', pool, { index: Number(b.dataset.index) }));
+    const add = sec.querySelector('.addrow');
+    if (!add) continue;
+    const kind = add.querySelector('.kind'), val = add.querySelector('.val'), sugg = add.querySelector('.sugg');
+    add.querySelector('.add').addEventListener('click', () => {
+      const v = val.value.trim();
+      if (!v) return;
+      editDraft('add', pool, { [kind.value]: v, weight: parseFloat(add.querySelector('.aw').value) });
+    });
+    let timer = null;
+    val.addEventListener('input', () => {
+      clearTimeout(timer);
+      const q = val.value.trim();
+      if (q.length < 2 || !SEARCHABLE.includes(kind.value)) { sugg.hidden = true; return; }
+      timer = setTimeout(async () => {
+        const k = kind.value;
+        const url = k === 'keyword' ? `/api/search/keyword?q=${enc(q)}&channel=${enc(poolsCtx.channel)}&pool_name=${enc(pool)}`
+          : k === 'item' ? `/api/search/item?q=${enc(q)}` : `/api/search/tag?namespace=${enc(k)}&q=${enc(q)}`;
+        const data = await apiJson('GET', url);
+        sugg.innerHTML = '';
+        for (const r of data.results || []) {
+          const div = document.createElement('div');
+          div.textContent = k === 'keyword' ? `${r.surface} → ${r.keyword}` : k === 'item' ? poolTitle(r) : r;
+          div.addEventListener('click', () => { val.value = k === 'keyword' ? r.surface : k === 'item' ? poolTitle(r) : r; sugg.hidden = true; });
+          sugg.appendChild(div);
+        }
+        sugg.hidden = !sugg.children.length;
+      }, 200);
+    });
+  }
+  const copy = $('copyYaml');
+  if (copy) copy.addEventListener('click', copyYaml);
+  const discard = $('discard');
+  if (discard) discard.addEventListener('click', discardDraft);
+}
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.searchbox')) document.querySelectorAll('.sugg').forEach((b) => { b.hidden = true; });
+});
+
+function showEditError(message) {
+  const el = $('editError');
+  if (!el) return;
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+// One profile edit: starts the draft on the first one, posts the edit, and redraws every pool from the answer.
+async function editDraft(op, pool, entry) {
+  const { channel } = poolsCtx;
+  showEditError('');
+  const acct = $('acctSel') && $('acctSel').value;
+  setPoolsBusy(true, 'Re-ranking');
+  try {
+    if (!poolsCtx.draft) {
+      const made = await apiJson('POST', `/api/channels/${enc(channel)}/drafts`, acct ? { account: Number(acct) } : {});
+      if (made.error) { setPoolsBusy(false); showEditError(made.error); return; }
+      poolsCtx.draft = made.draft;
+      // The draft id goes in the URL without a navigation, so this tab keeps it across a reload.
+      history.replaceState(null, '', channelHash(channel, 'pools', null, made.draft));
+      markRoute(parseRoute());
+    }
+    const data = await apiJson('POST', `/api/channels/${enc(channel)}/drafts/${enc(poolsCtx.draft)}/edits`, { op, pool, entry });
+    setPoolsBusy(false);
+    if (data.error) {
+      if (data.status === 404) {
+        poolsNotice = 'This draft is gone (it expired or the server restarted); the page shows the deployed pools again.';
+        location.replace(channelHash(channel, 'pools'));
+        return;
+      }
+      showEditError(data.error);
+      return;
+    }
+    poolsCtx.data = data;
+    drawPools();
+  } catch (e) {
+    setPoolsBusy(false);
+    showEditError(String(e));
+  }
+}
+
+async function copyYaml() {
+  const { channel, draft } = poolsCtx;
+  const pool = $('copyPool').value;
+  const res = await fetch(`/api/channels/${enc(channel)}/drafts/${enc(draft)}/yaml?pool=${enc(pool)}`);
+  const text = await res.text();
+  if (!res.ok) { showEditError(`HTTP ${res.status}: ${text}`); return; }
+  const out = $('yamlOut');
+  out.hidden = false;
+  out.innerHTML = `<div class="muted">${esc(pool)}'s profile, ready to paste into channel.yaml:</div><pre>${esc(text || '(the profile has no entries)')}</pre>`;
+  try { await navigator.clipboard.writeText(text); out.insertAdjacentHTML('afterbegin', '<div class="muted">Copied to the clipboard.</div>'); } catch (e) { /* the text above stays selectable */ }
+}
+
+async function discardDraft() {
+  const { channel, draft } = poolsCtx;
+  const data = await apiJson('DELETE', `/api/channels/${enc(channel)}/drafts/${enc(draft)}`);
+  if (data.error && data.status !== 404) { showEditError(data.error); return; }
+  location.hash = channelHash(channel, 'pools');
+}
 
 $('lineupSelect').addEventListener('change', () => { const r = parseRoute(); location.hash = channelHash($('lineupSelect').value, r.view, $('days').value); });
 $('applyDays').addEventListener('click', () => {

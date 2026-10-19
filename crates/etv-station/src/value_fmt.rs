@@ -1,6 +1,6 @@
 //! A single `serde_json::Value` renderer shared by every diagnostic surface
 //! that prints an opaque plugin-authored map — [`crate::audit_report`]'s
-//! per-item audit trail and `taste-debug`'s per-candidate metadata dump.
+//! per-item audit trail and the web dashboard's per-candidate metadata.
 //!
 //! Both surfaces render `metadata`/`detail` maps a Rhai plugin attached, whose
 //! keys neither surface knows in advance (ADR 0002: metadata is opaque to the

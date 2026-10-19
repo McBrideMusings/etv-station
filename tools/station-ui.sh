@@ -7,8 +7,8 @@
 # against the real ~11,634-movie catalog, which makes a live-tuning loop
 # unusable. See the module's own doc for the rest of that story.
 #
-# Reuses tools/taste-debug.sh's local catalog/plexdb cache
-# (tmp/claude/scratchpad/taste-debug/, kept in step with the host by
+# Keeps a local catalog/plexdb cache
+# (tmp/claude/scratchpad/station-cache/, kept in step with the host by
 # tools/taste-cache.sh) rather than a second one. ETV_STATION_CATALOG points the
 # station config's `catalog_path` at that copy, and PLEXDB_SNAPSHOT_PATH makes
 # every pool's own `datastores: [{ path: "${PLEXDB_SNAPSHOT_PATH}" }]` resolve to
@@ -26,7 +26,7 @@ if [ -f .env ]; then
   set +a
 fi
 
-CACHE_DIR="tmp/claude/scratchpad/taste-debug"
+CACHE_DIR="tmp/claude/scratchpad/station-cache"
 
 bash tools/taste-cache.sh catalog.db plexdb.snapshot.db || exit 1
 
