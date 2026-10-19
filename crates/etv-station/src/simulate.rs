@@ -51,7 +51,7 @@ use crate::score::ScoreInputs;
 const MAX_GENERATIONS_PER_TICK: usize = 512;
 
 /// One scheduled airing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SimulatedAiring {
     pub id: String,
     /// Which `rule.blocks` index produced it.
@@ -68,7 +68,7 @@ pub struct SimulatedAiring {
 }
 
 /// One resolver run and what it scheduled.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SimulatedGeneration {
     pub index: usize,
     /// When this generation's first item airs.
@@ -78,7 +78,7 @@ pub struct SimulatedGeneration {
     pub airings: Vec<SimulatedAiring>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Simulation {
     pub start: OffsetDateTime,
     pub generations: Vec<SimulatedGeneration>,

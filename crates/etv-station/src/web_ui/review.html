@@ -188,6 +188,7 @@ const GUIDE_OPEN_HOUR = 12;
 
 let current = null;   // the last /api/review payload
 let lineup = { prev: null, next: null };
+let loadSeq = 0;   // a newer load() supersedes an older one still polling
 
 function params() {
   const p = new URLSearchParams(location.search);
@@ -210,13 +211,21 @@ async function load(channel, days, push) {
   $('state').innerHTML = '<span class="spinner"></span>Simulating…';
   $('report').classList.add('loading');
   for (const b of [$('prevBtn'), $('nextBtn'), $('applyDays')]) b.disabled = true;
+  const seq = ++loadSeq;
   let data;
   try {
-    const res = await fetch(`/api/review?${q}`);
-    data = await res.json();
+    // A 202 means the worker is still simulating this channel; ask again.
+    for (;;) {
+      const res = await fetch(`/api/review?${q}`);
+      data = await res.json();
+      if (!data.pending) break;
+      await new Promise((r) => setTimeout(r, 1000));
+      if (seq !== loadSeq) return;
+    }
   } catch (e) {
     data = { error: String(e) };
   }
+  if (seq !== loadSeq) return;
   $('report').classList.remove('loading');
   $('applyDays').disabled = false;
   if (data.lineup) lineup = data.lineup;
