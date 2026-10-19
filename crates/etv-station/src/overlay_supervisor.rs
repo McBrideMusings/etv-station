@@ -85,6 +85,8 @@ pub struct OverlayContext {
     pub channel_name: String,
     pub output_folder: PathBuf,
     pub fifo_path: PathBuf,
+    /// The station's `fonts:` entries, passed to the overlay as `--font`.
+    pub fonts: Vec<PathBuf>,
 }
 
 impl OverlayContext {
@@ -337,7 +339,11 @@ fn reap_decision(exited_cleanly: bool, had_reader: bool) -> Reap {
 
 fn spawn_overlay(ctx: &OverlayContext) -> std::io::Result<Child> {
     let binary = overlay_binary_path();
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    for font in &ctx.fonts {
+        command.arg("--font").arg(font);
+    }
+    command
         .arg("pipe")
         .arg("--fifo")
         .arg(&ctx.fifo_path)
@@ -410,6 +416,7 @@ mod tests {
             channel_name: "test".into(),
             output_folder: dir.to_path_buf(),
             fifo_path: dir.join("overlay.fifo"),
+            fonts: Vec::new(),
         }
     }
 

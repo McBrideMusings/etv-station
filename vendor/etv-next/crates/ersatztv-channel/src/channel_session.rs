@@ -723,17 +723,7 @@ impl ChannelSession {
                 buffer: audio_norm.buffer_kbps.map(Kbps),
                 channels: audio_norm.channels,
                 sample_rate: audio_norm.sample_rate_hz.map(Hz),
-                loudness: if audio_norm.normalize_loudness {
-                    Some(
-                        audio_norm
-                            .loudness
-                            .as_ref()
-                            .map(|l| l.into())
-                            .unwrap_or_default(),
-                    )
-                } else {
-                    None
-                },
+                loudness: item_loudness(current_item, audio_norm),
             },
             video_format: video_norm.format.clone().map(VideoFormat::from),
             bit_depth: video_norm.bit_depth,
@@ -1327,6 +1317,7 @@ impl ChannelSession {
             program: None,
             metadata: None,
             overlay: None,
+            normalize_loudness: None,
         }
     }
 
@@ -2065,6 +2056,7 @@ fn build_error_card_item(
         program: None,
         metadata: None,
         overlay: None,
+        normalize_loudness: None,
     }
 }
 
@@ -2145,6 +2137,29 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+/// The loudness filter settings for one item: the item's own
+/// `normalize_loudness` wins, and the channel's setting applies when the item
+/// leaves it absent.
+fn item_loudness(
+    item: &PlayoutItem,
+    audio_norm: &ersatztv_channel::config::AudioNormalizationConfig,
+) -> Option<ffpipeline::output_settings::AudioLoudnessSettings> {
+    if item
+        .normalize_loudness
+        .unwrap_or(audio_norm.normalize_loudness)
+    {
+        Some(
+            audio_norm
+                .loudness
+                .as_ref()
+                .map(|l| l.into())
+                .unwrap_or_default(),
+        )
+    } else {
+        None
     }
 }
 
@@ -2294,6 +2309,54 @@ mod reburst_tests {
             TARGET_BUFFER > REBURST_ARM_AT_LEAD,
             "a full buffer must comfortably arm the check"
         );
+    }
+}
+
+#[cfg(test)]
+mod loudness_tests {
+    use super::*;
+
+    fn item(normalize_loudness: &str) -> PlayoutItem {
+        serde_json::from_str(&format!(
+            r#"{{"id": "t", "start": "2026-08-12T21:00:00Z", "finish": "2026-08-12T21:01:00Z"{normalize_loudness}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn channel_audio(
+        normalize_loudness: bool,
+    ) -> ersatztv_channel::config::AudioNormalizationConfig {
+        serde_json::from_value(serde_json::json!({
+            "format": null,
+            "bitrate_kbps": null,
+            "buffer_kbps": null,
+            "channels": null,
+            "sample_rate_hz": null,
+            "normalize_loudness": normalize_loudness,
+            "loudness": null,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn item_opt_out_skips_loudnorm_on_a_normalizing_channel() {
+        let opted_out = item(r#", "normalize_loudness": false"#);
+        assert!(item_loudness(&opted_out, &channel_audio(true)).is_none());
+    }
+
+    #[test]
+    fn item_without_the_field_follows_the_channel() {
+        let plain = item("");
+        assert!(plain.normalize_loudness.is_none());
+        assert!(item_loudness(&plain, &channel_audio(true)).is_some());
+        assert!(item_loudness(&plain, &channel_audio(false)).is_none());
+    }
+
+    #[test]
+    fn item_true_applies_loudnorm_whatever_the_channel_says() {
+        let opted_in = item(r#", "normalize_loudness": true"#);
+        assert!(item_loudness(&opted_in, &channel_audio(true)).is_some());
+        assert!(item_loudness(&opted_in, &channel_audio(false)).is_some());
     }
 }
 

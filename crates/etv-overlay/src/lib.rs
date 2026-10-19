@@ -1,6 +1,7 @@
 pub mod config_carrier;
 pub mod error_card;
 pub mod fifo_writer;
+pub mod fonts;
 pub mod overlay_spec;
 pub mod overlay_timeline;
 pub mod phase_watchdog;

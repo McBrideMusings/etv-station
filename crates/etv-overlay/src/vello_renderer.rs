@@ -19,24 +19,39 @@ use crate::rhai_engine::{LayerState, OverlayState};
 
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 
-/// Vendored Latin-subset Inter Regular (~68KB, SIL OFL). Registered into the
-/// renderer's FontContext so OverlayKind::Text renders inside slim Linux
-/// deploy containers that ship without a system font stack. See
-/// `assets/fonts/README.md` for provenance.
-const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
-const FALLBACK_FONT_FAMILY: &str = "Inter";
-/// Vendored Latin-subset Inter Bold (~47KB, SIL OFL), the bold face of the same
-/// family. There is no italic cut: italic text is the stack's synthesized
-/// oblique ([`glyph_skew`]).
-const FALLBACK_BOLD_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter-Bold.ttf");
+/// The family every text stack ends with: the OS's generic sans-serif, which
+/// Parley's font collection resolves through the host's font configuration
+/// (fontconfig on Linux). No font ships in the binary; a family the station's
+/// `fonts:` list does not provide, or that the OS lacks, renders in this one.
+const FALLBACK_FONT_FAMILY: &str = "sans-serif";
 
 /// The Parley font stack `draw_text` shapes with: the configured family first,
-/// then the vendored Inter fallback so anything the family doesn't cover (or
-/// any host where the family is missing, e.g. a slim deploy container) still
-/// produces glyphs. The unit tests assert this still appends the fallback, so
-/// a refactor that silently drops it fails the build.
+/// then the OS sans-serif so anything the family doesn't cover (or any host
+/// where the family is missing) still produces glyphs. The unit tests assert
+/// this still appends the fallback, so a refactor that silently drops it
+/// fails the build.
 fn font_stack(font_family: &str) -> String {
     format!("{font_family}, {FALLBACK_FONT_FAMILY}")
+}
+
+/// Registers every font file `fonts` names (files, or directories of them)
+/// into `collection`. A file Parley cannot read a face from is an error
+/// naming it, so a corrupt font is not mistaken for a missing family later.
+fn register_user_fonts(
+    collection: &mut parley::fontique::Collection,
+    fonts: &[PathBuf],
+) -> anyhow::Result<()> {
+    for file in crate::fonts::expand(fonts)? {
+        let bytes = std::fs::read(&file)
+            .map_err(|e| anyhow::anyhow!("cannot read font {}: {e}", file.display()))?;
+        if collection
+            .register_fonts(Blob::from(bytes), None)
+            .is_empty()
+        {
+            anyhow::bail!("font {} holds no readable font face", file.display());
+        }
+    }
+    Ok(())
 }
 
 /// How a text block is styled beyond family, size and spacing: the alignment
@@ -216,7 +231,19 @@ pub struct VelloRenderer {
 }
 
 impl VelloRenderer {
+    /// A renderer with no fonts beyond the OS's own.
     pub fn new(width: u32, height: u32, pixel_format: PixelFormat) -> anyhow::Result<Self> {
+        Self::new_with_fonts(width, height, pixel_format, &[])
+    }
+
+    /// A renderer that also registers `fonts` — font files or directories of
+    /// them — so a text layer can name their families.
+    pub fn new_with_fonts(
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+        fonts: &[PathBuf],
+    ) -> anyhow::Result<Self> {
         if !matches!(pixel_format, PixelFormat::Rgba8) {
             anyhow::bail!("only rgba8 is supported in the spike");
         }
@@ -283,12 +310,7 @@ impl VelloRenderer {
         });
 
         let mut font_context = FontContext::new();
-        font_context
-            .collection
-            .register_fonts(Blob::from(FALLBACK_FONT_BYTES.to_vec()), None);
-        font_context
-            .collection
-            .register_fonts(Blob::from(FALLBACK_BOLD_FONT_BYTES.to_vec()), None);
+        register_user_fonts(&mut font_context.collection, fonts)?;
 
         Ok(Self {
             device,
@@ -829,9 +851,9 @@ impl VelloRenderer {
             }
         }
 
-        // Non-empty content that produced no glyphs means even the bundled
-        // Inter fallback couldn't shape the string — likely a non-Latin
-        // codepoint, since the vendored font is a Latin subset. Log once per
+        // Non-empty content that produced no glyphs means even the
+        // OS sans-serif couldn't shape the string — likely a codepoint no
+        // installed font covers, or no font installed at all. Log once per
         // font_family so the operator sees the symptom instead of an
         // empty-looking overlay. A block with every line hidden is not that.
         if shown > 0
@@ -843,7 +865,7 @@ impl VelloRenderer {
             tracing::error!(
                 font_family = place.font_family,
                 content = content,
-                "text overlay produced no glyphs; configured font family is missing on host and vendored fallback could not shape the content (non-Latin?)",
+                "text overlay produced no glyphs; configured font family is not registered and the OS sans-serif could not shape the content (no installed font covers it?)",
             );
         }
         Some(rect)
@@ -1203,11 +1225,37 @@ mod tests {
     use super::*;
     use parley::fontique::{Collection, CollectionOptions};
 
-    /// A `FontContext` with NO system fonts, holding only the vendored Inter —
-    /// mirrors a slim deploy container with no system font stack. Lets the
-    /// fallback tests run host-independently (no system font can satisfy a
-    /// query) and without a GPU.
-    fn fonts_free_context() -> FontContext {
+    /// A static single-face TrueType font from the host, or `None` where the
+    /// host has none of the usual ones. No font is committed to the repo, so
+    /// the tests that need a known face borrow one and skip without it.
+    fn host_font() -> Option<PathBuf> {
+        const DIRS: [&str; 5] = [
+            "/System/Library/Fonts/Supplemental",
+            "/Library/Fonts",
+            "/usr/share/fonts/truetype/dejavu",
+            "/usr/share/fonts/truetype/liberation",
+            "/usr/share/fonts/truetype/noto",
+        ];
+        const FILES: [&str; 5] = [
+            "Arial.ttf",
+            "DejaVuSans.ttf",
+            "LiberationSans-Regular.ttf",
+            "NotoSans-Regular.ttf",
+            "Verdana.ttf",
+        ];
+        DIRS.iter()
+            .flat_map(|d| FILES.iter().map(move |f| Path::new(d).join(f)))
+            .find(|p| p.is_file())
+    }
+
+    /// A `FontContext` with NO system fonts, holding only [`host_font`],
+    /// registered through the same path `fonts:` takes. Returns it with the
+    /// family name it registered, or `None` (logged) with no font to borrow.
+    fn single_font_context() -> Option<(FontContext, String)> {
+        let Some(font) = host_font() else {
+            eprintln!("skipping: no static host font to borrow");
+            return None;
+        };
         let mut fcx = FontContext {
             collection: Collection::new(CollectionOptions {
                 shared: false,
@@ -1215,27 +1263,33 @@ mod tests {
             }),
             source_cache: Default::default(),
         };
-        fcx.collection
-            .register_fonts(Blob::from(FALLBACK_FONT_BYTES.to_vec()), None);
-        fcx.collection
-            .register_fonts(Blob::from(FALLBACK_BOLD_FONT_BYTES.to_vec()), None);
-        fcx
+        register_user_fonts(&mut fcx.collection, &[font]).expect("a host font registers");
+        let family = fcx
+            .collection
+            .family_names()
+            .next()
+            .expect("the font registered a family")
+            .to_string();
+        Some((fcx, family))
     }
 
-    fn layout_of(content: &str, face: &TextFace) -> Layout<()> {
-        let mut fcx = fonts_free_context();
+    fn layout_of(content: &str, face: &TextFace) -> Option<Layout<()>> {
+        let (mut fcx, family) = single_font_context()?;
         let mut lcx: LayoutContext<()> = LayoutContext::new();
-        build_text_layout(&mut fcx, &mut lcx, content, "Inter", 40.0, 0.0, None, face)
+        Some(build_text_layout(
+            &mut fcx, &mut lcx, content, &family, 40.0, 0.0, None, face,
+        ))
     }
 
-    /// Per glyph run: the font blob's length and the synthesized skew.
-    fn runs_of(layout: &Layout<()>) -> Vec<(usize, Option<f32>)> {
+    /// Per glyph run: whether the face is synthesized heavier, and the
+    /// synthesized skew.
+    fn runs_of(layout: &Layout<()>) -> Vec<(bool, Option<f32>)> {
         let mut runs = Vec::new();
         for line in layout.lines() {
             for item in line.items() {
                 if let PositionedLayoutItem::GlyphRun(run) = item {
                     let run = run.run();
-                    runs.push((run.font().data.as_ref().len(), run.synthesis().skew()));
+                    runs.push((run.synthesis().embolden(), run.synthesis().skew()));
                 }
             }
         }
@@ -1281,33 +1335,39 @@ mod tests {
     }
 
     #[test]
-    fn bold_shapes_with_the_bold_face_and_regular_does_not() {
-        let regular = runs_of(&layout_of("Card", &TextFace::default()));
-        let bold = runs_of(&layout_of(
+    fn bold_asks_the_renderer_for_a_heavier_face_and_regular_does_not() {
+        let Some(regular) = layout_of("Card", &TextFace::default()) else {
+            return;
+        };
+        let bold = layout_of(
             "Card",
             &TextFace {
                 bold: true,
                 ..TextFace::default()
             },
-        ));
-        assert_eq!(regular[0].0, FALLBACK_FONT_BYTES.len());
-        assert_eq!(bold[0].0, FALLBACK_BOLD_FONT_BYTES.len());
-        assert_eq!(
-            bold[0].1, None,
-            "bold is a real face, not a synthesized one"
-        );
+        )
+        .expect("the font was found a moment ago");
+        let (regular, bold) = (runs_of(&regular), runs_of(&bold));
+        assert!(!regular[0].0, "{regular:?}");
+        assert!(bold[0].0, "a single-face family is emboldened by synthesis");
     }
 
     #[test]
     fn italic_asks_the_renderer_for_a_slant() {
-        let upright = runs_of(&layout_of("Card", &TextFace::default()));
-        let italic = runs_of(&layout_of(
-            "Card",
-            &TextFace {
-                italic: true,
-                ..TextFace::default()
-            },
-        ));
+        let Some(upright) = layout_of("Card", &TextFace::default()) else {
+            return;
+        };
+        let upright = runs_of(&upright);
+        let italic = runs_of(
+            &layout_of(
+                "Card",
+                &TextFace {
+                    italic: true,
+                    ..TextFace::default()
+                },
+            )
+            .expect("the font was found a moment ago"),
+        );
         assert_eq!(upright[0].1, None);
         let skew = italic[0]
             .1
@@ -1322,7 +1382,10 @@ mod tests {
             spans,
             ..TextFace::default()
         };
-        let runs = runs_of(&layout_of(&text, &face));
+        let Some(layout) = layout_of(&text, &face) else {
+            return;
+        };
+        let runs = runs_of(&layout);
         let slanted = runs.iter().filter(|r| r.1.is_some()).count();
         assert_eq!(slanted, 1, "{runs:?}");
         assert!(runs.len() >= 3, "{runs:?}");
@@ -1348,21 +1411,21 @@ mod tests {
     #[test]
     fn alignment_places_a_short_line_against_the_widest_one() {
         let content = "A very wide first line\nshort";
-        let left = layout_of(content, &TextFace::default());
-        let center = layout_of(
-            content,
-            &TextFace {
-                align: TextAlign::Center,
-                ..TextFace::default()
-            },
-        );
-        let right = layout_of(
-            content,
-            &TextFace {
-                align: TextAlign::Right,
-                ..TextFace::default()
-            },
-        );
+        let Some(left) = layout_of(content, &TextFace::default()) else {
+            return;
+        };
+        let aligned = |align| {
+            layout_of(
+                content,
+                &TextFace {
+                    align,
+                    ..TextFace::default()
+                },
+            )
+            .expect("the font was found a moment ago")
+        };
+        let center = aligned(TextAlign::Center);
+        let right = aligned(TextAlign::Right);
         let width = left.width();
         assert!((center.width() - width).abs() < 0.5 && (right.width() - width).abs() < 0.5);
         let (l, c, r) = (
@@ -1380,22 +1443,29 @@ mod tests {
     }
 
     /// Directly guards the regression #60 names: a refactor of the text font
-    /// stack that silently drops the vendored Inter fallback fails here.
+    /// stack that silently drops the OS sans-serif fallback fails here.
     #[test]
-    fn font_stack_appends_vendored_fallback() {
+    fn font_stack_appends_the_os_sans_serif() {
         let stack = font_stack("Helvetica");
-        assert_eq!(stack, "Helvetica, Inter");
+        assert_eq!(stack, "Helvetica, sans-serif");
         assert!(stack.ends_with(FALLBACK_FONT_FAMILY));
     }
 
-    /// With system fonts disabled (the slim-container case), a text layer whose
-    /// configured `font_family` is absent must still shape glyphs — and they
-    /// must come from the vendored Inter blob, since it is the only font
-    /// present. Proves the bundled font registers and renders Latin text where
-    /// no system fallback exists. Host-independent and GPU-free.
+    /// With no `fonts:` registered, a family nothing provides still shapes
+    /// glyphs, in a face the OS supplies for `sans-serif`. Skipped on a host
+    /// whose font configuration names no sans-serif at all.
     #[test]
-    fn missing_family_renders_via_vendored_inter() {
-        let mut fcx = fonts_free_context();
+    fn missing_family_renders_via_the_os_sans_serif() {
+        let mut fcx = FontContext::new();
+        let has_sans = fcx
+            .collection
+            .generic_families(parley::fontique::GenericFamily::SansSerif)
+            .next()
+            .is_some();
+        if !has_sans {
+            eprintln!("skipping: the OS names no sans-serif font");
+            return;
+        }
         let mut lcx: LayoutContext<()> = LayoutContext::new();
         let layout = build_text_layout(
             &mut fcx,
@@ -1407,35 +1477,45 @@ mod tests {
             None,
             &TextFace::default(),
         );
-
-        let mut total_glyphs = 0usize;
-        let mut any_run = false;
-        let mut all_vendored = true;
-        for line in layout.lines() {
-            for item in line.items() {
-                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                    continue;
-                };
-                let n = glyph_run.positioned_glyphs().count();
-                if n == 0 {
-                    continue;
-                }
-                any_run = true;
-                total_glyphs += n;
-                let font_bytes: &[u8] = glyph_run.run().font().data.as_ref();
-                if font_bytes != FALLBACK_FONT_BYTES {
-                    all_vendored = false;
-                }
-            }
-        }
-
+        let glyphs: usize = layout
+            .lines()
+            .flat_map(|line| line.items())
+            .filter_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(run) => Some(run.positioned_glyphs().count()),
+                _ => None,
+            })
+            .sum();
         assert!(
-            total_glyphs > 0,
-            "a missing font_family should still shape glyphs via the vendored fallback",
+            glyphs > 0,
+            "a missing font_family should fall back to sans-serif"
         );
+    }
+
+    /// A file under a listed directory registers its family, and a file that
+    /// is not a font fails naming itself.
+    #[test]
+    fn listed_fonts_register_and_a_corrupt_one_errors() {
+        let Some(font) = host_font() else {
+            eprintln!("skipping: no static host font to borrow");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&font, dir.path().join("listed.ttf")).unwrap();
+        let mut collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        register_user_fonts(&mut collection, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(collection.family_names().count(), 1);
+
+        let bad = dir.path().join("broken.ttf");
+        let mut bytes = vec![0u8, 1, 0, 0];
+        bytes.extend_from_slice(b"junk");
+        std::fs::write(&bad, bytes).unwrap();
+        let err = register_user_fonts(&mut collection, std::slice::from_ref(&bad)).unwrap_err();
         assert!(
-            any_run && all_vendored,
-            "glyphs must be shaped by the vendored Inter blob, not another font",
+            err.to_string().contains(&bad.display().to_string()),
+            "{err}"
         );
     }
 

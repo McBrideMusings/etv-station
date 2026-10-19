@@ -219,6 +219,9 @@ REEXTRACT_PID=$!
 # first seconds holds one frame of its animation; leave it unset to watch the
 # interval cycle instead.
 PREVIEW_EXTRA=()
+# FONT_ARGS: the same `--font` list the other overlay tools use.
+# shellcheck source=tools/overlay-fonts.sh
+source "$(dirname "${BASH_SOURCE[0]}")/overlay-fonts.sh"
 [ -n "${METADATA-}" ] && PREVIEW_EXTRA+=(--metadata "$METADATA")
 [ -n "${PREV_METADATA-}" ] && PREVIEW_EXTRA+=(--prev-metadata "$PREV_METADATA")
 [ -n "${ITEM_ELAPSED-}" ] && PREVIEW_EXTRA+=(--item-elapsed "$ITEM_ELAPSED")
@@ -240,7 +243,7 @@ if [ -n "$BUMPER" ]; then
         --channel "$BUMPER_CHANNEL_NUMBER" --fps "${FPS:-30}" --ndjson \
         ${NEXT_ARGS[@]+"${NEXT_ARGS[@]}"})" || exit 1
       while IFS= read -r ITEM; do
-        ./target/debug/etv-overlay watch --item "$ITEM" --config "$SPEC_PATH" --time-scale 1
+        ./target/debug/etv-overlay ${FONT_ARGS[@]+"${FONT_ARGS[@]}"} watch --item "$ITEM" --config "$SPEC_PATH" --time-scale 1
         STATUS=$?
         [ "$STATUS" -ne 0 ] && exit "$STATUS"
       done <<< "$ITEMS"
@@ -255,7 +258,7 @@ printf '%s streaming (time_scale=%s, title=%s) into VLC — Ctrl-C to stop\n' "$
 # actually kills its ffmpeg child (see etv-overlay.rs `watch`). Run in the
 # foreground (no backgrounding here) so a real terminal's Ctrl-C delivers
 # SIGINT to this whole pipeline directly, no trap relay needed.
-./target/debug/etv-overlay watch \
+./target/debug/etv-overlay ${FONT_ARGS[@]+"${FONT_ARGS[@]}"} watch \
   --input "$BG_PATH" \
   --config "$SPEC_PATH" \
   --time-scale "$TIME_SCALE" \
