@@ -39,6 +39,96 @@ pub struct EmitContext<'a> {
     /// relative path against its own working directory, not the playout
     /// folder.
     pub overlay_root: &'a Path,
+    /// A media file's length in ms, or `None` when it cannot be read. A
+    /// non-looping Clip or Render shorter than its window is cut at the file's
+    /// end and the rest is black, so no out-point lands past the file.
+    pub media_len_ms: &'a dyn Fn(&Path) -> Option<u64>,
+}
+
+/// Length of `path` in ms from `ffprobe`'s container duration, or `None` when
+/// ffprobe cannot be run, times out, rejects the file or reports no duration.
+pub fn probe_len_ms(path: &Path) -> Option<u64> {
+    let args: Vec<std::ffi::OsString> = [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "csv=p=0",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .iter()
+    .map(Into::into)
+    .chain([path.as_os_str().to_owned()])
+    .collect();
+    match crate::ffprobe::run_bounded(&args, crate::ffprobe::PROBE_TIMEOUT) {
+        Ok(crate::ffprobe::Bounded::Done {
+            success: true,
+            stdout,
+            ..
+        }) => {
+            let secs: f64 = String::from_utf8_lossy(&stdout).trim().parse().ok()?;
+            (secs.is_finite() && secs >= 0.0).then(|| (secs * 1000.0).floor() as u64)
+        }
+        _ => None,
+    }
+}
+
+/// Push one Local item playing `path` from `in_ms` for `duration_ms`. When the
+/// file ends sooner, the item is cut at the file's end and a black item
+/// (`#pad`) covers the rest.
+fn push_local_padded(
+    items: &mut Vec<PlayoutItem>,
+    ctx: &EmitContext<'_>,
+    id: &str,
+    path: &Path,
+    in_ms: u64,
+    begin: OffsetDateTime,
+    duration_ms: u64,
+) {
+    let playable = (ctx.media_len_ms)(path).map(|len| len.saturating_sub(in_ms));
+    if playable.is_none() {
+        tracing::warn!(
+            event = "bumper.media_len_unknown",
+            channel = ctx.channel,
+            path = %path.display(),
+            window_ms = duration_ms,
+            "a bumper file's length could not be read; its window is emitted unpadded"
+        );
+    }
+    let file_ms = playable.map_or(duration_ms, |p| p.min(duration_ms));
+    let mut at = begin;
+    if file_ms > 0 {
+        let finish = at + Duration::milliseconds(file_ms as i64);
+        let source = PlayoutItemSource::local(
+            path.to_string_lossy().into_owned(),
+            Some(in_ms),
+            Some(in_ms + file_ms),
+        );
+        items.push(PlayoutItem::scheduled(id.to_string(), at, finish, source));
+        at = finish;
+    }
+    if file_ms < duration_ms {
+        tracing::warn!(
+            event = "bumper.media_short",
+            channel = ctx.channel,
+            path = %path.display(),
+            in_ms,
+            file_ms,
+            window_ms = duration_ms,
+            "a bumper file ends before its window; the rest is black"
+        );
+        let finish = begin + Duration::milliseconds(duration_ms as i64);
+        let id = if file_ms == 0 {
+            id.to_string()
+        } else {
+            format!("{id}#pad")
+        };
+        let source = PlayoutItemSource::lavfi("color=c=black".to_string());
+        items.push(PlayoutItem::scheduled(id, at, finish, source));
+    }
 }
 
 /// Emit `resolved` as consecutive playout items beginning at `start`.
@@ -64,8 +154,18 @@ pub fn emit_timeline(
                 out_ms,
             } => {
                 let window = out_ms.saturating_sub(*in_ms);
-                let mut parts = Vec::new();
-                if seg.segment.loop_ && window > 0 && seg.duration_ms > window {
+                if !(seg.segment.loop_ && window > 0 && seg.duration_ms > window) {
+                    push_local_padded(
+                        &mut items,
+                        ctx,
+                        &id_base,
+                        path,
+                        *in_ms,
+                        begin,
+                        seg.duration_ms,
+                    );
+                } else {
+                    let mut parts = Vec::new();
                     for _ in 0..seg.duration_ms / window {
                         parts.push(window);
                     }
@@ -73,36 +173,22 @@ pub fn emit_timeline(
                     if tail > 0 {
                         parts.push(tail);
                     }
-                } else {
-                    parts.push(seg.duration_ms);
-                }
-                let suffixed = parts.len() > 1;
-                let mut at = begin;
-                for (n, len) in parts.into_iter().enumerate() {
-                    let finish = at + Duration::milliseconds(len as i64);
-                    let id = if suffixed {
-                        format!("{id_base}#{n}")
-                    } else {
-                        id_base.clone()
-                    };
-                    let source = PlayoutItemSource::local(
-                        path.to_string_lossy().into_owned(),
-                        Some(*in_ms),
-                        Some(in_ms + len),
-                    );
-                    items.push(PlayoutItem::scheduled(id, at, finish, source));
-                    at = finish;
+                    let mut at = begin;
+                    for (n, len) in parts.into_iter().enumerate() {
+                        let finish = at + Duration::milliseconds(len as i64);
+                        let id = format!("{id_base}#{n}");
+                        let source = PlayoutItemSource::local(
+                            path.to_string_lossy().into_owned(),
+                            Some(*in_ms),
+                            Some(in_ms + len),
+                        );
+                        items.push(PlayoutItem::scheduled(id, at, finish, source));
+                        at = finish;
+                    }
                 }
             }
             SegmentSource::Render { path, .. } => {
-                // The render's length is not known here, so it is not
-                // repeated: one item plays the file from the start.
-                let source = PlayoutItemSource::local(
-                    path.to_string_lossy().into_owned(),
-                    Some(0),
-                    Some(seg.duration_ms),
-                );
-                items.push(PlayoutItem::scheduled(id_base, begin, end, source));
+                push_local_padded(&mut items, ctx, &id_base, path, 0, begin, seg.duration_ms);
             }
             SegmentSource::Http { url, in_ms, .. } => {
                 tracing::info!(
@@ -374,6 +460,7 @@ mod tests {
             channel: "7",
             fps: 30.0,
             overlay_root: Path::new("/station/overlays"),
+            media_len_ms: &|_| None,
         }
     }
 
@@ -518,6 +605,84 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_clip_shorter_than_its_window_is_cut_at_the_file_end_and_padded_black() {
+        let clip = seg(
+            "clip",
+            SegmentSource::Clip {
+                path: "/m/a.mkv".into(),
+                in_ms: 1_000,
+                out_ms: 20_000,
+            },
+            Dur::Fixed(10_000),
+        );
+        let resolved = fit(
+            &Timeline {
+                segments: vec![clip],
+                bed: None,
+            },
+            10_000,
+            30.0,
+        )
+        .unwrap();
+        let ctx = EmitContext {
+            media_len_ms: &|_| Some(5_000),
+            ..ctx()
+        };
+        let items = emit_timeline(&resolved, &ctx, start());
+        assert_eq!(items.len(), 2);
+        match items[0].source.as_ref().unwrap() {
+            PlayoutItemSource::Local {
+                in_point_ms,
+                out_point_ms,
+                ..
+            } => assert_eq!((*in_point_ms, *out_point_ms), (Some(1_000), Some(5_000))),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            (items[0].finish - items[0].start).whole_milliseconds(),
+            4_000
+        );
+        assert_eq!(items[1].id, "bumper:7:1800000000000:0#pad");
+        assert_eq!(lavfi_params(&items[1]), "color=c=black");
+        assert_eq!(items[0].finish, items[1].start);
+        assert_eq!(
+            (items[1].finish - items[0].start).whole_milliseconds(),
+            10_000
+        );
+    }
+
+    #[test]
+    fn a_render_shorter_than_its_window_is_padded_and_a_long_one_is_untouched() {
+        let render = |dur| {
+            let resolved = fit(
+                &Timeline {
+                    segments: vec![seg(
+                        "r",
+                        SegmentSource::Render {
+                            profile: "p".into(),
+                            path: "/r/x.mp4".into(),
+                        },
+                        Dur::Fixed(dur),
+                    )],
+                    bed: None,
+                },
+                dur,
+                30.0,
+            )
+            .unwrap();
+            let ctx = EmitContext {
+                media_len_ms: &|_| Some(6_000),
+                ..ctx()
+            };
+            emit_timeline(&resolved, &ctx, start())
+        };
+        assert_eq!(render(10_000).len(), 2);
+        let exact = render(6_000);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].id, "bumper:7:1800000000000:0");
     }
 
     #[test]
