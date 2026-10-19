@@ -2,13 +2,13 @@
 # Print one web dashboard endpoint's JSON — the same answer the page shows.
 #
 # A simulation-backed endpoint (a channel's review) answers 202
-# {"pending": true} while the UI's worker simulates; this asks again every
-# 15s until the body arrives, so a caller gets the review, never the 202.
+# {"pending": true} (with the real review) while the UI's worker projects; this
+# asks again every 15s until the projection arrives, never returning the 202.
 #
 # Usage:
 #   tools/ui-get.sh <path> [--prod]
 #   tools/ui-get.sh /api/lineup
-#   tools/ui-get.sh '/api/channels/034-syfy/review?days=3'
+#   tools/ui-get.sh '/api/channels/034-syfy/review?project=3d'
 #   tools/ui-get.sh /api/health --prod
 #
 # Local is http://127.0.0.1:${ETV_UI_PORT:-4747} (tools/station-ui.sh). --prod

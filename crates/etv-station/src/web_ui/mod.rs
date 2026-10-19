@@ -1,8 +1,9 @@
 //! The station's web dashboard, served by `etv-station --serve-ui`: one page
 //! at `/` with a tab bar (Channels, Guide, Health) and, on Channels, a rail of
-//! every lineup channel. A channel's Schedule is its review — the upcoming
-//! schedule simulated as the daemon would run it, its depth, overlap and
-//! programming grades, and why each airing is on it (`channel`). The rail is
+//! every lineup channel. A channel's Schedule is its review — the airings
+//! the daemon has published and aired, a projection past them on request, their
+//! depth, overlap and programming grades, and why each airing is on it
+//! (`channel`). The rail is
 //! the lineup in `station.yaml` order (`lineup`). The Tune page at `/tune`
 //! (`tune`) edits a pool's taste profile live.
 //!
@@ -13,18 +14,19 @@
 //! a `/`.
 //!
 //! Nothing here writes to the station's config or data: Tune's profile edits
-//! live in this process's memory, stills and simulations cache under the OS
-//! temp directory. The server listens on the network in the container with no
+//! live in this process's memory, stills cache under the OS temp directory and
+//! projections under the data volume beside the catalog. The server listens on the network in the container with no
 //! auth of its own, so every channel a request names is checked against the
 //! lineup. Requests are served one at a time on one thread; simulations run on
-//! `sim_cache`'s worker thread and stills on their own threads, and the
+//! `projection`'s worker thread and stills on their own threads, and the
 //! container runs the whole process at `nice 19` so the channels' transcodes
 //! always come first. `GET /api/health` returns what this process was started
 //! with.
 
 mod channel;
 mod lineup;
-mod sim_cache;
+mod projection;
+mod real;
 mod tune;
 
 use std::collections::{HashMap, HashSet};
@@ -98,7 +100,7 @@ pub fn serve(options: Options) -> Result<(), String> {
     );
 
     let review = ReviewState::new(options.station.clone(), options.catalog.clone());
-    review.sims.spawn(channel::DEFAULT_REVIEW_DAYS);
+    review.sims.spawn();
     let mut state = AppState {
         catalog,
         cache: ScoreCache::default(),
@@ -122,7 +124,7 @@ fn api_health(state: &AppState) -> (u16, Value) {
     let status = if channels.is_ok() { 200 } else { 503 };
     let sims = state.review.sims.stats();
     let body = json!({
-        "sim_cache": {
+        "projections": {
             "in_memory": sims.in_memory,
             "queued": sims.queued,
             "running": sims.running,
@@ -343,13 +345,20 @@ mod tests {
     }
 
     #[test]
-    fn a_percent_encoded_key_reaches_its_channel_and_answers_pending() {
+    fn a_percent_encoded_key_reaches_its_channel_and_answers_its_real_schedule() {
         let mut state = example_state();
-        // No worker runs here, so a channel the lineup holds stays queued.
-        let (status, body) = get_json(&mut state, "/api/channels/channels%2Fa24.yaml/review");
-        assert_eq!(status, 202, "{body}");
-        assert_eq!(body["pending"], true);
-        assert_eq!(body["channel"], "channels/a24.yaml");
+        let station =
+            config::load_for_inspection(&state.options.station).expect("example station loads");
+        let base = state.options.station.parent().unwrap().to_path_buf();
+        let key = lineup::lineup_keys(&station.lineup, &base)
+            .into_iter()
+            .find(|k| k.contains('/'))
+            .expect("the example lineup repeats folder names, so keys are paths");
+        let encoded = key.replace('/', "%2F");
+        let (status, body) = get_json(&mut state, &format!("/api/channels/{encoded}/review"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["channel"], key.as_str());
+        assert_eq!(body["span"]["label"], "real only");
     }
 
     #[test]
@@ -361,5 +370,195 @@ mod tests {
             body["error"].as_str().unwrap().contains("not-a-channel"),
             "{body}"
         );
+    }
+
+    /// A one-channel station on disk: 20 half-hour movies in the catalog, and
+    /// one published chunk from local midnight to 01:00 UTC, so the frontier
+    /// is a fixed instant.
+    struct Fixture {
+        dir: tempfile::TempDir,
+        state: AppState,
+    }
+
+    const FIXTURE_CHANNEL: &str = "number: 1\nname: a\nwindow_days: 1\nroll_interval: \"1h\"\n\
+        retention_days: 1\nchunk_hours: 6\nseed: 7\nrule:\n  blocks:\n    - mode: all\n      \
+        pools:\n        - name: movies\n          expr: 'item.type == \"movie\"'\n          \
+        order: random\n          advance: resume\n      pattern:\n        - pool: movies\n          take: 4\n";
+
+    fn fixture() -> Fixture {
+        use crate::catalog::{Entry, EntrySource, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("channels/a")).unwrap();
+        std::fs::write(root.join("channels/a/channel.yaml"), FIXTURE_CHANNEL).unwrap();
+        std::fs::write(
+            root.join("station.yaml"),
+            format!(
+                "tz: UTC\noutput_base: {out}\nchannels:\n  - channels/a/channel.yaml\ncatalog_path: {cat}\n\
+                 normalization:\n  audio:\n    format: aac\n    bitrate_kbps: 192\n    buffer_kbps: 384\n    \
+                 channels: 2\n    sample_rate_hz: 48000\n    normalize_loudness: false\n  video:\n    \
+                 format: h264\n    bit_depth: 8\n    width: 1280\n    height: 720\n    bitrate_kbps: 2000\n    \
+                 buffer_kbps: 4000\n  subtitle:\n    mode: convert\n",
+                out = root.join("out").display(),
+                cat = root.join("catalog.db").display(),
+            ),
+        )
+        .unwrap();
+        let writable = Catalog::open(root.join("catalog.db")).unwrap();
+        for n in 0..20 {
+            let id = format!("m{n:02}");
+            let mut e = Entry::new(&id, "movie", &id, crate::catalog::Source::Plex);
+            e.duration_ms = Some(30 * 60 * 1000);
+            writable.upsert_entry(&e).unwrap();
+            writable
+                .add_source(&EntrySource {
+                    source: Source::LocalFs,
+                    source_id: format!("fs-{id}"),
+                    entry_id: id.clone(),
+                    playback_path: format!("/media/{id}.mkv"),
+                    last_seen: None,
+                    missing_since: None,
+                    unairable_reason: None,
+                })
+                .unwrap();
+        }
+        drop(writable);
+
+        let midnight = crate::tz::local_midnight_at_or_before(
+            time::OffsetDateTime::now_utc(),
+            crate::tz::parse("UTC").unwrap(),
+        );
+        let (start, finish) = (midnight, midnight + time::Duration::hours(1));
+        let name =
+            |t: time::OffsetDateTime| t.format(&ersatztv_playout::playout::DATE_FORMAT).unwrap();
+        let out = root.join("out/a");
+        std::fs::create_dir_all(&out).unwrap();
+        let rfc = |t: time::OffsetDateTime| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        std::fs::write(
+            out.join(format!("{}_{}.json", name(start), name(finish))),
+            format!(
+                r#"{{"version":"https://ersatztv.org/playout/version/0.0.3","items":[
+                {{"id":"m00","start":"{}","finish":"{}"}},
+                {{"id":"m01","start":"{}","finish":"{}"}}]}}"#,
+                rfc(start),
+                rfc(start + time::Duration::minutes(30)),
+                rfc(start + time::Duration::minutes(30)),
+                rfc(finish),
+            ),
+        )
+        .unwrap();
+
+        let station = root.join("station.yaml");
+        let catalog_path = root.join("catalog.db");
+        let state = AppState {
+            catalog: Catalog::open_readonly(&catalog_path).unwrap(),
+            cache: ScoreCache::default(),
+            session: None,
+            review: ReviewState::new(station.clone(), catalog_path.clone()),
+            options: Options {
+                station,
+                catalog: catalog_path,
+                plugins_dir: None,
+                bind: IpAddr::from([127, 0, 0, 1]),
+                port: 0,
+            },
+        };
+        state.review.sims.spawn();
+        Fixture { dir, state }
+    }
+
+    fn review(state: &mut AppState, query: &str) -> (u16, Value) {
+        match dispatch(state, &Method::Get, "/api/channels/a/review", query, "") {
+            Reply::Json(status, body) => (status, body),
+            _ => panic!("review did not answer JSON"),
+        }
+    }
+
+    /// Asks again until the worker has finished the projection.
+    fn projected(state: &mut AppState, query: &str) -> Value {
+        for _ in 0..600 {
+            let (status, body) = review(state, query);
+            if status == 200 {
+                return body;
+            }
+            assert_eq!(status, 202, "{body}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("the projection never finished");
+    }
+
+    #[test]
+    fn the_schedule_opens_on_the_real_playout_with_no_simulation() {
+        let mut f = fixture();
+        let (status, body) = review(&mut f.state, "");
+        assert_eq!(status, 200, "{body}");
+        let airings = body["airings"].as_array().unwrap();
+        let ids: Vec<&str> = airings.iter().map(|a| a["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["m00", "m01"]);
+        assert!(airings.iter().all(|a| a["projected"] == false));
+        assert_eq!(body["span"]["label"], "real only");
+        assert_eq!(body["projection"], Value::Null);
+        let frontier = body["frontier"].as_i64().unwrap();
+        assert_eq!(body["span"]["real_until"], frontier);
+        assert_eq!(body["span"]["projected_until"], Value::Null);
+    }
+
+    #[test]
+    fn a_projection_continues_past_the_frontier_and_is_stable_across_catalog_touches() {
+        let mut f = fixture();
+        let first = projected(&mut f.state, "project=3d");
+        let frontier = first["frontier"].as_i64().unwrap();
+        let airings = first["airings"].as_array().unwrap();
+        let (real, ahead): (Vec<&Value>, Vec<&Value>) =
+            airings.iter().partition(|a| a["projected"] == false);
+        assert_eq!(real.len(), 2);
+        assert!(!ahead.is_empty());
+        assert!(
+            ahead
+                .iter()
+                .all(|a| a["start"].as_i64().unwrap() >= frontier)
+        );
+        assert_eq!(first["span"]["projected_until"], frontier + 3 * 86_400);
+        assert_eq!(first["span"]["label"], "real + 3 days projected");
+        let key = first["projection"]["key"].as_str().unwrap().to_string();
+
+        // Touching only the catalog file changes no input, so the same
+        // projection comes back at once.
+        let catalog = std::fs::File::options()
+            .write(true)
+            .open(f.dir.path().join("catalog.db"))
+            .unwrap();
+        catalog
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        let (status, again) = review(&mut f.state, "project=3d");
+        assert_eq!(status, 200, "{again}");
+        assert_eq!(again["projection"]["key"], key);
+        assert_eq!(again["airings"], first["airings"]);
+
+        // Editing the channel file changes the key, and the page is told which input.
+        let channel = f.dir.path().join("channels/a/channel.yaml");
+        let edited = std::fs::read_to_string(&channel)
+            .unwrap()
+            .replace("take: 4", "take: 3");
+        std::fs::write(&channel, edited).unwrap();
+        let (status, pending) = review(&mut f.state, "project=3d");
+        assert_eq!(status, 202, "{pending}");
+        assert_ne!(pending["projection"]["key"], key.as_str());
+        let after = projected(&mut f.state, "project=3d");
+        assert_eq!(
+            after["projection"]["changed"],
+            serde_json::json!(["config"])
+        );
+    }
+
+    #[test]
+    fn a_project_length_outside_the_choices_is_refused() {
+        let mut f = fixture();
+        let (status, body) = review(&mut f.state, "project=5d");
+        assert_eq!(status, 400, "{body}");
     }
 }
