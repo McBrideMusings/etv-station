@@ -44,6 +44,10 @@ pub enum SegmentSource {
     Still { image_path: PathBuf },
     /// A render-cache file for `profile`.
     Render { profile: String, path: PathBuf },
+    /// A render that has not landed yet: `stand_in` airs now, and
+    /// [`crate::reconcile::swap_pending_playout`] swaps `path` in once the
+    /// file is readable and before the segment airs.
+    Pending { path: PathBuf, stand_in: PathBuf },
     /// A slice of a remote file ETV-next fetches over HTTP(S). `url` is a
     /// playout URI template: a `{{VAR}}` in it is expanded from ETV-next's own
     /// environment at play time, so a token never enters the playout file.

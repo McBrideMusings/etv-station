@@ -15,8 +15,9 @@
 //! (etv-station-7aa7.9), so `SegmentAudio::Own` omits `tracks.audio`. A bed or
 //! mute segment sets its level on purpose, so its items carry
 //! `normalize_loudness: false` and the channel's loudnorm leaves them alone.
-//! Ducking a bed under clip audio is etv-station-7aa7.27, and swapping a
-//! pending stand-in for its real file is etv-station-7aa7.35.
+//! Ducking a bed under clip audio is etv-station-7aa7.27, and a
+//! pending segment airs its stand-in and carries [`PENDING_KEY`] so the swap
+//! (etv-station-7aa7.35) can find it.
 
 use std::path::Path;
 
@@ -30,6 +31,11 @@ use time::{Duration, OffsetDateTime};
 use super::timeline::{
     AudioSource, OverlayVars, ResolvedSegment, ResolvedTimeline, SegmentAudio, SegmentSource,
 };
+
+/// The `metadata` key marking an item whose real file has not landed yet; its
+/// value is `{"path": <real file>, "loop": <bool>}`. Removed by
+/// [`crate::reconcile::swap_pending_playout`] when the swap is made.
+pub const PENDING_KEY: &str = "pending";
 
 /// What [`emit_timeline`] needs to know about the channel it emits for.
 pub struct EmitContext<'a> {
@@ -47,23 +53,78 @@ pub struct EmitContext<'a> {
     pub media_len_ms: &'a dyn Fn(&Path) -> Option<u64>,
 }
 
+/// The two things reading a media file needs: whose log line it is, and how
+/// long the file is.
+pub struct Media<'a> {
+    pub channel: &'a str,
+    pub len_ms: &'a dyn Fn(&Path) -> Option<u64>,
+}
+
+impl<'a> From<&'a EmitContext<'a>> for Media<'a> {
+    fn from(ctx: &'a EmitContext<'a>) -> Self {
+        Media {
+            channel: ctx.channel,
+            len_ms: ctx.media_len_ms,
+        }
+    }
+}
+
+/// Fill `duration_ms` from `path` starting at `in_ms`. `window_ms` is how much
+/// of the file one play covers. A looping span longer than its window repeats
+/// the window, one item per repeat (`#n`); anything else is a single padded
+/// item ([`push_local_padded`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_local_span(
+    items: &mut Vec<PlayoutItem>,
+    media: &Media<'_>,
+    id_base: &str,
+    path: &Path,
+    in_ms: u64,
+    window_ms: u64,
+    loop_: bool,
+    begin: OffsetDateTime,
+    duration_ms: u64,
+) {
+    if !(loop_ && window_ms > 0 && duration_ms > window_ms) {
+        push_local_padded(items, media, id_base, path, in_ms, begin, duration_ms);
+        return;
+    }
+    let mut parts = vec![window_ms; (duration_ms / window_ms) as usize];
+    let tail = duration_ms % window_ms;
+    if tail > 0 {
+        parts.push(tail);
+    }
+    let mut at = begin;
+    for (n, len) in parts.into_iter().enumerate() {
+        let finish = at + Duration::milliseconds(len as i64);
+        let id = format!("{id_base}#{n}");
+        let source = PlayoutItemSource::local(
+            path.to_string_lossy().into_owned(),
+            Some(in_ms),
+            Some(in_ms + len),
+        );
+        items.push(PlayoutItem::scheduled(id, at, finish, source));
+        at = finish;
+    }
+}
+
 /// Push one Local item playing `path` from `in_ms` for `duration_ms`. When the
 /// file ends sooner, the item is cut at the file's end and a black item
 /// (`#pad`) covers the rest.
 fn push_local_padded(
     items: &mut Vec<PlayoutItem>,
-    ctx: &EmitContext<'_>,
+    media: &Media<'_>,
     id: &str,
     path: &Path,
     in_ms: u64,
     begin: OffsetDateTime,
     duration_ms: u64,
 ) {
-    let playable = (ctx.media_len_ms)(path).map(|len| len.saturating_sub(in_ms));
+    let playable = (media.len_ms)(path).map(|len| len.saturating_sub(in_ms));
     if playable.is_none() {
         tracing::warn!(
             event = "bumper.media_len_unknown",
-            channel = ctx.channel,
+            channel = media.channel,
             path = %path.display(),
             window_ms = duration_ms,
             "a bumper file's length could not be read; its window is emitted unpadded"
@@ -84,7 +145,7 @@ fn push_local_padded(
     if file_ms < duration_ms {
         tracing::warn!(
             event = "bumper.media_short",
-            channel = ctx.channel,
+            channel = media.channel,
             path = %path.display(),
             in_ms,
             file_ms,
@@ -112,6 +173,7 @@ pub fn emit_timeline(
     start: OffsetDateTime,
 ) -> Vec<PlayoutItem> {
     let start_unix_ms = start.unix_timestamp() * 1000 + i64::from(start.millisecond());
+    let media = Media::from(ctx);
     let mut items = Vec::new();
     for (index, seg) in resolved.segments.iter().enumerate() {
         let id_base = format!("{BUMPER_ID_PREFIX}{}:{start_unix_ms}:{index}", ctx.channel);
@@ -131,41 +193,39 @@ pub fn emit_timeline(
                     // A repeat cannot run past the file's end.
                     window = window.min(len.saturating_sub(*in_ms));
                 }
-                if !(seg.segment.loop_ && window > 0 && seg.duration_ms > window) {
-                    push_local_padded(
-                        &mut items,
-                        ctx,
-                        &id_base,
-                        path,
-                        *in_ms,
-                        begin,
-                        seg.duration_ms,
-                    );
-                } else {
-                    let mut parts = Vec::new();
-                    for _ in 0..seg.duration_ms / window {
-                        parts.push(window);
-                    }
-                    let tail = seg.duration_ms % window;
-                    if tail > 0 {
-                        parts.push(tail);
-                    }
-                    let mut at = begin;
-                    for (n, len) in parts.into_iter().enumerate() {
-                        let finish = at + Duration::milliseconds(len as i64);
-                        let id = format!("{id_base}#{n}");
-                        let source = PlayoutItemSource::local(
-                            path.to_string_lossy().into_owned(),
-                            Some(*in_ms),
-                            Some(in_ms + len),
-                        );
-                        items.push(PlayoutItem::scheduled(id, at, finish, source));
-                        at = finish;
-                    }
-                }
+                push_local_span(
+                    &mut items,
+                    &media,
+                    &id_base,
+                    path,
+                    *in_ms,
+                    window,
+                    seg.segment.loop_,
+                    begin,
+                    seg.duration_ms,
+                );
             }
             SegmentSource::Render { path, .. } => {
-                push_local_padded(&mut items, ctx, &id_base, path, 0, begin, seg.duration_ms);
+                push_local_padded(
+                    &mut items,
+                    &media,
+                    &id_base,
+                    path,
+                    0,
+                    begin,
+                    seg.duration_ms,
+                );
+            }
+            SegmentSource::Pending { stand_in, .. } => {
+                push_local_padded(
+                    &mut items,
+                    &media,
+                    &id_base,
+                    stand_in,
+                    0,
+                    begin,
+                    seg.duration_ms,
+                );
             }
             SegmentSource::Http { url, in_ms, .. } => {
                 tracing::info!(
@@ -224,11 +284,18 @@ pub fn emit_timeline(
                 item.normalize_loudness = Some(false);
             }
             item.overlay = Some(overlay_for(seg.segment.overlay.as_ref(), ctx.overlay_root));
-            item.metadata = Some(json!({
+            let mut metadata = json!({
                 "bumper": true,
                 "segment": seg.segment.name,
                 "vars": seg.segment.overlay.as_ref().map(|o| &o.vars),
-            }));
+            });
+            if let SegmentSource::Pending { path, .. } = &seg.segment.source {
+                metadata[PENDING_KEY] = json!({
+                    "path": path,
+                    "loop": seg.segment.loop_,
+                });
+            }
+            item.metadata = Some(metadata);
         }
     }
     items
@@ -255,7 +322,9 @@ pub fn otio_json(resolved: &ResolvedTimeline, fps: f64) -> serde_json::Value {
                     SegmentSource::Clip { path, in_ms, .. } => {
                         (path.to_string_lossy().into_owned(), *in_ms)
                     }
-                    SegmentSource::Render { path, .. } => (path.to_string_lossy().into_owned(), 0),
+                    SegmentSource::Render { path, .. } | SegmentSource::Pending { path, .. } => {
+                        (path.to_string_lossy().into_owned(), 0)
+                    }
                     SegmentSource::Http { url, in_ms, .. } => (url.clone(), *in_ms),
                     SegmentSource::Still { image_path } => {
                         (image_path.to_string_lossy().into_owned(), 0)
@@ -915,5 +984,33 @@ mod tests {
             quote_filter_arg("/a b/it's,x:y.png"),
             r"'/a b/it'\''s,x:y.png'"
         );
+    }
+
+    #[test]
+    fn a_pending_segment_airs_its_stand_in_and_names_the_real_file() {
+        let mut pending = seg(
+            "ident",
+            SegmentSource::Pending {
+                path: "/r/real.mp4".into(),
+                stand_in: "/r/stand.mp4".into(),
+            },
+            Dur::Fixed(4_000),
+        );
+        pending.loop_ = true;
+        let items = emit(
+            &Timeline {
+                segments: vec![pending],
+                bed: None,
+            },
+            4_000,
+        );
+        assert_eq!(items.len(), 1);
+        match items[0].source.as_ref().unwrap() {
+            PlayoutItemSource::Local { path, .. } => assert_eq!(path, "/r/stand.mp4"),
+            other => panic!("{other:?}"),
+        }
+        let meta = items[0].metadata.as_ref().unwrap();
+        assert_eq!(meta[PENDING_KEY]["path"], "/r/real.mp4");
+        assert_eq!(meta[PENDING_KEY]["loop"], true);
     }
 }

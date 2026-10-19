@@ -1306,6 +1306,11 @@ async fn run_generation(
     // immediate — `open_and_ingest_catalog` has just run.
     let mut refresh = catalog_refresh_interval(station);
 
+    // A bumper whose render has not landed airs a stand-in; this tick swaps
+    // the real file in once it is readable, far sooner than a catalog refresh.
+    let mut pending_swap = tokio::time::interval(PENDING_SWAP_EVERY);
+    pending_swap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // `biased` makes shutdown win if both signals are pending, and both win
     // over a refresh — a station being told to stop has no business starting a
     // multi-minute Plex sweep first. SIGUSR1 sits above the timer so an operator
@@ -1321,6 +1326,14 @@ async fn run_generation(
             }
             _ = tick(refresh.as_mut()) => {
                 run_catalog_refresh(station, plex, RefreshKind::Scheduled, cancel).await;
+            }
+            _ = pending_swap.tick() => {
+                crate::reconcile::swap_pending_playout(
+                    &station.channels,
+                    OffsetDateTime::now_utc(),
+                    crate::duration::media_len_ms,
+                )
+                .await;
             }
         }
     };
@@ -1432,6 +1445,9 @@ enum RefreshKind {
     /// precisely the situation someone reaches for this in.
     Forced,
 }
+
+/// How often the daemon looks for landed renders to swap into pending bumpers.
+const PENDING_SWAP_EVERY: Duration = Duration::from_secs(30);
 
 /// One refresh tick: [`refresh_and_sweep`], then hand the memory it freed
 /// back to the kernel.

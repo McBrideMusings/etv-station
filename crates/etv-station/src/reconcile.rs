@@ -54,6 +54,7 @@ use ersatztv_playout::playout::{Playout, PlayoutItem, PlayoutItemSource};
 use time::OffsetDateTime;
 
 use crate::atomic::atomic_write_json;
+use crate::bumper::emit::{Media, PENDING_KEY, push_local_span};
 use crate::catalog::Catalog;
 use crate::config::LoadedChannel;
 use crate::errors::StationError;
@@ -345,6 +346,202 @@ async fn reconcile_item(catalog: &Catalog, item: &mut PlayoutItem) -> Result<Ite
     }
     Ok(ItemOutcome::PathPatched)
 }
+
+/// A pending segment whose real file lands less than this long before it airs
+/// keeps its stand-in: ETV-next may already be preparing the item.
+const PENDING_SWAP_LEAD: time::Duration = time::Duration::seconds(30);
+
+/// A pending item's `(real file, loop)`, from its `metadata.pending`.
+fn pending_of(item: &PlayoutItem) -> Option<(String, bool)> {
+    let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
+    Some((
+        pending.get("path")?.as_str()?.to_string(),
+        pending
+            .get("loop")
+            .and_then(|l| l.as_bool())
+            .unwrap_or(false),
+    ))
+}
+
+/// A copy of `item`; the vendored playout types are not `Clone`. A round trip
+/// through JSON cannot fail for an item that was itself read from JSON.
+fn copy_item(item: &PlayoutItem) -> Option<PlayoutItem> {
+    serde_json::from_value(serde_json::to_value(item).ok()?).ok()
+}
+
+/// Swap every pending segment in `items` whose real file is readable and that
+/// starts more than [`PENDING_SWAP_LEAD`] after `now`. One segment is a run of
+/// consecutive items naming the same pending path (a stand-in shorter than its
+/// slot is followed by black); the run is replaced by the real file's items, so
+/// a file shorter than the slot is looped when the segment loops and padded
+/// with black otherwise. Returns how many segments were swapped.
+pub fn swap_pending_items(
+    items: &mut Vec<PlayoutItem>,
+    channel: &str,
+    now: OffsetDateTime,
+    media_len_ms: fn(&Path) -> Option<u64>,
+) -> usize {
+    let mut old: Vec<Option<PlayoutItem>> = std::mem::take(items).into_iter().map(Some).collect();
+    let mut swapped = 0;
+    let mut i = 0;
+    while i < old.len() {
+        let Some((path, loop_)) = old[i].as_ref().and_then(pending_of) else {
+            items.extend(old[i].take());
+            i += 1;
+            continue;
+        };
+        let base_of = |item: &PlayoutItem| item.id.split('#').next().map(str::to_string);
+        let group_base = old[i].as_ref().and_then(base_of);
+        let mut end = i + 1;
+        while end < old.len()
+            && old[end].as_ref().is_some_and(|it| {
+                base_of(it) == group_base && pending_of(it).is_some_and(|(p, _)| p == path)
+            })
+        {
+            end += 1;
+        }
+        let group: Vec<PlayoutItem> = old[i..end].iter_mut().filter_map(Option::take).collect();
+        i = end;
+        let (start, finish) = (group[0].start, group[group.len() - 1].finish);
+        let real = Path::new(&path);
+        let len = if start > now + PENDING_SWAP_LEAD && real.is_file() {
+            media_len_ms(real).filter(|l| *l > 0)
+        } else {
+            None
+        };
+        let Some(len) = len else {
+            items.extend(group);
+            continue;
+        };
+        let slot_ms = (finish - start).whole_milliseconds().max(0) as u64;
+        let base = group[0].id.split('#').next().unwrap_or(&group[0].id);
+        let mut fresh = Vec::new();
+        push_local_span(
+            &mut fresh,
+            &Media {
+                channel,
+                len_ms: &media_len_ms,
+            },
+            base,
+            real,
+            0,
+            len,
+            loop_,
+            start,
+            slot_ms,
+        );
+        let Some(mut template) = copy_item(&group[0]) else {
+            items.extend(group);
+            continue;
+        };
+        if let Some(meta) = template.metadata.as_mut().and_then(|m| m.as_object_mut()) {
+            meta.remove(PENDING_KEY);
+        }
+        tracing::info!(
+            event = "bumper.pending_swapped",
+            channel,
+            item = base,
+            path = %path,
+            slot_ms,
+            file_ms = len,
+            looped = loop_ && len < slot_ms,
+            padded = !loop_ && len < slot_ms,
+            items = fresh.len(),
+            "a pending bumper's real file landed before airtime; swapping it in for the stand-in",
+        );
+        let copies: Option<Vec<PlayoutItem>> = fresh
+            .into_iter()
+            .map(|new| {
+                let mut item = copy_item(&template)?;
+                item.id = new.id;
+                item.start = new.start;
+                item.finish = new.finish;
+                item.source = new.source;
+                Some(item)
+            })
+            .collect();
+        let Some(copies) = copies else {
+            items.extend(group);
+            continue;
+        };
+        items.extend(copies);
+        swapped += 1;
+    }
+    swapped
+}
+
+/// Swap landed renders into every channel's unaired playout, atomically
+/// (temp file + rename). Aired and airing items are never touched. Returns
+/// the number of segments swapped.
+///
+/// A file or channel that cannot be read is logged and skipped, as in
+/// [`reconcile_playout_paths`].
+pub async fn swap_pending_playout(
+    channels: &[LoadedChannel],
+    now: OffsetDateTime,
+    media_len_ms: fn(&Path) -> Option<u64>,
+) -> usize {
+    let mut total = 0;
+    for channel in channels {
+        let files = match crate::scan::scan_output_folder(&channel.output_folder).await {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(
+                    event = "bumper.pending_scan_failed",
+                    channel = %channel.name,
+                    error = %e,
+                    "could not scan this channel's output folder for pending bumpers",
+                );
+                continue;
+            }
+        };
+        for file in files.into_iter().filter(|f| f.finish > now) {
+            match swap_pending_file(&file.path, &channel.name, now, media_len_ms).await {
+                Ok(n) => total += n,
+                Err(e) => tracing::warn!(
+                    event = "bumper.pending_file_failed",
+                    channel = %channel.name,
+                    file = %file.path.display(),
+                    error = %e,
+                    "could not swap pending bumpers in this playout file; leaving it as it is",
+                ),
+            }
+        }
+    }
+    total
+}
+
+async fn swap_pending_file(
+    path: &Path,
+    channel: &str,
+    now: OffsetDateTime,
+    media_len_ms: fn(&Path) -> Option<u64>,
+) -> Result<usize, String> {
+    let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+    // Almost no file holds a pending item; skip parsing the ones that cannot.
+    if !bytes
+        .windows(PENDING_NEEDLE.len())
+        .any(|w| w == PENDING_NEEDLE)
+    {
+        return Ok(0);
+    }
+    let mut playout: Playout = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let channel = channel.to_string();
+    let (playout, swapped) = tokio::task::spawn_blocking(move || {
+        let n = swap_pending_items(&mut playout.items, &channel, now, media_len_ms);
+        (playout, n)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if swapped > 0 {
+        atomic_write_json(path, &playout)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(swapped)
+}
+
+const PENDING_NEEDLE: &[u8] = b"\"pending\"";
 
 #[cfg(test)]
 mod tests {
@@ -858,5 +1055,216 @@ mod tests {
 
         assert_eq!(counts.items_path_missing, 0);
         assert_eq!(counts.files_rewritten, 0);
+    }
+
+    fn pending_item(
+        id: &str,
+        path: &str,
+        loop_: bool,
+        start: OffsetDateTime,
+        secs: i64,
+    ) -> PlayoutItem {
+        let mut it = item(
+            id,
+            "/stand/in.mp4",
+            start,
+            start + time::Duration::seconds(secs),
+        );
+        it.metadata = Some(serde_json::json!({
+            "bumper": true,
+            PENDING_KEY: { "path": path, "loop": loop_ },
+        }));
+        it
+    }
+
+    fn len_4s(_: &Path) -> Option<u64> {
+        Some(4_000)
+    }
+
+    fn len_20s(_: &Path) -> Option<u64> {
+        Some(20_000)
+    }
+
+    fn spans(items: &[PlayoutItem]) -> Vec<(String, i64, Option<u64>)> {
+        items
+            .iter()
+            .map(|i| {
+                let out = match &i.source {
+                    Some(PlayoutItemSource::Local { out_point_ms, .. }) => *out_point_ms,
+                    _ => None,
+                };
+                (
+                    source_path(i).unwrap_or("lavfi").to_string(),
+                    (i.finish - i.start).whole_seconds(),
+                    out,
+                )
+            })
+            .collect()
+    }
+
+    fn real_file(dir: &TempDir) -> String {
+        let real = dir.path().join("real.mp4");
+        std::fs::write(&real, b"x").unwrap();
+        real.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_landed_file_replaces_the_unaired_stand_in() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+        let mut items = vec![pending_item(
+            "bumper:c:1:0",
+            &real,
+            false,
+            datetime!(2026-08-16 13:00:00 UTC),
+            10,
+        )];
+        assert_eq!(swap_pending_items(&mut items, "c", now, len_20s), 1);
+        assert_eq!(spans(&items), vec![(real, 10, Some(10_000))]);
+        assert_eq!(items[0].id, "bumper:c:1:0");
+        assert!(
+            items[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get(PENDING_KEY)
+                .is_none()
+        );
+        assert_eq!(items[0].metadata.as_ref().unwrap()["bumper"], true);
+    }
+
+    #[test]
+    fn a_short_file_loops_when_the_segment_loops_and_pads_black_otherwise() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+        let at = datetime!(2026-08-16 13:00:00 UTC);
+
+        let mut looped = vec![pending_item("bumper:c:1:0", &real, true, at, 10)];
+        swap_pending_items(&mut looped, "c", now, len_4s);
+        assert_eq!(
+            spans(&looped),
+            vec![
+                (real.clone(), 4, Some(4_000)),
+                (real.clone(), 4, Some(4_000)),
+                (real.clone(), 2, Some(2_000)),
+            ]
+        );
+        assert_eq!(looped[2].id, "bumper:c:1:0#2");
+
+        let mut padded = vec![pending_item("bumper:c:1:0", &real, false, at, 10)];
+        swap_pending_items(&mut padded, "c", now, len_4s);
+        assert_eq!(
+            spans(&padded),
+            vec![(real, 4, Some(4_000)), ("lavfi".into(), 6, None)]
+        );
+        assert_eq!(padded[1].id, "bumper:c:1:0#pad");
+    }
+
+    #[test]
+    fn a_stand_in_and_its_black_pad_are_swapped_as_one_segment() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let at = datetime!(2026-08-16 13:00:00 UTC);
+        let mut items = vec![
+            pending_item("bumper:c:1:0", &real, false, at, 4),
+            pending_item(
+                "bumper:c:1:0#pad",
+                &real,
+                false,
+                at + time::Duration::seconds(4),
+                6,
+            ),
+        ];
+        let n = swap_pending_items(&mut items, "c", datetime!(2026-08-16 12:00:00 UTC), len_20s);
+        assert_eq!(n, 1);
+        assert_eq!(spans(&items), vec![(real, 10, Some(10_000))]);
+    }
+
+    #[test]
+    fn an_airing_or_imminent_item_and_an_unlanded_file_keep_their_stand_in() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let now = datetime!(2026-08-16 13:00:00 UTC);
+        let mut items = vec![
+            pending_item(
+                "bumper:c:1:0",
+                &real,
+                false,
+                now - time::Duration::seconds(5),
+                10,
+            ),
+            pending_item(
+                "bumper:c:2:0",
+                &real,
+                false,
+                now + time::Duration::seconds(10),
+                10,
+            ),
+            pending_item(
+                "bumper:c:3:0",
+                "/does/not/exist.mp4",
+                false,
+                now + time::Duration::minutes(5),
+                10,
+            ),
+        ];
+        assert_eq!(swap_pending_items(&mut items, "c", now, len_20s), 0);
+        assert!(
+            items
+                .iter()
+                .all(|i| source_path(i) == Some("/stand/in.mp4"))
+        );
+        assert!(
+            items
+                .iter()
+                .all(|i| i.metadata.as_ref().unwrap().get(PENDING_KEY).is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_playout_file_is_rewritten_only_when_a_swap_happens() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let out = TempDir::new().unwrap();
+        let file = write_playout(
+            &out,
+            vec![pending_item(
+                "bumper:c:1:0",
+                &real,
+                false,
+                datetime!(2026-08-16 13:00:00 UTC),
+                10,
+            )],
+        )
+        .await;
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+        let n = swap_pending_file(&file, "c", now, len_20s).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(source_path(&items_at(&file).await[0]), Some(real.as_str()));
+        let n = swap_pending_file(&file, "c", now, len_20s).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn two_back_to_back_pending_segments_naming_one_file_stay_two_segments() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let at = datetime!(2026-08-16 13:00:00 UTC);
+        let mut items = vec![
+            pending_item("bumper:c:1:0", &real, false, at, 10),
+            pending_item(
+                "bumper:c:1:1",
+                &real,
+                false,
+                at + time::Duration::seconds(10),
+                10,
+            ),
+        ];
+        let n = swap_pending_items(&mut items, "c", datetime!(2026-08-16 12:00:00 UTC), len_20s);
+        assert_eq!(n, 2);
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["bumper:c:1:0", "bumper:c:1:1"]);
     }
 }

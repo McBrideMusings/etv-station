@@ -33,7 +33,9 @@ pub fn records(
                 SegmentSource::Still { image_path } => {
                     (image_path.display().to_string(), None, None)
                 }
-                SegmentSource::Render { path, .. } => (path.display().to_string(), None, None),
+                SegmentSource::Render { path, .. } | SegmentSource::Pending { path, .. } => {
+                    (path.display().to_string(), None, None)
+                }
             };
             PlayRecord {
                 entry_id: placed.segment.name.clone(),
