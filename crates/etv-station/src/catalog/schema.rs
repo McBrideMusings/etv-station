@@ -217,6 +217,16 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE entries ADD COLUMN plex_absolute_episode INTEGER;
     UPDATE entries SET plex_absolute_episode = absolute_episode;
     "#,
+    // v11 — files ffprobe finds unairable. The filesystem ingest probes every
+    // file it walks; one with no video stream, no length, or a length far off
+    // the catalog's runtime gets the reason written here, and `resolve_query`
+    // stops drawing any entry that has a live source carrying one. The column
+    // is per file, not per entry: a re-scan that probes the file fine, or a
+    // file replaced on disk, clears it. NULL = airable or never probed, which
+    // is what every existing row gets.
+    r#"
+    ALTER TABLE entry_sources ADD COLUMN unairable_reason TEXT;
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

@@ -201,7 +201,9 @@ impl Catalog {
     /// **This is the pool-selection query, so it is where missing entries are
     /// skipped** (ADR 0006). `missing_since IS NULL` is added unconditionally
     /// and is not expressible in the CEL — a config author cannot ask for
-    /// missing entries, because there is nothing to play behind one.
+    /// missing entries, because there is nothing to play behind one. An entry
+    /// with a live source the filesystem ingest found unairable
+    /// ([`Self::set_source_unairable`]) is skipped the same way.
     ///
     /// Nothing else gains the filter. `no_repeat_within` spacing in
     /// [`crate::constrain`] still counts a missing entry's past airings (they
@@ -211,7 +213,7 @@ impl Catalog {
         let where_clause = query::translate(cel)?;
         let sql = format!(
             "SELECT entry_id FROM entries WHERE ({}) AND entries.missing_since IS NULL \
-             ORDER BY entry_id",
+             AND {UNAIRABLE_FILTER} ORDER BY entry_id",
             where_clause.sql
         );
         self.ordered_ids(&sql, where_clause.params)
@@ -390,6 +392,43 @@ impl Catalog {
             ],
         )?;
         Ok(())
+    }
+
+    /// Record what probing the file behind `(source, source_id)` concluded:
+    /// `Some(reason)` when it cannot air, `None` when it can. Returns whether a
+    /// row exists for that key. [`Self::add_source`] never touches the column, so
+    /// a pass that learned nothing about a file (a timeout) leaves the earlier
+    /// verdict standing.
+    pub fn set_source_unairable(
+        &self,
+        source: Source,
+        source_id: &str,
+        reason: Option<&str>,
+    ) -> Result<bool, CatalogError> {
+        let n = self.conn.execute(
+            "UPDATE entry_sources SET unairable_reason = ?3 \
+             WHERE source = ?1 AND source_id = ?2",
+            params![source.as_str(), source_id, reason],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The reason the file behind `(source, source_id)` cannot air, if the last
+    /// probe that answered said so.
+    pub fn source_unairable_reason(
+        &self,
+        source: Source,
+        source_id: &str,
+    ) -> Result<Option<String>, CatalogError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT unairable_reason FROM entry_sources WHERE source = ?1 AND source_id = ?2",
+                params![source.as_str(), source_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(row.flatten())
     }
 
     /// Mark every provenance row for `source` that this scan did not touch, and
@@ -1296,6 +1335,13 @@ fn collect_sources(
         )
         .collect()
 }
+
+/// The `resolve_query` predicate that drops an entry with a live source whose
+/// file ffprobe found unairable. A source marked missing keeps its reason but
+/// no longer counts: the file behind it is not the one a channel would play.
+const UNAIRABLE_FILTER: &str = "NOT EXISTS (SELECT 1 FROM entry_sources s \
+     WHERE s.entry_id = entries.entry_id AND s.unairable_reason IS NOT NULL \
+     AND s.missing_since IS NULL)";
 
 /// Column list for `entries`, in the order [`row_to_entry`] reads.
 const ENTRY_COLS: &str = "entry_id, type, title, title_sort, show, show_id, season, episode, \
