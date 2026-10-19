@@ -10,10 +10,10 @@
 //! order, so most channels are ready before anyone opens them.
 //!
 //! A result is valid for one [`SimKey`] (channel file, days, start date) and
-//! one [`Fingerprint`]: the mtimes of the channel file, every `.rhai` script
-//! its config names, and the catalog (with its WAL). An edit to any of them
-//! makes the next lookup miss. A script a plugin imports, `station.yaml` and
-//! the plexdb snapshot are not in the fingerprint.
+//! one [`Fingerprint`]: the mtimes of `station.yaml`, the channel file, every
+//! `.rhai` script its config names plus the scripts those import, every
+//! datastore (plexdb snapshot) a pool is granted, and the catalog (with its
+//! WAL). An edit to any of them makes the next lookup miss.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -106,23 +106,100 @@ fn collect_scripts(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-pub fn fingerprint(config_path: &Path, config: &ChannelConfig, catalog_path: &Path) -> Fingerprint {
-    let base = config_path.parent().unwrap_or(Path::new("."));
-    let mut names = Vec::new();
-    if let Ok(v) = serde_json::to_value(config) {
-        collect_scripts(&v, &mut names);
+/// Every `path` of a `datastores:` grant in `value`.
+fn collect_datastores(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(a) => a.iter().for_each(|v| collect_datastores(v, out)),
+        Value::Object(o) => {
+            for (k, v) in o {
+                if k == "datastores" {
+                    if let Value::Array(grants) = v {
+                        out.extend(
+                            grants
+                                .iter()
+                                .filter_map(|g| g.get("path")?.as_str().map(str::to_string)),
+                        );
+                    }
+                } else {
+                    collect_datastores(v, out);
+                }
+            }
+        }
+        _ => {}
     }
-    let mut scripts: Vec<PathBuf> = names
-        .iter()
-        .map(|n| crate::score::resolve_plugin_path(base, Path::new(n)))
-        .collect();
+}
+
+/// The module names a script's `import "name"` statements load.
+fn imported_modules(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("import")?;
+            let rest = rest.trim_start().strip_prefix('"')?;
+            Some(rest[..rest.find('"')?].to_string())
+        })
+        .collect()
+}
+
+/// `scripts` plus every module they import, transitively. rhai's file
+/// resolver reads `<name>.rhai` relative to the working directory; the
+/// channel file's directory is covered too.
+fn with_imports(base: &Path, scripts: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut all: Vec<PathBuf> = Vec::new();
+    let mut queue = scripts;
+    while let Some(path) = queue.pop() {
+        if all.contains(&path) {
+            continue;
+        }
+        if let Ok(source) = std::fs::read_to_string(&path) {
+            for name in imported_modules(&source) {
+                let file = format!("{name}.rhai");
+                queue.push(PathBuf::from(&file));
+                queue.push(base.join(&file));
+            }
+        }
+        all.push(path);
+    }
+    all
+}
+
+pub fn fingerprint(
+    station_path: &Path,
+    config_path: &Path,
+    config: &ChannelConfig,
+    catalog_path: &Path,
+) -> Fingerprint {
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    let value = serde_json::to_value(config).ok();
+    let mut names = Vec::new();
+    let mut datastores = Vec::new();
+    if let Some(v) = &value {
+        collect_scripts(v, &mut names);
+        collect_datastores(v, &mut datastores);
+    }
+    let mut scripts = with_imports(
+        base,
+        names
+            .iter()
+            .map(|n| crate::score::resolve_plugin_path(base, Path::new(n)))
+            .collect(),
+    );
     scripts.sort();
     scripts.dedup();
+    // Grants are stored as written (`${VAR}`); the plexdb file is the expanded path.
+    let mut datastores: Vec<PathBuf> = datastores
+        .into_iter()
+        .map(|p| PathBuf::from(config::expand_process_env(&p).unwrap_or(p)))
+        .collect();
+    datastores.sort();
+    datastores.dedup();
     let mut wal = catalog_path.as_os_str().to_owned();
     wal.push("-wal");
 
-    let mut paths = vec![config_path.to_path_buf()];
+    // Position 1 must stay the channel file: `SimCache::step` reads its mtime from there.
+    let mut paths = vec![station_path.to_path_buf(), config_path.to_path_buf()];
     paths.extend(scripts);
+    paths.extend(datastores);
     paths.push(catalog_path.to_path_buf());
     paths.push(PathBuf::from(wal));
     paths
@@ -340,7 +417,12 @@ impl SimCache {
                 else {
                     return true;
                 };
-                let fp = fingerprint(&lc.config_path, &lc.config, &self.catalog_path);
+                let fp = fingerprint(
+                    &self.station_path,
+                    &lc.config_path,
+                    &lc.config,
+                    &self.catalog_path,
+                );
                 (key, lc, fp)
             }
             None => {
@@ -349,7 +431,12 @@ impl SimCache {
                     let Some(lc) = station.channels.iter().find(|c| c.config_path == *path) else {
                         continue;
                     };
-                    let fp = fingerprint(&lc.config_path, &lc.config, &self.catalog_path);
+                    let fp = fingerprint(
+                        &self.station_path,
+                        &lc.config_path,
+                        &lc.config,
+                        &self.catalog_path,
+                    );
                     let key = default_key(path);
                     if !self.has(&key, &fp) {
                         found = Some((key, lc, fp));
@@ -368,7 +455,7 @@ impl SimCache {
 
         self.lock().running = Some(key.clone());
         let began = std::time::Instant::now();
-        let channel_mtime = fp.first().and_then(|(_, m)| *m);
+        let channel_mtime = fp.get(1).and_then(|(_, m)| *m);
         let account = match accounts.get(&lc.config_path) {
             Some((m, id)) if *m == channel_mtime => Ok(*id),
             _ => super::channel_account_id(&lc.config).inspect(|id| {
@@ -467,6 +554,19 @@ mod tests {
         let fresh = SimCache::new("station.yaml".into(), "catalog.db".into(), c.dir.clone());
         assert!(matches!(fresh.lookup(&key("a"), &fp(1)), Lookup::Ready(_)));
         let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    #[test]
+    fn imports_are_found_and_datastores_collected() {
+        assert_eq!(
+            imported_modules("import \"shared/util\" as u;\n  import \"b\" as b;\nlet x = 1;"),
+            ["shared/util", "b"]
+        );
+        let v: Value =
+            serde_json::json!({"pools":[{"datastores":[{"name":"d","path":"/x/plex.db"}]}]});
+        let mut out = Vec::new();
+        collect_datastores(&v, &mut out);
+        assert_eq!(out, ["/x/plex.db"]);
     }
 
     #[test]
