@@ -1082,7 +1082,10 @@ then screenshot, light and dark: a channel's Schedule populated, its Pattern, th
 pending state (a fresh channel while the worker is busy), a 404 key
 (`#/channels/nope/schedule` shows "The review could not be built"), Guide and
 Health (each "Not built yet"), and the page at 400px wide (the rail folds into a
-picker). `/tune` still serves the Tune page.
+picker). `/tune` still serves the Tune page. After restarting the server on a new
+build, load `about:blank` before the dashboard URL: a navigation that changes only
+the hash keeps the old page's script running, so every screenshot after it shows
+the previous build.
 
 A review's simulation runs on a worker thread (`sim_cache`), not the request thread.
 `GET /api/channels/{ch}/review` answers 202 `{"pending": true}` until the worker has the channel
