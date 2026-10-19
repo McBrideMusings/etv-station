@@ -1,0 +1,1077 @@
+//! A channel's review (`GET /api/channels/{ch}/review`) and its tune-in
+//! stills: the simulated schedule as a report, cached by `sim_cache`.
+
+use super::lineup::{channel_key, lineup_keys};
+use super::*;
+
+/// Where a plugin pool's pick stood in the list it walked: its `rank` (the
+/// walk position, after any temperature), its `score_rank` (by score alone),
+/// the `temperature` that separated the two, and whether the slot was an
+/// exploration `draw` — read off the plugin's own `pool` audit stage, `null`
+/// for an airing no plugin ranked. Under a rotating seed this is what shows
+/// the walk: ranks climb 1, 2, 3 through one period's list and start over at
+/// a rollover.
+///
+/// The `select` stage (the core's own record of the draw) adds the seed and
+/// temperature the visit drew with, the period index each was in, and where
+/// in that period's list the pick sat — `null` fields on a pool nothing
+/// rotates.
+fn ranking_of(metadata: Option<&Value>) -> Value {
+    let stage = |name: &str| {
+        metadata
+            .and_then(|m| m.get("audit"))
+            .and_then(Value::as_array)
+            .and_then(|stages| {
+                stages
+                    .iter()
+                    .find(|stage| stage.get("stage").and_then(Value::as_str) == Some(name))
+            })
+            .and_then(|stage| stage.get("detail"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let (pool, select) = (stage("pool"), stage("select"));
+    if pool.is_null() && select.is_null() {
+        return Value::Null;
+    }
+    json!({
+        "rank": pool.get("rank"),
+        "score_rank": pool.get("score_rank"),
+        "draw": pool.get("draw"),
+        "seed": select.get("seed"),
+        "temperature": select.get("temperature"),
+        "seed_period": select.get("seed_period"),
+        "temperature_period": select.get("temperature_period"),
+        "list_position": select.get("list_position"),
+        "list_length": select.get("list_length"),
+    })
+}
+
+/// The pool an airing was drawn from, read off the pattern engine's `select`
+/// audit stage (`detail.pool`).
+pub(super) fn drawn_from_pool(metadata: Option<&Value>) -> Option<String> {
+    metadata?
+        .get("audit")?
+        .as_array()?
+        .iter()
+        .find(|stage| stage.get("stage").and_then(Value::as_str) == Some("select"))?
+        .get("detail")?
+        .get("pool")?
+        .as_str()
+        .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Channel review (the page's Schedule, `/api/channels/{ch}/review`): one channel's simulated schedule as
+// a report — depth before repeats, film/series share, overlap with the rest of
+// the lineup, seeded tune-in samples and a day-by-day guide. It reads the
+// channel exactly as `channel.yaml` writes it (its own plugin scripts, no
+// working-copy profile), reloaded on every request. The simulation itself is
+// cached by `sim_cache` and filled by a worker thread, keyed on the mtimes of
+// the channel file, its scripts and the catalog, so an edit to any of them
+// shows on the next reload; a request that misses the cache gets 202
+// `{"pending": true}` and the page asks again. The numbers are
+// `crate::review`'s.
+// ---------------------------------------------------------------------------
+
+/// Days the Review view simulates when a request names none, and the most it
+/// may ask for.
+pub(super) const DEFAULT_REVIEW_DAYS: u32 = 14;
+const MAX_REVIEW_DAYS: u32 = 60;
+
+/// How many seeded tune-in moments the view samples.
+const TUNE_IN_SAMPLES: usize = 5;
+
+/// What the Review view keeps between requests.
+pub(super) struct ReviewState {
+    station_path: PathBuf,
+    /// Each channel's candidate entry-id set, keyed by config path and
+    /// recomputed when the file's mtime changes. A failure is not cached, so
+    /// the next review retries it.
+    fingerprints: HashMap<PathBuf, (std::time::SystemTime, Arc<HashSet<String>>)>,
+    /// Every movie id and every episode id in the catalog, for telling a
+    /// channel that draws from the whole library apart from one that doesn't.
+    library: Option<(HashSet<String>, HashSet<String>)>,
+    /// The last review's comparable numbers per channel, for "Since last run".
+    previous: HashMap<String, Vec<(String, Value)>>,
+    /// Every tune-in still a review has offered, keyed by the file name its
+    /// URL carries, so `/api/stills/{id}` renders it on first request.
+    stills: HashMap<String, TuneInStill>,
+    /// Where rendered stills are kept. A still's file name is a digest of
+    /// everything that decides it and the directory names this binary's
+    /// build, so a file here is never stale.
+    pub(super) still_dir: PathBuf,
+    /// Simulated schedules, filled by a worker thread so no request waits on one.
+    pub(super) sims: Arc<sim_cache::SimCache>,
+}
+
+impl ReviewState {
+    pub(super) fn new(station_path: PathBuf, catalog_path: PathBuf) -> Self {
+        // One directory per build of this binary, so a rebuilt renderer or
+        // simulator never serves what the previous one produced.
+        let build = std::env::current_exe()
+            .and_then(|p| p.metadata())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        Self {
+            sims: sim_cache::SimCache::new(
+                station_path.clone(),
+                catalog_path,
+                std::env::temp_dir()
+                    .join("etv-station-ui-sims")
+                    .join(&build),
+            ),
+            station_path,
+            fingerprints: HashMap::new(),
+            library: None,
+            previous: HashMap::new(),
+            stills: HashMap::new(),
+            still_dir: std::env::temp_dir()
+                .join("etv-station-ui-stills")
+                .join(&build),
+        }
+    }
+}
+
+fn file_mtime(path: &Path) -> Result<std::time::SystemTime, String> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How many upcoming placements per rotation the Review JSON previews.
+const ROTATION_PREVIEW_PLACEMENTS: usize = 14;
+
+/// `GET /api/channels/{key}/review?days=`: the channel's review, or 202
+/// `{"pending": true}` while the worker simulates it. A key that is not in
+/// the lineup is a 404.
+pub(super) fn api_channel_review(
+    state: &mut AppState,
+    key: &str,
+    query: &str,
+) -> Result<(u16, Value), String> {
+    let began = std::time::Instant::now();
+    let params = parse_query(query);
+    let key = key.to_string();
+    let station = config::load_for_inspection(&state.review.station_path)
+        .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))?;
+
+    // Every channel file the station's `channels:` patterns found, loaded or
+    // not, in station.yaml order.
+    let base = state
+        .review
+        .station_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let keys = lineup_keys(&station.lineup, &base);
+    let Some(position) = keys.iter().position(|k| *k == key) else {
+        return Ok((
+            404,
+            json!({ "error": format!("no channel {key:?} in {}", state.review.station_path.display()) }),
+        ));
+    };
+    let days = params
+        .get("days")
+        .and_then(|d| d.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_REVIEW_DAYS)
+        .clamp(1, MAX_REVIEW_DAYS);
+
+    let config_path = &station.lineup[position];
+    if let Some(dropped) = station
+        .dropped
+        .iter()
+        .find(|d| d.config_path == *config_path)
+    {
+        tracing::warn!(event = "ui.review.load_failed", channel = %key, reason = %dropped.reason, "review: channel failed to load");
+        return Ok((
+            200,
+            json!({
+                "channel": key,
+                "config_path": dropped.config_path.display().to_string(),
+                "days": days,
+                "load_error": dropped.reason,
+            }),
+        ));
+    }
+    let lc = station
+        .channels
+        .iter()
+        .find(|c| c.config_path == *config_path)
+        .ok_or_else(|| format!("{key} is in the lineup but neither loaded nor dropped"))?;
+
+    let tz = crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
+    let start = crate::tz::local_midnight_at_or_before(time::OffsetDateTime::now_utc(), tz);
+    let mut day_starts = vec![start];
+    for _ in 0..days {
+        let last = *day_starts.last().expect("non-empty");
+        day_starts.push(crate::tz::add_chunk(last, 24, tz));
+    }
+    let end = *day_starts.last().expect("non-empty");
+
+    let sim_key = sim_cache::SimKey {
+        config_path: lc.config_path.clone(),
+        days,
+        start: start.unix_timestamp(),
+    };
+    let fp = sim_cache::fingerprint(
+        &state.options.station,
+        &lc.config_path,
+        &lc.config,
+        &state.options.catalog,
+    );
+    let (sim, sim_source) = match state.review.sims.lookup(&sim_key, &fp) {
+        sim_cache::Lookup::Ready(sim) => (sim, "cache"),
+        sim_cache::Lookup::Failed(e) => return Err(e),
+        sim_cache::Lookup::Pending => {
+            tracing::info!(event = "ui.review.pending", channel = %key, days, "review: simulation queued");
+            return Ok((
+                202,
+                json!({ "pending": true, "channel": key, "days": days }),
+            ));
+        }
+    };
+
+    let block_names: Vec<String> = lc
+        .config
+        .rule
+        .all_blocks()
+        .enumerate()
+        .map(|(i, b)| {
+            b.program()
+                .and_then(|p| p.title.clone())
+                .or_else(|| lc.config.rule.slot_name(i).map(str::to_string))
+                .unwrap_or_else(|| format!("block {i}"))
+        })
+        .collect();
+    let mut entries: HashMap<String, Option<CatalogEntry>> = HashMap::new();
+    let mut airings: Vec<crate::review::ReviewAiring> = Vec::new();
+    let mut simulated: Vec<&crate::simulate::SimulatedAiring> = Vec::new();
+    for a in sim.generations.iter().flat_map(|g| &g.airings) {
+        // Every airing, past the span's end too, so the last one in the span
+        // still has a successor for its tune-in still's NEXT card. Airings
+        // run in time order, so `simulated[i]` is `airings[i]` for each `i`
+        // the span keeps.
+        simulated.push(a);
+        if a.start >= end {
+            continue;
+        }
+        let entry = entries
+            .entry(a.id.clone())
+            .or_insert_with(|| state.catalog.entry(&a.id).ok().flatten());
+        airings.push(crate::review::ReviewAiring {
+            id: a.id.clone(),
+            title: entry
+                .as_ref()
+                .map(airing_label)
+                .unwrap_or_else(|| a.id.clone()),
+            kind: entry
+                .as_ref()
+                .map(|e| e.kind.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            show: entry.as_ref().and_then(|e| e.show.clone()),
+            show_id: a.show_id.clone(),
+            season: entry.as_ref().and_then(|e| e.season),
+            episode: entry.as_ref().and_then(|e| e.episode),
+            pool: drawn_from_pool(a.metadata.as_ref())
+                .unwrap_or_else(|| block_names.get(a.block).cloned().unwrap_or_default()),
+            start: a.start,
+            duration: a.duration,
+        });
+    }
+
+    let review = build_review(state, &station, lc, &airings, &simulated, start, end)?;
+    let summary = comparable_numbers(&review);
+    let since_last = state.review.previous.insert(key.clone(), summary.clone());
+    let since_last_json = since_last.map(|old| {
+        let old: HashMap<String, Value> = old.into_iter().collect();
+        summary
+            .iter()
+            .map(|(label, new)| {
+                let old = old.get(label).cloned().unwrap_or(Value::Null);
+                json!({ "label": label, "old": old, "new": new, "changed": old != *new })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let nominal_secs = lc
+        .config
+        .scoring
+        .as_ref()
+        .map(|s| s.nominal_item_secs)
+        .unwrap_or_else(|| config::ScoringConfig::default().nominal_item_secs);
+    let mut notices = Vec::new();
+    let unprobed = airings
+        .iter()
+        .filter(|a| {
+            entries
+                .get(&a.id)
+                .and_then(|e| e.as_ref())
+                .and_then(|e| e.duration_ms)
+                .is_none()
+        })
+        .count();
+    if unprobed > 0 {
+        notices.push(format!(
+            "{unprobed} of {} airings have no catalog length and run at nominal_item_secs ({nominal_secs}s); \
+             the daemon would probe the file instead.",
+            airings.len()
+        ));
+    }
+    if lc.config.anchor.is_some() {
+        notices.push(
+            "This channel sets an anchor; the anchor join on its first generation is not modelled."
+                .to_string(),
+        );
+    }
+
+    // What the airing inspector shows beside each airing's audit trail: the
+    // catalog fields a pool reads, and a label for every item a trail names
+    // as passed over that never airs in the span (an aired one is labelled
+    // in `airings`), so the page never prints a bare entry id.
+    let ids: Vec<String> = airings.iter().map(|a| a.id.clone()).collect();
+    let genres = state
+        .catalog
+        .tags_for_many(&ids, TagNs::Genre)
+        .map_err(|e| e.to_string())?;
+    let directors = state
+        .catalog
+        .tags_for_many(&ids, TagNs::Director)
+        .map_err(|e| e.to_string())?;
+    let collections = state
+        .catalog
+        .collections_for_many(&ids)
+        .map_err(|e| e.to_string())?;
+    let audits: Vec<Value> = (0..airings.len())
+        .map(|i| crate::audit_report::split_audit(simulated[i].metadata.as_ref()).0)
+        .collect();
+    let passed_over: Vec<String> = audits
+        .iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|stage| stage["detail"]["near_misses"].as_array())
+        .flatten()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .filter(|id| !entries.contains_key(id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let titles: HashMap<String, String> = state
+        .catalog
+        .entries_for(&passed_over)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|(id, e)| (id.clone(), airing_label(e)))
+        .collect();
+
+    // Fields that belong to the item, not the airing: one copy per entry id,
+    // however many times it airs. The page merges them back onto each airing.
+    let mut items: HashMap<&str, Value> = HashMap::new();
+    for a in &airings {
+        items.entry(a.id.as_str()).or_insert_with(|| {
+            let e = entries.get(&a.id).and_then(|e| e.as_ref());
+            json!({
+                "title": e.map(|e| e.title.clone()),
+                "season": e.and_then(|e| e.season),
+                "episode": e.and_then(|e| e.episode),
+                "year": e.and_then(|e| e.year),
+                "genres": genres.get(&a.id),
+                "collections": collections.get(&a.id),
+                "directors": directors.get(&a.id),
+                "content_rating": e.and_then(|e| e.content_rating.clone()),
+                "summary": e.and_then(|e| e.summary.clone()),
+            })
+        });
+    }
+
+    let airings_json: Vec<Value> = airings
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            json!({
+                "index": i,
+                "id": a.id,
+                "label": a.title,
+                "show": a.show,
+                "kind": a.kind,
+                "pool": a.pool,
+                "start": a.start.unix_timestamp(),
+                "offset_secs": (a.start - start).whole_seconds(),
+                "duration_secs": a.duration.whole_seconds(),
+                "ranking": ranking_of(simulated[i].metadata.as_ref()),
+                "audit": audits[i],
+            })
+        })
+        .collect();
+
+    tracing::info!(
+        event = "ui.review",
+        channel = %key,
+        days,
+        sim_source,
+        generations = sim.generations.len(),
+        airings = airings.len(),
+        overlap_channels = review["overlap"]["channels"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        ms = began.elapsed().as_millis() as u64,
+        "review: schedule replayed"
+    );
+
+    let mut out = review;
+    let obj = out.as_object_mut().expect("build_review returns an object");
+    obj.insert("channel".into(), json!(key));
+    obj.insert("since_last".into(), json!(since_last_json));
+    obj.insert("notices".into(), json!(notices));
+    obj.insert(
+        "rotations".into(),
+        crate::rotation::rows_json(&crate::rotation::preview_channel(
+            &lc.config,
+            tz,
+            &crate::rotation::read_rotations(&lc.output_folder),
+            time::OffsetDateTime::now_utc(),
+            ROTATION_PREVIEW_PLACEMENTS,
+        )),
+    );
+    obj.insert("airings".into(), json!(airings_json));
+    obj.insert("items".into(), json!(items));
+    obj.insert("titles".into(), json!(titles));
+    obj.insert(
+        "day_starts".into(),
+        json!(
+            day_starts
+                .iter()
+                .map(|d| d.unix_timestamp())
+                .collect::<Vec<_>>()
+        ),
+    );
+    Ok((200, out))
+}
+
+/// A movie as `Title (Year)`, an episode as `Show S01E02 · Title`.
+fn airing_label(e: &CatalogEntry) -> String {
+    match (&e.show, e.season, e.episode) {
+        (Some(show), Some(s), Some(ep)) => format!("{show} S{s:02}E{ep:02} · {}", e.title),
+        (Some(show), _, _) => format!("{show} · {}", e.title),
+        _ => match e.year {
+            Some(y) => format!("{} ({y})", e.title),
+            None => e.title.clone(),
+        },
+    }
+}
+
+/// The channel's `rule.blocks` as the Review page lays them out: per block,
+/// its title and whichever of a daypart sequencer, pattern steps, an
+/// hour-switched schedule of patterns, a plain pool list or a fixed entry
+/// count drives it. A step's `take` is `[min, max]`, `null` for `take: all`.
+fn blocks_json(channel: &config::ChannelConfig) -> Value {
+    let blocks: Vec<Value> = channel
+        .rule
+        .all_blocks()
+        .enumerate()
+        .map(|(i, b)| {
+            let name = b
+                .program()
+                .and_then(|p| p.title.clone())
+                .or_else(|| channel.rule.slot_name(i).map(str::to_string))
+                .unwrap_or_else(|| format!("block {i}"));
+            json!({
+                "name": name,
+                "sequencer": b.sequencer.as_ref()
+                    .and_then(|s| s.file_name())
+                    .map(|n| n.to_string_lossy().into_owned()),
+                "steps": steps_json(&b.pattern),
+                "pools": b.pools.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                "entries": b.entries().len(),
+                "placed": placements(&channel.rule, i),
+            })
+        })
+        .collect();
+    json!(blocks)
+}
+
+/// Where `rule.schedules` place block `idx`, one line per range: the
+/// schedule's name, its days, and the clock range. Empty for an any-time block.
+fn placements(rule: &config::RuleConfig, idx: usize) -> Vec<String> {
+    let Some(slot) = rule.slot_name(idx) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for schedule in &rule.schedules {
+        let mut days: Vec<String> = schedule.dates.iter().map(|d| String::from(*d)).collect();
+        days.extend(
+            schedule
+                .weekdays
+                .iter()
+                .map(|w| format!("{w:?}").to_lowercase()),
+        );
+        let days = if days.is_empty() {
+            "every day".to_string()
+        } else {
+            days.join(", ")
+        };
+        for (range, placed) in &schedule.hours {
+            if placed == slot {
+                out.push(format!("{}: {days}, {range}", schedule.name));
+            }
+        }
+    }
+    out
+}
+
+/// One pattern's steps: pool, `take` as `[min, max]` (`null` for `all`), and
+/// the step's `chance`.
+fn steps_json(steps: &[config::PatternStep]) -> Vec<Value> {
+    steps
+        .iter()
+        .map(|s| json!({ "pool": s.pool, "take": s.take.bounds(), "chance": s.chance }))
+        .collect()
+}
+
+/// One channel's candidate entry ids, resolved from its config with no
+/// scorer run, cached until the file changes.
+fn channel_fingerprint(
+    review: &mut ReviewState,
+    catalog: &Catalog,
+    lc: &config::LoadedChannel,
+) -> Result<Arc<HashSet<String>>, String> {
+    let mtime = file_mtime(&lc.config_path)?;
+    if let Some((cached_mtime, ids)) = review.fingerprints.get(&lc.config_path)
+        && *cached_mtime == mtime
+    {
+        return Ok(ids.clone());
+    }
+    let ids = crate::resolve::resolve_channel_fingerprint_ids(
+        &lc.config,
+        &lc.config_path,
+        &[],
+        None,
+        Some(catalog),
+    )
+    .map(|ids| Arc::new(ids.into_iter().collect::<HashSet<_>>()))
+    .map_err(|e| e.to_string())?;
+    review
+        .fingerprints
+        .insert(lc.config_path.clone(), (mtime, ids.clone()));
+    Ok(ids)
+}
+
+/// Whether a channel's candidates hold every movie or every episode in the
+/// catalog — a channel that can air anything shares everything, so listing
+/// its overlap says nothing.
+fn is_whole_library(library: &(HashSet<String>, HashSet<String>), ids: &HashSet<String>) -> bool {
+    let (movies, episodes) = library;
+    (!movies.is_empty() && movies.is_subset(ids))
+        || (!episodes.is_empty() && episodes.is_subset(ids))
+}
+
+/// Every other channel sharing candidates with `lc`, largest first, each with
+/// the shared titles (episodes rolled up to their show).
+fn overlap_json(
+    state: &mut AppState,
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+) -> Result<Value, String> {
+    if state.review.library.is_none() {
+        let movies = state
+            .catalog
+            .resolve_query(r#"item.type == "movie""#)
+            .map_err(|e| e.to_string())?;
+        let episodes = state
+            .catalog
+            .resolve_query(r#"item.type == "episode""#)
+            .map_err(|e| e.to_string())?;
+        state.review.library = Some((movies.into_iter().collect(), episodes.into_iter().collect()));
+    }
+    let own = channel_fingerprint(&mut state.review, &state.catalog, lc)?;
+    let library = state.review.library.as_ref().expect("filled above");
+    let own_whole = is_whole_library(library, &own);
+
+    let mut whole_library = Vec::new();
+    let mut errors = Vec::new();
+    let mut shared: Vec<(&config::LoadedChannel, Vec<String>)> = Vec::new();
+    let mut others = Vec::new();
+    for other in station
+        .channels
+        .iter()
+        .filter(|c| c.config_path != lc.config_path)
+    {
+        match channel_fingerprint(&mut state.review, &state.catalog, other) {
+            Ok(ids) => others.push((other, ids)),
+            Err(e) => {
+                errors.push(json!({ "channel": channel_key(&other.config_path), "error": e }))
+            }
+        }
+    }
+    let library = state.review.library.as_ref().expect("filled above");
+    for (other, ids) in others {
+        if is_whole_library(library, &ids) {
+            whole_library.push(channel_key(&other.config_path));
+            continue;
+        }
+        if own_whole {
+            continue;
+        }
+        let common: Vec<String> = own.intersection(&ids).cloned().collect();
+        if !common.is_empty() {
+            shared.push((other, common));
+        }
+    }
+    shared.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then(a.0.config.number.cmp(&b.0.config.number))
+    });
+
+    let channels: Vec<Value> = shared
+        .iter()
+        .map(|(other, ids)| {
+            json!({
+                "channel": channel_key(&other.config_path),
+                "number": other.config.number,
+                "display_name": other.config.display_name,
+                "shared": ids.len(),
+                "titles": shared_titles(&state.catalog, ids),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "this_channel_whole_library": own_whole,
+        "candidates": own.len(),
+        "channels": channels,
+        "whole_library": whole_library,
+        "errors": errors,
+    }))
+}
+
+/// Shared ids as titles: a film as `Title (Year)`, a show's episodes as one
+/// `Show (n episodes)` line. Most shared first.
+fn shared_titles(catalog: &Catalog, ids: &[String]) -> Vec<String> {
+    let mut shows: HashMap<String, usize> = HashMap::new();
+    let mut films: Vec<String> = Vec::new();
+    for id in ids {
+        match catalog.entry(id).ok().flatten() {
+            Some(e) => match &e.show {
+                Some(show) => *shows.entry(show.clone()).or_insert(0) += 1,
+                None => films.push(airing_label(&e)),
+            },
+            None => films.push(id.clone()),
+        }
+    }
+    let mut shows: Vec<(String, usize)> = shows.into_iter().collect();
+    shows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    films.sort();
+    shows
+        .into_iter()
+        .map(|(show, n)| {
+            if n == 1 {
+                format!("{show} (1 episode)")
+            } else {
+                format!("{show} ({n} episodes)")
+            }
+        })
+        .chain(films)
+        .collect()
+}
+
+/// The report itself: header, tiles, depth rows, overlap and tune-in samples.
+fn build_review(
+    state: &mut AppState,
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+    airings: &[crate::review::ReviewAiring],
+    simulated: &[&crate::simulate::SimulatedAiring],
+    start: time::OffsetDateTime,
+    end: time::OffsetDateTime,
+) -> Result<Value, String> {
+    use crate::review;
+
+    let days = (end - start).as_seconds_f64() / 86_400.0;
+    let first_repeat = review::first_repeat(airings, start, |_| true)
+        .map(|r| json!({ "days": r.days, "index": r.index, "label": airings[r.index].title }));
+
+    // The last airing can run past the span's end; only its share inside the
+    // span counts toward airtime.
+    let clipped: Vec<review::ReviewAiring> = airings
+        .iter()
+        .map(|a| review::ReviewAiring {
+            duration: a.duration.min(end - a.start),
+            ..a.clone()
+        })
+        .collect();
+    let by_kind = review::airtime_by_kind(&clipped);
+    let total: f64 = by_kind.values().sum();
+    let share = |kind: &str| {
+        if total > 0.0 {
+            by_kind.get(kind).copied().unwrap_or(0.0) / total
+        } else {
+            0.0
+        }
+    };
+
+    let depth: Vec<Value> = review::depth_rows(airings, start)
+        .into_iter()
+        .map(|row| {
+            json!({
+                "kind": row.kind,
+                "name": row.name,
+                "pool": row.pool,
+                "aired": row.aired,
+                "distinct": row.distinct,
+                "first_repeat_days": row.first_repeat.as_ref().map(|r| r.days),
+                "first_repeat_label": row.first_repeat.as_ref().map(|r| airings[r.index].title.clone()),
+            })
+        })
+        .collect();
+
+    let seed = review_seed(station, lc, start);
+    let mut samples: Vec<Value> = Vec::new();
+    for (n, t) in review::tune_in_samples(airings, start, end, seed, TUNE_IN_SAMPLES)
+        .into_iter()
+        .enumerate()
+    {
+        let next: Vec<usize> = (t.index + 1..airings.len()).take(2).collect();
+        let still = offer_still(
+            state,
+            station,
+            lc,
+            Neighbours {
+                prev: t.index.checked_sub(1).map(|i| simulated[i]),
+                airing: simulated[t.index],
+                next: simulated.get(t.index + 1).copied(),
+            },
+            t.into,
+            n + 1,
+        );
+        samples.push(json!({
+            "n": n + 1,
+            "at": t.at.unix_timestamp(),
+            "index": t.index,
+            "minutes_in": t.into.whole_minutes(),
+            "minutes_total": airings[t.index].duration.whole_minutes(),
+            "next": next,
+            "still": still,
+        }));
+    }
+
+    let distinct = airings
+        .iter()
+        .map(|a| a.id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let overlap = overlap_json(state, station, lc)?;
+
+    let random_order_pools: HashSet<String> = lc
+        .config
+        .rule
+        .blocks
+        .iter()
+        .flat_map(|b| &b.pools)
+        .filter(|p| matches!(p.order, Some(config::Order::Random)))
+        .map(|p| p.name.clone())
+        .collect();
+    let show_ids: Vec<String> = airings
+        .iter()
+        .filter_map(|a| a.show_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let episode_counts = state
+        .catalog
+        .episode_counts_for(&show_ids)
+        .map_err(|e| e.to_string())?;
+    let principles: Vec<Value> = review::grade_principles(&review::GradeInputs {
+        airings,
+        start,
+        end,
+        tz: crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?,
+        random_order_pools: &random_order_pools,
+        episode_counts: &episode_counts,
+    })
+    .into_iter()
+    .map(|p| {
+        json!({
+            "name": p.name,
+            "grade": p.grade,
+            "value": p.value,
+            "measure": p.measure,
+            "not_scored": p.not_scored,
+        })
+    })
+    .collect();
+
+    Ok(json!({
+        "channel": channel_key(&lc.config_path),
+        "config_path": lc.config_path.display().to_string(),
+        "number": lc.config.number,
+        "name": lc.name,
+        "display_name": lc.config.display_name,
+        "seed": lc.config.seed,
+        "tz": station.station.tz,
+        "days": days.round() as u32,
+        "start": start.unix_timestamp(),
+        "end": end.unix_timestamp(),
+        "blocks": blocks_json(&lc.config),
+        "first_repeat": first_repeat,
+        "airtime": {
+            "total_secs": total,
+            "by_kind": by_kind,
+            "film_share": share("movie"),
+            "series_share": share("episode"),
+        },
+        "items_aired": airings.len(),
+        "distinct_items": distinct,
+        "depth": depth,
+        "principles": principles,
+        "overlap": overlap,
+        "samples": samples,
+    }))
+}
+
+/// The channel's seed at `at` — what the review's seeded tune-in samples and
+/// still names key on, so a rerun of the same span picks the same moments.
+fn review_seed(
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+    at: time::OffsetDateTime,
+) -> u64 {
+    let tz = crate::tz::parse(&station.station.tz).unwrap_or(time_tz::timezones::db::UTC);
+    crate::variety::Variety::new(&lc.config, tz)
+        .dice(at, None)
+        .seed
+}
+
+/// One tune-in sample's still, as the page reads it: `{url}` when there is a
+/// media file to grab a frame from, else `{unavailable, path?}` naming why
+/// not. Registers the still so its URL renders it on first request.
+fn offer_still(
+    state: &mut AppState,
+    station: &config::Station,
+    lc: &config::LoadedChannel,
+    at: Neighbours<'_>,
+    into: time::Duration,
+    n: usize,
+) -> Value {
+    let still = match TuneInStill::offer(
+        state.catalog.sources_for(&at.airing.id),
+        &MediaRemap::from_env(),
+        &lc.overlays,
+        &station.station.normalization.video,
+        &station.station.fonts,
+        at,
+        into,
+    ) {
+        Ok(still) => still,
+        Err(Unavailable { why, path: None }) => return json!({ "unavailable": why }),
+        Err(Unavailable {
+            why,
+            path: Some(path),
+        }) => return json!({ "unavailable": why, "path": path.display().to_string() }),
+    };
+    let channel: String = channel_key(&lc.config_path)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let id = format!(
+        "{channel}-s{}-n{n}-{}.jpg",
+        review_seed(station, lc, at.airing.start),
+        still.digest()
+    );
+    state.review.stills.insert(id.clone(), still);
+    json!({ "url": format!("/api/stills/{id}") })
+}
+
+/// `GET /api/stills/{id}`: the still a review offered under `id`, or a 404
+/// for an id no review offered.
+pub(super) fn still_reply(state: &AppState, id: &str) -> Reply {
+    match state.review.stills.get(id) {
+        Some(still) => Reply::Still(id.to_string(), Box::new(still.clone())),
+        None => Reply::Json(404, json!({ "error": "no such still; reload the review" })),
+    }
+}
+
+/// Answers a still request, rendering on first request and serving from the
+/// still directory after. The render runs on its own thread, which answers
+/// the request, so a slow media read holds up that one image and not the rest
+/// of the tool. A render that fails is a 500 naming why.
+pub(super) fn respond_still(
+    dir: PathBuf,
+    id: String,
+    still: TuneInStill,
+    request: tiny_http::Request,
+) {
+    std::thread::spawn(
+        move || match render_review_still_serially(&dir, &id, &still) {
+            Ok(jpeg) => respond_jpeg(request, jpeg),
+            Err(e) => respond_json(request, 500, &json!({ "error": e })),
+        },
+    );
+}
+
+/// One still renders at a time, whatever the number of request threads
+/// waiting: a Review page asks for every sample's still at once, and each
+/// render is an ffmpeg reading the media array the channels transcode from.
+fn render_review_still_serially(
+    dir: &Path,
+    id: &str,
+    still: &TuneInStill,
+) -> Result<Vec<u8>, String> {
+    static RENDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = RENDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let jpeg = render_review_still(dir, id, still)?;
+    prune_still_dir(dir, STILL_DIR_MAX_FILES);
+    Ok(jpeg)
+}
+
+/// The most rendered stills the still directory keeps; the oldest go first.
+const STILL_DIR_MAX_FILES: usize = 200;
+
+/// Deletes the oldest files in `dir` until at most `max` remain, so the
+/// directory (the container's writable layer) stays bounded however many
+/// distinct stills reviews offer. A file that cannot be listed or removed is
+/// left; the next render tries again.
+pub(super) fn prune_still_dir(dir: &Path, max: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((meta.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= max {
+        return;
+    }
+    files.sort();
+    for (_, path) in &files[..files.len() - max] {
+        if std::fs::remove_file(path).is_ok() {
+            tracing::debug!(event = "ui.still.pruned", path = %path.display(), "still: pruned");
+        }
+    }
+}
+
+fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<u8>, String> {
+    let began = std::time::Instant::now();
+    let served = still
+        .render_cached(Path::new("ffmpeg"), dir, id)
+        .inspect_err(|e| {
+            tracing::warn!(
+                event = "ui.still.failed",
+                id,
+                media = %still.media.display(),
+                at_secs = still.at_secs,
+                error = %e,
+                "still: render failed"
+            )
+        })?;
+    let (jpeg, rendered) = match served {
+        StillJpeg::Cached(jpeg) => {
+            tracing::debug!(event = "ui.still.cached", id, "still: served from cache");
+            return Ok(jpeg);
+        }
+        StillJpeg::Rendered(jpeg, rendered) => (jpeg, rendered),
+    };
+    tracing::info!(
+        event = "ui.still.rendered",
+        id,
+        media = %still.media.display(),
+        at_secs = still.at_secs,
+        title = ?still.program.title,
+        next_title = ?still.program.next_title,
+        overlay_time = ?rendered.overlay_time,
+        shows_next = rendered.shows_next,
+        ms = began.elapsed().as_millis() as u64,
+        "still: rendered"
+    );
+    Ok(jpeg)
+}
+
+/// The numbers "Since last run" compares, in display order.
+fn comparable_numbers(review: &Value) -> Vec<(String, Value)> {
+    let pct = |v: &Value| v.as_f64().map(|f| json!((f * 1000.0).round() / 10.0));
+    let mut out = vec![
+        ("Days shown".to_string(), review["days"].clone()),
+        (
+            "Days until first repeat".to_string(),
+            review["first_repeat"]["days"]
+                .as_f64()
+                .map(|d| json!((d * 10.0).round() / 10.0))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "Film share of airtime (%)".to_string(),
+            pct(&review["airtime"]["film_share"]).unwrap_or(Value::Null),
+        ),
+        (
+            "Series share of airtime (%)".to_string(),
+            pct(&review["airtime"]["series_share"]).unwrap_or(Value::Null),
+        ),
+        (
+            "Channels sharing content".to_string(),
+            json!(
+                review["overlap"]["channels"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            ),
+        ),
+        ("Items aired".to_string(), review["items_aired"].clone()),
+        (
+            "Distinct items".to_string(),
+            review["distinct_items"].clone(),
+        ),
+    ];
+    for row in review["depth"].as_array().into_iter().flatten() {
+        if row["kind"] != "pool" {
+            continue;
+        }
+        out.push((
+            format!(
+                "Pool {} — days until first repeat",
+                row["name"].as_str().unwrap_or("")
+            ),
+            row["first_repeat_days"]
+                .as_f64()
+                .map(|d| json!((d * 10.0).round() / 10.0))
+                .unwrap_or(Value::Null),
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_still_dir_keeps_the_newest_max_files() {
+        let dir = std::env::temp_dir().join(format!("etv-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        for i in 0..10u64 {
+            let f = std::fs::File::create(dir.join(format!("{i}.jpg"))).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i))
+                .unwrap();
+        }
+        prune_still_dir(&dir, 4);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["6.jpg", "7.jpg", "8.jpg", "9.jpg"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

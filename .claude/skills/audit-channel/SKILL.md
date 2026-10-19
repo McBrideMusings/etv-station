@@ -104,7 +104,7 @@ applicable" with the reason.
 
 ## Step 4 — review pass
 
-Run the Review view as `.claude/skills/programming/SKILL.md` §"The Review view"
+Run the channel review as `.claude/skills/programming/SKILL.md` §"The channel review"
 says, 14 days, and keep the server running — the before/after of any fix you
 propose comes from the same process. Grade the channel against
 `docs/programming.md`, naming the principle behind each critique, and report

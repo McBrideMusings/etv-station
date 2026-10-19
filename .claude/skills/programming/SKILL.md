@@ -1,6 +1,6 @@
 ---
 name: programming
-description: "Load before editing any channel.yaml under deploy/appdata/channels/ or examples/channels/ (pools, blocks, pattern, sequencer, slots, schedules, dayparts, seasonal runs, rest periods), and before reviewing or judging a channel's schedule. Points at docs/programming.md for the principles and runs the web UI's Review view before and after the edit."
+description: "Load before editing any channel.yaml under deploy/appdata/channels/ or examples/channels/ (pools, blocks, pattern, sequencer, slots, schedules, dayparts, seasonal runs, rest periods), and before reviewing or judging a channel's schedule. Points at docs/programming.md for the principles and runs the web dashboard's channel review before and after the edit."
 user_invocable: true
 ---
 
@@ -13,7 +13,7 @@ of them. It names the steps around a schedule edit.
 
 1. **Read `docs/programming.md`** in full before changing what a channel airs or
    when. Name the principle each change serves when you report it.
-2. **Run the channel's Review view and keep its numbers** (below). That run is
+2. **Run the channel's review and keep its numbers** (below). That run is
    the "before".
 3. **Read the comment-style rule** for `channel.yaml` in `CLAUDE.local.md`
    (§"Comment style in `deploy/appdata/channels/*/channel.yaml`") and follow it.
@@ -26,9 +26,9 @@ a worktree under `~/.worktrees/`, and an edit there
 produces no commit. Edit those files in the main checkout, by hand, in this
 session — never hand that work to a worktree agent.
 
-## The Review view
+## The channel review
 
-The station's web UI (`etv-station --serve-ui`) serves it. Start it from the main checkout:
+The station's web dashboard (`etv-station --serve-ui`) shows it as a channel's Schedule tab, `http://127.0.0.1:4747/#/channels/<folder>/schedule`. Start it from the main checkout:
 
 ```sh
 ./tools/station-ui.sh                   # always a release build; serves http://127.0.0.1:4747/
@@ -36,13 +36,13 @@ The station's web UI (`etv-station --serve-ui`) serves it. Start it from the mai
 
 `STATION_UI_CONFIG=<file>` picks the lineup it steps through (default
 `deploy/appdata/station.yaml`); point it at `examples/station.yaml` for a channel
-under `examples/channels/`. The deployed container serves the same pages on port 4747,
+under `examples/channels/`. The deployed container serves the same dashboard on port 4747,
 against prod's own catalog and deployed plugins; it cannot see an edit you have not deployed.
 
 Read the numbers from the JSON, not a screenshot:
 
 ```sh
-curl -s 'http://127.0.0.1:4747/api/review?channel=<folder>&days=14'
+tools/ui-get.sh '/api/channels/<folder>/review?days=14'          # add --prod for the deployed one
 ```
 
 `<folder>` is the channel's key in the lineup. Under `deploy/appdata/channels/`
@@ -52,8 +52,8 @@ flat files sharing one folder, it is the path relative to the station file, e.g.
 
 The simulation runs on a worker thread (`crates/etv-station/src/web_ui/sim_cache.rs`).
 A request it has no result for answers `202 {"pending":true}` at once and moves
-the channel to the front of the worker's queue; ask again every 15s until the
-body is the review. The worker first finishes the simulation it is running —
+the channel to the front of the worker's queue; `tools/ui-get.sh` asks again
+every 15s until the body is the review. The worker first finishes the simulation it is running —
 on startup it fills the whole lineup in `station.yaml` order — so the first
 answer can take that channel's time plus your own. Request the channel as soon
 as the server is up.

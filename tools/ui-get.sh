@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Print one web dashboard endpoint's JSON — the same answer the page shows.
+#
+# A simulation-backed endpoint (a channel's review) answers 202
+# {"pending": true} while the UI's worker simulates; this asks again every
+# 15s until the body arrives, so a caller gets the review, never the 202.
+#
+# Usage:
+#   tools/ui-get.sh <path> [--prod]
+#   tools/ui-get.sh /api/lineup
+#   tools/ui-get.sh '/api/channels/034-syfy/review?days=3'
+#   tools/ui-get.sh /api/health --prod
+#
+# Local is http://127.0.0.1:${ETV_UI_PORT:-4747} (tools/station-ui.sh). --prod
+# is ${ETV_UI_PROD_URL}, else http://${UNRAID_HOST}:4747, read from .env.
+# ETV_UI_WAIT caps the wait for a pending answer (default 900s).
+#
+# The body goes to stdout. Exits 0 on a 2xx, 1 on a 4xx/5xx (body still on
+# stdout, status on stderr), 2 when the server cannot be reached or the wait
+# runs out.
+set -euo pipefail
+
+usage() { echo "usage: tools/ui-get.sh <path> [--prod]" >&2; exit 2; }
+
+path=""
+prod=0
+for arg in "$@"; do
+  case "$arg" in
+    --prod) prod=1 ;;
+    -h|--help) usage ;;
+    *) [ -z "$path" ] || usage; path="$arg" ;;
+  esac
+done
+[ -n "$path" ] || usage
+case "$path" in /*) ;; *) path="/$path" ;; esac
+
+# A value the caller set wins over .env's.
+caller_port="${ETV_UI_PORT:-}"
+caller_prod_url="${ETV_UI_PROD_URL:-}"
+caller_wait="${ETV_UI_WAIT:-}"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -f "$repo/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$repo/.env"
+  set +a
+fi
+ETV_UI_PORT="${caller_port:-${ETV_UI_PORT:-}}"
+ETV_UI_PROD_URL="${caller_prod_url:-${ETV_UI_PROD_URL:-}}"
+ETV_UI_WAIT="${caller_wait:-${ETV_UI_WAIT:-}}"
+
+if [ "$prod" = 1 ]; then
+  if [ -n "${ETV_UI_PROD_URL:-}" ]; then
+    base="$ETV_UI_PROD_URL"
+  else
+    : "${UNRAID_HOST:?set UNRAID_HOST (or ETV_UI_PROD_URL) in .env}"
+    base="http://$UNRAID_HOST:4747"
+  fi
+else
+  base="http://127.0.0.1:${ETV_UI_PORT:-4747}"
+fi
+
+body="$(mktemp)"
+trap 'rm -f "$body"' EXIT
+deadline=$(( $(date +%s) + ${ETV_UI_WAIT:-900} ))
+while :; do
+  if ! status="$(curl -sS --max-time 60 -o "$body" -w '%{http_code}' "$base$path")"; then
+    echo "ui-get: cannot reach $base$path" >&2
+    exit 2
+  fi
+  if [ "$status" != 202 ]; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "ui-get: $base$path still pending after ${ETV_UI_WAIT:-900}s" >&2
+    exit 2
+  fi
+  echo "ui-get: $path pending; asking again in 15s" >&2
+  sleep 15
+done
+
+cat "$body"
+echo
+case "$status" in
+  2??) exit 0 ;;
+  *) echo "ui-get: $base$path answered HTTP $status" >&2; exit 1 ;;
+esac

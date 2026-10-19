@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>etv-station · Review</title>
+<title>etv-station</title>
 <style>
   :root {
     color-scheme: light;
@@ -24,10 +24,39 @@
     }
   }
   * { box-sizing: border-box; }
-  /* The page itself never scrolls: toolbar and masthead stay put, and only the guide and the rail scroll inside it. */
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 12px 20px;
+  /* `hidden` must win over every `display` rule below (the toolbar is flex, the narrow picker block). */
+  [hidden] { display: none !important; }
+  /* The page itself never scrolls: tabs, lineup and masthead stay put, and only the lineup, the guide and the rail scroll inside it. */
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0;
     background: var(--bg); color: var(--fg); font-size: 14px; line-height: 1.4;
     height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
+
+  /* The dashboard frame: a tab bar, then on Channels the lineup beside the channel's page. */
+  .tabs { display: flex; align-items: center; gap: 4px; padding: 8px 20px; border-bottom: 1px solid var(--line); background: var(--panel); flex: none; }
+  .tabs .brand { font-weight: 800; margin-right: 12px; }
+  .tabs a { padding: 4px 12px; border-radius: 3px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 13px; }
+  .tabs a[aria-current="page"] { background: var(--bg); color: var(--fg); box-shadow: inset 0 0 0 1px var(--line); }
+  .tabs a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .app { flex: 1; min-height: 0; display: grid; grid-template-columns: 210px minmax(0, 1fr); }
+  .app.wide { grid-template-columns: minmax(0, 1fr); }
+  .lineup { border-right: 1px solid var(--line); overflow: auto; padding: 8px 0; font-size: 13px; }
+  .lineup a { display: flex; gap: 8px; padding: 3px 14px; color: var(--fg); text-decoration: none; white-space: nowrap; }
+  .lineup a .n { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 2.2em; text-align: right; }
+  .lineup a .nm { overflow: hidden; text-overflow: ellipsis; }
+  .lineup a:hover { background: var(--panel); }
+  .lineup a[aria-current="page"] { background: var(--accent); color: var(--bg); }
+  .lineup a[aria-current="page"] .n { color: inherit; }
+  .lineup a.broken .nm { color: var(--err-fg); }
+  .lineup a:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .lineup .lstate { padding: 4px 14px; }
+  #lineupSelect { display: none; }
+  main { min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 10px 20px 12px; }
+  .subtabs { display: flex; gap: 2px; }
+  .subtabs a { padding: 3px 10px; color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent; font-weight: 600; }
+  .subtabs a[aria-current="page"] { color: var(--fg); border-bottom-color: var(--accent); }
+  .pattern-page { max-width: 760px; }
+  .empty { max-width: 520px; margin: 40px auto; text-align: center; }
+  .empty h1 { font-size: 20px; margin: 0 0 6px; }
   a { color: var(--accent); }
   h2 { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 6px; }
   .muted { color: var(--muted); font-size: 12.5px; }
@@ -154,6 +183,11 @@
     :root { --col: 120px; }
     /* Too narrow to lock: the page scrolls, the guide keeps its own scroll box above the rail. */
     body { height: auto; overflow: visible; display: block; }
+    /* The lineup folds into a picker above the channel's page. */
+    .app { display: block; }
+    .lineup { display: none; }
+    #lineupSelect { display: block; margin: 10px 20px 0; max-width: calc(100% - 40px); }
+    main { padding: 10px 16px; }
     #report { display: block; overflow: visible; }
     .layout { grid-template-columns: minmax(0, 1fr); }
     .gwrap { height: 70vh; }
@@ -163,20 +197,33 @@
 </style>
 </head>
 <body>
-<div class="toolbar">
-  <a href="/">← Tuning view</a>
-  <button id="prevBtn" type="button">← Previous channel</button>
-  <button id="nextBtn" type="button">Next channel →</button>
-  <label for="picker" class="muted">Channel</label>
-  <select id="picker"></select>
-  <span id="position" class="muted"></span>
-  <span class="spacer"></span>
-  <label for="days">Days shown</label>
-  <input type="number" id="days" min="1" max="60" value="14">
-  <button id="applyDays" type="button">Re-simulate</button>
+<nav class="tabs" aria-label="Dashboard">
+  <span class="brand">etv-station</span>
+  <a id="tabChannels" href="#/channels">Channels</a>
+  <a id="tabGuide" href="#/guide">Guide</a>
+  <a id="tabHealth" href="#/health">Health</a>
+  <span class="spacer" style="flex:1"></span>
+  <a href="/tune">Tune</a>
+</nav>
+<div class="app" id="app">
+  <nav class="lineup" id="lineup" aria-label="Channels"><div class="lstate muted">Loading the lineup…</div></nav>
+  <main>
+    <select id="lineupSelect" aria-label="Channel"></select>
+    <div class="toolbar" id="toolbar">
+      <nav class="subtabs" aria-label="Channel views">
+        <a id="subSchedule" href="#">Schedule</a>
+        <a id="subPattern" href="#">Pattern</a>
+      </nav>
+      <span id="position" class="muted"></span>
+      <span class="spacer"></span>
+      <label for="days">Days shown</label>
+      <input type="number" id="days" min="1" max="60" value="14">
+      <button id="applyDays" type="button">Re-simulate</button>
+    </div>
+    <div id="state" class="muted"></div>
+    <div id="report"></div>
+  </main>
 </div>
-<div id="state" class="muted"></div>
-<div id="report"></div>
 <div id="tip" hidden></div>
 
 <script>
@@ -190,14 +237,26 @@ const GUIDE_OPEN_HOUR = 12;
 
 // A 202 poll gives up after this long and shows an error instead of spinning.
 const POLL_DEADLINE_MS = 600000;
-let current = null;   // the last /api/review payload
-let lineup = { prev: null, next: null };
-let shownKey = null;   // the lineup key the picker last confirmed
+let current = null;   // the last channel review payload
+let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
-function params() {
-  const p = new URLSearchParams(location.search);
-  return { channel: p.get('channel'), days: p.get('days') };
+// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern}?days=N`,
+// `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
+function parseRoute() {
+  const [path, qs] = location.hash.replace(/^#/, '').split('?');
+  const parts = path.split('/').filter(Boolean);
+  const q = new URLSearchParams(qs || '');
+  const tab = ['channels', 'guide', 'health'].includes(parts[0]) ? parts[0] : 'channels';
+  return {
+    tab,
+    channel: tab === 'channels' && parts[1] ? decodeURIComponent(parts[1]) : null,
+    view: parts[2] === 'pattern' ? 'pattern' : 'schedule',
+    days: q.get('days'),
+  };
+}
+function channelHash(channel, view, days) {
+  return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${days ? `?days=${days}` : ''}`;
 }
 
 function fmt(ts, tz, opts) {
@@ -208,26 +267,33 @@ const dayOf = (ts, tz) => fmt(ts, tz, { weekday: 'short', month: 'short', day: '
 const days1 = (d) => (Math.round(d * 10) / 10).toFixed(1);
 const hourLabel = (h) => (h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p');
 
-async function load(channel, days, push) {
+// Fetches the channel's review, asking again while the worker answers 202, then draws `view` from it.
+async function load(channel, days, view) {
   const q = new URLSearchParams();
-  if (channel) q.set('channel', channel);
   if (days) q.set('days', days);
-  if (push) history.pushState(null, '', `/review?${q}`);
-  $('state').innerHTML = '<span class="spinner"></span>Simulating…';
+  const elapsed = Date.now();
+  const pending = () => {
+    $('state').innerHTML = `<span class="spinner"></span>Simulating ${esc(channel)}… (${Math.round((Date.now() - elapsed) / 1000)}s; asked again every second)`;
+  };
+  pending();
+  // Another channel's report never stays on screen under this one's spinner; the same channel's dims while it reloads.
+  if (!current || current.channel !== channel) { current = null; $('report').innerHTML = ''; }
   $('report').classList.add('loading');
-  for (const b of [$('prevBtn'), $('nextBtn'), $('applyDays'), $('picker')]) b.disabled = true;
+  $('applyDays').disabled = true;
   const seq = ++loadSeq;
   const deadline = Date.now() + POLL_DEADLINE_MS;
   let data;
   try {
     // A 202 means the worker is still simulating this channel; ask again.
     for (;;) {
-      const res = await fetch(`/api/review?${q}`);
+      const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/review?${q}`);
       data = await res.json();
+      if (!res.ok) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
       if (!data.pending) break;
       if (Date.now() > deadline) throw new Error(`still simulating after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
       await new Promise((r) => setTimeout(r, 1000));
       if (seq !== loadSeq) return;
+      pending();
     }
   } catch (e) {
     data = { error: String(e) };
@@ -235,20 +301,16 @@ async function load(channel, days, push) {
   if (seq !== loadSeq) return;
   $('report').classList.remove('loading');
   $('applyDays').disabled = false;
-  $('picker').disabled = false;
-  if (data.lineup) lineup = data.lineup;
-  $('prevBtn').disabled = !lineup.prev;
-  $('nextBtn').disabled = !lineup.next;
-  fillPicker(data);
-  $('position').textContent = data.lineup ? `${data.lineup.position} of ${data.lineup.total} in station.yaml order` : '';
   if (data.days) $('days').value = data.days;
   $('state').textContent = '';
   if (data.error) {
-    $('report').innerHTML = `<header class="mast"><h1>${esc(channel || 'Review')}</h1></header>
+    current = null;
+    $('report').innerHTML = `<header class="mast"><h1>${esc(channel)}</h1></header>
       <h2>The review could not be built</h2><div class="error">${esc(data.error)}</div>`;
     return;
   }
   if (data.load_error) {
+    current = null;
     document.title = `etv-station · ${data.channel}`;
     $('report').innerHTML = `<header class="mast"><div><h1>${esc(data.channel)}</h1>
       <div class="sub">${esc(data.config_path)}</div></div></header>
@@ -258,21 +320,93 @@ async function load(channel, days, push) {
   // Per-item catalog fields arrive once per entry id in `items`; merge them onto each airing.
   for (const a of data.airings) Object.assign(a, data.items[a.id]);
   current = data;
-  render(data);
+  draw(view);
 }
 
-// The picker lists every lineup entry as "number · display name"; a channel that failed to load shows its key.
-function fillPicker(data) {
-  const sel = $('picker');
-  const list = data.lineup && data.lineup.channels;
-  // No lineup in the response (an error): put the picker back on the channel the page still shows.
-  if (!list) { if (shownKey) sel.value = shownKey; return; }
-  sel.innerHTML = list.map((c) => {
-    const name = c.number == null ? c.key : `${c.number} · ${c.display_name || c.key}`;
-    return `<option value="${esc(c.key)}">${esc(name)}</option>`;
-  }).join('');
-  const here = list[data.lineup.position - 1];
-  if (here) { sel.value = here.key; shownKey = here.key; }
+function draw(view) {
+  if (view === 'pattern') renderPattern(current); else render(current);
+}
+
+// The lineup rail: every channel in station.yaml order as "number name"; one that failed to load shows its key in red.
+async function loadLineup() {
+  let data;
+  try {
+    const res = await fetch('/api/lineup');
+    data = await res.json();
+    if (!res.ok) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
+  } catch (e) {
+    data = { error: String(e) };
+  }
+  if (data.error) {
+    $('lineup').innerHTML = `<div class="lstate error">${esc(data.error)}</div>`;
+    return;
+  }
+  lineup = data.channels;
+  if (!lineup.length) {
+    $('lineup').innerHTML = '<div class="lstate muted">The station lists no channels.</div>';
+    return;
+  }
+  $('lineup').innerHTML = lineup.map((c) => `<a data-key="${esc(c.channel)}" class="${c.error ? 'broken' : ''}"
+      title="${esc(c.error ? `${c.channel}: ${c.error}` : c.channel)}">
+      <span class="n">${esc(c.number ?? '—')}</span><span class="nm">${esc(c.display_name || c.channel)}</span></a>`).join('');
+  $('lineupSelect').innerHTML = lineup.map((c) =>
+    `<option value="${esc(c.channel)}">${esc(c.number == null ? c.channel : `${c.number} · ${c.display_name || c.channel}`)}</option>`).join('');
+}
+
+// Marks where the page is: the tab, the channel in the lineup, the sub-tab, and the links that keep the days.
+function markRoute(r) {
+  for (const [id, tab] of [['tabChannels', 'channels'], ['tabGuide', 'guide'], ['tabHealth', 'health']]) {
+    if (r.tab === tab) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
+  }
+  $('app').classList.toggle('wide', r.tab !== 'channels');
+  $('lineup').hidden = r.tab !== 'channels';
+  $('lineupSelect').hidden = r.tab !== 'channels';
+  $('toolbar').hidden = r.tab !== 'channels';
+  if (r.tab !== 'channels' || !lineup) return;
+  const days = $('days').value;
+  for (const a of $('lineup').querySelectorAll('a')) {
+    a.href = channelHash(a.dataset.key, r.view, days);
+    if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+  }
+  $('lineupSelect').value = r.channel;
+  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern']]) {
+    $(id).href = channelHash(r.channel, view, days);
+    if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
+  }
+  const i = lineup.findIndex((c) => c.channel === r.channel);
+  $('position').textContent = i < 0 ? '' : `${i + 1} of ${lineup.length} in station.yaml order`;
+  const sel = $('lineup').querySelector('[aria-current="page"]');
+  if (sel) sel.scrollIntoView({ block: 'nearest' });
+}
+
+// Guide and Health have no content yet: say so rather than show an empty frame.
+function renderEmpty(tab) {
+  current = null;
+  document.title = `etv-station · ${tab === 'guide' ? 'Guide' : 'Health'}`;
+  $('state').textContent = '';
+  $('report').classList.remove('loading');
+  $('report').innerHTML = `<div class="empty"><h1>${tab === 'guide' ? 'Guide' : 'Health'}</h1>
+    <p class="muted">${tab === 'guide'
+      ? 'Not built yet. It will show what is on every channel now, with the stream playing beside it.'
+      : 'Not built yet. It will show each channel\'s encoder, failures and last stall.'}</p></div>`;
+}
+
+let shown = null;   // the channel and days the report holds, so a sub-tab switch redraws without refetching
+async function route() {
+  const r = parseRoute();
+  if (!lineup) await loadLineup();
+  if (r.tab === 'channels' && !r.channel) {
+    // A bare `#/channels` (or no hash) opens the first channel in the lineup.
+    if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.days)); return; }
+  }
+  if (r.days) $('days').value = r.days;
+  markRoute(r);
+  if (r.tab !== 'channels') { loadSeq++; shown = null; renderEmpty(r.tab); return; }
+  if (!r.channel) return;
+  const key = `${r.channel}|${$('days').value}`;
+  if (shown === key && current) { draw(r.view); return; }
+  shown = key;
+  await load(r.channel, $('days').value, r.view);
 }
 
 function poolColor(d) {
@@ -418,7 +552,7 @@ function render(d) {
 
   $('report').innerHTML = html.join('');
   renderGuide(d, colors);
-  $('patternBtn').addEventListener('click', () => showPanel(patternPanel(d, colors)));
+  $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'pattern', $('days').value); });
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
   $('gwrap').scrollTop = GUIDE_OPEN_HOUR * 60 * ppm;
 }
@@ -464,7 +598,17 @@ function patternPanel(d, colors) {
     const placed = b.placed.length ? `<p class="muted">Airs ${esc(b.placed.join('; '))}.</p>` : '';
     return `<h4>${esc(b.name)}</h4>${placed}${rows}`;
   }).join('');
-  return `<button class="x" type="button" aria-label="Close">×</button><h3>Pattern</h3>${blocks}`;
+  return blocks;
+}
+
+// The Pattern sub-tab: the masthead's identity line, then every block's steps with what each pool aired.
+function renderPattern(d) {
+  document.title = `etv-station · ${d.number} ${d.display_name || d.name} · Pattern`;
+  const colors = poolColor(d);
+  $('report').innerHTML = `<header class="mast"><div class="bug">${esc(d.number)}</div>
+      <div><h1>${esc(d.display_name || d.name)}</h1>
+      <div class="sub">${d.days} days simulated (${esc(d.tz)}) · ${esc(d.config_path)}</div></div></header>
+    <section class="insp pattern-page">${patternPanel(d, colors)}</section>`;
 }
 
 const num = (v) => (typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(2) : String(v));
@@ -614,16 +758,18 @@ document.addEventListener('scroll', () => {
   if (focused) showTip(focused); else hideTip();
 }, true);
 
-$('prevBtn').addEventListener('click', () => lineup.prev && load(lineup.prev, $('days').value, true));
-$('nextBtn').addEventListener('click', () => lineup.next && load(lineup.next, $('days').value, true));
-$('picker').addEventListener('change', () => load($('picker').value, $('days').value, true));
-$('applyDays').addEventListener('click', () => load(current ? current.channel : params().channel, $('days').value, true));
+$('lineupSelect').addEventListener('change', () => { const r = parseRoute(); location.hash = channelHash($('lineupSelect').value, r.view, $('days').value); });
+$('applyDays').addEventListener('click', () => {
+  const r = parseRoute();
+  if (!r.channel) return;
+  const target = channelHash(r.channel, r.view, $('days').value);
+  // The same hash fires no hashchange; re-simulating the shown days still asks again.
+  if (location.hash === target) { shown = null; route(); } else location.hash = target;
+});
 $('days').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('applyDays').click(); });
-window.addEventListener('popstate', () => { const p = params(); load(p.channel, p.days, false); });
+window.addEventListener('hashchange', route);
 
-const p = params();
-if (p.days) $('days').value = p.days;
-load(p.channel, p.days, false);
+route();
 </script>
 </body>
 </html>

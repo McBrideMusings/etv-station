@@ -24,12 +24,13 @@ for three orchestrate rounds.
 ./tools/verify-all.sh test         # just tests, still both
 ```
 
-The web UI's Review page is plain HTML with an inline script that no cargo test loads.
-Run its load check after any edit to `crates/etv-station/src/web_ui/review.html`:
+The web UI's pages are plain HTML with an inline script that no cargo test loads.
+Run the load check after any edit to `crates/etv-station/src/web_ui/shell.html` or `tune.html`:
 
 ```bash
-node tools/review-page-check.js crates/etv-station/src/web_ui/review.html
-# expect: review page script loads without error
+node tools/ui-page-check.js crates/etv-station/src/web_ui/shell.html
+node tools/ui-page-check.js crates/etv-station/src/web_ui/tune.html
+# expect: dashboard page script loads without error, once per page
 ```
 
 The script is the only place the command list lives — `CLAUDE.md` and `admin.toml`
@@ -359,7 +360,7 @@ export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratc
 export ETV_STATION_CATALOG=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/taste-debug/catalog.db
 cargo run --release --bin etv-station -- \
   --config "$SIM/appdata/station.yaml" --serve-ui --ui-port <PORT>
-curl -s 'http://127.0.0.1:<PORT>/api/review?channel=034-syfy&days=14' > a.json   # twice: a.json, b.json
+ETV_UI_PORT=<PORT> tools/ui-get.sh '/api/channels/034-syfy/review?days=14' > a.json   # twice: a.json, b.json
 ```
 
 Look for, per films pool: `list_position` 1, 2, … inside one `seed_period`
@@ -1059,19 +1060,32 @@ station config does not load. Every request logs `event="ui.request"` with statu
 and ms; a review logs `ui.review` with its generation count and ms.
 
 Locally: `./tools/station-ui.sh` (`admin tools ui`), then
-`curl -s http://127.0.0.1:4747/api/health`. In the image, with no media and no Plex,
+`tools/ui-get.sh /api/health`. In the image, with no media and no Plex,
 copy `examples/` to a scratch `config/`, mount `crates/etv-overlay/fixtures` at
 `/crates/etv-overlay/fixtures` (the lavfi channel's overlay names it by a `../../`
 path), and run with `-e ETV_STATION_CONFIG=/config/station-test.yaml -p 14747:4747`.
 Look for, observed 2026-10-18 on a native build: health 200 within 2s of start,
-`<title>etv-station · Review</title>` at `/review`, `/channels.m3u` still 200 on
+`<title>etv-station</title>` at `/`, `/channels.m3u` still 200 on
 8409, and `docker exec <ctr> ps -eo pid,ni,args` showing the `--serve-ui` process
 at NI 19 while the daemon and `ersatztv` sit at 0. After `docker kill -s TERM`, the
 `--serve-ui` process is gone within 3s. `POST /api/select` with a path outside the
 lineup answers 400 "is not a tunable channel in this station's lineup".
 
+**The dashboard** is one page at `/`: tabs (Channels, Guide, Health) and, on
+Channels, a lineup rail fed by `GET /api/lineup` (every lineup channel in
+`station.yaml` order: `channel` key, `number`, `display_name`, `scored`, and
+`error` for one that failed to load; logs `ui.lineup`). The view lives in the
+hash and mirrors the API: `#/channels/{ch}/schedule|pattern?days=N` is answered by
+`GET /api/channels/{ch}/review?days=N`; a key not in the lineup is a 404. Run
+`tools/ui-get.sh /api/lineup` and `tools/ui-get.sh '/api/channels/<key>/review?days=3'`,
+then screenshot, light and dark: a channel's Schedule populated, its Pattern, the
+pending state (a fresh channel while the worker is busy), a 404 key
+(`#/channels/nope/schedule` shows "The review could not be built"), Guide and
+Health (each "Not built yet"), and the page at 400px wide (the rail folds into a
+picker). `/tune` still serves the Tune page.
+
 A review's simulation runs on a worker thread (`sim_cache`), not the request thread.
-`GET /api/review` answers 202 `{"pending": true}` until the worker has the channel
+`GET /api/channels/{ch}/review` answers 202 `{"pending": true}` until the worker has the channel
 (the page polls every second), then 200 from the cache; `/api/health` stays
 responsive meanwhile and carries `sim_cache: {in_memory, queued, running}`. The
 worker fills the lineup in `station.yaml` order and runs a requested channel next

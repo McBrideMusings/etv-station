@@ -316,7 +316,7 @@ impl SimCache {
             std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
         })();
         match result {
-            Ok(()) => super::prune_still_dir(&self.dir, DISK_MAX_FILES),
+            Ok(()) => super::channel::prune_still_dir(&self.dir, DISK_MAX_FILES),
             Err(e) => {
                 tracing::warn!(event = "ui.sim.disk_write_failed", path = %path.display(), error = %e, "simulation not cached on disk")
             }
@@ -458,7 +458,7 @@ impl SimCache {
         let channel_mtime = fp.get(1).and_then(|(_, m)| *m);
         let account = match accounts.get(&lc.config_path) {
             Some((m, id)) if *m == channel_mtime => Ok(*id),
-            _ => super::channel_account_id(&lc.config).inspect(|id| {
+            _ => super::tune::channel_account_id(&lc.config).inspect(|id| {
                 accounts.insert(lc.config_path.clone(), (channel_mtime, *id));
             }),
         };
@@ -481,7 +481,7 @@ impl SimCache {
         });
         tracing::info!(
             event = "ui.sim.done",
-            channel = %super::channel_key(&key.config_path),
+            channel = %super::lineup::channel_key(&key.config_path),
             days = key.days,
             ok = result.is_ok(),
             error = result.as_ref().err().map(String::as_str),
