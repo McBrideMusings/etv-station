@@ -1436,6 +1436,25 @@ fn lineup_keys(lineup: &[PathBuf], base: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The picker's options: one per lineup entry, in lineup order, each with the
+/// key the Review URL takes. A channel that loaded carries its number and
+/// display name; one that was dropped has only its key.
+fn lineup_options(station: &config::Station, keys: &[String]) -> Vec<Value> {
+    station
+        .lineup
+        .iter()
+        .zip(keys)
+        .map(|(path, key)| {
+            let loaded = station.channels.iter().find(|c| c.config_path == *path);
+            json!({
+                "key": key,
+                "number": loaded.map(|c| c.config.number),
+                "display_name": loaded.and_then(|c| c.config.display_name.clone()),
+            })
+        })
+        .collect()
+}
+
 fn file_mtime(path: &Path) -> Result<std::time::SystemTime, String> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
@@ -1472,6 +1491,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         "total": keys.len(),
         "prev": position.checked_sub(1).map(|i| keys[i].clone()),
         "next": keys.get(position + 1).cloned(),
+        "channels": lineup_options(&station, &keys),
     });
     let days = params
         .get("days")
