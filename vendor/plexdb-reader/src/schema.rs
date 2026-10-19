@@ -79,6 +79,46 @@ pub fn check_store(conn: &Connection, path: &Path) -> Result<(), ReaderError> {
     Ok(())
 }
 
+/// The `frames.db` schema version this crate's search was written against
+/// (`plexdb/frames.py::SCHEMA_VERSION`). A frames.db at any other version is
+/// refused at open, older or newer.
+pub const SUPPORTED_FRAMES_VERSION: i64 = 4;
+
+/// Confirm the attached `frames` schema is a frames.db at exactly
+/// [`SUPPORTED_FRAMES_VERSION`].
+pub fn check_frames(conn: &Connection, path: &Path) -> Result<(), ReaderError> {
+    let has: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM frames.sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has.is_none() {
+        return Err(ReaderError::NotAFramesFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM frames.schema_version LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let found = found.ok_or_else(|| ReaderError::NotAFramesFile {
+        path: path.to_path_buf(),
+    })?;
+    if found != SUPPORTED_FRAMES_VERSION {
+        return Err(ReaderError::UnsupportedFramesVersion {
+            path: path.to_path_buf(),
+            found,
+            supported: SUPPORTED_FRAMES_VERSION,
+        });
+    }
+    Ok(())
+}
+
 fn has_table(conn: &Connection, name: &str) -> Result<bool, ReaderError> {
     Ok(conn
         .query_row(

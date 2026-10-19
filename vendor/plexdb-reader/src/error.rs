@@ -41,4 +41,55 @@ pub enum ReaderError {
 
     #[error("store query failed: {0}")]
     Query(#[from] rusqlite::Error),
+
+    #[error("failed to attach the Frame index at {path}: {source}")]
+    FramesOpen {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("{path} has no schema_version row — it is not a frames.db")]
+    NotAFramesFile { path: PathBuf },
+
+    #[error(
+        "frames.db at {path} is schema version {found}, but plexdb-reader reads version \
+         {supported} — rebuild plexdb-reader against a matching plex-db-ex, or migrate the \
+         Frame index with `plexdb frames migrate`"
+    )]
+    UnsupportedFramesVersion {
+        path: PathBuf,
+        found: i64,
+        supported: i64,
+    },
+
+    #[error("the Frame index is not attached — open the Reader with a frames.db path")]
+    FramesNotAttached,
+
+    #[error("no Phrase cache was given — open the Reader with a PhraseCache to search")]
+    NoPhraseCache,
+
+    #[error("the Phrase cache at {path} failed: {source}")]
+    PhraseCache {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("{0}")]
+    EncoderUnavailable(String),
+
+    #[error("{0}")]
+    EncoderFailed(String),
+
+    #[error(
+        "the pool holds titles indexed by more than one model ({0}); a search compares vectors of one model"
+    )]
+    MixedModels(String),
+
+    #[error("the Frame index is inconsistent for {item_id}: {detail}")]
+    InconsistentIndex { item_id: String, detail: String },
+
+    #[error("invalid search: {0}")]
+    InvalidSearch(String),
 }

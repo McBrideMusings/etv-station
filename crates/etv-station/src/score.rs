@@ -35,8 +35,8 @@
 //! // as `#{ datastore: "name" }` instead of a bare string; see
 //! // `config::Pool::datastores`. A granted datastore is reached as
 //! // `ctx.datastore("name")` (#181), which returns a handle exposing the
-//! // plex-db-ex reader crate's eight accessors — `enrichment_for`,
-//! // `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`,
+//! // plex-db-ex reader crate's nine accessors — `enrichment_for`,
+//! // `enrichment_for_many`, `edges_from`, `edges_to`, `tag_neighbours`, `taste_vector_for`,
 //! // `pooled_taste_vector`, `watched_units_for`, `watched_units` — or fails
 //! // the pick() call naming the datastore if it was never granted.
 //! // `"http"` gates `ctx.http(url, method, body)`, the one way a script
@@ -859,7 +859,7 @@ impl GrantedCapabilities {
         grants: &[crate::config::DatastoreGrant],
     ) -> Result<Self, String> {
         for grant in grants {
-            let reader = plexdb_reader::Reader::open(&grant.path)
+            let reader = plexdb_reader::Reader::open(&grant.path, None, None)
                 .map_err(|e| format!("datastore {:?} at {:?}: {e}", grant.name, grant.path))?;
             self.datastores
                 .insert(grant.name.clone(), Arc::new(Mutex::new(reader)));
@@ -1122,6 +1122,25 @@ impl Datastore {
         Ok(edges.into_iter().map(edge_to_dynamic).collect())
     }
 
+    /// The tags sharing titles with `tag` on the precomputed tag network of
+    /// `kind`, strongest first, as `[#{ tag, shared, df }]`.
+    fn tag_neighbours(&mut self, kind: &str, tag: &str) -> Result<Array, Box<EvalAltResult>> {
+        let neighbours = self
+            .lock()
+            .tag_neighbours(kind, tag)
+            .map_err(|e| format!("datastore: tag_neighbours({kind:?}, {tag:?}): {e}"))?;
+        Ok(neighbours
+            .into_iter()
+            .map(|n| {
+                let mut m = Map::new();
+                m.insert("tag".into(), n.tag.into());
+                m.insert("shared".into(), n.shared.into());
+                m.insert("df".into(), n.df.into());
+                Dynamic::from_map(m)
+            })
+            .collect())
+    }
+
     fn taste_vector_for(&mut self, plex_account_id: i64) -> Result<Dynamic, Box<EvalAltResult>> {
         let vector = self
             .lock()
@@ -1363,6 +1382,7 @@ pub(crate) fn engine() -> Engine {
         .register_fn("enrichment_for_many", Datastore::enrichment_for_many)
         .register_fn("edges_from", Datastore::edges_from)
         .register_fn("edges_to", Datastore::edges_to)
+        .register_fn("tag_neighbours", Datastore::tag_neighbours)
         .register_fn("taste_vector_for", Datastore::taste_vector_for)
         .register_fn("pooled_taste_vector", Datastore::pooled_taste_vector)
         .register_fn("watched_units_for", Datastore::watched_units_for)
@@ -1461,7 +1481,7 @@ impl ScoreCache {
         let entries = crate::profile::load(pool, base_dir)?;
         let keyword_store = match pool.datastores.first() {
             Some(grant) => Some(
-                plexdb_reader::Reader::open(&grant.path)
+                plexdb_reader::Reader::open(&grant.path, None, None)
                     .map_err(|e| format!("datastore {:?} at {:?}: {e}", grant.name, grant.path))?,
             ),
             None => None,

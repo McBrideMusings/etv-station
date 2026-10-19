@@ -42,6 +42,19 @@ fn write_fixture(path: &std::path::Path) {
              history_key TEXT PRIMARY KEY, item_id TEXT NOT NULL,
              plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL
          );
+         CREATE TABLE tag_network (
+             kind TEXT NOT NULL, value TEXT NOT NULL, df INTEGER NOT NULL,
+             x REAL NOT NULL, y REAL NOT NULL, PRIMARY KEY (kind, value)
+         );
+         CREATE TABLE tag_network_edge (
+             kind TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL,
+             shared INTEGER NOT NULL, PRIMARY KEY (kind, a, b)
+         );
+         INSERT INTO tag_network (kind, value, df, x, y) VALUES
+             ('movie', 'action', 97, 0, 0), ('movie', 'kung fu', 120, 0, 0),
+             ('movie', 'martial art', 142, 0, 0);
+         INSERT INTO tag_network_edge (kind, a, b, shared) VALUES
+             ('movie', 'action', 'kung fu', 60), ('movie', 'kung fu', 'martial art', 100);
          INSERT INTO items (item_id, type) VALUES ('imdb:tt1', 'movie'), ('imdb:tt3', 'movie');
          INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
              ('imdb:tt1', 'tmdb_keywords', 'keyword', 'heist', '2026-01-01T00:00:00+00:00'),
@@ -87,6 +100,16 @@ fn pick(ctx) {
 
     let back = ds.edges_to("imdb:tt2", "tmdb_similar");
     if back.len != 1 || back[0].from_id != "imdb:tt1" { throw "edges_to: wrong result"; }
+
+    // `shared` is a reserved word in Rhai, so it is read by index, not `.shared`.
+    let near = ds.tag_neighbours("movie", "kung fu");
+    if near.len != 2 { throw "tag_neighbours: expected 2 neighbours, got " + near.len; }
+    if near[0].tag != "martial art" || near[0]["shared"] != 100 || near[0].df != 142 {
+        throw "tag_neighbours: wrong strongest neighbour";
+    }
+    if near[1].tag != "action" || near[1]["shared"] != 60 || near[1].df != 97 {
+        throw "tag_neighbours: wrong second neighbour";
+    }
 
     let vector = ds.taste_vector_for(42);
     if vector.attributes.len != 1 { throw "taste_vector_for: expected 1 attribute"; }
@@ -238,7 +261,7 @@ fn a_duplicate_item_keyword_row_from_two_sources_counts_once() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("taste.db");
     write_dupe_and_keyword_form_fixture(&db);
-    let reader = plexdb_reader::Reader::open(&db).unwrap();
+    let reader = plexdb_reader::Reader::open(&db, None, None).unwrap();
 
     let facts = reader.enrichment_for("dup-a", "keywords").unwrap();
     assert_eq!(
@@ -271,7 +294,7 @@ fn keyword_for_surface_and_surfaces_for_keyword_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("taste.db");
     write_dupe_and_keyword_form_fixture(&db);
-    let reader = plexdb_reader::Reader::open(&db).unwrap();
+    let reader = plexdb_reader::Reader::open(&db, None, None).unwrap();
 
     assert_eq!(
         reader.keyword_for_surface("Heists").unwrap(),

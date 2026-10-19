@@ -1755,6 +1755,28 @@ and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
+#### `seen_boost` and `rating` — lean toward played titles, cut on a rating
+
+```yaml
+config:
+  seen_boost: 1.5                          # multiplier on titles in the account's plays; 1.0 = off
+  rating: { source: letterboxd, min: 6.5 } # or max:, or both
+```
+
+**`seen_boost`** multiplies the final score (after recency damping) of every
+title in the watched set `seen:` partitions on: the account's plays on a
+`single_user` channel, the house's on a pooled one. Unlike `seen: only` it keeps
+unplayed titles in the pool. It must be above 0.
+
+**`rating`** keeps titles whose value from one mdblist source lies within
+`[min, max]`, read from the `ratings` enrichment namespace (the fact's key is
+the source name). Values use the source's own scale: letterboxd 0–10, tomatoes
+0–100. A title with no value from that source is dropped. On a shows pool the
+value is the show's.
+
+Audit detail carries `seen_boosted` (bool) and `rating: { source, value }`
+(null on a pool with no `rating:`).
+
 #### `why` — an on-screen reason, worded by the pool
 
 Three more `config` keys give each pick a short reason an overlay can draw.
@@ -2020,7 +2042,7 @@ opened only by name:
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched; `ctx.entry_id_for(source, id)` — the `entry_id` the catalog filed under that `(source, source_id)` provenance row (`source` is `"plex"` or `"local_fs"`), or `()` when none matches, so a script joining its own external history (a Tautulli `rating_key`) resolves it without the daemon owning the join (ADR 0014) | `"catalog_read"` |
 | `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
 | `http` | `ctx.http(url, method, body)` — one HTTP call returning the response body as text; a 4xx/5xx, a transport failure or 10 seconds without a response is an error; one `pick()` call's `ctx.http` calls together may spend 30 seconds, after which each further call errors at once, naming the budget (ADR 0014) | `"http"` |
-| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
+| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `tag_neighbours`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411; `tag_neighbours(kind, tag)` returns `[#{ tag, shared, df }]` — the tags co-occurring with `tag` on the plex-db-ex tag network, ordered by `shared` descending; read `shared` as `n["shared"]`, since `shared` is a reserved word in Rhai; etv-station-xm8p.2); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
 
 Unlike `hooks()`, `capabilities()` is optional — a script with no such function
 declares nothing, which is the right answer for a plugin that only reads the
