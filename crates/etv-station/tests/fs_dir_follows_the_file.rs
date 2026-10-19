@@ -104,6 +104,7 @@ fn an_entry_with_files_in_two_folders_answers_to_both() {
             playback_path: format!("/data/media/{folder}/die-hard.mkv"),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
     }

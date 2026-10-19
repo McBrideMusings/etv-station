@@ -43,6 +43,7 @@ fn lotr_catalog() -> Catalog {
             playback_path: format!("/media/lotr/{id}.mkv"),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
     }
@@ -104,6 +105,7 @@ fn lotr_sample_breaks_ties_by_entry_id_and_sorts_nulls_last() {
             playback_path: format!("/media/{id}.mkv"),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
     };

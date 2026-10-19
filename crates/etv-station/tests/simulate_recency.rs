@@ -36,6 +36,7 @@ fn catalog() -> Catalog {
             playback_path: format!("/media/{id}.mkv"),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
     }
@@ -248,6 +249,7 @@ fn add_local_file(cat: &Catalog, e: &Entry) {
         playback_path: format!("/media/{}.mkv", e.entry_id),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 }

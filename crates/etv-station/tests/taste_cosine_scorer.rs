@@ -151,6 +151,7 @@ fn add(cat: &Catalog, id: &str, kind: &str) {
         playback_path: format!("/media/{id}.mkv"),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 }
@@ -644,6 +645,7 @@ fn an_episode_with_no_show_id_never_reaches_a_shows_pool() {
         playback_path: "/media/orphan.mkv".into(),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 
@@ -1295,6 +1297,7 @@ fn add_episode(cat: &Catalog, show_id: &str, season: i64, episode: i64) {
         playback_path: format!("/media/{id}.mkv"),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 }

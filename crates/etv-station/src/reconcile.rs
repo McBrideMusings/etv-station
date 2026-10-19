@@ -664,6 +664,7 @@ mod tests {
             playback_path: path.into(),
             last_seen: Some("2026-08-16T00:00:00Z".into()),
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         db
@@ -939,6 +940,7 @@ mod tests {
                 playback_path: "/media/b-new.mkv".into(),
                 last_seen: Some("2027-01-01T00:00:00Z".into()),
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }

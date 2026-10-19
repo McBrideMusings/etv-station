@@ -94,6 +94,7 @@ fn episode_catalog() -> Catalog {
         playback_path: "/media/ep1.mkv".into(),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
     cat.add_tag("ep1", TagNs::Genre, "Drama").unwrap();
@@ -178,6 +179,7 @@ fn films_and_bumpers_catalog() -> Catalog {
             playback_path: format!("/media/{id}.mkv"),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
     }
@@ -236,6 +238,7 @@ fn the_catalog_summary_column_still_auto_populates_description() {
         playback_path: "/media/m1.mkv".into(),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 
@@ -271,6 +274,7 @@ fn a_movie_keeps_its_own_title_and_no_sub_title() {
         playback_path: "/media/m1.mkv".into(),
         last_seen: None,
         missing_since: None,
+        unairable_reason: None,
     })
     .unwrap();
 
