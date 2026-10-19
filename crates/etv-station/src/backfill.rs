@@ -248,6 +248,7 @@ mod tests {
                 program: None,
                 metadata: None,
                 overlay: None,
+                normalize_loudness: None,
             });
             records.push(PlayRecord {
                 entry_id: id,

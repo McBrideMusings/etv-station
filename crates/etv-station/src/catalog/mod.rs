@@ -41,6 +41,13 @@ pub use model::{Collection, Entry, EntrySource, ExternalNs, Source, TagNs};
 /// Plex ingest.
 const META_LAST_PLEX_INGEST: &str = "last_plex_ingest";
 
+/// `catalog_meta` key holding the unix-seconds start of the last completed
+/// *full* Plex pass — the only pass that reconciles removals. Kept apart from
+/// [`META_LAST_PLEX_INGEST`] because a delta also advances that one, and a delta
+/// every refresh interval would otherwise keep the full sweep's age near zero
+/// forever.
+const META_LAST_PLEX_FULL_INGEST: &str = "last_plex_full_ingest";
+
 /// How many ids may ride in one statement's `IN (…)` list.
 ///
 /// SQLite refuses a statement with more bound variables than its compiled-in
@@ -1298,6 +1305,20 @@ impl Catalog {
     /// Record that a Plex ingest completed at `unix_secs`.
     pub fn set_last_plex_ingest(&self, unix_secs: i64) -> Result<(), CatalogError> {
         self.set_meta(META_LAST_PLEX_INGEST, &unix_secs.to_string())
+    }
+
+    /// Unix seconds at which the last completed *full* Plex pass started, `None`
+    /// if none has ever finished. Written in the same transaction as the pass's
+    /// removal reconciliation.
+    pub fn last_plex_full_ingest(&self) -> Result<Option<i64>, CatalogError> {
+        Ok(self
+            .meta(META_LAST_PLEX_FULL_INGEST)?
+            .and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    /// Record that a full Plex pass started at `unix_secs`.
+    pub fn set_last_plex_full_ingest(&self, unix_secs: i64) -> Result<(), CatalogError> {
+        self.set_meta(META_LAST_PLEX_FULL_INGEST, &unix_secs.to_string())
     }
 
     /// Run a query whose rows are a single TEXT column, collecting them in order.

@@ -473,6 +473,7 @@ mod tests {
             // ever leaked into the guide these assertions would say so.
             metadata: Some(serde_json::json!({ "picked_because": "oscar" })),
             overlay: None,
+            normalize_loudness: None,
         }
     }
 
@@ -487,6 +488,7 @@ mod tests {
             program: None,
             metadata: None,
             overlay: None,
+            normalize_loudness: None,
         }
     }
 

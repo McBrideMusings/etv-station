@@ -417,6 +417,7 @@ mod tests {
             }),
             metadata: None,
             overlay: None,
+            normalize_loudness: None,
         }
     }
 

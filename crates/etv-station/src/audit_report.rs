@@ -414,6 +414,7 @@ mod tests {
                 }),
                 metadata: audit_for(i),
                 overlay: None,
+                normalize_loudness: None,
             });
             cursor = finish;
         }
@@ -656,6 +657,7 @@ mod tests {
             program: None,
             metadata: None,
             overlay: None,
+            normalize_loudness: None,
         }
     }
 

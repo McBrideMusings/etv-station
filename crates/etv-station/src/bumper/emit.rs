@@ -12,7 +12,9 @@
 //!
 //! Loudness gain and fades on a clip's own audio are not applied here: the
 //! station turns on ETV-next's `normalize_loudness` for every item
-//! (etv-station-7aa7.9), so `SegmentAudio::Own` omits `tracks.audio`.
+//! (etv-station-7aa7.9), so `SegmentAudio::Own` omits `tracks.audio`. A bed or
+//! mute segment sets its level on purpose, so its items carry
+//! `normalize_loudness: false` and the channel's loudnorm leaves them alone.
 //! Ducking a bed under clip audio is etv-station-7aa7.27, and swapping a
 //! pending stand-in for its real file is etv-station-7aa7.35.
 
@@ -242,6 +244,9 @@ pub fn emit_timeline(
                     video: None,
                     subtitle: None,
                 });
+            }
+            if seg.segment.audio != SegmentAudio::Own {
+                item.normalize_loudness = Some(false);
             }
             item.overlay = Some(overlay_for(seg.segment.overlay.as_ref(), ctx.overlay_root));
             item.metadata = Some(json!({
@@ -713,6 +718,26 @@ mod tests {
             fade_in_ms: 500,
             fade_out_ms: 1_000,
         }
+    }
+
+    #[test]
+    fn bed_and_mute_items_opt_out_of_loudnorm_and_own_audio_does_not() {
+        let mut card = seg("card", SegmentSource::black(), Dur::Fixed(4_000));
+        card.audio = SegmentAudio::Bed;
+        let mut quiet = seg("quiet", SegmentSource::black(), Dur::Fixed(1_000));
+        quiet.audio = SegmentAudio::Mute;
+        let own = seg("own", SegmentSource::black(), Dur::Fixed(1_000));
+        assert_eq!(own.audio, SegmentAudio::Own);
+        let items = emit(
+            &Timeline {
+                segments: vec![card, quiet, own],
+                bed: Some(bed()),
+            },
+            6_000,
+        );
+        assert_eq!(items[0].normalize_loudness, Some(false));
+        assert_eq!(items[1].normalize_loudness, Some(false));
+        assert_eq!(items[2].normalize_loudness, None);
     }
 
     #[test]
