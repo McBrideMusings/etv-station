@@ -103,6 +103,13 @@
             }
           ]
         },
+        "normalize_loudness": {
+          "description": "Whether the channel's loudness normalization applies to this item. Omit for the channel's normalize_loudness setting. false skips the loudnorm filter for this item only; true does not turn normalization on for a channel that has it off.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "program": {
           "description": "Optional EPG metadata. Whatever is provided here is emitted in the XMLTV guide; missing fields are simply omitted. Producers of playout JSON are responsible for populating these — the server never sources them externally.",
           "oneOf": [

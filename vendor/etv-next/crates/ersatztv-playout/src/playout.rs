@@ -114,6 +114,13 @@ pub struct PlayoutItem {
     /// channel's overlay fifo, which owns what the script path and vars mean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<ItemOverlay>,
+    /// Whether the channel's loudness normalization applies to this item.
+    /// Absent means the channel's `normalize_loudness` setting decides;
+    /// `false` skips the loudnorm filter for this item only, so a producer
+    /// that set an audio level on purpose keeps it. `true` does not turn
+    /// normalization on for a channel that has it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalize_loudness: Option<bool>,
 }
 
 /// A playout item's overlay selection. See [`PlayoutItem::overlay`].
@@ -269,6 +276,7 @@ impl PlayoutItem {
             program: None,
             metadata: None,
             overlay: None,
+            normalize_loudness: None,
         })
     }
 
@@ -310,6 +318,7 @@ impl PlayoutItem {
             program: None,
             metadata: None,
             overlay: None,
+            normalize_loudness: None,
         }
     }
 }
