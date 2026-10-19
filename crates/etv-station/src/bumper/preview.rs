@@ -83,6 +83,7 @@ pub fn preview(req: &PreviewRequest<'_>) -> Result<Preview, String> {
             prev: None,
             channel: req.channel.clone(),
             air_date,
+            draw: 0,
             granted,
             history: None,
         },
