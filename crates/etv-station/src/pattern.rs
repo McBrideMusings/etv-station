@@ -2790,6 +2790,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -2955,6 +2956,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -3259,6 +3261,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -4514,6 +4517,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }
@@ -4972,6 +4976,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         };
@@ -5794,6 +5799,7 @@ fn audit(ctx, picks, workspace) { #{} }
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }

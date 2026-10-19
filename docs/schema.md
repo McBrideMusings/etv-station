@@ -141,7 +141,7 @@ text card naming the next programme, looped so it can take any gap.
 
 ## Entry
 
-Every entry is tagged by a `kind` field. Four kinds. Source: `config/entry.rs`.
+Every entry is tagged by a `kind` field. Five kinds. Source: `config/entry.rs`.
 
 ### `kind: item` — an authored file
 
@@ -389,6 +389,55 @@ The entry must name exactly one collection: an ambiguous name and an empty
 collection are both config errors. For membership *without* the order — a
 collection as a set to filter or shuffle — use a `query` entry with
 `item.collections.contains("…")`. One stored structure, two read paths.
+
+### `kind: chronology` — play a standalone chronology (#164)
+
+Plays an authored, cross-show watch order declared once in its own file. The
+entry is the block's whole item source for that run.
+
+| Field | Required | Type |
+|---|---|---|
+| `name` | **yes** | the `name:` of a chronology file the station lists under `chronologies:` |
+
+```yaml
+- kind: chronology
+  name: dragonball
+```
+
+A chronology file holds a `name` and an `entries` list. Each entry carries an
+explicit `position` and names one item: an episode by `show` + `season` +
+`episode`, or a standalone film by `title` (and optionally `year`).
+
+```yaml
+# chronologies/dragonball.yaml
+name: dragonball
+entries:
+  - {position: 10, show: "Dragon Ball", season: 1, episode: 1}
+  - {position: 20, show: "Dragon Ball", season: 1, episode: 2}
+  - {position: 30, title: "Dragon Ball: Curse of the Blood Rubies", year: 1986}
+  - {position: 40, show: "Dragon Ball", season: 2, episode: 1}
+```
+
+The entry plays in position order, whatever order the lines are written in, so
+the block holds it in its authored sequence with `order: manual`;
+leave gaps so a later insertion needs no renumbering. There is no `order` on the
+entry: the positions are the order. Every channel naming the chronology resolves
+the same list, and editing the file retunes all of them.
+
+Failures are loud, because a hand-maintained order must not shrink or guess as
+the library changes:
+
+- Two entries on one `position` fail the **station load**, naming both entries.
+- An entry that matches no catalog item, matches more than one, or matches an
+  item with no playable file fails the **channel's resolve**, naming the
+  chronology, the position and the entry (`Dragon Ball S1E5`).
+- Two entries naming the same catalog item fail the channel's resolve, naming
+  both positions.
+- A `name` no file declares drops the channel naming it, listing the names that
+  exist. A name declared in two files fails the station load naming both.
+
+A chronology resolves only through a station load, which is what attaches it to
+the entry; a channel file read on its own has nothing to resolve it against.
 
 ### `kind: include` — pull in another block file
 
@@ -646,6 +695,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
+| `chronologies` | no — default empty | list of chronology files, literal or glob like `channels`; each declares one named, ordered list of item references a block plays with [`kind: chronology`](#kind-chronology-play-a-standalone-chronology-164) |
 | `categories` | no — default empty | list of category files, literal or glob like `channels`; each declares named keyword sets pools reference as `category("name")` (see [`category`](#category-name-a-keyword-set-defined-once-170)) |
 | `source_roots` | no — default empty | list of directories the daemon walks to populate the catalog when `catalog_path` is set — an operational choice about what this deployment scans, not used for identity. Empty skips the filesystem scan entirely. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime. |
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |

@@ -317,6 +317,7 @@ mod tests {
                 output_base: PathBuf::from("/tmp/out"),
                 channels: Vec::new(),
                 categories: Vec::new(),
+                chronologies: Vec::new(),
                 source_roots: Vec::new(),
                 identity_roots: Vec::new(),
                 catalog_path,
@@ -593,6 +594,7 @@ mod tests {
                 playback_path: format!("/media/{id}.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }

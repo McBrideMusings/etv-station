@@ -49,6 +49,14 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
 
+    /// Chronology files (#164): literal paths or globs, resolved like
+    /// `channels`. Each file declares one named, ordered list of item
+    /// references that any channel's block plays with `kind: chronology`. A
+    /// name declared twice, two entries on one position, or a name referenced
+    /// but never declared fails the load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chronologies: Vec<String>,
+
     /// Filesystem directories the daemon walks to populate the catalog when
     /// `catalog_path` is set — an operational choice about which parts of this
     /// deployment's disk the daemon is allowed to read. Empty (the default)

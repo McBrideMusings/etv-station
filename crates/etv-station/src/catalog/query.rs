@@ -659,6 +659,7 @@ mod tests {
             playback_path: format!("/plex/{id}.mkv"),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
     }
@@ -759,6 +760,7 @@ mod tests {
                 playback_path: format!("/data/media/{dir}/fellowship.mkv"),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         }

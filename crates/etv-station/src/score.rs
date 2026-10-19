@@ -3654,6 +3654,7 @@ fn audit(ctx, picks, workspace) { #{} }
             playback_path: "/x".into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         let mut cache = ScoreCache::default();

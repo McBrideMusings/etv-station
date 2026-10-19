@@ -1,6 +1,7 @@
 mod block;
 mod categories;
 mod channel;
+mod chronology;
 mod constraints;
 mod entry;
 mod fill;
@@ -22,8 +23,11 @@ pub mod variety;
 pub use crate::guide::GuideConfig;
 pub use block::{BlockFile, Duplicates};
 pub use channel::{AnnotateConfig, ChannelConfig, ChannelGuide, ChannelSubtitle, ScoringConfig};
+pub use chronology::{Chronologies, Chronology, ChronologyFile, ChronologyRef};
 pub use constraints::{Constraints, NoRepeatWithin};
-pub use entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
+pub use entry::{
+    ChronologyEntry, CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry,
+};
 pub use fill::{Align, DEFAULT_MIN_FILL, FillEntry};
 pub use filter::Filter;
 pub use hooks::{HookDecl, HookGrant, HookTrigger};

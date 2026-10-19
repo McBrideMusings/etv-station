@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_playout::playout::ProgramMetadata;
 use serde::{Deserialize, Serialize};
 
+use super::chronology::Chronology;
 use super::filter::Filter;
 use super::mode::Mode;
 use super::order::Order;
@@ -30,6 +32,7 @@ pub enum Entry {
     Item(Box<ItemEntry>),
     Query(QueryEntry),
     Collection(CollectionEntry),
+    Chronology(ChronologyEntry),
     Include(IncludeEntry),
 }
 
@@ -40,6 +43,7 @@ impl Entry {
             Entry::Item(_) => "item",
             Entry::Query(_) => "query",
             Entry::Collection(_) => "collection",
+            Entry::Chronology(_) => "chronology",
             Entry::Include(_) => "include",
         }
     }
@@ -106,6 +110,34 @@ pub struct CollectionEntry {
     /// The collection's name as its source names it (e.g. the Plex collection
     /// title). Resolved to a `collection_id` at generation time.
     pub name: String,
+}
+
+/// A standalone chronology (#164) referenced by name: an authored,
+/// cross-show watch order declared once in a file outside any channel. The
+/// station load looks `name` up and attaches the chronology to `resolved`, so
+/// every channel naming it resolves the same list; the resolver then maps each
+/// reference to a catalog item, in position order.
+///
+/// The entry is the block's whole item source for that run — it takes no
+/// `order`, because the chronology's positions are the order.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChronologyEntry {
+    /// The chronology's `name:` as declared in a file the station's
+    /// `chronologies:` lists.
+    pub name: String,
+
+    /// Attached by the station load. `None` on a channel read outside a
+    /// station, which the resolver rejects. Serialized so a fingerprint of the
+    /// loaded config changes when the chronology file does.
+    #[serde(skip_deserializing, serialize_with = "serialize_chronology")]
+    pub resolved: Option<Arc<Chronology>>,
+}
+
+fn serialize_chronology<S: serde::Serializer>(
+    resolved: &Option<Arc<Chronology>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    resolved.as_deref().serialize(serializer)
 }
 
 /// A block-level fallback (#97): resolved **instead of** the block's primary

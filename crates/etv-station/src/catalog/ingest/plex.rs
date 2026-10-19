@@ -484,6 +484,7 @@ pub fn ingest_items(
             // survives a rename, so the row's `playback_path` is simply
             // updated to the new filename and `missing_since` stays clear.
             missing_since: None,
+            unairable_reason: None,
         })?;
 
         for (ns, values) in [

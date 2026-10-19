@@ -186,6 +186,22 @@ pub(crate) fn record_airability(
             );
         }
         catalog.set_source_unairable(Source::LocalFs, &source_id, reason.as_deref())?;
+        // A Plex row naming this same file is no escape from its verdict: the
+        // entry has a second source, not a second file. Only a row naming a
+        // different file counts as an airable alternative.
+        if let Some(entry_id) = catalog.entry_id_for_source(Source::LocalFs, &source_id)? {
+            for other in catalog.sources_for(&entry_id)? {
+                if other.source != Source::LocalFs
+                    && canonical_path(&other.playback_path, &roots) == source_id
+                {
+                    catalog.set_source_unairable(
+                        other.source,
+                        &other.source_id,
+                        reason.as_deref(),
+                    )?;
+                }
+            }
+        }
     }
     Ok(unairable)
 }
@@ -262,6 +278,7 @@ pub fn ingest_files(
             // Ignored by `add_source`, which always writes NULL here: a row
             // this pass wrote is a row this pass saw (ADR 0006).
             missing_since: None,
+            unairable_reason: None,
         })?;
 
         stats.sources_written += 1;
@@ -474,6 +491,7 @@ mod tests {
             playback_path: "/data/media/movies/Die Hard (1988)/Die.Hard.mkv".into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
 
@@ -523,6 +541,7 @@ mod tests {
             playback_path: path.into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         cat.upsert_entry(&Entry::new("imdb:tt1", "movie", "X", Source::Plex))
@@ -534,6 +553,7 @@ mod tests {
             playback_path: path.into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
 
@@ -856,6 +876,7 @@ mod tests {
             playback_path: path.into(),
             last_seen: Some("2000-01-01T00:00:00Z".into()),
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         ingest_files(&cat, &[file(path, 120.0)], &roots, true).unwrap();
@@ -1032,6 +1053,7 @@ mod tests {
             playback_path: trunc.into(),
             last_seen: None,
             missing_since: None,
+            unairable_reason: None,
         })
         .unwrap();
         ingest_files(&cat, &[file(trunc, 5.0), file(other, 5.0)], &roots, true).unwrap();
@@ -1041,6 +1063,56 @@ mod tests {
         ];
         assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 1);
         assert_eq!(pooled(&cat), vec![fs_id(other)]);
+    }
+
+    /// A Plex row naming the probed file shares its verdict; a Plex row naming a
+    /// different file does not, so the entry still airs from it. A later airable
+    /// probe clears both.
+    #[test]
+    fn a_verdict_reaches_only_the_plex_row_naming_the_same_file() {
+        use crate::tracks::StreamKind::Video;
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let bad = "/data/media/movies/bad.mkv";
+        let good = "/data/media/movies/good.mkv";
+        let plex_row = |id: &str, path: &str| EntrySource {
+            source: Source::Plex,
+            source_id: id.into(),
+            entry_id: "plex:1".into(),
+            playback_path: path.into(),
+            last_seen: None,
+            missing_since: None,
+            unairable_reason: None,
+        };
+        let mut plex = Entry::new("plex:1", "movie", "Both", Source::Plex);
+        plex.duration_ms = Some(5_000_000);
+        cat.upsert_entry(&plex).unwrap();
+        cat.add_source(&plex_row("p-bad", bad)).unwrap();
+        cat.add_source(&plex_row("p-good", good)).unwrap();
+        ingest_files(&cat, &[file(bad, 5.0)], &roots, true).unwrap();
+        // The bad file has no video stream; the good one is never fs-probed.
+        let probes = vec![(PathBuf::from(bad), answered(5, &[]))];
+        assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 1);
+        assert!(
+            cat.source_unairable_reason(Source::Plex, "p-bad")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            cat.source_unairable_reason(Source::Plex, "p-good").unwrap(),
+            None
+        );
+        assert_eq!(
+            cat.resolve_query("item.title != ''").unwrap(),
+            vec!["plex:1"]
+        );
+
+        let probes = vec![(PathBuf::from(bad), answered(5000, &[Video]))];
+        assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 0);
+        assert_eq!(
+            cat.source_unairable_reason(Source::Plex, "p-bad").unwrap(),
+            None
+        );
     }
 
     /// 16 files that each take 200ms to probe finish in about two waves at a

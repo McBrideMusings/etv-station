@@ -409,6 +409,7 @@ mod tests {
             playback_path: path.into(),
             last_seen: None,
             missing_since: missing.then(|| "2026-01-01T00:00:00Z".into()),
+            unairable_reason: None,
         }
     }
 

@@ -21,6 +21,12 @@ channels:
   - channels/*.yaml
   - samples/*.yaml
 
+# Chronologies (#164): authored in-universe watch orders, each a file declaring
+# one named list of item references with explicit positions. A channel block
+# plays one with `kind: chronology`, by name.
+chronologies:
+  - chronologies/*.yaml
+
 # Sqlite catalog the daemon opens and ingests at startup: the local filesystem
 # roots first, then Plex when PLEX_URL and PLEX_TOKEN are both in the
 # environment. Without it only inline-item, manual-order channels resolve, which

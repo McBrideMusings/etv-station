@@ -424,6 +424,7 @@ mod tests {
                 playback_path: String::new(),
                 last_seen: None,
                 missing_since: None,
+                unairable_reason: None,
             })
             .unwrap();
         for (ns, value) in guids {
