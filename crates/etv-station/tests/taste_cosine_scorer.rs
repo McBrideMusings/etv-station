@@ -1716,6 +1716,170 @@ fn the_unusual_term_pushes_away_from_what_the_house_watches() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `seen_boost` leans toward played titles; `rating` cuts on an mdblist source.
+// ---------------------------------------------------------------------------
+
+/// Three films sharing one keyword, so their cosines tie. `tie-z` is the only
+/// one account 42 played; the id order alone would put it last. The `ratings`
+/// rows give `tie-b` and `tie-z` a letterboxd value and `tie-a` only a
+/// tomatoes one.
+fn write_boost_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('tie-a', 'movie'), ('tie-b', 'movie'), ('tie-z', 'movie');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('tie-a', 'keywords', 'keyword', 'k', 't'),
+                 ('tie-b', 'keywords', 'keyword', 'k', 't'),
+                 ('tie-z', 'keywords', 'keyword', 'k', 't'),
+                 ('tie-a', 'ratings', 'tomatoes', '88', 't'),
+                 ('tie-b', 'ratings', 'letterboxd', '5.2', 't'),
+                 ('tie-b', 'ratings', 'tomatoes', '10', 't'),
+                 ('tie-z', 'ratings', 'letterboxd', '7.4', 't'),
+                 ('tie-z', 'ratings', 'tomatoes', '62', 't');
+             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
+                 ('h1', 'tie-z', 42, 1700000000);",
+        )
+        .unwrap();
+}
+
+fn boost_scorer() -> Scorer {
+    Scorer::new(
+        &catalog_of(["tie-a", "tie-b", "tie-z"]),
+        write_boost_fixture,
+    )
+}
+
+fn pick_config(scorer: &Scorer, config: serde_json::Value) -> Vec<PickedItem> {
+    let mut config = config;
+    config["exploration_fraction"] = serde_json::json!(0.0);
+    scorer.pick_for("movies", 0, 10, Some(config), Some(42), &[])
+}
+
+#[test]
+fn seen_boost_lifts_played_titles_above_equal_scored_unplayed_ones() {
+    let scorer = boost_scorer();
+
+    let flat = pick_config(&scorer, serde_json::json!({}));
+    assert_eq!(
+        order_of(&flat),
+        ["tie-a", "tie-b", "tie-z"],
+        "ids break the tie"
+    );
+
+    let off = pick_config(&scorer, serde_json::json!({ "seen_boost": 1.0 }));
+    assert_eq!(order_of(&off), order_of(&flat), "1.0 changes nothing");
+    assert_eq!(detail_of(&off[2])["seen_boosted"], serde_json::json!(false));
+
+    let boosted = pick_config(&scorer, serde_json::json!({ "seen_boost": 1.5 }));
+    assert_eq!(
+        order_of(&boosted),
+        ["tie-z", "tie-a", "tie-b"],
+        "the played title leads, the unplayed two keep their order"
+    );
+    assert_close(
+        detail_f64(&boosted[0], "score"),
+        1.5 * detail_f64(&boosted[1], "score"),
+        "the boosted score against an unboosted tie",
+    );
+    assert_eq!(
+        detail_of(&boosted[0])["seen_boosted"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        detail_of(&boosted[1])["seen_boosted"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
+fn seen_boost_at_zero_is_refused() {
+    let err = boost_scorer()
+        .try_pick_for(
+            "movies",
+            0,
+            10,
+            Some(serde_json::json!({ "seen_boost": 0.0 })),
+            Some(42),
+            &[],
+        )
+        .unwrap_err();
+    assert!(err.contains("seen_boost"), "{err}");
+}
+
+#[test]
+fn a_rating_cutoff_keeps_titles_inside_the_bound_on_that_sources_scale() {
+    let scorer = boost_scorer();
+    let ids = |rating: serde_json::Value| {
+        let mut v: Vec<String> = pick_config(&scorer, serde_json::json!({ "rating": rating }))
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        v.sort();
+        v
+    };
+
+    assert_eq!(
+        ids(serde_json::json!({ "source": "letterboxd", "min": 6.5 })),
+        ["tie-z"]
+    );
+    assert_eq!(
+        ids(serde_json::json!({ "source": "letterboxd", "max": 6.0 })),
+        ["tie-b"]
+    );
+    assert_eq!(
+        ids(serde_json::json!({ "source": "letterboxd", "min": 5.0, "max": 8.0 })),
+        ["tie-b", "tie-z"]
+    );
+    // tomatoes is 0-100: 62 and 88 clear 60, 10 does not. tie-a has no
+    // letterboxd value and so was dropped above, but carries a tomatoes one.
+    assert_eq!(
+        ids(serde_json::json!({ "source": "tomatoes", "min": 60 })),
+        ["tie-a", "tie-z"]
+    );
+}
+
+#[test]
+fn a_malformed_rating_block_is_refused() {
+    for bad in [
+        serde_json::json!("letterboxd"),
+        serde_json::json!({ "min": 6.5 }),
+        serde_json::json!({ "source": "letterboxd" }),
+    ] {
+        let err = boost_scorer()
+            .try_pick_for(
+                "movies",
+                0,
+                10,
+                Some(serde_json::json!({ "rating": bad })),
+                Some(42),
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("config.rating"), "{err}");
+    }
+}
+
+#[test]
+fn a_rated_pool_drops_a_title_with_no_value_and_the_audit_names_the_value() {
+    let picked = pick_config(
+        &boost_scorer(),
+        serde_json::json!({ "rating": { "source": "letterboxd", "min": 0 } }),
+    );
+    assert_eq!(
+        order_of(&picked),
+        ["tie-b", "tie-z"],
+        "tie-a has no letterboxd value"
+    );
+    assert_eq!(
+        detail_of(&picked[0])["rating"],
+        serde_json::json!({ "source": "letterboxd", "value": 5.2 })
+    );
+    let unrated = pick_config(&boost_scorer(), serde_json::json!({}));
+    assert!(detail_of(&unrated[0])["rating"].is_null());
+}
+
 /// The house term divides rather than subtracts, so no weight — however
 /// extreme — can drive a score to or below zero. A negative score would sort
 /// under a title carrying no keywords at all, and would invert the recency

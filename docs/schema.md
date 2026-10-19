@@ -1754,6 +1754,28 @@ and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
+#### `seen_boost` and `rating` — lean toward played titles, cut on a rating
+
+```yaml
+config:
+  seen_boost: 1.5                          # multiplier on titles in the account's plays; 1.0 = off
+  rating: { source: letterboxd, min: 6.5 } # or max:, or both
+```
+
+**`seen_boost`** multiplies the final score (after recency damping) of every
+title in the watched set `seen:` partitions on: the account's plays on a
+`single_user` channel, the house's on a pooled one. Unlike `seen: only` it keeps
+unplayed titles in the pool. It must be above 0.
+
+**`rating`** keeps titles whose value from one mdblist source lies within
+`[min, max]`, read from the `ratings` enrichment namespace (the fact's key is
+the source name). Values use the source's own scale: letterboxd 0–10, tomatoes
+0–100. A title with no value from that source is dropped. On a shows pool the
+value is the show's.
+
+Audit detail carries `seen_boosted` (bool) and `rating: { source, value }`
+(null on a pool with no `rating:`).
+
 #### `why` — an on-screen reason, worded by the pool
 
 Three more `config` keys give each pick a short reason an overlay can draw.
