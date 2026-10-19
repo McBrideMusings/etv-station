@@ -230,8 +230,15 @@ enum Cmd {
     /// without restarting ffmpeg, so a spec being iterated on updates the
     /// running stream a few hundred ms after each save.
     Watch {
-        #[arg(long)]
-        input: PathBuf,
+        #[arg(long, required_unless_present = "item")]
+        input: Option<PathBuf>,
+        /// Play one playout item (the JSON `etv-station bumper-preview
+        /// --ndjson` prints) instead of looping `--input`: its `source` is the
+        /// background, `tracks.audio` the sound, `finish - start` the length,
+        /// and its `overlay` and `metadata` drive the graphic exactly as
+        /// `pipe` would. Plays once, then exits, so a caller can chain items.
+        #[arg(long, value_parser = parse_json, conflicts_with = "input")]
+        item: Option<serde_json::Value>,
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -350,12 +357,13 @@ fn main() -> anyhow::Result<()> {
         } => run_with_ffmpeg(input, config, output, fifo, ffmpeg, keep_fifo),
         Cmd::Watch {
             input,
+            item,
             config,
             fifo,
             ffmpeg,
             time_scale,
             program,
-        } => watch(input, config, fifo, ffmpeg, time_scale, program),
+        } => watch(input, item, config, fifo, ffmpeg, time_scale, program),
         Cmd::Pipe {
             fifo,
             create_fifo,
@@ -564,8 +572,84 @@ fn run_with_ffmpeg(
 /// perceptible gain.
 const CONFIG_POLL_FRAMES: u64 = 30;
 
+/// One playout item, reduced to what `watch` needs to play it once: how
+/// ffmpeg reads its background and its sound, how long it runs, and which
+/// graphic draws over it.
+struct WatchItem {
+    video_input: Vec<String>,
+    audio_graph: Option<String>,
+    duration_secs: f64,
+    overlay: Option<etv_overlay::program_context::ItemOverlay>,
+    metadata: serde_json::Value,
+}
+
+impl WatchItem {
+    fn from_json(item: &serde_json::Value) -> anyhow::Result<Self> {
+        let rfc3339 = |key: &str| -> anyhow::Result<OffsetDateTime> {
+            let raw = item
+                .get(key)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("item has no string `{key}`"))?;
+            OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .map_err(|e| anyhow::anyhow!("item `{key}` {raw:?}: {e}"))
+        };
+        let duration_secs = (rfc3339("finish")? - rfc3339("start")?).as_seconds_f64();
+        anyhow::ensure!(duration_secs > 0.0, "item finishes before it starts");
+
+        let source = item
+            .get("source")
+            .ok_or_else(|| anyhow::anyhow!("item has no `source`"))?;
+        let text = |key: &str| source.get(key).and_then(|v| v.as_str());
+        let video_input = match text("source_type") {
+            Some("lavfi") => {
+                let params = text("params")
+                    .ok_or_else(|| anyhow::anyhow!("lavfi source has no `params`"))?;
+                vec!["-f".into(), "lavfi".into(), "-i".into(), params.into()]
+            }
+            Some("local") => {
+                let path =
+                    text("path").ok_or_else(|| anyhow::anyhow!("local source has no `path`"))?;
+                let in_secs = source
+                    .get("in_point_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as f64
+                    / 1000.0;
+                vec!["-ss".into(), in_secs.to_string(), "-i".into(), path.into()]
+            }
+            other => {
+                anyhow::bail!("watch --item plays `local` and `lavfi` sources, not {other:?}")
+            }
+        };
+        if item
+            .pointer("/tracks/audio/source/source_type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t != "lavfi")
+        {
+            tracing::warn!("item audio is not a lavfi source; previewing without it");
+        }
+        let audio_graph = item
+            .pointer("/tracks/audio/source")
+            .filter(|s| s.get("source_type").and_then(|t| t.as_str()) == Some("lavfi"))
+            .and_then(|s| s.get("params").and_then(|p| p.as_str()))
+            .map(str::to_owned);
+        Ok(Self {
+            video_input,
+            audio_graph,
+            duration_secs,
+            overlay: item
+                .get("overlay")
+                .and_then(etv_overlay::program_context::ItemOverlay::from_value),
+            metadata: item
+                .get("metadata")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        })
+    }
+}
+
 fn watch(
-    input: PathBuf,
+    input: Option<PathBuf>,
+    item: Option<serde_json::Value>,
     config: PathBuf,
     fifo: Option<PathBuf>,
     ffmpeg_bin: Option<PathBuf>,
@@ -576,55 +660,87 @@ fn watch(
     let base_geometry = spec.geometry();
     let fifo_path = fifo.unwrap_or_else(|| default_fifo_path("watch"));
     let mut fifo = FifoWriter::create(fifo_path.clone())?;
+    let item = item.as_ref().map(WatchItem::from_json).transpose()?;
 
     let ffmpeg = ffmpeg_bin.unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    let filter = "[0:v][1:v]overlay=x=0:y=0:eof_action=pass:format=auto[v]";
+    let (width, height, rate) = (spec.width, spec.height, spec.framerate);
+    // A played item's background is not authored at the canvas size
+    // (`color=c=black` is 320x240), so it is fitted to the canvas first.
+    let filter = if item.is_some() {
+        format!(
+            "[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,\
+             pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate}[bg];\
+             [bg][1:v]overlay=x=0:y=0:eof_action=pass:format=auto[v]"
+        )
+    } else {
+        "[0:v][1:v]overlay=x=0:y=0:eof_action=pass:format=auto[v]".to_string()
+    };
+
+    let mut args: Vec<std::ffi::OsString> = ["-hide_banner", "-loglevel", "warning", "-y"]
+        .map(Into::into)
+        .into();
+    match (&item, &input) {
+        (Some(it), _) => args.extend(it.video_input.iter().map(Into::into)),
+        (None, Some(input)) => {
+            args.extend([
+                "-stream_loop".into(),
+                "-1".into(),
+                "-i".into(),
+                input.into(),
+            ]);
+        }
+        (None, None) => anyhow::bail!("watch needs --input or --item"),
+    }
+    args.extend([
+        "-f".into(),
+        "rawvideo".into(),
+        "-pixel_format".into(),
+        spec.pixel_format.ffmpeg_arg().into(),
+        "-video_size".into(),
+        format!("{width}x{height}").into(),
+        "-framerate".into(),
+        rate.to_string().into(),
+        "-i".into(),
+        fifo.path().into(),
+    ]);
+    let mut audio_map = "0:a?";
+    if let Some(graph) = item.as_ref().and_then(|it| it.audio_graph.as_deref()) {
+        args.extend(["-f".into(), "lavfi".into(), "-i".into(), graph.into()]);
+        audio_map = "2:a";
+    }
+    args.extend([
+        "-filter_complex".into(),
+        filter.into(),
+        "-map".into(),
+        "[v]".into(),
+        "-map".into(),
+        audio_map.into(),
+    ]);
+    if let Some(it) = &item {
+        args.extend(["-t".into(), it.duration_secs.to_string().into()]);
+    }
+    args.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            "-",
+        ]
+        .map(Into::into),
+    );
 
     let mut child = KillOnDrop(
         Command::new(&ffmpeg)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-y",
-                "-stream_loop",
-                "-1",
-                "-i",
-            ])
-            .arg(&input)
-            .args([
-                "-f",
-                "rawvideo",
-                "-pixel_format",
-                spec.pixel_format.ffmpeg_arg(),
-                "-video_size",
-            ])
-            .arg(format!("{}x{}", spec.width, spec.height))
-            .args(["-framerate"])
-            .arg(spec.framerate.to_string())
-            .arg("-i")
-            .arg(fifo.path())
-            .args([
-                "-filter_complex",
-                filter,
-                "-map",
-                "[v]",
-                "-map",
-                "0:a?",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-preset",
-                "veryfast",
-                "-tune",
-                "zerolatency",
-                "-c:a",
-                "aac",
-                "-f",
-                "mpegts",
-                "-",
-            ])
+            .args(&args)
             .stdin(Stdio::null())
             // ffmpeg's muxed mpegts IS this process's whole stdout contract for
             // `watch` — inheriting lets the caller's `| vlc -` read it straight
@@ -643,7 +759,15 @@ fn watch(
     }
     let mut renderer = VelloRenderer::new(spec.width, spec.height, spec.pixel_format)?;
     let mut engine = RhaiEngine::for_spec(&spec)?;
-    let program = program_context_for(preview);
+    let explicit_metadata = preview.metadata.is_some();
+    let mut program = program_context_for(preview);
+    if let Some(it) = &item {
+        program.overlay = it.overlay.clone();
+        if !explicit_metadata {
+            program.metadata = it.metadata.clone();
+        }
+    }
+    let mut item_engine = ItemOverlayEngine::default();
     let mut last_mtime = fs_mtime(&config);
 
     let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
@@ -702,8 +826,19 @@ fn watch(
             }
         }
 
-        let time_seconds = (frame_index as f64 / spec.framerate.max(1) as f64) * time_scale;
-        let state = engine.evaluate(time_seconds, frame_index, &program);
+        // A played item runs in real time: its `-t` is real seconds, so a scaled
+        // clock would drift the graphic away from the clip's length.
+        let scale = if item.is_some() { 1.0 } else { time_scale };
+        let time_seconds = (frame_index as f64 / spec.framerate.max(1) as f64) * scale;
+        if let Some(it) = &item {
+            program.item_elapsed = time_seconds;
+            program.item_remaining = (it.duration_secs - time_seconds).max(0.0);
+        }
+        let airing = match &program.overlay {
+            Some(overlay) => item_engine.engine_for(overlay),
+            None => &engine,
+        };
+        let state = airing.evaluate(time_seconds, frame_index, &program);
         let frame = renderer.render_frame(&state)?;
 
         if let Err(e) = fifo.write_frame(&frame) {
@@ -733,6 +868,11 @@ fn watch(
     // instead of leaving that to whenever `child` drops.
     let _ = child.kill();
     let _ = child.wait();
+    // An interrupted item exits nonzero so a caller chaining items stops
+    // instead of starting the next one.
+    if item.is_some() && SHUTDOWN.load(Ordering::SeqCst) {
+        anyhow::bail!("interrupted");
+    }
     Ok(())
 }
 
@@ -1217,6 +1357,33 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::time::Instant;
+
+    fn item(source: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "bumper:c:0:0",
+            "start": "2026-10-18T23:00:00Z",
+            "finish": "2026-10-18T23:00:02.500Z",
+            "source": source,
+            "overlay": { "script": "/x/card.rhai", "vars": { "title": "T" } },
+            "metadata": { "bumper": true },
+        })
+    }
+
+    #[test]
+    fn a_lavfi_item_plays_for_its_span_with_its_own_overlay() {
+        let it = WatchItem::from_json(&item(
+            serde_json::json!({ "source_type": "lavfi", "params": "color=c=black" }),
+        ))
+        .unwrap();
+        assert_eq!(it.video_input, ["-f", "lavfi", "-i", "color=c=black"]);
+        assert_eq!(it.duration_secs, 2.5);
+        assert!(it.audio_graph.is_none());
+        assert_eq!(it.metadata["bumper"], true);
+        assert!(matches!(
+            it.overlay,
+            Some(etv_overlay::program_context::ItemOverlay::Script { .. })
+        ));
+    }
 
     /// Regression test for the channel-wedging overlay exit.
     ///

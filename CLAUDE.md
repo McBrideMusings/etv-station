@@ -49,7 +49,8 @@ The common operations:
 bun run docs:dev                         # serve VitePress docs on http://localhost:5193
 ./tools/overlay-test.sh                  # render a Vello overlay onto a bumper fixture and open the mp4
 ./tools/overlay-still.sh                 # render a single overlay frame to PNG and open it
-admin overlay-watch <channel-dir>        # live isolated overlay preview in VLC, hot-reloads on save
+admin overlay-watch <channel-dir>        # live isolated overlay preview in VLC, hot-reloads on save; --metadata '<json>' previews a card
+admin bumper-watch <channel> <script> --gap 45s   # play a bumper script on a gap into VLC (etv-station bumper-preview resolves it)
 admin verify-accel                       # prove channels encode on the GPU, not silently on the CPU
 admin backup                             # snapshot history.db / catalog.db / .device_id on the host
 admin audit <channel> [--next N]         # why each upcoming item is on a channel's schedule

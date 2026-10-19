@@ -15,9 +15,45 @@
 #   TITLE="Die Hard" ./tools/overlay-watch.sh 010-pierce
 #   BG=bg-checkerboard-20s.mp4 ./tools/overlay-watch.sh 036-the-academy  # alpha check
 #   BG=station-bumper-12s.mp4 ./tools/overlay-watch.sh 054-dragon-ball
+#
+# Flags, for a script that reads station-written item metadata (`pool_label`,
+# a bumper card's vars). Each also has an env var of the same name in caps:
+#   ./tools/overlay-watch.sh 034-syfy --metadata '{"pool_label":"Zombies"}'
+#   ./tools/overlay-watch.sh 034-syfy --metadata '{"pool_label":"Zombies"}' \
+#       --prev-metadata '{"pool_label":"Kaiju"}' --item-elapsed 2
+#
+# Bumper mode previews a whole bumper instead of a looping background — what
+# `bumper-watch.sh` runs. The bumper script is resolved on the gap by
+# `etv-station bumper-preview` and each playout item it emits is played in
+# order, with its own overlay, into VLC; the lap repeats until Ctrl-C:
+#   ./tools/overlay-watch.sh 054-dragon-ball --bumper examples/plugins/text-card-bumper.rhai \
+#       --gap 45s --next path/to/next-feature.mkv
 set -u
 
-CHANNEL="${1:?usage: overlay-watch.sh <channel path, or a bare deploy/appdata channel name>}"
+CHANNEL=""
+BUMPER="${BUMPER-}"
+BUMPER_GAP="${BUMPER_GAP:-45s}"
+BUMPER_NEXT="${BUMPER_NEXT-}"
+BUMPER_CHANNEL_NUMBER="${BUMPER_CHANNEL_NUMBER:-1}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --metadata)       METADATA="${2:?--metadata needs a JSON value}"; shift 2 ;;
+    --prev-metadata)  PREV_METADATA="${2:?--prev-metadata needs a JSON value}"; shift 2 ;;
+    --item-elapsed)   ITEM_ELAPSED="${2:?--item-elapsed needs seconds}"; shift 2 ;;
+    --bumper)         BUMPER="${2:?--bumper needs a .rhai script}"; shift 2 ;;
+    --gap)            BUMPER_GAP="${2:?--gap needs a length such as 45s}"; shift 2 ;;
+    --next)           BUMPER_NEXT="${2:?--next needs a media path or entry_id}"; shift 2 ;;
+    --channel-number) BUMPER_CHANNEL_NUMBER="${2:?--channel-number needs N}"; shift 2 ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *)
+      if [ -n "$CHANNEL" ]; then echo "unexpected argument: $1" >&2; exit 2; fi
+      CHANNEL="$1"; shift ;;
+  esac
+done
+if [ -z "$CHANNEL" ]; then
+  echo "usage: overlay-watch.sh <channel path, or a bare deploy/appdata channel name> [--metadata JSON] [--prev-metadata JSON] [--item-elapsed SECS] [--bumper SCRIPT --gap 45s --next PATH|ENTRY_ID]" >&2
+  exit 2
+fi
 # A bare name with no path separator is a channel's declared `name:` (the
 # identity the station and overlay-extract.py use, #414), looked up across the
 # deploy/appdata layout; anything with a "/" in it — a deploy/appdata dir or an
@@ -186,6 +222,32 @@ PREVIEW_EXTRA=()
 [ -n "${METADATA-}" ] && PREVIEW_EXTRA+=(--metadata "$METADATA")
 [ -n "${PREV_METADATA-}" ] && PREVIEW_EXTRA+=(--prev-metadata "$PREV_METADATA")
 [ -n "${ITEM_ELAPSED-}" ] && PREVIEW_EXTRA+=(--item-elapsed "$ITEM_ELAPSED")
+
+if [ -n "$BUMPER" ]; then
+  # Same canvas the channel's overlay resolved to, so the preview frames
+  # match the geometry the bumper airs at.
+  FPS="$(sed -nE 's/^framerate:[[:space:]]*([0-9.]+).*/\1/p' "$SPEC_PATH" | head -n 1)"
+  printf '%s previewing bumper %s (gap=%s, fps=%s) into VLC — Ctrl-C to stop\n' "$(bold '==>')" "$BUMPER" "$BUMPER_GAP" "${FPS:-30}"
+  NEXT_ARGS=()
+  [ -n "$BUMPER_NEXT" ] && NEXT_ARGS+=(--next "$BUMPER_NEXT")
+  # One lap per pass, re-resolved each time so an edit to the bumper script
+  # shows on the next lap. A failed resolve or any item exiting nonzero (Ctrl-C
+  # included) ends the loop with that status.
+  set -o pipefail
+  (
+    while true; do
+      ITEMS="$(./target/debug/etv-station bumper-preview "$BUMPER" --gap "$BUMPER_GAP" \
+        --channel "$BUMPER_CHANNEL_NUMBER" --fps "${FPS:-30}" --ndjson \
+        ${NEXT_ARGS[@]+"${NEXT_ARGS[@]}"})" || exit 1
+      while IFS= read -r ITEM; do
+        ./target/debug/etv-overlay watch --item "$ITEM" --config "$SPEC_PATH" --time-scale 1
+        STATUS=$?
+        [ "$STATUS" -ne 0 ] && exit "$STATUS"
+      done <<< "$ITEMS"
+    done
+  ) | "$VLC" -q -
+  exit $?
+fi
 
 printf '%s streaming (time_scale=%s, title=%s) into VLC — Ctrl-C to stop\n' "$(bold '==>')" "$TIME_SCALE" "$TITLE"
 # The built binary directly, not `cargo run` — one less process in the way of
