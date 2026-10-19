@@ -1115,6 +1115,50 @@ mod tests {
         );
     }
 
+    /// A verdict is about one file: when Plex repoints the row to a different
+    /// path the mark goes, and re-adding the same path keeps it.
+    #[test]
+    fn repointing_a_marked_plex_row_clears_its_mark() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let bad = "/data/media/movies/bad.mkv";
+        let fixed = "/data/media/movies/fixed.mkv";
+        let plex_row = |path: &str| EntrySource {
+            source: Source::Plex,
+            source_id: "p-1".into(),
+            entry_id: "plex:1".into(),
+            playback_path: path.into(),
+            last_seen: None,
+            missing_since: None,
+            unairable_reason: None,
+        };
+        let mut plex = Entry::new("plex:1", "movie", "Both", Source::Plex);
+        plex.duration_ms = Some(5_000_000);
+        cat.upsert_entry(&plex).unwrap();
+        cat.add_source(&plex_row(bad)).unwrap();
+        ingest_files(&cat, &[file(bad, 5.0)], &roots, true).unwrap();
+        let probes = vec![(PathBuf::from(bad), answered(5, &[]))];
+        assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 1);
+        assert!(cat.resolve_query("item.title != ''").unwrap().is_empty());
+
+        cat.add_source(&plex_row(bad)).unwrap();
+        assert!(
+            cat.source_unairable_reason(Source::Plex, "p-1")
+                .unwrap()
+                .is_some()
+        );
+
+        cat.add_source(&plex_row(fixed)).unwrap();
+        assert_eq!(
+            cat.source_unairable_reason(Source::Plex, "p-1").unwrap(),
+            None
+        );
+        assert_eq!(
+            cat.resolve_query("item.title != ''").unwrap(),
+            vec!["plex:1"]
+        );
+    }
+
     /// 16 files that each take 200ms to probe finish in about two waves at a
     /// limit of 8, not 16 serial waits, and results keep the input order.
     #[tokio::test]

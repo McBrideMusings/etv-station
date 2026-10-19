@@ -390,7 +390,9 @@ impl Catalog {
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(source, source_id) DO UPDATE SET
                 entry_id=excluded.entry_id, playback_path=excluded.playback_path,
-                last_seen=excluded.last_seen, missing_since=NULL",
+                last_seen=excluded.last_seen, missing_since=NULL,
+                unairable_reason=CASE WHEN playback_path IS excluded.playback_path
+                                      THEN unairable_reason ELSE NULL END",
             params![
                 s.source.as_str(),
                 s.source_id,
@@ -404,9 +406,10 @@ impl Catalog {
 
     /// Record what probing the file behind `(source, source_id)` concluded:
     /// `Some(reason)` when it cannot air, `None` when it can. Returns whether a
-    /// row exists for that key. [`Self::add_source`] never touches the column, so
-    /// a pass that learned nothing about a file (a timeout) leaves the earlier
-    /// verdict standing.
+    /// row exists for that key. [`Self::add_source`] keeps the column while the
+    /// path is unchanged, so a pass that learned nothing about a file (a timeout)
+    /// leaves the earlier verdict standing; it clears the column when the path
+    /// changes, since the verdict was about the old file.
     pub fn set_source_unairable(
         &self,
         source: Source,
