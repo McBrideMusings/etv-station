@@ -214,6 +214,18 @@ enum Cmd {
         #[command(flatten)]
         program: PreviewProgram,
     },
+    /// Print what an overlay's script draws at one instant — every layer's
+    /// kind, resolved text or image path, visibility, opacity and offsets,
+    /// the hidden ones included. Takes the flags `render-still` takes. A spec
+    /// under deploy/appdata/ exists in the main checkout only.
+    Explain {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 0.0)]
+        time: f64,
+        #[command(flatten)]
+        program: PreviewProgram,
+    },
     /// Pipe overlay frames through ffmpeg and produce a muxed mp4
     Run {
         #[arg(long)]
@@ -352,6 +364,11 @@ fn main() -> anyhow::Result<()> {
             time,
             program,
         } => render_still(config, output, time, program, &cli.fonts),
+        Cmd::Explain {
+            config,
+            time,
+            program,
+        } => explain(config, time, program),
         Cmd::Run {
             input,
             config,
@@ -419,6 +436,20 @@ fn render_still(
     let frame = etv_overlay::still::render_rgba(&spec, time, &program_context_for(program), fonts)?;
     write_png(&output, spec.width, spec.height, &frame)?;
     tracing::info!(path = %output.display(), "wrote still frame");
+    Ok(())
+}
+
+fn explain(config: PathBuf, time: f64, program: PreviewProgram) -> anyhow::Result<()> {
+    if !config.exists() {
+        return Err(etv_overlay::explain::missing_spec_error(&config));
+    }
+    let spec = OverlaySpec::from_path(&config)?;
+    let engine = RhaiEngine::for_spec(&spec)?;
+    let frame_index = (time * spec.framerate.max(1) as f64) as u64;
+    let state = engine
+        .try_evaluate(time, frame_index, &program_context_for(program))
+        .map_err(|e| anyhow::anyhow!("rhai script eval failed at t={time}: {e}"))?;
+    print!("{}", etv_overlay::explain::describe(&state));
     Ok(())
 }
 
