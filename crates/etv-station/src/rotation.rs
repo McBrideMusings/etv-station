@@ -235,9 +235,20 @@ fn draw(
         member: member.clone(),
         at,
     });
-    if state.recent.len() > RECENT_CAP {
-        let excess = state.recent.len() - RECENT_CAP;
-        state.recent.drain(..excess);
+    // Keep what the constraint can still read: at least RECENT_CAP draws, and
+    // every draw a positional gap or a time gap reaches back to.
+    let keep = match gap {
+        NoRepeatWithin::Positions(n) => RECENT_CAP.max(n),
+        NoRepeatWithin::Duration(_) => usize::MAX,
+    };
+    let horizon = match gap {
+        NoRepeatWithin::Duration(d) => Some(at - d),
+        _ => None,
+    };
+    while state.recent.len() > RECENT_CAP
+        && (state.recent.len() > keep || horizon.is_some_and(|h| state.recent[0].at < h))
+    {
+        state.recent.remove(0);
     }
     DrawReason {
         rotation: name.to_string(),
@@ -653,6 +664,33 @@ schedules:
         assert_eq!(got[0].chain.len(), 2);
         assert_eq!(got[0].chain[0].rotation, "prime");
         assert_eq!(got[0].chain[1].rotation, "movies");
+    }
+
+    #[test]
+    fn a_wrapping_range_is_one_placement_across_midnight() {
+        let r = rule(
+            r#"
+blocks: [{ entries: [] }]
+slots:
+  prime: { slots: [a, b] }
+  a: { entries: [] }
+  b: { entries: [] }
+schedules:
+  - name: late
+    hours: { "21..02": prime }
+"#,
+        );
+        let cal = crate::calendar::Calendar::new(&r, time_tz::timezones::db::UTC).unwrap();
+        let mut state = BTreeMap::new();
+        let mut leaf = |at| {
+            let (on_air, drawn) = cal.on_air_drawn(at, &seed, &mut state);
+            assert!(matches!(on_air, crate::calendar::OnAir::Slot { .. }));
+            drawn.unwrap().leaf().to_string()
+        };
+        let before = leaf(datetime!(2026-10-19 22:00 UTC));
+        let after = leaf(datetime!(2026-10-20 01:00 UTC));
+        assert_eq!(before, after, "one placement, one draw");
+        assert_ne!(before, leaf(datetime!(2026-10-20 22:00 UTC)));
     }
 
     #[test]

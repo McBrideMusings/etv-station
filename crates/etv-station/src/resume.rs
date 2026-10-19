@@ -382,6 +382,18 @@ impl ResumeMap {
         self.checkpoints.retain(|c| c.start > now);
     }
 
+    /// Forget every rotation draw made for a placement starting at or after
+    /// `instant`, and take those members back out of the current round-robin
+    /// pass. For a wipe that found no checkpoint to restore.
+    pub fn forget_rotation_draws_from(&mut self, instant: OffsetDateTime) {
+        for rotation in self.rotations.values_mut() {
+            while rotation.recent.last().is_some_and(|d| d.at >= instant) {
+                let gone = rotation.recent.pop().expect("checked non-empty");
+                rotation.drawn.retain(|m| *m != gone.member);
+            }
+        }
+    }
+
     /// Rewind to the latest checkpoint at or before `instant`: restore the
     /// state recorded there and drop it (and every later checkpoint), so the
     /// span from `instant` on can be regenerated. Returns that checkpoint's

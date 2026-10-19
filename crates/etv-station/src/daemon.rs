@@ -2283,7 +2283,11 @@ async fn rewind_to_surviving(
     // No checkpoint at or before the frontier means its state was pruned after
     // airing; the pools continue from where they stand — a possible seam
     // glitch, never black.
-    resume.rewind_to(frontier);
+    if resume.rewind_to(frontier).is_none() {
+        // No checkpoint restored the rotation draws, so drop the ones made for
+        // placements the wipe removed; they draw again under the current config.
+        resume.forget_rotation_draws_from(frontier);
+    }
     ctx.history_db.truncate_from(&channel.name, frontier)?;
     crate::resume::save(output, resume).await?;
     Ok(frontier)
