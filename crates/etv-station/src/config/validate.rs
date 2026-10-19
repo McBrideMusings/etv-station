@@ -1911,6 +1911,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         let msg = format!("{err}");
@@ -1940,6 +1941,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
@@ -1970,6 +1972,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("America/Atlantis"), "err = {err}");
@@ -1998,6 +2001,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            fonts: vec![],
         };
         assert!(validate_station(&dummy_path(), &s).is_err());
     }

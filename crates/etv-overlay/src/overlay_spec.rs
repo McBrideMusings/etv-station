@@ -212,11 +212,12 @@ pub enum OverlayKind {
         /// How the lines of a multi-line block sit against its widest line.
         #[serde(default)]
         align: TextAlign,
-        /// The whole block in the bold face (Inter Bold, bundled).
+        /// The whole block in the family's bold face, or a synthesized heavier
+        /// one when the family has none.
         #[serde(default)]
         bold: bool,
-        /// The whole block slanted. Inter has no italic cut, so this is the
-        /// font stack's synthesized oblique.
+        /// The whole block slanted: the family's italic cut when it has one,
+        /// else the font stack's synthesized oblique.
         #[serde(default)]
         italic: bool,
         /// Read `*italic*` and `**bold**` spans in `content`, marker pairs

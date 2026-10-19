@@ -658,6 +658,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
 | `idle_grace_seconds` | no — default `90` | seconds a channel's worker stays warm after its last viewer leaves, so surfing back to it skips the cold start. Written into every `channelN.json`; ETV-next's worker reads it. `90` is also the floor — a smaller value is raised to it, because the overlay renderer exits after 60s without a reader and must stay under the worker's lifetime. A warm channel keeps its ffmpeg encoding for nobody, so raise it only as far as the encoder has headroom. |
+| `fonts` | no — default empty | font files, or directories whose `.ttf`, `.otf` and `.ttc` files all count, relative to this file's directory. Every overlay process registers every listed font, so a text layer's `font_family` can name any family they provide. A family no listed font provides renders in the OS sans-serif (resolved through fontconfig; the container's base image has Noto Sans and DejaVu). No font ships in the binary. A path that does not exist, or a file that is not a font, fails the station load with an error naming the path. |
 
 **How the three ingest modes are chosen.** At startup the daemon compares the
 catalog's recorded last-ingest time against the two knobs above. Age below
@@ -1319,8 +1320,8 @@ a line, and the block is as wide as its widest line:
 | Key | Default | Meaning |
 |---|---|---|
 | `align` | `left` | `left`, `center` or `right`: where a shorter line sits against the widest one. |
-| `bold` | `false` | the whole block in the bundled Inter Bold. |
-| `italic` | `false` | the whole block slanted. Inter has no italic cut, so this is a synthesized oblique. |
+| `bold` | `false` | the whole block in the family's bold face, or a synthesized heavier one when the family has none. |
+| `italic` | `false` | the whole block slanted: the family's italic cut when it has one, else a synthesized oblique. |
 | `markup` | `false` | read `*italic*` and `**bold**` spans in `content`; the markers are not drawn, and an unpaired one stays literal and spans do not nest. |
 | `visible_lines` | all | draw only the first N lines. The block is still measured and placed whole, so a line appearing never moves the lines already up. Settable per frame on a declared layer. |
 | `below` | none | the index (in the frame's layer list) of an earlier text layer to hang this one under: top edge on its bottom edge, and the `align` edge (left, center, right) flush with the same edge of that layer's box. `corner` and `margin` are ignored; `offset_x`/`offset_y` still apply. The other layer is measured from its whole content, so a credit sits under the widest line even while later lines are still hidden. A block whose `below` target is not drawn this frame is not drawn. |
@@ -2434,7 +2435,7 @@ graphics:
     config:
       corner: bottom-left
       font:
-        family: Inter
+        family: Helvetica
         size: 42
 ```
 

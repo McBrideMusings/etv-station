@@ -1172,7 +1172,7 @@ async fn run_generation(
     // which only wakes already-parked waiters.
     let mut stops: Vec<Arc<Notify>> = Vec::new();
     for idx in 0..station.channels.len() {
-        if let Some(ctx) = build_overlay_context(&station.channels[idx]) {
+        if let Some(ctx) = build_overlay_context(&station.channels[idx], &station.station.fonts) {
             let stop = Arc::new(Notify::new());
             stops.push(stop.clone());
             let name = station.channels[idx].name.clone();
@@ -1682,12 +1682,16 @@ async fn prepare_generation(station: &Station) -> Result<&'static Tz, StationErr
     Ok(tz)
 }
 
-fn build_overlay_context(channel: &LoadedChannel) -> Option<overlay_supervisor::OverlayContext> {
+fn build_overlay_context(
+    channel: &LoadedChannel,
+    fonts: &[PathBuf],
+) -> Option<overlay_supervisor::OverlayContext> {
     channel.overlays.base.as_ref()?;
     Some(overlay_supervisor::OverlayContext {
         channel_name: channel.name.clone(),
         output_folder: channel.output_folder.clone(),
         fifo_path: overlay_supervisor::resolve_fifo_path(&channel.output_folder),
+        fonts: fonts.to_vec(),
     })
 }
 

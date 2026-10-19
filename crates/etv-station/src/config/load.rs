@@ -123,6 +123,8 @@ fn load_with(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    resolve_fonts(station_path, &base, &mut station.fonts)?;
+
     let categories = load_categories(station_path, &base, &station.categories)?;
     let channel_paths = expand_channel_patterns(station_path, &base, &station.channels)?;
     let lineup = channel_paths.clone();
@@ -161,6 +163,25 @@ fn load_with(
         dropped,
         lineup,
     })
+}
+
+/// Resolves each `fonts:` entry against the station config's directory, as an
+/// absolute path, and refuses an entry that is missing or is not a font — the
+/// overlay process would otherwise only discover it when it first renders.
+fn resolve_fonts(
+    station_path: &Path,
+    base: &Path,
+    fonts: &mut [PathBuf],
+) -> Result<(), ConfigError> {
+    for font in fonts.iter_mut() {
+        let joined = base.join(&*font);
+        *font = std::path::absolute(&joined).unwrap_or(joined);
+    }
+    etv_overlay::fonts::expand(fonts).map_err(|e| ConfigError::Validation {
+        path: station_path.to_path_buf(),
+        message: format!("fonts: {e}"),
+    })?;
+    Ok(())
 }
 
 /// Load and resolve one channel config to a [`LoadedChannel`], or the single
@@ -1350,6 +1371,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            fonts: vec![],
         }
     }
 
@@ -1773,6 +1795,25 @@ mod tests {
         let station = load_with(&station_path, &no_env, &placeholder).expect("station loads");
         assert_eq!(station.station.tz, "UTC");
         assert_eq!(station.channels.len(), 1);
+    }
+
+    /// A `fonts:` entry naming a file that is not there fails the load,
+    /// naming the path as the station resolved it.
+    #[test]
+    fn a_missing_font_fails_the_station_load_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let station_path =
+            write_min_station(dir.path(), &[("a.yaml", &channel_body(Some(1), Some("a")))]);
+        let mut yaml = std::fs::read_to_string(&station_path).unwrap();
+        yaml.push_str("fonts:\n  - fonts/Missing.ttf\n");
+        std::fs::write(&station_path, yaml).unwrap();
+
+        let err = load_with_env(&station_path, &no_env).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("fonts/Missing.ttf") && message.contains("does not exist"),
+            "{message}"
+        );
     }
 
     /// #263 rule 1: a channel config with no `number:` fails to load and does
