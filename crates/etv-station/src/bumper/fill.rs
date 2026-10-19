@@ -612,6 +612,13 @@ fn source_label(source: &SegmentSource) -> String {
         SegmentSource::Lavfi { params } => format!("lavfi:{params}"),
         SegmentSource::Still { image_path } => image_path.display().to_string(),
         SegmentSource::Render { path, .. } => path.display().to_string(),
+        SegmentSource::Pending { path, stand_in } => {
+            format!(
+                "pending:{} (stand-in {})",
+                path.display(),
+                stand_in.display()
+            )
+        }
         SegmentSource::Http { url, .. } => {
             format!("http:{}", crate::plugin_http::display_host(url))
         }

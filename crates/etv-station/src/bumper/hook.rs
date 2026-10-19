@@ -551,6 +551,7 @@ impl SegmentBuilder {
                 SegmentSource::Lavfi { .. } => "lavfi",
                 SegmentSource::Still { .. } => "still",
                 SegmentSource::Render { .. } => "render",
+                SegmentSource::Pending { .. } => "pending",
                 SegmentSource::Http { .. } => "http",
             };
             format!("{kind}{index}")
@@ -1132,6 +1133,18 @@ fn bumper_engine(host: Host) -> rhai::Engine {
                 },
             )
         })
+        .register_fn(
+            "pending",
+            |s: &mut SegmentBuilder, path: &str, stand_in: &str| {
+                s.set_source(
+                    "pending",
+                    SegmentSource::Pending {
+                        path: PathBuf::from(path),
+                        stand_in: PathBuf::from(stand_in),
+                    },
+                )
+            },
+        )
         .register_fn("fixed", |s: &mut SegmentBuilder, secs: f64| {
             let ms = secs_to_ms(secs, "fixed()")?;
             s.set_duration("fixed", Duration::Fixed(ms))
@@ -1321,6 +1334,29 @@ fn build(ctx) {
         assert_eq!(built.usage["timeline"], 1);
         assert_eq!(built.usage["with_flex"], 1);
         assert_eq!(built.usage["looped"], 1);
+    }
+
+    #[test]
+    fn pending_sets_a_stand_in_source_and_counts_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_text = r#"
+fn hooks() { ["bumper"] }
+fn build(ctx) {
+    let t = timeline();
+    t.push(segment().pending("/r/real.mp4", "/r/stand.mp4").fixed(6.0).looped().mute());
+    t
+}
+"#;
+        let built = build(&script(&dir, script_text), &input(None)).unwrap();
+        assert_eq!(
+            built.timeline.segments[0].source,
+            SegmentSource::Pending {
+                path: "/r/real.mp4".into(),
+                stand_in: "/r/stand.mp4".into()
+            }
+        );
+        assert_eq!(built.timeline.segments[0].name, "pending0");
+        assert_eq!(built.usage["pending"], 1);
     }
 
     #[test]
