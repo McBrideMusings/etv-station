@@ -270,7 +270,7 @@ struct StationContext<'a> {
     /// `history` above — that field is the *watch* history a scorer plugin
     /// reads (`ctx.history`); this one is the play-history ledger every
     /// channel appends to and projects its resume cursor from.
-    history_db: &'a HistoryDb,
+    history_db: &'a Arc<HistoryDb>,
     /// The station-level `tracks:` rules (#261), the base of the track
     /// selection cascade.
     station_tracks: Option<&'a crate::config::TrackRules>,
@@ -3111,8 +3111,9 @@ pub(crate) fn target_count(
 }
 
 /// Run the align/fill pass over one generation's schedule. A channel with no
-/// aligned block gets its schedule back unchanged. `ctx.airings` answers empty
-/// for these bumpers until the daemon passes the ledger in (etv-station-7aa7.44).
+/// aligned block gets its schedule back unchanged. The bumper scripts read the
+/// airings ledger through `ctx.airings`; the rows for what they place come back
+/// in [`crate::bumper::fill::Laid::bumper_records`].
 #[allow(clippy::too_many_arguments)]
 fn align_fill(
     channel: &LoadedChannel,
@@ -3175,7 +3176,7 @@ fn align_fill(
         },
         tz: ctx.tz,
         overlay_root: &overlay_root,
-        history: None,
+        history: Some(Arc::clone(ctx.history_db)),
         plans,
         item_map: &item_map,
     };
@@ -3544,6 +3545,7 @@ async fn pattern_catch_up(
             items,
             durations,
             progress,
+            bumper_records,
         } = align_fill(
             channel,
             ctx,
@@ -3552,6 +3554,7 @@ async fn pattern_catch_up(
                 items,
                 durations,
                 progress,
+                bumper_records: Vec::new(),
             },
             skip,
             seq_start,
@@ -3672,6 +3675,13 @@ async fn pattern_catch_up(
                 })
             })
             .collect();
+        // Bumper rows share the generation's `written_at` and go in the same
+        // transaction as the programmes, so a failed write leaves neither.
+        let mut records = records;
+        records.extend(bumper_records.into_iter().map(|mut r| {
+            r.played_at = written_at;
+            r
+        }));
         ctx.history_db.record(&channel.name, &records)?;
 
         // `resume_out` carries only pool state; the checkpoint trail and the
@@ -3735,7 +3745,7 @@ mod resume_fingerprint_survives_generation_tests {
 
     fn ctx<'a>(
         history: &'a SharedHistory,
-        history_db: &'a HistoryDb,
+        history_db: &'a Arc<HistoryDb>,
         tz: &'static Tz,
     ) -> StationContext<'a> {
         StationContext {
@@ -3837,7 +3847,7 @@ order = "manual"
         let channel = ch_straddling(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let mut stamped = crate::resume::ResumeMap::new();
@@ -3867,7 +3877,7 @@ order = "manual"
         let channel = ch_straddling(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let resume = pattern_catch_up(
@@ -4007,7 +4017,7 @@ order = "manual"
         let channel = ch_list(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let mut resume = pattern_catch_up(
@@ -4187,7 +4197,7 @@ take = 2
         let channel = ch_pattern(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog = Some(pattern_catalog());
 
         let mut resume = pattern_catch_up(
@@ -4249,7 +4259,7 @@ take = 2
         let channel = ch_pattern(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog = Some(pattern_catalog());
 
         let mut resume = pattern_catch_up(

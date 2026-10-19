@@ -41,7 +41,7 @@ use super::emit::{EmitContext, emit_timeline};
 use super::hook::{BumperInput, ChannelInfo, build_or_black, rng_seed};
 use super::timeline::{ResolvedTimeline, SegmentSource, Timeline, fit};
 use crate::config::{Align, BlockInclude, SourceConfig};
-use crate::history::HistoryDb;
+use crate::history::{HistoryDb, PlayRecord};
 use crate::resolve::ResolvedItem;
 use crate::resume::Progress;
 
@@ -119,6 +119,9 @@ pub struct Laid {
     pub items: Vec<ResolvedItem>,
     pub durations: Vec<Duration>,
     pub progress: Vec<Progress>,
+    /// The airings-ledger rows for the bumper segments [`fill_gaps`] inserted,
+    /// for the caller to record once the generation is on disk. Empty on input.
+    pub bumper_records: Vec<PlayRecord>,
 }
 
 /// One bumper playout item, as the schedule's next entry.
@@ -159,12 +162,13 @@ pub fn fill_gaps(
     // Pass 1, over borrowed items: the pieces that lead item `skip` and the
     // ones that follow each item.
     let mut lead: Vec<Piece> = Vec::new();
+    let mut records: Vec<PlayRecord> = Vec::new();
     let mut after: Vec<Vec<Piece>> = (0..n).map(|_| Vec::new()).collect();
     let mut at = start;
     if fill_leading {
         let first = &laid.items[skip];
         if let Some(plan) = plan_for(env, first) {
-            lead = fill_gap(env, plan, at, None, Some(first), first.block);
+            lead = fill_gap(env, plan, at, None, Some(first), first.block, &mut records);
             at = advance(at, &lead);
         }
     }
@@ -177,7 +181,15 @@ pub fn fill_gaps(
     {
         at += time::Duration::seconds_f64(duration.as_secs_f64());
         if let Some(plan) = plan_for(env, item) {
-            after[i] = fill_gap(env, plan, at, Some(item), laid.items.get(i + 1), item.block);
+            after[i] = fill_gap(
+                env,
+                plan,
+                at,
+                Some(item),
+                laid.items.get(i + 1),
+                item.block,
+                &mut records,
+            );
             at = advance(at, &after[i]);
         }
     }
@@ -191,6 +203,7 @@ pub fn fill_gaps(
         items: Vec::with_capacity(n),
         durations: Vec::with_capacity(n),
         progress: Vec::with_capacity(n),
+        bumper_records: records,
     };
     let push = |out: &mut Laid, pieces: Vec<Piece>, state: &Progress| {
         for piece in pieces {
@@ -242,6 +255,7 @@ fn fill_gap(
     prev: Option<&ResolvedItem>,
     next: Option<&ResolvedItem>,
     block: usize,
+    records: &mut Vec<PlayRecord>,
 ) -> Vec<Piece> {
     let boundary = boundary_at_or_after(at, plan.every, env.tz);
     // A generation's next start is summed in a different order than the walk
@@ -340,6 +354,12 @@ fn fill_gap(
             overlay_root: env.overlay_root,
         };
         let items = emit_timeline(&resolved, &emit_ctx, cursor);
+        records.extend(super::ledger::records(
+            &resolved,
+            cursor,
+            OffsetDateTime::now_utc(),
+            &drawn.script.display().to_string(),
+        ));
         log_draw(
             env,
             &drawn.script,
@@ -744,6 +764,7 @@ fn build(ctx) {
             items: spans.iter().map(|(id, _)| programme(id)).collect(),
             durations: spans.iter().map(|(_, d)| *d).collect(),
             progress: spans.iter().map(|_| Progress::default()).collect(),
+            bumper_records: Vec::new(),
         }
     }
 
@@ -827,6 +848,30 @@ fn build(ctx) {
         );
         assert_eq!(gap_length(&out, "a", "b"), mins(8));
         assert!(bumpers(&out) >= 1);
+    }
+
+    #[test]
+    fn each_drawn_timeline_leaves_bumper_ledger_rows_at_its_gap_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopy = script(dir.path(), "loopy.rhai", LOOPY);
+        let start = datetime!(2026-10-17 20:00 UTC);
+        let out = run(
+            plan(vec![cand(&loopy)]),
+            laid(&[("a", mins(22)), ("b", mins(30))]),
+            start,
+            false,
+            &plain,
+        );
+
+        assert_eq!(out.bumper_records.len(), 1, "one segment, one draw");
+        let row = &out.bumper_records[0];
+        assert_eq!(row.kind, crate::history::AiringKind::Bumper);
+        assert_eq!(row.start, datetime!(2026-10-17 20:22 UTC));
+        assert_eq!(row.source.as_deref(), Some("color=c=black"));
+        assert_eq!(
+            row.produced_by.as_deref(),
+            Some(loopy.display().to_string().as_str())
+        );
     }
 
     #[test]
