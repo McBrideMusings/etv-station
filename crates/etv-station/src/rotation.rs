@@ -761,6 +761,25 @@ schedules:
 
     #[test]
     fn the_preview_matches_a_minute_by_minute_walk_when_schedules_shadow_each_other() {
+        assert_matches_minute_walk(
+            time_tz::timezones::db::UTC,
+            datetime!(2026-10-19 12:00:30 UTC),
+        );
+    }
+
+    #[test]
+    fn the_preview_matches_a_minute_by_minute_walk_across_a_dst_gap() {
+        assert_matches_minute_walk(
+            time_tz::timezones::db::america::CHICAGO,
+            datetime!(2026-03-07 12:00 UTC),
+        );
+        assert_matches_minute_walk(
+            time_tz::timezones::db::america::CHICAGO,
+            datetime!(2026-10-30 12:00 UTC),
+        );
+    }
+
+    fn assert_matches_minute_walk(tz: &'static time_tz::Tz, from: OffsetDateTime) {
         let r = rule(
             r#"
 blocks: [{ entries: [] }]
@@ -772,14 +791,13 @@ slots:
   c: { entries: [] }
 schedules:
   - name: every-night
-    hours: { "18..23": prime, "22:30..03": late }
+    hours: { "18..23": prime, "22:30..01": late, "02:30..03:30": late }
   - name: fridays
     weekdays: [fri]
     hours: { "20:15..21:45": late }
 "#,
         );
-        let cal = crate::calendar::Calendar::new(&r, time_tz::timezones::db::UTC).unwrap();
-        let from = datetime!(2026-10-19 12:00:30 UTC);
+        let cal = crate::calendar::Calendar::new(&r, tz).unwrap();
         let rows = preview(&r, &cal, &seed, &BTreeMap::new(), from, 6);
 
         let mut seen = std::collections::BTreeSet::new();

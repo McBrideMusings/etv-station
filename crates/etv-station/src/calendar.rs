@@ -181,6 +181,27 @@ impl<'a> Calendar<'a> {
                 if at > from {
                     out.push(at);
                 }
+                // A local time the clock skips (spring forward) converts to an
+                // instant before the gap; the first real minute after it is
+                // where the zone's offset changes, within the next hour.
+                let local = at.to_timezone(self.tz);
+                if u16::from(local.hour()) * 60 + u16::from(local.minute()) != *m {
+                    let offset = local.offset();
+                    let (mut lo, mut hi) = (0i64, 60i64);
+                    while hi - lo > 1 {
+                        let mid = (lo + hi) / 2;
+                        let probe = (at + Duration::minutes(mid)).to_timezone(self.tz);
+                        if probe.offset() == offset {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    let after = at + Duration::minutes(hi);
+                    if after > from && after < until {
+                        out.push(after);
+                    }
+                }
             }
             if !any_in_range {
                 break;
