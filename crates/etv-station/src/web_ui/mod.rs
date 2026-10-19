@@ -1540,7 +1540,12 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         days,
         start: start.unix_timestamp(),
     };
-    let fp = sim_cache::fingerprint(&lc.config_path, &lc.config, &state.options.catalog);
+    let fp = sim_cache::fingerprint(
+        &state.options.station,
+        &lc.config_path,
+        &lc.config,
+        &state.options.catalog,
+    );
     let (sim, sim_source) = match state.review.sims.lookup(&sim_key, &fp) {
         sim_cache::Lookup::Ready(sim) => (sim, "cache"),
         sim_cache::Lookup::Failed(e) => return Err(e),

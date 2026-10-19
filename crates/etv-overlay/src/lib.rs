@@ -1,5 +1,6 @@
 pub mod config_carrier;
 pub mod error_card;
+pub mod explain;
 pub mod fifo_writer;
 pub mod fonts;
 pub mod overlay_spec;

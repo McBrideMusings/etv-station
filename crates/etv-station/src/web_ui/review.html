@@ -188,6 +188,8 @@ const POOL_COLORS = ['#a9c4ff', '#ffc98f', '#a8e0b4', '#f4a9c8', '#d3b8ff', '#ff
 // The guide opens scrolled to this hour, so the afternoon and evening fill the first screen.
 const GUIDE_OPEN_HOUR = 12;
 
+// A 202 poll gives up after this long and shows an error instead of spinning.
+const POLL_DEADLINE_MS = 600000;
 let current = null;   // the last /api/review payload
 let lineup = { prev: null, next: null };
 let shownKey = null;   // the lineup key the picker last confirmed
@@ -215,6 +217,7 @@ async function load(channel, days, push) {
   $('report').classList.add('loading');
   for (const b of [$('prevBtn'), $('nextBtn'), $('applyDays'), $('picker')]) b.disabled = true;
   const seq = ++loadSeq;
+  const deadline = Date.now() + POLL_DEADLINE_MS;
   let data;
   try {
     // A 202 means the worker is still simulating this channel; ask again.
@@ -222,6 +225,7 @@ async function load(channel, days, push) {
       const res = await fetch(`/api/review?${q}`);
       data = await res.json();
       if (!data.pending) break;
+      if (Date.now() > deadline) throw new Error(`still simulating after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
       await new Promise((r) => setTimeout(r, 1000));
       if (seq !== loadSeq) return;
     }
