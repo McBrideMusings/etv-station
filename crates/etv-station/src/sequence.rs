@@ -960,6 +960,7 @@ fn arrange(ctx) {
                 drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
+                done: 0,
                 pattern: None,
             },
         );

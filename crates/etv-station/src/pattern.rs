@@ -252,6 +252,10 @@ struct PoolRuntime<'a> {
     /// Series visited since the walk last covered every series — the lap that
     /// decides where a rollover opens (see [`PoolResume::lap`]).
     lap: BTreeSet<String>,
+    /// The last [`Self::visit`] drew everything from one series with the
+    /// rotation parked on it at the visit's start, so a prefix of its items
+    /// can be resumed by drawing the rest.
+    visit_resumable: bool,
 }
 
 impl PoolRuntime<'_> {
@@ -585,13 +589,20 @@ impl PoolRuntime<'_> {
     }
 
     /// One visit to a step: draw `take` items per `rotate` / `on_short`.
+    ///
+    /// `done` is how many of the visit's items already aired before a
+    /// generation resumed inside it ([`PoolResume::done`]); a `Visit` draw
+    /// that is resumable gives that many fewer. Always zero for a visit the
+    /// walk opens itself.
     fn visit(
         &mut self,
         take: Take,
         from: TakeFrom,
         roll: &RollKey,
+        done: usize,
         channel: &mut ChannelHistory,
     ) -> Result<Vec<String>, String> {
+        self.visit_resumable = false;
         // A range is decided once per visit, so a `rotate = "slot"` visit
         // sizes its slots from the same roll a `rotate = "visit"` draw does.
         let take = resolve_take(take, roll);
@@ -620,11 +631,14 @@ impl PoolRuntime<'_> {
                     if self.is_dry() {
                         break;
                     }
-                    out.extend(self.serve(Draw::Count(1), from, roll, slot as u64, channel)?);
+                    out.extend(self.serve(Draw::Count(1), from, roll, slot as u64, 0, channel)?);
                 }
+                // The rotation moves every slot, so no start-of-visit state
+                // can resume it part-way.
+                self.visit_resumable = false;
                 Ok(out)
             }
-            Rotate::Visit => self.serve(take, from, roll, 0, channel),
+            Rotate::Visit => self.serve(take, from, roll, 0, done, channel),
         }
     }
 
@@ -641,6 +655,7 @@ impl PoolRuntime<'_> {
         from: TakeFrom,
         roll: &RollKey,
         nonce: u64,
+        done: usize,
         channel: &mut ChannelHistory,
     ) -> Result<Vec<String>, String> {
         let first = self.eligible_pick(roll, nonce, channel);
@@ -657,9 +672,13 @@ impl PoolRuntime<'_> {
         // An override beats both a count and `all` for the series it names
         // (#173) — the plugin's per-entry `take` stands in for the step's own,
         // whatever the step wrote.
+        //
+        // A resumed visit draws only what had not aired: `done` of its items
+        // are behind the series cursor already. `all` needs no subtraction —
+        // it is sized from what the series has left.
         let take = match (override_take, want, first) {
-            (Some(n), _, _) => n,
-            (None, Draw::Count(n), _) => n,
+            (Some(n), _, _) => n.saturating_sub(done),
+            (None, Draw::Count(n), _) => n.saturating_sub(done),
             (None, Draw::All, Some(si)) => self.series[si].remaining(),
             (None, Draw::All, None) => return Ok(Vec::new()),
         };
@@ -752,6 +771,13 @@ impl PoolRuntime<'_> {
             self.lap.clear();
         }
 
+        // A visit one series served whole, drawn from the series' start, can be
+        // resumed after any of its items: the rotation still points at that
+        // series until the visit completes, and the ledger cursor skips what
+        // aired. A visit that spilled onto a second series, or placed its
+        // cursor absolutely (`end`, `random`), is redone from its start.
+        self.visit_resumable = contributed.len() == 1 && from == TakeFrom::Start;
+
         // Park the rotation. A series that served the whole visit alone has had
         // its turn, so the next visit starts after it; one that only partly
         // served keeps its place so the next visit continues it.
@@ -785,7 +811,7 @@ impl PoolRuntime<'_> {
     }
 
     /// This pool's state to persist for the next window.
-    fn to_resume(&self, cycle: u64, step: usize) -> PoolResume {
+    fn to_resume(&self, cycle: u64, step: usize, done: usize) -> PoolResume {
         // Where each series left off is NOT recorded here — the play-history
         // ledger already holds it, and the cursor this pool resumed from was a
         // projection of that. Writing it a second time would be the duplicate
@@ -799,6 +825,11 @@ impl PoolRuntime<'_> {
             },
             step: if self.cfg.advance == Advance::Resume {
                 step
+            } else {
+                0
+            },
+            done: if self.cfg.advance == Advance::Resume {
+                done
             } else {
                 0
             },
@@ -1288,6 +1319,18 @@ pub fn build(
         .map(|r| r.step)
         .max()
         .unwrap_or(0);
+    // How far into that step's visit the previous generation's state sits,
+    // when a rewind cut the visit between two of its items.
+    let first_done = pools
+        .iter()
+        .filter(|_| stop_at_visit)
+        .filter(|p| p.advance == Advance::Resume)
+        .filter_map(|p| state.resume.pool(&p.name))
+        .filter(|r| r.cycle == first_cycle && r.step == first_step)
+        .filter(|r| r.pattern.as_deref() == Some(pattern_id.as_str()))
+        .map(|r| r.done)
+        .max()
+        .unwrap_or(0);
     // The window may end at any visit boundary, not only at a cycle's: what
     // airs at the boundary still finishes, but the walk does not go on to the
     // rest of the cycle, which on a long pattern ("1 film, then 2-4 episodes")
@@ -1385,9 +1428,31 @@ pub fn build(
             } else {
                 (cycle + 1, 0)
             };
-            let before = pools_resume(&runtimes, at_cycle, at_step, &pattern_id);
-            let drawn = runtimes[idx].visit(step.take, step.from, &roll, &mut channel)?;
-            progress.extend(std::iter::repeat_n(before, drawn.len()));
+            // Only the visit the previous generation was cut inside resumes
+            // part-way; every later visit opens whole.
+            let resumed = if cycle == first_cycle && step_idx == first_step {
+                first_done
+            } else {
+                0
+            };
+            let before = pools_resume(&runtimes, at_cycle, at_step, resumed, &pattern_id);
+            let drawn = runtimes[idx].visit(step.take, step.from, &roll, resumed, &mut channel)?;
+            // Each drawn id's progress is the state had only the ones before it
+            // aired. A resumable visit has one stop per item; any other redoes
+            // the whole visit from `before`, since its rotation moved partway
+            // through.
+            let resumable = runtimes[idx].visit_resumable && stop_at_visit;
+            for n in 0..drawn.len() {
+                let mut at = before.clone();
+                if resumable && n > 0 {
+                    // Every pool of a resumable block resumes, so all carry it.
+                    for pool in at.values_mut() {
+                        pool.done = resumed + n;
+                        pool.pattern = Some(pattern_id.clone());
+                    }
+                }
+                progress.push(at);
+            }
             if measure {
                 laid += runtimes[idx].runtime_of(&drawn);
             }
@@ -1540,7 +1605,7 @@ pub fn build(
         );
     }
 
-    let resume_out = pools_resume(&runtimes, stopped_at.0, stopped_at.1, &pattern_id);
+    let resume_out = pools_resume(&runtimes, stopped_at.0, stopped_at.1, 0, &pattern_id);
     progress.push(resume_out.clone());
     // The metadata half of what plugin pools picked (#166) — narrowed from
     // the take-override half, which stays behind on each `PoolRuntime` for
@@ -1625,7 +1690,7 @@ fn rollover<'a>(
     // rotation and lap — is exactly the "previous" a rolled-over pool opens
     // from, so the same seat rule serves a rollover between generations and
     // one inside a generation.
-    let prev = rt.to_resume(0, 0);
+    let prev = rt.to_resume(0, 0, 0);
     let fresh = pool_runtime(
         catalog,
         cfg,
@@ -1653,18 +1718,20 @@ fn rollover<'a>(
 }
 
 /// Every pool's resume state as the walk stands now, `cycle` and `step` being
-/// the pattern position a generation resuming from here starts at.
+/// the pattern position a generation resuming from here starts at, and `done`
+/// how many of that step's items have already aired.
 fn pools_resume(
     runtimes: &[PoolRuntime],
     cycle: u64,
     step: usize,
+    done: usize,
     pattern_id: &str,
 ) -> BTreeMap<String, PoolResume> {
     runtimes
         .iter()
         .map(|rt| {
-            let mut resume = rt.to_resume(cycle, step);
-            if resume.step > 0 {
+            let mut resume = rt.to_resume(cycle, step, done);
+            if resume.step > 0 || resume.done > 0 {
                 resume.pattern = Some(pattern_id.to_string());
             }
             (rt.cfg.name.clone(), resume)
@@ -2503,6 +2570,7 @@ fn pool_runtime<'a>(
         refills: 0,
         list_key: dice.list_key(cfg),
         lap: BTreeSet::new(),
+        visit_resumable: false,
     };
     // Seeded through the same path a draw takes, so the window is trimmed to
     // `reach` by one rule rather than two.
@@ -3801,6 +3869,7 @@ mod tests {
                 drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
+                done: 0,
                 pattern: None,
             },
         );
@@ -3865,6 +3934,7 @@ mod tests {
                 drawn: Vec::new(),
                 cycle: 0,
                 step: 0,
+                done: 0,
                 pattern: None,
             },
         );

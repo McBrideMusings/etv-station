@@ -244,6 +244,14 @@ pub struct PoolResume {
     /// rather than replaying them.
     #[serde(default, skip_serializing_if = "is_zero_step")]
     pub step: usize,
+    /// How many of `step`'s items already aired when the walk stopped inside
+    /// that visit. Zero at every visit boundary, which is where a generation
+    /// ends; non-zero only in per-item checkpoints, so a wipe cutting
+    /// between the episodes of a `take = 2` visit resumes the visit's
+    /// remaining item instead of drawing the whole visit again. Read with
+    /// `step`: it is honoured under the same pattern id and ignored otherwise.
+    #[serde(default, skip_serializing_if = "is_zero_step")]
+    pub done: usize,
     /// [`crate::pattern::pattern_id`] of the pattern `step` was recorded
     /// under. `step` indexes into that pattern as written, so a generation
     /// honours it only when the pattern it walks has the same id; any edit to

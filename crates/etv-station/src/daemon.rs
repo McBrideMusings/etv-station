@@ -1310,6 +1310,9 @@ async fn run_generation(
     // the real file in once it is readable, far sooner than a catalog refresh.
     let mut pending_swap = tokio::time::interval(PENDING_SWAP_EVERY);
     pending_swap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // What the previous tick saw of each pending file, so one still being
+    // written (its size or mtime moved) is not swapped half-rendered.
+    let mut pending_seen = crate::reconcile::PendingSeen::new();
 
     // `biased` makes shutdown win if both signals are pending, and both win
     // over a refresh — a station being told to stop has no business starting a
@@ -1333,6 +1336,7 @@ async fn run_generation(
                     history_db,
                     OffsetDateTime::now_utc(),
                     crate::duration::media_len_ms,
+                    &mut pending_seen,
                 )
                 .await;
             }
@@ -4295,6 +4299,58 @@ take = 2
         );
     }
 
+    /// etv-station-78tf.2: a wipe cutting between the two episodes of one
+    /// `take = 2` visit regenerates the rest of that visit, not a fresh cycle.
+    #[tokio::test]
+    async fn a_wipe_mid_visit_resumes_the_visit_not_the_cycle() {
+        let dir = tempdir().unwrap();
+        let channel = ch_pattern(&dir);
+        let tz = crate::tz::parse("UTC").unwrap();
+        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
+        let mut catalog = Some(pattern_catalog());
+
+        let mut resume = pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            crate::resume::ResumeMap::new(),
+            "startup",
+        )
+        .await
+        .unwrap();
+        let mut before = airings_on_disk(&channel.output_folder).await;
+        before.dedup();
+        let cut = before
+            .iter()
+            .find(|(id, _)| id == "b-e02")
+            .expect("the fixture airs b-e02")
+            .1;
+        wipe_playout_from(&channel, cut).await.unwrap();
+        rewind_to_surviving(&channel, ctx(&history, &history_db, tz), &mut resume, cut)
+            .await
+            .unwrap();
+        pattern_catch_up(
+            &channel,
+            ctx(&history, &history_db, tz),
+            &mut catalog,
+            resume,
+            "roll",
+        )
+        .await
+        .unwrap();
+        let mut after = airings_on_disk(&channel.output_folder).await;
+        after.dedup();
+        let ids = |v: &[(String, OffsetDateTime)]| -> Vec<String> {
+            v.iter().take(12).map(|(id, _)| id.clone()).collect()
+        };
+        assert_eq!(
+            ids(&before),
+            ids(&after),
+            "the regenerated seam keeps the authored 1 film, 2 episodes shape",
+        );
+    }
+
     /// The pattern half of #378, through the daemon's own checkpoint loop:
     /// a wipe sparing a boundary-straddling chunk rewinds `pools[x].next` only
     /// past what survived, so the regenerated span continues each rotation
@@ -4385,10 +4441,7 @@ take = 2
                 "show {show} repeated or stepped back: {eps:?}",
             );
         }
-        // Turns are compared as runs of one show rather than as pairs: a wipe
-        // cutting mid-visit spares that visit's first episode, and the
-        // regenerated span redoes the visit — a film, then the same show's
-        // next two — so that turn runs three episodes long across the seam.
+        // Turns are compared as runs of one show, not as pairs of episodes.
         let mut visits: Vec<&str> = episodes.iter().map(|(s, _)| *s).collect();
         visits.dedup();
         let visit_breaks: Vec<_> = visits
