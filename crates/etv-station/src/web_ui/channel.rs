@@ -153,18 +153,166 @@ fn file_mtime(path: &Path) -> Result<std::time::SystemTime, String> {
 /// How many upcoming placements per rotation the Review JSON previews.
 const ROTATION_PREVIEW_PLACEMENTS: usize = 14;
 
-/// `GET /api/channels/{key}/review[?project=Nd]`: the channel's review over its
-/// real airings, plus N days projected past the frontier when asked. While the
-/// worker simulates the projection the answer is 202 with the real span and
-/// `"pending": true`. A key that is not in the lineup is a 404, a `project`
-/// outside [`projection::DAY_CHOICES`] a 400.
+/// `GET /api/channels/{key}/review[?project=Nd][&draft=ID]`: the channel's
+/// review over its real airings, plus N days projected past the frontier when
+/// asked. While the worker simulates the projection the answer is 202 with the
+/// real span and `"pending": true`. A key that is not in the lineup is a 404, a
+/// `project` outside [`projection::DAY_CHOICES`] a 400.
+///
+/// With `draft` the answer is `{deployed, draft, diff}`: the deployed review
+/// and the same review re-simulated with the draft's pools swapped in, over
+/// the same window, and what moved between them. The window defaults to
+/// [`DRAFT_PROJECT_DAYS`]. The answer is 202 while either simulation runs.
 pub(super) fn api_channel_review(
     state: &mut AppState,
     key: &str,
     query: &str,
 ) -> Result<(u16, Value), String> {
-    let began = std::time::Instant::now();
     let params = parse_query(query);
+    let Some(draft_id) = params.get("draft").filter(|d| !d.is_empty()).cloned() else {
+        return channel_review(state, key, &params, None);
+    };
+    let edits = match super::pools::draft_edits(state, key, &draft_id) {
+        Ok(e) => e,
+        Err(e) => return Ok((404, json!({ "error": e }))),
+    };
+    let mut params = params;
+    params
+        .entry("project".to_string())
+        .or_insert_with(|| format!("{DRAFT_PROJECT_DAYS}d"));
+    // Both are asked before either answer is read, so a cold cache queues the
+    // two simulations together.
+    let (dep_status, deployed) = channel_review(state, key, &params, None)?;
+    let (draft_status, draft) = channel_review(state, key, &params, Some(&edits))?;
+    for (status, body) in [(dep_status, &deployed), (draft_status, &draft)] {
+        if status != 200 && status != 202 {
+            return Ok((status, body.clone()));
+        }
+    }
+    if deployed.get("load_error").is_some() {
+        return Ok((200, deployed));
+    }
+    let diff = review_diff(&deployed, &draft);
+    let pending = dep_status == 202 || draft_status == 202;
+    tracing::info!(
+        event = "ui.review.draft",
+        channel = %key,
+        draft = %draft_id,
+        pending,
+        changed_airings = diff["changed_airings"].as_array().map(Vec::len).unwrap_or(0),
+        "review: draft graded against deployed"
+    );
+    Ok((
+        if pending { 202 } else { 200 },
+        json!({
+            "pending": pending,
+            "deployed_pending": dep_status == 202,
+            "draft_pending": draft_status == 202,
+            "deployed": deployed,
+            "draft": draft,
+            "diff": diff,
+        }),
+    ))
+}
+
+/// How many days a draft's review projects when the request names no length:
+/// a draft re-simulation costs about 10s a generation (etv-station-1ne2).
+const DRAFT_PROJECT_DAYS: u32 = 3;
+
+/// What moved between a deployed review and its draft: each principle's grade
+/// with a direction in words, each depth row, the first repeat, and the draft
+/// airings that are not the deployed schedule's airing at the same instant.
+fn review_diff(deployed: &Value, draft: &Value) -> Value {
+    let direction = |was: Option<i64>, now: Option<i64>| match (was, now) {
+        (Some(w), Some(n)) if n > w => "up",
+        (Some(w), Some(n)) if n < w => "down",
+        _ => "same",
+    };
+    let principles =
+        |r: &Value| -> Vec<Value> { r["principles"].as_array().cloned().unwrap_or_default() };
+    let dep_principles = principles(deployed);
+    let grades: Vec<Value> = principles(draft)
+        .iter()
+        .map(|p| {
+            let was = dep_principles.iter().find(|d| d["name"] == p["name"]);
+            let (was_grade, now_grade) =
+                (was.and_then(|w| w["grade"].as_i64()), p["grade"].as_i64());
+            json!({
+                "name": p["name"],
+                "deployed": was.map(|w| w["grade"].clone()).unwrap_or(Value::Null),
+                "draft": p["grade"],
+                "deployed_measure": was.map(|w| w["measure"].clone()).unwrap_or(Value::Null),
+                "draft_measure": p["measure"],
+                "direction": direction(was_grade, now_grade),
+            })
+        })
+        .collect();
+
+    let row_id = |r: &Value| format!("{}|{}|{}", r["kind"], r["name"], r["pool"]);
+    let dep_depth: Vec<Value> = deployed["depth"].as_array().cloned().unwrap_or_default();
+    let depth: Vec<Value> = draft["depth"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    let was = dep_depth.iter().find(|d| row_id(d) == row_id(r));
+                    json!({
+                        "kind": r["kind"],
+                        "name": r["name"],
+                        "pool": r["pool"],
+                        "aired": { "deployed": was.map(|w| w["aired"].clone()), "draft": r["aired"] },
+                        "distinct": { "deployed": was.map(|w| w["distinct"].clone()), "draft": r["distinct"] },
+                        "first_repeat_days": {
+                            "deployed": was.map(|w| w["first_repeat_days"].clone()),
+                            "draft": r["first_repeat_days"],
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let at = |a: &Value| (a["start"].as_i64(), a["id"].as_str().map(str::to_string));
+    let dep_airings: Vec<Value> = deployed["airings"].as_array().cloned().unwrap_or_default();
+    let deployed_set: HashSet<(Option<i64>, Option<String>)> = dep_airings.iter().map(at).collect();
+    let was_at: HashMap<Option<i64>, Value> = dep_airings
+        .iter()
+        .map(|a| (a["start"].as_i64(), a["id"].clone()))
+        .collect();
+    let changed: Vec<Value> = draft["airings"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|a| !deployed_set.contains(&at(a)))
+                .map(|a| {
+                    json!({
+                        "index": a["index"],
+                        "id": a["id"],
+                        "label": a["label"],
+                        "start": a["start"],
+                        "was": was_at.get(&a["start"].as_i64()).cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "grades": grades,
+        "depth": depth,
+        "first_repeat": { "deployed": deployed["first_repeat"], "draft": draft["first_repeat"] },
+        "changed_airings": changed,
+    })
+}
+
+/// One review: the deployed channel's, or `draft`'s pools swapped in.
+fn channel_review(
+    state: &mut AppState,
+    key: &str,
+    params: &HashMap<String, String>,
+    draft: Option<&projection::DraftEdits>,
+) -> Result<(u16, Value), String> {
+    let began = std::time::Instant::now();
     let key = key.to_string();
     let station = config::load_for_inspection(&state.review.station_path)
         .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))?;
@@ -264,6 +412,7 @@ pub(super) fn api_channel_review(
                 &seed.show_cursor,
             ),
             candidates,
+            draft,
         );
         let request = projection::Request {
             channel: key.clone(),
@@ -275,6 +424,7 @@ pub(super) fn api_channel_review(
             show_cursor: seed.show_cursor,
             resume: seed.resume,
             digests,
+            draft: draft.cloned(),
         };
         let request_key = request.key();
         match state.review.sims.lookup(request) {
@@ -368,7 +518,11 @@ pub(super) fn api_channel_review(
 
     let review = build_review(state, &station, lc, &airings, &simulated, start, end)?;
     let summary = comparable_numbers(&review);
-    let since_last = state.review.previous.insert(key.clone(), summary.clone());
+    // A draft's numbers are not the channel's "last run".
+    let since_last = match draft {
+        None => state.review.previous.insert(key.clone(), summary.clone()),
+        Some(_) => None,
+    };
     let since_last_json = since_last.map(|old| {
         let old: HashMap<String, Value> = old.into_iter().collect();
         summary

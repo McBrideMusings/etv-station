@@ -664,6 +664,23 @@ fn pools_response(state: &mut AppState, key: &str, loc: &Located, draft: Option<
     ))
 }
 
+/// The draft `id`'s edits on `key`, for a projection. Marks the draft used.
+pub(super) fn draft_edits(
+    state: &mut AppState,
+    key: &str,
+    id: &str,
+) -> Result<super::projection::DraftEdits, String> {
+    let d = state.pools.drafts.touch(key, id)?;
+    Ok(super::projection::DraftEdits {
+        profiles: d
+            .profiles
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        account_id: d.account_id,
+    })
+}
+
 /// `GET /api/channels/{ch}/pools?draft=`
 pub(super) fn api_pools(state: &mut AppState, key: &str, query: &str) -> Answer {
     let params = parse_query(query);
@@ -1213,7 +1230,8 @@ mod tests {
         )
         .unwrap();
 
-        let catalog = Catalog::open_in_memory().unwrap();
+        let catalog_path = root.join("catalog.db");
+        let catalog = Catalog::open(&catalog_path).unwrap();
         for id in ["mov-a", "mov-b", "mov-c", "mov-d"] {
             catalog
                 .upsert_entry(&CatalogEntry::new(id, "movie", id, Source::Plex))
@@ -1230,19 +1248,21 @@ mod tests {
                 })
                 .unwrap();
         }
+        drop(catalog);
         let state = AppState {
-            catalog,
+            catalog: Catalog::open_readonly(&catalog_path).unwrap(),
             pools: PoolState::default(),
-            review: ReviewState::new(station.clone(), PathBuf::from("/nonexistent/catalog.db")),
+            review: ReviewState::new(station.clone(), catalog_path.clone()),
             options: Options {
                 station,
-                catalog: PathBuf::from("/nonexistent/catalog.db"),
+                catalog: catalog_path,
                 plugins_dir: None,
                 bind: IpAddr::from([127, 0, 0, 1]),
                 port: 0,
                 health: HealthSources::default(),
             },
         };
+        state.review.sims.spawn();
         Fixture { _dir: dir, state }
     }
 
@@ -1425,5 +1445,131 @@ mod tests {
             "",
         );
         assert_eq!(pools["draft"]["edits"], 0);
+    }
+
+    /// Asks again until both simulations have finished.
+    fn graded(state: &mut AppState, query: &str) -> Value {
+        for _ in 0..1200 {
+            let (status, body) = call(state, Method::Get, query, "");
+            if status == 200 {
+                return body;
+            }
+            assert_eq!(status, 202, "{body}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the simulations never finished");
+    }
+
+    #[test]
+    fn deployed_and_draft_simulations_are_cached_under_different_keys() {
+        let mut f = fixture();
+        let draft = open_draft(&mut f.state, "foryou");
+        add_desert(&mut f.state, &draft);
+        let query = format!("/api/channels/foryou/review?draft={draft}&project=1d");
+        let body = graded(&mut f.state, &query);
+        let (dep, dra) = (
+            body["deployed"]["projection"]["key"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            body["draft"]["projection"]["key"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        assert_ne!(dep, dra);
+        assert_eq!(
+            body["draft"]["projection"]["inputs"]["draft"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_ne!(
+            body["deployed"]["projection"]["inputs"]["draft"],
+            body["draft"]["projection"]["inputs"]["draft"]
+        );
+        assert_eq!(
+            body["draft"]["projection"]["changed"],
+            json!([]),
+            "the first draft projection has no earlier draft to differ from"
+        );
+
+        // A second draft with the identical edit set is the same projection:
+        // it answers at once, with no 202.
+        let again = open_draft(&mut f.state, "foryou");
+        add_desert(&mut f.state, &again);
+        let (status, hit) = call(
+            &mut f.state,
+            Method::Get,
+            &format!("/api/channels/foryou/review?draft={again}&project=1d"),
+            "",
+        );
+        assert_eq!(status, 200, "{hit}");
+        assert_eq!(hit["draft"]["projection"]["key"], dra.as_str());
+        assert_eq!(hit["deployed"]["projection"]["key"], dep.as_str());
+    }
+
+    #[test]
+    fn a_draft_that_changes_what_airs_names_the_airings_and_the_grade_that_moved() {
+        let mut f = fixture();
+        let draft = open_draft(&mut f.state, "foryou");
+        add_desert(&mut f.state, &draft);
+        let body = graded(
+            &mut f.state,
+            &format!("/api/channels/foryou/review?draft={draft}&project=3d"),
+        );
+        let changed = body["diff"]["changed_airings"].as_array().unwrap();
+        assert!(!changed.is_empty(), "{}", body["diff"]);
+        let first = &changed[0];
+        assert!(
+            first["id"].is_string() && first["start"].is_i64(),
+            "{first}"
+        );
+        assert_ne!(first["id"], first["was"], "{first}");
+        let grades = body["diff"]["grades"].as_array().unwrap();
+        assert!(!grades.is_empty());
+        // Four movies cannot move a grade's 0-3 score, but the draft does
+        // change what a graded principle measured.
+        assert!(
+            grades
+                .iter()
+                .any(|g| g["deployed_measure"] != g["draft_measure"]),
+            "{grades:?}"
+        );
+        for g in grades {
+            let dir = g["direction"].as_str().unwrap();
+            let (was, now) = (g["deployed"].as_i64(), g["draft"].as_i64());
+            let expected = match (was, now) {
+                (Some(w), Some(n)) if n > w => "up",
+                (Some(w), Some(n)) if n < w => "down",
+                _ => "same",
+            };
+            assert_eq!(dir, expected, "{g}");
+        }
+        assert_eq!(
+            body["deployed"]["span"]["label"], "real + 3 days projected",
+            "the draft window is the deployed window"
+        );
+
+        // A draft with no edit is the deployed schedule: nothing changed.
+        let idle = open_draft(&mut f.state, "foryou");
+        let same = graded(
+            &mut f.state,
+            &format!("/api/channels/foryou/review?draft={idle}&project=3d"),
+        );
+        assert_eq!(same["diff"]["changed_airings"], json!([]));
+    }
+
+    #[test]
+    fn a_missing_draft_is_a_404_on_the_review() {
+        let mut f = fixture();
+        let (status, body) = call(
+            &mut f.state,
+            Method::Get,
+            "/api/channels/foryou/review?draft=nope",
+            "",
+        );
+        assert_eq!(status, 404, "{body}");
     }
 }

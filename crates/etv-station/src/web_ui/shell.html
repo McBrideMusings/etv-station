@@ -108,6 +108,11 @@
   /* Projected, not scheduled: a dashed edge and a crosshatch no repeat marker uses. */
   .blk.proj { border: 1px dashed var(--fg); opacity: .8;
     background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.5) 0 3px, transparent 3px 7px), repeating-linear-gradient(135deg, rgba(255,255,255,.5) 0 3px, transparent 3px 7px); }
+  /* Changed by the draft: a thick solid frame with an inset gap, which no repeat or projected marker uses and which does not rely on colour. */
+  .blk.chg { border: 3px solid var(--fg); box-shadow: inset 0 0 0 2px var(--bg); }
+  .swatch.chg { width: 14px; height: 10px; background-color: var(--track); border: 3px solid var(--fg); box-sizing: border-box; }
+  .dir { font-weight: 700; white-space: nowrap; }
+  .arrow { color: var(--muted); }
   .swatch.proj { width: 14px; height: 10px; background-color: var(--track); border: 1px dashed var(--fg); }
   .frontier { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--err-fg); z-index: 1; pointer-events: none; }
   .frontier span { position: absolute; right: 2px; top: 1px; font-size: 9.5px; font-weight: 700; color: var(--err-fg); background: var(--bg); padding: 0 3px; border-radius: 2px; }
@@ -338,10 +343,15 @@ function parseRoute() {
     draft: q.get('draft'),
   };
 }
+// With a draft open the Schedule projects 3 days unless the address names a length: a draft re-simulation is slow.
+function routeWithDraftWindow(r) {
+  if (r.draft && r.view === 'schedule' && !r.project) r.project = '3d';
+  return r;
+}
 function channelHash(channel, view, project, draft) {
   const q = [];
   if (project && view !== 'pools') q.push(`project=${project}`);
-  if (draft && view === 'pools') q.push(`draft=${encodeURIComponent(draft)}`);
+  if (draft && view !== 'pattern') q.push(`draft=${encodeURIComponent(draft)}`);
   return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${q.length ? `?${q.join('&')}` : ''}`;
 }
 
@@ -403,6 +413,66 @@ async function load(channel, project, view) {
   show(data, view);
 }
 
+// The Schedule with a draft open: the server re-simulates the channel with the draft's pools swapped in and answers
+// {deployed, draft, diff}, or 202 while either simulation runs. The deployed review is drawn meanwhile; the page asks
+// again every DRAFT_POLL_MS beside a counter, then draws the draft's review with the diff against the deployed one.
+const DRAFT_POLL_MS = 15000;
+async function loadDraft(channel, project, draft, view) {
+  const began = Date.now();
+  $('state').textContent = '';
+  if (!current || current.channel !== channel) { current = null; $('report').innerHTML = ''; }
+  $('report').classList.add('loading');
+  setControls(project, true);
+  const seq = ++loadSeq;
+  const simulating = () => {
+    const which = [];
+    if (pendingNow.deployed) which.push('deployed');
+    if (pendingNow.draft) which.push('draft');
+    $('projState').innerHTML = `<span class="spinner"></span>Simulating ${esc(which.join(' and ') || 'draft')}… (asked again every ${DRAFT_POLL_MS / 1000}s) ${Math.round((Date.now() - began) / 1000)}s`;
+  };
+  const pendingNow = { deployed: true, draft: true };
+  const ticker = setInterval(simulating, 1000);
+  const q = new URLSearchParams({ draft });
+  if (project) q.set('project', project);
+  let data;
+  let drewReal = false;
+  try {
+    simulating();
+    for (;;) {
+      const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/review?${q}`);
+      data = await res.json();
+      if (seq !== loadSeq) return;
+      if (!res.ok && res.status !== 202) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
+      if (!data.pending) break;
+      pendingNow.deployed = !!data.deployed_pending;
+      pendingNow.draft = !!data.draft_pending;
+      if (!drewReal && data.deployed && !data.deployed.error) { $('report').classList.remove('loading'); show(data.deployed, view); drewReal = true; }
+      simulating();
+      await new Promise((r) => setTimeout(r, DRAFT_POLL_MS));
+      if (seq !== loadSeq) return;
+    }
+  } catch (e) {
+    data = { error: String(e) };
+  } finally {
+    clearInterval(ticker);
+  }
+  if (seq !== loadSeq) return;
+  $('report').classList.remove('loading');
+  $('projState').textContent = '';
+  setControls(project, false);
+  if (data.error) {
+    current = null;
+    $('report').innerHTML = `<header class="mast"><h1>${esc(channel)}</h1></header>
+      <h2>The draft review could not be built</h2><div class="error">${esc(data.error)}</div>
+      <p><a href="${channelHash(channel, 'schedule', project)}">Show the deployed schedule</a></p>`;
+    return;
+  }
+  if (data.deployed && data.deployed.load_error) { show(data.deployed, view); return; }
+  data.draft.diff = data.diff;
+  data.draft.draftId = draft;
+  show(data.draft, view);
+}
+
 // Draws one review payload, or the load-error page for a channel whose config fails to load.
 function show(data, view) {
   if (data.load_error) {
@@ -460,6 +530,7 @@ async function loadLineup() {
 
 // Marks where the page is: the tab, the channel in the lineup, the sub-tab, and the links that keep the days.
 function markRoute(r) {
+  routeWithDraftWindow(r);
   for (const [id, tab] of [['tabChannels', 'channels'], ['tabGuide', 'guide'], ['tabHealth', 'health']]) {
     if (r.tab === tab) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
@@ -472,7 +543,7 @@ function markRoute(r) {
   const project = r.project;
   $('projCtl').hidden = r.view === 'pools';
   for (const a of $('lineup').querySelectorAll('a')) {
-    a.href = channelHash(a.dataset.key, r.view, project);
+    a.href = channelHash(a.dataset.key, r.view, project);   // a draft belongs to one channel, so the rail drops it
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
@@ -558,7 +629,7 @@ function drawHealth(d) {
 
 let shown = null;   // the channel and projection the report holds, so a sub-tab switch redraws without refetching
 async function route() {
-  const r = parseRoute();
+  const r = routeWithDraftWindow(parseRoute());
   if (!lineup) await loadLineup();
   if (r.tab === 'channels' && !r.channel) {
     // A bare `#/channels` (or no hash) opens the first channel in the lineup.
@@ -571,10 +642,11 @@ async function route() {
   if (!r.channel) return;
   if (r.view === 'pools') { guideSeq++; healthSeq++; shown = null; await loadPools(r.channel, r.draft); return; }
   guideSeq++; poolsSeq++; healthSeq++;
-  const key = `${r.channel}|${r.project}`;
+  const key = `${r.channel}|${r.project}|${r.view === 'schedule' ? r.draft || '' : ''}`;
   if (shown === key && current) { draw(r.view); return; }
   shown = key;
-  await load(r.channel, r.project, r.view);
+  if (r.draft && r.view === 'schedule') await loadDraft(r.channel, r.project, r.draft, r.view);
+  else await load(r.channel, r.project, r.view);
 }
 
 function poolColor(d) {
@@ -635,6 +707,10 @@ function render(d) {
   const tz = d.tz;
   const span = d.days;
   const covers = d.span.label;   // "real only" or "real + N days projected"; every number below is over it
+  const diff = d.diff || null;   // set when a draft is open: what moved against the deployed schedule
+  const gradeOf = (name) => (diff ? diff.grades.find((g) => g.name === name) : null);
+  const dots = (g) => (g == null ? '—' : '●'.repeat(g) + '○'.repeat(3 - g));
+  const WORDS = { up: '▲ up', down: '▼ down', same: '= same' };
   const html = [];
 
   // 1. Masthead
@@ -650,7 +726,7 @@ function render(d) {
     </div>
     <dl class="facts">
       <div><dt>First repeat</dt><dd>${fr ? days1(fr.days) + ' d' : '&gt;' + span + ' d'}</dd>
-        <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : `Nothing repeated in ${esc(covers)}`}</dd></div>
+        <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : `Nothing repeated in ${esc(covers)}`}${diff ? `<br>deployed: ${diff.first_repeat.deployed ? days1(diff.first_repeat.deployed.days) + ' d' : '&gt;' + span + ' d'}` : ''}</dd></div>
       <div><dt>Film / series airtime</dt><dd>${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</dd>
         <dd class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</dd></div>
       <div><dt>Channels sharing content</dt><dd>${d.overlap.this_channel_whole_library ? '—' : ov.length}</dd>
@@ -659,11 +735,13 @@ function render(d) {
       <div><dt>Items aired</dt><dd>${d.items_aired}</dd><dd class="d">${d.distinct_items} distinct · ${esc(covers)}</dd></div>
     </dl>
     ${notesHTML(d)}
+    ${diff ? `<div class="notes"><div class="notice" id="draftNote"><b>Draft ${esc(d.draftId)}</b> — ${diff.changed_airings.length} of ${d.airings.filter((a) => a.projected).length} projected airings differ from the deployed schedule over ${esc(covers)}. Grades read deployed → draft.</div></div>` : ''}
   </header>`);
 
   html.push(`<div class="legend">${Object.entries(colors).map(([p, c]) => `<span><span class="swatch" style="background:${c}"></span>${esc(p)}</span>`).join('')}
     <span><span class="rbadge">R</span>already aired earlier in the span</span>
     <span><span class="swatch proj"></span>Projected — not scheduled</span>
+    ${d.diff ? '<span><span class="swatch chg"></span>Changed by the draft</span>' : ''}
     <span><span class="swatch fl"></span>Frontier: where the published playout ends</span>
     <span><span class="pin">1</span>tune-in sample</span></div>`);
 
@@ -693,17 +771,23 @@ function render(d) {
   const scored = d.principles.filter((p) => p.grade != null);
   const points = scored.reduce((t, p) => t + p.grade, 0);
   const principleRows = d.principles.map((p) => p.grade != null
-    ? `<tr><td class="pname">${esc(p.name)}</td><td class="dots" aria-label="${p.grade} of 3">${'●'.repeat(p.grade)}${'○'.repeat(3 - p.grade)}</td>
-        <td class="pmeasure">${esc(p.measure)}</td></tr>`
+    ? (() => {
+      const g = gradeOf(p.name);
+      const cell = g
+        ? `<td class="dots" aria-label="${g.deployed ?? 'not scored'} of 3 deployed, ${p.grade} of 3 in the draft, ${g.direction}">${dots(g.deployed)} <span class="arrow">→</span> ${dots(p.grade)} <span class="dir">${WORDS[g.direction]}</span></td>`
+        : `<td class="dots" aria-label="${p.grade} of 3">${dots(p.grade)}</td>`;
+      const was = g && g.deployed_measure && g.deployed_measure !== p.measure ? `<br><span class="muted">deployed: ${esc(g.deployed_measure)}</span>` : '';
+      return `<tr><td class="pname">${esc(p.name)}</td>${cell}<td class="pmeasure">${esc(p.measure)}${was}</td></tr>`;
+    })()
     : `<tr class="unscored"><td class="pname">${esc(p.name)}</td><td class="dots">—</td>
         <td class="pmeasure">${p.measure ? esc(p.measure) + '<br>' : ''}<span class="muted">Not scored: ${esc(p.not_scored)}</span></td></tr>`).join('');
   html.push(`<section><h2>Programming principles</h2>
-    <div class="ptotal"><span class="big">${points} / ${scored.length * 3}</span>
+    <div class="ptotal"><span class="big">${diff ? `${diff.grades.reduce((t, g) => t + (g.deployed != null && g.draft != null ? g.deployed : 0), 0)} → ` : ''}${points} / ${scored.length * 3}</span>
       <span class="muted">${scored.length} of ${d.principles.length} principles measured over ${esc(covers)}. Thresholds are in docs/programming.md under each principle's Grade.</span></div>
     <table class="principles"><tbody>${principleRows}</tbody></table></section>`);
 
   // 4. Depth
-  const depthRows = d.depth.map((r) => {
+  const depthRows = d.depth.map((r, di) => {
     const days = r.first_repeat_days;
     const pct = days == null ? 100 : Math.min(100, (days / span) * 100);
     const value = days == null ? `&gt;${span} d` : `${days1(days)} d`;
@@ -712,7 +796,7 @@ function render(d) {
     return `<tr class="${r.kind}"${tip}><td class="name">${swatch}${esc(r.name)}</td>
       <td class="num">${r.aired} / ${r.distinct}</td>
       <td style="width:30%"><div class="bar"><span class="${days == null ? 'open' : ''}" style="width:${pct}%"></span></div></td>
-      <td class="num">${value}</td></tr>`;
+      <td class="num">${value}${diff && diff.depth[di] && diff.depth[di].aired.deployed != null ? `<br><span class="muted">deployed: ${diff.depth[di].first_repeat_days.deployed == null ? '&gt;' + span : days1(diff.depth[di].first_repeat_days.deployed)} d</span>` : ''}</td></tr>`;
   }).join('');
   html.push(`<section><h2>Depth</h2>
     <p class="muted">Days from the start of the span until each pool or show first airs something a second time, over ${esc(covers)}. Aired / distinct items.</p>
@@ -1118,6 +1202,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function renderGuide(d, colors) {
+  const changedAt = new Set(d.diff ? d.diff.changed_airings.map((c) => c.index) : []);
   const tz = d.tz;
   const cells = ['<div class="corner"></div>'];
   for (let i = 0; i + 1 < d.day_starts.length; i++) cells.push(`<div class="colhead">${esc(dayOf(d.day_starts[i], tz))}</div>`);
@@ -1145,6 +1230,7 @@ function renderGuide(d, colors) {
       const sample = d.samples.find((x) => x.index === a.index && x.at >= ds && x.at < de);
       const label = `${timeOf(a.start, tz)}–${timeOf(a.start + a.duration_secs, tz)} · ${a.label} · ${a.pool}`
         + (a.projected ? ' · Projected — not scheduled' : '')
+        + (changedAt.has(a.index) ? ' · changed by the draft' : '')
         + (rep ? ` · repeat, first aired ${dayOf(d.airings[a.repeat_of].start, tz)} ${timeOf(d.airings[a.repeat_of].start, tz)}` : '');
       const px = h * ppm;
       const time = `<span class="tm">${cont ? `cont. from ${esc(timeOf(a.start, tz))}` : esc(timeOf(a.start, tz))}</span> ${sample ? `<span class="pin">${sample.n}</span>` : ''}${rep && !cont ? '<span class="rbadge">R</span>' : ''}`;
@@ -1153,7 +1239,7 @@ function renderGuide(d, colors) {
         : px >= 32 ? `<div>${time}</div><div>${title}</div>`
         : px >= 19 ? `<div>${time} ${title}</div>`
         : '';
-      blocks.push(`<div class="blk${rep ? ' hatch' : ''}${a.projected ? ' proj' : ''}${body ? '' : ' tiny'}" data-index="${a.index}"${cont ? '' : ' tabindex="0"'} data-tip="${esc(label)}" aria-label="${esc(label)}"
+      blocks.push(`<div class="blk${rep ? ' hatch' : ''}${a.projected ? ' proj' : ''}${changedAt.has(a.index) ? ' chg' : ''}${body ? '' : ' tiny'}" data-index="${a.index}"${cont ? '' : ' tabindex="0"'} data-tip="${esc(label)}" aria-label="${esc(label)}"
         style="top:calc(${top} * var(--ppm));height:calc(${h} * var(--ppm));background-color:${colors[a.pool] || '#ccc'}">${body}</div>`);
     }
     // The frontier: where the published playout ends. Past it, blocks are projected.
@@ -1463,7 +1549,7 @@ $('lineupSelect').addEventListener('change', () => { const r = parseRoute(); loc
 function chooseProject(project) {
   const r = parseRoute();
   if (!r.channel) return;
-  const target = channelHash(r.channel, r.view, project);
+  const target = channelHash(r.channel, r.view, project, r.draft);
   if (location.hash === target) { shown = null; route(); } else location.hash = target;
 }
 for (const b of $('projBtns').querySelectorAll('button')) b.addEventListener('click', () => chooseProject(b.dataset.project));

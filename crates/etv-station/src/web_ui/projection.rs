@@ -12,7 +12,8 @@
 //! datastores a pool is granted, too large to read), `station.yaml`, the state
 //! the projection starts from (the `.resume` sidecar and the recent airings),
 //! the channel's resolved candidate set (entry ids and durations) and
-//! [`crate::simulate::SIMULATOR_REVISION`]. No file mtime outside the datastore
+//! [`crate::simulate::SIMULATOR_REVISION`], and the draft's edit set (a draft
+//! with no edit hashes as no draft, so it shares the deployed projection). No file mtime outside the datastore
 //! stamp, no catalog mtime and no binary build time is in it, so the same
 //! inputs give the same projection across deploys and across midnight. The
 //! cache directory lives on the data volume beside the catalog.
@@ -29,6 +30,7 @@ use time::OffsetDateTime;
 
 use crate::catalog::Catalog;
 use crate::config::{self, ChannelConfig};
+use crate::profile::ProfileEntry;
 use crate::resume::ResumeMap;
 use crate::simulate::{Ledger, SIMULATOR_REVISION, Simulation};
 
@@ -42,13 +44,14 @@ const MEMORY_SLOTS: usize = 8;
 const DISK_MAX_FILES: usize = 400;
 
 /// The names of the inputs a projection is keyed on, in display order.
-pub const INPUT_NAMES: [&str; 6] = [
+pub const INPUT_NAMES: [&str; 7] = [
     "config",
     "scripts",
     "station",
     "frontier",
     "candidates",
     "simulator",
+    "draft",
 ];
 
 /// Input name -> hex digest of its content.
@@ -68,6 +71,33 @@ pub struct Projection {
     pub simulation: Simulation,
 }
 
+/// A draft's edits, swapped into the channel's pools for one projection.
+#[derive(Debug, Clone, Default)]
+pub struct DraftEdits {
+    /// Each edited pool's inline `profile:`, keyed by pool name.
+    pub profiles: BTreeMap<String, Vec<ProfileEntry>>,
+    /// The Plex account the draft scores for.
+    pub account_id: Option<i64>,
+}
+
+impl DraftEdits {
+    /// The edit set as one digest. A draft with no edited pool is the
+    /// deployed channel, so it digests like no draft at all.
+    pub fn digest(draft: Option<&DraftEdits>) -> String {
+        match draft {
+            Some(d) if !d.profiles.is_empty() => {
+                let text = serde_json::json!({ "profiles": d.profiles, "account": d.account_id });
+                sha_hex(&[b"draft", text.to_string().as_bytes()])
+            }
+            _ => sha_hex(&[b"none"]),
+        }
+    }
+
+    fn is_edited(&self) -> bool {
+        !self.profiles.is_empty()
+    }
+}
+
 /// Everything one projection starts from, gathered by the request thread.
 pub struct Request {
     pub channel: String,
@@ -80,9 +110,21 @@ pub struct Request {
     pub show_cursor: BTreeMap<String, String>,
     pub resume: ResumeMap,
     pub digests: Digests,
+    /// The draft whose pools replace the deployed ones, when this projection
+    /// is a draft's.
+    pub draft: Option<DraftEdits>,
 }
 
 impl Request {
+    /// What "the previous projection of this length" means for the change
+    /// notice: a channel's deployed projections, or its draft ones.
+    fn series(&self) -> String {
+        match &self.draft {
+            Some(d) if d.is_edited() => format!("{}#draft", self.channel),
+            _ => self.channel.clone(),
+        }
+    }
+
     /// The cache key: the same inputs and length always give the same key.
     pub fn key(&self) -> String {
         let mut h = Sha256::new();
@@ -292,6 +334,7 @@ pub fn digests(
     config: &ChannelConfig,
     frontier: String,
     candidates: String,
+    draft: Option<&DraftEdits>,
 ) -> Digests {
     let file = |p: &Path| match std::fs::read(p) {
         Ok(bytes) => sha_hex(&[b"file", &bytes]),
@@ -319,6 +362,7 @@ pub fn digests(
             "simulator".to_string(),
             sha_hex(&[&SIMULATOR_REVISION.to_le_bytes()]),
         ),
+        ("draft".to_string(), DraftEdits::digest(draft)),
     ])
 }
 
@@ -383,7 +427,7 @@ impl SimCache {
             return Lookup::Ready(p);
         }
         let changed = self
-            .last(&req.channel, req.days)
+            .last(&req.series(), req.days)
             .map(|old| changed_inputs(&old, &req.digests))
             .unwrap_or_default();
         let mut g = self.lock();
@@ -437,11 +481,12 @@ impl SimCache {
                     simulation,
                 });
                 self.write_disk(&projection);
+                let series = job.request.series();
                 self.lock().last.insert(
-                    (job.request.channel.clone(), job.request.days),
+                    (series.clone(), job.request.days),
                     job.request.digests.clone(),
                 );
-                self.write_last(&job.request.channel, job.request.days, &job.request.digests);
+                self.write_last(&series, job.request.days, &job.request.digests);
                 self.remember(projection);
             }
             Err(e) => {
@@ -550,15 +595,31 @@ impl SimCache {
     }
 
     fn simulate(&self, req: &Request, catalog: &Catalog) -> Result<Simulation, String> {
-        let station = config::load_for_inspection(&self.station_path)
+        let mut station = config::load_for_inspection(&self.station_path)
             .map_err(|e| format!("load {}: {e}", self.station_path.display()))?;
+        let tz = crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
         let lc = station
             .channels
-            .iter()
+            .iter_mut()
             .find(|c| c.config_path == req.config_path)
             .ok_or_else(|| format!("{} is no longer in the lineup", req.channel))?;
-        let tz = crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
-        let account_id = super::pools::channel_account_id(&lc.config)?;
+        let mut account_id = None;
+        let mut account_known = false;
+        if let Some(draft) = req.draft.as_ref().filter(|d| d.is_edited()) {
+            for block in lc.config.rule.all_blocks_mut() {
+                for pool in &mut block.pools {
+                    if let Some(profile) = draft.profiles.get(&pool.name) {
+                        pool.profile = profile.clone();
+                    }
+                }
+            }
+            account_id = draft.account_id;
+            account_known = true;
+        }
+        if !account_known {
+            account_id = super::pools::channel_account_id(&lc.config)?;
+        }
+        let lc = &*lc;
         let ledger = Ledger::seeded(
             req.tail.clone(),
             req.cursor.clone(),
@@ -615,6 +676,7 @@ mod tests {
             show_cursor: BTreeMap::new(),
             resume: ResumeMap::new(),
             digests: digests_of(config),
+            draft: None,
         }
     }
 
