@@ -632,6 +632,28 @@ for f in sorted(glob.glob('deploy/appdata/channels/*/logo.png') + glob.glob('dep
 ffmpeg -y -i bad.png -pix_fmt rgba fixed.png   # the fix; alpha survives
 ```
 
+## Verifying `bumper-preview` and `bumper-watch`
+
+No station, catalog or Plex needed. Resolve a bumper on a gap and read the items:
+
+```sh
+cargo build -q -p etv-station -p etv-overlay
+./target/debug/etv-station bumper-preview examples/plugins/text-card-bumper.rhai --gap 45s | jq -c '.[] | [.id, .start, .finish, .overlay]'
+./target/debug/etv-station bumper-preview examples/plugins/text-card-bumper.rhai --gap 45s --otio | jq '.tracks.children[0].children | length'
+```
+
+Expect two items for the text-card bumper (a 2 s black, then a looped black card whose `overlay.script` is an absolute path), the first `start` to the last `finish` spanning exactly 45 s, and `2` from the OTIO count. A script that throws exits 1 with its message on stderr and nothing on stdout (the generator would air black; the preview must not).
+
+`bumper-watch` plays those items through `etv-overlay watch --item`, one process per item, into VLC. Prove it without VLC by standing in a capture script for it (`overlay-watch.sh` reads `$VLC`), then count the frames the card drew over:
+
+```sh
+VLC=<script that runs: cat > out.ts> ./tools/bumper-watch.sh examples/channels/lavfi-test.yaml <bumper.rhai> --gap 5s
+# after ~25 s, SIGINT the pipeline, then:
+ffmpeg -v error -i out.ts -vf "signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-" -an -f null - | grep YMAX | sort | uniq -c
+```
+
+Expect both a black count (`YMAX=16`) and a text-frame count (`YMAX=248` for white text). The `etv-overlay` log shows `overlay=None` for an item with `"overlay": "none"` and `overlay=Script { script: …card.rhai, vars: … }` for the card item. `admin overlay-watch <channel> --metadata '<json>'` is the same pipeline for a single looping background.
+
 ## Verifying the block card and pool labels
 
 A pool's `label:`/`advisory:` ride on every item it draws as
@@ -1028,9 +1050,17 @@ at NI 19 while the daemon and `ersatztv` sit at 0. After `docker kill -s TERM`, 
 `--serve-ui` process is gone within 3s. `POST /api/select` with a path outside the
 lineup answers 400 "is not a tunable channel in this station's lineup".
 
-A 14-day review of 034-syfy takes ~166s (2026-10-18) and the server answers nothing
-else meanwhile; that is the replay's cost, identical on the pre-move binary, not a
-hang.
+A review's simulation runs on a worker thread (`sim_cache`), not the request thread.
+`GET /api/review` answers 202 `{"pending": true}` until the worker has the channel
+(the page polls every second), then 200 from the cache; `/api/health` stays
+responsive meanwhile and carries `sim_cache: {in_memory, queued, running}`. The
+worker fills the lineup in `station.yaml` order and runs a requested channel next
+(it does not interrupt one in progress). Each finish logs `ui.sim.done` with ms; a
+served review logs `ui.review` with `sim_source="cache"`. Observed 2026-10-18 on a
+debug build over a 3-channel lineup: 034-syfy 14 days simulated in 958s, 041-cartoons
+in 101s, and both served from the cache afterwards in 2s and 11s. Results persist
+under `$TMPDIR/etv-station-ui-sims/<build>/`; touching the channel file, a `.rhai`
+script it names, or the catalog makes the next request queue a fresh simulation.
 
 ## Verifying the channel-wide repeat rule (`rule.no_repeat_within`)
 

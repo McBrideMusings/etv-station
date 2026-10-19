@@ -25,6 +25,12 @@ fi
 : "${ETV_BIND_ADDRESS:=0.0.0.0}"
 export ETV_BIND_ADDRESS ETV_PORT
 
+# `etv-station --serve-ui` port. Defaults to 4747, the container's; a swarm
+# worker sets its own beside ETV_PORT.
+: "${ETV_UI_PORT:=4747}"
+UI_URL="http://127.0.0.1:${ETV_UI_PORT}"
+UI_LOG_FILE="tmp/verify-integration-ui.log"
+
 # The test config needs nothing external. dev-run.sh re-sources .env itself, so
 # this flag, not an unset here, keeps a Plex URL from starting a full library
 # ingest before the station rolls its first channel.
@@ -39,6 +45,10 @@ LAUNCH_WAIT_SECS=900
 CLEANUP_GRACE_SECS=10
 MASTER_WAIT_SECS=120
 SEGMENT_WAIT_SECS=10
+# The web UI answers one request at a time, so a queued review can hold a health
+# probe for as long as the review takes; --max-time sits well above that.
+UI_WAIT_SECS=60
+UI_REQUEST_SECS=30
 
 # Use a minimal test configuration that doesn't require external resources
 : "${STATION_CONFIG:=examples/station-test.yaml}"
@@ -270,6 +280,30 @@ check_or_die "xmltv.xml is valid XML" probe_check_xmltv_wellformed "$xmltv_body"
 # Check for <channel id= element.
 check_or_die "xmltv.xml contains <channel id= element" \
   probe_check_xmltv_channel_present "$xmltv_body"
+
+# The web UI is not part of dev-run.sh's stack, so start it here against the same
+# config and probe /api/health: 200 with "ok":true and a tunable_channels count.
+printf 'verifying web UI health...\n'
+cargo run -q -p etv-station --bin etv-station -- \
+  --config "$STATION_CONFIG" --serve-ui --ui-port "$ETV_UI_PORT" >"$UI_LOG_FILE" 2>&1 &
+ui_pid=$!
+ui_body=""
+ui_started=$SECONDS
+while [ -z "$ui_body" ] && [ $((SECONDS - ui_started)) -lt "$UI_WAIT_SECS" ]; do
+  if ! kill -0 "$ui_pid" 2>/dev/null; then
+    fail "web UI exited before answering /api/health; last lines of $UI_LOG_FILE:"
+    tail -20 "$UI_LOG_FILE" >&2
+    exit 1
+  fi
+  ui_body="$(curl -fs --max-time "$UI_REQUEST_SECS" "$UI_URL/api/health" || true)"
+  [ -n "$ui_body" ] || sleep 1
+done
+check_or_die "web UI /api/health is ok and reports tunable_channels" \
+  probe_check_ui_health "$ui_body"
+
+# Stop the UI before the orphan check below, which counts every etv-station.
+kill -TERM -- "-$ui_pid" 2>/dev/null || true
+wait $ui_pid 2>/dev/null || true
 
 # Send SIGINT to dev-run process group and wait for clean exit.
 printf 'shutting down dev stack...\n'

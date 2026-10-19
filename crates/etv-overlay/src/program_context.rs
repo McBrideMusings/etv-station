@@ -100,7 +100,7 @@ impl ItemOverlay {
     /// Reads the `overlay` value of a playout item. A value that is neither
     /// `"none"` nor an object with a string `script` reads as absent: a
     /// malformed override falls back to the channel overlay for that item.
-    fn from_value(value: &serde_json::Value) -> Option<Self> {
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
         match value {
             serde_json::Value::String(s) if s == "none" => Some(Self::None),
             serde_json::Value::Object(map) => {

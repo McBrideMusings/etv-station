@@ -32,7 +32,8 @@
 //!   edit, only for the pool an edit actually touched — every other pool's
 //!   cached ranking is untouched. Requests are served one at a time on one
 //!   thread, and the replay is single-threaded, so the UI uses at most one
-//!   core however many browsers are open; the container also runs it at
+//!   core however many browsers are open (the Review view's schedules are the
+//!   exception: a worker thread simulates them, see `sim_cache`); the container also runs it at
 //!   `nice 19` so the channels' transcodes always come first.
 //! - **Fidelity.** The pool's own real `sources:` (or, absent one, its
 //!   script's own default `sources()`) is always what gets scored against —
@@ -55,6 +56,8 @@
 //! Each pool's plexdb path comes from its `datastores:` grant, not a flag —
 //! set `PLEXDB_SNAPSHOT_PATH` (or whatever env var the grant references).
 //! `GET /api/health` returns what this process was started with.
+
+mod sim_cache;
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -238,11 +241,13 @@ pub fn serve(options: Options) -> Result<(), String> {
         "web UI listening"
     );
 
+    let review = ReviewState::new(options.station.clone(), options.catalog.clone());
+    review.sims.spawn(DEFAULT_REVIEW_DAYS);
     let mut state = AppState {
         catalog,
         cache: ScoreCache::default(),
         session: None,
-        review: ReviewState::new(options.station.clone()),
+        review,
         options,
     };
     for request in server.incoming_requests() {
@@ -259,7 +264,13 @@ fn api_health(state: &AppState) -> (u16, Value) {
     let o = &state.options;
     let channels = discover_channels(&o.station);
     let status = if channels.is_ok() { 200 } else { 503 };
+    let sims = state.review.sims.stats();
     let body = json!({
+        "sim_cache": {
+            "in_memory": sims.in_memory,
+            "queued": sims.queued,
+            "running": sims.running,
+        },
         "ok": channels.is_ok(),
         "station": o.station.display().to_string(),
         "catalog": o.catalog.display().to_string(),
@@ -1332,8 +1343,12 @@ fn api_tautulli_users() -> Result<(u16, Value), String> {
 // a report — depth before repeats, film/series share, overlap with the rest of
 // the lineup, seeded tune-in samples and a day-by-day guide. It reads the
 // channel exactly as `channel.yaml` writes it (its own plugin scripts, no
-// working-copy profile), reloaded on every request so an edit to the file
-// shows on the next reload. The numbers are `crate::review`'s.
+// working-copy profile), reloaded on every request. The simulation itself is
+// cached by `sim_cache` and filled by a worker thread, keyed on the mtimes of
+// the channel file, its scripts and the catalog, so an edit to any of them
+// shows on the next reload; a request that misses the cache gets 202
+// `{"pending": true}` and the page asks again. The numbers are
+// `crate::review`'s.
 // ---------------------------------------------------------------------------
 
 /// Days the Review view simulates when a request names none, and the most it
@@ -1356,10 +1371,6 @@ struct ReviewState {
     library: Option<(HashSet<String>, HashSet<String>)>,
     /// The last review's comparable numbers per channel, for "Since last run".
     previous: HashMap<String, Vec<(String, Value)>>,
-    /// The Plex account each single-user channel resolved to, keyed by config
-    /// path and dropped when the file's mtime changes, so a review does not
-    /// ask Tautulli again on every request.
-    accounts: HashMap<PathBuf, (std::time::SystemTime, Option<i64>)>,
     /// Every tune-in still a review has offered, keyed by the file name its
     /// URL carries, so `/api/review/still` renders it on first request.
     stills: HashMap<String, TuneInStill>,
@@ -1367,28 +1378,37 @@ struct ReviewState {
     /// everything that decides it and the directory names this binary's
     /// build, so a file here is never stale.
     still_dir: PathBuf,
+    /// Simulated schedules, filled by a worker thread so no request waits on one.
+    sims: Arc<sim_cache::SimCache>,
 }
 
 impl ReviewState {
-    fn new(station_path: PathBuf) -> Self {
+    fn new(station_path: PathBuf, catalog_path: PathBuf) -> Self {
+        // One directory per build of this binary, so a rebuilt renderer or
+        // simulator never serves what the previous one produced.
+        let build = std::env::current_exe()
+            .and_then(|p| p.metadata())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
         Self {
+            sims: sim_cache::SimCache::new(
+                station_path.clone(),
+                catalog_path,
+                std::env::temp_dir()
+                    .join("etv-station-ui-sims")
+                    .join(&build),
+            ),
             station_path,
             fingerprints: HashMap::new(),
             library: None,
             previous: HashMap::new(),
-            accounts: HashMap::new(),
             stills: HashMap::new(),
-            // One directory per build of this binary, so a rebuilt renderer
-            // never serves a still the previous one drew.
-            still_dir: std::env::temp_dir().join("etv-station-ui-stills").join(
-                std::env::current_exe()
-                    .and_then(|p| p.metadata())
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs().to_string())
-                    .unwrap_or_default(),
-            ),
+            still_dir: std::env::temp_dir()
+                .join("etv-station-ui-stills")
+                .join(&build),
         }
     }
 }
@@ -1420,22 +1440,6 @@ fn file_mtime(path: &Path) -> Result<std::time::SystemTime, String> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// [`channel_account_id`], cached per config file.
-fn review_account_id(
-    review: &mut ReviewState,
-    lc: &config::LoadedChannel,
-) -> Result<Option<i64>, String> {
-    let mtime = file_mtime(&lc.config_path)?;
-    if let Some((cached, id)) = review.accounts.get(&lc.config_path)
-        && *cached == mtime
-    {
-        return Ok(*id);
-    }
-    let id = channel_account_id(&lc.config)?;
-    review.accounts.insert(lc.config_path.clone(), (mtime, id));
-    Ok(id)
 }
 
 fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String> {
@@ -1508,16 +1512,23 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
     }
     let end = *day_starts.last().expect("non-empty");
 
-    let account_id = review_account_id(&mut state.review, lc)?;
-    let sim = crate::simulate::simulate(
-        &lc.config,
-        &lc.config_path,
-        &state.catalog,
-        account_id,
+    let sim_key = sim_cache::SimKey {
+        config_path: lc.config_path.clone(),
         days,
-        start,
-        Some(tz),
-    )?;
+        start: start.unix_timestamp(),
+    };
+    let fp = sim_cache::fingerprint(&lc.config_path, &lc.config, &state.options.catalog);
+    let (sim, sim_source) = match state.review.sims.lookup(&sim_key, &fp) {
+        sim_cache::Lookup::Ready(sim) => (sim, "cache"),
+        sim_cache::Lookup::Failed(e) => return Err(e),
+        sim_cache::Lookup::Pending => {
+            tracing::info!(event = "ui.review.pending", channel = %key, days, "review: simulation queued");
+            return Ok((
+                202,
+                json!({ "pending": true, "channel": key, "days": days }),
+            ));
+        }
+    };
 
     let block_names: Vec<String> = lc
         .config
@@ -1695,6 +1706,7 @@ fn api_review(state: &mut AppState, query: &str) -> Result<(u16, Value), String>
         event = "ui.review",
         channel = %key,
         days,
+        sim_source,
         generations = sim.generations.len(),
         airings = airings.len(),
         overlap_channels = review["overlap"]["channels"]
@@ -2197,7 +2209,41 @@ fn render_review_still_serially(
     let _one_at_a_time = RENDER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    render_review_still(dir, id, still)
+    let jpeg = render_review_still(dir, id, still)?;
+    prune_still_dir(dir, STILL_DIR_MAX_FILES);
+    Ok(jpeg)
+}
+
+/// The most rendered stills the still directory keeps; the oldest go first.
+const STILL_DIR_MAX_FILES: usize = 200;
+
+/// Deletes the oldest files in `dir` until at most `max` remain, so the
+/// directory (the container's writable layer) stays bounded however many
+/// distinct stills reviews offer. A file that cannot be listed or removed is
+/// left; the next render tries again.
+fn prune_still_dir(dir: &Path, max: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((meta.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= max {
+        return;
+    }
+    files.sort();
+    for (_, path) in &files[..files.len() - max] {
+        if std::fs::remove_file(path).is_ok() {
+            tracing::debug!(event = "ui.still.pruned", path = %path.display(), "still: pruned");
+        }
+    }
 }
 
 fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<u8>, String> {
@@ -2295,6 +2341,27 @@ const REVIEW_HTML: &str = include_str!("review.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_still_dir_keeps_the_newest_max_files() {
+        let dir = std::env::temp_dir().join(format!("etv-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        for i in 0..10u64 {
+            let f = std::fs::File::create(dir.join(format!("{i}.jpg"))).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i))
+                .unwrap();
+        }
+        prune_still_dir(&dir, 4);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["6.jpg", "7.jpg", "8.jpg", "9.jpg"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn inline_index_follows_position_not_ctx_profile_order() {
