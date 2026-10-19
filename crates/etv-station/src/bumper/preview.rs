@@ -26,6 +26,10 @@ pub struct PreviewRequest<'a> {
     pub fps: f64,
     /// The item after the gap; `None` previews a frontier gap.
     pub next: Option<Map>,
+    /// The programmes after `next`, nearest first.
+    pub upcoming: Vec<Map>,
+    /// The `config:` a fill entry would give the script.
+    pub config: Option<serde_json::Value>,
     pub channel: ChannelInfo,
     /// Directory a relative overlay script path is resolved against.
     pub overlay_root: &'a Path,
@@ -81,6 +85,8 @@ pub fn preview(req: &PreviewRequest<'_>) -> Result<Preview, String> {
             gap_ms: req.gap_ms,
             next: req.next.clone(),
             prev: None,
+            upcoming: req.upcoming.clone(),
+            config: req.config.clone(),
             channel: req.channel.clone(),
             air_date,
             draw: 0,
@@ -148,11 +154,13 @@ pub fn next_item(spec: &str, catalog: Option<&Catalog>) -> Result<Map, String> {
         ));
     };
     let items = crate::score::load_items(catalog, &[spec.to_string()])?;
-    items
+    let mut item = items
         .into_iter()
         .next()
         .and_then(|d: Dynamic| d.try_cast::<Map>())
-        .ok_or_else(|| format!("no catalog entry {spec:?}"))
+        .ok_or_else(|| format!("no catalog entry {spec:?}"))?;
+    crate::score::add_source_ids(catalog, &mut item)?;
+    Ok(item)
 }
 
 #[cfg(test)]
@@ -171,6 +179,8 @@ mod tests {
             gap_ms,
             fps: 30.0,
             next: None,
+            upcoming: Vec::new(),
+            config: None,
             channel: ChannelInfo {
                 name: "preview".into(),
                 number: 7,

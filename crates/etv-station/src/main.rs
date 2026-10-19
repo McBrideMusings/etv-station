@@ -271,6 +271,16 @@ struct BumperPreviewArgs {
     #[arg(long, value_name = "PATH|ENTRY_ID")]
     next: Option<String>,
 
+    /// A programme after `--next`, as `ctx.upcoming` lists it: a media file
+    /// or a catalog `entry_id`. Repeat it, nearest first.
+    #[arg(long, value_name = "PATH|ENTRY_ID")]
+    upcoming: Vec<String>,
+
+    /// The `config:` a fill entry would give the script, as JSON
+    /// (`'{"mode":"upcoming"}'`); the script reads it as `ctx.config`.
+    #[arg(long, value_name = "JSON")]
+    script_config: Option<String>,
+
     /// The channel number `ctx.channel.number` reports; its name is
     /// `channel-<N>`.
     #[arg(long, value_name = "N", default_value_t = 1)]
@@ -1478,23 +1488,37 @@ fn bumper_preview(config_path: Option<&Path>, args: &BumperPreviewArgs) -> ExitC
         Ok(ms) => ms,
         Err(e) => return fail(e),
     };
+    let item_for = |spec: &str| -> Result<rhai::Map, String> {
+        let catalog = match config_path {
+            Some(path) if !std::path::Path::new(spec).is_file() => {
+                Some(open_preview_catalog(path)?)
+            }
+            _ => None,
+        };
+        preview::next_item(spec, catalog.as_ref())
+    };
     let next = match args.next.as_deref() {
         None => None,
-        Some(spec) => {
-            let catalog = match config_path {
-                Some(path) if !std::path::Path::new(spec).is_file() => {
-                    match open_preview_catalog(path) {
-                        Ok(c) => Some(c),
-                        Err(e) => return fail(e),
-                    }
-                }
-                _ => None,
-            };
-            match preview::next_item(spec, catalog.as_ref()) {
-                Ok(m) => Some(m),
-                Err(e) => return fail(e),
-            }
-        }
+        Some(spec) => match item_for(spec) {
+            Ok(m) => Some(m),
+            Err(e) => return fail(e),
+        },
+    };
+    let upcoming = match args
+        .upcoming
+        .iter()
+        .map(|spec| item_for(spec))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(items) => items,
+        Err(e) => return fail(e),
+    };
+    let script_config = match args.script_config.as_deref() {
+        None => None,
+        Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(v) => Some(v),
+            Err(e) => return fail(format!("--script-config is not JSON: {e}")),
+        },
     };
     let overlay_root = match args
         .overlay_root
@@ -1510,6 +1534,8 @@ fn bumper_preview(config_path: Option<&Path>, args: &BumperPreviewArgs) -> ExitC
         gap_ms,
         fps: args.fps,
         next,
+        upcoming,
+        config: script_config,
         channel: ChannelInfo {
             name: format!("channel-{}", args.channel),
             number: args.channel,

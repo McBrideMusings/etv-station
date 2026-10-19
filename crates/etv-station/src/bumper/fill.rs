@@ -53,6 +53,9 @@ pub const FILL_FPS: f64 = 30.0;
 /// rest. A script that cannot reach its own `max_gap` never loops forever.
 const MAX_DRAWS_PER_GAP: u32 = 400;
 
+/// Most programmes after the next one that a script's `ctx.upcoming` lists.
+const UPCOMING_LIMIT: usize = 12;
+
 /// A block's fill settings, resolved against the channel config's directory.
 #[derive(Debug, Clone)]
 pub struct FillPlan {
@@ -69,6 +72,8 @@ pub struct FillCandidate {
     pub min_gap_ms: u64,
     pub max_gap_ms: Option<u64>,
     pub granted: Vec<String>,
+    /// The entry's `config:`, handed to the script as `ctx.config`.
+    pub config: Option<serde_json::Value>,
 }
 
 impl FillPlan {
@@ -92,6 +97,7 @@ impl FillPlan {
                     min_gap_ms: e.min_gap.map_or(0, |d| d.as_millis() as u64),
                     max_gap_ms: e.max_gap.map(|d| d.as_millis() as u64),
                     granted: e.capabilities.clone(),
+                    config: e.config.clone(),
                 })
                 .collect(),
         })
@@ -168,7 +174,15 @@ pub fn fill_gaps(
     if fill_leading {
         let first = &laid.items[skip];
         if let Some(plan) = plan_for(env, first) {
-            lead = fill_gap(env, plan, at, None, Some(first), first.block, &mut records);
+            lead = fill_gap(
+                env,
+                plan,
+                at,
+                None,
+                &laid.items[skip..],
+                first.block,
+                &mut records,
+            );
             at = advance(at, &lead);
         }
     }
@@ -186,7 +200,7 @@ pub fn fill_gaps(
                 plan,
                 at,
                 Some(item),
-                laid.items.get(i + 1),
+                laid.items.get(i + 1..).unwrap_or_default(),
                 item.block,
                 &mut records,
             );
@@ -247,13 +261,14 @@ fn advance(mut at: OffsetDateTime, pieces: &[Piece]) -> OffsetDateTime {
 }
 
 /// The pieces that fill the gap from `at` to the next grid line. Empty when
-/// `at` is on the grid.
+/// `at` is on the grid. `ahead` is the schedule after the gap: its first item
+/// is the programme the gap leads into, the rest are `ctx.upcoming`.
 fn fill_gap(
     env: &FillEnv<'_>,
     plan: &FillPlan,
     at: OffsetDateTime,
     prev: Option<&ResolvedItem>,
-    next: Option<&ResolvedItem>,
+    ahead: &[ResolvedItem],
     block: usize,
     records: &mut Vec<PlayRecord>,
 ) -> Vec<Piece> {
@@ -267,8 +282,18 @@ fn fill_gap(
     }
     let air_date = at.to_timezone(env.tz).date().to_string();
     let prev_map = prev.map(env.item_map);
-    let next_map = next.map(env.item_map);
-    let seed = rng_seed(&env.channel.name, next.map(|n| n.id.as_str()), &air_date);
+    let next_map = ahead.first().map(env.item_map);
+    let upcoming: Vec<Map> = ahead
+        .iter()
+        .skip(1)
+        .take(UPCOMING_LIMIT)
+        .map(env.item_map)
+        .collect();
+    let seed = rng_seed(
+        &env.channel.name,
+        ahead.first().map(|n| n.id.as_str()),
+        &air_date,
+    );
 
     let mut pieces: Vec<Piece> = Vec::new();
     let mut cursor = at;
@@ -330,8 +355,11 @@ fn fill_gap(
                 cand,
                 draw_ms,
                 draw,
-                prev_map.as_ref(),
-                next_map.as_ref(),
+                &Around {
+                    prev: prev_map.as_ref(),
+                    next: next_map.as_ref(),
+                    upcoming: &upcoming,
+                },
                 &air_date,
             );
             let good = drawn.error.is_none() && (!last_draw || can_reach(&drawn.timeline, draw_ms));
@@ -395,19 +423,27 @@ struct Drawn {
     error: Option<String>,
 }
 
+/// The programmes a draw sits between, as the item maps `ctx` carries.
+struct Around<'a> {
+    prev: Option<&'a Map>,
+    next: Option<&'a Map>,
+    upcoming: &'a [Map],
+}
+
 fn draw_one(
     env: &FillEnv<'_>,
     cand: &FillCandidate,
     gap_ms: u64,
     draw: u32,
-    prev: Option<&Map>,
-    next: Option<&Map>,
+    around: &Around<'_>,
     air_date: &str,
 ) -> Drawn {
     let input = BumperInput {
         gap_ms,
-        next: next.cloned(),
-        prev: prev.cloned(),
+        next: around.next.cloned(),
+        prev: around.prev.cloned(),
+        upcoming: around.upcoming.to_vec(),
+        config: cand.config.clone(),
         channel: env.channel.clone(),
         air_date: air_date.to_string(),
         draw,
@@ -575,6 +611,9 @@ fn source_label(source: &SegmentSource) -> String {
         SegmentSource::Lavfi { params } => format!("lavfi:{params}"),
         SegmentSource::Still { image_path } => image_path.display().to_string(),
         SegmentSource::Render { path, .. } => path.display().to_string(),
+        SegmentSource::Http { url, .. } => {
+            format!("http:{}", crate::plugin_http::display_host(url))
+        }
     }
 }
 
@@ -727,6 +766,7 @@ fn build(ctx) {
             min_gap_ms: 0,
             max_gap_ms: None,
             granted: vec![],
+            config: None,
         }
     }
 
@@ -1020,6 +1060,46 @@ fn build(ctx) {
         short_b.max_gap_ms = Some(60_000);
         let got = names(vec![cand(&a), short_b]);
         assert!(got.iter().all(|n| n != "from-b"), "got {got:?}");
+    }
+
+    /// A trailer bumper whose film has no Plex id builds nothing, so the pass
+    /// draws the entry after it instead of airing black.
+    #[test]
+    fn a_trailer_bumper_with_no_trailer_falls_through_to_the_next_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopy = script(
+            dir.path(),
+            "loopy.rhai",
+            &LOOPY.replace("black()", "black().name(\"from-loopy\")"),
+        );
+        let trailer = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/plugins/trailer-bumper.rhai");
+        let only_trailer = FillCandidate {
+            weight: 100_000,
+            granted: vec!["http".into()],
+            config: Some(serde_json::json!({ "mode": "next" })),
+            ..cand(&trailer)
+        };
+        let out = run(
+            plan(vec![only_trailer, cand(&loopy)]),
+            laid(&[("a", mins(22)), ("b", mins(30))]),
+            datetime!(2026-10-17 20:00 UTC),
+            false,
+            &plain,
+        );
+        let names: Vec<String> = between(&out, "a", "b")
+            .iter()
+            .map(|i| {
+                i.metadata.as_ref().unwrap()["segment"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !names.is_empty() && names.iter().all(|n| n == "from-loopy"),
+            "{names:?}"
+        );
     }
 
     #[test]

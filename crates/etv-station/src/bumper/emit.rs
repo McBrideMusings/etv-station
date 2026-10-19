@@ -104,6 +104,28 @@ pub fn emit_timeline(
                 );
                 items.push(PlayoutItem::scheduled(id_base, begin, end, source));
             }
+            SegmentSource::Http { url, in_ms, .. } => {
+                tracing::info!(
+                    event = "bumper.http_source",
+                    channel = ctx.channel,
+                    segment = %seg.segment.name,
+                    host = %crate::plugin_http::display_host(url),
+                    in_ms = *in_ms,
+                    length_ms = seg.duration_ms,
+                    "a bumper segment plays a remote file"
+                );
+                // A remote file cannot be repeated, so the item plays from the
+                // in point for the fitted length; a script keeps that within
+                // the file with a flex range that ends at its length.
+                let source = PlayoutItemSource::http(
+                    url.clone(),
+                    Some(*in_ms),
+                    Some(in_ms + seg.duration_ms),
+                    None,
+                    None,
+                );
+                items.push(PlayoutItem::scheduled(id_base, begin, end, source));
+            }
             SegmentSource::Lavfi { params } => {
                 let source = PlayoutItemSource::lavfi(params.clone());
                 items.push(PlayoutItem::scheduled(id_base, begin, end, source));
@@ -168,6 +190,7 @@ pub fn otio_json(resolved: &ResolvedTimeline, fps: f64) -> serde_json::Value {
                         (path.to_string_lossy().into_owned(), *in_ms)
                     }
                     SegmentSource::Render { path, .. } => (path.to_string_lossy().into_owned(), 0),
+                    SegmentSource::Http { url, in_ms, .. } => (url.clone(), *in_ms),
                     SegmentSource::Still { image_path } => {
                         (image_path.to_string_lossy().into_owned(), 0)
                     }

@@ -44,6 +44,14 @@ pub enum SegmentSource {
     Still { image_path: PathBuf },
     /// A render-cache file for `profile`.
     Render { profile: String, path: PathBuf },
+    /// A slice of a remote file ETV-next fetches over HTTP(S). `url` is a
+    /// playout URI template: a `{{VAR}}` in it is expanded from ETV-next's own
+    /// environment at play time, so a token never enters the playout file.
+    Http {
+        url: String,
+        in_ms: u64,
+        out_ms: u64,
+    },
 }
 
 impl SegmentSource {
