@@ -1838,6 +1838,7 @@ fn build(ctx) {
                 channel: "t",
                 fps: 30.0,
                 overlay_root: Path::new("/o"),
+                media_len_ms: &|_| None,
             },
             OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
         );
