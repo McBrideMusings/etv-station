@@ -687,6 +687,36 @@ impl HistoryDb {
         Ok(())
     }
 
+    /// Point the bumper row for `entry_id` starting at `start` (within a
+    /// second, for the frame rounding of an emitted item's start) at `source`.
+    /// Used when a pending segment's real file replaces its stand-in before
+    /// airtime. Returns how many rows it updated: 0 when the row is not there
+    /// yet (its generation has not written it) or a rewind deleted it.
+    pub fn set_bumper_source(
+        &self,
+        channel: &str,
+        entry_id: &str,
+        start: OffsetDateTime,
+        source: &str,
+    ) -> Result<usize, HistoryError> {
+        const WINDOW_NS: i64 = 1_000_000_000;
+        let conn = self.lock();
+        let rows = conn.execute(
+            "UPDATE airings SET source = ?1
+             WHERE channel = ?2 AND entry_id = ?3 AND kind = ?4
+               AND start_ns BETWEEN ?5 AND ?6",
+            params![
+                source,
+                channel,
+                entry_id,
+                AiringKind::Bumper.as_str(),
+                to_ns(start) - WINDOW_NS,
+                to_ns(start) + WINDOW_NS,
+            ],
+        )?;
+        Ok(rows)
+    }
+
     /// Rows matching `filter`, in start order, at most `filter.limit` of them
     /// (`limit == 0` returns none). Scheduled rows are included: the ledger
     /// holds every row until a rewind deletes it.
