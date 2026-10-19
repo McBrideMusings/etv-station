@@ -21,8 +21,11 @@
 //! `projection`'s worker thread and stills on their own threads, and the
 //! container runs the whole process at `nice 19` so the channels' transcodes
 //! always come first. `GET /api/health` returns what this process was started
-//! with.
+//! with, including the ETV-next URL the Guide reads from (`ETV_NEXT_URL`). `GET
+//! /api/airings/{airing}/audit` returns the stored audit record of one real
+//! airing, which is how the Guide answers "why is this on" (`airing`).
 
+mod airing;
 mod channel;
 mod lineup;
 mod projection;
@@ -40,6 +43,7 @@ use crate::profile::ProfileEntry;
 use crate::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use crate::tautulli::{self, HistoryScope};
 use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
+use airing::api_airing_audit;
 use channel::{ReviewState, api_channel_review, still_reply};
 use lineup::api_lineup;
 use rusqlite::{Connection, OpenFlags};
@@ -138,6 +142,7 @@ fn api_health(state: &AppState) -> (u16, Value) {
         "tunable_channels": channels.as_ref().map(Vec::len).ok(),
         "error": channels.err(),
         "revision": std::env::var("ETV_STATION_REVISION").ok(),
+        "etv_next_url": std::env::var("ETV_NEXT_URL").ok().filter(|u| !u.is_empty()),
     });
     (status, body)
 }
@@ -192,6 +197,12 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
     if *method == Method::Get {
         if let Some(id) = path.strip_prefix("/api/stills/") {
             return still_reply(state, &percent_decode(id));
+        }
+        if let Some(airing) = path
+            .strip_prefix("/api/airings/")
+            .and_then(|rest| rest.strip_suffix("/audit"))
+        {
+            return json_reply(api_airing_audit(state, &percent_decode(airing)));
         }
         if let Some(key) = path
             .strip_prefix("/api/channels/")

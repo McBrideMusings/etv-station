@@ -206,6 +206,28 @@
     .gwrap { height: 70vh; }
     .rail { overflow: visible; }
   }
+
+  /* Guide: a row per channel, time running across, programme width = running time. */
+  .gsrc { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .gtool { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
+  .tg { position: relative; width: max-content; }
+  .tg-head, .tg-row { display: flex; }
+  .tg-head { position: sticky; top: 0; z-index: 3; background: var(--bg); border-bottom: 2px solid var(--fg); height: 22px; }
+  .tg-corner, .tg-ch { position: sticky; left: 0; z-index: 2; width: var(--chw); flex: none; background: var(--bg); }
+  .tg-ch { padding: 0 8px; line-height: 26px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid var(--line); }
+  .tg-ch .n { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+  .tg-times { position: relative; flex: none; }
+  .tg-times span { position: absolute; top: 4px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; padding-left: 4px; border-left: 1px solid var(--line); height: 18px; }
+  .tg-track { position: relative; flex: none; height: 26px; border-bottom: 1px solid var(--line);
+    background-image: repeating-linear-gradient(to right, var(--line) 0 1px, transparent 1px calc(30 * var(--gppm))); }
+  .pgm { position: absolute; top: 2px; height: 22px; border-radius: 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line); font-size: 11.5px; line-height: 20px; padding: 0 5px; cursor: pointer; outline: none; }
+  .pgm.live { border-color: var(--accent); }
+  .pgm:hover, .pgm:focus-visible { outline: 2px solid var(--fg); outline-offset: -2px; }
+  .pgm.sel { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .tg-now { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); z-index: 1; pointer-events: none; }
+  .gnote { margin-top: 8px; }
+  .insp .err { margin-top: 8px; }
   #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
 </head>
@@ -418,16 +440,14 @@ function markRoute(r) {
   if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
 
-// Guide and Health have no content yet: say so rather than show an empty frame.
+// Health has no content yet: say so rather than show an empty frame.
 function renderEmpty(tab) {
   current = null;
-  document.title = `etv-station · ${tab === 'guide' ? 'Guide' : 'Health'}`;
+  document.title = 'etv-station · Health';
   $('state').textContent = '';
   $('report').classList.remove('loading');
-  $('report').innerHTML = `<div class="empty"><h1>${tab === 'guide' ? 'Guide' : 'Health'}</h1>
-    <p class="muted">${tab === 'guide'
-      ? 'Not built yet. It will show what is on every channel now, with the stream playing beside it.'
-      : 'Not built yet. It will show each channel\'s encoder, failures and last stall.'}</p></div>`;
+  $('report').innerHTML = `<div class="empty"><h1>Health</h1>
+    <p class="muted">Not built yet. It will show each channel's encoder, failures and last stall.</p></div>`;
 }
 
 let shown = null;   // the channel and projection the report holds, so a sub-tab switch redraws without refetching
@@ -439,8 +459,10 @@ async function route() {
     if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.project)); return; }
   }
   markRoute(r);
-  if (r.tab !== 'channels') { loadSeq++; shown = null; renderEmpty(r.tab); return; }
+  if (r.tab === 'guide') { loadSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
+  if (r.tab !== 'channels') { loadSeq++; guideSeq++; shown = null; renderEmpty(r.tab); return; }
   if (!r.channel) return;
+  guideSeq++;
   const key = `${r.channel}|${r.project}`;
   if (shown === key && current) { draw(r.view); return; }
   shown = key;
@@ -723,10 +745,177 @@ function airingPanel(d, a, colors) {
     <h4>Catalog</h4><div class="sum">${esc(a.id)}${cat ? ' · ' + esc(cat) : ''}${a.summary ? `<br>${esc(a.summary)}` : ''}</div>`;
 }
 
+// ---- Guide: ETV-next's live XMLTV grid, read by the browser. Clicking a programme asks the station for that airing's audit record.
+const GUIDE_PPM = 3.1;        // px per minute
+const GUIDE_BACK_MIN = 60;    // the grid opens this long before the half-hour at or before now
+const GUIDE_SPAN_MIN = 8 * 60;
+const GUIDE_CH_PX = 150;
+let guideSeq = 0;
+let guideBase = null;
+
+// The ETV-next origin (and path prefix) the browser reads from: the station's ETV_NEXT_URL, else this page's own host on 8409.
+async function etvBase() {
+  if (guideBase) return guideBase;
+  let url = null;
+  try { url = (await (await fetch('/api/health')).json()).etv_next_url; } catch (e) { /* fall back to the page's host */ }
+  guideBase = (url || `${location.protocol}//${location.hostname}:8409`).replace(/\/+$/, '');
+  return guideBase;
+}
+
+function parseM3u(text) {
+  const out = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('#EXTINF')) continue;
+    const attr = (k) => (lines[i].match(new RegExp(`${k}="([^"]*)"`)) || [])[1];
+    out.push({ id: attr('tvg-id'), chno: attr('tvg-chno'), name: attr('tvg-name') || lines[i].split(',').pop().trim() });
+  }
+  return out;
+}
+
+// XMLTV's `20261019201500 +0000` as Unix seconds.
+function xmltvTime(s) {
+  const m = /^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)\s*([+-])(\d\d)(\d\d)$/.exec((s || '').trim());
+  if (!m) return NaN;
+  const off = (m[7] === '-' ? -1 : 1) * (Number(m[8]) * 60 + Number(m[9]));
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000 - off * 60;
+}
+
+function parseXmltv(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('the XMLTV did not parse');
+  const names = {};
+  for (const c of doc.querySelectorAll('tv > channel')) {
+    const digits = [...c.querySelectorAll('display-name')].map((n) => n.textContent.trim()).find((t) => /^\d+$/.test(t));
+    names[c.getAttribute('id')] = digits ? Number(digits) : null;
+  }
+  const programmes = {};
+  for (const p of doc.querySelectorAll('tv > programme')) {
+    const start = xmltvTime(p.getAttribute('start'));
+    const stop = xmltvTime(p.getAttribute('stop'));
+    if (!(stop > start)) continue;
+    const text = (tag) => { const e = p.querySelector(tag); return e ? e.textContent.trim() : ''; };
+    (programmes[p.getAttribute('channel')] ||= []).push({ start, stop, title: text('title'), sub: text('sub-title') });
+  }
+  return { numbers: names, programmes };
+}
+
+async function fetchText(url) {
+  let res;
+  try { res = await fetch(url); } catch (e) { throw new Error(`${url}: ${e.message || e}`); }
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  return res.text();
+}
+
+async function loadGuide() {
+  const seq = ++guideSeq;
+  const began = Date.now();
+  const base = await etvBase();
+  const urls = { m3u: `${base}/channels.m3u`, xml: `${base}/xmltv.xml` };
+  $('report').innerHTML = `<div class="gtool"><strong>Guide</strong><span class="gsrc">from ${esc(base)}</span></div><div id="gstate"></div>`;
+  const tick = () => { $('gstate').innerHTML = `<span class="spinner"></span>Loading the guide from ${esc(base)}… (${Math.round((Date.now() - began) / 1000)}s)`; };
+  tick();
+  const timer = setInterval(() => { if ($('gstate')) tick(); }, 1000);
+  let data;
+  try {
+    const [m3u, xml] = await Promise.allSettled([fetchText(urls.m3u), fetchText(urls.xml)]);
+    const failed = [m3u, xml].filter((r) => r.status === 'rejected').map((r) => r.reason.message || String(r.reason));
+    if (failed.length) throw new Error(failed.join('\n'));
+    data = { channels: parseM3u(m3u.value), xmltv: parseXmltv(xml.value) };
+  } catch (e) {
+    data = { error: String(e.message || e) };
+  } finally {
+    clearInterval(timer);
+  }
+  if (seq !== guideSeq) return;
+  if (data.error) {
+    $('gstate').innerHTML = `<div class="error">ETV-next is unreachable or answered badly.\nTried ${esc(urls.m3u)} and ${esc(urls.xml)}\n${esc(data.error)}</div>
+      <p class="muted">The base URL is the station's ETV_NEXT_URL, else this page's host on port 8409.</p>`;
+    return;
+  }
+  drawGuide(data, base);
+}
+
+function drawGuide(data, base) {
+  const now = Math.floor(Date.now() / 1000);
+  const wstart = Math.floor(now / 1800) * 1800 - GUIDE_BACK_MIN * 60;
+  const wend = wstart + GUIDE_SPAN_MIN * 60;
+  const width = GUIDE_SPAN_MIN * GUIDE_PPM;
+  const ticks = [];
+  for (let t = wstart; t < wend; t += 1800) {
+    ticks.push(`<span style="left:${((t - wstart) / 60) * GUIDE_PPM}px">${esc(timeOf(t))}</span>`);
+  }
+  const rows = data.channels.map((c) => {
+    const number = c.chno && /^\d+$/.test(c.chno) ? Number(c.chno)
+      : data.xmltv.numbers[c.id] != null ? data.xmltv.numbers[c.id]
+      : Number((/(\d+)\D*$/.exec(c.id || '') || [])[1]);
+    const blocks = (data.xmltv.programmes[c.id] || []).filter((p) => p.stop > wstart && p.start < wend).map((p) => {
+      const s = Math.max(p.start, wstart);
+      const e = Math.min(p.stop, wend);
+      const left = ((s - wstart) / 60) * GUIDE_PPM;
+      const w = Math.max(((e - s) / 60) * GUIDE_PPM - 2, 2);
+      const label = `${timeOf(p.start)}–${timeOf(p.stop)} · ${p.title}${p.sub ? ` · ${p.sub}` : ''}`;
+      return `<div class="pgm${p.start <= now && now < p.stop ? ' live' : ''}" tabindex="0" data-number="${number}" data-start="${p.start}" data-stop="${p.stop}"
+        data-title="${esc(p.title)}" data-sub="${esc(p.sub)}" data-channel="${esc(c.name)}" data-tip="${esc(label)}" aria-label="${esc(label)}"
+        style="left:${left}px;width:${w}px">${esc(p.title)}</div>`;
+    }).join('');
+    return `<div class="tg-row"><div class="tg-ch" title="${esc(c.name)}"><span class="n">${esc(Number.isFinite(number) ? number : '—')}</span>${esc(c.name)}</div>
+      <div class="tg-track" style="width:${width}px">${blocks}</div></div>`;
+  }).join('');
+  const nowX = GUIDE_CH_PX + ((now - wstart) / 60) * GUIDE_PPM;
+  $('report').innerHTML = `<div class="gtool"><strong>Guide</strong><span class="muted">${data.channels.length} channels · updated ${esc(timeOf(now))}</span>
+      <button type="button" id="guideReload">Reload</button><span class="gsrc">from ${esc(base)}</span></div>
+    <div class="layout"><div class="gwrap" id="gg" style="--chw:${GUIDE_CH_PX}px;--gppm:${GUIDE_PPM}px">
+      <div class="tg"><div class="tg-head"><div class="tg-corner"></div><div class="tg-times" style="width:${width}px">${ticks.join('')}</div></div>
+        ${rows}<div class="tg-now" style="left:${nowX}px"></div></div></div>
+      <aside class="rail"><section class="insp" id="insp" hidden></section>
+        <p class="muted gnote">Click a programme to see why it is on: the stored selection trail of that airing.</p></aside></div>`;
+  $('guideReload').addEventListener('click', loadGuide);
+  const g = $('gg');
+  g.scrollLeft = Math.max(0, ((now - wstart) / 60) * GUIDE_PPM - 120);
+}
+
+async function selectProgramme(el) {
+  const { number, start, stop, title, sub, channel } = el.dataset;
+  const airing = `${number}.${start}`;
+  const head = `<button class="x" type="button" aria-label="Close">×</button><h3>${esc(title)}</h3><div class="ep">${esc(sub)}</div>
+    <div class="meta"><span>${esc(dayOf(Number(start)))} ${esc(timeOf(Number(start)))}–${esc(timeOf(Number(stop)))}</span><span>${Math.round((stop - start) / 60)} min</span><span>${esc(number)} ${esc(channel)}</span></div>`;
+  showPanel(`${head}<div class="muted"><span class="spinner"></span>Reading the audit for airing ${esc(airing)}…</div>`);
+  el.classList.add('sel');
+  let data; let status = 0;
+  try {
+    const res = await fetch(`/api/airings/${encodeURIComponent(airing)}/audit`);
+    status = res.status;
+    data = await res.json();
+  } catch (e) {
+    data = { error: String(e) };
+  }
+  if (!el.classList.contains('sel')) return;   // another programme was picked meanwhile
+  const panel = $('insp');
+  if (!panel) return;
+  const keep = (html) => { panel.innerHTML = html; panel.querySelector('.x').addEventListener('click', closePanel); };
+  if (status !== 200) {
+    keep(`${head}<div class="error err">HTTP ${status || '—'}: ${esc(data.error || 'no error message')}</div>`);
+    return;
+  }
+  const trail = Array.isArray(data.stages) ? data.stages : [];
+  const it = data.item;
+  keep(`<button class="x" type="button" aria-label="Close">×</button><h3>${esc(it.label)}</h3><div class="ep">${esc(sub)}</div>
+    <div class="meta"><span>${esc(dayOf(data.start))} ${esc(timeOf(data.start))}–${esc(timeOf(data.finish))}</span><span>${Math.round((data.finish - data.start) / 60)} min</span><span>${esc(data.number)} ${esc(channel)}</span>
+      ${it.content_rating ? `<span>rated ${esc(it.content_rating)}</span>` : ''}</div>
+    <h4>Why it's here: ${trail.length} stage${trail.length === 1 ? '' : 's'}</h4>
+    ${trail.length ? trail.map((s) => stageHTML({ titles: data.titles || {}, airings: [] }, s)).join('') : '<div class="muted">No selection trail was recorded for this airing.</div>'}
+    <h4>Catalog</h4><div class="sum">${esc(it.id)}${it.summary ? `<br>${esc(it.summary)}` : ''}</div>`);
+}
+document.addEventListener('click', (e) => { const p = e.target.closest('.pgm'); if (p) selectProgramme(p); });
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.pgm')) { e.preventDefault(); selectProgramme(e.target.closest('.pgm')); }
+});
+
 function closePanel() {
   const p = $('insp');
   if (p) { p.hidden = true; p.innerHTML = ''; }
-  document.querySelectorAll('.blk.sel').forEach((b) => b.classList.remove('sel'));
+  document.querySelectorAll('.blk.sel, .pgm.sel').forEach((b) => b.classList.remove('sel'));
 }
 
 function showPanel(html) {
