@@ -89,8 +89,9 @@
 //                        oldest first and newest LAST, capped at the
 //                        channel's `scoring.recent_depth` (default 200).
 //                        Airings of THIS channel, not Plex watch events —
-//                        `ctx.history` is the other thing and this script
-//                        does not read it. Ambient: no capability gates it.
+//                        `ctx.history` is the other thing; this script reads
+//                        it only to name a watched title as a pick's reason
+//                        (#319). Ambient: no capability gates ctx.recent.
 //   ctx.datastore(name)  a handle onto the plex-db-ex reader (#181),
 //                        exposing enrichment_for_many / pooled_taste_vector
 //                        among others
@@ -196,6 +197,13 @@ fn genre_bucket() { "genres" }
 // is the newest 1000 Tautulli rows, so a film watched three years ago would
 // read as unseen and land in the discovery half.
 fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
+
+// How far back a watched title may be cited as the reason for a pick (#319),
+// in days. `ctx.history` is the newest 1000 rows with no age bound, so without
+// this a title the house watched eleven months ago could be named as the
+// reason for tonight's film. Read only when the pool sets `why` on a movies
+// pool; a pick with no title inside the window keeps its keyword reason.
+fn bridge_window_days(ctx) { tunable(ctx, "bridge_window_days", 30).to_int() }
 
 // How much a candidate is discounted for sitting close to what the WHOLE
 // HOUSE watches (#411) — the "unusual choice" knob. The score is divided by
@@ -981,6 +989,57 @@ fn pick(ctx) {
         ctx.target_count + 10
     };
 
+    // BRIDGE TITLES (#319): for a keyword a pick shares with the taste vector,
+    // the most recently watched movie inside `bridge_window_days` that also
+    // carries it. Built once here, as keyword -> that movie, so naming one for
+    // a pick is a map probe — never a scan of the history per candidate or per
+    // pick. Only on a movies pool that words a `why`; a title outside
+    // `ctx.sets.movies` has no title to cite and is skipped. The history
+    // arrives newest-first only by convention, so it is sorted here, with
+    // entry_id breaking a tie, to keep two runs over the same data agreeing.
+    let bridge_idx = #{};
+    if ctx.config["why"] != () && unit_kind == "movie" && ctx.history.len > 0 {
+        let cutoff = ctx.now - bridge_window_days(ctx) * 86400;
+        let evs = [];
+        for e in ctx.history {
+            if e.watched_at >= cutoff { evs.push(e); }
+        }
+        evs.sort(|a, b| {
+            if a.watched_at > b.watched_at { -1 } else if a.watched_at < b.watched_at { 1 }
+            else if a.entry_id < b.entry_id { -1 } else if a.entry_id > b.entry_id { 1 }
+            else { 0 }
+        });
+        let wanted = #{};
+        for e in evs { wanted[e.entry_id] = true; }
+        let titled = #{};
+        for item in ctx.sets.movies {
+            if wanted[item.entry_id] != () && item.title != () { titled[item.entry_id] = item; }
+        }
+        let hist_ids = [];
+        let listed = #{};
+        for e in evs {
+            if titled[e.entry_id] != () && listed[e.entry_id] == () {
+                listed[e.entry_id] = true;
+                hist_ids.push(e.entry_id);
+            }
+        }
+        if hist_ids.len > 0 {
+            let hist_facts = ds.enrichment_for_many(hist_ids, ns);
+            for e in evs {
+                let item = titled[e.entry_id];
+                let facts = hist_facts[e.entry_id];
+                if item == () || facts == () { continue; }
+                for f in facts {
+                    if f.namespace == ns && excluded[f.value] == () && bridge_idx[f.value] == () {
+                        let b = #{ entry_id: e.entry_id, title: item.title, watcher: e.watcher };
+                        if item.year != () { b.year = item.year; }
+                        bridge_idx[f.value] = b;
+                    }
+                }
+            }
+        }
+    }
+
     let out = [];
     let ws_rows = #{};
     // Units in the order they were selected, and the audit record each one
@@ -1082,6 +1141,20 @@ fn pick(ctx) {
             let e = entries[i];
             profile_entries.push(#{ kind: e.kind, reference: e.reference, origin: e.origin, weight: e.weight });
         }
+        // The watched title behind this pick's heaviest shared keyword that
+        // has one, or () — an exploration draw is off-profile by design and
+        // names none, and a rewatched pick never cites itself.
+        let bridge = ();
+        if source != "explore" && !bridge_idx.is_empty() {
+            for k in top_keywords(row.on_profile, row.on_profile_w, row.on_profile.len) {
+                let b = bridge_idx[k];
+                if b != () && b.entry_id != row.id {
+                    bridge = #{ title: b.title, watcher: b.watcher, via: k };
+                    if b.year != () { bridge.year = b.year; }
+                    break;
+                }
+            }
+        }
         stages[row.id] = #{
             score: row.score,
             base_score: row.base_score,
@@ -1124,6 +1197,7 @@ fn pick(ctx) {
             on_favor: row.on_favor,
             on_favor_w: row.on_favor_w,
             source: source,
+            bridge: bridge,
         };
         selected.push(row.id);
     }
@@ -1210,6 +1284,7 @@ fn pick(ctx) {
             if why != () {
                 metadata.why = why.line;
                 metadata.why_detail = why.detail;
+                if why.bridge != () { metadata.why_bridge = why.bridge; }
             }
             out.push(#{ entry_id: id, metadata: metadata });
             // Keyed by the EMITTED entry_id, since audit() is handed the
@@ -1259,6 +1334,10 @@ fn top_keywords(words, weights, n) {
 // " film" and " television series" come off the end, and a keyword longer
 // than three words is skipped — the long TMDB phrases ("laugh out loud
 // relationship entanglement") read as noise at a glance.
+//
+// When a watched title bridges to the pick (#319), the detail is that title
+// then the keyword that linked them (`via`), and the pick also carries
+// `why_bridge` (title, year, watcher, via) for a channel that names who watched.
 fn on_screen_why(ctx, stage) {
     let line = ctx.config["why"];
     if line == () { return (); }
@@ -1290,12 +1369,27 @@ fn on_screen_why(ctx, stage) {
         if k.split(" ").len > 3 || k == "" || short.contains(k) { continue; }
         short.push(k);
     }
-    let detail = "";
-    for i in 0..short.len {
-        if i > 0 { detail += " · "; }
-        detail += short[i];
+    // A watched title, when one bridges to this pick, leads the detail and
+    // the heaviest keyword follows: still two reasons on screen, and the
+    // overlay joins them without asking which is which. `why_bridge` carries
+    // who watched it for a channel that wants to say so.
+    let bridge = stage.bridge;
+    let shown = [];
+    if bridge != () { shown.push(bridge.title); }
+    if bridge != () {
+        if bridge.via.split(" ").len <= 3 { shown.push(bridge.via); }
+    } else {
+        for k in short {
+            if shown.len >= 2 { break; }
+            shown.push(k);
+        }
     }
-    #{ line: line, detail: detail }
+    let detail = "";
+    for i in 0..shown.len {
+        if i > 0 { detail += " · "; }
+        detail += shown[i];
+    }
+    #{ line: line, detail: detail, bridge: bridge }
 }
 
 // The one sentence a viewer reads in the guide (etv-station-puhx): the

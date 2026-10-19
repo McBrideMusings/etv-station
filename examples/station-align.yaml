@@ -1,0 +1,34 @@
+# station-test.yaml's twin for the align/fill pass: the same no-media, no-Plex
+# station, with the one channel that fills its gaps with bumpers. Run it from the
+# repo root, like station-test.yaml:
+#   env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
+#     ./target/debug/etv-station --config examples/station-align.yaml
+# or `STATION_CONFIG=examples/station-align.yaml ./tools/dev-run.sh`.
+tz: "America/Chicago"
+
+output_base: examples/output
+
+channels:
+  - channels/align-test.yaml
+
+catalog_path: tmp/catalog.db
+
+catalog_refresh_secs: 86400
+
+normalization:
+  audio:
+    format: aac
+    bitrate_kbps: 192
+    buffer_kbps: 384
+    channels: 2
+    sample_rate_hz: 48000
+    normalize_loudness: false
+  video:
+    format: h264
+    bit_depth: 8
+    width: 1280
+    height: 720
+    bitrate_kbps: 2000
+    buffer_kbps: 4000
+  subtitle:
+    mode: convert

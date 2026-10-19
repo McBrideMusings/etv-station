@@ -1,0 +1,53 @@
+number: 2
+name: align-test
+# Exercises the align/fill pass: three lavfi programmes of 7, 11 and 17 minutes
+# on a 30-minute grid, so each ends short of a grid line and the gap after it is
+# filled with test_card bumpers. Run it with
+# `STATION_CONFIG=examples/station-align.yaml ./tools/dev-run.sh`; every
+# programme after a filled gap starts on a :00 or :30 mark.
+display_name: "Align Test Channel"
+window_days: 1
+chunk_hours: 1
+roll_interval: "60s"
+retention_days: 1
+
+overlay:
+  file: "../../crates/etv-overlay/fixtures/channel_watermark.yaml"
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "manual"
+      align: 30m
+      fill:
+        - script: ../plugins/bumpers/test_card.rhai
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "7m"
+          source:
+            kind: lavfi
+            params: "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+          program:
+            title: "Seven Minutes"
+            categories: ["Test"]
+
+        - kind: item
+          in_point: "0s"
+          out_point: "11m"
+          source:
+            kind: lavfi
+            params: "smptebars=size=1280x720:rate=30 [out0]; sine=frequency=880 [out1]"
+          program:
+            title: "Eleven Minutes"
+            categories: ["Test"]
+
+        - kind: item
+          in_point: "0s"
+          out_point: "17m"
+          source:
+            kind: lavfi
+            params: "mandelbrot=size=1280x720:rate=30 [out0]; sine=frequency=220 [out1]"
+          program:
+            title: "Seventeen Minutes"
+            categories: ["Test"]

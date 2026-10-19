@@ -196,6 +196,15 @@ fn build_playout_item(
     start: OffsetDateTime,
     finish: OffsetDateTime,
 ) -> PlayoutItem {
+    // A bumper the align/fill pass built already is a whole playout item; only
+    // its place in the sequence is decided here.
+    if let Some(stored) = &item.bumper
+        && let Ok(mut bumper) = serde_json::from_value::<PlayoutItem>(stored.clone())
+    {
+        bumper.start = start;
+        bumper.finish = finish;
+        return bumper;
+    }
     let mut playout_item =
         PlayoutItem::scheduled(item.id.clone(), start, finish, item.to_playout_source());
     playout_item.program = item.program.as_ref().map(clone_program);
@@ -354,6 +363,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 

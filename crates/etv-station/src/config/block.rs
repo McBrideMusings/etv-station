@@ -84,6 +84,26 @@ pub struct BlockFile {
     /// the other, enforced in validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequencer: Option<std::path::PathBuf>,
+
+    /// The local-clock grid this block's programmes end on (`30m`, `none`).
+    /// After layout and probing, the gap between a programme's end and the next
+    /// grid line is filled with bumpers from `fill`. Unset and `align: none`
+    /// both leave programmes back to back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<super::fill::Align>,
+
+    /// A gap shorter than this airs as black with the channel logo instead of
+    /// a bumper. Default [`super::fill::DEFAULT_MIN_FILL`].
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_fill: Option<std::time::Duration>,
+
+    /// The bumper scripts that fill a gap up to `align`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fill: Vec<super::fill::FillEntry>,
 }
 
 #[cfg(test)]
@@ -129,6 +149,43 @@ params = "testsrc"
         // Unset on disk stays unset; `BlockInclude::duplicates()` applies the
         // per-block-kind default.
         assert_eq!(block.duplicates, None);
+    }
+
+    #[test]
+    fn parses_align_min_fill_and_a_fill_list() {
+        use crate::config::Align;
+        use std::time::Duration;
+
+        let yaml = r#"
+align: 30m
+min_fill: 2s
+fill:
+  - script: bumpers/test_card.rhai
+    weight: 3
+    when: 'next.type == "movie"'
+    min_gap: 5s
+    max_gap: 15s
+entries:
+  - kind: item
+    source:
+      kind: lavfi
+      params: testsrc
+"#;
+        let block: BlockFile = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(block.align, Some(Align::Every(Duration::from_secs(1800))));
+        assert_eq!(block.min_fill, Some(Duration::from_secs(2)));
+        let entry = &block.fill[0];
+        assert_eq!(
+            entry.script,
+            std::path::PathBuf::from("bumpers/test_card.rhai")
+        );
+        assert_eq!(entry.weight, 3);
+        assert_eq!(entry.when.as_deref(), Some(r#"next.type == "movie""#));
+        assert_eq!(entry.min_gap, Some(Duration::from_secs(5)));
+        assert_eq!(entry.max_gap, Some(Duration::from_secs(15)));
+
+        let none: BlockFile = serde_norway::from_str("align: none\nentries: []\n").unwrap();
+        assert_eq!(none.align, Some(Align::Off));
     }
 
     #[test]

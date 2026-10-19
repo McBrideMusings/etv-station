@@ -125,6 +125,11 @@ pub struct ResolvedItem {
     /// the playout item's `tracks`. `None` until a probed file has been
     /// through it, and for sources that cannot be probed.
     pub selected: Option<SelectedTracks>,
+    /// Set on a bumper the align/fill pass inserted ([`crate::bumper::fill`]):
+    /// the finished playout item, serialized, with its `start` and `finish`
+    /// left for [`crate::rule`] to overwrite from the sequence. `None` on a
+    /// programme.
+    pub bumper: Option<serde_json::Value>,
 }
 
 /// The audio and subtitle streams chosen for one item, as indexes into the
@@ -1703,6 +1708,7 @@ fn pending_item(id: String) -> ResolvedItem {
         guide_fields: GuideFields::default(),
         tracks: None,
         selected: None,
+        bumper: None,
     }
 }
 
@@ -2268,6 +2274,7 @@ fn build_catalog_item(
         // `resolve_pool_block_items`, and the levels above it by the daemon.
         tracks: None,
         selected: None,
+        bumper: None,
     })
 }
 
@@ -2299,6 +2306,7 @@ fn resolve_item(
         guide_fields: GuideFields::default(),
         tracks: item.tracks.clone(),
         selected: None,
+        bumper: None,
     }
 }
 
@@ -2431,6 +2439,9 @@ mod tests {
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
+            align: None,
+            min_fill: None,
+            fill: Vec::new(),
         }
     }
 

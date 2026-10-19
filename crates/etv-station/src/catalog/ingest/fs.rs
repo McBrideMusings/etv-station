@@ -41,6 +41,7 @@ use time::format_description::well_known::Rfc3339;
 use crate::catalog::identity::{canonical_path, derive_entry_id};
 use crate::catalog::model::{Entry, EntrySource, Source};
 use crate::catalog::{Catalog, CatalogError};
+use crate::duration::FileProbe;
 
 /// Video container extensions the walker considers media.
 const MEDIA_EXTS: [&str; 5] = ["mp4", "mkv", "mov", "m4v", "webm"];
@@ -73,6 +74,10 @@ pub struct FsIngestStats {
     /// Entries newly marked missing because every one of their provenance rows
     /// is now missing, leaving nothing to play.
     pub entries_marked_missing: usize,
+    /// Files whose probe found them unairable this pass (no video stream, no
+    /// length, or a length far off the catalog's runtime). Pools stop drawing
+    /// their entries.
+    pub files_unairable: usize,
 }
 
 /// Walk `roots`, probe durations, and ingest into `catalog`. `identity_roots`
@@ -80,7 +85,9 @@ pub struct FsIngestStats {
 /// [`canonical_path`]) — a separate setting from `roots` (#243): this function
 /// scans exactly the directories it is given, whatever `identity_roots` says.
 /// Files that fail to probe are still ingested with a `None` duration — a
-/// missing runtime is a metadata gap, not a reason to drop the file.
+/// missing runtime is a metadata gap, not a reason to drop the file. A file
+/// whose probe answers but describes something that cannot air is ingested too,
+/// and marked unairable ([`record_airability`]) so pools stop drawing it.
 pub async fn ingest_roots(
     catalog: &Catalog,
     roots: &[PathBuf],
@@ -108,17 +115,79 @@ pub async fn ingest_roots(
     files.sort();
     files.dedup();
 
-    let probed = probe_concurrently(files, PROBE_CONCURRENCY, |path| async move {
-        ffprobe_seconds(&path).await
+    let probes = probe_concurrently(files, PROBE_CONCURRENCY, |path| async move {
+        crate::duration::probe_file(&path).await
     })
     .await;
+    let probed: Vec<(PathBuf, Option<f64>)> = probes
+        .iter()
+        .map(|(path, probe)| (path.clone(), probe_seconds(probe)))
+        .collect();
     // All writes in one transaction: a failure part-way rolls back, never
     // leaving a half-scanned catalog.
     //
     // `prune_absent: true` — this walked every configured root exhaustively, so a
     // stored row the walk did not reach is a file that is gone, not one that was
     // skipped. Anything that ever scans a subset of the roots must pass `false`.
-    catalog.in_transaction(|c| ingest_files(c, &probed, identity_roots, true))
+    catalog.in_transaction(|c| {
+        let mut stats = ingest_files(c, &probed, identity_roots, true)?;
+        stats.files_unairable = record_airability(c, &probes, identity_roots)?;
+        Ok(stats)
+    })
+}
+
+/// The length a probe measured, for the catalog's `duration_ms`. `None` when the
+/// probe learned nothing usable: the row keeps the length an earlier scan wrote.
+fn probe_seconds(probe: &FileProbe) -> Option<f64> {
+    match probe {
+        FileProbe::Answered { duration, .. } => Some(duration.as_secs_f64()),
+        FileProbe::NoAnswer | FileProbe::Garbled(_) => None,
+    }
+}
+
+/// Write each probed file's verdict onto its `local_fs` provenance row, and
+/// return how many were found unairable. Run after [`ingest_files`], which
+/// creates the rows. A file whose probe did not answer is left alone, so a
+/// stale mount cannot clear or set a verdict. The length compared against is the
+/// catalog's own runtime, which exists only for an entry some other source
+/// (Plex) authored; an `fs:` entry's runtime *is* the probe.
+pub(crate) fn record_airability(
+    catalog: &Catalog,
+    probes: &[(PathBuf, FileProbe)],
+    identity_roots: &[String],
+) -> Result<usize, FsIngestError> {
+    let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
+    let mut unairable = 0;
+    for (path, probe) in probes {
+        let source_id = canonical_path(&path.to_string_lossy(), &roots);
+        let reason = match probe {
+            FileProbe::NoAnswer => continue,
+            FileProbe::Garbled(reason) => Some(reason.clone()),
+            FileProbe::Answered { duration, streams } => {
+                let catalog_runtime = catalog
+                    .entry_id_for_source(Source::LocalFs, &source_id)?
+                    .filter(|entry_id| !entry_id.starts_with("fs:"))
+                    .map(|entry_id| catalog.entry(&entry_id))
+                    .transpose()?
+                    .flatten()
+                    .and_then(|e| e.duration_ms)
+                    .filter(|&ms| ms > 0)
+                    .map(|ms| std::time::Duration::from_millis(ms as u64));
+                crate::duration::unairable_reason(*duration, streams, catalog_runtime)
+            }
+        };
+        if let Some(reason) = &reason {
+            unairable += 1;
+            tracing::warn!(
+                event = "catalog.file_unairable",
+                path = %path.display(),
+                reason = %reason,
+                "file cannot air; pools stop drawing its entry"
+            );
+        }
+        catalog.set_source_unairable(Source::LocalFs, &source_id, reason.as_deref())?;
+    }
+    Ok(unairable)
 }
 
 /// Write catalog rows for already-probed files. Pure over the catalog (no
@@ -221,14 +290,15 @@ const PROBE_CONCURRENCY: usize = 8;
 
 /// Run `probe` over every file with at most `limit` in flight, returning the
 /// results in the order of `files` so the write pass stays deterministic.
-async fn probe_concurrently<F, Fut>(
+async fn probe_concurrently<T, F, Fut>(
     files: Vec<PathBuf>,
     limit: usize,
     probe: F,
-) -> Vec<(PathBuf, Option<f64>)>
+) -> Vec<(PathBuf, T)>
 where
+    T: Default + Send + 'static,
     F: Fn(PathBuf) -> Fut,
-    Fut: std::future::Future<Output = Option<f64>> + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
 {
     let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
     let mut set = tokio::task::JoinSet::new();
@@ -243,20 +313,20 @@ where
             (idx, fut.await)
         });
     }
-    let mut secs: Vec<Option<f64>> = vec![None; files.len()];
+    let mut results: Vec<T> = files.iter().map(|_| T::default()).collect();
     while let Some(done) = set.join_next().await {
         // A panicked probe task leaves its file's duration unknown, the same
         // as a failed probe.
         match done {
-            Ok((idx, s)) => secs[idx] = s,
+            Ok((idx, r)) => results[idx] = r,
             Err(e) => tracing::warn!(
                 event = "catalog.probe_task_failed",
                 error = %e,
-                "probe task panicked; its file keeps an unknown duration"
+                "probe task panicked; its file is treated as unprobed"
             ),
         }
     }
-    files.into_iter().zip(secs).collect()
+    files.into_iter().zip(results).collect()
 }
 
 /// The file's stem as its title (`station-bumper-01.mp4` → `station-bumper-01`).
@@ -286,48 +356,6 @@ pub fn type_from_path(path: &Path) -> String {
         _ => "video",
     }
     .into()
-}
-
-/// Probe a file's duration in seconds. Returns `None` on any failure (spawn
-/// error, non-zero exit, unparseable output) — a scan tolerates individual bad
-/// files rather than aborting the whole pass.
-async fn ffprobe_seconds(path: &Path) -> Option<f64> {
-    let args: Vec<std::ffi::OsString> = [
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-    ]
-    .iter()
-    .map(Into::into)
-    .chain([path.as_os_str().to_owned()])
-    .collect();
-    let stdout = match crate::ffprobe::run_bounded_async(args).await.ok()? {
-        crate::ffprobe::Bounded::Done {
-            success: true,
-            stdout,
-            ..
-        } => stdout,
-        crate::ffprobe::Bounded::Done { .. } => return None,
-        crate::ffprobe::Bounded::TimedOut => {
-            tracing::warn!(
-                event = "catalog.probe_timeout",
-                path = %path.display(),
-                timeout_secs = crate::ffprobe::PROBE_TIMEOUT.as_secs(),
-                "ffprobe did not finish; file skipped"
-            );
-            return None;
-        }
-    };
-    // `parse::<f64>` accepts "nan"/"inf"; reject non-finite so a corrupt probe
-    // records an unknown duration (None) rather than a garbage 0 / i64::MAX ms.
-    String::from_utf8_lossy(&stdout)
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|s| s.is_finite())
 }
 
 #[cfg(test)]
@@ -898,6 +926,121 @@ mod tests {
         // Two rows on the books, one of them missing — the moved-from path is
         // kept so the file moving back is a re-match, not a fresh entry.
         assert_eq!(cat.all_entry_ids().unwrap().len(), 2);
+    }
+
+    fn answered(secs: u64, kinds: &[crate::tracks::StreamKind]) -> FileProbe {
+        FileProbe::Answered {
+            duration: std::time::Duration::from_secs(secs),
+            streams: kinds
+                .iter()
+                .enumerate()
+                .map(|(i, k)| crate::tracks::StreamInfo {
+                    index: i as u32,
+                    kind: *k,
+                    codec: "x".into(),
+                    lang: None,
+                    title: None,
+                    channels: None,
+                    default: false,
+                    forced: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn fs_id(path: &str) -> String {
+        derive_entry_id(&[], &canonical_path(path, &["/data/media"]))
+    }
+
+    fn pooled(cat: &Catalog) -> Vec<String> {
+        cat.resolve_query(r#"item.fs_dir == "movies""#).unwrap()
+    }
+
+    #[test]
+    fn a_file_with_no_video_stream_leaves_the_pool_and_a_good_rescan_returns_it() {
+        use crate::tracks::StreamKind::{Audio, Video};
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let good = "/data/media/movies/good.mkv";
+        let bad = "/data/media/movies/bad.mkv";
+        let files = [file(good, 5400.0), file(bad, 5400.0)];
+        ingest_files(&cat, &files, &roots, true).unwrap();
+        assert_eq!(pooled(&cat).len(), 2);
+
+        let probes = vec![
+            (PathBuf::from(good), answered(5400, &[Video, Audio])),
+            (PathBuf::from(bad), answered(5400, &[Audio])),
+        ];
+        assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 1);
+        let left = pooled(&cat);
+        assert_eq!(left, vec![fs_id(good)]);
+        assert_eq!(
+            cat.source_unairable_reason(Source::LocalFs, &canonical_path(bad, &["/data/media"]))
+                .unwrap(),
+            Some("no video stream".to_string())
+        );
+
+        // A timeout learns nothing: the verdict stands.
+        let probes = vec![(PathBuf::from(bad), FileProbe::NoAnswer)];
+        record_airability(&cat, &probes, &roots).unwrap();
+        assert_eq!(pooled(&cat).len(), 1);
+
+        // The file is replaced with a good one; the next answer clears it.
+        let probes = vec![(PathBuf::from(bad), answered(5400, &[Video, Audio]))];
+        assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 0);
+        assert_eq!(pooled(&cat).len(), 2);
+    }
+
+    #[test]
+    fn cover_art_zero_length_and_garbled_output_are_unairable() {
+        use crate::tracks::StreamKind::{Other, Video};
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        let paths: Vec<String> = ["art", "zero", "garbled"]
+            .iter()
+            .map(|n| format!("/data/media/movies/{n}.mkv"))
+            .collect();
+        let files: Vec<_> = paths.iter().map(|p| file(p, 60.0)).collect();
+        ingest_files(&cat, &files, &roots, true).unwrap();
+        let probes = vec![
+            (PathBuf::from(&paths[0]), answered(60, &[Other])),
+            (PathBuf::from(&paths[1]), answered(0, &[Video])),
+            (
+                PathBuf::from(&paths[2]),
+                FileProbe::Garbled("format.duration missing".into()),
+            ),
+        ];
+        assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 3);
+        assert!(pooled(&cat).is_empty());
+    }
+
+    #[test]
+    fn a_probe_far_off_a_plex_runtime_is_unairable_but_an_fs_runtime_is_the_probe() {
+        use crate::tracks::StreamKind::Video;
+        let cat = Catalog::open_in_memory().unwrap();
+        let roots = ["/data/media".to_string()];
+        // A Plex-authored entry whose runtime is 5,040s, matched by path.
+        let trunc = "/data/media/movies/trunc.mkv";
+        let other = "/data/media/movies/other.mkv";
+        let mut plex = Entry::new("plex:1", "movie", "Truncated", Source::Plex);
+        plex.duration_ms = Some(5_040_000);
+        cat.upsert_entry(&plex).unwrap();
+        cat.add_source(&EntrySource {
+            source: Source::Plex,
+            source_id: trunc.into(),
+            entry_id: "plex:1".into(),
+            playback_path: trunc.into(),
+            last_seen: None,
+            missing_since: None,
+        })
+        .unwrap();
+        ingest_files(&cat, &[file(trunc, 5.0), file(other, 5.0)], &roots, true).unwrap();
+        let probes = vec![
+            (PathBuf::from(trunc), answered(5, &[Video])),
+            (PathBuf::from(other), answered(5, &[Video])),
+        ];
+        assert_eq!(record_airability(&cat, &probes, &roots).unwrap(), 1);
+        assert_eq!(pooled(&cat), vec![fs_id(other)]);
     }
 
     /// 16 files that each take 200ms to probe finish in about two waves at a

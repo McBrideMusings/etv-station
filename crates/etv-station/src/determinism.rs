@@ -374,6 +374,9 @@ mod tests {
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
+            align: None,
+            min_fill: None,
+            fill: Vec::new(),
         }
     }
 
@@ -413,6 +416,9 @@ mod tests {
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
+            align: None,
+            min_fill: None,
+            fill: Vec::new(),
         }
     }
 
@@ -478,6 +484,9 @@ mod tests {
             mode: Mode::All,
             order: Some(Order::Random),
             filter: None,
+            align: None,
+            min_fill: None,
+            fill: Vec::new(),
         }
     }
 
@@ -686,6 +695,9 @@ fn audit(ctx, picks, workspace) {
             mode: Mode::All,
             order: None,
             filter: None,
+            align: None,
+            min_fill: None,
+            fill: Vec::new(),
         }
     }
 

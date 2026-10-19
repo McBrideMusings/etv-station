@@ -68,6 +68,10 @@ flat list of entries. Source: `config/block.rs` (`BlockFile`).
 | `entries` | **yes** | list of [`Entry`](#entry) |
 | `fallback` | no | [`Fallback`](#fallback) — resolved instead of `entries` when `entries` resolves to nothing |
 
+| `align` | no — default `none` | `none` \| a duration (`30m`, `1h`): the local-clock grid this block's programmes end on |
+| `min_fill` | no — default `2s` | a gap shorter than this is black with the channel logo, not a bumper |
+| `fill` | when `align` is set | list of [fill entries](#align-and-fill--bumpers-up-to-the-grid), the bumper scripts that fill a gap |
+
 ```yaml
 # blocks/starwars-timeline.yaml
 program:
@@ -86,6 +90,53 @@ entries:
 
 `${ETV_TEST_MEDIA_DIR}` and other `${VAR}` references in source paths are
 expanded from the environment at load time.
+
+### Align and fill — bumpers up to the grid
+
+`align`, `min_fill` and `fill` sit on a block (a block file or an inline
+`rule.blocks` entry) and apply to `entries`, `pattern` and `sequencer` blocks
+alike: the pass reads only where each programme ends.
+
+```yaml
+align: 30m            # grid lines every 30 minutes from local midnight; `none` turns the pass off
+min_fill: 2s          # optional, default 2s
+fill:
+  - script: bumpers/test_card.rhai   # relative to the channel file; must declare the `bumper` hook
+    weight: 1                        # optional, default 1
+    when: 'next.type == "movie"'     # optional CEL over next, prev, gap_ms, channel
+    min_gap: 5s                      # optional: only while the remaining gap is at least this
+    max_gap: 15s                     # optional: only while the remaining gap is at most this
+    capabilities: []                 # what the script's capabilities() declares, exactly
+```
+
+After a generation's programmes are laid out and probed, and before they are cut
+into chunks, the gap between each programme's end and the next grid line is
+filled, so the next programme starts on the line. `align` must divide 24 hours
+evenly and needs a `fill` list; `fill` and `min_fill` need an `align`.
+
+- A gap always fills to the line, chaining bumpers as long as it takes.
+- A gap under `min_fill` is one black item with the channel's own overlay (its
+  logo). The playout schema has no fade filter on an item, so that black item is
+  the dip out of the programme and into the next.
+- Each draw is a weighted pick among the entries whose `when` holds and whose
+  `min_gap` admits the remaining gap. If some entry's `max_gap` covers the rest of
+  the gap, that draw is the last: an entry whose timeline can stretch (a looped
+  segment, or flex room up to the gap) is chosen over one that would leave a black
+  filler. If none covers it, the draw is any admitted entry, fitted to its
+  `max_gap`. An entry with no `max_gap` covers any gap.
+- Each draw logs `event="bumper.fill"` with the channel, script, remaining gap,
+  each segment's fitted length and source, and the fallback taken (`none`, or why
+  black aired).
+- Bumper items carry the `bumper:` id prefix. The airings ledger's programme rows
+  are the same with and without the pass.
+- A script that fails, or returns nothing, is replaced by black for its draw.
+- A generation that starts off the grid (a restart, or a refresh that cut at a
+  programme's end) fills up to the first line before its first programme.
+
+`examples/plugins/bumpers/test_card.rhai` is the integration fixture: black with a
+text card naming the next programme, looped so it can take any gap.
+`examples/channels/align-test.yaml` uses it; run it with
+`STATION_CONFIG=examples/station-align.yaml ./tools/dev-run.sh`.
 
 ## Entry
 
@@ -1726,6 +1777,19 @@ sets no `why` writes neither. The station carries both keys through untouched
 and never reads them; `deploy/appdata/shared/corner-sequence.rhai` is one
 overlay that draws them.
 
+**A reason can be a watched title.** On a movies pool that sets `why`, the
+scorer also looks, once per generation, for the most recently watched movie in
+`ctx.history` that carries one of the pick's matched keywords (heaviest first).
+When one exists, `why_detail` leads with that title and follows with the
+keyword that linked them (`Blade Runner · neo-noir`), and the pick's metadata gains
+`why_bridge`: `{ title, year, watcher, via }`, where `watcher` is who watched
+it (empty on a pooled history row that names nobody) and `via` the shared
+keyword. A channel that wants to say the name reads `why_bridge.watcher`; one
+that doesn't ignores it. A watch qualifies only inside `bridge_window_days`
+(pool `config:`, default `30`). A pick with no qualifying title, an
+exploration draw, and a title that would cite itself keep the keyword detail
+and carry no `why_bridge`. The overlay is unchanged.
+
 #### `ignore_keywords` — tags that describe packaging, not subject
 
 ```yaml
@@ -1984,8 +2048,8 @@ below. The two sides must agree exactly:
 `examples/plugins/taste-cosine.rhai` reads `ctx.sets` and reaches for a named
 datastore, so it declares
 `["catalog_read", "watch_history", #{ datastore: "taste" }]` (#254's interface
-list — `watch_history` is declared without `pick()` reading `ctx.history`
-today, reserved rather than removed); `examples/samples/foryou.yaml` grants
+list — `pick()` reads `ctx.history` only to name a watched title as a
+pick's reason, see `why` above); `examples/samples/foryou.yaml` grants
 all three on the one pool that points at it.
 
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on

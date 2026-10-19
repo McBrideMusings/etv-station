@@ -270,7 +270,7 @@ struct StationContext<'a> {
     /// `history` above — that field is the *watch* history a scorer plugin
     /// reads (`ctx.history`); this one is the play-history ledger every
     /// channel appends to and projects its resume cursor from.
-    history_db: &'a HistoryDb,
+    history_db: &'a Arc<HistoryDb>,
     /// The station-level `tracks:` rules (#261), the base of the track
     /// selection cascade.
     station_tracks: Option<&'a crate::config::TrackRules>,
@@ -983,6 +983,7 @@ async fn ingest_catalog(
             sources = stats.sources_written,
             sources_marked_missing = stats.sources_marked_missing,
             entries_marked_missing = stats.entries_marked_missing,
+            files_unairable = stats.files_unairable,
             "local-fs catalog ingest complete",
         ),
         Err(e) => {
@@ -1996,6 +1997,7 @@ mod supervisor_tests {
                 guide_fields: crate::guide::GuideFields::default(),
                 tracks: None,
                 selected: None,
+                bumper: None,
             })
             .collect();
         let durations = vec![slot; count];
@@ -2365,6 +2367,7 @@ mod regen_floor_tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 
@@ -3108,6 +3111,85 @@ pub(crate) fn target_count(
     remaining.min(chunk).div_euclid(per_item).clamp(1, MAX) as usize
 }
 
+/// Run the align/fill pass over one generation's schedule. A channel with no
+/// aligned block gets its schedule back unchanged. The bumper scripts read the
+/// airings ledger through `ctx.airings`; the rows for what they place come back
+/// in [`crate::bumper::fill::Laid::bumper_records`].
+#[allow(clippy::too_many_arguments)]
+fn align_fill(
+    channel: &LoadedChannel,
+    ctx: StationContext<'_>,
+    catalog: Option<&Catalog>,
+    laid: crate::bumper::fill::Laid,
+    skip: usize,
+    start: OffsetDateTime,
+    fill_leading: bool,
+    end_state: &crate::resume::ResumeMap,
+) -> crate::bumper::fill::Laid {
+    use crate::bumper::fill::{FillEnv, FillPlan, fill_gaps};
+    let plans: Vec<Option<FillPlan>> = {
+        let base = channel
+            .config_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        channel
+            .config
+            .rule
+            .all_blocks()
+            .map(|b| FillPlan::from_block(b, base))
+            .collect()
+    };
+    if plans.iter().all(Option::is_none) {
+        return laid;
+    }
+    // A bumper's overlay script path is written absolute: etv-overlay resolves
+    // a relative one against its own working directory.
+    let overlay_root = channel
+        .config_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let item_map = |item: &crate::resolve::ResolvedItem| -> rhai::Map {
+        if let Some(cat) = catalog
+            && let Ok(items) = crate::score::load_items(cat, std::slice::from_ref(&item.id))
+            && let Some(map) = items
+                .into_iter()
+                .next()
+                .and_then(|d| d.try_cast::<rhai::Map>())
+        {
+            return map;
+        }
+        let mut map = rhai::Map::new();
+        map.insert("entry_id".into(), item.id.clone().into());
+        if let Some(title) = item.program.as_ref().and_then(|p| p.title.clone()) {
+            map.insert("title".into(), title.into());
+        }
+        map
+    };
+    let env = FillEnv {
+        channel: crate::bumper::hook::ChannelInfo {
+            name: channel.name.clone(),
+            number: channel.config.number,
+            logo: None,
+            vocabulary: Vec::new(),
+        },
+        tz: ctx.tz,
+        overlay_root: &overlay_root,
+        history: Some(Arc::clone(ctx.history_db)),
+        plans,
+        item_map: &item_map,
+    };
+    // The state after the last item, which the bumpers after it carry.
+    let end_progress = crate::resume::Progress {
+        pools: end_state.pools.clone(),
+        position: end_state.position,
+        slot_positions: end_state.slot_positions.clone(),
+    };
+    fill_gaps(&env, laid, skip, start, fill_leading, &end_progress)
+}
+
 /// Returns the map to carry into the next tick.
 async fn pattern_catch_up(
     channel: &LoadedChannel,
@@ -3435,29 +3517,53 @@ async fn pattern_catch_up(
         // anchor means treating them as already aired, which is the whole claim
         // the anchor makes, and the list position the resolve just recorded has
         // moved past them.
-        let (items_slice, durations_slice, progress_slice, seq_start) =
-            match channel.config.anchor.filter(|_| first_generation) {
-                Some(anchor) => {
-                    let (skip, into_item) = crate::rule::phase_at(anchor, from, &durations);
-                    if skip > 0 || !into_item.is_zero() {
-                        tracing::info!(
-                            event = "anchor.join",
-                            channel = %channel.name,
-                            anchor = %anchor,
-                            skipped_items = skip,
-                            "joined the sequence mid-list from the configured anchor",
-                        );
-                    }
-                    (
-                        &items[skip..],
-                        &durations[skip..],
-                        &progress[skip..],
-                        from - into_item,
-                    )
+        let (skip, seq_start) = match channel.config.anchor.filter(|_| first_generation) {
+            Some(anchor) => {
+                let (skip, into_item) = crate::rule::phase_at(anchor, from, &durations);
+                if skip > 0 || !into_item.is_zero() {
+                    tracing::info!(
+                        event = "anchor.join",
+                        channel = %channel.name,
+                        anchor = %anchor,
+                        skipped_items = skip,
+                        "joined the sequence mid-list from the configured anchor",
+                    );
                 }
-                None => (&items[..], &durations[..], &progress[..], from),
-            };
+                (skip, from - into_item)
+            }
+            None => (0, from),
+        };
         first_generation = false;
+
+        // The align/fill pass (ADR 0004's accepted drift, closed): bumpers for
+        // the gap between a programme's end and its block's next grid line.
+        // After probing and guide rendering, so it sees real lengths and the
+        // guide text never sees a bumper as a neighbour; before chunk slicing,
+        // so the chunk files hold the bumpers. A joined-mid-list generation
+        // has no real gap at its head (`seq_start` is in the past).
+        let programmes = items.len();
+        let crate::bumper::fill::Laid {
+            items,
+            durations,
+            progress,
+            bumper_records,
+        } = align_fill(
+            channel,
+            ctx,
+            catalog.as_ref(),
+            crate::bumper::fill::Laid {
+                items,
+                durations,
+                progress,
+                bumper_records: Vec::new(),
+            },
+            skip,
+            seq_start,
+            seq_start == from,
+            &resume_out,
+        );
+        let (items_slice, durations_slice, progress_slice) =
+            (&items[skip..], &durations[skip..], &progress[skip..]);
 
         let rule = crate::rule::Sequential::new(items_slice, durations_slice);
         let span = rule.total_duration() - (from - seq_start);
@@ -3469,7 +3575,7 @@ async fn pattern_catch_up(
                 event = "pattern.zero_length",
                 channel = %channel.name,
                 phase = phase,
-                items = items.len(),
+                items = programmes,
                 "generation produced no playable duration; nothing further can be emitted",
             );
             resume.checkpoints.pop();
@@ -3505,7 +3611,7 @@ async fn pattern_catch_up(
             &written,
             from,
             to,
-            items.len(),
+            programmes,
         );
 
         // Checkpoint every item boundary this generation wrote, on top of the
@@ -3549,10 +3655,15 @@ async fn pattern_catch_up(
         let records: Vec<crate::history::PlayRecord> = items
             .iter()
             .zip(durations.iter())
-            .map(|(item, dur)| {
+            .filter_map(|(item, dur)| {
                 let start = airing;
                 airing += time::Duration::seconds_f64(dur.as_secs_f64());
-                crate::history::PlayRecord {
+                // A bumper is not a programme: the ledger's programme rows
+                // are the same with and without the align/fill pass.
+                if item.bumper.is_some() {
+                    return None;
+                }
+                Some(crate::history::PlayRecord {
                     entry_id: item.id.clone(),
                     show_id: show_ids.get(&item.id).cloned(),
                     start,
@@ -3562,9 +3673,16 @@ async fn pattern_catch_up(
                     // error card as a film somebody watched.
                     error_card: item.error_card,
                     ..Default::default()
-                }
+                })
             })
             .collect();
+        // Bumper rows share the generation's `written_at` and go in the same
+        // transaction as the programmes, so a failed write leaves neither.
+        let mut records = records;
+        records.extend(bumper_records.into_iter().map(|mut r| {
+            r.played_at = written_at;
+            r
+        }));
         ctx.history_db.record(&channel.name, &records)?;
 
         // `resume_out` carries only pool state; the checkpoint trail and the
@@ -3628,7 +3746,7 @@ mod resume_fingerprint_survives_generation_tests {
 
     fn ctx<'a>(
         history: &'a SharedHistory,
-        history_db: &'a HistoryDb,
+        history_db: &'a Arc<HistoryDb>,
         tz: &'static Tz,
     ) -> StationContext<'a> {
         StationContext {
@@ -3730,7 +3848,7 @@ order = "manual"
         let channel = ch_straddling(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let mut stamped = crate::resume::ResumeMap::new();
@@ -3760,7 +3878,7 @@ order = "manual"
         let channel = ch_straddling(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let resume = pattern_catch_up(
@@ -3900,7 +4018,7 @@ order = "manual"
         let channel = ch_list(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let mut resume = pattern_catch_up(
@@ -4080,7 +4198,7 @@ take = 2
         let channel = ch_pattern(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog = Some(pattern_catalog());
 
         let mut resume = pattern_catch_up(
@@ -4142,7 +4260,7 @@ take = 2
         let channel = ch_pattern(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
         let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let history_db = HistoryDb::open_in_memory().unwrap();
+        let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog = Some(pattern_catalog());
 
         let mut resume = pattern_catch_up(
@@ -4433,6 +4551,7 @@ mod render_guide_tests {
             guide_fields: GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 

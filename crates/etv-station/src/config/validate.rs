@@ -217,6 +217,7 @@ fn validate_channel_with_plex(
         validate_constraints(&include.constraints(), &bad)?;
         validate_guide(path, &label, include.guide())?;
         validate_tracks(path, &label, include.tracks())?;
+        validate_fill(include, base_dir, &bad)?;
         for pool in &include.pools {
             validate_variety(
                 path,
@@ -1007,6 +1008,65 @@ fn validate_plugin_declares_pool_provider(
     Ok(())
 }
 
+/// A block's `align:` / `min_fill:` / `fill:` (the align/fill pass): the grid
+/// must tile a day, `fill` is required exactly when an `align` is set, every
+/// entry's gap limits and `when:` must be coherent, and every script must be
+/// a `bumper` plugin granted exactly the capabilities it declares.
+fn validate_fill(
+    include: &BlockInclude,
+    base_dir: &Path,
+    bad: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let every = include.align.and_then(|a| a.every());
+    let Some(every) = every else {
+        if !include.fill.is_empty() {
+            return Err(bad(
+                "`fill:` has no effect without an `align:` to fill up to".into(),
+            ));
+        }
+        if include.min_fill.is_some() {
+            return Err(bad(
+                "`min_fill:` has no effect without an `align:` to fill up to".into(),
+            ));
+        }
+        return Ok(());
+    };
+    if every.is_zero() || 86_400 % every.as_secs().max(1) != 0 || every.subsec_nanos() != 0 {
+        return Err(bad(format!(
+            "align {} must be a whole number of seconds that divides 24h evenly",
+            humantime::format_duration(every)
+        )));
+    }
+    if include.fill.is_empty() {
+        return Err(bad(
+            "`align:` needs a `fill:` list of bumper scripts to fill gaps with".into(),
+        ));
+    }
+    for (n, entry) in include.fill.iter().enumerate() {
+        let at = format!("fill #{n} ({})", entry.script.display());
+        if entry.weight == 0 {
+            return Err(bad(format!("{at}: weight must be at least 1")));
+        }
+        if let (Some(lo), Some(hi)) = (entry.min_gap, entry.max_gap)
+            && lo > hi
+        {
+            return Err(bad(format!(
+                "{at}: min_gap {} exceeds max_gap {}",
+                humantime::format_duration(lo),
+                humantime::format_duration(hi)
+            )));
+        }
+        if let Some(when) = &entry.when {
+            cel::Program::compile(when)
+                .map_err(|e| bad(format!("{at}: `when` is not valid CEL: {e}")))?;
+        }
+        let script = crate::score::resolve_plugin_path(base_dir, &entry.script);
+        crate::bumper::hook::validate_script(&script, &entry.capabilities)
+            .map_err(|e| bad(format!("{at}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// A pool naming a script for `plugin:` grants it exactly the capabilities
 /// (#167) the script's `capabilities()` declares — no more, no less.
 ///
@@ -1402,6 +1462,9 @@ mod tests {
             mode: Mode::All,
             order: Some(Order::Manual),
             filter: None,
+            align: None,
+            min_fill: None,
+            fill: Vec::new(),
         }
     }
 
@@ -2837,6 +2900,83 @@ fn capabilities() { [] }
         )
         .unwrap_err();
         assert!(format!("{err}").contains("telepathy"));
+    }
+
+    /// `align:` / `min_fill:` / `fill:` refuse every incoherent combination at
+    /// load: a fill list with no grid, a grid with nothing to fill it, a grid
+    /// that does not tile a day, a bumper script that is not one.
+    #[test]
+    fn incoherent_align_and_fill_settings_are_rejected() {
+        use crate::config::{Align, FillEntry};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bumper.rhai"),
+            "fn hooks() { [\"bumper\"] }\nfn build(ctx) { timeline() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pool.rhai"),
+            "fn hooks() { [\"pool_provider\"] }\nfn audit(ctx, picks, workspace) { #{} }\n",
+        )
+        .unwrap();
+        let entry = |script: &str| FillEntry {
+            script: script.into(),
+            weight: 1,
+            when: None,
+            min_gap: None,
+            max_gap: None,
+            capabilities: vec![],
+        };
+        let check = |align: Option<Align>, fill: Vec<FillEntry>| -> Result<(), String> {
+            let mut block = inline_block(vec![]);
+            block.align = align;
+            block.fill = fill;
+            let bad = |message: String| ConfigError::Validation {
+                path: PathBuf::from("c.yaml"),
+                message,
+            };
+            validate_fill(&block, dir.path(), &bad).map_err(|e| e.to_string())
+        };
+        let half_hour = Some(Align::Every(Duration::from_secs(1800)));
+
+        assert!(check(half_hour, vec![entry("bumper.rhai")]).is_ok());
+        assert!(check(None, vec![]).is_ok());
+        assert!(
+            check(None, vec![entry("bumper.rhai")])
+                .unwrap_err()
+                .contains("without an `align:`")
+        );
+        assert!(
+            check(half_hour, vec![])
+                .unwrap_err()
+                .contains("needs a `fill:`")
+        );
+        let seven_hours = Some(Align::Every(Duration::from_secs(7 * 3600)));
+        assert!(
+            check(seven_hours, vec![entry("bumper.rhai")])
+                .unwrap_err()
+                .contains("divides 24h")
+        );
+        assert!(
+            check(half_hour, vec![entry("pool.rhai")])
+                .unwrap_err()
+                .contains("bumper")
+        );
+        let mut backwards = entry("bumper.rhai");
+        backwards.min_gap = Some(Duration::from_secs(20));
+        backwards.max_gap = Some(Duration::from_secs(5));
+        assert!(
+            check(half_hour, vec![backwards])
+                .unwrap_err()
+                .contains("exceeds max_gap")
+        );
+        let mut broken = entry("bumper.rhai");
+        broken.when = Some("next.type ==".into());
+        assert!(
+            check(half_hour, vec![broken])
+                .unwrap_err()
+                .contains("not valid CEL")
+        );
     }
 
     /// A minimal but real plexdb store: `Reader::open` reads `schema_version`

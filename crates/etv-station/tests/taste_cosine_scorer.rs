@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source, TagNs};
 use etv_station::config::DatastoreGrant;
 use etv_station::score::{
-    Capability, GrantedCapabilities, PickedItem, PoolSources, ScoreCache, ScoreInputs,
+    Capability, GrantedCapabilities, PickedItem, PoolSources, ScoreCache, ScoreInputs, WatchEvent,
     declared_capabilities, declared_hooks, pick,
 };
 
@@ -2314,4 +2314,93 @@ fn temperature_loosens_the_ranking_by_seed_and_zero_keeps_it() {
         .find(|p| detail_f64(p, "rank") != detail_f64(p, "score_rank"))
         .expect("some pick moved");
     assert_eq!(detail_f64(moved, "temperature"), 1.0);
+}
+
+/// One generation with a watch history, `now` fixed at 10_000_000 seconds so
+/// a watch's age is the number a test writes.
+fn pick_with_history(
+    scorer: &Scorer,
+    config: serde_json::Value,
+    history: Vec<WatchEvent>,
+) -> Vec<PickedItem> {
+    let inputs = ScoreInputs {
+        target_count: 3,
+        now: 10_000_000,
+        history: history.into(),
+        ..Default::default()
+    };
+    pick(
+        &scorer.cache,
+        &scorer.script,
+        scorer.sources.as_ref(),
+        &inputs,
+        etv_station::variety::Dice::fixed(0),
+        "movies",
+        Some(&config),
+        grant(&scorer.db),
+    )
+    .unwrap()
+}
+
+fn watched(entry_id: &str, days_ago: i64, watcher: &str) -> WatchEvent {
+    WatchEvent {
+        entry_id: entry_id.into(),
+        watched_at: 10_000_000 - days_ago * 86_400,
+        watcher: Some(watcher.into()),
+    }
+}
+
+/// #319: a why line names an already-watched title for a keyword the pick
+/// shares with the taste vector, only from inside `bridge_window_days`, keeps
+/// its keyword reason when nothing qualifies, and agrees with itself on a
+/// second run.
+#[test]
+fn a_why_line_can_name_a_title_watched_inside_the_window() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let config = serde_json::json!({
+        "exploration_fraction": 0.0,
+        "why": "Because",
+        "bridge_window_days": 30,
+    });
+    let field = |p: &PickedItem, key: &str| p.metadata.as_ref().unwrap().get(key).cloned();
+    let find = |picks: &[PickedItem], id: &str| picks.iter().find(|p| p.id == id).unwrap().clone();
+
+    // mov-a carries contact + time; mov-c shares `contact` with it.
+    let picks = pick_with_history(&scorer, config.clone(), vec![watched("mov-a", 2, "pat")]);
+    let mov_c = find(&picks, "mov-c");
+    assert_eq!(
+        field(&mov_c, "why_detail"),
+        Some(serde_json::json!("mov-a · contact"))
+    );
+    let bridge = field(&mov_c, "why_bridge").unwrap();
+    assert_eq!(bridge["title"], "mov-a");
+    assert_eq!(bridge["watcher"], "pat");
+    assert_eq!(bridge["via"], "contact");
+
+    // mov-a itself never cites itself; its keywords have no other watched title.
+    let mov_a = find(&picks, "mov-a");
+    assert!(field(&mov_a, "why_bridge").is_none());
+
+    // Two runs over unchanged data agree.
+    let again = pick_with_history(&scorer, config.clone(), vec![watched("mov-a", 2, "pat")]);
+    assert_eq!(
+        field(&find(&again, "mov-c"), "why_bridge"),
+        field(&mov_c, "why_bridge")
+    );
+
+    // Watched 100 days ago: outside the 30-day window, so the keyword reason stands.
+    let stale = pick_with_history(&scorer, config.clone(), vec![watched("mov-a", 100, "pat")]);
+    let mov_c = find(&stale, "mov-c");
+    assert_eq!(
+        field(&mov_c, "why_detail"),
+        Some(serde_json::json!("contact"))
+    );
+    assert!(field(&mov_c, "why_bridge").is_none());
+
+    // No history at all reads exactly as before.
+    let none = pick_with_history(&scorer, config, vec![]);
+    assert_eq!(
+        field(&find(&none, "mov-c"), "why_detail"),
+        Some(serde_json::json!("contact"))
+    );
 }

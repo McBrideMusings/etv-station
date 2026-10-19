@@ -279,22 +279,17 @@ fn config_duration(item: &ResolvedItem) -> Result<Duration, StationError> {
 /// a long or short film.
 const PROBE_DEVIATION_FACTOR: u32 = 2;
 
-/// Whether a probe describes a file that can air, or the reason it cannot: no
-/// video stream, no positive container length, or a length more than
-/// [`PROBE_DEVIATION_FACTOR`] off the catalog's runtime (a truncated download or
-/// a bad header). An unairable file fails like a non-zero ffprobe exit, so it
-/// becomes an error card or is dropped; the catalog's runtime is never
-/// substituted for a length the file does not have. The cache keeps the raw
-/// probe, so this runs on every use and a catalog update takes effect without
-/// re-probing.
-fn check_probe(
-    path: &Path,
+/// The reason a probe describes a file that cannot air, or `None` when it can:
+/// no video stream, no positive container length, or a length more than
+/// [`PROBE_DEVIATION_FACTOR`] off `catalog`, the catalog's own runtime. One
+/// verdict for the playout path ([`check_probe`]) and the catalog ingest, so the
+/// two cannot disagree about which files are unairable.
+pub(crate) fn unairable_reason(
     probed: Duration,
     streams: &[StreamInfo],
-    item: &ResolvedItem,
-) -> Result<Duration, StationError> {
-    let catalog = item.catalog_duration.filter(|c| !c.is_zero());
-    let reason = if !streams.iter().any(|s| s.kind == StreamKind::Video) {
+    catalog: Option<Duration>,
+) -> Option<String> {
+    if !streams.iter().any(|s| s.kind == StreamKind::Video) {
         Some("no video stream".to_string())
     } else if probed.is_zero() {
         Some("container duration is zero".to_string())
@@ -310,7 +305,25 @@ fn check_probe(
                     c.as_secs_f64()
                 )
             })
-    };
+    }
+}
+
+/// Whether a probe describes a file that can air, or the reason it cannot: no
+/// video stream, no positive container length, or a length more than
+/// [`PROBE_DEVIATION_FACTOR`] off the catalog's runtime (a truncated download or
+/// a bad header). An unairable file fails like a non-zero ffprobe exit, so it
+/// becomes an error card or is dropped; the catalog's runtime is never
+/// substituted for a length the file does not have. The cache keeps the raw
+/// probe, so this runs on every use and a catalog update takes effect without
+/// re-probing.
+fn check_probe(
+    path: &Path,
+    probed: Duration,
+    streams: &[StreamInfo],
+    item: &ResolvedItem,
+) -> Result<Duration, StationError> {
+    let catalog = item.catalog_duration.filter(|c| !c.is_zero());
+    let reason = unairable_reason(probed, streams, catalog);
     match reason {
         None => Ok(probed),
         Some(reason) => {
@@ -344,6 +357,22 @@ fn clamp_to_config(probed: Duration, item: &ResolvedItem) -> Duration {
 }
 
 async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), StationError> {
+    match ffprobe_stdout(path).await {
+        ProbeRun::Output(stdout) => parse_probe(path, &stdout),
+        ProbeRun::NoAnswer(e) => Err(e),
+    }
+}
+
+/// How one `ffprobe` run ended.
+enum ProbeRun {
+    /// ffprobe exited 0 and printed this.
+    Output(Vec<u8>),
+    /// ffprobe did not answer: it could not run, exited non-zero, or timed
+    /// out. Says nothing certain about the file's content.
+    NoAnswer(StationError),
+}
+
+async fn ffprobe_stdout(path: &Path) -> ProbeRun {
     let args: Vec<std::ffi::OsString> = [
         "-v",
         "error",
@@ -357,11 +386,15 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
     .map(Into::into)
     .chain([path.as_os_str().to_owned()])
     .collect();
-    let stdout = match crate::ffprobe::run_bounded_async(args).await.map_err(|e| {
-        StationError::FfprobeUnavailable {
-            reason: format!("spawn: {e}"),
+    let outcome = match crate::ffprobe::run_bounded_async(args).await {
+        Ok(o) => o,
+        Err(e) => {
+            return ProbeRun::NoAnswer(StationError::FfprobeUnavailable {
+                reason: format!("spawn: {e}"),
+            });
         }
-    })? {
+    };
+    let stdout = match outcome {
         crate::ffprobe::Bounded::Done {
             success: true,
             stdout,
@@ -370,7 +403,7 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         crate::ffprobe::Bounded::Done { stderr, .. } => {
             let stderr = String::from_utf8_lossy(&stderr);
             let stderr = stderr.trim();
-            return Err(StationError::Ffprobe {
+            return ProbeRun::NoAnswer(StationError::Ffprobe {
                 path: path.to_path_buf(),
                 reason: if stderr.is_empty() {
                     "non-zero exit".into()
@@ -384,9 +417,9 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
                 event = "duration.probe_timeout",
                 path = %path.display(),
                 timeout_secs = crate::ffprobe::PROBE_TIMEOUT.as_secs(),
-                "ffprobe did not finish; item becomes an error card"
+                "ffprobe did not finish; no verdict on the file"
             );
-            return Err(StationError::Ffprobe {
+            return ProbeRun::NoAnswer(StationError::Ffprobe {
                 path: path.to_path_buf(),
                 reason: format!(
                     "ffprobe timed out after {}s",
@@ -396,7 +429,36 @@ async fn ffprobe_media(path: &Path) -> Result<(Duration, Vec<StreamInfo>), Stati
         }
     };
 
-    parse_probe(path, &stdout)
+    ProbeRun::Output(stdout)
+}
+
+/// What a catalog ingest learned from probing one file.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) enum FileProbe {
+    /// ffprobe did not answer (stale mount, timeout, non-zero exit): nothing
+    /// is concluded about the file.
+    #[default]
+    NoAnswer,
+    /// ffprobe answered with a length and streams.
+    Answered {
+        duration: Duration,
+        streams: Vec<StreamInfo>,
+    },
+    /// ffprobe exited 0 but its output has no usable length: the file cannot
+    /// air.
+    Garbled(String),
+}
+
+/// Probe `path` once for the catalog ingest.
+pub(crate) async fn probe_file(path: &Path) -> FileProbe {
+    match ffprobe_stdout(path).await {
+        ProbeRun::NoAnswer(_) => FileProbe::NoAnswer,
+        ProbeRun::Output(stdout) => match parse_probe(path, &stdout) {
+            Ok((duration, streams)) => FileProbe::Answered { duration, streams },
+            Err(StationError::Ffprobe { reason, .. }) => FileProbe::Garbled(reason),
+            Err(_) => FileProbe::NoAnswer,
+        },
+    }
 }
 
 /// Turn ffprobe's JSON into a length and streams. Whether the file can air is
@@ -456,6 +518,9 @@ struct ProbeDisposition {
     default: u8,
     #[serde(default)]
     forced: u8,
+    /// Cover art muxed in as a one-frame video stream.
+    #[serde(default)]
+    attached_pic: u8,
 }
 
 impl ProbeStream {
@@ -472,6 +537,9 @@ impl ProbeStream {
             index: self.index,
             kind: match self.codec_type.as_str() {
                 "audio" => StreamKind::Audio,
+                // Cover art is not video: a file with only a poster stream
+                // has nothing to play.
+                "video" if self.disposition.attached_pic != 0 => StreamKind::Other,
                 "video" => StreamKind::Video,
                 "subtitle" => StreamKind::Subtitle,
                 _ => StreamKind::Other,
@@ -552,6 +620,22 @@ mod tests {
     }
 
     #[test]
+    fn cover_art_is_not_a_video_stream() {
+        let probed: Vec<ProbeStream> = serde_json::from_str(
+            r#"[{"index":0,"codec_type":"audio","codec_name":"mp3"},
+                {"index":1,"codec_type":"video","codec_name":"mjpeg",
+                 "disposition":{"default":0,"forced":0,"attached_pic":1}}]"#,
+        )
+        .unwrap();
+        let streams: Vec<StreamInfo> = probed.iter().map(ProbeStream::to_info).collect();
+        assert_eq!(streams[1].kind, StreamKind::Other);
+        assert_eq!(
+            unairable_reason(Duration::from_secs(200), &streams, None),
+            Some("no video stream".into())
+        );
+    }
+
+    #[test]
     fn a_cached_entry_from_before_streams_were_recorded_is_probed_again() {
         let old: HashMap<PathBuf, CacheEntry> =
             serde_json::from_str(r#"{"/m/a.mkv":{"mtime_secs":5,"duration_secs":60.0}}"#).unwrap();
@@ -575,6 +659,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 
@@ -607,6 +692,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -632,6 +718,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         };
         let mut stats = ProbeStats::default();
         let err = cache.duration_for(&item, &mut stats).await.unwrap_err();
@@ -653,6 +740,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 
@@ -732,6 +820,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         };
         let err = cache.resolve_all(vec![bad]).await.unwrap_err();
         assert!(matches!(err, StationError::MissingField { .. }));

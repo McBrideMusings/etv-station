@@ -152,6 +152,7 @@ mod tests {
             guide_fields: crate::guide::GuideFields::default(),
             tracks: None,
             selected: None,
+            bumper: None,
         }
     }
 
