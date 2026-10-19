@@ -1139,7 +1139,7 @@ fn validate_plugin_capabilities(
     // version when they disagree, and names the path when the file is
     // simply missing.
     for grant in &pool.datastores {
-        plexdb_reader::Reader::open(&grant.path).map_err(|e| {
+        plexdb_reader::Reader::open(&grant.path, None, None).map_err(|e| {
             bad(format!(
                 "pool {:?}: datastore {:?} at {:?} could not be opened: {e}",
                 pool.name, grant.name, grant.path

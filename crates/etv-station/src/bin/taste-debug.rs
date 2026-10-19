@@ -161,7 +161,8 @@ fn main() -> Result<(), String> {
         .unwrap_or_else(|| "taste".to_string());
 
     if let Some(surface) = &cli.resolve {
-        let reader = plexdb_reader::Reader::open(&plexdb_path).map_err(|e| e.to_string())?;
+        let reader =
+            plexdb_reader::Reader::open(&plexdb_path, None, None).map_err(|e| e.to_string())?;
         match reader
             .keyword_for_surface(surface)
             .map_err(|e| e.to_string())?

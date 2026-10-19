@@ -4,10 +4,12 @@
 //! change that drops a field a consumer reads fails that consumer's
 //! **build**, not a runtime query built from a string (ADR-0003).
 
+use serde::Serialize;
+
 /// One namespaced, opaque fact about a title — a row of `enrichment`.
 ///
 /// The store never interprets `key`/`value`; neither does this crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnrichmentFact {
     pub namespace: String,
     pub key: String,
@@ -17,13 +19,26 @@ pub struct EnrichmentFact {
 
 /// One directed, typed, ranked relationship between two titles — a row of
 /// `edges`. A snapshot of what a source said at one moment, not a fact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Edge {
     pub from_id: String,
     pub to_id: String,
     pub edge_type: String,
     pub rank: i64,
     pub fetched_at: String,
+}
+
+/// One tag that co-occurs with another on the tag network — a row of
+/// `tag_network_edge` seen from one of its two ends.
+///
+/// `shared` is how many titles carry both tags; `df` is how many titles carry
+/// `tag` alone, so a caller can tell a strong tie to a rare tag from one to a
+/// ubiquitous tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagNeighbour {
+    pub tag: String,
+    pub shared: i64,
+    pub df: i64,
 }
 
 /// One attribute in a user's Layer 2 taste vector, and how strongly their
@@ -42,7 +57,7 @@ pub struct Edge {
 /// abandoned watch is no signal rather than negative signal. The exploration
 /// fraction describes how a *channel* is assembled, not what a person likes,
 /// so it stays with the consumer. There is no constant in here to tune.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TasteAttribute {
     pub namespace: String,
     pub key: String,
@@ -61,7 +76,7 @@ pub struct TasteAttribute {
 /// none. There is deliberately no `weight` field — `rank`, `size`, `likes`
 /// and `mentions` are the facts a source gave; a consumer wanting one number
 /// computes it from those (plex-db-ex#33, ADR-0012).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CollectionMembership {
     pub collection_id: String,
     pub source: String,
@@ -82,7 +97,7 @@ pub struct CollectionMembership {
 /// as one unit — which over-weights a long show. Reported rather than
 /// silently folded in, because the alternative is a vector that is quietly
 /// wrong in a way nothing downstream can detect.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TasteVector {
     pub attributes: Vec<TasteAttribute>,
     pub shows_without_seasons: Vec<String>,

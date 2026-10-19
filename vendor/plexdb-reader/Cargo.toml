@@ -1,5 +1,5 @@
 # Vendored from plex-db-ex (McBrideMusings/plex-db-ex), crates/plexdb-reader,
-# at commit 52dcbe1. Files under src/ are unmodified copies of that crate;
+# at commit c581319. Files under src/ are unmodified copies of that crate;
 # only this manifest is adapted to plug into etv-station's own workspace
 # instead of plex-db-ex's. See docs/architecture.md's "Why plexdb-reader is
 # vendored, not a git dependency" for why, and how to refresh this copy.
@@ -15,6 +15,16 @@ description = "Read-only typed access to a plexdb.db store (ADR-0003)."
 # rather than assuming a candidate set never exceeds it.
 rusqlite = { workspace = true, features = ["limits"] }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `frame_vec` is a vec0 virtual table (ADR-0024); reading it needs the extension
+# loaded, at the version the writer's `sqlite-vec` pin names.
+sqlite-vec = "=0.1.9"
+# The Phrase cache's one HTTP call (ADR-0026). No TLS feature: the encoder is a
+# plain-http endpoint on the writer's network. Pinned here, not through the
+# workspace, because the station's own `ureq` is the 2.x line.
+ureq = { version = "=3.4.2", default-features = false, features = ["json"] }
+url = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
