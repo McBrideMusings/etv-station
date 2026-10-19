@@ -968,6 +968,17 @@ count airings per local day and pool. Review always starts today and caps at
 50 days, so a date further out needs a scratch copy of the channel with its
 `dates:` moved into range.
 
+## Verifying the align/fill pass
+
+`examples/station-align.yaml` runs one lavfi channel (`examples/channels/align-test.yaml`: programmes of 7, 11 and 17 minutes, `align: 30m`, `examples/plugins/bumpers/test_card.rhai`).
+
+```sh
+env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
+  ./target/debug/etv-station --config examples/station-align.yaml
+```
+
+Stop it after ~30s. Look for: `event="bumper.fill"` lines (channel, script, gap_ms, segments, fallback), zero WARN/ERROR, and in `examples/output/align-test/*.json` every programme that follows a `bumper:` item starting on :00 or :30 with no gap between items. `sqlite3 examples/output/history.db "select kind,count(*) from airings group by kind"` shows only `programme`. Observed 2026-10-18: 48 programmes, 49 bumpers, 0 off-grid.
+
 ## Gotchas
 
 - The first Plex ingest reads the whole library and genuinely takes minutes
