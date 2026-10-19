@@ -62,6 +62,15 @@ To see the Guide against a running stack: start `./tools/dev-run.sh` (ETV-next o
 `./tools/station-ui.sh`, open `http://127.0.0.1:4747/#/guide`. Stop ETV-next and reload to see
 the error-upstream state, which names the URLs tried.
 
+Clicking a channel name in the Guide plays `{base}/channel/{n}.m3u8` in a player in the rail: native
+HLS where `canPlayType('application/vnd.apple.mpegurl')` answers (Safari, recent Chrome), otherwise
+hls.js from `GET /assets/hls.min.js` (embedded in the binary, test
+`web_ui::tests::the_embedded_hls_script_is_served_from_the_dashboard`). A manifest 404 shows
+"Cannot play <url> / Network error: HTTP 404 …" under the video. With no stack running, a stand-in
+server answering `/api/health`, `/channels.m3u`, `/xmltv.xml`, `/assets/hls.min.js` and
+`/channel/{n}.m3u8` (an `ffmpeg -f hls` testsrc) exercises the page; to force the hls.js path in a
+browser with native HLS, override `HTMLMediaElement.prototype.canPlayType` to return `''` first.
+
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
 

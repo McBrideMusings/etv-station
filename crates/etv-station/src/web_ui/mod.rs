@@ -23,6 +23,8 @@
 //! with, including the ETV-next URL the Guide reads from (`ETV_NEXT_URL`). `GET
 //! /api/airings/{airing}/audit` returns the stored audit record of one real
 //! airing, which is how the Guide answers "why is this on" (`airing`).
+//! `GET /assets/hls.min.js` serves the hls.js copy embedded in the binary, which
+//! the Guide's player loads for browsers that cannot play HLS natively.
 
 mod airing;
 mod channel;
@@ -150,6 +152,8 @@ fn api_health(state: &AppState) -> (u16, Value) {
 enum Reply {
     Json(u16, Value),
     Html(&'static str),
+    /// A script the page loads from this server, so playback needs no CDN.
+    Script(&'static str),
     /// A tune-in still a review offered under this id, rendered on its own
     /// thread by [`channel::respond_still`].
     Still(String, Box<TuneInStill>),
@@ -171,6 +175,7 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
     let began = std::time::Instant::now();
     match dispatch(state, &method, &path, &query, &body) {
         Reply::Html(html) => respond_html(request, html),
+        Reply::Script(js) => respond_script(request, js),
         Reply::Still(id, still) => {
             channel::respond_still(state.review.still_dir.clone(), id, *still, request)
         }
@@ -212,6 +217,7 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
     let result = match (method, path) {
         (Method::Get, "/") => return Reply::Html(SHELL_HTML),
         (Method::Get, "/tune") => return Reply::Html(TUNE_HTML),
+        (Method::Get, "/assets/hls.min.js") => return Reply::Script(HLS_JS),
         (Method::Get, "/api/health") => Ok(api_health(state)),
         (Method::Get, "/api/lineup") => api_lineup(state),
         (Method::Get, "/api/channels") => api_channels(state),
@@ -263,6 +269,14 @@ fn respond_html(request: tiny_http::Request, body: &str) {
     let _ = request.respond(response);
 }
 
+fn respond_script(request: tiny_http::Request, body: &str) {
+    let content_type =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/javascript; charset=utf-8"[..])
+            .expect("static header");
+    let response = tiny_http::Response::from_string(body).with_header(content_type);
+    let _ = request.respond(response);
+}
+
 /// `key=value&key2=value2`, percent-decoded, `+` read as a literal `+` (this
 /// tool only ever sends plain text through these, never a form submission).
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
@@ -299,6 +313,8 @@ fn percent_decode(s: &str) -> String {
 
 const SHELL_HTML: &str = include_str!("shell.html");
 const TUNE_HTML: &str = include_str!("tune.html");
+/// hls.js 1.5.17 (Apache-2.0, https://github.com/video-dev/hls.js), unmodified, for browsers without native HLS.
+const HLS_JS: &str = include_str!("hls.min.js");
 
 #[cfg(test)]
 mod tests {
@@ -361,6 +377,15 @@ mod tests {
         assert_eq!(status, 202, "{body}");
         assert_eq!(body["pending"], true);
         assert_eq!(body["channel"], "channels/a24.yaml");
+    }
+
+    #[test]
+    fn the_embedded_hls_script_is_served_from_the_dashboard() {
+        let mut state = example_state();
+        match dispatch(&mut state, &Method::Get, "/assets/hls.min.js", "", "") {
+            Reply::Script(js) => assert!(js.contains("Hls"), "not hls.js"),
+            _ => panic!("/assets/hls.min.js did not answer a script"),
+        }
     }
 
     #[test]

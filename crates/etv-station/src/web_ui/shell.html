@@ -214,6 +214,13 @@
   .pgm.sel { outline: 3px solid var(--accent); outline-offset: -3px; }
   .tg-now { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); z-index: 1; pointer-events: none; }
   .gnote { margin-top: 8px; }
+  .tg-ch.watch { cursor: pointer; }
+  .tg-ch.watch:hover, .tg-ch.watch:focus-visible, .tg-ch.playing { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .player { border: 1px solid var(--line); margin-bottom: 12px; padding: 8px; }
+  .player video { width: 100%; background: #000; display: block; aspect-ratio: 16 / 9; }
+  .player h3 { margin: 0 0 2px; font-size: 14px; }
+  .player .now { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .player .x { float: right; }
   .insp .err { margin-top: 8px; }
   #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
@@ -421,6 +428,7 @@ async function route() {
   }
   if (r.days) $('days').value = r.days;
   markRoute(r);
+  stopPlayer();
   if (r.tab === 'guide') { loadSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
   if (r.tab !== 'channels') { loadSeq++; guideSeq++; shown = null; renderEmpty(r.tab); return; }
   if (!r.channel) return;
@@ -690,6 +698,9 @@ const GUIDE_SPAN_MIN = 8 * 60;
 const GUIDE_CH_PX = 150;
 let guideSeq = 0;
 let guideBase = null;
+let guideData = null;
+let hlsPlayer = null;
+let hlsScript = null;
 
 // The ETV-next origin (and path prefix) the browser reads from: the station's ETV_NEXT_URL, else this page's own host on 8409.
 async function etvBase() {
@@ -746,6 +757,7 @@ async function fetchText(url) {
 }
 
 async function loadGuide() {
+  stopPlayer();
   const seq = ++guideSeq;
   const began = Date.now();
   const base = await etvBase();
@@ -771,8 +783,72 @@ async function loadGuide() {
       <p class="muted">The base URL is the station's ETV_NEXT_URL, else this page's host on port 8409.</p>`;
     return;
   }
+  guideData = data;
   drawGuide(data, base);
 }
+
+// hls.js is served by the dashboard itself (/assets/hls.min.js), loaded only when a browser cannot play HLS natively.
+function loadHls() {
+  hlsScript ||= new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = '/assets/hls.min.js';
+    s.onload = () => resolve(window.Hls);
+    s.onerror = () => { hlsScript = null; reject(new Error('the dashboard could not load /assets/hls.min.js')); };
+    document.head.appendChild(s);
+  });
+  return hlsScript;
+}
+
+function stopPlayer() {
+  if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+  document.querySelectorAll('.tg-ch.playing').forEach((r) => r.classList.remove('playing'));
+  const p = $('player');
+  if (p) { p.hidden = true; p.innerHTML = ''; }
+}
+
+// Plays ETV-next's /channel/{n}.m3u8 beside the grid, and says in words why it could not.
+async function watchChannel(row) {
+  const { number, name, id } = row.dataset;
+  const p = $('player');
+  if (!p) return;
+  stopPlayer();
+  row.classList.add('playing');
+  const base = await etvBase();
+  const url = `${base}/channel/${number}.m3u8`;
+  const now = Math.floor(Date.now() / 1000);
+  const cur = ((guideData && guideData.xmltv.programmes[id]) || []).find((g) => g.start <= now && now < g.stop);
+  p.innerHTML = `<button class="x" type="button" aria-label="Close player">×</button><h3>${esc(number)} ${esc(name)}</h3>
+    <div class="now">${cur ? `Now: ${esc(cur.title)}${cur.sub ? ` · ${esc(cur.sub)}` : ''} (${esc(timeOf(cur.start))}–${esc(timeOf(cur.stop))})` : 'Nothing is listed on the guide right now.'}</div>
+    <video id="pv" controls autoplay muted playsinline></video><div id="perr"></div>`;
+  p.hidden = false;
+  p.querySelector('.x').addEventListener('click', stopPlayer);
+  const video = $('pv');
+  const fail = (what) => { const e = $('perr'); if (e && $('pv') === video) e.innerHTML = `<div class="error err">Cannot play ${esc(url)}\n${esc(what)}</div>`; };
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.addEventListener('error', () => fail(`The browser's player reported an error${video.error && video.error.message ? `: ${video.error.message}` : ''} (the manifest may be missing or unreachable).`));
+    video.src = url;
+    return;
+  }
+  let Hls;
+  try { Hls = await loadHls(); } catch (e) { fail(String(e.message || e)); return; }
+  if ($('pv') !== video) return;   // another channel was picked meanwhile
+  if (!Hls.isSupported()) { fail('This browser cannot play HLS.'); return; }
+  const hls = new Hls();
+  hlsPlayer = hls;
+  hls.on(Hls.Events.ERROR, (_, d) => {
+    if (!d.fatal) return;
+    const status = d.response && d.response.code ? `HTTP ${d.response.code} for ${d.url || url}` : (d.details || d.type);
+    fail(`${d.type === Hls.ErrorTypes.NETWORK_ERROR ? 'Network error' : 'Playback error'}: ${status}`);
+    hls.destroy();
+    if (hlsPlayer === hls) hlsPlayer = null;
+  });
+  hls.loadSource(url);
+  hls.attachMedia(video);
+}
+document.addEventListener('click', (e) => { const r = e.target.closest('.tg-ch.watch'); if (r) watchChannel(r); });
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.tg-ch.watch')) { e.preventDefault(); watchChannel(e.target.closest('.tg-ch.watch')); }
+});
 
 function drawGuide(data, base) {
   const now = Math.floor(Date.now() / 1000);
@@ -797,7 +873,8 @@ function drawGuide(data, base) {
         data-title="${esc(p.title)}" data-sub="${esc(p.sub)}" data-channel="${esc(c.name)}" data-tip="${esc(label)}" aria-label="${esc(label)}"
         style="left:${left}px;width:${w}px">${esc(p.title)}</div>`;
     }).join('');
-    return `<div class="tg-row"><div class="tg-ch" title="${esc(c.name)}"><span class="n">${esc(Number.isFinite(number) ? number : '—')}</span>${esc(c.name)}</div>
+    const watch = Number.isFinite(number) ? ` watch" tabindex="0" role="button" data-number="${number}" data-name="${esc(c.name)}" data-id="${esc(c.id)}` : '';
+    return `<div class="tg-row"><div class="tg-ch${watch}" title="${Number.isFinite(number) ? 'Watch ' : ''}${esc(c.name)}"><span class="n">${esc(Number.isFinite(number) ? number : '—')}</span>${esc(c.name)}</div>
       <div class="tg-track" style="width:${width}px">${blocks}</div></div>`;
   }).join('');
   const nowX = GUIDE_CH_PX + ((now - wstart) / 60) * GUIDE_PPM;
@@ -806,8 +883,8 @@ function drawGuide(data, base) {
     <div class="layout"><div class="gwrap" id="gg" style="--chw:${GUIDE_CH_PX}px;--gppm:${GUIDE_PPM}px">
       <div class="tg"><div class="tg-head"><div class="tg-corner"></div><div class="tg-times" style="width:${width}px">${ticks.join('')}</div></div>
         ${rows}<div class="tg-now" style="left:${nowX}px"></div></div></div>
-      <aside class="rail"><section class="insp" id="insp" hidden></section>
-        <p class="muted gnote">Click a programme to see why it is on: the stored selection trail of that airing.</p></aside></div>`;
+      <aside class="rail"><section class="player" id="player" hidden></section><section class="insp" id="insp" hidden></section>
+        <p class="muted gnote">Click a channel to watch it. Click a programme to see why it is on: the stored selection trail of that airing.</p></aside></div>`;
   $('guideReload').addEventListener('click', loadGuide);
   const g = $('gg');
   g.scrollLeft = Math.max(0, ((now - wstart) / 60) * GUIDE_PPM - 120);
