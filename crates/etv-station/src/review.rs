@@ -250,7 +250,7 @@ pub fn grade_principles(g: &GradeInputs) -> Vec<PrincipleGrade> {
         episode_order(g),
         not_scored(
             "Movie slot length",
-            "the station cannot pad a film to a clock-aligned slot yet (etv-station-85)",
+            "the station cannot pad a film to a clock-aligned slot yet",
         ),
         not_scored(
             "Themed and seasonal periods",
@@ -397,7 +397,11 @@ fn block_programming(g: &GradeInputs) -> PrincipleGrade {
         NAME,
         grade,
         mean,
-        format!("{mean:.2} episodes per visit over {} visits", runs.len()),
+        format!(
+            "{mean:.2} episodes per visit over {} {}",
+            runs.len(),
+            if runs.len() == 1 { "visit" } else { "visits" },
+        ),
     )
 }
 
@@ -791,6 +795,26 @@ mod tests {
         assert_eq!(b.value, Some(2.0));
         assert_eq!(b.grade, Some(3));
         assert_eq!(grade_of(&g, "Marathons").value, Some(3.0));
+    }
+
+    #[test]
+    fn principle_text_says_one_visit_and_names_no_tracker_id() {
+        let s = vec![ep("b1", "b", "series", 1, 1, 0)];
+        let g = grade_principles(&inputs(&s, &HashSet::new(), &HashMap::new(), 1));
+        assert_eq!(
+            grade_of(&g, "Block programming").measure,
+            "1.00 episodes per visit over 1 visit"
+        );
+        for p in &g {
+            assert!(
+                !p.measure.contains("etv-station-"),
+                "{}: {}",
+                p.name,
+                p.measure
+            );
+            let reason = p.not_scored.as_deref().unwrap_or_default();
+            assert!(!reason.contains("etv-station-"), "{}: {reason}", p.name);
+        }
     }
 
     #[test]

@@ -299,8 +299,8 @@ run_logged ersatztv "$ETV_NEXT_DIR/lineup.json"
 etv_pid=$!
 log "serving on ${ETV_BIND_ADDRESS:-0.0.0.0}:${ETV_PORT:-8409}"
 
-# 4b. The station's web dashboard (`etv-station --serve-ui`): its one page and the Tune
-# page, on its own port. Same non-fatal shape as the diagnostics: its loop's
+# 4b. The station's web dashboard (`etv-station --serve-ui`): its one page,
+# on its own port. Same non-fatal shape as the diagnostics: its loop's
 # pid goes in diag_pids so shutdown() reaps it, and it is never in the
 # `wait -n` recognized set, so a crashed UI is restarted here and never takes
 # the stream down. It starts after ETV-next so a schedule replay never competes

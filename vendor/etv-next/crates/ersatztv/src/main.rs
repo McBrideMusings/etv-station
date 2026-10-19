@@ -761,7 +761,15 @@ pub(crate) fn get_scheme_host(headers: &HeaderMap) -> String {
         .or_else(|| get_first_header_value(headers, axum::http::header::HOST.as_str()))
         .unwrap_or("localhost");
 
-    format!("{scheme}://{host}")
+    // a reverse proxy that strips a path prefix before forwarding (Caddy
+    // `handle_path /iptv/*`) reports it here; without it every absolute URL
+    // handed out would point outside the prefix
+    let prefix = get_first_header_value(headers, "x-forwarded-prefix")
+        .filter(|p| p.starts_with('/'))
+        .map(|p| p.trim_end_matches('/'))
+        .unwrap_or("");
+
+    format!("{scheme}://{host}{prefix}")
 }
 
 // headers set by chained proxies may contain multiple comma-separated values;
@@ -1120,5 +1128,75 @@ mod channel_health_report_tests {
         assert_eq!(row["retry_in_secs"], 30);
         assert_eq!(row["last_failure"]["cause"], "no segments");
         assert!(row["last_failure"]["at"].is_string());
+    }
+}
+
+#[cfg(test)]
+mod forwarded_prefix_tests {
+    use ersatztv::config::ChannelConfig;
+
+    use super::*;
+
+    async fn lineup_with_channel(dir: &std::path::Path) -> Arc<LineupState> {
+        std::fs::create_dir(dir.join("playout")).unwrap();
+        let cfg_path = dir.join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: None,
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir, cfg).await.unwrap();
+        Arc::new(LineupState {
+            channels: vec![channel],
+            active: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
+            device_id: String::new(),
+        })
+    }
+
+    async fn channels_m3u(prefix: Option<&str>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let state = lineup_with_channel(dir.path()).await;
+        let mut req = axum::http::Request::builder()
+            .header("host", "internal:8409")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "ersatz.example.com");
+        if let Some(p) = prefix {
+            req = req.header("x-forwarded-prefix", p);
+        }
+        let request = req.body(axum::body::Body::empty()).unwrap();
+        let response = channel_playlist(State(state), request)
+            .await
+            .unwrap()
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn prefix_header_lands_in_stream_and_guide_urls() {
+        let m3u = channels_m3u(Some("/iptv/")).await;
+        assert!(m3u.contains("url-tvg=\"https://ersatz.example.com/iptv/xmltv.xml\""));
+        assert!(m3u.contains("\nhttps://ersatz.example.com/iptv/channel/1.m3u8\n"));
+    }
+
+    #[tokio::test]
+    async fn without_the_header_urls_are_unchanged() {
+        let m3u = channels_m3u(None).await;
+        assert!(m3u.contains("url-tvg=\"https://ersatz.example.com/xmltv.xml\""));
+        assert!(m3u.contains("\nhttps://ersatz.example.com/channel/1.m3u8\n"));
+    }
+
+    #[tokio::test]
+    async fn a_prefix_not_starting_with_slash_is_ignored() {
+        let m3u = channels_m3u(Some("iptv")).await;
+        assert!(m3u.contains("\nhttps://ersatz.example.com/channel/1.m3u8\n"));
     }
 }

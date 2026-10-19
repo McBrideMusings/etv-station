@@ -216,8 +216,7 @@ mod tests {
 
         let state = AppState {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
-            cache: ScoreCache::default(),
-            session: None,
+            pools: PoolState::default(),
             review: ReviewState::new(
                 station_path.clone(),
                 PathBuf::from("/nonexistent/catalog.db"),
@@ -228,6 +227,7 @@ mod tests {
                 plugins_dir: None,
                 bind: IpAddr::from([127, 0, 0, 1]),
                 port: 0,
+                health: HealthSources::default(),
             },
         };
         (state, lc.config.number)

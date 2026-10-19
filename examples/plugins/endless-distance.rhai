@@ -66,7 +66,7 @@ fn drift(ctx) { tunable(ctx, "drift", 0.02) }
 // How many of a step's runners-up get named in that step's pick's audit
 // trail as near misses (#393). Bounded by the script, not the station —
 // overridable per pool via `config:` like every other tunable here. A full
-// candidate dump stays taste-debug's job.
+// candidate dump is Channels > Pools in the web dashboard.
 fn near_miss_limit(ctx) { tunable(ctx, "near_miss_limit", 3).to_int() }
 
 // Which datastore grant this script reaches for — see

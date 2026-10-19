@@ -79,7 +79,7 @@ argv_log="$DIAG/ffmpeg-argv-ch${channel}.log"
 # block so the file always starts at a `=== ` header.
 #
 # A concurrent spawn appending between the tail and the mv loses its record.
-# That is acceptable here and nowhere else: every consumer (verify-accel.sh,
+# That is acceptable here and nowhere else: every consumer (the Health tab,
 # stall-bisect.sh, readrate-sweep.sh) reads only the NEWEST block, and the
 # rename itself is atomic, so the file is never seen half-written. Trimming only
 # above the threshold keeps the window rare.

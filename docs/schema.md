@@ -1760,8 +1760,8 @@ Two pools naming one script share resolved sets only when they narrow them the
 same way. Each resolved exclusion logs `profile exclusion resolved` and each
 requirement `profile requirement resolved` (pool, reference, origin, `matched`)
 at info, and each set they narrow logs `profile narrowing removed candidates`
-(`candidates`, `removed`, `remaining`) at debug; `taste-debug` prints each
-exclusion and its match count under the profile.
+(`candidates`, `removed`, `remaining`) at debug; Channels > Pools in the web dashboard
+lists each exclusion under the profile.
 
 **`profile_files`** are YAML lists of entries, relative to the channel file.
 Their entries arrive first, in list order, then the inline `profile`. A file
@@ -2122,7 +2122,7 @@ flip"; `endless-distance.rhai`: "inside the band but lost the seeded
 tie-break" or "outside this step's distance band") — the station neither
 supplies nor validates them, the same opaque treatment as the rest of
 `detail`. Naming every rejected candidate remains out of scope; a full
-candidate dump stays `taste-debug`'s job.
+candidate dump is Channels > Pools in the web dashboard.
 
 #### `hooks()` — what a script says it can do
 

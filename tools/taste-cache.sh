@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Keeps the local copies tools/taste-debug.sh and tools/station-ui.sh read under
-# tmp/claude/scratchpad/taste-debug/ in step with the Unraid host's
+# Keeps the local copies tools/station-ui.sh reads under
+# tmp/claude/scratchpad/station-cache/ in step with the Unraid host's
 # /mnt/user/appdata/etv-station/data/.
 #
 #   tools/taste-cache.sh catalog.db plexdb.snapshot.db
@@ -29,7 +29,7 @@ if [ -f .env ]; then
   set +a
 fi
 
-CACHE_DIR="tmp/claude/scratchpad/taste-debug"
+CACHE_DIR="tmp/claude/scratchpad/station-cache"
 REMOTE_DIR="/mnt/user/appdata/etv-station/data"
 
 if [ "$#" -eq 0 ]; then

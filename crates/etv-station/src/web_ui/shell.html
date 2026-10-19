@@ -11,6 +11,7 @@
     --accent: #3d4fd1; --bar: #3d4fd1; --bar-open: #9aa3b1; --track: #e9ebef;
     --warn-bg: #fff6d8; --warn-fg: #6b4e00; --err-bg: #fde8e8; --err-fg: #8a1414;
     --ink-bg: #16181d; --ink-fg: #ffffff;
+    --up: #1a7f37; --down: #b42318;
     --ppm: 1.15px;   /* guide height per minute of airtime */
     --col: 138px;    /* guide width per day */
   }
@@ -21,6 +22,7 @@
       --accent: #8e9cff; --bar: #8e9cff; --bar-open: #5c6370; --track: #262a32;
       --warn-bg: #3a3014; --warn-fg: #f2d98a; --err-bg: #3d1c1c; --err-fg: #ffb4b4;
       --ink-bg: #e6e8ec; --ink-fg: #121418;
+      --up: #5fd07a; --down: #ff8f85;
     }
   }
   * { box-sizing: border-box; }
@@ -106,6 +108,11 @@
   /* Projected, not scheduled: a dashed edge and a crosshatch no repeat marker uses. */
   .blk.proj { border: 1px dashed var(--fg); opacity: .8;
     background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.5) 0 3px, transparent 3px 7px), repeating-linear-gradient(135deg, rgba(255,255,255,.5) 0 3px, transparent 3px 7px); }
+  /* Changed by the draft: a thick solid frame with an inset gap, which no repeat or projected marker uses and which does not rely on colour. */
+  .blk.chg { border: 3px solid var(--fg); box-shadow: inset 0 0 0 2px var(--bg); }
+  .swatch.chg { width: 14px; height: 10px; background-color: var(--track); border: 3px solid var(--fg); box-sizing: border-box; }
+  .dir { font-weight: 700; white-space: nowrap; }
+  .arrow { color: var(--muted); }
   .swatch.proj { width: 14px; height: 10px; background-color: var(--track); border: 1px dashed var(--fg); }
   .frontier { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--err-fg); z-index: 1; pointer-events: none; }
   .frontier span { position: absolute; right: 2px; top: 1px; font-size: 9.5px; font-weight: 700; color: var(--err-fg); background: var(--bg); padding: 0 3px; border-radius: 2px; }
@@ -190,6 +197,8 @@
   .overlap-row summary { cursor: pointer; }
   .overlap-row .titles { margin: 4px 0 2px 16px; font-size: 12px; color: var(--muted); }
   .old { color: var(--muted); }
+  td.v-fail { background: var(--err-bg); color: var(--err-fg); }
+  td.v-stale { background: var(--warn-bg); color: var(--warn-fg); }
   .changed .new { font-weight: 650; }
 
   @media (max-width: 900px) {
@@ -206,6 +215,35 @@
     .gwrap { height: 70vh; }
     .rail { overflow: visible; }
   }
+  /* Pools: one section per pool; the draft bar sits above them. */
+  .draftbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 10px; margin-bottom: 8px;
+    background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 3px; position: sticky; top: 0; z-index: 5; }
+  .draftbar.idle { border-left-color: var(--line); }
+  .draftbar .spacer { flex: 1; }
+  select, input[type=text] { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 2px 6px; }
+  .poolsec { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 10px; }
+  .poolsec > summary { cursor: pointer; padding: 6px 10px; background: var(--panel); display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+  .poolsec .chip { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 2px; }
+  .pgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 20px; padding: 8px 10px 10px; }
+  .pfield { min-width: 0; }
+  .pfield.wide { grid-column: 1 / -1; }
+  .pfield h4 { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 4px; }
+  .pfield h4 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  dl.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1px 10px; margin: 0; font-size: 12px; }
+  dl.kv dt { color: var(--muted); }
+  dl.kv dd { margin: 0; font-family: ui-monospace, monospace; font-size: 11.5px; overflow-wrap: anywhere; }
+  table.ptable input.w { width: 70px; }
+  .addrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+  .addrow input.aw { width: 60px; }
+  .searchbox { position: relative; }
+  .sugg { position: absolute; z-index: 6; left: 0; top: 100%; min-width: 220px; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--line); }
+  .sugg div { padding: 3px 8px; cursor: pointer; }
+  .sugg div:hover { background: var(--panel); }
+  .rank-scroll { max-height: 360px; overflow: auto; border: 1px solid var(--line); }
+  .rank-scroll thead th { position: sticky; top: 0; background: var(--bg); }
+  .mv { font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; }
+  .mv.up { color: var(--up); } .mv.down { color: var(--down); } .mv.new, .mv.same { color: var(--muted); }
+  #yamlOut pre { margin: 4px 0 8px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; overflow: auto; font-size: 12px; }
 
   /* Guide: a row per channel, time running across, programme width = running time. */
   .gsrc { color: var(--muted); font-size: 12px; margin-left: auto; }
@@ -253,8 +291,6 @@
   <a id="tabChannels" href="#/channels">Channels</a>
   <a id="tabGuide" href="#/guide">Guide</a>
   <a id="tabHealth" href="#/health">Health</a>
-  <span class="spacer" style="flex:1"></span>
-  <a href="/tune">Tune</a>
 </nav>
 <div class="app" id="app">
   <nav class="lineup" id="lineup" aria-label="Channels"><div class="lstate muted">Loading the lineup…</div></nav>
@@ -265,18 +301,21 @@
         <a id="subSchedule" href="#">Schedule</a>
         <a id="subPattern" href="#">Pattern</a>
         <a id="subGraphics" href="#">Graphics</a>
+        <a id="subPools" href="#">Pools</a>
       </nav>
       <span id="position" class="muted"></span>
       <span class="spacer"></span>
-      <span id="projState" class="muted" aria-live="polite"></span>
-      <span class="muted" id="projLabel">Project ahead</span>
-      <span class="seg" role="group" aria-labelledby="projLabel" id="projBtns">
-        <button type="button" data-project="1d" aria-pressed="false">+1d</button>
-        <button type="button" data-project="3d" aria-pressed="false">+3d</button>
-        <button type="button" data-project="7d" aria-pressed="false">+7d</button>
-        <button type="button" data-project="14d" aria-pressed="false">+14d</button>
+      <span id="projCtl" class="toolbar" style="margin:0">
+        <span id="projState" class="muted" aria-live="polite"></span>
+        <span class="muted" id="projLabel">Project ahead</span>
+        <span class="seg" role="group" aria-labelledby="projLabel" id="projBtns">
+          <button type="button" data-project="1d" aria-pressed="false">+1d</button>
+          <button type="button" data-project="3d" aria-pressed="false">+3d</button>
+          <button type="button" data-project="7d" aria-pressed="false">+7d</button>
+          <button type="button" data-project="14d" aria-pressed="false">+14d</button>
+        </span>
+        <button id="projClear" type="button">Real only</button>
       </span>
-      <button id="projClear" type="button">Real only</button>
     </div>
     <div id="state" class="muted"></div>
     <div id="report"></div>
@@ -300,7 +339,7 @@ let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
 // The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern|graphics}?project=Nd`,
-// `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
+// `#/channels/{key}/pools?draft=ID`, `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
 function parseRoute() {
   const [path, qs] = location.hash.replace(/^#/, '').split('?');
   const parts = path.split('/').filter(Boolean);
@@ -309,12 +348,21 @@ function parseRoute() {
   return {
     tab,
     channel: tab === 'channels' && parts[1] ? decodeURIComponent(parts[1]) : null,
-    view: ['pattern', 'graphics'].includes(parts[2]) ? parts[2] : 'schedule',
+    view: ['pattern', 'pools', 'graphics'].includes(parts[2]) ? parts[2] : 'schedule',
     project: ['1d', '3d', '7d', '14d'].includes(q.get('project')) ? q.get('project') : null,
+    draft: q.get('draft'),
   };
 }
-function channelHash(channel, view, project) {
-  return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${project ? `?project=${project}` : ''}`;
+// With a draft open the Schedule projects 3 days unless the address names a length: a draft re-simulation is slow.
+function routeWithDraftWindow(r) {
+  if (r.draft && r.view === 'schedule' && !r.project) r.project = '3d';
+  return r;
+}
+function channelHash(channel, view, project, draft) {
+  const q = [];
+  if (project && view !== 'pools') q.push(`project=${project}`);
+  if (draft && view !== 'pattern') q.push(`draft=${encodeURIComponent(draft)}`);
+  return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${q.length ? `?${q.join('&')}` : ''}`;
 }
 
 function fmt(ts, tz, opts) {
@@ -375,6 +423,66 @@ async function load(channel, project, view) {
   show(data, view);
 }
 
+// The Schedule with a draft open: the server re-simulates the channel with the draft's pools swapped in and answers
+// {deployed, draft, diff}, or 202 while either simulation runs. The deployed review is drawn meanwhile; the page asks
+// again every DRAFT_POLL_MS beside a counter, then draws the draft's review with the diff against the deployed one.
+const DRAFT_POLL_MS = 15000;
+async function loadDraft(channel, project, draft, view) {
+  const began = Date.now();
+  $('state').textContent = '';
+  if (!current || current.channel !== channel) { current = null; $('report').innerHTML = ''; }
+  $('report').classList.add('loading');
+  setControls(project, true);
+  const seq = ++loadSeq;
+  const simulating = () => {
+    const which = [];
+    if (pendingNow.deployed) which.push('deployed');
+    if (pendingNow.draft) which.push('draft');
+    $('projState').innerHTML = `<span class="spinner"></span>Simulating ${esc(which.join(' and ') || 'draft')}… (asked again every ${DRAFT_POLL_MS / 1000}s) ${Math.round((Date.now() - began) / 1000)}s`;
+  };
+  const pendingNow = { deployed: true, draft: true };
+  const ticker = setInterval(simulating, 1000);
+  const q = new URLSearchParams({ draft });
+  if (project) q.set('project', project);
+  let data;
+  let drewReal = false;
+  try {
+    simulating();
+    for (;;) {
+      const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/review?${q}`);
+      data = await res.json();
+      if (seq !== loadSeq) return;
+      if (!res.ok && res.status !== 202) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
+      if (!data.pending) break;
+      pendingNow.deployed = !!data.deployed_pending;
+      pendingNow.draft = !!data.draft_pending;
+      if (!drewReal && data.deployed && !data.deployed.error) { $('report').classList.remove('loading'); show(data.deployed, view); drewReal = true; }
+      simulating();
+      await new Promise((r) => setTimeout(r, DRAFT_POLL_MS));
+      if (seq !== loadSeq) return;
+    }
+  } catch (e) {
+    data = { error: String(e) };
+  } finally {
+    clearInterval(ticker);
+  }
+  if (seq !== loadSeq) return;
+  $('report').classList.remove('loading');
+  $('projState').textContent = '';
+  setControls(project, false);
+  if (data.error) {
+    current = null;
+    $('report').innerHTML = `<header class="mast"><h1>${esc(channel)}</h1></header>
+      <h2>The draft review could not be built</h2><div class="error">${esc(data.error)}</div>
+      <p><a href="${channelHash(channel, 'schedule', project)}">Show the deployed schedule</a></p>`;
+    return;
+  }
+  if (data.deployed && data.deployed.load_error) { show(data.deployed, view); return; }
+  data.draft.diff = data.diff;
+  data.draft.draftId = draft;
+  show(data.draft, view);
+}
+
 // Draws one review payload, or the load-error page for a channel whose config fails to load.
 function show(data, view) {
   if (data.load_error) {
@@ -432,6 +540,7 @@ async function loadLineup() {
 
 // Marks where the page is: the tab, the channel in the lineup, the sub-tab, and the links that keep the days.
 function markRoute(r) {
+  routeWithDraftWindow(r);
   for (const [id, tab] of [['tabChannels', 'channels'], ['tabGuide', 'guide'], ['tabHealth', 'health']]) {
     if (r.tab === tab) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
@@ -445,13 +554,14 @@ function markRoute(r) {
   for (const id of ['projState', 'projLabel', 'projBtns', 'projClear']) $(id).hidden = !projecting;
   if (r.tab !== 'channels' || !lineup) return;
   const project = r.project;
+  $('projCtl').hidden = r.view === 'pools';
   for (const a of $('lineup').querySelectorAll('a')) {
-    a.href = channelHash(a.dataset.key, r.view, project);
+    a.href = channelHash(a.dataset.key, r.view, project);   // a draft belongs to one channel, so the rail drops it
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
-  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern'], ['subGraphics', 'graphics']]) {
-    $(id).href = channelHash(r.channel, view, project);
+  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern'], ['subPools', 'pools'], ['subGraphics', 'graphics']]) {
+    $(id).href = channelHash(r.channel, view, project, r.draft);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
   const i = lineup.findIndex((c) => c.channel === r.channel);
@@ -460,19 +570,79 @@ function markRoute(r) {
   if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
 
-// Health has no content yet: say so rather than show an empty frame.
-function renderEmpty(tab) {
-  current = null;
+// ---- Health: each channel's encoder verdict, ETV-next's failure state and its last stall. Read-only.
+let healthSeq = 0;
+const VERDICT_WORDS = { PASS: 'Passing', FAIL: 'Failing', STALE: 'Stale', NONE: 'No transcode recorded' };
+const utcOf = (iso) => (iso || '').replace('T', ' ').replace(/(\.\d+)?Z$/, '') + ' UTC';
+const ageOf = (secs) => secs == null ? '—' : secs < 3600 ? `${Math.round(secs / 60)}m` : secs < 172800 ? `${Math.round(secs / 3600)}h` : `${Math.round(secs / 86400)}d`;
+// A time as UTC and station-local, e.g. "2026-10-19 19:18 UTC (3:18pm EDT)".
+function bothClocks(iso, tz) {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return esc(iso || '—');
+  if (!tz) return esc(utcOf(new Date(ms).toISOString().slice(0, 16) + 'Z'));
+  const local = new Date(ms).toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', timeZoneName: 'short', month: 'short', day: 'numeric' });
+  return `${esc(utcOf(new Date(ms).toISOString().slice(0, 16) + 'Z'))} <span class="muted">(${esc(local)})</span>`;
+}
+
+async function loadHealth() {
+  const seq = ++healthSeq;
+  const began = Date.now();
   document.title = 'etv-station · Health';
   $('state').textContent = '';
   $('report').classList.remove('loading');
-  $('report').innerHTML = `<div class="empty"><h1>Health</h1>
-    <p class="muted">Not built yet. It will show each channel's encoder, failures and last stall.</p></div>`;
+  $('report').innerHTML = `<div class="gtool"><strong>Health</strong></div><div id="hstate"></div>`;
+  const tick = () => { if ($('hstate')) $('hstate').innerHTML = `<span class="spinner"></span>Reading channel health… (${Math.round((Date.now() - began) / 1000)}s)`; };
+  tick();
+  const timer = setInterval(tick, 1000);
+  let build = {}, data;
+  try {
+    const [h, c] = await Promise.all([fetch('/api/health'), fetch('/api/health/channels')]);
+    build = await h.json().catch(() => ({}));
+    data = await c.json().catch(() => ({}));
+    if (!c.ok) data = { error: `HTTP ${c.status}: ${data.error || 'no error message'}` };
+  } catch (e) {
+    data = { error: String(e.message || e) };
+  } finally {
+    clearInterval(timer);
+  }
+  if (seq !== healthSeq) return;
+  const head = `<div class="gtool"><strong>Health</strong><span class="muted">revision ${esc(build.revision || 'unknown')} · built ${build.build_time && build.build_time !== 'unknown' ? bothClocks(build.build_time, data.tz) : 'unknown'}</span>
+    <button type="button" id="healthReload">Reload</button></div>`;
+  if (data.error) {
+    $('report').innerHTML = head + `<div class="error">${esc(data.error)}</div>`;
+  } else {
+    $('report').innerHTML = head + drawHealth(data);
+  }
+  $('healthReload').addEventListener('click', loadHealth);
+}
+
+function drawHealth(d) {
+  const upstream = d.upstream
+    ? `<div class="error">ETV-next is unreachable or answered badly, so failure state is missing below.\nTried ${esc(d.upstream.url)}\n${esc(d.upstream.error)}</div>` : '';
+  const expected = d.expected && d.expected.encoder
+    ? `<p class="muted">Expected encoder: ${esc(d.expected.encoder)}${d.expected.vaapi_device ? ` on ${esc(d.expected.vaapi_device)}` : ''}.</p>`
+    : `<p class="muted">No hardware encoder is configured (ETV_ACCEL), so every transcode counts as software.</p>`;
+  const rows = d.channels.map((c) => {
+    const e = c.encoder;
+    const cls = e.verdict === 'FAIL' ? 'v-fail' : e.verdict === 'STALE' ? 'v-stale' : '';
+    const fail = c.failures == null ? '—'
+      : c.failed ? `failed, ${c.retry_in_secs > 0 ? `503 for ${c.retry_in_secs}s more` : 'retry open'}${c.last_failure ? ` — ${esc(c.last_failure.cause)}` : ''}`
+      : c.failures > 0 ? `${c.failures} consecutive` : 'none';
+    const stall = c.last_stall
+      ? `${bothClocks(c.last_stall.at, d.tz)}${c.last_stall.recovered ? ' <span class="muted">(recovered)</span>' : ' <span class="muted">(not recovered)</span>'}`
+      : '<span class="muted">none logged</span>';
+    return `<tr><td class="num">${esc(c.channel)}</td><td>${esc(c.name || c.key)}</td>
+      <td class="${cls}" title="${esc(e.reason)}">${esc(VERDICT_WORDS[e.verdict] || e.verdict)}${e.verdict === 'PASS' || e.verdict === 'NONE' ? '' : ` — ${esc(e.reason)}`}</td>
+      <td>${fail}</td><td>${stall}</td><td class="num">${esc(ageOf(c.argv_log_age_secs))}</td></tr>`;
+  }).join('');
+  const diag = d.diag && !d.diag.readable
+    ? `<div class="notice">The diag folder ${esc(d.diag.dir || '(unset)')} cannot be read, so no channel has an argv log or stall history here (ETV_DIAG_DIR).</div>` : '';
+  return `${upstream}${diag}${expected}<table class="health"><thead><tr><th class="num">Channel</th><th>Name</th><th>Encoder</th><th>Failures</th><th>Last stall</th><th class="num">Argv log age</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 let shown = null;   // the channel and projection the report holds, so a sub-tab switch redraws without refetching
 async function route() {
-  const r = parseRoute();
+  const r = routeWithDraftWindow(parseRoute());
   if (!lineup) await loadLineup();
   if (r.tab === 'channels' && !r.channel) {
     // A bare `#/channels` (or no hash) opens the first channel in the lineup.
@@ -481,15 +651,17 @@ async function route() {
   markRoute(r);
   stopPlayer();
   if (r.tab !== 'channels' || r.view !== 'graphics') { gSeq++; renderSeq++; }
-  if (r.tab === 'guide') { loadSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
-  if (r.tab !== 'channels') { loadSeq++; guideSeq++; shown = null; renderEmpty(r.tab); return; }
+  if (r.tab === 'guide') { loadSeq++; poolsSeq++; healthSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
+  if (r.tab === 'health') { loadSeq++; guideSeq++; poolsSeq++; shown = null; current = null; loadHealth(); return; }
   if (!r.channel) return;
-  guideSeq++;
-  if (r.view === 'graphics') { loadSeq++; shown = null; current = null; loadGraphics(r.channel); return; }
-  const key = `${r.channel}|${r.project}`;
+  if (r.view === 'pools') { guideSeq++; healthSeq++; shown = null; await loadPools(r.channel, r.draft); return; }
+  if (r.view === 'graphics') { loadSeq++; guideSeq++; poolsSeq++; healthSeq++; shown = null; current = null; loadGraphics(r.channel); return; }
+  guideSeq++; poolsSeq++; healthSeq++;
+  const key = `${r.channel}|${r.project}|${r.view === 'schedule' ? r.draft || '' : ''}`;
   if (shown === key && current) { draw(r.view); return; }
   shown = key;
-  await load(r.channel, r.project, r.view);
+  if (r.draft && r.view === 'schedule') await loadDraft(r.channel, r.project, r.draft, r.view);
+  else await load(r.channel, r.project, r.view);
 }
 
 // Channels › Graphics: the overlay and bumper scripts the channel names, each rendered on request.
@@ -658,6 +830,10 @@ function render(d) {
   const tz = d.tz;
   const span = d.days;
   const covers = d.span.label;   // "real only" or "real + N days projected"; every number below is over it
+  const diff = d.diff || null;   // set when a draft is open: what moved against the deployed schedule
+  const gradeOf = (name) => (diff ? diff.grades.find((g) => g.name === name) : null);
+  const dots = (g) => (g == null ? '—' : '●'.repeat(g) + '○'.repeat(3 - g));
+  const WORDS = { up: '▲ up', down: '▼ down', same: '= same' };
   const html = [];
 
   // 1. Masthead
@@ -673,7 +849,7 @@ function render(d) {
     </div>
     <dl class="facts">
       <div><dt>First repeat</dt><dd>${fr ? days1(fr.days) + ' d' : '&gt;' + span + ' d'}</dd>
-        <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : `Nothing repeated in ${esc(covers)}`}</dd></div>
+        <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : `Nothing repeated in ${esc(covers)}`}${diff ? `<br>deployed: ${diff.first_repeat.deployed ? days1(diff.first_repeat.deployed.days) + ' d' : '&gt;' + span + ' d'}` : ''}</dd></div>
       <div><dt>Film / series airtime</dt><dd>${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</dd>
         <dd class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</dd></div>
       <div><dt>Channels sharing content</dt><dd>${d.overlap.this_channel_whole_library ? '—' : ov.length}</dd>
@@ -682,11 +858,13 @@ function render(d) {
       <div><dt>Items aired</dt><dd>${d.items_aired}</dd><dd class="d">${d.distinct_items} distinct · ${esc(covers)}</dd></div>
     </dl>
     ${notesHTML(d)}
+    ${diff ? `<div class="notes"><div class="notice" id="draftNote"><b>Draft ${esc(d.draftId)}</b> — ${diff.changed_airings.length} of ${d.airings.filter((a) => a.projected).length} projected airings differ from the deployed schedule over ${esc(covers)}. Grades read deployed → draft.</div></div>` : ''}
   </header>`);
 
   html.push(`<div class="legend">${Object.entries(colors).map(([p, c]) => `<span><span class="swatch" style="background:${c}"></span>${esc(p)}</span>`).join('')}
     <span><span class="rbadge">R</span>already aired earlier in the span</span>
     <span><span class="swatch proj"></span>Projected — not scheduled</span>
+    ${d.diff ? '<span><span class="swatch chg"></span>Changed by the draft</span>' : ''}
     <span><span class="swatch fl"></span>Frontier: where the published playout ends</span>
     <span><span class="pin">1</span>tune-in sample</span></div>`);
 
@@ -716,17 +894,23 @@ function render(d) {
   const scored = d.principles.filter((p) => p.grade != null);
   const points = scored.reduce((t, p) => t + p.grade, 0);
   const principleRows = d.principles.map((p) => p.grade != null
-    ? `<tr><td class="pname">${esc(p.name)}</td><td class="dots" aria-label="${p.grade} of 3">${'●'.repeat(p.grade)}${'○'.repeat(3 - p.grade)}</td>
-        <td class="pmeasure">${esc(p.measure)}</td></tr>`
+    ? (() => {
+      const g = gradeOf(p.name);
+      const cell = g
+        ? `<td class="dots" aria-label="${g.deployed ?? 'not scored'} of 3 deployed, ${p.grade} of 3 in the draft, ${g.direction}">${dots(g.deployed)} <span class="arrow">→</span> ${dots(p.grade)} <span class="dir">${WORDS[g.direction]}</span></td>`
+        : `<td class="dots" aria-label="${p.grade} of 3">${dots(p.grade)}</td>`;
+      const was = g && g.deployed_measure && g.deployed_measure !== p.measure ? `<br><span class="muted">deployed: ${esc(g.deployed_measure)}</span>` : '';
+      return `<tr><td class="pname">${esc(p.name)}</td>${cell}<td class="pmeasure">${esc(p.measure)}${was}</td></tr>`;
+    })()
     : `<tr class="unscored"><td class="pname">${esc(p.name)}</td><td class="dots">—</td>
         <td class="pmeasure">${p.measure ? esc(p.measure) + '<br>' : ''}<span class="muted">Not scored: ${esc(p.not_scored)}</span></td></tr>`).join('');
   html.push(`<section><h2>Programming principles</h2>
-    <div class="ptotal"><span class="big">${points} / ${scored.length * 3}</span>
+    <div class="ptotal"><span class="big">${diff ? `${diff.grades.reduce((t, g) => t + (g.deployed != null && g.draft != null ? g.deployed : 0), 0)} → ` : ''}${points} / ${scored.length * 3}</span>
       <span class="muted">${scored.length} of ${d.principles.length} principles measured over ${esc(covers)}. Thresholds are in docs/programming.md under each principle's Grade.</span></div>
     <table class="principles"><tbody>${principleRows}</tbody></table></section>`);
 
   // 4. Depth
-  const depthRows = d.depth.map((r) => {
+  const depthRows = d.depth.map((r, di) => {
     const days = r.first_repeat_days;
     const pct = days == null ? 100 : Math.min(100, (days / span) * 100);
     const value = days == null ? `&gt;${span} d` : `${days1(days)} d`;
@@ -735,7 +919,7 @@ function render(d) {
     return `<tr class="${r.kind}"${tip}><td class="name">${swatch}${esc(r.name)}</td>
       <td class="num">${r.aired} / ${r.distinct}</td>
       <td style="width:30%"><div class="bar"><span class="${days == null ? 'open' : ''}" style="width:${pct}%"></span></div></td>
-      <td class="num">${value}</td></tr>`;
+      <td class="num">${value}${diff && diff.depth[di] && diff.depth[di].aired.deployed != null ? `<br><span class="muted">deployed: ${diff.depth[di].first_repeat_days.deployed == null ? '&gt;' + span : days1(diff.depth[di].first_repeat_days.deployed)} d</span>` : ''}</td></tr>`;
   }).join('');
   html.push(`<section><h2>Depth</h2>
     <p class="muted">Days from the start of the span until each pool or show first airs something a second time, over ${esc(covers)}. Aired / distinct items.</p>
@@ -782,7 +966,7 @@ function patternWords(blocks) {
     const body = b.sequencer ? `sequencer ${b.sequencer}`
       : b.steps.length ? `${stepsWords(b.steps)}, repeating`
       : b.pools.length ? `pools ${b.pools.join(', ')}`
-      : `${b.entries} fixed entries`;
+      : `${b.entries} fixed ${b.entries === 1 ? 'entry' : 'entries'}`;
     return `${b.name}: ${body}${b.placed.length ? ` — airs ${b.placed.join('; ')}` : ''}`;
   }).join('; ');
 }
@@ -809,7 +993,7 @@ function patternPanel(d, colors) {
     if (b.sequencer) rows = `<p class="muted">Sequencer ${esc(b.sequencer)} over pools ${esc(b.pools.join(', '))}.</p>`;
     else if (b.steps.length) rows = stepsTable(b.steps);
     else if (b.pools.length) rows = `<table class="steps"><tbody>${b.pools.map((p) => `<tr>${poolCells(p)}</tr>`).join('')}</tbody></table>`;
-    else rows = `<p class="muted">${b.entries} fixed entries.</p>`;
+    else rows = `<p class="muted">${b.entries} fixed ${b.entries === 1 ? 'entry' : 'entries'}.</p>`;
     const placed = b.placed.length ? `<p class="muted">Airs ${esc(b.placed.join('; '))}.</p>` : '';
     return `<h4>${esc(b.name)}</h4>${placed}${rows}`;
   }).join('');
@@ -1141,6 +1325,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function renderGuide(d, colors) {
+  const changedAt = new Set(d.diff ? d.diff.changed_airings.map((c) => c.index) : []);
   const tz = d.tz;
   const cells = ['<div class="corner"></div>'];
   for (let i = 0; i + 1 < d.day_starts.length; i++) cells.push(`<div class="colhead">${esc(dayOf(d.day_starts[i], tz))}</div>`);
@@ -1168,6 +1353,7 @@ function renderGuide(d, colors) {
       const sample = d.samples.find((x) => x.index === a.index && x.at >= ds && x.at < de);
       const label = `${timeOf(a.start, tz)}–${timeOf(a.start + a.duration_secs, tz)} · ${a.label} · ${a.pool}`
         + (a.projected ? ' · Projected — not scheduled' : '')
+        + (changedAt.has(a.index) ? ' · changed by the draft' : '')
         + (rep ? ` · repeat, first aired ${dayOf(d.airings[a.repeat_of].start, tz)} ${timeOf(d.airings[a.repeat_of].start, tz)}` : '');
       const px = h * ppm;
       const time = `<span class="tm">${cont ? `cont. from ${esc(timeOf(a.start, tz))}` : esc(timeOf(a.start, tz))}</span> ${sample ? `<span class="pin">${sample.n}</span>` : ''}${rep && !cont ? '<span class="rbadge">R</span>' : ''}`;
@@ -1176,7 +1362,7 @@ function renderGuide(d, colors) {
         : px >= 32 ? `<div>${time}</div><div>${title}</div>`
         : px >= 19 ? `<div>${time} ${title}</div>`
         : '';
-      blocks.push(`<div class="blk${rep ? ' hatch' : ''}${a.projected ? ' proj' : ''}${body ? '' : ' tiny'}" data-index="${a.index}"${cont ? '' : ' tabindex="0"'} data-tip="${esc(label)}" aria-label="${esc(label)}"
+      blocks.push(`<div class="blk${rep ? ' hatch' : ''}${a.projected ? ' proj' : ''}${changedAt.has(a.index) ? ' chg' : ''}${body ? '' : ' tiny'}" data-index="${a.index}"${cont ? '' : ' tabindex="0"'} data-tip="${esc(label)}" aria-label="${esc(label)}"
         style="top:calc(${top} * var(--ppm));height:calc(${h} * var(--ppm));background-color:${colors[a.pool] || '#ccc'}">${body}</div>`);
     }
     // The frontier: where the published playout ends. Past it, blocks are projected.
@@ -1214,12 +1400,279 @@ document.addEventListener('scroll', () => {
   if (focused) showTip(focused); else hideTip();
 }, true);
 
+// ---- Channels › Pools: every pool's sources, config, profile and ranking; profile edits live in a per-tab draft ----
+
+const enc = encodeURIComponent;
+let poolsCtx = null;     // { channel, draft, data } for the Pools page on screen
+let poolsSeq = 0;        // a newer load supersedes an older one still waiting
+let poolsNotice = '';    // one line shown above the pools after a draft expired
+let accountsLoaded = null;  // GET /api/tautulli/users: the list, or null when Tautulli is not configured
+
+// A failed request is { error: 'HTTP <status>: <the server's error>', status }; anything else is the body.
+async function apiJson(method, path, body) {
+  const opts = { method };
+  if (body !== undefined) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+  try {
+    const res = await fetch(path, opts);
+    let data;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok) return { error: `HTTP ${res.status}: ${data.error || 'no error message'}`, status: res.status };
+    return data;
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+const poolTitle = (c) => (c.show ? `${c.show} — ` : '') + c.title + (c.year ? ` (${c.year})` : '');
+
+function setPoolsBusy(on, what) {
+  $('report').classList.toggle('loading', on);
+  if (!on) { $('state').textContent = ''; return; }
+  const began = Date.now();
+  const paint = () => { $('state').innerHTML = `<span class="spinner"></span>${esc(what)}… (${Math.round((Date.now() - began) / 1000)}s)`; };
+  paint();
+  const timer = setInterval(() => { if (!$('report').classList.contains('loading')) clearInterval(timer); else paint(); }, 1000);
+}
+
+async function loadPools(channel, draft) {
+  const seq = ++poolsSeq;
+  loadSeq++;   // a schedule poll still running for the old view stops
+  guideSeq++;
+  current = null;
+  $('report').innerHTML = '';
+  setPoolsBusy(true, `Ranking ${channel}'s pools`);
+  const data = await apiJson('GET', `/api/channels/${enc(channel)}/pools${draft ? `?draft=${enc(draft)}` : ''}`);
+  if (seq !== poolsSeq) return;
+  setPoolsBusy(false);
+  if (data.status === 404 && draft) {
+    // The draft expired or the server restarted: show the deployed pools and say so.
+    poolsNotice = `Draft ${draft} is gone (it expired, was discarded, or the server restarted). Showing the deployed pools.`;
+    location.replace(channelHash(channel, 'pools'));
+    return;
+  }
+  poolsCtx = { channel, draft: draft || null, data };
+  drawPools();
+}
+
+async function loadAccounts() {
+  if (accountsLoaded !== null) return accountsLoaded;
+  const data = await apiJson('GET', '/api/tautulli/users');
+  accountsLoaded = data.error ? [] : data.results;
+  return accountsLoaded;
+}
+
+function kvHtml(v) {
+  if (v === null || v === undefined) return '<span class="muted">—</span>';
+  if (Array.isArray(v)) return v.length ? v.map((x) => `<div>${kvHtml(x)}</div>`).join('') : '<span class="muted">(empty)</span>';
+  if (typeof v === 'object') {
+    const keys = Object.keys(v);
+    if (!keys.length) return '<span class="muted">(empty)</span>';
+    return `<dl class="kv">${keys.map((k) => `<dt>${esc(k)}</dt><dd>${kvHtml(v[k])}</dd>`).join('')}</dl>`;
+  }
+  return esc(typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(3) : v);
+}
+
+const KINDS = ['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'studio', 'content_rating', 'item', 'set'];
+const SEARCHABLE = ['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'item'];
+
+function movementHtml(item) {
+  if (!('movement' in item)) return '';
+  if (item.movement === null) return '<span class="mv new" title="not in the deployed ranking">new</span>';
+  if (item.movement > 0) return `<span class="mv up" title="was #${item.was}">▲ ${item.movement}</span>`;
+  if (item.movement < 0) return `<span class="mv down" title="was #${item.was}">▼ ${-item.movement}</span>`;
+  return '<span class="mv same" title="same place">—</span>';
+}
+
+function poolHtml(name, p, draft, openIt) {
+  const head = `<summary><b>${esc(name)}</b> <span class="chip">${p.scored ? 'scored by plugin' : 'not scored'}</span>
+    ${p.scored ? `<span class="muted">${p.ranking_count} ranked${p.edited ? ' · edited in this draft' : ''}</span>` : ''}</summary>`;
+  const sources = `<div class="pfield"><h4>sources${p.scored && !p.sources_authored ? ' <span class="muted">(the plugin\'s own default)</span>' : ''}</h4>${kvHtml(p.sources)}</div>`;
+  const config = `<div class="pfield"><h4>config${p.config_authored ? '' : ' <span class="muted">(none written)</span>'}</h4>${kvHtml(p.config)}</div>`;
+  if (!p.scored) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}</div></details>`;
+  if (p.error) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}</div>
+    <div class="error">${esc(p.error)}</div></details>`;
+
+  const entries = p.profile.entries.map((e) => `<tr>
+      <td><input type="number" step="0.1" class="w" value="${esc(e.weight)}" data-index="${e.index ?? ''}" ${e.index == null ? 'disabled title="from a profile file"' : ''}></td>
+      <td>${esc(e.kind || '')}</td><td>${esc(e.reference || '')}</td>
+      <td><button type="button" class="rm" data-index="${e.index ?? ''}" ${e.index == null ? 'disabled' : ''}>remove</button></td></tr>`).join('');
+  const excluded = p.profile.exclusions.length
+    ? `<div class="muted">excluded (read-only here): ${p.profile.exclusions.map((x) => esc(x.reference)).join(', ')}</div>` : '';
+  const profile = `<div class="pfield wide"><h4>profile <span class="muted">— weights this pool's score is tilted by</span></h4>
+    <table class="ptable"><thead><tr><th>weight</th><th>kind</th><th>reference</th><th></th></tr></thead>
+      <tbody>${entries || '<tr><td colspan="4" class="muted">(no entries)</td></tr>'}</tbody></table>
+    <div class="addrow"><select class="kind">${KINDS.map((k) => `<option>${k}</option>`).join('')}</select>
+      <span class="searchbox"><input type="text" class="val" placeholder="value (type to search)"><div class="sugg" hidden></div></span>
+      <input type="number" class="aw" value="1" step="0.1" title="weight"><button type="button" class="add">Add</button></div>${excluded}</div>`;
+  const rows = p.ranking.map((c) => `<tr><td class="num">${c.rank}</td><td>${esc(poolTitle(c))}</td>
+      <td>${movementHtml(c)}</td><td class="muted">${esc(c.audit ? c.audit.verdict : '')}</td></tr>`).join('');
+  const ranking = `<div class="pfield wide"><h4>ranking <span class="muted">— from the profile alone: one full pick, no airing history, no exploration${draft && p.edited ? '; movement is against the deployed ranking' : ''}</span></h4>
+    <div class="rank-scroll"><table class="rtable"><thead><tr><th class="num">#</th><th>title</th><th>${draft && p.edited ? 'moved' : ''}</th><th>verdict</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="4" class="muted">(nothing ranked)</td></tr>'}</tbody></table></div>
+    <div class="muted">showing ${p.ranking.length} of ${p.ranking_count}</div></div>`;
+  return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}${profile}${ranking}</div></details>`;
+}
+
+function drawPools() {
+  const { channel, draft, data } = poolsCtx;
+  document.title = `etv-station · ${channel} · Pools`;
+  const head = `<header class="mast"><div><h1>${esc(channel)}</h1><div class="sub">Pools${data.config_path ? ` · ${esc(data.config_path)}` : ''}</div></div></header>`;
+  if (data.error) {
+    $('report').innerHTML = `${head}<h2>The pools could not be built</h2><div class="error">${esc(data.error)}</div>`;
+    return;
+  }
+  if (data.load_error) {
+    $('report').innerHTML = `${head}<h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
+    return;
+  }
+  const anyScored = data.order.some((n) => data.pools[n].scored);
+  const edited = data.order.filter((n) => data.pools[n].edited);
+  let bar = '';
+  if (anyScored) {
+    if (draft) {
+      bar = `<div class="draftbar" id="draftbar"><b>Draft</b> <span id="editCount">${data.draft ? data.draft.edits : 0} edit${data.draft && data.draft.edits === 1 ? '' : 's'}</span>
+        <span class="muted">· account ${data.account_id == null ? 'all users' : esc(data.account_id)}</span><span class="spacer"></span>
+        <select id="copyPool" aria-label="Pool">${data.order.filter((n) => data.pools[n].scored).map((n) => `<option ${edited[0] === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+        <button type="button" id="copyYaml">Copy profile YAML</button><button type="button" id="discard">Discard</button></div>`;
+    } else {
+      bar = `<div class="draftbar idle" id="draftbar"><span class="muted">No draft. Your first profile edit starts one; it lives in this tab's URL and changes nothing on disk.</span>
+        <span class="spacer"></span><label for="acctSel">Account</label><select id="acctSel"><option value="">channel default</option></select></div>`;
+    }
+  }
+  $('report').innerHTML = `${head}${poolsNotice ? `<div class="notice">${esc(poolsNotice)}</div>` : ''}${bar}
+    <div id="editError" class="error" hidden></div><div id="yamlOut" hidden></div>
+    ${data.order.map((n) => poolHtml(n, data.pools[n], draft, !edited.length || data.pools[n].edited)).join('') || '<p class="muted">This channel has no pools.</p>'}`;
+  poolsNotice = '';
+  wirePools();
+  if (anyScored && !draft) populateAccounts();
+}
+
+async function populateAccounts() {
+  const users = await loadAccounts();
+  const sel = $('acctSel');
+  if (!sel) return;
+  for (const u of users) sel.insertAdjacentHTML('beforeend', `<option value="${esc(u.user_id)}">${esc(u.display_name)} (${esc(u.user_id)})</option>`);
+}
+
+function wirePools() {
+  for (const sec of document.querySelectorAll('.poolsec')) {
+    const pool = sec.dataset.pool;
+    for (const w of sec.querySelectorAll('input.w')) {
+      w.addEventListener('change', () => editDraft('update', pool, { index: Number(w.dataset.index), weight: parseFloat(w.value) }));
+    }
+    for (const b of sec.querySelectorAll('button.rm')) b.addEventListener('click', () => editDraft('remove', pool, { index: Number(b.dataset.index) }));
+    const add = sec.querySelector('.addrow');
+    if (!add) continue;
+    const kind = add.querySelector('.kind'), val = add.querySelector('.val'), sugg = add.querySelector('.sugg');
+    add.querySelector('.add').addEventListener('click', () => {
+      const v = val.value.trim();
+      if (!v) return;
+      editDraft('add', pool, { [kind.value]: v, weight: parseFloat(add.querySelector('.aw').value) });
+    });
+    let timer = null;
+    val.addEventListener('input', () => {
+      clearTimeout(timer);
+      const q = val.value.trim();
+      if (q.length < 2 || !SEARCHABLE.includes(kind.value)) { sugg.hidden = true; return; }
+      timer = setTimeout(async () => {
+        const k = kind.value;
+        const url = k === 'keyword' ? `/api/search/keyword?q=${enc(q)}&channel=${enc(poolsCtx.channel)}&pool_name=${enc(pool)}`
+          : k === 'item' ? `/api/search/item?q=${enc(q)}` : `/api/search/tag?namespace=${enc(k)}&q=${enc(q)}`;
+        const data = await apiJson('GET', url);
+        sugg.innerHTML = '';
+        for (const r of data.results || []) {
+          const div = document.createElement('div');
+          div.textContent = k === 'keyword' ? `${r.surface} → ${r.keyword}` : k === 'item' ? poolTitle(r) : r;
+          div.addEventListener('click', () => { val.value = k === 'keyword' ? r.surface : k === 'item' ? poolTitle(r) : r; sugg.hidden = true; });
+          sugg.appendChild(div);
+        }
+        sugg.hidden = !sugg.children.length;
+      }, 200);
+    });
+  }
+  const copy = $('copyYaml');
+  if (copy) copy.addEventListener('click', copyYaml);
+  const discard = $('discard');
+  if (discard) discard.addEventListener('click', discardDraft);
+}
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.searchbox')) document.querySelectorAll('.sugg').forEach((b) => { b.hidden = true; });
+});
+
+function showEditError(message) {
+  const el = $('editError');
+  if (!el) return;
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+// One profile edit: starts the draft on the first one, posts the edit, and redraws every pool from the answer.
+async function editDraft(op, pool, entry) {
+  const ctx = poolsCtx;
+  const seq = poolsSeq;
+  const { channel } = ctx;
+  // The ranking takes seconds; a channel or tab switched meanwhile owns the page, and this answer is dropped.
+  const stale = () => seq !== poolsSeq || ctx !== poolsCtx;
+  showEditError('');
+  const acct = $('acctSel') && $('acctSel').value;
+  setPoolsBusy(true, 'Re-ranking');
+  try {
+    if (!poolsCtx.draft) {
+      const made = await apiJson('POST', `/api/channels/${enc(channel)}/drafts`, acct ? { account: Number(acct) } : {});
+      if (stale()) return;
+      if (made.error) { setPoolsBusy(false); showEditError(made.error); return; }
+      ctx.draft = made.draft;
+      // The draft id goes in the URL without a navigation, so this tab keeps it across a reload.
+      history.replaceState(null, '', channelHash(channel, 'pools', null, made.draft));
+      markRoute(parseRoute());
+    }
+    const data = await apiJson('POST', `/api/channels/${enc(channel)}/drafts/${enc(ctx.draft)}/edits`, { op, pool, entry });
+    if (stale()) return;
+    setPoolsBusy(false);
+    if (data.error) {
+      if (data.status === 404) {
+        poolsNotice = 'This draft is gone (it expired or the server restarted); the page shows the deployed pools again.';
+        location.replace(channelHash(channel, 'pools'));
+        return;
+      }
+      // The draft exists now, so the bar shows it even though this edit was refused.
+      drawPools();
+      showEditError(data.error);
+      return;
+    }
+    ctx.data = data;
+    drawPools();
+  } catch (e) {
+    setPoolsBusy(false);
+    showEditError(String(e));
+  }
+}
+
+async function copyYaml() {
+  const { channel, draft } = poolsCtx;
+  const pool = $('copyPool').value;
+  const res = await fetch(`/api/channels/${enc(channel)}/drafts/${enc(draft)}/yaml?pool=${enc(pool)}`);
+  const text = await res.text();
+  if (!res.ok) { showEditError(`HTTP ${res.status}: ${text}`); return; }
+  const out = $('yamlOut');
+  out.hidden = false;
+  out.innerHTML = `<div class="muted">${esc(pool)}'s profile, ready to paste into channel.yaml:</div><pre>${esc(text || '(the profile has no entries)')}</pre>`;
+  try { await navigator.clipboard.writeText(text); out.insertAdjacentHTML('afterbegin', '<div class="muted">Copied to the clipboard.</div>'); } catch (e) { /* the text above stays selectable */ }
+}
+
+async function discardDraft() {
+  const { channel, draft } = poolsCtx;
+  const data = await apiJson('DELETE', `/api/channels/${enc(channel)}/drafts/${enc(draft)}`);
+  if (data.error && data.status !== 404) { showEditError(data.error); return; }
+  location.hash = channelHash(channel, 'pools');
+}
+
 $('lineupSelect').addEventListener('change', () => { const r = parseRoute(); location.hash = channelHash($('lineupSelect').value, r.view, r.project); });
 // Choosing a projection length changes the hash; choosing the pressed length again asks for it afresh.
 function chooseProject(project) {
   const r = parseRoute();
   if (!r.channel) return;
-  const target = channelHash(r.channel, r.view, project);
+  const target = channelHash(r.channel, r.view, project, r.draft);
   if (location.hash === target) { shown = null; route(); } else location.hash = target;
 }
 for (const b of $('projBtns').querySelectorAll('button')) b.addEventListener('click', () => chooseProject(b.dataset.project));

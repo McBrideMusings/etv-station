@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 
 use crate::errors::StationError;
 use crate::scan;
-/// Shared with `taste-debug`'s metadata printer (etv-station-398) — see
+/// Shared with the web dashboard's metadata rendering (etv-station-398) — see
 /// [`crate::value_fmt`] for why this is one function and not two copies.
 use crate::value_fmt::format_value;
 
@@ -185,7 +185,7 @@ async fn read_chunk_playout(path: &Path) -> Result<Option<Playout>, StationError
 /// Each item's audit trail comes from `metadata.audit`, an ordered array
 /// whose per-stage record is a map of `stage`/`by`/`verdict` plus whatever
 /// else the script put under `detail` (ADR 0011, ADR 0002) — every key is
-/// printed generically, the same way `taste-debug`'s metadata printer works,
+/// printed generically, the same way the web dashboard's metadata rendering works,
 /// so a script adding a new `detail` key needs no station change to appear
 /// here. An item carrying no audit trail (every item written before #389, and
 /// every item on a channel with no plugin pool) renders one "unexplained"
