@@ -67,7 +67,12 @@
   button, input { font: inherit; color: inherit; }
   button { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 3px 9px; }
   button:disabled { opacity: .45; cursor: default; }
-  input[type=number] { width: 58px; padding: 2px 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; }
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; margin-left: -1px; }
+  .seg button:first-child { border-radius: 3px 0 0 3px; margin-left: 0; }
+  .seg button:last-child { border-radius: 0 3px 3px 0; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  #projState { min-width: 0; }
   #state { min-height: 18px; }
   .spinner { display: inline-block; width: 13px; height: 13px; margin-right: 6px; vertical-align: -2px;
     border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
@@ -100,6 +105,14 @@
   .rbadge { display: inline-flex; align-items: center; justify-content: center; min-width: 15px; height: 15px; border-radius: 2px;
     background: var(--ink-bg); color: var(--ink-fg); font-size: 10px; font-weight: 800; margin-right: 5px; padding: 0 2px; }
   .hatch { background-image: repeating-linear-gradient(135deg, rgba(0,0,0,.13) 0 4px, transparent 4px 8px); }
+  /* Projected, not scheduled: a dashed edge and a crosshatch no repeat marker uses. */
+  .blk.proj { border: 1px dashed var(--fg); opacity: .8;
+    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.5) 0 3px, transparent 3px 7px), repeating-linear-gradient(135deg, rgba(255,255,255,.5) 0 3px, transparent 3px 7px); }
+  .swatch.proj { width: 14px; height: 10px; background-color: var(--track); border: 1px dashed var(--fg); }
+  .frontier { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--err-fg); z-index: 1; pointer-events: none; }
+  .frontier span { position: absolute; right: 2px; top: 1px; font-size: 9.5px; font-weight: 700; color: var(--err-fg); background: var(--bg); padding: 0 3px; border-radius: 2px; }
+  .swatch.fl { height: 0; width: 14px; border-top: 2px solid var(--err-fg); background: none; vertical-align: 3px; }
+  .tag-proj { font-size: 11px; font-weight: 700; border: 1px dashed var(--fg); border-radius: 2px; padding: 0 5px; }
 
   /* Guide first: a column per day, time running down, block height = running time. Side rail holds the numbers. */
   .layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 16px; }
@@ -224,6 +237,35 @@
   .mv { font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; }
   .mv.up { color: var(--up); } .mv.down { color: var(--down); } .mv.new, .mv.same { color: var(--muted); }
   #yamlOut pre { margin: 4px 0 8px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; overflow: auto; font-size: 12px; }
+
+  /* Guide: a row per channel, time running across, programme width = running time. */
+  .gsrc { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .gtool { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
+  .tg { position: relative; width: max-content; }
+  .tg-head, .tg-row { display: flex; }
+  .tg-head { position: sticky; top: 0; z-index: 3; background: var(--bg); border-bottom: 2px solid var(--fg); height: 22px; }
+  .tg-corner, .tg-ch { position: sticky; left: 0; z-index: 2; width: var(--chw); flex: none; background: var(--bg); }
+  .tg-ch { padding: 0 8px; line-height: 26px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid var(--line); }
+  .tg-ch .n { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+  .tg-times { position: relative; flex: none; }
+  .tg-times span { position: absolute; top: 4px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; padding-left: 4px; border-left: 1px solid var(--line); height: 18px; }
+  .tg-track { position: relative; flex: none; height: 26px; border-bottom: 1px solid var(--line);
+    background-image: repeating-linear-gradient(to right, var(--line) 0 1px, transparent 1px calc(30 * var(--gppm))); }
+  .pgm { position: absolute; top: 2px; height: 22px; border-radius: 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line); font-size: 11.5px; line-height: 20px; padding: 0 5px; cursor: pointer; outline: none; }
+  .pgm.live { border-color: var(--accent); }
+  .pgm:hover, .pgm:focus-visible { outline: 2px solid var(--fg); outline-offset: -2px; }
+  .pgm.sel { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .tg-now { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); z-index: 1; pointer-events: none; }
+  .gnote { margin-top: 8px; }
+  .tg-ch.watch { cursor: pointer; }
+  .tg-ch.watch:hover, .tg-ch.watch:focus-visible, .tg-ch.playing { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .player { border: 1px solid var(--line); margin-bottom: 12px; padding: 8px; }
+  .player video { width: 100%; background: #000; display: block; aspect-ratio: 16 / 9; }
+  .player h3 { margin: 0 0 2px; font-size: 14px; }
+  .player .now { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .player .x { float: right; }
+  .insp .err { margin-top: 8px; }
   #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
 </head>
@@ -246,10 +288,16 @@
       </nav>
       <span id="position" class="muted"></span>
       <span class="spacer"></span>
-      <span id="daysCtl" class="toolbar" style="margin:0">
-        <label for="days">Days shown</label>
-        <input type="number" id="days" min="1" max="60" value="14">
-        <button id="applyDays" type="button">Re-simulate</button>
+      <span id="projCtl" class="toolbar" style="margin:0">
+        <span id="projState" class="muted" aria-live="polite"></span>
+        <span class="muted" id="projLabel">Project ahead</span>
+        <span class="seg" role="group" aria-labelledby="projLabel" id="projBtns">
+          <button type="button" data-project="1d" aria-pressed="false">+1d</button>
+          <button type="button" data-project="3d" aria-pressed="false">+3d</button>
+          <button type="button" data-project="7d" aria-pressed="false">+7d</button>
+          <button type="button" data-project="14d" aria-pressed="false">+14d</button>
+        </span>
+        <button id="projClear" type="button">Real only</button>
       </span>
     </div>
     <div id="state" class="muted"></div>
@@ -273,7 +321,7 @@ let current = null;   // the last channel review payload
 let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
-// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern}?days=N`,
+// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern}?project=Nd`,
 // `#/channels/{key}/pools?draft=ID`, `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
 function parseRoute() {
   const [path, qs] = location.hash.replace(/^#/, '').split('?');
@@ -284,13 +332,13 @@ function parseRoute() {
     tab,
     channel: tab === 'channels' && parts[1] ? decodeURIComponent(parts[1]) : null,
     view: ['pattern', 'pools'].includes(parts[2]) ? parts[2] : 'schedule',
-    days: q.get('days'),
+    project: ['1d', '3d', '7d', '14d'].includes(q.get('project')) ? q.get('project') : null,
     draft: q.get('draft'),
   };
 }
-function channelHash(channel, view, days, draft) {
+function channelHash(channel, view, project, draft) {
   const q = [];
-  if (days && view !== 'pools') q.push(`days=${days}`);
+  if (project && view !== 'pools') q.push(`project=${project}`);
   if (draft && view === 'pools') q.push(`draft=${encodeURIComponent(draft)}`);
   return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${q.length ? `?${q.join('&')}` : ''}`;
 }
@@ -303,41 +351,46 @@ const dayOf = (ts, tz) => fmt(ts, tz, { weekday: 'short', month: 'short', day: '
 const days1 = (d) => (Math.round(d * 10) / 10).toFixed(1);
 const hourLabel = (h) => (h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p');
 
-// Fetches the channel's review, asking again while the worker answers 202, then draws `view` from it.
-async function load(channel, days, view) {
+// Fetches the channel's review. The real schedule answers at once and is drawn; while a requested
+// projection runs the server answers 202 with that same real review, so the page asks again every
+// second beside a spinner and redraws with the projection when it lands.
+async function load(channel, project, view) {
   const q = new URLSearchParams();
-  if (days) q.set('days', days);
-  const elapsed = Date.now();
-  const pending = () => {
-    $('state').innerHTML = `<span class="spinner"></span>Simulating ${esc(channel)}… (${Math.round((Date.now() - elapsed) / 1000)}s; asked again every second)`;
+  if (project) q.set('project', project);
+  const began = Date.now();
+  const projecting = () => {
+    $('projState').innerHTML = `<span class="spinner"></span>Projecting ${esc(project.replace('d', ''))} day${project === '1d' ? '' : 's'}… (${Math.round((Date.now() - began) / 1000)}s)`;
   };
-  pending();
-  // Another channel's report never stays on screen under this one's spinner; the same channel's dims while it reloads.
+  $('state').textContent = '';
+  $('projState').textContent = '';
+  // Another channel's report never stays on screen under this one's load; the same channel's dims while it reloads.
   if (!current || current.channel !== channel) { current = null; $('report').innerHTML = ''; }
   $('report').classList.add('loading');
-  $('applyDays').disabled = true;
+  setControls(project, true);
   const seq = ++loadSeq;
   const deadline = Date.now() + POLL_DEADLINE_MS;
   let data;
+  let drewReal = false;
   try {
-    // A 202 means the worker is still simulating this channel; ask again.
     for (;;) {
       const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/review?${q}`);
       data = await res.json();
+      if (seq !== loadSeq) return;
       if (!res.ok) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
       if (!data.pending) break;
-      if (Date.now() > deadline) throw new Error(`still simulating after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
+      if (!drewReal) { $('report').classList.remove('loading'); show(data, view); drewReal = true; }
+      if (Date.now() > deadline) throw new Error(`still projecting after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
+      projecting();
       await new Promise((r) => setTimeout(r, 1000));
       if (seq !== loadSeq) return;
-      pending();
     }
   } catch (e) {
     data = { error: String(e) };
   }
   if (seq !== loadSeq) return;
   $('report').classList.remove('loading');
-  $('applyDays').disabled = false;
-  if (data.days) $('days').value = data.days;
+  $('projState').textContent = '';
+  setControls(project, false);
   $('state').textContent = '';
   if (data.error) {
     current = null;
@@ -345,6 +398,11 @@ async function load(channel, days, view) {
       <h2>The review could not be built</h2><div class="error">${esc(data.error)}</div>`;
     return;
   }
+  show(data, view);
+}
+
+// Draws one review payload, or the load-error page for a channel whose config fails to load.
+function show(data, view) {
   if (data.load_error) {
     current = null;
     document.title = `etv-station · ${data.channel}`;
@@ -357,6 +415,15 @@ async function load(channel, days, view) {
   for (const a of data.airings) Object.assign(a, data.items[a.id]);
   current = data;
   draw(view);
+}
+
+// The Project ahead buttons: the pressed one is the length on screen; all stay off while a load is in flight.
+function setControls(project, busy) {
+  for (const b of $('projBtns').querySelectorAll('button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.project === project));
+    b.disabled = busy;
+  }
+  $('projClear').disabled = busy || !project;
 }
 
 function draw(view) {
@@ -398,16 +465,17 @@ function markRoute(r) {
   $('lineup').hidden = r.tab !== 'channels';
   $('lineupSelect').hidden = r.tab !== 'channels';
   $('toolbar').hidden = r.tab !== 'channels';
+  setControls(r.project, false);
   if (r.tab !== 'channels' || !lineup) return;
-  const days = $('days').value;
-  $('daysCtl').hidden = r.view === 'pools';
+  const project = r.project;
+  $('projCtl').hidden = r.view === 'pools';
   for (const a of $('lineup').querySelectorAll('a')) {
-    a.href = channelHash(a.dataset.key, r.view, days);
+    a.href = channelHash(a.dataset.key, r.view, project);
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
   for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern'], ['subPools', 'pools']]) {
-    $(id).href = channelHash(r.channel, view, days, r.draft);
+    $(id).href = channelHash(r.channel, view, project, r.draft);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
   const i = lineup.findIndex((c) => c.channel === r.channel);
@@ -416,36 +484,35 @@ function markRoute(r) {
   if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
 
-// Guide and Health have no content yet: say so rather than show an empty frame.
+// Health has no content yet: say so rather than show an empty frame.
 function renderEmpty(tab) {
   current = null;
-  document.title = `etv-station · ${tab === 'guide' ? 'Guide' : 'Health'}`;
+  document.title = 'etv-station · Health';
   $('state').textContent = '';
   $('report').classList.remove('loading');
-  $('report').innerHTML = `<div class="empty"><h1>${tab === 'guide' ? 'Guide' : 'Health'}</h1>
-    <p class="muted">${tab === 'guide'
-      ? 'Not built yet. It will show what is on every channel now, with the stream playing beside it.'
-      : 'Not built yet. It will show each channel\'s encoder, failures and last stall.'}</p></div>`;
+  $('report').innerHTML = `<div class="empty"><h1>Health</h1>
+    <p class="muted">Not built yet. It will show each channel's encoder, failures and last stall.</p></div>`;
 }
 
-let shown = null;   // the channel and days the report holds, so a sub-tab switch redraws without refetching
+let shown = null;   // the channel and projection the report holds, so a sub-tab switch redraws without refetching
 async function route() {
   const r = parseRoute();
   if (!lineup) await loadLineup();
   if (r.tab === 'channels' && !r.channel) {
     // A bare `#/channels` (or no hash) opens the first channel in the lineup.
-    if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.days)); return; }
+    if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.project)); return; }
   }
-  if (r.days) $('days').value = r.days;
   markRoute(r);
-  if (r.tab !== 'channels') { loadSeq++; poolsSeq++; shown = null; renderEmpty(r.tab); return; }
+  stopPlayer();
+  if (r.tab === 'guide') { loadSeq++; poolsSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
+  if (r.tab !== 'channels') { loadSeq++; guideSeq++; poolsSeq++; shown = null; renderEmpty(r.tab); return; }
   if (!r.channel) return;
-  if (r.view === 'pools') { shown = null; await loadPools(r.channel, r.draft); return; }
-  poolsSeq++;
-  const key = `${r.channel}|${$('days').value}`;
+  if (r.view === 'pools') { guideSeq++; shown = null; await loadPools(r.channel, r.draft); return; }
+  guideSeq++; poolsSeq++;
+  const key = `${r.channel}|${r.project}`;
   if (shown === key && current) { draw(r.view); return; }
   shown = key;
-  await load(r.channel, $('days').value, r.view);
+  await load(r.channel, r.project, r.view);
 }
 
 function poolColor(d) {
@@ -478,12 +545,34 @@ function subline(a) {
   return [se, a.title].filter(Boolean).join(' · ');
 }
 
+// What each input of a projection's cache key is called on the page.
+const INPUT_WORDS = {
+  config: 'the channel file', scripts: 'a plugin script or datastore', station: 'station.yaml',
+  frontier: 'the state it starts from (.resume or recent airings)', candidates: 'the channel\'s candidate set',
+  simulator: 'the simulator revision',
+};
+
+function notesHTML(d) {
+  const notes = [];
+  if (!d.airings.length) notes.push('<div class="notice">No published playout for this channel yet.</div>');
+  const changed = (d.projection && d.projection.changed) || [];
+  if (changed.length) {
+    notes.push(`<div class="notice" id="projChanged">Projection recomputed: ${changed.map((c) => esc(INPUT_WORDS[c] || c)).join(', ')} changed since the previous projection of this length.</div>`);
+  }
+  if (d.projection && d.projection.error) {
+    notes.push(`<div class="error">The projection failed: ${esc(d.projection.error)}</div>`);
+  }
+  for (const n of d.notices) notes.push(`<div class="notice">Simulator gap: ${esc(n)}</div>`);
+  return notes.length ? `<div class="notes">${notes.join('')}</div>` : '';
+}
+
 function render(d) {
   document.title = `etv-station · ${d.number} ${d.display_name || d.name}`;
   const colors = poolColor(d);
   markRepeats(d);
   const tz = d.tz;
   const span = d.days;
+  const covers = d.span.label;   // "real only" or "real + N days projected"; every number below is over it
   const html = [];
 
   // 1. Masthead
@@ -494,24 +583,26 @@ function render(d) {
     <div class="bug">${esc(d.number)}</div>
     <div>
       <h1>${esc(d.display_name || d.name)}</h1>
-      <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${span} days simulated (${esc(tz)}) · seed ${esc(d.seed ?? 'none')} · ${esc(d.config_path)}</div>
+      <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${esc(covers)} (${esc(tz)}) · seed ${esc(d.seed ?? 'none')} · ${esc(d.config_path)}</div>
       <div class="pattern"><button type="button" class="linkish" id="patternBtn">Pattern</button><span class="pstub" title="${esc(patternWords(d.blocks))}">${esc(patternWords(d.blocks))}</span></div>
     </div>
     <dl class="facts">
       <div><dt>First repeat</dt><dd>${fr ? days1(fr.days) + ' d' : '&gt;' + span + ' d'}</dd>
-        <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : 'Nothing repeated inside the span'}</dd></div>
+        <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : `Nothing repeated in ${esc(covers)}`}</dd></div>
       <div><dt>Film / series airtime</dt><dd>${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</dd>
         <dd class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</dd></div>
       <div><dt>Channels sharing content</dt><dd>${d.overlap.this_channel_whole_library ? '—' : ov.length}</dd>
         <dd class="d" title="${esc(largest ? `${largest.number} ${largest.display_name || largest.channel} (${largest.shared})` : '')}">${d.overlap.this_channel_whole_library ? 'Draws from the whole library'
           : largest ? `Largest: ${esc(largest.number)} ${esc(largest.display_name || largest.channel)} (${largest.shared})` : 'None share an item'}</dd></div>
-      <div><dt>Items aired</dt><dd>${d.items_aired}</dd><dd class="d">${d.distinct_items} distinct</dd></div>
+      <div><dt>Items aired</dt><dd>${d.items_aired}</dd><dd class="d">${d.distinct_items} distinct · ${esc(covers)}</dd></div>
     </dl>
-    ${d.notices.length ? `<div class="notes">${d.notices.map((n) => `<div class="notice">Simulator gap: ${esc(n)}</div>`).join('')}</div>` : ''}
+    ${notesHTML(d)}
   </header>`);
 
   html.push(`<div class="legend">${Object.entries(colors).map(([p, c]) => `<span><span class="swatch" style="background:${c}"></span>${esc(p)}</span>`).join('')}
     <span><span class="rbadge">R</span>already aired earlier in the span</span>
+    <span><span class="swatch proj"></span>Projected — not scheduled</span>
+    <span><span class="swatch fl"></span>Frontier: where the published playout ends</span>
     <span><span class="pin">1</span>tune-in sample</span></div>`);
 
   // 2. Guide, with the rail beside it
@@ -546,7 +637,7 @@ function render(d) {
         <td class="pmeasure">${p.measure ? esc(p.measure) + '<br>' : ''}<span class="muted">Not scored: ${esc(p.not_scored)}</span></td></tr>`).join('');
   html.push(`<section><h2>Programming principles</h2>
     <div class="ptotal"><span class="big">${points} / ${scored.length * 3}</span>
-      <span class="muted">${scored.length} of ${d.principles.length} principles measured. Thresholds are in docs/programming.md under each principle's Grade.</span></div>
+      <span class="muted">${scored.length} of ${d.principles.length} principles measured over ${esc(covers)}. Thresholds are in docs/programming.md under each principle's Grade.</span></div>
     <table class="principles"><tbody>${principleRows}</tbody></table></section>`);
 
   // 4. Depth
@@ -562,7 +653,7 @@ function render(d) {
       <td class="num">${value}</td></tr>`;
   }).join('');
   html.push(`<section><h2>Depth</h2>
-    <p class="muted">Days from the start of the span until each pool or show first airs something a second time. Aired / distinct items.</p>
+    <p class="muted">Days from the start of the span until each pool or show first airs something a second time, over ${esc(covers)}. Aired / distinct items.</p>
     <table><thead><tr><th>Pool / show</th><th class="num">Aired</th><th></th><th class="num">First repeat</th></tr></thead>
     <tbody>${depthRows}</tbody></table></section>`);
 
@@ -591,7 +682,7 @@ function render(d) {
 
   $('report').innerHTML = html.join('');
   renderGuide(d, colors);
-  $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'pattern', $('days').value); });
+  $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'pattern', parseRoute().project); });
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
   $('gwrap').scrollTop = GUIDE_OPEN_HOUR * 60 * ppm;
 }
@@ -646,7 +737,7 @@ function renderPattern(d) {
   const colors = poolColor(d);
   $('report').innerHTML = `<header class="mast"><div class="bug">${esc(d.number)}</div>
       <div><h1>${esc(d.display_name || d.name)}</h1>
-      <div class="sub">${d.days} days simulated (${esc(d.tz)}) · ${esc(d.config_path)}</div></div></header>
+      <div class="sub">${esc(d.span.label)} (${esc(d.tz)}) · ${esc(d.config_path)}</div></div></header>
     <section class="insp pattern-page">${patternPanel(d, colors)}</section>`;
 }
 
@@ -692,18 +783,254 @@ function airingPanel(d, a, colors) {
   return `<button class="x" type="button" aria-label="Close">×</button>
     <h3>${esc(headline(a))}</h3><div class="ep">${esc(subline(a))}</div>
     <div class="meta"><span>${esc(dayOf(a.start, tz))} ${esc(timeOf(a.start, tz))}–${esc(timeOf(a.start + a.duration_secs, tz))}</span>
-      <span>${Math.round(a.duration_secs / 60)} min</span><span><span class="swatch" style="background:${colors[a.pool] || '#ccc'}"></span>${esc(a.pool)}</span>
+      <span>${Math.round(a.duration_secs / 60)} min</span>${a.projected ? '<span class="tag-proj">Projected — not scheduled</span>' : ''}<span><span class="swatch" style="background:${colors[a.pool] || '#ccc'}"></span>${esc(a.pool)}</span>
       ${a.content_rating ? `<span>rated ${esc(a.content_rating)}</span>` : ''}${sample ? `<span><span class="pin">${sample.n}</span>tune-in sample</span>` : ''}</div>
     <h4>Why it's here: ${trail.length} stage${trail.length === 1 ? '' : 's'}</h4>
     ${trail.length ? trail.map((s) => stageHTML(d, s)).join('') : '<div class="muted">No selection trail was recorded for this airing.</div>'}
-    <h4>Airings in the ${d.days} days (${all.length})</h4><ol class="hist">${hist}</ol>
+    <h4>Airings in ${esc(d.span.label)} (${all.length})</h4><ol class="hist">${hist}</ol>
     <h4>Catalog</h4><div class="sum">${esc(a.id)}${cat ? ' · ' + esc(cat) : ''}${a.summary ? `<br>${esc(a.summary)}` : ''}</div>`;
 }
+
+// ---- Guide: ETV-next's live XMLTV grid, read by the browser. Clicking a programme asks the station for that airing's audit record.
+const GUIDE_PPM = 3.1;        // px per minute
+const GUIDE_BACK_MIN = 60;    // the grid opens this long before the half-hour at or before now
+const GUIDE_SPAN_MIN = 8 * 60;
+const GUIDE_CH_PX = 150;
+let guideSeq = 0;
+let guideBase = null;
+let guideData = null;
+let hlsPlayer = null;
+let hlsScript = null;
+
+// The ETV-next origin (and path prefix) the browser reads from: the station's ETV_NEXT_URL, else this page's own host on 8409.
+async function etvBase() {
+  if (guideBase) return guideBase;
+  let url = null;
+  try { url = (await (await fetch('/api/health')).json()).etv_next_url; } catch (e) { /* fall back to the page's host */ }
+  guideBase = (url || `${location.protocol}//${location.hostname}:8409`).replace(/\/+$/, '');
+  return guideBase;
+}
+
+function parseM3u(text) {
+  const out = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('#EXTINF')) continue;
+    const attr = (k) => (lines[i].match(new RegExp(`${k}="([^"]*)"`)) || [])[1];
+    out.push({ id: attr('tvg-id'), chno: attr('tvg-chno'), name: attr('tvg-name') || lines[i].split(',').pop().trim() });
+  }
+  return out;
+}
+
+// XMLTV's `20261019201500 +0000` as Unix seconds.
+function xmltvTime(s) {
+  const m = /^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)\s*([+-])(\d\d)(\d\d)$/.exec((s || '').trim());
+  if (!m) return NaN;
+  const off = (m[7] === '-' ? -1 : 1) * (Number(m[8]) * 60 + Number(m[9]));
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000 - off * 60;
+}
+
+function parseXmltv(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('the XMLTV did not parse');
+  const names = {};
+  for (const c of doc.querySelectorAll('tv > channel')) {
+    const digits = [...c.querySelectorAll('display-name')].map((n) => n.textContent.trim()).find((t) => /^\d+$/.test(t));
+    names[c.getAttribute('id')] = digits ? Number(digits) : null;
+  }
+  const programmes = {};
+  for (const p of doc.querySelectorAll('tv > programme')) {
+    const start = xmltvTime(p.getAttribute('start'));
+    const stop = xmltvTime(p.getAttribute('stop'));
+    if (!(stop > start)) continue;
+    const text = (tag) => { const e = p.querySelector(tag); return e ? e.textContent.trim() : ''; };
+    (programmes[p.getAttribute('channel')] ||= []).push({ start, stop, title: text('title'), sub: text('sub-title') });
+  }
+  return { numbers: names, programmes };
+}
+
+async function fetchText(url) {
+  let res;
+  try { res = await fetch(url); } catch (e) { throw new Error(`${url}: ${e.message || e}`); }
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  return res.text();
+}
+
+async function loadGuide() {
+  stopPlayer();
+  const seq = ++guideSeq;
+  const began = Date.now();
+  const base = await etvBase();
+  const urls = { m3u: `${base}/channels.m3u`, xml: `${base}/xmltv.xml` };
+  $('report').innerHTML = `<div class="gtool"><strong>Guide</strong><span class="gsrc">from ${esc(base)}</span></div><div id="gstate"></div>`;
+  const tick = () => { $('gstate').innerHTML = `<span class="spinner"></span>Loading the guide from ${esc(base)}… (${Math.round((Date.now() - began) / 1000)}s)`; };
+  tick();
+  const timer = setInterval(() => { if ($('gstate')) tick(); }, 1000);
+  let data;
+  try {
+    const [m3u, xml] = await Promise.allSettled([fetchText(urls.m3u), fetchText(urls.xml)]);
+    const failed = [m3u, xml].filter((r) => r.status === 'rejected').map((r) => r.reason.message || String(r.reason));
+    if (failed.length) throw new Error(failed.join('\n'));
+    data = { channels: parseM3u(m3u.value), xmltv: parseXmltv(xml.value) };
+  } catch (e) {
+    data = { error: String(e.message || e) };
+  } finally {
+    clearInterval(timer);
+  }
+  if (seq !== guideSeq) return;
+  if (data.error) {
+    $('gstate').innerHTML = `<div class="error">ETV-next is unreachable or answered badly.\nTried ${esc(urls.m3u)} and ${esc(urls.xml)}\n${esc(data.error)}</div>
+      <p class="muted">The base URL is the station's ETV_NEXT_URL, else this page's host on port 8409.</p>`;
+    return;
+  }
+  guideData = data;
+  drawGuide(data, base);
+}
+
+// hls.js is served by the dashboard itself (/assets/hls.min.js), loaded only when a browser cannot play HLS natively.
+function loadHls() {
+  hlsScript ||= new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = '/assets/hls.min.js';
+    s.onload = () => resolve(window.Hls);
+    s.onerror = () => { hlsScript = null; reject(new Error('the dashboard could not load /assets/hls.min.js')); };
+    document.head.appendChild(s);
+  });
+  return hlsScript;
+}
+
+function stopPlayer() {
+  if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+  document.querySelectorAll('.tg-ch.playing').forEach((r) => r.classList.remove('playing'));
+  const p = $('player');
+  if (p) { p.hidden = true; p.innerHTML = ''; }
+}
+
+// Plays ETV-next's /channel/{n}.m3u8 beside the grid, and says in words why it could not.
+async function watchChannel(row) {
+  const { number, name, id } = row.dataset;
+  const p = $('player');
+  if (!p) return;
+  stopPlayer();
+  row.classList.add('playing');
+  const base = await etvBase();
+  const url = `${base}/channel/${number}.m3u8`;
+  const now = Math.floor(Date.now() / 1000);
+  const cur = ((guideData && guideData.xmltv.programmes[id]) || []).find((g) => g.start <= now && now < g.stop);
+  p.innerHTML = `<button class="x" type="button" aria-label="Close player">×</button><h3>${esc(number)} ${esc(name)}</h3>
+    <div class="now">${cur ? `Now: ${esc(cur.title)}${cur.sub ? ` · ${esc(cur.sub)}` : ''} (${esc(timeOf(cur.start))}–${esc(timeOf(cur.stop))})` : 'Nothing is listed on the guide right now.'}</div>
+    <video id="pv" controls autoplay muted playsinline></video><div id="perr"></div>`;
+  p.hidden = false;
+  p.querySelector('.x').addEventListener('click', stopPlayer);
+  const video = $('pv');
+  const fail = (what) => { const e = $('perr'); if (e && $('pv') === video) e.innerHTML = `<div class="error err">Cannot play ${esc(url)}\n${esc(what)}</div>`; };
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.addEventListener('error', () => fail(`The browser's player reported an error${video.error && video.error.message ? `: ${video.error.message}` : ''} (the manifest may be missing or unreachable).`));
+    video.src = url;
+    return;
+  }
+  let Hls;
+  try { Hls = await loadHls(); } catch (e) { fail(String(e.message || e)); return; }
+  if ($('pv') !== video) return;   // another channel was picked meanwhile
+  if (!Hls.isSupported()) { fail('This browser cannot play HLS.'); return; }
+  const hls = new Hls();
+  hlsPlayer = hls;
+  hls.on(Hls.Events.ERROR, (_, d) => {
+    if (!d.fatal) return;
+    const status = d.response && d.response.code ? `HTTP ${d.response.code} for ${d.url || url}` : (d.details || d.type);
+    fail(`${d.type === Hls.ErrorTypes.NETWORK_ERROR ? 'Network error' : 'Playback error'}: ${status}`);
+    hls.destroy();
+    if (hlsPlayer === hls) hlsPlayer = null;
+  });
+  hls.loadSource(url);
+  hls.attachMedia(video);
+}
+document.addEventListener('click', (e) => { const r = e.target.closest('.tg-ch.watch'); if (r) watchChannel(r); });
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.tg-ch.watch')) { e.preventDefault(); watchChannel(e.target.closest('.tg-ch.watch')); }
+});
+
+function drawGuide(data, base) {
+  const now = Math.floor(Date.now() / 1000);
+  const wstart = Math.floor(now / 1800) * 1800 - GUIDE_BACK_MIN * 60;
+  const wend = wstart + GUIDE_SPAN_MIN * 60;
+  const width = GUIDE_SPAN_MIN * GUIDE_PPM;
+  const ticks = [];
+  for (let t = wstart; t < wend; t += 1800) {
+    ticks.push(`<span style="left:${((t - wstart) / 60) * GUIDE_PPM}px">${esc(timeOf(t))}</span>`);
+  }
+  const rows = data.channels.map((c) => {
+    const number = c.chno && /^\d+$/.test(c.chno) ? Number(c.chno)
+      : data.xmltv.numbers[c.id] != null ? data.xmltv.numbers[c.id]
+      : Number((/(\d+)\D*$/.exec(c.id || '') || [])[1]);
+    const blocks = (data.xmltv.programmes[c.id] || []).filter((p) => p.stop > wstart && p.start < wend).map((p) => {
+      const s = Math.max(p.start, wstart);
+      const e = Math.min(p.stop, wend);
+      const left = ((s - wstart) / 60) * GUIDE_PPM;
+      const w = Math.max(((e - s) / 60) * GUIDE_PPM - 2, 2);
+      const label = `${timeOf(p.start)}–${timeOf(p.stop)} · ${p.title}${p.sub ? ` · ${p.sub}` : ''}`;
+      return `<div class="pgm${p.start <= now && now < p.stop ? ' live' : ''}" tabindex="0" data-number="${number}" data-start="${p.start}" data-stop="${p.stop}"
+        data-title="${esc(p.title)}" data-sub="${esc(p.sub)}" data-channel="${esc(c.name)}" data-tip="${esc(label)}" aria-label="${esc(label)}"
+        style="left:${left}px;width:${w}px">${esc(p.title)}</div>`;
+    }).join('');
+    const watch = Number.isFinite(number) ? ` watch" tabindex="0" role="button" data-number="${number}" data-name="${esc(c.name)}" data-id="${esc(c.id)}` : '';
+    return `<div class="tg-row"><div class="tg-ch${watch}" title="${Number.isFinite(number) ? 'Watch ' : ''}${esc(c.name)}"><span class="n">${esc(Number.isFinite(number) ? number : '—')}</span>${esc(c.name)}</div>
+      <div class="tg-track" style="width:${width}px">${blocks}</div></div>`;
+  }).join('');
+  const nowX = GUIDE_CH_PX + ((now - wstart) / 60) * GUIDE_PPM;
+  $('report').innerHTML = `<div class="gtool"><strong>Guide</strong><span class="muted">${data.channels.length} channels · updated ${esc(timeOf(now))}</span>
+      <button type="button" id="guideReload">Reload</button><span class="gsrc">from ${esc(base)}</span></div>
+    <div class="layout"><div class="gwrap" id="gg" style="--chw:${GUIDE_CH_PX}px;--gppm:${GUIDE_PPM}px">
+      <div class="tg"><div class="tg-head"><div class="tg-corner"></div><div class="tg-times" style="width:${width}px">${ticks.join('')}</div></div>
+        ${rows}<div class="tg-now" style="left:${nowX}px"></div></div></div>
+      <aside class="rail"><section class="player" id="player" hidden></section><section class="insp" id="insp" hidden></section>
+        <p class="muted gnote">Click a channel to watch it. Click a programme to see why it is on: the stored selection trail of that airing.</p></aside></div>`;
+  $('guideReload').addEventListener('click', loadGuide);
+  const g = $('gg');
+  g.scrollLeft = Math.max(0, ((now - wstart) / 60) * GUIDE_PPM - 120);
+}
+
+async function selectProgramme(el) {
+  const { number, start, stop, title, sub, channel } = el.dataset;
+  const airing = `${number}.${start}`;
+  const head = `<button class="x" type="button" aria-label="Close">×</button><h3>${esc(title)}</h3><div class="ep">${esc(sub)}</div>
+    <div class="meta"><span>${esc(dayOf(Number(start)))} ${esc(timeOf(Number(start)))}–${esc(timeOf(Number(stop)))}</span><span>${Math.round((stop - start) / 60)} min</span><span>${esc(number)} ${esc(channel)}</span></div>`;
+  showPanel(`${head}<div class="muted"><span class="spinner"></span>Reading the audit for airing ${esc(airing)}…</div>`);
+  el.classList.add('sel');
+  let data; let status = 0;
+  try {
+    const res = await fetch(`/api/airings/${encodeURIComponent(airing)}/audit`);
+    status = res.status;
+    data = await res.json();
+  } catch (e) {
+    data = { error: String(e) };
+  }
+  if (!el.classList.contains('sel')) return;   // another programme was picked meanwhile
+  const panel = $('insp');
+  if (!panel) return;
+  const keep = (html) => { panel.innerHTML = html; panel.querySelector('.x').addEventListener('click', closePanel); };
+  if (status !== 200) {
+    keep(`${head}<div class="error err">HTTP ${status || '—'}: ${esc(data.error || 'no error message')}</div>`);
+    return;
+  }
+  const trail = Array.isArray(data.stages) ? data.stages : [];
+  const it = data.item;
+  keep(`<button class="x" type="button" aria-label="Close">×</button><h3>${esc(it.label)}</h3><div class="ep">${esc(sub)}</div>
+    <div class="meta"><span>${esc(dayOf(data.start))} ${esc(timeOf(data.start))}–${esc(timeOf(data.finish))}</span><span>${Math.round((data.finish - data.start) / 60)} min</span><span>${esc(data.number)} ${esc(channel)}</span>
+      ${it.content_rating ? `<span>rated ${esc(it.content_rating)}</span>` : ''}</div>
+    <h4>Why it's here: ${trail.length} stage${trail.length === 1 ? '' : 's'}</h4>
+    ${trail.length ? trail.map((s) => stageHTML({ titles: data.titles || {}, airings: [] }, s)).join('') : '<div class="muted">No selection trail was recorded for this airing.</div>'}
+    <h4>Catalog</h4><div class="sum">${esc(it.id)}${it.summary ? `<br>${esc(it.summary)}` : ''}</div>`);
+}
+document.addEventListener('click', (e) => { const p = e.target.closest('.pgm'); if (p) selectProgramme(p); });
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.pgm')) { e.preventDefault(); selectProgramme(e.target.closest('.pgm')); }
+});
 
 function closePanel() {
   const p = $('insp');
   if (p) { p.hidden = true; p.innerHTML = ''; }
-  document.querySelectorAll('.blk.sel').forEach((b) => b.classList.remove('sel'));
+  document.querySelectorAll('.blk.sel, .pgm.sel').forEach((b) => b.classList.remove('sel'));
 }
 
 function showPanel(html) {
@@ -755,6 +1082,7 @@ function renderGuide(d, colors) {
       const cont = a.start < ds;
       const sample = d.samples.find((x) => x.index === a.index && x.at >= ds && x.at < de);
       const label = `${timeOf(a.start, tz)}–${timeOf(a.start + a.duration_secs, tz)} · ${a.label} · ${a.pool}`
+        + (a.projected ? ' · Projected — not scheduled' : '')
         + (rep ? ` · repeat, first aired ${dayOf(d.airings[a.repeat_of].start, tz)} ${timeOf(d.airings[a.repeat_of].start, tz)}` : '');
       const px = h * ppm;
       const time = `<span class="tm">${cont ? `cont. from ${esc(timeOf(a.start, tz))}` : esc(timeOf(a.start, tz))}</span> ${sample ? `<span class="pin">${sample.n}</span>` : ''}${rep && !cont ? '<span class="rbadge">R</span>' : ''}`;
@@ -763,8 +1091,12 @@ function renderGuide(d, colors) {
         : px >= 32 ? `<div>${time}</div><div>${title}</div>`
         : px >= 19 ? `<div>${time} ${title}</div>`
         : '';
-      blocks.push(`<div class="blk${rep ? ' hatch' : ''}${body ? '' : ' tiny'}" data-index="${a.index}"${cont ? '' : ' tabindex="0"'} data-tip="${esc(label)}" aria-label="${esc(label)}"
+      blocks.push(`<div class="blk${rep ? ' hatch' : ''}${a.projected ? ' proj' : ''}${body ? '' : ' tiny'}" data-index="${a.index}"${cont ? '' : ' tabindex="0"'} data-tip="${esc(label)}" aria-label="${esc(label)}"
         style="top:calc(${top} * var(--ppm));height:calc(${h} * var(--ppm));background-color:${colors[a.pool] || '#ccc'}">${body}</div>`);
+    }
+    // The frontier: where the published playout ends. Past it, blocks are projected.
+    if (d.frontier != null && d.frontier >= ds && d.frontier < de) {
+      blocks.push(`<div class="frontier" style="top:calc(${((d.frontier - ds) / 60) * scale} * var(--ppm))"><span>frontier ${esc(timeOf(d.frontier, tz))}</span></div>`);
     }
     cells.push(`<div class="col">${blocks.join('')}</div>`);
   }
@@ -834,6 +1166,7 @@ function setPoolsBusy(on, what) {
 async function loadPools(channel, draft) {
   const seq = ++poolsSeq;
   loadSeq++;   // a schedule poll still running for the old view stops
+  guideSeq++;
   current = null;
   $('report').innerHTML = '';
   setPoolsBusy(true, `Ranking ${channel}'s pools`);
@@ -1063,15 +1396,16 @@ async function discardDraft() {
   location.hash = channelHash(channel, 'pools');
 }
 
-$('lineupSelect').addEventListener('change', () => { const r = parseRoute(); location.hash = channelHash($('lineupSelect').value, r.view, $('days').value); });
-$('applyDays').addEventListener('click', () => {
+$('lineupSelect').addEventListener('change', () => { const r = parseRoute(); location.hash = channelHash($('lineupSelect').value, r.view, r.project); });
+// Choosing a projection length changes the hash; choosing the pressed length again asks for it afresh.
+function chooseProject(project) {
   const r = parseRoute();
   if (!r.channel) return;
-  const target = channelHash(r.channel, r.view, $('days').value);
-  // The same hash fires no hashchange; re-simulating the shown days still asks again.
+  const target = channelHash(r.channel, r.view, project);
   if (location.hash === target) { shown = null; route(); } else location.hash = target;
-});
-$('days').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('applyDays').click(); });
+}
+for (const b of $('projBtns').querySelectorAll('button')) b.addEventListener('click', () => chooseProject(b.dataset.project));
+$('projClear').addEventListener('click', () => chooseProject(null));
 window.addEventListener('hashchange', route);
 
 route();

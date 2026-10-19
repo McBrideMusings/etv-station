@@ -397,6 +397,23 @@ impl HistoryDb {
         Self::init(conn)
     }
 
+    /// Open an existing history db for reading only: no create, no
+    /// migrations. For a reader running beside the daemon (the web UI).
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self, HistoryError> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|source| HistoryError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     /// An in-memory history db — used by tests.
     pub fn open_in_memory() -> Result<Self, HistoryError> {
         Self::init(Connection::open_in_memory()?)

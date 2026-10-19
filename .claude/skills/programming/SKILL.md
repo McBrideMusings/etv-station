@@ -42,21 +42,18 @@ against prod's own catalog and deployed plugins; it cannot see an edit you have 
 Read the numbers from the JSON, not a screenshot:
 
 ```sh
-tools/ui-get.sh '/api/channels/<folder>/review?days=14'          # add --prod for the deployed one
+tools/ui-get.sh '/api/channels/<folder>/review?project=14d'          # add --prod for the deployed one
 ```
 
 `<folder>` is the channel's key in the lineup. Under `deploy/appdata/channels/`
 it is the directory name, e.g. `034-syfy`. Under `examples/`, where channels are
 flat files sharing one folder, it is the path relative to the station file, e.g.
-`channels/a24.yaml` — pass it as is, unencoded. `days` defaults to 14, max 60.
+`channels/a24.yaml` — pass it as is, unencoded. With no `project` the review is the channel's real airings; `project=1d|3d|7d|14d` adds that many days simulated from the frontier.
 
-The simulation runs on a worker thread (`crates/etv-station/src/web_ui/sim_cache.rs`).
-A request it has no result for answers `202 {"pending":true}` at once and moves
-the channel to the front of the worker's queue; `tools/ui-get.sh` asks again
-every 15s until the body is the review. The worker first finishes the simulation it is running —
-on startup it fills the whole lineup in `station.yaml` order — so the first
-answer can take that channel's time plus your own. Request the channel as soon
-as the server is up.
+A projection runs on a worker thread (`crates/etv-station/src/web_ui/projection.rs`).
+While it runs the answer is `202` with the real review and `pending: true`;
+`tools/ui-get.sh` asks again every 15s until the projection lands. Projections are cached on a
+content hash of the inputs, so repeating a request is instant.
 
 Measured 2026-10-18 on a release build: 14 days of 034-syfy (185 generations, 377
 airings) takes ~166s, warm or cold. On 2026-10-12, at schema v9 (the `item.show` index),

@@ -52,29 +52,23 @@ two schedules match and the test panics with "the two passes matched". Observed
 2026-08-20 passing and failing on back-to-back runs of the identical tree. Re-run
 it; if it is the only failure, the tree is green.
 
-`tools/epg-browser.py` is Python, so `verify-all.sh` never touches it. `admin
-test` runs `tools/epg-layout-check.py` alongside the cargo trees: it drives the
-real TUI under Textual's headless driver against fixture data (no network, no
-station) and fails if any pane spills past the terminal edge, or if the detail
-pane is too narrow for the widest line in the app (the full stream URL). With no
-arguments it checks both layouts — 80x24, where the detail pane is a bottom row,
-and 160x45, where it is a right-hand column. Run it at another size with `uv run
-tools/epg-layout-check.py 128 40`. The switch is at
-`EpgBrowserApp.WIDE_COLUMNS = 129`: three side-by-side panes need 34 channels +
-40 minimum programmes + 55 detail before nothing clips, so anything narrower
-stacks.
+The dashboard's Guide tab reads ETV-next's `/channels.m3u` and `/xmltv.xml` in the browser
+(base URL: `ETV_NEXT_URL` from `GET /api/health`'s `etv_next_url`, else the page's host on
+port 8409). Clicking a programme asks `GET /api/airings/{number}.{start unix seconds}/audit`
+for that airing's stored audit record; the HTTP-seam test is
+`web_ui::airing::tests::the_endpoint_returns_the_stored_record_for_a_known_airing_and_404s_an_unknown_one`.
+To see the Guide against a running stack: start `./tools/dev-run.sh` (ETV-next on 8409), start
+`./tools/station-ui.sh`, open `http://127.0.0.1:4747/#/guide`. Stop ETV-next and reload to see
+the error-upstream state, which names the URLs tried.
 
-`admin epg`'s action must stay `kind = "shell-passthrough"` with `interactive =
-true`. That is the only action kind that hands the child this terminal's stdin
-and stdout directly. It was `kind = "interactive-shell"` until 2026-08-21, which
-launches with `stdout=subprocess.PIPE` and ignores `interactive` entirely — the
-flag is only read by the shell-passthrough factory. `shutil.get_terminal_size()`
-then saw no tty and returned its 80x24 fallback, so the TUI composited a 24-row
-frame into a 45-row pane and the rows below its footer kept a stale copy of an
-earlier frame. Measured in a 120x45 pty: the piped path reports `isatty=False,
-size=(80, 24)`; the passthrough path reports `isatty=True, size=(120, 45)`. If
-the TUI ever renders duplicated or half-height again, check that kind first —
-`epg-layout-check.py` cannot see this, since it never touches a terminal.
+Clicking a channel name in the Guide plays `{base}/channel/{n}.m3u8` in a player in the rail: native
+HLS where `canPlayType('application/vnd.apple.mpegurl')` answers (Safari, recent Chrome), otherwise
+hls.js from `GET /assets/hls.min.js` (embedded in the binary, test
+`web_ui::tests::the_embedded_hls_script_is_served_from_the_dashboard`). A manifest 404 shows
+"Cannot play <url> / Network error: HTTP 404 …" under the video. With no stack running, a stand-in
+server answering `/api/health`, `/channels.m3u`, `/xmltv.xml`, `/assets/hls.min.js` and
+`/channel/{n}.m3u8` (an `ffmpeg -f hls` testsrc) exercises the page; to force the hls.js path in a
+browser with native HLS, override `HTMLMediaElement.prototype.canPlayType` to return `''` first.
 
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
@@ -359,7 +353,7 @@ export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratc
 export ETV_STATION_CATALOG=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/station-cache/catalog.db
 cargo run --release --bin etv-station -- \
   --config "$SIM/appdata/station.yaml" --serve-ui --ui-port <PORT>
-ETV_UI_PORT=<PORT> tools/ui-get.sh '/api/channels/034-syfy/review?days=14' > a.json   # twice: a.json, b.json
+ETV_UI_PORT=<PORT> tools/ui-get.sh '/api/channels/034-syfy/review?project=14d' > a.json   # twice: a.json, b.json
 ```
 
 Look for, per films pool: `list_position` 1, 2, … inside one `seed_period`
@@ -516,11 +510,14 @@ media type and Plex reports the bare number.
 any season/episode on it is a defect:
 
 ```sh
-uv run tools/epg-browser.py channel ersatztv.6
+curl -s "$ETV_NEXT_URL/xmltv.xml" \
+  | xmllint --xpath 'count(//programme[@channel="ersatztv.6"][episode-num or sub-title])' -
 ```
 
-Look for: no programme with a non-null `season` or `episode`, and no `sub_title`.
-One is enough to fail.
+Look for: `0`, no programme on that channel with an `episode-num` or `sub-title`.
+Anything above zero fails. (`ETV_NEXT_URL` is the Guide's base URL, the one
+`GET /api/health` reports as `etv_next_url`; the channel id is the one in that
+XMLTV's `<channel id>`.)
 
 **Then ask the catalog directly.** This is the invariant, and it is one query —
 the entry a rating key is pinned to is pinned for life (ADR 0009), so a merge
@@ -1074,9 +1071,9 @@ channel".
 Channels, a lineup rail fed by `GET /api/lineup` (every lineup channel in
 `station.yaml` order: `channel` key, `number`, `display_name`, `scored`, and
 `error` for one that failed to load; logs `ui.lineup`). The view lives in the
-hash and mirrors the API: `#/channels/{ch}/schedule|pattern?days=N` is answered by
-`GET /api/channels/{ch}/review?days=N`; a key not in the lineup is a 404. Run
-`tools/ui-get.sh /api/lineup` and `tools/ui-get.sh '/api/channels/<key>/review?days=3'`,
+hash and mirrors the API: `#/channels/{ch}/schedule|pattern?project=Nd` is answered by
+`GET /api/channels/{ch}/review?project=Nd`; a key not in the lineup is a 404. Run
+`tools/ui-get.sh /api/lineup` and `tools/ui-get.sh '/api/channels/<key>/review?project=3d'`,
 then screenshot, light and dark: a channel's Schedule populated, its Pattern, the
 pending state (a fresh channel while the worker is busy), a 404 key
 (`#/channels/nope/schedule` shows "The review could not be built"), Guide and
@@ -1108,17 +1105,20 @@ state (`#/channels/001-for-you/pools?draft=gone` first shows the 404 notice, the
 deployed pools). The Tautulli account choice lists users only when `TAUTULLI_URL`
 and `TAUTULLI_API_KEY` are set.
 
-A review's simulation runs on a worker thread (`sim_cache`), not the request thread.
-`GET /api/channels/{ch}/review` answers 202 `{"pending": true}` until the worker has the channel
-(the page polls every second), then 200 from the cache; `/api/health` stays
-responsive meanwhile and carries `sim_cache: {in_memory, queued, running}`. The
-worker fills the lineup in `station.yaml` order and runs a requested channel next
-(it does not interrupt one in progress). Each finish logs `ui.sim.done` with ms; a
-served review logs `ui.review` with `sim_source="cache"`. Observed 2026-10-18 on a
-debug build over a 3-channel lineup: 034-syfy 14 days simulated in 958s, 041-cartoons
-in 101s, and both served from the cache afterwards in 2s and 11s. Results persist
-under `$TMPDIR/etv-station-ui-sims/<build>/`; touching the channel file, a `.rhai`
-script it names, or the catalog makes the next request queue a fresh simulation.
+A review answers from the channel's real airings with no simulation: `GET /api/channels/{ch}/review`
+is 200 at once (observed 2026-10-19 on a fixture station: 12 ms), every airing `projected: false`,
+`span.label` "real only". `?project=1d|3d|7d|14d` adds that many days simulated from the frontier
+on a worker thread (`projection`): 202 with the real review and `pending: true` until it lands (the
+page keeps the real schedule up beside a spinner and asks again every second), then 200 with
+`projected: true` airings, `span.projected_until` = frontier + N days and `projection.key`. Repeat
+the request: the key and airings are identical, and touching only `catalog.db`'s mtime leaves the
+key alone; editing `channel.yaml` changes it and `projection.changed` reads `["config"]`.
+Results persist in `ui-projections/` beside the catalog (they survive a deploy). Each finish logs
+`ui.projection.done` with ms and `changed`; a served review logs `ui.review`. `/api/health` carries
+`projections: {in_memory, queued, running}`. The Schedule's screenshots (real, projecting,
+projected, projection-changed; light and dark) can be taken against a fixture station:
+a scratch binary that writes a catalog, a `station.yaml` and one chunk file is enough, since
+the real side needs only the chunk files.
 
 ## Verifying the channel-wide repeat rule (`rule.no_repeat_within`)
 

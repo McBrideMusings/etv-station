@@ -167,6 +167,13 @@ pub fn generate(
     })
 }
 
+/// How many of a channel's last airings a generation reads: the widest of the
+/// adjacency reach and the scorer's recent depth. A ledger holding this many
+/// answers every `tail` a generation asks.
+pub fn ledger_reach(config: &ChannelConfig) -> usize {
+    config.adjacency_reach().max(recent_depth(config))
+}
+
 /// How deep a recently-aired tail this channel's scorer sees
 /// (`scoring.recent_depth`).
 fn recent_depth(config: &ChannelConfig) -> usize {

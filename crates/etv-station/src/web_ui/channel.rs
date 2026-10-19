@@ -1,8 +1,10 @@
 //! A channel's review (`GET /api/channels/{ch}/review`) and its tune-in
-//! stills: the simulated schedule as a report, cached by `sim_cache`.
+//! stills: the real schedule as a report, with a projection past its frontier
+//! on request, cached by `projection`.
 
 use super::lineup::{channel_key, lineup_keys};
 use super::*;
+use crate::generation;
 
 /// Where a plugin pool's pick stood in the list it walked: its `rank` (the
 /// walk position, after any temperature), its `score_rank` (by score alone),
@@ -62,22 +64,17 @@ pub(super) fn drawn_from_pool(metadata: Option<&Value>) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Channel review (the page's Schedule, `/api/channels/{ch}/review`): one channel's simulated schedule as
+// Channel review (the page's Schedule, `/api/channels/{ch}/review`): one channel's schedule as
 // a report — depth before repeats, film/series share, overlap with the rest of
-// the lineup, seeded tune-in samples and a day-by-day guide. It reads the
-// channel exactly as `channel.yaml` writes it (its own plugin scripts, no
-// working-copy profile), reloaded on every request. The simulation itself is
-// cached by `sim_cache` and filled by a worker thread, keyed on the mtimes of
-// the channel file, its scripts and the catalog, so an edit to any of them
-// shows on the next reload; a request that misses the cache gets 202
-// `{"pending": true}` and the page asks again. The numbers are
-// `crate::review`'s.
+// the lineup, seeded tune-in samples and a day-by-day guide. It opens on the
+// channel's real airings (`real`: the published playout and the play history),
+// with no simulation. `?project=Nd` adds N days simulated from the real
+// frontier, seeded from the daemon's `.resume` state and recent airings; the
+// projection is cached by `projection` on a content hash of its inputs and
+// filled by a worker thread, so a request that misses the cache gets 202 with
+// the real span and the page asks again. The numbers are `crate::review`'s,
+// computed over whatever span is on screen.
 // ---------------------------------------------------------------------------
-
-/// Days the Review view simulates when a request names none, and the most it
-/// may ask for.
-pub(super) const DEFAULT_REVIEW_DAYS: u32 = 14;
-const MAX_REVIEW_DAYS: u32 = 60;
 
 /// How many seeded tune-in moments the view samples.
 const TUNE_IN_SAMPLES: usize = 5;
@@ -101,9 +98,16 @@ pub(super) struct ReviewState {
     /// everything that decides it and the directory names this binary's
     /// build, so a file here is never stale.
     pub(super) still_dir: PathBuf,
-    /// Simulated schedules, filled by a worker thread so no request waits on one.
-    pub(super) sims: Arc<sim_cache::SimCache>,
+    /// Each channel's candidate set as one digest, with the channel file's
+    /// mtime and when it was computed: resolving every candidate costs more
+    /// than a poll should, and a catalog change shows within the memo's life.
+    candidate_digests: HashMap<PathBuf, (std::time::SystemTime, std::time::Instant, String)>,
+    /// Projections, filled by a worker thread so no request waits on one.
+    pub(super) sims: Arc<projection::SimCache>,
 }
+
+/// How long a channel's candidate digest is reused.
+const CANDIDATE_DIGEST_LIFE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ReviewState {
     pub(super) fn new(station_path: PathBuf, catalog_path: PathBuf) -> Self {
@@ -117,13 +121,17 @@ impl ReviewState {
             .map(|d| d.as_secs().to_string())
             .unwrap_or_default();
         Self {
-            sims: sim_cache::SimCache::new(
+            // On the data volume beside the catalog, so a projection survives a
+            // deploy; nothing in its key names the build.
+            sims: projection::SimCache::new(
                 station_path.clone(),
-                catalog_path,
-                std::env::temp_dir()
-                    .join("etv-station-ui-sims")
-                    .join(&build),
+                catalog_path.clone(),
+                catalog_path
+                    .parent()
+                    .map(|p| p.join("ui-projections"))
+                    .unwrap_or_else(|| std::env::temp_dir().join("etv-station-ui-projections")),
             ),
+            candidate_digests: HashMap::new(),
             station_path,
             fingerprints: HashMap::new(),
             library: None,
@@ -145,9 +153,11 @@ fn file_mtime(path: &Path) -> Result<std::time::SystemTime, String> {
 /// How many upcoming placements per rotation the Review JSON previews.
 const ROTATION_PREVIEW_PLACEMENTS: usize = 14;
 
-/// `GET /api/channels/{key}/review?days=`: the channel's review, or 202
-/// `{"pending": true}` while the worker simulates it. A key that is not in
-/// the lineup is a 404.
+/// `GET /api/channels/{key}/review[?project=Nd]`: the channel's review over its
+/// real airings, plus N days projected past the frontier when asked. While the
+/// worker simulates the projection the answer is 202 with the real span and
+/// `"pending": true`. A key that is not in the lineup is a 404, a `project`
+/// outside [`projection::DAY_CHOICES`] a 400.
 pub(super) fn api_channel_review(
     state: &mut AppState,
     key: &str,
@@ -174,11 +184,22 @@ pub(super) fn api_channel_review(
             json!({ "error": format!("no channel {key:?} in {}", state.review.station_path.display()) }),
         ));
     };
-    let days = params
-        .get("days")
-        .and_then(|d| d.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_REVIEW_DAYS)
-        .clamp(1, MAX_REVIEW_DAYS);
+    let project_days = match params.get("project") {
+        None => None,
+        Some(p) => match p
+            .strip_suffix('d')
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|n| projection::DAY_CHOICES.contains(n))
+        {
+            Some(n) => Some(n),
+            None => {
+                return Ok((
+                    400,
+                    json!({ "error": format!("project={p:?} is not one of {:?} days, as 1d, 3d, 7d or 14d", projection::DAY_CHOICES) }),
+                ));
+            }
+        },
+    };
 
     let config_path = &station.lineup[position];
     if let Some(dropped) = station
@@ -192,7 +213,6 @@ pub(super) fn api_channel_review(
             json!({
                 "channel": key,
                 "config_path": dropped.config_path.display().to_string(),
-                "days": days,
                 "load_error": dropped.reason,
             }),
         ));
@@ -204,36 +224,99 @@ pub(super) fn api_channel_review(
         .ok_or_else(|| format!("{key} is in the lineup but neither loaded nor dropped"))?;
 
     let tz = crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
-    let start = crate::tz::local_midnight_at_or_before(time::OffsetDateTime::now_utc(), tz);
+    let now = time::OffsetDateTime::now_utc();
+    let start = crate::tz::local_midnight_at_or_before(now, tz);
+    let nominal_secs = lc
+        .config
+        .scoring
+        .as_ref()
+        .map(|s| s.nominal_item_secs)
+        .unwrap_or_else(|| config::ScoringConfig::default().nominal_item_secs);
+
+    let history = real::open_history(&station.station.output_base)?;
+    let real = real::read(
+        lc,
+        history.as_ref(),
+        &state.catalog,
+        start,
+        time::Duration::seconds(i64::from(nominal_secs.max(1))),
+    )?;
+    // With nothing published a projection starts at the span's first instant:
+    // a fixed point, so its cache key does not turn over every second.
+    let frontier = real.frontier.unwrap_or(start);
+
+    let mut projected: Vec<crate::simulate::SimulatedAiring> = Vec::new();
+    let mut pending = false;
+    let mut projection_json = Value::Null;
+    let mut projected_until: Option<time::OffsetDateTime> = None;
+    if let Some(n) = project_days {
+        let seed = real::seed(lc, history.as_ref(), generation::ledger_reach(&lc.config))?;
+        let candidates = candidates_digest(&mut state.review, &state.catalog, lc)?;
+        let digests = projection::digests(
+            &state.options.station,
+            &lc.config_path,
+            &lc.config,
+            projection::frontier_digest(
+                frontier,
+                &seed.resume_bytes,
+                &seed.tail,
+                &seed.cursor,
+                &seed.show_cursor,
+            ),
+            candidates,
+        );
+        let request = projection::Request {
+            channel: key.clone(),
+            config_path: lc.config_path.clone(),
+            days: n,
+            frontier,
+            tail: seed.tail,
+            cursor: seed.cursor,
+            show_cursor: seed.show_cursor,
+            resume: seed.resume,
+            digests,
+        };
+        let request_key = request.key();
+        match state.review.sims.lookup(request) {
+            projection::Lookup::Ready(p) => {
+                let until = frontier + time::Duration::days(i64::from(n));
+                projected = p
+                    .simulation
+                    .generations
+                    .iter()
+                    .flat_map(|g| g.airings.iter().cloned())
+                    .filter(|a| a.start >= frontier && a.start < until)
+                    .collect();
+                projected_until = Some(until);
+                projection_json = json!({
+                    "key": p.key,
+                    "days": p.days,
+                    "inputs": p.inputs,
+                    "changed": p.changed,
+                });
+            }
+            projection::Lookup::Failed(e) => {
+                tracing::warn!(event = "ui.review.projection_failed", channel = %key, project_days = n, error = %e, "review: projection failed");
+                projection_json = json!({ "error": e, "days": n });
+            }
+            projection::Lookup::Pending => {
+                tracing::info!(event = "ui.review.pending", channel = %key, project_days = n, key = %request_key, "review: projection queued");
+                pending = true;
+                projection_json = json!({ "pending": true, "days": n, "key": request_key });
+            }
+        }
+    }
+
+    let span_end = projected_until.unwrap_or(frontier);
     let mut day_starts = vec![start];
-    for _ in 0..days {
+    while *day_starts.last().expect("non-empty") < span_end || day_starts.len() < 2 {
         let last = *day_starts.last().expect("non-empty");
         day_starts.push(crate::tz::add_chunk(last, 24, tz));
     }
     let end = *day_starts.last().expect("non-empty");
-
-    let sim_key = sim_cache::SimKey {
-        config_path: lc.config_path.clone(),
-        days,
-        start: start.unix_timestamp(),
-    };
-    let fp = sim_cache::fingerprint(
-        &state.options.station,
-        &lc.config_path,
-        &lc.config,
-        &state.options.catalog,
-    );
-    let (sim, sim_source) = match state.review.sims.lookup(&sim_key, &fp) {
-        sim_cache::Lookup::Ready(sim) => (sim, "cache"),
-        sim_cache::Lookup::Failed(e) => return Err(e),
-        sim_cache::Lookup::Pending => {
-            tracing::info!(event = "ui.review.pending", channel = %key, days, "review: simulation queued");
-            return Ok((
-                202,
-                json!({ "pending": true, "channel": key, "days": days }),
-            ));
-        }
-    };
+    let real_count = real.airings.len();
+    let all: Vec<crate::simulate::SimulatedAiring> =
+        real.airings.into_iter().chain(projected).collect();
 
     let block_names: Vec<String> = lc
         .config
@@ -250,7 +333,7 @@ pub(super) fn api_channel_review(
     let mut entries: HashMap<String, Option<CatalogEntry>> = HashMap::new();
     let mut airings: Vec<crate::review::ReviewAiring> = Vec::new();
     let mut simulated: Vec<&crate::simulate::SimulatedAiring> = Vec::new();
-    for a in sim.generations.iter().flat_map(|g| &g.airings) {
+    for a in &all {
         // Every airing, past the span's end too, so the last one in the span
         // still has a successor for its tune-in still's NEXT card. Airings
         // run in time order, so `simulated[i]` is `airings[i]` for each `i`
@@ -297,14 +380,9 @@ pub(super) fn api_channel_review(
             .collect::<Vec<_>>()
     });
 
-    let nominal_secs = lc
-        .config
-        .scoring
-        .as_ref()
-        .map(|s| s.nominal_item_secs)
-        .unwrap_or_else(|| config::ScoringConfig::default().nominal_item_secs);
     let mut notices = Vec::new();
-    let unprobed = airings
+    let projected_airings = &airings[real_count.min(airings.len())..];
+    let unprobed = projected_airings
         .iter()
         .filter(|a| {
             entries
@@ -316,12 +394,12 @@ pub(super) fn api_channel_review(
         .count();
     if unprobed > 0 {
         notices.push(format!(
-            "{unprobed} of {} airings have no catalog length and run at nominal_item_secs ({nominal_secs}s); \
+            "{unprobed} of {} projected airings have no catalog length and run at nominal_item_secs ({nominal_secs}s); \
              the daemon would probe the file instead.",
-            airings.len()
+            projected_airings.len()
         ));
     }
-    if lc.config.anchor.is_some() {
+    if project_days.is_some() && lc.config.anchor.is_some() {
         notices.push(
             "This channel sets an anchor; the anchor join on its first generation is not modelled."
                 .to_string(),
@@ -399,6 +477,7 @@ pub(super) fn api_channel_review(
                 "kind": a.kind,
                 "pool": a.pool,
                 "start": a.start.unix_timestamp(),
+                "projected": i >= real_count,
                 "offset_secs": (a.start - start).whole_seconds(),
                 "duration_secs": a.duration.whole_seconds(),
                 "ranking": ranking_of(simulated[i].metadata.as_ref()),
@@ -410,9 +489,9 @@ pub(super) fn api_channel_review(
     tracing::info!(
         event = "ui.review",
         channel = %key,
-        days,
-        sim_source,
-        generations = sim.generations.len(),
+        project_days,
+        pending,
+        real_airings = real_count,
         airings = airings.len(),
         overlap_channels = review["overlap"]["channels"]
             .as_array()
@@ -422,9 +501,30 @@ pub(super) fn api_channel_review(
         "review: schedule replayed"
     );
 
+    let span_label = match project_days {
+        Some(1) if !pending => "real + 1 day projected".to_string(),
+        Some(n) if !pending => format!("real + {n} days projected"),
+        _ => "real only".to_string(),
+    };
     let mut out = review;
     let obj = out.as_object_mut().expect("build_review returns an object");
     obj.insert("channel".into(), json!(key));
+    obj.insert(
+        "frontier".into(),
+        json!(real.frontier.map(|f| f.unix_timestamp())),
+    );
+    obj.insert(
+        "span".into(),
+        json!({
+            "real_until": real.frontier.map(|f| f.unix_timestamp()),
+            "projected_until": projected_until.map(|f| f.unix_timestamp()),
+            "label": span_label,
+        }),
+    );
+    obj.insert("projection".into(), projection_json);
+    if pending {
+        obj.insert("pending".into(), json!(true));
+    }
     obj.insert("since_last".into(), json!(since_last_json));
     obj.insert("notices".into(), json!(notices));
     obj.insert(
@@ -449,11 +549,11 @@ pub(super) fn api_channel_review(
                 .collect::<Vec<_>>()
         ),
     );
-    Ok((200, out))
+    Ok((if pending { 202 } else { 200 }, out))
 }
 
 /// A movie as `Title (Year)`, an episode as `Show S01E02 · Title`.
-fn airing_label(e: &CatalogEntry) -> String {
+pub(super) fn airing_label(e: &CatalogEntry) -> String {
     match (&e.show, e.season, e.episode) {
         (Some(show), Some(s), Some(ep)) => format!("{show} S{s:02}E{ep:02} · {}", e.title),
         (Some(show), _, _) => format!("{show} · {}", e.title),
@@ -530,6 +630,46 @@ fn steps_json(steps: &[config::PatternStep]) -> Vec<Value> {
         .iter()
         .map(|s| json!({ "pool": s.pool, "take": s.take.bounds(), "chance": s.chance }))
         .collect()
+}
+
+/// The channel's candidate set (entry ids and durations) as one digest. Not
+/// the `channel_fingerprint` cache: that one is keyed on the channel file's
+/// mtime and would hide a catalog change; this one recomputes after
+/// [`CANDIDATE_DIGEST_LIFE`].
+fn candidates_digest(
+    review: &mut ReviewState,
+    catalog: &Catalog,
+    lc: &config::LoadedChannel,
+) -> Result<String, String> {
+    let mtime = file_mtime(&lc.config_path)?;
+    if let Some((cached_mtime, at, digest)) = review.candidate_digests.get(&lc.config_path)
+        && *cached_mtime == mtime
+        && at.elapsed() < CANDIDATE_DIGEST_LIFE
+    {
+        return Ok(digest.clone());
+    }
+    let ids = crate::resolve::resolve_channel_fingerprint_ids(
+        &lc.config,
+        &lc.config_path,
+        &[],
+        None,
+        Some(catalog),
+    )
+    .map_err(|e| e.to_string())?;
+    let entries = catalog.entries_for(&ids).map_err(|e| e.to_string())?;
+    let digest = projection::candidates_digest(
+        ids.into_iter()
+            .map(|id| {
+                let ms = entries.get(&id).and_then(|e| e.duration_ms);
+                (id, ms)
+            })
+            .collect(),
+    );
+    review.candidate_digests.insert(
+        lc.config_path.clone(),
+        (mtime, std::time::Instant::now(), digest.clone()),
+    );
+    Ok(digest)
 }
 
 /// One channel's candidate entry ids, resolved from its config with no
