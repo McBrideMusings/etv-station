@@ -1777,6 +1777,19 @@ sets no `why` writes neither. The station carries both keys through untouched
 and never reads them; `deploy/appdata/shared/corner-sequence.rhai` is one
 overlay that draws them.
 
+**A reason can be a watched title.** On a movies pool that sets `why`, the
+scorer also looks, once per generation, for the most recently watched movie in
+`ctx.history` that carries one of the pick's matched keywords (heaviest first).
+When one exists, `why_detail` leads with that title and follows with the
+keyword that linked them (`Blade Runner · neo-noir`), and the pick's metadata gains
+`why_bridge`: `{ title, year, watcher, via }`, where `watcher` is who watched
+it (empty on a pooled history row that names nobody) and `via` the shared
+keyword. A channel that wants to say the name reads `why_bridge.watcher`; one
+that doesn't ignores it. A watch qualifies only inside `bridge_window_days`
+(pool `config:`, default `30`). A pick with no qualifying title, an
+exploration draw, and a title that would cite itself keep the keyword detail
+and carry no `why_bridge`. The overlay is unchanged.
+
 #### `ignore_keywords` — tags that describe packaging, not subject
 
 ```yaml
@@ -2035,8 +2048,8 @@ below. The two sides must agree exactly:
 `examples/plugins/taste-cosine.rhai` reads `ctx.sets` and reaches for a named
 datastore, so it declares
 `["catalog_read", "watch_history", #{ datastore: "taste" }]` (#254's interface
-list — `watch_history` is declared without `pick()` reading `ctx.history`
-today, reserved rather than removed); `examples/samples/foryou.yaml` grants
+list — `pick()` reads `ctx.history` only to name a watched title as a
+pick's reason, see `why` above); `examples/samples/foryou.yaml` grants
 all three on the one pool that points at it.
 
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
