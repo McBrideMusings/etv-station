@@ -791,6 +791,9 @@ fn write_pass(
             stats.entries_marked_missing = c.mark_entries_missing_without_live_sources(stamp)?;
         }
         c.set_last_plex_ingest(started)?;
+        if prune_absent {
+            c.set_last_plex_full_ingest(started)?;
+        }
         Ok::<PlexIngestStats, PlexIngestError>(stats)
     })
 }
@@ -2194,11 +2197,18 @@ mod tests {
         assert_eq!(delta.sources_marked_missing, 0);
         assert_eq!(delta.entries_marked_missing, 0);
         assert_eq!(live(&cat), 4, "a delta pass must prune nothing");
+        assert_eq!(cat.last_plex_ingest().unwrap(), Some(2));
+        assert_eq!(
+            cat.last_plex_full_ingest().unwrap(),
+            Some(1),
+            "a delta must not advance the full-pass timestamp"
+        );
 
         let full = write_pass(&cat, &items[..2], &[], &[], &roots, None, 3).unwrap();
         assert_eq!(full.sources_marked_missing, 2);
         assert_eq!(full.entries_marked_missing, 2);
         assert_eq!(live(&cat), 2);
+        assert_eq!(cat.last_plex_full_ingest().unwrap(), Some(3));
     }
 
     /// Before ADR 0006 the Plex ingest reconciled *collections* and nothing
