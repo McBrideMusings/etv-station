@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use super::block::BlockFile;
 use super::categories::{self, Categories};
 use super::channel::ChannelConfig;
-use super::entry::{CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry};
+use super::chronology::{self, Chronologies};
+use super::entry::{
+    ChronologyEntry, CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry,
+};
 use super::overlay::{self, ChannelOverlays};
 use super::source::SourceConfig;
 use super::station::{self, StationConfig};
@@ -126,6 +129,7 @@ fn load_with(
     resolve_fonts(station_path, &base, &mut station.fonts)?;
 
     let categories = load_categories(station_path, &base, &station.categories)?;
+    let chronologies = load_chronologies(station_path, &base, &station.chronologies)?;
     let channel_paths = expand_channel_patterns(station_path, &base, &station.channels)?;
     let lineup = channel_paths.clone();
 
@@ -136,7 +140,14 @@ fn load_with(
     let mut channels = Vec::with_capacity(channel_paths.len());
     let mut dropped = Vec::new();
     for channel_path in channel_paths {
-        match load_one_channel(&station, &base, &channel_path, &categories, refs) {
+        match load_one_channel(
+            &station,
+            &base,
+            &channel_path,
+            &categories,
+            &chronologies,
+            refs,
+        ) {
             Ok(channel) => channels.push(channel),
             Err(e) => {
                 tracing::error!(
@@ -193,11 +204,13 @@ fn load_one_channel(
     base: &Path,
     channel_path: &Path,
     categories: &Categories,
+    chronologies: &Chronologies,
     env: EnvLookup<'_>,
 ) -> Result<LoadedChannel, ConfigError> {
     let mut config: ChannelConfig = read_config_file(channel_path)?;
     resolve_blocks(&mut config, channel_path, env)?;
     expand_categories(&mut config, channel_path, categories)?;
+    attach_chronologies(&mut config, channel_path, chronologies)?;
     validate::validate_channel(channel_path, &config)?;
     let name = resolve_identity(channel_path, &config)?;
     apply_station_variety(&mut config, station, &name);
@@ -243,6 +256,56 @@ fn load_categories(
         files.push((path, parsed));
     }
     Categories::from_files(files).map_err(invalid)
+}
+
+/// Read every chronology file the station's `chronologies:` patterns name. A
+/// bad or duplicate declaration, or two entries on one position, fails the
+/// whole station load: a chronology is shared, so there is no single channel
+/// to drop for it.
+fn load_chronologies(
+    station_path: &Path,
+    base: &Path,
+    patterns: &[String],
+) -> Result<Chronologies, ConfigError> {
+    let invalid = |message: String| ConfigError::Validation {
+        path: station_path.to_path_buf(),
+        message,
+    };
+    let mut files = Vec::new();
+    for path in expand_channel_patterns(station_path, base, patterns)? {
+        let parsed = chronology::read_chronology_file(&path).map_err(invalid)?;
+        files.push((path, parsed));
+    }
+    Chronologies::from_files(files).map_err(invalid)
+}
+
+/// Attach the named chronology to every `kind: chronology` entry of one
+/// channel (#164), before the channel validates. A name no file declares drops
+/// the channel naming it.
+fn attach_chronologies(
+    config: &mut ChannelConfig,
+    channel_path: &Path,
+    chronologies: &Chronologies,
+) -> Result<(), ConfigError> {
+    let labels: Vec<String> = (0..config.rule.all_blocks().count())
+        .map(|idx| config.rule.block_label(idx))
+        .collect();
+    for (label, include) in labels.iter().zip(config.rule.all_blocks_mut()) {
+        for entry in &mut include.entries {
+            if let Entry::Chronology(c) = entry {
+                c.resolved =
+                    Some(
+                        chronologies
+                            .get(&c.name)
+                            .map_err(|e| ConfigError::Validation {
+                                path: channel_path.to_path_buf(),
+                                message: format!("{label}: {e}"),
+                            })?,
+                    );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Replace `category("name")` in every pool expression of one channel with its
@@ -827,6 +890,7 @@ fn assert_entry_kinds_covered(entry: &Entry) {
         Entry::Item(_) => {}
         Entry::Query(_) => {}
         Entry::Collection(_) => {}
+        Entry::Chronology(_) => {}
         Entry::Include(_) => {}
     }
 }
@@ -883,6 +947,7 @@ fn check_entry_unknown_keys(value: &serde_json::Value, prefix: &str, out: &mut V
         "item" => check_variant_unknown_keys::<ItemEntry>(value, prefix, out),
         "query" => check_variant_unknown_keys::<QueryEntry>(value, prefix, out),
         "collection" => check_variant_unknown_keys::<CollectionEntry>(value, prefix, out),
+        "chronology" => check_variant_unknown_keys::<ChronologyEntry>(value, prefix, out),
         "include" => check_variant_unknown_keys::<IncludeEntry>(value, prefix, out),
         _ => {}
     }
@@ -980,36 +1045,16 @@ mod tests {
         path
     }
 
-    fn local_paths(loaded: &Station) -> Vec<&str> {
-        loaded
-            .channels
-            .iter()
-            .flat_map(|c| c.config.rule.blocks.iter())
-            .flat_map(|b| b.entries())
-            .filter_map(|e| match e {
-                Entry::Item(item) => match &item.source {
-                    SourceConfig::Local { path } => Some(path.as_str()),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn loads_example_fixture() {
-        // An example channel references ${ETV_TEST_MEDIA_DIR}, and the
-        // `foryou.yaml` sample's movies pool references
-        // ${PLEXDB_SNAPSHOT_PATH} (#254) — hand the loader a table holding
-        // both rather than exporting either into the running process.
+        // The `foryou.yaml` sample's movies pool references
+        // ${PLEXDB_SNAPSHOT_PATH} (#254) — hand the loader a table holding it
+        // rather than exporting it into the running process.
         let taste_store = write_minimal_taste_store();
         // Bound rather than passed inline: `env_map` returns an `impl Fn` that
         // captures its argument's lifetime, so a temporary array would be
         // freed while the returned lookup still borrowed it.
-        let vars = [
-            ("ETV_TEST_MEDIA_DIR", "/tmp/etv-test-media"),
-            ("PLEXDB_SNAPSHOT_PATH", taste_store.to_str().unwrap()),
-        ];
+        let vars = [("PLEXDB_SNAPSHOT_PATH", taste_store.to_str().unwrap())];
         let env = env_map(&vars);
         let path = examples_station();
         let loaded = load_with_env(&path, &env).expect("examples/station.yaml should load");
@@ -1026,14 +1071,6 @@ mod tests {
             .map(|b| b.entries().len())
             .sum();
         assert!(entries > 0, "rule must resolve to at least one entry");
-
-        // Proves the expansion came from the table above and not from whatever
-        // ETV_TEST_MEDIA_DIR happens to hold in the shell running the suite.
-        let paths = local_paths(&loaded);
-        assert!(
-            paths.iter().any(|p| p.starts_with("/tmp/etv-test-media")),
-            "a local source must expand from the supplied table, got {paths:?}"
-        );
     }
 
     #[test]
@@ -1359,6 +1396,7 @@ mod tests {
             output_base: PathBuf::from("out"),
             channels: vec!["channels/a.yaml".into()],
             categories: Vec::new(),
+            chronologies: Vec::new(),
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,

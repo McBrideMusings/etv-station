@@ -365,6 +365,24 @@ pub struct Swapped {
     pub path: String,
 }
 
+/// What the previous tick saw of each pending file: its size and mtime. A file
+/// whose stamp differs this tick is still being written, so it is not swapped.
+pub type PendingSeen = std::collections::HashMap<std::path::PathBuf, (u64, std::time::SystemTime)>;
+
+/// Record `real`'s stamp in `next`; true when `prev`, the map the previous
+/// tick built, holds the same one. A file that cannot be stat'd is never
+/// stable.
+fn stable_since_last_tick(prev: &PendingSeen, next: &mut PendingSeen, real: &Path) -> bool {
+    let Some(stamp) = std::fs::metadata(real)
+        .ok()
+        .and_then(|m| Some((m.len(), m.modified().ok()?)))
+    else {
+        return false;
+    };
+    next.insert(real.to_path_buf(), stamp);
+    prev.get(real) == Some(&stamp)
+}
+
 /// A pending item's `(real file, loop)`, from its `metadata.pending`.
 fn pending_of(item: &PlayoutItem) -> Option<(String, bool)> {
     let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
@@ -391,12 +409,17 @@ fn copy_item(item: &PlayoutItem) -> Option<PlayoutItem> {
 /// with black otherwise. `record_swap` is asked before each swap to point the
 /// segment's ledger row at the real file; a `false` leaves the stand-in in
 /// place for the next tick, so the file and the ledger never disagree.
+/// A file whose size or mtime differs from what `prev` recorded on the
+/// previous tick is still being written and keeps its stand-in until it holds
+/// still for one full tick; this tick's stamps go into `next`.
 /// Returns the segments swapped.
 pub fn swap_pending_items(
     items: &mut Vec<PlayoutItem>,
     channel: &str,
     now: OffsetDateTime,
     media_len_ms: fn(&Path) -> Option<u64>,
+    prev: &PendingSeen,
+    next: &mut PendingSeen,
     record_swap: &mut dyn FnMut(&Swapped) -> bool,
 ) -> Vec<Swapped> {
     let mut old: Vec<Option<PlayoutItem>> = std::mem::take(items).into_iter().map(Some).collect();
@@ -422,7 +445,10 @@ pub fn swap_pending_items(
         i = end;
         let (start, finish) = (group[0].start, group[group.len() - 1].finish);
         let real = Path::new(&path);
-        let len = if start > now + PENDING_SWAP_LEAD && real.is_file() {
+        let len = if real.is_file()
+            && stable_since_last_tick(prev, next, real)
+            && start > now + PENDING_SWAP_LEAD
+        {
             media_len_ms(real).filter(|l| *l > 0)
         } else {
             None
@@ -515,13 +541,18 @@ pub fn swap_pending_items(
 /// keeps its stand-in until a later tick.
 ///
 /// A file or channel that cannot be read is logged and skipped, as in
-/// [`reconcile_playout_paths`].
+/// [`reconcile_playout_paths`]. `seen` carries each pending file's size and
+/// mtime from one tick to the next; the caller keeps it across ticks. Each call
+/// replaces it with the stamps this tick saw, so a path no longer pending drops
+/// out, and a stamp taken earlier in this tick never counts as a previous one.
 pub async fn swap_pending_playout(
     channels: &[LoadedChannel],
     history_db: &Arc<HistoryDb>,
     now: OffsetDateTime,
     media_len_ms: fn(&Path) -> Option<u64>,
+    seen: &mut PendingSeen,
 ) -> usize {
+    let prev = std::mem::take(seen);
     let mut total = 0;
     for channel in channels {
         let files = match crate::scan::scan_output_folder(&channel.output_folder).await {
@@ -537,7 +568,16 @@ pub async fn swap_pending_playout(
             }
         };
         for file in files.into_iter().filter(|f| f.finish > now) {
-            match swap_pending_file(&file.path, &channel.name, history_db, now, media_len_ms).await
+            match swap_pending_file(
+                &file.path,
+                &channel.name,
+                history_db,
+                now,
+                media_len_ms,
+                &prev,
+                seen,
+            )
+            .await
             {
                 Ok(n) => total += n,
                 Err(e) => tracing::warn!(
@@ -559,6 +599,8 @@ async fn swap_pending_file(
     history_db: &Arc<HistoryDb>,
     now: OffsetDateTime,
     media_len_ms: fn(&Path) -> Option<u64>,
+    prev: &PendingSeen,
+    next: &mut PendingSeen,
 ) -> Result<usize, String> {
     let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     // Almost no file holds a pending item; skip parsing the ones that cannot.
@@ -571,7 +613,8 @@ async fn swap_pending_file(
     let mut playout: Playout = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let channel = channel.to_string();
     let history_db = Arc::clone(history_db);
-    let (playout, swapped) = tokio::task::spawn_blocking(move || {
+    let prev_owned = prev.clone();
+    let (playout, swapped, stamps) = tokio::task::spawn_blocking(move || {
         let mut record_swap = |s: &Swapped| {
             match history_db.set_bumper_source(&channel, &s.segment, s.start, &s.path) {
                 Ok(rows) if rows > 0 => true,
@@ -596,17 +639,21 @@ async fn swap_pending_file(
                 }
             }
         };
+        let mut stamps = PendingSeen::new();
         let swapped = swap_pending_items(
             &mut playout.items,
             &channel,
             now,
             media_len_ms,
+            &prev_owned,
+            &mut stamps,
             &mut record_swap,
         );
-        (playout, swapped)
+        (playout, swapped, stamps)
     })
     .await
     .map_err(|e| e.to_string())?;
+    next.extend(stamps);
     if !swapped.is_empty() {
         atomic_write_json(path, &playout)
             .await
@@ -1179,6 +1226,60 @@ mod tests {
             .collect()
     }
 
+    /// `swap_pending_items` as the second tick of a stable file: the first call
+    /// only records what it saw, the second is the one whose result counts.
+    fn swap_items(
+        items: &mut Vec<PlayoutItem>,
+        channel: &str,
+        now: OffsetDateTime,
+        len: fn(&Path) -> Option<u64>,
+        record: &mut dyn FnMut(&Swapped) -> bool,
+    ) -> Vec<Swapped> {
+        let mut first = PendingSeen::new();
+        swap_pending_items(
+            items,
+            channel,
+            now,
+            len,
+            &PendingSeen::new(),
+            &mut first,
+            record,
+        );
+        swap_pending_items(
+            items,
+            channel,
+            now,
+            len,
+            &first,
+            &mut PendingSeen::new(),
+            record,
+        )
+    }
+
+    /// One daemon tick over `items`: the stamps `seen` holds are the previous
+    /// tick's, and it is replaced with this tick's.
+    fn item_tick(
+        items: &mut Vec<PlayoutItem>,
+        now: OffsetDateTime,
+        seen: &mut PendingSeen,
+    ) -> usize {
+        let prev = std::mem::take(seen);
+        swap_pending_items(items, "c", now, len_20s, &prev, seen, &mut |_| true).len()
+    }
+
+    /// One daemon tick over a single playout file.
+    async fn file_tick(
+        file: &Path,
+        db: &Arc<HistoryDb>,
+        now: OffsetDateTime,
+        seen: &mut PendingSeen,
+    ) -> usize {
+        let prev = std::mem::take(seen);
+        swap_pending_file(file, "c", db, now, len_20s, &prev, seen)
+            .await
+            .unwrap()
+    }
+
     fn real_file(dir: &TempDir) -> String {
         let real = dir.path().join("real.mp4");
         std::fs::write(&real, b"x").unwrap();
@@ -1198,7 +1299,7 @@ mod tests {
             10,
         )];
         assert_eq!(
-            swap_pending_items(&mut items, "c", now, len_20s, &mut |_| true).len(),
+            swap_items(&mut items, "c", now, len_20s, &mut |_| true).len(),
             1
         );
         assert_eq!(spans(&items), vec![(real, 10, Some(10_000))]);
@@ -1222,7 +1323,7 @@ mod tests {
         let at = datetime!(2026-08-16 13:00:00 UTC);
 
         let mut looped = vec![pending_item("bumper:c:1:0", &real, true, at, 10)];
-        swap_pending_items(&mut looped, "c", now, len_4s, &mut |_| true);
+        swap_items(&mut looped, "c", now, len_4s, &mut |_| true);
         assert_eq!(
             spans(&looped),
             vec![
@@ -1234,7 +1335,7 @@ mod tests {
         assert_eq!(looped[2].id, "bumper:c:1:0#2");
 
         let mut padded = vec![pending_item("bumper:c:1:0", &real, false, at, 10)];
-        swap_pending_items(&mut padded, "c", now, len_4s, &mut |_| true);
+        swap_items(&mut padded, "c", now, len_4s, &mut |_| true);
         assert_eq!(
             spans(&padded),
             vec![(real, 4, Some(4_000)), ("lavfi".into(), 6, None)]
@@ -1257,7 +1358,7 @@ mod tests {
                 6,
             ),
         ];
-        let n = swap_pending_items(
+        let n = swap_items(
             &mut items,
             "c",
             datetime!(2026-08-16 12:00:00 UTC),
@@ -1298,7 +1399,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            swap_pending_items(&mut items, "c", now, len_20s, &mut |_| true).len(),
+            swap_items(&mut items, "c", now, len_20s, &mut |_| true).len(),
             0
         );
         assert!(
@@ -1331,11 +1432,10 @@ mod tests {
         .await;
         let now = datetime!(2026-08-16 12:00:00 UTC);
         let db = Arc::new(HistoryDb::open_in_memory().unwrap());
+        let mut seen = PendingSeen::new();
 
         // The generation has not recorded the segment yet: it keeps its stand-in.
-        let n = swap_pending_file(&file, "c", &db, now, len_20s)
-            .await
-            .unwrap();
+        let n = file_tick(&file, &db, now, &mut seen).await;
         assert_eq!(n, 0);
         assert_eq!(
             source_path(&items_at(&file).await[0]),
@@ -1354,14 +1454,10 @@ mod tests {
             }],
         )
         .unwrap();
-        let n = swap_pending_file(&file, "c", &db, now, len_20s)
-            .await
-            .unwrap();
+        let n = file_tick(&file, &db, now, &mut seen).await;
         assert_eq!(n, 1);
         assert_eq!(source_path(&items_at(&file).await[0]), Some(real.as_str()));
-        let n = swap_pending_file(&file, "c", &db, now, len_20s)
-            .await
-            .unwrap();
+        let n = file_tick(&file, &db, now, &mut seen).await;
         assert_eq!(n, 0);
     }
 
@@ -1396,7 +1492,13 @@ mod tests {
         )
         .unwrap();
 
-        let n = swap_pending_playout(&[ch], &db, now(), len_20s).await;
+        let mut seen = PendingSeen::new();
+        let chs = [ch];
+        assert_eq!(
+            swap_pending_playout(&chs, &db, now(), len_20s, &mut seen).await,
+            0
+        );
+        let n = swap_pending_playout(&chs, &db, now(), len_20s, &mut seen).await;
         assert_eq!(n, 1);
 
         let source_of = |name: &str| {
@@ -1414,6 +1516,73 @@ mod tests {
     }
 
     #[test]
+    fn a_growing_file_keeps_its_stand_in_until_it_holds_still() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+        let at = datetime!(2026-08-16 13:00:00 UTC);
+        let mut items = vec![pending_item("bumper:c:1:0", &real, false, at, 10)];
+        let mut seen = PendingSeen::new();
+
+        assert_eq!(item_tick(&mut items, now, &mut seen), 0, "first sight");
+        std::fs::write(&real, b"xxxxxxxx").unwrap();
+        assert_eq!(
+            item_tick(&mut items, now, &mut seen),
+            0,
+            "grew since the last tick"
+        );
+        assert!(
+            items[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get(PENDING_KEY)
+                .is_some()
+        );
+        assert_eq!(
+            item_tick(&mut items, now, &mut seen),
+            1,
+            "held still one tick"
+        );
+        assert!(
+            items[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get(PENDING_KEY)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_in_two_playout_files_is_not_stable_within_one_tick() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let (out, out2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let at = datetime!(2026-08-16 13:00:00 UTC);
+        let a = write_playout(
+            &out,
+            vec![pending_item("bumper:c:1:0", &real, false, at, 10)],
+        )
+        .await;
+        let b = write_playout(
+            &out2,
+            vec![pending_item("bumper:c:2:0", &real, false, at, 10)],
+        )
+        .await;
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+        let db = Arc::new(HistoryDb::open_in_memory().unwrap());
+        let mut seen = PendingSeen::new();
+        let prev = PendingSeen::new();
+        for f in [&a, &b] {
+            let n = swap_pending_file(f, "c", &db, now, len_20s, &prev, &mut seen)
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "no earlier tick has seen this file");
+        }
+    }
+
+    #[test]
     fn two_back_to_back_pending_segments_naming_one_file_stay_two_segments() {
         let dir = TempDir::new().unwrap();
         let real = real_file(&dir);
@@ -1428,7 +1597,7 @@ mod tests {
                 10,
             ),
         ];
-        let n = swap_pending_items(
+        let n = swap_items(
             &mut items,
             "c",
             datetime!(2026-08-16 12:00:00 UTC),

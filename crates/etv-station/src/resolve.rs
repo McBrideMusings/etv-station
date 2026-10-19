@@ -57,8 +57,9 @@ use time::OffsetDateTime;
 
 use crate::catalog::{Catalog, EntrySource, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, CollectionEntry, Constraints, Duplicates, Entry, Fallback, Filter,
-    ItemEntry, Mode, NoRepeatWithin, Order, QueryEntry, ShowGroup, SourceConfig,
+    BlockInclude, ChannelConfig, ChronologyEntry, ChronologyRef, CollectionEntry, Constraints,
+    Duplicates, Entry, Fallback, Filter, ItemEntry, Mode, NoRepeatWithin, Order, QueryEntry,
+    ShowGroup, SourceConfig,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap};
 use crate::errors::ConfigError;
@@ -993,6 +994,16 @@ pub fn resolve_channel_fingerprint_ids(
                         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                     block_ids.extend(resolved.into_iter().map(|item| item.id));
                 }
+                Entry::Chronology(chronology) => {
+                    let cat = catalog.ok_or_else(|| {
+                        unsupported(format!(
+                            "block #{idx}: a chronology entry needs the catalog to fingerprint"
+                        ))
+                    })?;
+                    let resolved = resolve_chronology(cat, chronology)
+                        .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                    block_ids.extend(resolved.into_iter().map(|item| item.id));
+                }
                 Entry::Include(_) => {
                     return Err(unsupported(format!(
                         "block #{idx}: include entries are not implemented yet (#69)"
@@ -1508,6 +1519,22 @@ fn resolve_block(
                 );
                 items.extend(resolved);
             }
+            Entry::Chronology(chronology) => {
+                let cat = catalog.ok_or_else(|| {
+                    unsupported(format!(
+                        "block #{idx}: a chronology entry needs the catalog, which is not available"
+                    ))
+                })?;
+                let mut resolved = resolve_chronology(cat, chronology)
+                    .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
+                stamp_select(
+                    &mut resolved,
+                    "entries:chronology",
+                    &format!("entry of chronology {:?}", chronology.name),
+                    Some(serde_json::json!({ "chronology": chronology.name })),
+                );
+                items.extend(resolved);
+            }
             Entry::Include(_) => {
                 return Err(unsupported(format!(
                     "block #{idx}: include entries are not implemented yet (#69)"
@@ -1930,6 +1957,83 @@ fn resolve_collection(
         ));
     }
     pending_items(catalog, members)
+}
+
+/// Resolve a `chronology` entry (#164): map each reference, in position
+/// order, to the one catalog item it names. A reference matching nothing, or
+/// more than one item, fails naming the entry — a hand-maintained order must
+/// not quietly shrink or guess as the library changes.
+fn resolve_chronology(
+    catalog: &Catalog,
+    entry: &ChronologyEntry,
+) -> Result<Vec<ResolvedItem>, String> {
+    let chronology = entry.resolved.as_ref().ok_or_else(|| {
+        format!(
+            "chronology {:?} was not attached; chronologies resolve only through a station \
+             load that lists them under `chronologies:`",
+            entry.name
+        )
+    })?;
+    let mut ids: Vec<String> = Vec::with_capacity(chronology.entries.len());
+    let mut seen: HashMap<String, &ChronologyRef> = HashMap::new();
+    let mut refs: Vec<&ChronologyRef> = Vec::with_capacity(chronology.entries.len());
+    for reference in &chronology.entries {
+        let mut matched = catalog
+            .resolve_query(&reference.query())
+            .map_err(|e| e.to_string())?;
+        match matched.len() {
+            1 => {
+                let id = matched.remove(0);
+                // The block's `collapse` duplicates policy would drop the second
+                // airing without a word, shrinking the authored order.
+                if let Some(first) = seen.insert(id.clone(), reference) {
+                    return Err(format!(
+                        "chronology {:?}: {} at position {} and {} at position {} name the \
+                         same catalog item ({id})",
+                        chronology.name,
+                        first.describe(),
+                        first.position,
+                        reference.describe(),
+                        reference.position
+                    ));
+                }
+                ids.push(id);
+                refs.push(reference);
+            }
+            0 => {
+                return Err(format!(
+                    "chronology {:?} position {}: {} matches no catalog item",
+                    chronology.name,
+                    reference.position,
+                    reference.describe()
+                ));
+            }
+            n => {
+                return Err(format!(
+                    "chronology {:?} position {}: {} matches {n} catalog items ({}); a \
+                     reference must name exactly one",
+                    chronology.name,
+                    reference.position,
+                    reference.describe(),
+                    matched.join(", ")
+                ));
+            }
+        }
+    }
+    // `pending_items` skips a catalog row with no file behind it, which would
+    // quietly drop an entry from a hand-authored order.
+    let sources = catalog.sources_for_many(&ids).map_err(|e| e.to_string())?;
+    for (id, reference) in ids.iter().zip(&refs) {
+        if !sources.contains_key(id) {
+            return Err(format!(
+                "chronology {:?} position {}: {} ({id}) has no playable file in the catalog",
+                chronology.name,
+                reference.position,
+                reference.describe()
+            ));
+        }
+    }
+    pending_items(catalog, ids)
 }
 
 /// Narrow a block's resolved list to `filter`'s restrictions (#197): `seasons`

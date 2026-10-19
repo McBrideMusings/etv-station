@@ -16,14 +16,11 @@
 //! `examples/overlays/` is not covered: those parse through the overlay crate's
 //! own loader, which reroots script and image paths as it reads.
 //!
-//! Block-file coverage is split in two (#360). `examples/samples/blocks/`
-//! holds a tracked, generic fixture and is always present, so it is parsed
-//! unconditionally — that is the coverage this test ships. `examples/blocks/`
-//! is gitignored personal channel content: present with real files on a
-//! machine that authored its own channels, absent on a fresh clone or a
-//! worktree. It is parsed only when it exists, as an opportunistic local
-//! check, and stays silent rather than failing when it is legitimately
-//! empty.
+//! Block-file coverage is tracked only (#360). `examples/samples/blocks/`
+//! holds a generic fixture and is parsed. `examples/blocks/` is gitignored
+//! personal channel content and is not parsed here, so a broken personal file
+//! cannot turn this test red in the one checkout that has it; the dev station
+//! fails loading it at startup instead.
 
 use std::path::{Path, PathBuf};
 
@@ -94,26 +91,6 @@ fn configs_in(dir: &Path) -> Vec<PathBuf> {
     nonempty_sorted(found, dir)
 }
 
-/// Every config on disk directly inside `dir`, tracked or not, for a
-/// directory that is legitimately absent — gitignored personal content that
-/// exists only on the machine that authored it, never on a fresh clone or a
-/// git worktree (#360). Missing entirely means "nothing to check": returns
-/// empty rather than failing. A directory that *does* exist must hold at
-/// least one config, so a present-but-empty leftover or a malformed file
-/// inside it still fails loudly — the local check only stops biting when the
-/// directory is gone, not when it's broken.
-fn optional_configs_in(dir: &Path) -> Vec<PathBuf> {
-    if !dir.is_dir() {
-        return Vec::new();
-    }
-    let found = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
-        .map(|entry| entry.expect("readable dir entry").path())
-        .filter(|path| path.is_file() && is_config(path))
-        .collect();
-    nonempty_sorted(found, dir)
-}
-
 #[test]
 fn every_example_station_config_parses() {
     for path in configs_in(&examples_dir()) {
@@ -174,20 +151,11 @@ fn assert_parses_as_block_file(path: &Path) {
     });
 }
 
-/// Tracked coverage (always present) plus an opportunistic local check
-/// (present only on a machine with personal channels) — see the module doc
-/// comment and #360.
+/// Tracked block fixtures only — see the module doc comment and #360.
 #[test]
 fn every_example_block_file_parses() {
     let root = examples_dir();
-
-    // Shipped coverage: a generic fixture that exists on every clone.
     for path in configs_in(&root.join("samples").join("blocks")) {
-        assert_parses_as_block_file(&path);
-    }
-
-    // Opportunistic: gitignored personal blocks, parsed only if present.
-    for path in optional_configs_in(&root.join("blocks")) {
         assert_parses_as_block_file(&path);
     }
 }

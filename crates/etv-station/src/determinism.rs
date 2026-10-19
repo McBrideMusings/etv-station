@@ -317,6 +317,7 @@ mod tests {
                 output_base: PathBuf::from("/tmp/out"),
                 channels: Vec::new(),
                 categories: Vec::new(),
+                chronologies: Vec::new(),
                 source_roots: Vec::new(),
                 identity_roots: Vec::new(),
                 catalog_path,

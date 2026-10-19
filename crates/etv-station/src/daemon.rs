@@ -1310,6 +1310,9 @@ async fn run_generation(
     // the real file in once it is readable, far sooner than a catalog refresh.
     let mut pending_swap = tokio::time::interval(PENDING_SWAP_EVERY);
     pending_swap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // What the previous tick saw of each pending file, so one still being
+    // written (its size or mtime moved) is not swapped half-rendered.
+    let mut pending_seen = crate::reconcile::PendingSeen::new();
 
     // `biased` makes shutdown win if both signals are pending, and both win
     // over a refresh — a station being told to stop has no business starting a
@@ -1333,6 +1336,7 @@ async fn run_generation(
                     history_db,
                     OffsetDateTime::now_utc(),
                     crate::duration::media_len_ms,
+                    &mut pending_seen,
                 )
                 .await;
             }
