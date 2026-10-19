@@ -334,8 +334,10 @@ pub struct PreviewRow {
 /// schedule places, read straight from the rotation's state with no generation
 /// run. A placement already drawn (the one on air) shows the draw it made.
 ///
-/// Placements are found by walking the calendar from `from`, so the rows come
-/// out in time order across rotations, at most `n` per rotation.
+/// Placements are found by sampling the calendar at `from` and at each
+/// schedule-range boundary after it ([`crate::calendar::Calendar::boundaries`]),
+/// so the rows come out in time order across rotations, at most `n` per
+/// rotation, at a cost that scales with the boundaries crossed, not minutes.
 pub fn preview(
     rule: &RuleConfig,
     calendar: &crate::calendar::Calendar<'_>,
@@ -358,10 +360,13 @@ pub fn preview(
     if n == 0 || wanted.is_empty() {
         return rows;
     }
-    let mut t = from;
     let horizon = from + time::Duration::days(366);
     let mut finished = 0usize;
-    while t < horizon && finished < wanted.len() {
+    let instants = std::iter::once(from).chain(calendar.boundaries(from, horizon));
+    for t in instants {
+        if finished >= wanted.len() {
+            break;
+        }
         if let crate::calendar::OnAir::Slot {
             slot,
             schedule,
@@ -394,7 +399,6 @@ pub fn preview(
                 });
             }
         }
-        t += time::Duration::MINUTE;
     }
     rows
 }
@@ -726,5 +730,84 @@ schedules:
             ]
         );
         assert!(state.is_empty());
+    }
+
+    #[test]
+    fn a_rotation_no_schedule_places_in_the_horizon_previews_empty() {
+        let r = rule(
+            r#"
+blocks: [{ entries: [] }]
+slots:
+  prime: { slots: [a, b] }
+  a: { entries: [] }
+  b: { entries: [] }
+schedules:
+  - name: leap
+    dates: ["02-29"]
+    hours: { "19..23": prime }
+"#,
+        );
+        let cal = crate::calendar::Calendar::new(&r, time_tz::timezones::db::UTC).unwrap();
+        let rows = preview(
+            &r,
+            &cal,
+            &seed,
+            &BTreeMap::new(),
+            datetime!(2026-10-19 12:00 UTC),
+            4,
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn the_preview_matches_a_minute_by_minute_walk_when_schedules_shadow_each_other() {
+        let r = rule(
+            r#"
+blocks: [{ entries: [] }]
+slots:
+  prime: { slots: [a, b, c] }
+  late: { slots: [b, c] }
+  a: { entries: [] }
+  b: { entries: [] }
+  c: { entries: [] }
+schedules:
+  - name: every-night
+    hours: { "18..23": prime, "22:30..03": late }
+  - name: fridays
+    weekdays: [fri]
+    hours: { "20:15..21:45": late }
+"#,
+        );
+        let cal = crate::calendar::Calendar::new(&r, time_tz::timezones::db::UTC).unwrap();
+        let from = datetime!(2026-10-19 12:00:30 UTC);
+        let rows = preview(&r, &cal, &seed, &BTreeMap::new(), from, 6);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut want = Vec::new();
+        let mut t = from;
+        while t < from + time::Duration::days(366) {
+            if let crate::calendar::OnAir::Slot {
+                slot,
+                placement: Some(start),
+                ..
+            } = cal.on_air(t)
+                && seen.insert((slot.to_string(), start))
+            {
+                want.push((slot.to_string(), start));
+            }
+            t += time::Duration::MINUTE;
+        }
+        let mut per: BTreeMap<String, usize> = BTreeMap::new();
+        want.retain(|(slot, _)| {
+            let c = per.entry(slot.clone()).or_default();
+            *c += 1;
+            *c <= 6
+        });
+        let got: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| (r.rotation.clone(), r.start.unix_timestamp()))
+            .collect();
+        assert_eq!(got, want);
+        assert!(got.len() >= 12);
     }
 }

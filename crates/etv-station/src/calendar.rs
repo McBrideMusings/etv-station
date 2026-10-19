@@ -149,6 +149,49 @@ impl<'a> Calendar<'a> {
         }
     }
 
+    /// Every instant in `(from, until)` at which what [`Self::on_air`] answers
+    /// can change, in time order: local midnight and each schedule range's
+    /// start and end, on every local day. Between two of them the answer is
+    /// constant, so a caller that wants each placement samples these instead of
+    /// every minute.
+    pub fn boundaries(&self, from: OffsetDateTime, until: OffsetDateTime) -> Vec<OffsetDateTime> {
+        let mut minutes: Vec<u16> = vec![0];
+        for schedule in &self.order {
+            for range in schedule.hours.keys() {
+                minutes.push(range.start);
+                minutes.push(range.end);
+            }
+        }
+        minutes.retain(|m| *m < 1440);
+        minutes.sort_unstable();
+        minutes.dedup();
+
+        let mut out = Vec::new();
+        let mut date = from.to_timezone(self.tz).date().previous_day();
+        while let Some(day) = date {
+            let mut any_in_range = false;
+            for m in &minutes {
+                let time = time::Time::from_hms((m / 60) as u8, (m % 60) as u8, 0)
+                    .unwrap_or(time::Time::MIDNIGHT);
+                let at = crate::tz::to_utc_assume_local(day, time, self.tz);
+                if at >= until {
+                    continue;
+                }
+                any_in_range = true;
+                if at > from {
+                    out.push(at);
+                }
+            }
+            if !any_in_range {
+                break;
+            }
+            date = day.next_day();
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The first whole minute after `from`, and before `until`, at which a
     /// different block is on air than at `from`.
     ///
