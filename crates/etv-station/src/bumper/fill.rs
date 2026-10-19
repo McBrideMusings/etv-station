@@ -380,7 +380,7 @@ fn fill_gap(
             channel: &env.channel.name,
             fps: FILL_FPS,
             overlay_root: env.overlay_root,
-            media_len_ms: &super::emit::probe_len_ms,
+            media_len_ms: &crate::duration::media_len_ms,
         };
         let items = emit_timeline(&resolved, &emit_ctx, cursor);
         records.extend(super::ledger::records(

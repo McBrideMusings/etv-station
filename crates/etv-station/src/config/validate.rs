@@ -1388,6 +1388,25 @@ fn validate_rotation(
             )));
         }
     }
+    for (field, present) in [
+        ("filter", include.filter.is_some()),
+        ("duplicates", include.duplicates.is_some()),
+        ("align", include.align.is_some()),
+        ("min_fill", include.min_fill.is_some()),
+        ("fill", !include.fill.is_empty()),
+        ("overlay", include.overlay.is_some()),
+        ("program", include.program.is_some()),
+        ("guide", include.guide.is_some()),
+        ("tracks", include.tracks.is_some()),
+        ("fallback", include.fallback.is_some()),
+        ("cycles", include.cycles.is_some()),
+    ] {
+        if present {
+            return Err(bad(format!(
+                "sets `{field}:` on a rotation, which reads none of it; set `{field}:` on the member slots instead"
+            )));
+        }
+    }
     let mut seen: HashSet<&str> = HashSet::new();
     for member in &include.slots {
         if !rule.slots.contains_key(member) {
@@ -3760,6 +3779,27 @@ fn audit(ctx, picks, workspace) { #{} }"#,
         });
         assert!(msg.contains("slot \"prime\""), "{msg}");
         assert!(msg.contains("`slots:` and `pools:`"), "{msg}");
+    }
+
+    #[test]
+    fn a_key_a_rotation_does_not_use_is_refused_naming_the_slot_and_key() {
+        let cases: [(&str, &str); 6] = [
+            ("filter", "{seasons: [1]}"),
+            ("duplicates", "keep"),
+            ("align", "30m"),
+            ("min_fill", "10s"),
+            ("fill", "[{script: bump.rhai}]"),
+            ("overlay", "clear"),
+        ];
+        for (key, value) in cases {
+            let msg = rotation_error(|r| {
+                let yaml = format!("{{slots: [a, b], {key}: {value}}}");
+                let block: BlockInclude = serde_norway::from_str(&yaml).unwrap();
+                r.slots.insert("prime".into(), block);
+            });
+            assert!(msg.contains("slot \"prime\""), "{key}: {msg}");
+            assert!(msg.contains(&format!("`{key}:`")), "{key}: {msg}");
+        }
     }
 
     #[test]

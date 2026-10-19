@@ -47,37 +47,6 @@ pub struct EmitContext<'a> {
     pub media_len_ms: &'a dyn Fn(&Path) -> Option<u64>,
 }
 
-/// Length of `path` in ms from `ffprobe`'s container duration, or `None` when
-/// ffprobe cannot be run, times out, rejects the file or reports no duration.
-pub fn probe_len_ms(path: &Path) -> Option<u64> {
-    let args: Vec<std::ffi::OsString> = [
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "csv=p=0",
-        "-protocol_whitelist",
-        "file",
-        "-i",
-    ]
-    .iter()
-    .map(Into::into)
-    .chain([path.as_os_str().to_owned()])
-    .collect();
-    match crate::ffprobe::run_bounded(&args, crate::ffprobe::PROBE_TIMEOUT) {
-        Ok(crate::ffprobe::Bounded::Done {
-            success: true,
-            stdout,
-            ..
-        }) => {
-            let secs: f64 = String::from_utf8_lossy(&stdout).trim().parse().ok()?;
-            (secs.is_finite() && secs >= 0.0).then(|| (secs * 1000.0).floor() as u64)
-        }
-        _ => None,
-    }
-}
-
 /// Push one Local item playing `path` from `in_ms` for `duration_ms`. When the
 /// file ends sooner, the item is cut at the file's end and a black item
 /// (`#pad`) covers the rest.
@@ -155,7 +124,13 @@ pub fn emit_timeline(
                 in_ms,
                 out_ms,
             } => {
-                let window = out_ms.saturating_sub(*in_ms);
+                let mut window = out_ms.saturating_sub(*in_ms);
+                if seg.segment.loop_
+                    && let Some(len) = (ctx.media_len_ms)(path)
+                {
+                    // A repeat cannot run past the file's end.
+                    window = window.min(len.saturating_sub(*in_ms));
+                }
                 if !(seg.segment.loop_ && window > 0 && seg.duration_ms > window) {
                     push_local_padded(
                         &mut items,
@@ -590,6 +565,46 @@ mod tests {
         assert_eq!(
             (items[2].finish - items[0].start).whole_milliseconds(),
             8_000
+        );
+    }
+
+    #[test]
+    fn a_looping_clip_shorter_than_its_out_point_repeats_at_the_file_length() {
+        let mut clip = seg(
+            "clip",
+            SegmentSource::Clip {
+                path: "/m/a.mkv".into(),
+                in_ms: 1_000,
+                out_ms: 20_000,
+            },
+            Dur::Fixed(10_000),
+        );
+        clip.loop_ = true;
+        let resolved = fit(
+            &Timeline {
+                segments: vec![clip],
+                bed: None,
+            },
+            10_000,
+            30.0,
+        )
+        .unwrap();
+        let ctx = EmitContext {
+            media_len_ms: &|_| Some(5_000),
+            ..ctx()
+        };
+        let items = emit_timeline(&resolved, &ctx, start());
+        let outs: Vec<Option<u64>> = items
+            .iter()
+            .map(|i| match i.source.as_ref().unwrap() {
+                PlayoutItemSource::Local { out_point_ms, .. } => *out_point_ms,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(outs, vec![Some(5_000), Some(5_000), Some(3_000)]);
+        assert_eq!(
+            (items[2].finish - items[0].start).whole_milliseconds(),
+            10_000
         );
     }
 
