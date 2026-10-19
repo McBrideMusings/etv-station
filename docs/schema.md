@@ -661,9 +661,10 @@ temperature: 0                 # optional — every channel with no temperature:
 
 **How the three ingest modes are chosen.** At startup the daemon compares the
 catalog's recorded last-ingest time against the two knobs above. Age below
-`catalog_refresh_secs` → skip, no HTTP at all. Age at or beyond
-`full_sweep_after_secs` (or no prior ingest, or a clock that moved backwards) →
-full re-read. Anything between → delta: each library section is queried with
+`catalog_refresh_secs` → skip, no HTTP at all. A full re-read runs when the
+time since the last *full* pass (a separate record from the last-ingest time,
+which deltas also advance) reaches `full_sweep_after_secs`, when no full pass
+is on record, when there is no prior ingest, or when a clock moved backwards. Anything between → delta: each library section is queried with
 `updatedAt>=<last ingest>` OR `addedAt>=<last ingest>` — the OR reaches an item
 Plex reports with no `updatedAt` at all, which would otherwise fail the
 comparison identically to a stale one and be invisible to every delta until the

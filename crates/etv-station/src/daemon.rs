@@ -805,7 +805,14 @@ impl PlexIngestPlan {
 /// Decide between skipping, a delta, and a full re-read.
 ///
 /// Pure so the three boundaries can be tested without a Plex server or a clock:
-/// `last` is when the previous pass started, `now` the current unix seconds.
+/// `last` is when the previous pass of any kind started, `last_full` when the
+/// previous *full* pass started, `now` the current unix seconds.
+///
+/// The sweep interval counts from `last_full`, not `last`: a delta advances
+/// `last`, so aging the sweep from it meant a delta every refresh interval kept
+/// the full pass — the only one that marks removed titles missing — from ever
+/// running. A catalog with a `last` but no `last_full` (written before the full
+/// pass was tracked) gets a full pass.
 ///
 /// Ordering matters. A never-ingested catalog is always full. Then age is
 /// checked against `full_sweep_after_secs` *before* the refresh window, so a
@@ -816,18 +823,20 @@ impl PlexIngestPlan {
 /// a delta would be relative to.
 fn plex_ingest_plan(
     last: Option<i64>,
+    last_full: Option<i64>,
     now: i64,
     catalog_refresh_secs: u64,
     full_sweep_after_secs: u64,
 ) -> PlexIngestPlan {
-    let Some(last) = last else {
+    let (Some(last), Some(last_full)) = (last, last_full) else {
         return PlexIngestPlan::Full;
     };
     let age = now - last;
-    if age < 0 {
+    let full_age = now - last_full;
+    if age < 0 || full_age < 0 {
         return PlexIngestPlan::Full;
     }
-    if full_sweep_after_secs == 0 || age >= full_sweep_after_secs as i64 {
+    if full_sweep_after_secs == 0 || full_age >= full_sweep_after_secs as i64 {
         return PlexIngestPlan::Full;
     }
     if age < catalog_refresh_secs as i64 {
@@ -999,6 +1008,7 @@ async fn ingest_catalog(
     if let Some(plex) = plex {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let last = catalog.last_plex_ingest()?;
+        let last_full = catalog.last_plex_full_ingest()?;
         // A forced refresh never asks the plan. See [`RefreshKind::Forced`]: a
         // delta cannot see a file that was renamed without Plex bumping its
         // `updatedAt`, and repairing exactly that is why anyone sends SIGUSR1.
@@ -1006,6 +1016,7 @@ async fn ingest_catalog(
             RefreshKind::Forced => PlexIngestPlan::Full,
             RefreshKind::Scheduled => plex_ingest_plan(
                 last,
+                last_full,
                 now,
                 station.station.catalog_refresh_secs,
                 station.station.full_sweep_after_secs,
@@ -4844,19 +4855,56 @@ mod ingest_plan_tests {
     const REFRESH: u64 = 900;
     const SWEEP: u64 = 86_400;
 
+    /// A plan for a catalog whose last pass of any kind was also its last full one.
+    fn plan(last: Option<i64>, now: i64, refresh: u64, sweep: u64) -> PlexIngestPlan {
+        plex_ingest_plan(last, last, now, refresh, sweep)
+    }
+
+    /// The bug: deltas keep advancing `last`, but the full pass is old.
     #[test]
-    fn a_catalog_never_ingested_is_read_in_full() {
+    fn deltas_do_not_postpone_the_full_sweep() {
+        let last_full = 1_000_000;
+        let last = last_full + SWEEP as i64 - 1_000; // a delta, outside the refresh window
         assert_eq!(
-            plex_ingest_plan(None, 1_000_000, REFRESH, SWEEP),
+            plex_ingest_plan(
+                Some(last),
+                Some(last_full),
+                last_full + SWEEP as i64,
+                REFRESH,
+                SWEEP
+            ),
             PlexIngestPlan::Full
         );
+        assert_eq!(
+            plex_ingest_plan(
+                Some(last),
+                Some(last_full),
+                last_full + SWEEP as i64 - 1,
+                REFRESH,
+                SWEEP
+            ),
+            PlexIngestPlan::Delta { since: last }
+        );
+    }
+
+    #[test]
+    fn a_catalog_with_no_recorded_full_pass_gets_one() {
+        assert_eq!(
+            plex_ingest_plan(Some(1_000_000), None, 1_000_001, REFRESH, SWEEP),
+            PlexIngestPlan::Full
+        );
+    }
+
+    #[test]
+    fn a_catalog_never_ingested_is_read_in_full() {
+        assert_eq!(plan(None, 1_000_000, REFRESH, SWEEP), PlexIngestPlan::Full);
     }
 
     #[test]
     fn a_restart_inside_the_refresh_window_does_not_contact_plex() {
         let last = 1_000_000;
         assert_eq!(
-            plex_ingest_plan(Some(last), last + 899, REFRESH, SWEEP),
+            plan(Some(last), last + 899, REFRESH, SWEEP),
             PlexIngestPlan::Skip { age_secs: 899 }
         );
     }
@@ -4865,7 +4913,7 @@ mod ingest_plan_tests {
     fn past_the_refresh_window_asks_plex_only_for_changes() {
         let last = 1_000_000;
         assert_eq!(
-            plex_ingest_plan(Some(last), last + 900, REFRESH, SWEEP),
+            plan(Some(last), last + 900, REFRESH, SWEEP),
             PlexIngestPlan::Delta { since: last }
         );
     }
@@ -4874,7 +4922,7 @@ mod ingest_plan_tests {
     fn past_the_sweep_interval_forces_a_full_pass() {
         let last = 1_000_000;
         assert_eq!(
-            plex_ingest_plan(Some(last), last + SWEEP as i64, REFRESH, SWEEP),
+            plan(Some(last), last + SWEEP as i64, REFRESH, SWEEP),
             PlexIngestPlan::Full
         );
     }
@@ -4885,7 +4933,7 @@ mod ingest_plan_tests {
     #[test]
     fn the_sweep_wins_over_the_refresh_window() {
         assert_eq!(
-            plex_ingest_plan(Some(0), 10, /* refresh */ 100_000, /* sweep */ 5),
+            plan(Some(0), 10, /* refresh */ 100_000, /* sweep */ 5),
             PlexIngestPlan::Full
         );
     }
@@ -4893,17 +4941,14 @@ mod ingest_plan_tests {
     #[test]
     fn a_zero_sweep_interval_disables_delta_entirely() {
         let last = 1_000_000;
-        assert_eq!(
-            plex_ingest_plan(Some(last), last + 1, REFRESH, 0),
-            PlexIngestPlan::Full
-        );
+        assert_eq!(plan(Some(last), last + 1, REFRESH, 0), PlexIngestPlan::Full);
     }
 
     #[test]
     fn a_zero_refresh_window_never_skips() {
         let last = 1_000_000;
         assert_eq!(
-            plex_ingest_plan(Some(last), last, 0, SWEEP),
+            plan(Some(last), last, 0, SWEEP),
             PlexIngestPlan::Delta { since: last }
         );
     }
@@ -4925,13 +4970,13 @@ mod ingest_plan_tests {
         let last = 1_000_000;
         // Fresh enough that the scheduled path would not even contact Plex...
         assert_eq!(
-            plex_ingest_plan(Some(last), last + 1, REFRESH, SWEEP),
+            plan(Some(last), last + 1, REFRESH, SWEEP),
             PlexIngestPlan::Skip { age_secs: 1 }
         );
         // ...and old enough that it would run a delta, which cannot see a
         // rename Plex did not stamp.
         assert_eq!(
-            plex_ingest_plan(Some(last), last + REFRESH as i64, REFRESH, SWEEP),
+            plan(Some(last), last + REFRESH as i64, REFRESH, SWEEP),
             PlexIngestPlan::Delta { since: last }
         );
         // Forcing consults none of that. `ingest_catalog` matches on
@@ -4940,7 +4985,7 @@ mod ingest_plan_tests {
         assert_eq!(
             match RefreshKind::Forced {
                 RefreshKind::Forced => PlexIngestPlan::Full,
-                RefreshKind::Scheduled => plex_ingest_plan(Some(last), last + 1, REFRESH, SWEEP),
+                RefreshKind::Scheduled => plan(Some(last), last + 1, REFRESH, SWEEP),
             },
             PlexIngestPlan::Full,
         );
@@ -4957,7 +5002,7 @@ mod ingest_plan_tests {
     #[test]
     fn a_backwards_clock_falls_back_to_a_full_pass() {
         assert_eq!(
-            plex_ingest_plan(Some(2_000_000), 1_000_000, REFRESH, SWEEP),
+            plan(Some(2_000_000), 1_000_000, REFRESH, SWEEP),
             PlexIngestPlan::Full
         );
     }
