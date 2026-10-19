@@ -1017,6 +1017,11 @@ rule:
 choose among series, with the same meaning; a rotation adds no selection
 vocabulary.
 
+**A rotation accepts only** `slots`, `select`, `order`, `weight` and
+`constraints.no_repeat_within`. It airs nothing itself, so `filter`, `duplicates`,
+`align`, `min_fill`, `fill`, `overlay`, `program`, `guide`, `tracks`, `fallback` and `cycles` on it fail the load; set them on the member
+slots, which air the content.
+
 **A placement is one range on one day.** `"19..23"` on Tuesday is one placement
 and the same range on Wednesday is the next; two ranges naming the same rotation
 are two placements. The rotation draws once per placement, so a generation that
@@ -1047,7 +1052,8 @@ that contains itself directly or through a chain of rotations, a member `rule.sl
 does not declare, a member listed twice, a slot with both `slots:` and `pools:`
 (or `entries:`, `pattern:`, `sequencer:`), `weight` without `select: random`,
 `order` without `select: round_robin`, a weight that is not above 0, a rotation
-under `rule.blocks`, and `select` or `weight` on a slot that lists no `slots:`.
+under `rule.blocks`, `filter`, `duplicates`, `align`, `min_fill`, `fill`, `overlay`, `program`, `guide`, `tracks`, `fallback` or `cycles`
+on a rotation, and `select` or `weight` on a slot that lists no `slots:`.
 
 **Observing it.** `calendar.select` carries `slot` (the member that airs),
 `rotation` (the slot the schedule placed) and `draws`, one entry per rotation on
