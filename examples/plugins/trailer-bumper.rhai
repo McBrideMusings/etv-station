@@ -64,7 +64,7 @@ fn trailer_for(ctx, item) {
 }
 
 fn card(seg, title, word) {
-    seg.overlay("shared/bumpers/card.rhai", #{ title: title, word: word })
+    seg.overlay("../../shared/bumpers/card.rhai", #{ title: title, word: word })
 }
 
 fn build(ctx) {

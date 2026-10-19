@@ -102,6 +102,7 @@ pub fn preview(req: &PreviewRequest<'_>) -> Result<Preview, String> {
             channel: &req.channel.name,
             fps: req.fps,
             overlay_root: req.overlay_root,
+            media_len_ms: &super::emit::probe_len_ms,
         },
         req.start,
     );

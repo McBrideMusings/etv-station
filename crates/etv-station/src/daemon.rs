@@ -3687,8 +3687,7 @@ async fn pattern_catch_up(
                     start,
                     played_at: written_at,
                     // The slot aired either way, so the series advances either
-                    // way. The flag is what keeps a scorer from counting an
-                    // error card as a film somebody watched.
+                    // way, and the recency tail counts it as aired.
                     error_card: item.error_card,
                     ..Default::default()
                 })
