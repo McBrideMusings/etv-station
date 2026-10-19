@@ -133,6 +133,7 @@ pub fn make_channel_card(id: String, channel: &str, reason: &str, slot: Duration
         guide_fields: crate::guide::GuideFields::default(),
         tracks: None,
         selected: None,
+        bumper: None,
     };
     crate::audit::push_stage(
         &mut card.metadata,

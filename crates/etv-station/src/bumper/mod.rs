@@ -3,6 +3,7 @@
 //! [`hook`] runs the plugin's `build(ctx)`.
 
 pub mod emit;
+pub mod fill;
 pub mod hook;
 pub mod ledger;
 pub mod preview;

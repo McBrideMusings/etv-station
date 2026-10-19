@@ -68,6 +68,9 @@ fn inline_block(entries: Vec<ConfigEntry>, guide: Option<GuideConfig>) -> BlockI
         mode: Mode::All,
         order: Some(Order::Manual),
         filter: None,
+        align: None,
+        min_fill: None,
+        fill: Vec::new(),
     }
 }
 

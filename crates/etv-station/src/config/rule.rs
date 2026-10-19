@@ -158,6 +158,26 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequencer: Option<PathBuf>,
 
+    /// The local-clock grid this block's programmes end on (`30m`, `none`).
+    /// After layout and probing, the gap between a programme's end and the next
+    /// grid line is filled with bumpers from `fill`. Unset and `align: none`
+    /// both leave programmes back to back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<super::fill::Align>,
+
+    /// A gap shorter than this airs as black with the channel logo instead of
+    /// a bumper. Default [`super::fill::DEFAULT_MIN_FILL`].
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_fill: Option<std::time::Duration>,
+
+    /// The bumper scripts that fill a gap up to `align`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fill: Vec<super::fill::FillEntry>,
+
     #[serde(default)]
     pub mode: Mode,
 
@@ -328,6 +348,9 @@ impl BlockInclude {
         self.fallback = body.fallback;
         self.pools = body.pools;
         self.sequencer = body.sequencer;
+        self.align = body.align;
+        self.min_fill = body.min_fill;
+        self.fill = body.fill;
         self.pattern = body.pattern;
         self.cycles = body.cycles;
         self.block = None;
