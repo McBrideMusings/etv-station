@@ -49,9 +49,17 @@ curl -s 'http://127.0.0.1:4747/api/review?channel=<folder>&days=14'
 it is the directory name, e.g. `034-syfy`. Under `examples/`, where channels are
 flat files sharing one folder, it is the path relative to the station file, e.g.
 `channels/a24.yaml` — pass it as is, unencoded. `days` defaults to 14, max 60.
+
+The simulation runs on a worker thread (`crates/etv-station/src/web_ui/sim_cache.rs`).
+A request it has no result for answers `202 {"pending":true}` at once and moves
+the channel to the front of the worker's queue; ask again every 15s until the
+body is the review. The worker first finishes the simulation it is running —
+on startup it fills the whole lineup in `station.yaml` order — so the first
+answer can take that channel's time plus your own. Request the channel as soon
+as the server is up.
+
 Measured 2026-10-18 on a release build: 14 days of 034-syfy (185 generations, 377
-airings) takes ~166s, warm or cold, and the server answers nothing else meanwhile —
-start it before you need it. On 2026-10-12, at schema v9 (the `item.show` index),
+airings) takes ~166s, warm or cold. On 2026-10-12, at schema v9 (the `item.show` index),
 035-prestige took ~14s; it is an entries-only channel that
 resolves 27 queries on each of its 331 hourly generations. Without the index,
 that 035 request takes over 9 minutes. The local UI reads `taste-cache.sh`'s copy of the
