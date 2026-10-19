@@ -527,6 +527,101 @@ mod tests {
         assert!(items.iter().all(|i| i.start >= future_start));
     }
 
+    /// A chunk whose filename finish is already past is skipped without being
+    /// opened: a corrupt one would fail the whole report if it were read.
+    #[tokio::test]
+    async fn a_wholly_past_chunk_is_never_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = crate::emit::chunk_filename(
+            datetime!(2026-04-20 06:00 UTC),
+            datetime!(2026-04-20 07:00 UTC),
+        )
+        .unwrap();
+        tokio::fs::write(dir.path().join(name), b"not json")
+            .await
+            .unwrap();
+
+        let items = upcoming(dir.path(), datetime!(2026-04-20 08:00 UTC), 10)
+            .await
+            .unwrap();
+        assert!(items.is_empty());
+    }
+
+    /// Items come back in start order even when the chunk file stores them
+    /// out of order.
+    #[tokio::test]
+    async fn items_stored_out_of_order_are_returned_in_start_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = vec![
+            plain_item(
+                "late",
+                datetime!(2026-04-20 12:30 UTC),
+                datetime!(2026-04-20 13:00 UTC),
+            ),
+            plain_item(
+                "early",
+                datetime!(2026-04-20 12:00 UTC),
+                datetime!(2026-04-20 12:30 UTC),
+            ),
+        ];
+        let name = crate::emit::chunk_filename(
+            datetime!(2026-04-20 12:00 UTC),
+            datetime!(2026-04-20 13:00 UTC),
+        )
+        .unwrap();
+        tokio::fs::write(
+            dir.path().join(name),
+            serde_json::to_vec(&Playout::new(stored)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let got = upcoming(dir.path(), datetime!(2026-04-20 12:00 UTC), 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["early", "late"]);
+    }
+
+    #[test]
+    fn an_empty_audit_array_is_reported_unexplained() {
+        let mut item = hand_built_item(None);
+        item.metadata = Some(serde_json::json!({ "audit": [] }));
+        let report = render("ch", datetime!(2026-04-20 12:00 UTC), &[item]);
+        assert!(
+            report.contains("(unexplained — no audit trail)\n"),
+            "got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn an_item_with_no_title_is_headed_by_its_id() {
+        let mut item = hand_built_item(None);
+        item.title = None;
+        let report = render("ch", datetime!(2026-04-20 12:00 UTC), &[item]);
+        assert!(
+            report.contains("2026-04-20 12:00:00Z — entry-0\n"),
+            "got:\n{report}"
+        );
+    }
+
+    /// A UTC start prints `Z`; any other offset prints itself, never a `Z`.
+    #[test]
+    fn a_non_utc_start_prints_its_offset_not_z() {
+        assert_eq!(
+            clock(datetime!(2026-04-20 12:00 UTC)),
+            "2026-04-20 12:00:00Z"
+        );
+        assert_eq!(
+            clock(datetime!(2026-04-20 12:00 -05:00)),
+            "2026-04-20 12:00:00 -05:00"
+        );
+        assert_eq!(
+            clock(datetime!(2026-04-20 12:00 -03:30)),
+            "2026-04-20 12:00:00 -03:30"
+        );
+    }
+
     #[tokio::test]
     async fn default_next_is_ten_and_override_is_honoured() {
         let dir = tempfile::tempdir().unwrap();
