@@ -353,6 +353,10 @@ pub fn resolve_channel_with_resume(
     // Per block: a pool block's `BlockBuild::progress`, empty for an entries
     // block, whose progress is its list position instead.
     let mut pool_progress: Vec<Vec<BTreeMap<String, PoolResume>>> = Vec::new();
+    let block_includes: HashMap<usize, &BlockInclude> = selected
+        .iter()
+        .map(|(idx, include)| (*idx, *include))
+        .collect();
     for (pos, (idx, include)) in selected.into_iter().enumerate() {
         // A block airs after the blocks before it, so its own clock — what a
         // rollover inside its walk, or a sequencer's dayparts, are measured
@@ -568,6 +572,16 @@ pub fn resolve_channel_with_resume(
         // it was.
         resume_out.position = seat.map_or(state.resume.position, |s| s.position(s.laid));
     }
+
+    // Only now, with the entries list cut to the items that will air, read
+    // their catalog rows.
+    hydrate_pending(
+        &mut out,
+        catalog,
+        &block_includes,
+        config.guide.as_ref().map(|g| &g.text),
+        path,
+    )?;
 
     if out.is_empty() {
         // Nothing resolved. A channel can no longer reach this by *playing* its
@@ -916,7 +930,7 @@ pub fn resolve_channel_fingerprint_ids(
                             "block #{idx}: a collection entry needs the catalog to fingerprint"
                         ))
                     })?;
-                    let resolved = resolve_collection(cat, collection, None, None)
+                    let resolved = resolve_collection(cat, collection)
                         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                     block_ids.extend(resolved.into_iter().map(|item| item.id));
                 }
@@ -1409,7 +1423,7 @@ fn resolve_block(
                         "block #{idx}: a query entry needs the catalog, which is not available"
                     ))
                 })?;
-                let mut resolved = resolve_query(cat, query, defaults, guide_defaults, seed)
+                let mut resolved = resolve_query(cat, query, seed)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                 stamp_select(
                     &mut resolved,
@@ -1425,7 +1439,7 @@ fn resolve_block(
                         "block #{idx}: a collection entry needs the catalog, which is not available"
                     ))
                 })?;
-                let mut resolved = resolve_collection(cat, collection, defaults, guide_defaults)
+                let mut resolved = resolve_collection(cat, collection)
                     .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
                 stamp_select(
                     &mut resolved,
@@ -1640,14 +1654,129 @@ fn stamp_select(
     }
 }
 
+/// What an entries block's catalog results are until the window cut has kept
+/// the ones that will air: the id, the `select` audit stage and the block they
+/// came from, with nothing read from the catalog. Reading an entry's row,
+/// provenance and five tag lists costs the same for the one item an hourly
+/// generation airs as for the thousand its query matched, so
+/// [`hydrate_pending`] does it for the survivors only. The sentinel path cannot
+/// be a real file, so no inline item is mistaken for one.
+const PENDING_PATH: &str = "\0pending-catalog-item";
+
+/// The stand-ins for `ids` that have something to play, in `ids` order. A row
+/// with no provenance is skipped here exactly as [`catalog_item`] skips it, so
+/// the list the cut sees is the list it always saw.
+fn pending_items(catalog: &Catalog, ids: Vec<String>) -> Result<Vec<ResolvedItem>, String> {
+    let sources = catalog.sources_for_many(&ids).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if sources.contains_key(&id) {
+            out.push(pending_item(id));
+        } else if let Some(entry) = catalog.entry(&id).map_err(|e| e.to_string())? {
+            tracing::warn!(
+                event = "item.no_playback_source",
+                item = %id,
+                title = %entry.title,
+                "catalog row has no file behind it; skipping this item",
+            );
+        } else {
+            return Err(format!("resolved entry {id} vanished from the catalog"));
+        }
+    }
+    Ok(out)
+}
+
+fn pending_item(id: String) -> ResolvedItem {
+    ResolvedItem {
+        block: 0,
+        id,
+        source: SourceConfig::Local {
+            path: PENDING_PATH.into(),
+        },
+        in_point: None,
+        out_point: None,
+        program: None,
+        catalog_duration: None,
+        error_card: false,
+        metadata: None,
+        guide: None,
+        guide_fields: GuideFields::default(),
+        tracks: None,
+        selected: None,
+    }
+}
+
+fn is_pending(item: &ResolvedItem) -> bool {
+    matches!(&item.source, SourceConfig::Local { path } if path == PENDING_PATH)
+}
+
+/// Replace every stand-in in `items` with the catalog item it names, in place,
+/// built from one bulk read per block. `defaults` gives a block's `[program]`
+/// and `guide:` cascade by `ResolvedItem::block`; the `select` audit stage a
+/// stand-in already carries is kept.
+fn hydrate_pending(
+    items: &mut [ResolvedItem],
+    catalog: Option<&Catalog>,
+    blocks: &HashMap<usize, &BlockInclude>,
+    channel_guide: Option<&GuideConfig>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    let unsupported = |message: String| ConfigError::Unsupported {
+        path: path.to_path_buf(),
+        message,
+    };
+    let mut ids_by_block: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for item in items.iter().filter(|i| is_pending(i)) {
+        ids_by_block
+            .entry(item.block)
+            .or_default()
+            .push(item.id.clone());
+    }
+    if ids_by_block.is_empty() {
+        return Ok(());
+    }
+    let cat = catalog.ok_or_else(|| {
+        unsupported("a query entry needs the catalog, which is not available".into())
+    })?;
+    let mut built: HashMap<(usize, String), VecDeque<ResolvedItem>> = HashMap::new();
+    for (block, ids) in ids_by_block {
+        let include = blocks
+            .get(&block)
+            .ok_or_else(|| unsupported(format!("block #{block} is not in this generation")))?;
+        let guide = GuideConfig::cascade(None, include.guide(), channel_guide);
+        for item in catalog_items(cat, &ids, include.program(), guide.as_ref())
+            .map_err(|m| unsupported(format!("block #{block}: {m}")))?
+        {
+            built
+                .entry((block, item.id.clone()))
+                .or_default()
+                .push_back(item);
+        }
+    }
+    for item in items.iter_mut().filter(|i| is_pending(i)) {
+        let Some(mut full) = built
+            .get_mut(&(item.block, item.id.clone()))
+            .and_then(VecDeque::pop_front)
+        else {
+            return Err(unsupported(format!(
+                "block #{}: entry {} vanished from the catalog",
+                item.block, item.id
+            )));
+        };
+        full.block = item.block;
+        full.metadata = item.metadata.take();
+        *item = full;
+    }
+    Ok(())
+}
+
 /// Resolve a `query` entry against the catalog: run the CEL query, apply the
-/// entry's own optional `order` (#46 per-entry order), then turn each resolved
-/// `entry_id` into a [`ResolvedItem`].
+/// entry's own optional `order` (#46 per-entry order), then return a stand-in
+/// ([`pending_item`]) per playable `entry_id`. The caller must run
+/// [`hydrate_pending`] before anything reads more than the ids.
 fn resolve_query(
     catalog: &Catalog,
     query: &QueryEntry,
-    defaults: Option<&ProgramMetadata>,
-    guide_defaults: Option<&GuideConfig>,
     seed: u64,
 ) -> Result<Vec<ResolvedItem>, String> {
     let mut ids = catalog
@@ -1658,13 +1787,7 @@ fn resolve_query(
             .resolve_order(&ids, order, seed)
             .map_err(|e| e.to_string())?;
     }
-    Ok(ids
-        .iter()
-        .map(|id| catalog_item(catalog, id, defaults, guide_defaults))
-        .collect::<Result<Vec<_>, String>>()?
-        .into_iter()
-        .flatten()
-        .collect())
+    pending_items(catalog, ids)
 }
 
 /// Resolve a block's `fallback` (#97) — through the exact same machinery as a
@@ -1686,7 +1809,7 @@ fn resolve_fallback(
             let cat = catalog.ok_or_else(|| {
                 "a query fallback needs the catalog, which is not available".to_string()
             })?;
-            resolve_query(cat, query, defaults, guide_defaults, seed)
+            resolve_query(cat, query, seed)
         }
         Fallback::Item(item) => Ok(vec![resolve_item(
             item,
@@ -1699,7 +1822,8 @@ fn resolve_fallback(
 }
 
 /// Resolve a `collection` entry: look the collection up by name and emit its
-/// members in stored `collection_items.position` order.
+/// members in stored `collection_items.position` order, as the same
+/// stand-ins [`resolve_query`] returns.
 ///
 /// No ordering step is involved — the run arrives ordered out of the catalog,
 /// and the block's default `manual` order preserves it. That is the whole point
@@ -1708,8 +1832,6 @@ fn resolve_fallback(
 fn resolve_collection(
     catalog: &Catalog,
     entry: &CollectionEntry,
-    defaults: Option<&ProgramMetadata>,
-    guide_defaults: Option<&GuideConfig>,
 ) -> Result<Vec<ResolvedItem>, String> {
     let mut ids = catalog
         .collection_ids_by_name(&entry.name)
@@ -1747,13 +1869,7 @@ fn resolve_collection(
             entry.name
         ));
     }
-    Ok(members
-        .iter()
-        .map(|id| catalog_item(catalog, id, defaults, guide_defaults))
-        .collect::<Result<Vec<_>, String>>()?
-        .into_iter()
-        .flatten()
-        .collect())
+    pending_items(catalog, members)
 }
 
 /// Narrow a block's resolved list to `filter`'s restrictions (#197): `seasons`
@@ -1910,14 +2026,93 @@ fn catalog_item(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("resolved entry {entry_id} vanished from the catalog"))?;
     let sources = catalog.sources_for(entry_id).map_err(|e| e.to_string())?;
-    let Some(source) = pick_playback_source(&sources) else {
+    let tags_of = |ns: TagNs| catalog.tags_for(entry_id, ns).map_err(|e| e.to_string());
+    let tags = CatalogTags {
+        genres: tags_of(TagNs::Genre)?,
+        cast: tags_of(TagNs::Cast)?,
+        directors: tags_of(TagNs::Director)?,
+        writers: tags_of(TagNs::Writer)?,
+        countries: tags_of(TagNs::Country)?,
+    };
+    Ok(build_catalog_item(
+        entry,
+        &sources,
+        tags,
+        defaults,
+        guide_defaults,
+    ))
+}
+
+/// The catalog's tag lists for one entry — what [`build_catalog_item`] turns
+/// into categories, credits and the `guide:` surface.
+struct CatalogTags {
+    genres: Vec<String>,
+    cast: Vec<String>,
+    directors: Vec<String>,
+    writers: Vec<String>,
+    countries: Vec<String>,
+}
+
+/// [`catalog_item`] for many ids at once: the same item per id, built from one
+/// bulk read of the entry rows, provenance and tags instead of seven reads per
+/// id. Returned in `ids` order, an unplayable row (`Ok(None)` in
+/// [`catalog_item`]) left out.
+fn catalog_items(
+    catalog: &Catalog,
+    ids: &[String],
+    defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
+) -> Result<Vec<ResolvedItem>, String> {
+    let mut entries = catalog.entries_for(ids).map_err(|e| e.to_string())?;
+    let mut sources = catalog.sources_for_many(ids).map_err(|e| e.to_string())?;
+    let tag_map = |ns: TagNs| catalog.tags_for_many(ids, ns).map_err(|e| e.to_string());
+    let mut genres = tag_map(TagNs::Genre)?;
+    let mut cast = tag_map(TagNs::Cast)?;
+    let mut directors = tag_map(TagNs::Director)?;
+    let mut writers = tag_map(TagNs::Writer)?;
+    let mut countries = tag_map(TagNs::Country)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        // A repeated id (`duplicates: keep`) finds its rows taken by its first
+        // occurrence, so rebuild from the catalog for it.
+        let (Some(entry), Some(src)) = (entries.remove(id), sources.remove(id)) else {
+            out.extend(catalog_item(catalog, id, defaults, guide_defaults)?);
+            continue;
+        };
+        let tags = CatalogTags {
+            genres: genres.remove(id).unwrap_or_default(),
+            cast: cast.remove(id).unwrap_or_default(),
+            directors: directors.remove(id).unwrap_or_default(),
+            writers: writers.remove(id).unwrap_or_default(),
+            countries: countries.remove(id).unwrap_or_default(),
+        };
+        out.extend(build_catalog_item(
+            entry,
+            &src,
+            tags,
+            defaults,
+            guide_defaults,
+        ));
+    }
+    Ok(out)
+}
+
+fn build_catalog_item(
+    entry: crate::catalog::Entry,
+    sources: &[EntrySource],
+    tags: CatalogTags,
+    defaults: Option<&ProgramMetadata>,
+    guide_defaults: Option<&GuideConfig>,
+) -> Option<ResolvedItem> {
+    let entry_id = entry.entry_id.as_str();
+    let Some(source) = pick_playback_source(sources) else {
         tracing::warn!(
             event = "item.no_playback_source",
             item = %entry_id,
             title = %entry.title,
             "catalog row has no file behind it; skipping this item",
         );
-        return Ok(None);
+        return None;
     };
     // Catalog columns are i64; ProgramMetadata uses u32. Out-of-range values
     // (negative / overflow) drop to None rather than wrap.
@@ -1941,31 +2136,18 @@ fn catalog_item(
 
     // #158 decision #3: genre tags become `<category>` automatically, no
     // config required. A channel can still override via `guide.categories`.
-    let genres = catalog
-        .tags_for(entry_id, TagNs::Genre)
-        .map_err(|e| e.to_string())?;
+    let CatalogTags {
+        genres,
+        cast,
+        directors,
+        writers,
+        countries,
+    } = tags;
     let categories = if genres.is_empty() {
         None
     } else {
         Some(genres.clone())
     };
-
-    // #248: `<credits>`/`<country>` populate the same way `categories` does
-    // above — straight from the catalog's tags, no `guide:` config required.
-    // Fetched once here and reused by `GuideFields` below (one clone per
-    // list, same pattern as `genres`).
-    let cast = catalog
-        .tags_for(entry_id, TagNs::Cast)
-        .map_err(|e| e.to_string())?;
-    let directors = catalog
-        .tags_for(entry_id, TagNs::Director)
-        .map_err(|e| e.to_string())?;
-    let writers = catalog
-        .tags_for(entry_id, TagNs::Writer)
-        .map_err(|e| e.to_string())?;
-    let countries = catalog
-        .tags_for(entry_id, TagNs::Country)
-        .map_err(|e| e.to_string())?;
 
     let program = ProgramMetadata {
         title: Some(title),
@@ -2052,7 +2234,7 @@ fn catalog_item(
         summary: entry.summary.clone(),
     };
 
-    Ok(Some(ResolvedItem {
+    Some(ResolvedItem {
         block: 0,
         id: entry.entry_id.clone(),
         source: SourceConfig::Local {
@@ -2086,7 +2268,7 @@ fn catalog_item(
         // `resolve_pool_block_items`, and the levels above it by the daemon.
         tracks: None,
         selected: None,
-    }))
+    })
 }
 
 fn resolve_item(
@@ -3248,6 +3430,71 @@ mod tests {
             SourceConfig::Local { path } => assert!(path.ends_with("tt0167260.mkv")),
             other => panic!("expected local source, got {other:?}"),
         }
+    }
+
+    /// The bulk build and the one-id build are the same procedure: each id
+    /// yields the same item either way, and a row with no playback source is
+    /// left out of both.
+    #[test]
+    fn the_bulk_catalog_build_matches_the_single_id_build() {
+        let cat = seeded_catalog();
+        cat.upsert_entry(&CatEntry::new("hollow", "movie", "No File", Source::Plex))
+            .unwrap();
+        let ids: Vec<String> = ["imdb:tt0167261", "hollow", "imdb:tt0120737"]
+            .map(String::from)
+            .to_vec();
+        let bulk = catalog_items(&cat, &ids, None, None).unwrap();
+        let single: Vec<ResolvedItem> = ids
+            .iter()
+            .filter_map(|id| catalog_item(&cat, id, None, None).unwrap())
+            .collect();
+        assert_eq!(bulk.len(), 2, "the hollow row is skipped");
+        for (b, s) in bulk.iter().zip(&single) {
+            assert_eq!(b.id, s.id);
+            assert_eq!(format!("{:?}", b.program), format!("{:?}", s.program));
+            assert_eq!(b.catalog_duration, s.catalog_duration);
+            assert_eq!(b.guide_fields.genres, s.guide_fields.genres);
+            assert_eq!(format!("{:?}", b.source), format!("{:?}", s.source));
+        }
+        // The stand-in list skips it too, before any window sees it.
+        let pending = pending_items(&cat, ids).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(is_pending));
+    }
+
+    /// A window that covers one member cuts the collection to it, and that one
+    /// member still comes out with its catalog metadata, playback path and
+    /// `select` audit stage — the cut happens on ids, not on built items.
+    #[test]
+    fn a_cut_collection_entry_still_yields_a_fully_built_item() {
+        let cat = catalog_with_marathon();
+        let inc = collection_block("Halloween Marathon");
+        let (items, resume, _) = resolve_channel_with_resume(
+            &channel(vec![inc]),
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            Some(Duration::from_secs(1)),
+            t0(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1, "a 1s window covers one member");
+        assert_eq!(items[0].id, "imdb:tt0167260");
+        assert_eq!(items[0].program.as_ref().unwrap().year, Some(2003));
+        assert!(!is_pending(&items[0]));
+        match &items[0].source {
+            SourceConfig::Local { path } => assert!(path.ends_with("tt0167260.mkv")),
+            other => panic!("expected local source, got {other:?}"),
+        }
+        let select = items[0].metadata.as_ref().expect("select stage kept");
+        assert!(
+            select.to_string().contains("entries:collection"),
+            "metadata = {select}"
+        );
+        assert_eq!(resume.position, 1);
     }
 
     #[test]

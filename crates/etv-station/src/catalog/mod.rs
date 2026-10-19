@@ -1069,6 +1069,34 @@ impl Catalog {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])
     }
 
+    /// Provenance rows for every requested entry, each list ordered as
+    /// [`Self::sources_for`] orders it — one statement per ~500 ids. An entry
+    /// with no provenance row is missing from the returned map.
+    pub fn sources_for_many(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<EntrySource>>, CatalogError> {
+        let mut out: std::collections::HashMap<String, Vec<EntrySource>> =
+            std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<&String> = entry_ids.iter().filter(|id| seen.insert(*id)).collect();
+        for chunk in unique.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT source, source_id, entry_id, playback_path, last_seen, missing_since \
+                 FROM entry_sources WHERE entry_id IN ({placeholders}) \
+                 ORDER BY entry_id, source, source_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            for source in collect_sources(&mut stmt, rusqlite::params_from_iter(chunk.iter()))? {
+                out.entry(source.entry_id.clone()).or_default().push(source);
+            }
+        }
+        Ok(out)
+    }
+
     /// Provenance rows for an entry, ordered by source then id.
     pub fn sources_for(&self, entry_id: &str) -> Result<Vec<EntrySource>, CatalogError> {
         let mut stmt = self.conn.prepare(
