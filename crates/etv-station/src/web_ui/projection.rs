@@ -78,14 +78,18 @@ pub struct DraftEdits {
     pub profiles: BTreeMap<String, Vec<ProfileEntry>>,
     /// The Plex account the draft scores for.
     pub account_id: Option<i64>,
+    /// The account the deployed channel scores for; a draft scored for any
+    /// other account is an edit even with every pool untouched.
+    pub channel_account_id: Option<i64>,
 }
 
 impl DraftEdits {
-    /// The edit set as one digest. A draft with no edited pool is the
-    /// deployed channel, so it digests like no draft at all.
+    /// The edit set as one digest. A draft with no edited pool and the
+    /// channel's own account is the deployed channel, so it digests like no
+    /// draft at all.
     pub fn digest(draft: Option<&DraftEdits>) -> String {
         match draft {
-            Some(d) if !d.profiles.is_empty() => {
+            Some(d) if d.is_edited() => {
                 let text = serde_json::json!({ "profiles": d.profiles, "account": d.account_id });
                 sha_hex(&[b"draft", text.to_string().as_bytes()])
             }
@@ -94,7 +98,7 @@ impl DraftEdits {
     }
 
     fn is_edited(&self) -> bool {
-        !self.profiles.is_empty()
+        !self.profiles.is_empty() || self.account_id != self.channel_account_id
     }
 }
 
