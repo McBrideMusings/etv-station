@@ -1142,7 +1142,9 @@ mod tests {
         // consumed through 149, so 150 is the first number free to reuse.
         assert_eq!(first.sequence_state().next_media_sequence, 150);
 
-        ersatztv_core::empty_folder(dir.path()).await.unwrap();
+        ersatztv_core::empty_session_folder(dir.path())
+            .await
+            .unwrap();
         let second = manager(dir.path(), OffsetDateTime::now_utc()).await;
 
         assert_eq!(second.media_sequence, 150);
@@ -1169,7 +1171,9 @@ mod tests {
         // Two already trimmed past, one still held ahead of a live segment.
         assert_eq!(first.sequence_state().next_discontinuity_sequence, 3);
 
-        ersatztv_core::empty_folder(dir.path()).await.unwrap();
+        ersatztv_core::empty_session_folder(dir.path())
+            .await
+            .unwrap();
         let second = manager(dir.path(), OffsetDateTime::now_utc()).await;
 
         assert_eq!(second.discontinuity_sequence, 3);

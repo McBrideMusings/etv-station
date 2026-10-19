@@ -17,7 +17,7 @@ use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use clap::{Parser, Subcommand};
 use ersatztv::error::LineupError;
-use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_folder};
+use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_output_root};
 use tokio::signal;
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
@@ -135,7 +135,7 @@ async fn run() -> Result<(), LineupError> {
 
             log::debug!("loaded {} channel definitions", channels.len());
 
-            empty_folder(&output_folder).await?;
+            empty_output_root(&output_folder).await?;
 
             let state = Arc::new(LineupState {
                 channels,
@@ -154,7 +154,7 @@ async fn run() -> Result<(), LineupError> {
             // plus every run folder written to within SEGMENT_RETENTION,
             // catching exactly the run folders the exit-time reap in
             // `channel_session::spawn` left standing. The one-time
-            // `empty_folder` above stays as it is — a cold start with no viewers
+            // `empty_output_root` above stays as it is — a cold start with no viewers
             // has nothing this sweep would improve on.
             //
             // Per channel, `channel_session::reap_channel_run_folders` holds

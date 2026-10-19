@@ -550,8 +550,10 @@ pub async fn reap_unreferenced_run_folders(
     Ok(removed)
 }
 
-/// Empty a session's output folder, keeping the folder itself and
-/// [`SEQUENCE_FILE_NAME`].
+/// Empty one session's output folder: remove everything in it except the
+/// top-level [`SEQUENCE_FILE_NAME`] (subfolders are media and go whole), and
+/// keep the folder itself. Creates the folder when
+/// it does not exist.
 ///
 /// The sequence file survives because it is the one thing in here that is not
 /// media: it records how far this session's segment numbering has already got,
@@ -561,42 +563,22 @@ pub async fn reap_unreferenced_run_folders(
 /// lower-numbered segment the new worker offers and freezes on its last decoded
 /// frame. See [`SEQUENCE_FILE_NAME`].
 ///
-/// A worker respawn no longer calls this — see [`new_run_folder_name`] and
-/// [`reap_run_folders`] for that path. What remains is the server's cold start
-/// (`main` empties the whole output root once, before anything is watching) and
-/// the sequence-file preservation behavior this module's tests pin.
-pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io::Error> {
-    if !output_folder.exists() {
-        create_dir_all(output_folder).await?;
+/// This never removes `session_folder`: a live session's folder is its identity
+/// and the next worker reuses it. To clear a whole output root of sessions, use
+/// [`empty_output_root`].
+pub async fn empty_session_folder(session_folder: &std::path::Path) -> Result<(), std::io::Error> {
+    if !session_folder.exists() {
+        create_dir_all(session_folder).await?;
     }
 
-    let mut entries = read_dir(output_folder).await?;
+    let mut entries = read_dir(session_folder).await?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         if entry.file_name() == std::ffi::OsStr::new(SEQUENCE_FILE_NAME) {
             continue;
         }
         if let Ok(file_type) = entry.file_type().await {
             if file_type.is_dir() {
-                Box::pin(empty_folder(&entry.path())).await?;
-                // The recursion above deliberately preserves SEQUENCE_FILE_NAME,
-                // so a child that had one is still non-empty and cannot be
-                // removed. That is not a failure: it is this function's own
-                // preservation rule observed one level up, and the folder is a
-                // live session's identity that the next worker will reuse.
-                //
-                // Treating it as fatal took the whole server down at startup —
-                // `main` empties the output root, which recurses into every
-                // channel session folder, keeps each `.sequence`, and then tried
-                // to rmdir them. Any channel whose media had already been
-                // cleared left a folder containing nothing but `.sequence`, and
-                // the process exited with "Directory not empty (os error 39)"
-                // before serving anything. One leftover dotfile could take the
-                // entire lineup offline until somebody deleted it by hand.
-                match remove_dir(entry.path()).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                    Err(e) => return Err(e),
-                }
+                remove_dir_all(entry.path()).await?;
             } else {
                 remove_file(entry.path()).await?;
             }
@@ -606,9 +588,46 @@ pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io
     Ok(())
 }
 
+/// Empty the output root at server startup: every child folder is emptied as a
+/// session folder ([`empty_session_folder`]), then removed unless it kept a
+/// [`SEQUENCE_FILE_NAME`]. A folder that kept one is a live session's identity
+/// and stays, even when the sequence file is all that is left in it. Files
+/// directly in the root are removed. Creates the root when it does not exist.
+///
+/// A child that kept its sequence file is skipped explicitly rather than
+/// attempting `rmdir` and tolerating `ENOTEMPTY`: a channel whose media had
+/// already been cleared leaves a folder holding nothing but `.sequence`, and
+/// treating that as a failure took the whole lineup down at startup.
+pub async fn empty_output_root(output_root: &std::path::Path) -> Result<(), std::io::Error> {
+    if !output_root.exists() {
+        create_dir_all(output_root).await?;
+    }
+
+    let mut entries = read_dir(output_root).await?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            remove_file(entry.path()).await?;
+            continue;
+        }
+        let child = entry.path();
+        empty_session_folder(&child).await?;
+        // An unreadable sequence file counts as present: keeping a folder is
+        // harmless, failing startup over it is not.
+        let kept_sequence = !matches!(child.join(SEQUENCE_FILE_NAME).try_exists(), Ok(false));
+        if !kept_sequence {
+            remove_dir(&child).await?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
-mod empty_folder_tests {
-    use super::{SEQUENCE_FILE_NAME, empty_folder};
+mod empty_session_tests {
+    use super::{SEQUENCE_FILE_NAME, empty_output_root, empty_session_folder};
 
     /// The sequence file is the session's identity, not its media, and a client
     /// still polling the session URL depends on it outliving the wipe. Delete it
@@ -626,7 +645,7 @@ mod empty_folder_tests {
             .await
             .unwrap();
 
-        empty_folder(root).await.unwrap();
+        empty_session_folder(root).await.unwrap();
 
         assert!(!root.join("live000000.ts").exists(), "media should be gone");
         assert!(
@@ -655,7 +674,7 @@ mod empty_folder_tests {
             .await
             .unwrap();
 
-        empty_folder(root).await.unwrap();
+        empty_session_folder(root).await.unwrap();
 
         assert!(root.exists(), "the folder itself must survive the wipe");
         let mut entries = tokio::fs::read_dir(root).await.unwrap();
@@ -705,7 +724,7 @@ mod empty_folder_tests {
             .await
             .unwrap();
 
-        empty_folder(root).await.unwrap();
+        empty_output_root(root).await.unwrap();
 
         assert!(
             ch5.join(SEQUENCE_FILE_NAME).exists(),
@@ -735,7 +754,17 @@ mod empty_folder_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("does-not-exist-yet");
 
-        empty_folder(&root).await.unwrap();
+        empty_session_folder(&root).await.unwrap();
+
+        assert!(root.is_dir());
+    }
+
+    #[tokio::test]
+    async fn the_output_root_is_created_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("no-root-yet");
+
+        empty_output_root(&root).await.unwrap();
 
         assert!(root.is_dir());
     }
