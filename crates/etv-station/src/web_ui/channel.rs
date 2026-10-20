@@ -807,11 +807,20 @@ pub(super) fn near_miss_titles(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    Ok(catalog
-        .entries_for(&ids)
-        .map_err(|e| e.to_string())?
+    let entries = catalog.entries_for(&ids).map_err(|e| e.to_string())?;
+    // An episode pool near-misses on a series id, which is no entry id.
+    let unresolved: Vec<String> = ids
+        .iter()
+        .filter(|id| !entries.contains_key(*id))
+        .cloned()
+        .collect();
+    let shows = catalog
+        .show_names_for(&unresolved)
+        .map_err(|e| e.to_string())?;
+    Ok(entries
         .iter()
         .map(|(id, e)| (id.clone(), airing_label(e)))
+        .chain(shows)
         .collect())
 }
 
@@ -1456,6 +1465,26 @@ fn comparable_numbers(review: &Value) -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_miss_series_id_is_labelled_with_the_show_name() {
+        use crate::catalog::{Entry, Source};
+        let catalog = Catalog::open_in_memory().unwrap();
+        let mut ep = Entry::new("ep1", "episode", "Encounter at Farpoint", Source::Plex);
+        ep.show = Some("Star Trek: The Next Generation".into());
+        ep.show_id = Some("imdb:tt0092455".into());
+        catalog.upsert_entry(&ep).unwrap();
+        let audits = vec![json!([{"detail": {"near_misses": [
+            {"id": "imdb:tt0092455"}, {"id": "ep1"}, {"id": "unknown"}
+        ]}}])];
+        let titles = near_miss_titles(&catalog, &audits, |_| true).unwrap();
+        assert_eq!(
+            titles.get("imdb:tt0092455").map(String::as_str),
+            Some("Star Trek: The Next Generation")
+        );
+        assert!(titles["ep1"].contains("Encounter at Farpoint"));
+        assert!(!titles.contains_key("unknown"));
+    }
 
     #[test]
     fn prune_still_dir_keeps_the_newest_max_files() {

@@ -917,6 +917,34 @@ impl Catalog {
         Ok(out)
     }
 
+    /// The show name of each requested `show_id`, one statement per ~500 ids.
+    /// An id that is no entry's `show_id`, or whose entries carry no `show`
+    /// name, is missing from the returned map.
+    pub fn show_names_for(
+        &self,
+        show_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, CatalogError> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in show_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT show_id, MIN(show) FROM entries \
+                 WHERE show IS NOT NULL AND show_id IN ({placeholders}) GROUP BY show_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, name) = row?;
+                out.insert(id, name);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every requested entry's tag values in `namespace`, each list ascending
     /// as [`Self::tags_for`] returns it — one statement per ~500 ids. An entry
     /// with no tags in the namespace is missing from the returned map.
