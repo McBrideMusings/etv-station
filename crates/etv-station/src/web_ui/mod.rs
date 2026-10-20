@@ -125,8 +125,21 @@ pub fn serve(options: Options) -> Result<(), String> {
         review,
         options,
     };
-    for request in server.incoming_requests() {
-        handle(&mut state, request);
+    // Between requests the server warms the review's overlap caches, so the
+    // first Schedule request after a start does not compute them.
+    loop {
+        match server.try_recv() {
+            Ok(Some(request)) => handle(&mut state, request),
+            Ok(None) => {
+                if !state.review.warm_step(&state.catalog) {
+                    match server.recv() {
+                        Ok(request) => handle(&mut state, request),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(_) => break,
+        }
     }
     Ok(())
 }

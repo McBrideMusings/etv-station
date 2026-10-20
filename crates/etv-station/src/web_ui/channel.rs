@@ -102,16 +102,104 @@ pub(super) struct ReviewState {
     /// mtime and when it was computed: resolving every candidate costs more
     /// than a poll should, and a catalog change shows within the memo's life.
     candidate_digests: HashMap<PathBuf, (std::time::SystemTime, std::time::Instant, String)>,
+    /// Progress of [`ReviewState::warm_step`], which fills `library` and
+    /// `fingerprints` while the server is idle.
+    warm: Warm,
     /// Projections, filled by a worker thread so no request waits on one.
     pub(super) sims: Arc<projection::SimCache>,
     /// Graphics renders, filled by a worker thread so no request waits on one.
     pub(super) renders: super::graphics::RenderQueue,
 }
 
+/// Where the idle-time cache warm-up stands.
+enum Warm {
+    Pending,
+    /// The station as loaded for the warm-up, and the next lineup channel
+    /// whose fingerprint is to be computed.
+    Running {
+        station: Box<config::Station>,
+        next: usize,
+        began: std::time::Instant,
+    },
+    Done,
+}
+
 /// How long a channel's candidate digest is reused.
 const CANDIDATE_DIGEST_LIFE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ReviewState {
+    /// Fills the caches the review's overlap section reads (the library's
+    /// movie and episode ids, then each channel's fingerprint) one unit at a
+    /// time, so a first review after a start finds them warm. Each call is one
+    /// catalog query or one channel's resolve, so a request that arrives
+    /// during the warm-up waits for one unit, not for all of them. Returns
+    /// whether more work remains.
+    pub(super) fn warm_step(&mut self, catalog: &Catalog) -> bool {
+        let began_step = std::time::Instant::now();
+        match std::mem::replace(&mut self.warm, Warm::Done) {
+            Warm::Done => false,
+            Warm::Pending => match config::load_for_inspection(&self.station_path) {
+                Ok(station) => {
+                    self.warm = Warm::Running {
+                        station: Box::new(station),
+                        next: 0,
+                        began: began_step,
+                    };
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(event = "ui.warm.failed", error = %e, "review warm-up: station did not load");
+                    false
+                }
+            },
+            Warm::Running {
+                station,
+                mut next,
+                began,
+            } => {
+                if self.library.is_none() {
+                    if let Err(e) = self.ensure_library(catalog) {
+                        tracing::warn!(event = "ui.warm.failed", error = %e, "review warm-up: library ids did not resolve");
+                        return false;
+                    }
+                } else if let Some(lc) = station.channels.get(next) {
+                    if let Err(e) = channel_fingerprint(self, catalog, lc) {
+                        tracing::warn!(event = "ui.warm.channel_failed", channel = %channel_key(&lc.config_path), error = %e, "review warm-up: fingerprint did not resolve");
+                    }
+                    next += 1;
+                } else {
+                    tracing::info!(
+                        event = "ui.warm.done",
+                        channels = station.channels.len(),
+                        ms = began.elapsed().as_millis() as u64,
+                        "review warm-up: overlap caches filled"
+                    );
+                    return false;
+                }
+                self.warm = Warm::Running {
+                    station,
+                    next,
+                    began,
+                };
+                true
+            }
+        }
+    }
+
+    /// Fills `library` when it is empty.
+    fn ensure_library(&mut self, catalog: &Catalog) -> Result<(), String> {
+        if self.library.is_none() {
+            let movies = catalog
+                .resolve_query(r#"item.type == "movie""#)
+                .map_err(|e| e.to_string())?;
+            let episodes = catalog
+                .resolve_query(r#"item.type == "episode""#)
+                .map_err(|e| e.to_string())?;
+            self.library = Some((movies.into_iter().collect(), episodes.into_iter().collect()));
+        }
+        Ok(())
+    }
+
     pub(super) fn new(station_path: PathBuf, catalog_path: PathBuf) -> Self {
         // One directory per build of this binary, so a rebuilt renderer or
         // simulator never serves what the previous one produced.
@@ -140,6 +228,7 @@ impl ReviewState {
                     .unwrap_or_else(|| std::env::temp_dir().join("etv-station-ui-renders")),
             ),
             candidate_digests: HashMap::new(),
+            warm: Warm::Pending,
             station_path,
             fingerprints: HashMap::new(),
             library: None,
@@ -397,6 +486,7 @@ fn channel_review(
         start,
         time::Duration::seconds(i64::from(nominal_secs.max(1))),
     )?;
+    let real_ms = began.elapsed().as_millis() as u64;
     // With nothing published a projection starts at the span's first instant:
     // a fixed point, so its cache key does not turn over every second.
     let frontier = real.frontier.unwrap_or(start);
@@ -659,6 +749,7 @@ fn channel_review(
             .as_array()
             .map(Vec::len)
             .unwrap_or(0),
+        real_ms,
         ms = began.elapsed().as_millis() as u64,
         "review: schedule replayed"
     );
@@ -878,17 +969,9 @@ fn overlap_json(
     station: &config::Station,
     lc: &config::LoadedChannel,
 ) -> Result<Value, String> {
-    if state.review.library.is_none() {
-        let movies = state
-            .catalog
-            .resolve_query(r#"item.type == "movie""#)
-            .map_err(|e| e.to_string())?;
-        let episodes = state
-            .catalog
-            .resolve_query(r#"item.type == "episode""#)
-            .map_err(|e| e.to_string())?;
-        state.review.library = Some((movies.into_iter().collect(), episodes.into_iter().collect()));
-    }
+    let began = std::time::Instant::now();
+    let cold = state.review.library.is_none() || state.review.fingerprints.is_empty();
+    state.review.ensure_library(&state.catalog)?;
     let own = channel_fingerprint(&mut state.review, &state.catalog, lc)?;
     let library = state.review.library.as_ref().expect("filled above");
     let own_whole = is_whole_library(library, &own);
@@ -941,6 +1024,14 @@ fn overlap_json(
             })
         })
         .collect();
+    tracing::info!(
+        event = "ui.review.overlap",
+        channel = %channel_key(&lc.config_path),
+        cold,
+        channels = station.channels.len(),
+        ms = began.elapsed().as_millis() as u64,
+        "review: overlap computed"
+    );
     Ok(json!({
         "this_channel_whole_library": own_whole,
         "candidates": own.len(),
