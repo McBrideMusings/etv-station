@@ -14,7 +14,7 @@
 //! `bumper::preview` emits for a bumper. Renders run one at a time on their
 //! own worker thread, so no request waits on one. A render's id is a digest of
 //! what decides it (the request, the files it reads and their mtimes, the
-//! renderer binary), so a saved script gets a new id and re-renders, and an
+//! files beside each script, the renderer and ffmpeg binaries), so a saved script gets a new id and re-renders, and an
 //! unchanged one is served from the renders directory.
 
 use std::ffi::{OsStr, OsString};
@@ -203,6 +203,40 @@ fn mtime_ns(path: &Path) -> Option<u128> {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
+}
+
+/// Most files one render's id covers beyond the ones it names, and the deepest
+/// directory it descends: a script's imports and images are found by the
+/// script at run time, so every file beside it counts as read.
+const TREE_MAX_FILES: usize = 500;
+const TREE_MAX_DEPTH: usize = 4;
+
+/// Every regular file under `dir`, appended to `out` (bounded).
+fn collect_tree(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if out.len() >= TREE_MAX_FILES {
+            return;
+        }
+        if path.is_dir() {
+            if depth < TREE_MAX_DEPTH {
+                collect_tree(&path, depth + 1, out);
+            }
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+/// The `ffmpeg` the render steps spawn, resolved on `PATH`, so a new build is a new render.
+fn ffmpeg_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join("ffmpeg"))
+        .find(|p| p.is_file())
 }
 
 /// A channel looked up in the lineup.
@@ -468,7 +502,13 @@ pub(super) fn api_graphics_render(
     };
     let mut paths: Vec<PathBuf> = vec![state.options.station.clone(), lc.config_path.clone()];
     paths.extend(footage.iter().map(|f| f.path.clone()));
+    for script in &script_inputs {
+        if let Some(dir) = script.parent() {
+            collect_tree(dir, 0, &mut paths);
+        }
+    }
     paths.extend(script_inputs);
+    paths.extend(ffmpeg_on_path());
     paths.extend(station.station.fonts.iter().cloned());
     paths.push(crate::overlay_supervisor::overlay_binary_path());
     paths.sort();
