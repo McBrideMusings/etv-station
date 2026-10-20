@@ -5,17 +5,22 @@
 //! Resolving a fingerprint costs a few hundred milliseconds a channel, so a
 //! whole lineup costs seconds. A request never resolves one. The worker thread
 //! ([`OverlapCache::spawn`]) fills the cache as soon as the server starts, then
-//! sleeps until a lookup finds a channel file newer than its fingerprint or a
-//! fingerprint that failed. A lookup ([`OverlapCache::lookup`]) answers from
+//! sleeps until a lookup finds a channel file newer than its fingerprint, or a
+//! failure older than [`FAILED_RETRY`]. A lookup ([`OverlapCache::lookup`]) answers from
 //! the cache or says how far the worker has got.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration as StdDuration, SystemTime};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use crate::catalog::Catalog;
 use crate::config;
+
+/// How long after a pass a failed fingerprint or library waits before a
+/// lookup wakes the worker to retry it, so a channel that cannot resolve does
+/// not cost a whole pass per page view.
+const FAILED_RETRY: StdDuration = StdDuration::from_secs(60);
 
 /// A channel's candidate entry ids.
 pub type Fingerprint = Arc<HashSet<String>>;
@@ -32,6 +37,8 @@ struct Inner {
     /// A lookup found something stale since the worker's last pass.
     wanted: bool,
     running: bool,
+    /// When the worker's last pass finished.
+    last_pass: Option<Instant>,
     /// Why the worker stopped for good.
     dead: Option<String>,
 }
@@ -52,7 +59,10 @@ pub enum Lookup {
         fingerprints: Vec<Result<Fingerprint, String>>,
     },
     /// The worker has not resolved them all yet: `ready` of `total` are.
-    Pending { ready: usize, total: usize },
+    Pending {
+        ready: usize,
+        total: usize,
+    },
     Failed(String),
 }
 
@@ -81,43 +91,44 @@ impl OverlapCache {
     }
 
     /// The library and each of `channels`' fingerprints, or how far the
-    /// worker has got. A stale or failed entry wakes the worker.
+    /// worker has got. A missing or stale entry wakes the worker, and so does
+    /// a failure once [`FAILED_RETRY`] has passed since the last pass.
     pub fn lookup(&self, channels: &[&Path]) -> Lookup {
         let mtimes: Vec<Option<SystemTime>> = channels.iter().map(|p| file_mtime(p)).collect();
         let mut g = self.lock();
         if let Some(why) = &g.dead {
             return Lookup::Failed(why.clone());
         }
-        let current: Vec<Option<&Result<Fingerprint, String>>> = channels
+        // A channel file that cannot be read has no fingerprint to wait for.
+        let current: Vec<Option<Result<Fingerprint, String>>> = channels
             .iter()
             .zip(&mtimes)
-            .map(|(path, mtime)| match g.fingerprints.get(*path) {
-                Some((at, result)) if Some(*at) == *mtime => Some(result),
+            .map(|(path, mtime)| match (mtime, g.fingerprints.get(*path)) {
+                (None, _) => Some(Err(format!("cannot read {}", path.display()))),
+                (Some(m), Some((at, result))) if at == m => Some(result.clone()),
                 _ => None,
             })
             .collect();
         let ready = current.iter().filter(|c| c.is_some()).count();
-        let any_failed = current.iter().any(|c| matches!(c, Some(Err(_))))
-            || matches!(g.library, Some(Err(_)));
-        let answer = match &g.library {
-            Some(Ok(library)) if ready == channels.len() => Lookup::Ready {
+        let stale = ready < channels.len() || g.library.is_none();
+        let any_failed =
+            current.iter().any(|c| matches!(c, Some(Err(_)))) || matches!(g.library, Some(Err(_)));
+        let retry_due = g.last_pass.is_none_or(|t| t.elapsed() >= FAILED_RETRY);
+        if stale || (any_failed && retry_due) {
+            g.wanted = true;
+            self.wake.notify_all();
+        }
+        match &g.library {
+            Some(Ok(library)) if !stale => Lookup::Ready {
                 library: library.clone(),
-                fingerprints: current
-                    .into_iter()
-                    .map(|c| c.expect("all ready").clone())
-                    .collect(),
+                fingerprints: current.into_iter().flatten().collect(),
             },
             Some(Err(e)) => Lookup::Failed(e.clone()),
             _ => Lookup::Pending {
                 ready,
                 total: channels.len(),
             },
-        };
-        if !matches!(answer, Lookup::Ready { .. }) || any_failed {
-            g.wanted = true;
-            self.wake.notify_all();
         }
-        answer
     }
 
     pub fn stats(&self) -> Stats {
@@ -129,12 +140,20 @@ impl OverlapCache {
     }
 
     /// Start the worker thread. Its first pass fills the cache for the whole
-    /// lineup.
+    /// lineup. A panic in it marks the cache dead, so lookups report it
+    /// rather than wait.
     pub fn spawn(self: &Arc<Self>) {
         let me = self.clone();
         let spawned = std::thread::Builder::new()
             .name("ui-overlap".into())
-            .spawn(move || me.run());
+            .spawn(move || {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.run())).is_err() {
+                    tracing::error!(event = "ui.overlap.panicked", "overlap worker panicked");
+                    let mut g = me.lock();
+                    g.running = false;
+                    g.dead = Some("the overlap worker panicked".into());
+                }
+            });
         if let Err(e) = spawned {
             tracing::error!(event = "ui.overlap.spawn_failed", error = %e, "overlap worker did not start");
             self.lock().dead = Some(format!("the overlap worker did not start: {e}"));
@@ -169,14 +188,31 @@ impl OverlapCache {
     /// Resolve the library if it is missing or failed, then every lineup
     /// channel whose fingerprint is missing, stale or failed.
     fn pass(&self, catalog: &Catalog) {
-        let began = std::time::Instant::now();
-        let station = match config::load_for_inspection(&self.station_path) {
-            Ok(s) => s,
+        let began = Instant::now();
+        let result = self.resolve_lineup(catalog);
+        self.lock().last_pass = Some(Instant::now());
+        match result {
+            Ok((channels, resolved, failed)) => tracing::info!(
+                event = "ui.overlap.pass",
+                channels,
+                resolved,
+                failed,
+                ms = began.elapsed().as_millis() as u64,
+                "overlap worker: fingerprints resolved"
+            ),
             Err(e) => {
-                tracing::warn!(event = "ui.overlap.failed", error = %e, "overlap worker: station did not load");
-                return;
+                tracing::warn!(event = "ui.overlap.failed", error = %e, "overlap worker: station did not load")
             }
-        };
+        }
+    }
+
+    /// The pass's work: how many lineup channels there were, how many were
+    /// resolved and how many of those failed.
+    fn resolve_lineup(&self, catalog: &Catalog) -> Result<(usize, usize, usize), String> {
+        // A channel file changed at or after this instant may differ from the
+        // config just loaded, so its result is not cached under its mtime.
+        let loaded_at = SystemTime::now();
+        let station = config::load_for_inspection(&self.station_path).map_err(|e| e.to_string())?;
         if !matches!(self.lock().library, Some(Ok(_))) {
             let library = resolve_library(catalog);
             if let Err(e) = &library {
@@ -211,18 +247,15 @@ impl OverlapCache {
                 failed += 1;
                 tracing::warn!(event = "ui.overlap.channel_failed", channel = %lc.config_path.display(), error = %e, "overlap worker: fingerprint did not resolve");
             }
-            self.lock()
-                .fingerprints
-                .insert(lc.config_path.clone(), (mtime, result));
+            let mut g = self.lock();
+            if mtime >= loaded_at {
+                g.wanted = true;
+            } else {
+                g.fingerprints
+                    .insert(lc.config_path.clone(), (mtime, result));
+            }
         }
-        tracing::info!(
-            event = "ui.overlap.pass",
-            channels = station.channels.len(),
-            resolved,
-            failed,
-            ms = began.elapsed().as_millis() as u64,
-            "overlap worker: fingerprints resolved"
-        );
+        Ok((station.channels.len(), resolved, failed))
     }
 }
 

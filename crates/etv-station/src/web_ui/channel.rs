@@ -524,8 +524,9 @@ fn channel_review(
     let summary = comparable_numbers(&review);
     // A draft's numbers are not the channel's "last run", and neither are
     // numbers whose overlap count is still resolving.
+    let overlap_pending = review["overlap"]["pending"] == true;
     let since_last = match draft {
-        None if review["overlap"]["pending"] == true => state.review.previous.get(&key).cloned(),
+        None if overlap_pending => state.review.previous.get(&key).cloned(),
         None => state.review.previous.insert(key.clone(), summary.clone()),
         Some(_) => None,
     };
@@ -535,7 +536,8 @@ fn channel_review(
             .iter()
             .map(|(label, new)| {
                 let old = old.get(label).cloned().unwrap_or(Value::Null);
-                json!({ "label": label, "old": old, "new": new, "changed": old != *new })
+                // A number this review could not compute (null) is not a change.
+                json!({ "label": label, "old": old, "new": new, "changed": !new.is_null() && old != *new })
             })
             .collect::<Vec<_>>()
     });
@@ -657,7 +659,7 @@ fn channel_review(
             .as_array()
             .map(Vec::len)
             .unwrap_or(0),
-        overlap_pending = review["overlap"]["pending"] == true,
+        overlap_pending,
         real_ms,
         ms = began.elapsed().as_millis() as u64,
         "review: schedule replayed"
@@ -846,7 +848,8 @@ fn is_whole_library(library: &(HashSet<String>, HashSet<String>), ids: &HashSet<
 /// Every other channel sharing candidates with `lc`, largest first, each with
 /// the shared titles (episodes rolled up to their show). While the overlap
 /// worker is still resolving the lineup it is `{pending, ready, channels}`
-/// instead, and the page asks again.
+/// instead, and the page asks again; when the library or the worker failed it
+/// is `{error}`, and the rest of the review still answers.
 fn overlap_json(
     state: &mut AppState,
     station: &config::Station,
@@ -874,7 +877,10 @@ fn overlap_json(
             );
             return Ok(json!({ "pending": true, "ready": ready, "channels": total }));
         }
-        Lookup::Failed(e) => return Err(e),
+        Lookup::Failed(e) => {
+            tracing::warn!(event = "ui.review.overlap_failed", channel = %channel_key(&lc.config_path), error = %e, "review: overlap unavailable");
+            return Ok(json!({ "error": e }));
+        }
     };
     let mut own = None;
     let mut others = Vec::new();
@@ -1313,14 +1319,14 @@ fn comparable_numbers(review: &Value) -> Vec<(String, Value)> {
             "Series share of airtime (%)".to_string(),
             pct(&review["airtime"]["series_share"]).unwrap_or(Value::Null),
         ),
+        // `channels` is a count while the overlap is pending and absent when
+        // it failed: then there is no number to compare.
         (
             "Channels sharing content".to_string(),
-            json!(
-                review["overlap"]["channels"]
-                    .as_array()
-                    .map(Vec::len)
-                    .unwrap_or(0)
-            ),
+            review["overlap"]["channels"]
+                .as_array()
+                .map(|c| json!(c.len()))
+                .unwrap_or(Value::Null),
         ),
         ("Items aired".to_string(), review["items_aired"].clone()),
         (
