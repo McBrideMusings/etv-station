@@ -958,7 +958,10 @@ fn enrich_audit(catalog: &Catalog, metadata: Option<&Value>) -> Option<Value> {
         .find(|stage| stage.get("stage").and_then(Value::as_str) != Some("select"))?
         .clone();
     let labels = super::channel::near_miss_titles(catalog, std::slice::from_ref(stages), |_| true)
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!(event = "ui.pools.near_miss_titles", error = %e, "near-miss labels unavailable");
+            HashMap::new()
+        });
     let near_misses = audit
         .get_mut("detail")
         .and_then(|d| d.get_mut("near_misses"))

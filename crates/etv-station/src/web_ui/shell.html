@@ -1429,7 +1429,7 @@ async function apiJson(method, path, body) {
 const nearMissesHtml = (c) => {
   const nm = c.audit && c.audit.detail && c.audit.detail.near_misses;
   return Array.isArray(nm) && nm.length
-    ? `<div class="near-misses">passed over: ${nm.map((m) => `${esc(m.label || m.id)} (${num(m.score)})`).join(' · ')}</div>` : '';
+    ? `<div>passed over: ${nm.map((m) => `${esc(m.label || m.id)} (${num(m.score)})`).join(' · ')}</div>` : '';
 };
 const poolTitle = (c) => (c.show ? `${c.show} — ` : '') + c.title + (c.year ? ` (${c.year})` : '');
 
