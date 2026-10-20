@@ -125,8 +125,21 @@ pub fn serve(options: Options) -> Result<(), String> {
         review,
         options,
     };
-    for request in server.incoming_requests() {
-        handle(&mut state, request);
+    // Between requests the server warms the review's overlap caches, so the
+    // first Schedule request after a start does not compute them.
+    loop {
+        match server.try_recv() {
+            Ok(Some(request)) => handle(&mut state, request),
+            Ok(None) => {
+                if !state.review.warm_step(&state.catalog) {
+                    match server.recv() {
+                        Ok(request) => handle(&mut state, request),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(_) => break,
+        }
     }
     Ok(())
 }
@@ -872,6 +885,26 @@ mod tests {
         let (status, fresh) = post_render(&mut f.state, ask);
         assert_eq!(status, 202, "{fresh}");
         assert_ne!(fresh["render"], id.as_str());
+    }
+
+    #[test]
+    fn touching_a_file_beside_the_script_changes_the_render_id() {
+        let mut f = graphics_fixture();
+        let dir = f.dir.path().join("channels/a");
+        let script = dir.join("card.rhai");
+        let module = dir.join("lib").join("helpers.rhai");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "fn x() { 1 }").unwrap();
+        let ask = json!({"kind": "still", "script": script.display().to_string(), "at": 2.0});
+        let (_, first) = post_render(&mut f.state, ask.clone());
+        let (_, same) = post_render(&mut f.state, ask.clone());
+        assert_eq!(first["render"], same["render"]);
+
+        let file = std::fs::File::options().write(true).open(&module).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        let (_, after) = post_render(&mut f.state, ask);
+        assert_ne!(first["render"], after["render"]);
     }
 
     #[test]
