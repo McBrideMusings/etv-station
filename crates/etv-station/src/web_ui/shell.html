@@ -376,8 +376,9 @@ const days1 = (d) => (Math.round(d * 10) / 10).toFixed(1);
 const hourLabel = (h) => (h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p');
 
 // Fetches the channel's review. The real schedule answers at once and is drawn; while a requested
-// projection runs the server answers 202 with that same real review, so the page asks again every
-// second beside a spinner and redraws with the projection when it lands.
+// projection runs the server answers 202 with that same real review, and while the lineup's overlap is
+// still resolving the review's `overlap` is `{pending}`, so the page asks again every second beside a
+// spinner and redraws when both have landed.
 async function load(channel, project, view) {
   const q = new URLSearchParams();
   if (project) q.set('project', project);
@@ -401,10 +402,10 @@ async function load(channel, project, view) {
       data = await res.json();
       if (seq !== loadSeq) return;
       if (!res.ok) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
-      if (!data.pending) break;
+      if (!data.pending && !data.overlap?.pending) break;
       if (!drewReal) { $('report').classList.remove('loading'); show(data, view); drewReal = true; }
-      if (Date.now() > deadline) throw new Error(`still projecting after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
-      projecting();
+      if (Date.now() > deadline) throw new Error(`still ${data.pending ? 'projecting' : 'resolving the overlap'} after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
+      if (data.pending) projecting();
       await new Promise((r) => setTimeout(r, 1000));
       if (seq !== loadSeq) return;
     }
@@ -455,7 +456,7 @@ async function loadDraft(channel, project, draft, view) {
       data = await res.json();
       if (seq !== loadSeq) return;
       if (!res.ok && res.status !== 202) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
-      if (!data.pending) break;
+      if (!data.pending && !data.deployed?.overlap?.pending && !data.draft?.overlap?.pending) break;
       pendingNow.deployed = !!data.deployed_pending;
       pendingNow.draft = !!data.draft_pending;
       if (!drewReal && data.deployed && !data.deployed.error) { $('report').classList.remove('loading'); show(data.deployed, view); drewReal = true; }
@@ -840,7 +841,8 @@ function render(d) {
 
   // 1. Masthead
   const fr = d.first_repeat;
-  const ov = d.overlap.channels;
+  const ovPending = !!d.overlap.pending;
+  const ov = d.overlap.channels || [];
   const largest = ov[0];
   html.push(`<header class="mast">
     <div class="bug">${esc(d.number)}</div>
@@ -854,8 +856,9 @@ function render(d) {
         <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : `Nothing repeated in ${esc(covers)}`}${diff ? `<br>deployed: ${diff.first_repeat.deployed ? days1(diff.first_repeat.deployed.days) + ' d' : '&gt;' + span + ' d'}` : ''}</dd></div>
       <div><dt>Film / series airtime</dt><dd>${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</dd>
         <dd class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</dd></div>
-      <div><dt>Channels sharing content</dt><dd>${d.overlap.this_channel_whole_library ? '—' : ov.length}</dd>
-        <dd class="d" title="${esc(largest ? `${largest.number} ${largest.display_name || largest.channel} (${largest.shared})` : '')}">${d.overlap.this_channel_whole_library ? 'Draws from the whole library'
+      <div><dt>Channels sharing content</dt><dd>${d.overlap.this_channel_whole_library || ovPending ? '—' : ov.length}</dd>
+        <dd class="d" title="${esc(largest ? `${largest.number} ${largest.display_name || largest.channel} (${largest.shared})` : '')}">${ovPending ? `Resolving the lineup (${d.overlap.ready} of ${d.overlap.channels})…`
+          : d.overlap.this_channel_whole_library ? 'Draws from the whole library'
           : largest ? `Largest: ${esc(largest.number)} ${esc(largest.display_name || largest.channel)} (${largest.shared})` : 'None share an item'}</dd></div>
       <div><dt>Items aired</dt><dd>${d.items_aired}</dd><dd class="d">${d.distinct_items} distinct · ${esc(covers)}</dd></div>
     </dl>
@@ -929,16 +932,18 @@ function render(d) {
     <tbody>${depthRows}</tbody></table></section>`);
 
   // 5. Overlap
-  const overlapRows = d.overlap.this_channel_whole_library
+  const overlapRows = ovPending
+    ? `<p class="muted"><span class="spinner"></span>Resolving every channel's candidates (${d.overlap.ready} of ${d.overlap.channels})…</p>`
+    : d.overlap.this_channel_whole_library
     ? '<p class="muted">This channel\'s pools resolve to the whole library, so every other channel overlaps it; no list.</p>'
     : ov.length === 0 ? '<p class="muted">No other channel shares an item.</p>'
     : ov.map((c) => `<details class="overlap-row"><summary><strong>${esc(c.number)} ${esc(c.display_name || c.channel)}</strong>
         — ${c.shared} shared</summary><div class="titles">${c.titles.map((t) => `<div>${esc(t)}</div>`).join('')}</div></details>`).join('');
-  const excluded = d.overlap.whole_library.length
+  const excluded = !ovPending && d.overlap.whole_library.length
     ? `<p class="muted">Left out: ${d.overlap.whole_library.map(esc).join(', ')} — their pools resolve to the whole library.</p>` : '';
-  const errs = d.overlap.errors.map((e) => `<div class="notice">${esc(e.channel)}: ${esc(e.error)}</div>`).join('');
+  const errs = (d.overlap.errors || []).map((e) => `<div class="notice">${esc(e.channel)}: ${esc(e.error)}</div>`).join('');
   html.push(`<section><h2>Overlap</h2>
-    <p class="muted">Channels whose configs resolve to some of the same items (${d.overlap.candidates} candidates here), largest first.</p>
+    <p class="muted">Channels whose configs resolve to some of the same items${ovPending ? '' : ` (${d.overlap.candidates} candidates here)`}, largest first.</p>
     ${overlapRows}${excluded}${errs}</section>`);
 
   // 6. Since last run
