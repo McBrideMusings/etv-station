@@ -889,7 +889,7 @@ function render(d) {
       <ol>${next}</ol></div>`;
   }).join('');
   const samplesSection = `<section><h2>Tune-in samples</h2>
-    <p class="muted">${d.samples.length} moments drawn from ${d.seed == null ? 'the default seed' : `seed ${esc(seedLabel(d.seed))}`}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
+    <p class="muted">${d.samples.length} moments drawn from ${d.seed == null ? 'the default seed' : typeof d.seed === 'object' ? `a seed that ${esc(seedLabel(d.seed))}` : `seed ${esc(seedLabel(d.seed))}`}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
     <div class="samples">${samples}</div></section>`;
 
   // 3. Principles: graded where the schedule measures them, listed with the reason where it cannot.
