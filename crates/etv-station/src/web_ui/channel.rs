@@ -789,7 +789,8 @@ fn channel_review(
 }
 
 /// A label for every item the audit trails in `audits` name as passed over
-/// (`detail.near_misses[].id`) and `wanted` accepts, keyed by entry id.
+/// (`detail.near_misses[].id`) and `wanted` accepts, keyed by the id as named:
+/// an entry id gets its airing label, a series id (`show_id`) its show name.
 pub(super) fn near_miss_titles(
     catalog: &Catalog,
     audits: &[Value],
