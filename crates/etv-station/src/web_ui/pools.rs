@@ -946,29 +946,31 @@ fn picked_item_json(
 /// The first `audit()` record `score::pick` attached to this item's
 /// `metadata.audit` (module docs: `pick()` runs `audit()` itself and merges
 /// its stage records in, keyed to the picked item), with every
-/// `detail.near_misses[].id` resolved to a title/year — the near-miss list
-/// is entry ids and a score/reason on its own (see `taste-cosine.rhai`'s
-/// `audit()`), useless to a reader without knowing what they name.
+/// `detail.near_misses[].id` given the `label` the Schedule and Guide show
+/// (`channel::near_miss_titles`) — the near-miss list is entry ids and a
+/// score/reason on its own (see `taste-cosine.rhai`'s `audit()`), useless to a
+/// reader without knowing what they name.
 fn enrich_audit(catalog: &Catalog, metadata: Option<&Value>) -> Option<Value> {
-    let mut audit = metadata?
-        .get("audit")?
+    let stages = metadata?.get("audit")?;
+    let mut audit = stages
         .as_array()?
         .iter()
         .find(|stage| stage.get("stage").and_then(Value::as_str) != Some("select"))?
         .clone();
+    let labels = super::channel::near_miss_titles(catalog, std::slice::from_ref(stages), |_| true)
+        .unwrap_or_default();
     let near_misses = audit
         .get_mut("detail")
         .and_then(|d| d.get_mut("near_misses"))
         .and_then(|nm| nm.as_array_mut());
     if let Some(near_misses) = near_misses {
         for row in near_misses.iter_mut() {
-            let id = row.get("id").and_then(|v| v.as_str()).map(str::to_string);
-            let Some(id) = id else { continue };
-            if let Ok(Some(e)) = catalog.entry(&id)
-                && let Some(obj) = row.as_object_mut()
-            {
-                obj.insert("title".to_string(), json!(e.title));
-                obj.insert("year".to_string(), json!(e.year));
+            let label = row
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| labels.get(id));
+            if let (Some(label), Some(obj)) = (label.cloned(), row.as_object_mut()) {
+                obj.insert("label".to_string(), json!(label));
             }
         }
     }
@@ -1341,6 +1343,25 @@ mod tests {
             plain["pools"]["films"]["sources"],
             json!({"expr": "item.type == \"movie\""})
         );
+    }
+
+    #[test]
+    fn ranking_near_misses_carry_the_airing_label() {
+        let mut f = fixture();
+        let (_, scored) = call(&mut f.state, Method::Get, "/api/channels/foryou/pools", "");
+        let rows: Vec<&Value> = scored["pools"]["movies"]["ranking"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["audit"]["detail"]["near_misses"].as_array())
+            .flatten()
+            .collect();
+        assert!(!rows.is_empty(), "no near-misses in {scored}");
+        for row in rows {
+            let label = row["label"].as_str().unwrap_or_default();
+            assert!(label.starts_with("mov-"), "{row}");
+            assert!(row.get("title").is_none(), "{row}");
+        }
     }
 
     #[test]
