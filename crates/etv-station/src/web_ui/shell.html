@@ -1436,6 +1436,12 @@ async function apiJson(method, path, body) {
   }
 }
 
+// The titles an item beat out, each as the Schedule and Guide label it, under the ranking row's verdict.
+const nearMissesHtml = (c) => {
+  const nm = c.audit && c.audit.detail && c.audit.detail.near_misses;
+  return Array.isArray(nm) && nm.length
+    ? `<div>passed over: ${nm.map((m) => `${esc(m.label || m.id)} (${num(m.score)})`).join(' · ')}</div>` : '';
+};
 const poolTitle = (c) => (c.show ? `${c.show} — ` : '') + c.title + (c.year ? ` (${c.year})` : '');
 
 function setPoolsBusy(on, what) {
@@ -1518,7 +1524,7 @@ function poolHtml(name, p, draft, openIt) {
       <span class="searchbox"><input type="text" class="val" placeholder="value (type to search)"><div class="sugg" hidden></div></span>
       <input type="number" class="aw" value="1" step="0.1" title="weight"><button type="button" class="add">Add</button></div>${excluded}</div>`;
   const rows = p.ranking.map((c) => `<tr><td class="num">${c.rank}</td><td>${esc(poolTitle(c))}</td>
-      <td>${movementHtml(c)}</td><td class="muted">${esc(c.audit ? c.audit.verdict : '')}</td></tr>`).join('');
+      <td>${movementHtml(c)}</td><td class="muted">${esc(c.audit ? c.audit.verdict : '')}${nearMissesHtml(c)}</td></tr>`).join('');
   const ranking = `<div class="pfield wide"><h4>ranking <span class="muted">— from the profile alone: one full pick, no airing history, no exploration${draft && p.edited ? '; movement is against the deployed ranking' : ''}</span></h4>
     <div class="rank-scroll"><table class="rtable"><thead><tr><th class="num">#</th><th>title</th><th>${draft && p.edited ? 'moved' : ''}</th><th>verdict</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="4" class="muted">(nothing ranked)</td></tr>'}</tbody></table></div>

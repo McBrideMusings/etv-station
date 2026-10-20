@@ -14,9 +14,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use ersatztv_playout::playout::Playout;
-use etv_overlay::overlay_spec::OverlaySpec;
-use etv_overlay::overlay_timeline::OverlayTimelineSource;
+use ersatztv_playout::playout::{Playout, PlayoutItem};
 use time::OffsetDateTime;
 
 use crate::errors::StationError;
@@ -35,13 +33,24 @@ pub struct ReportItem {
     pub finish: OffsetDateTime,
     pub title: Option<String>,
     pub metadata: Option<serde_json::Value>,
-    /// The overlay config in effect at `start`: the covering span's spec, the
-    /// channel's `base` for an instant no span covers, `None` for a span that
-    /// explicitly draws nothing, and `None` for every item on a channel with
-    /// no `overlay.json` on disk at all. Resolved by
-    /// [`etv_overlay::overlay_timeline::OverlayTimeline::spec_at`], never
-    /// reimplemented here.
-    pub overlay_spec: Option<OverlaySpec>,
+}
+
+impl From<PlayoutItem> for ReportItem {
+    /// The one place a chunk-file item becomes a report item: its title is the
+    /// program's title, else its sub-title.
+    fn from(item: PlayoutItem) -> Self {
+        let title = item
+            .program
+            .as_ref()
+            .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
+        ReportItem {
+            id: item.id,
+            start: item.start,
+            finish: item.finish,
+            title,
+            metadata: item.metadata,
+        }
+    }
 }
 
 /// Read `output_folder`'s chunk files, discard chunks that have already
@@ -57,13 +66,6 @@ pub async fn upcoming(
     next: usize,
 ) -> Result<Vec<ReportItem>, StationError> {
     let files = scan::scan_output_folder(output_folder).await?;
-
-    // Best-effort: a channel with no `overlay.json` on disk (or one this
-    // process cannot parse) leaves `overlay_source` unloaded, and
-    // `spec_at` on an unloaded source returns `None` for every item — which
-    // is exactly "no overlay configured" for this report, not an error.
-    let mut overlay_source = OverlayTimelineSource::new(output_folder);
-    let _ = overlay_source.refresh();
 
     let mut items: Vec<ReportItem> = Vec::new();
     for file in &files {
@@ -85,19 +87,7 @@ pub async fn upcoming(
             if item.finish <= now {
                 continue;
             }
-            let title = item
-                .program
-                .as_ref()
-                .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
-            let overlay_spec = overlay_source.spec_at(item.start).cloned();
-            items.push(ReportItem {
-                id: item.id,
-                start: item.start,
-                finish: item.finish,
-                title,
-                metadata: item.metadata,
-                overlay_spec,
-            });
+            items.push(item.into());
         }
     }
 
@@ -115,8 +105,7 @@ pub async fn upcoming(
 ///
 /// XMLTV, and so the guide, names a programme's start to the whole second while
 /// a chunk file keeps microseconds, so the match is on the
-/// second. `overlay_spec` is left `None`: a caller that wants it reads
-/// [`upcoming`].
+/// second.
 pub async fn item_at(
     output_folder: &Path,
     second: OffsetDateTime,
@@ -133,18 +122,7 @@ pub async fn item_at(
             if item.start < second || item.start >= next {
                 continue;
             }
-            let title = item
-                .program
-                .as_ref()
-                .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
-            return Ok(Some(ReportItem {
-                id: item.id,
-                start: item.start,
-                finish: item.finish,
-                title,
-                metadata: item.metadata,
-                overlay_spec: None,
-            }));
+            return Ok(Some(item.into()));
         }
     }
     Ok(None)
@@ -363,8 +341,6 @@ fn clock(t: OffsetDateTime) -> String {
 mod tests {
     use super::*;
     use ersatztv_playout::playout::{Playout, PlayoutItem, ProgramMetadata};
-    use etv_overlay::overlay_spec::PixelFormat;
-    use etv_overlay::overlay_timeline::{OverlaySpan, OverlayTimeline};
     use time::Duration;
     use time::macros::datetime;
 
@@ -565,7 +541,7 @@ mod tests {
 
     #[test]
     fn an_empty_audit_array_is_reported_unexplained() {
-        let mut item = hand_built_item(None);
+        let mut item = hand_built_item();
         item.metadata = Some(serde_json::json!({ "audit": [] }));
         let report = render("ch", datetime!(2026-04-20 12:00 UTC), &[item]);
         assert!(
@@ -576,7 +552,7 @@ mod tests {
 
     #[test]
     fn an_item_with_no_title_is_headed_by_its_id() {
-        let mut item = hand_built_item(None);
+        let mut item = hand_built_item();
         item.title = None;
         let report = render("ch", datetime!(2026-04-20 12:00 UTC), &[item]);
         assert!(
@@ -785,17 +761,7 @@ mod tests {
         assert_eq!(items.len(), 2, "before + straddler, deduped");
     }
 
-    fn overlay_spec_fixture(framerate: u32) -> OverlaySpec {
-        OverlaySpec {
-            width: 1280,
-            height: 720,
-            framerate,
-            pixel_format: PixelFormat::Rgba8,
-            graphics: vec![],
-        }
-    }
-
-    fn hand_built_item(overlay_spec: Option<OverlaySpec>) -> ReportItem {
+    fn hand_built_item() -> ReportItem {
         ReportItem {
             id: "entry-0".to_string(),
             start: datetime!(2026-04-20 12:00 UTC),
@@ -807,80 +773,6 @@ mod tests {
                 ],
                 "other_key": "kept",
             })),
-            overlay_spec,
         }
-    }
-
-    /// Write a channel's `overlay.json` timeline the same way the station
-    /// writes it, so `upcoming` can resolve each item's `overlay_spec`
-    /// exactly as the daemon would.
-    fn write_overlay_timeline(folder: &Path, timeline: &OverlayTimeline) {
-        std::fs::write(
-            folder.join(etv_overlay::overlay_timeline::OVERLAY_TIMELINE_FILE_NAME),
-            serde_json::to_vec(timeline).unwrap(),
-        )
-        .unwrap();
-    }
-
-    /// A covering span's spec, `base` for an uncovered instant, `None` for a
-    /// span that explicitly draws nothing, and `None` throughout for a
-    /// channel with no `overlay.json` — all resolved via
-    /// `OverlayTimeline::spec_at`, never reimplemented in `upcoming`.
-    #[tokio::test]
-    async fn overlay_spec_follows_the_timeline_fallback_rules() {
-        let dir = tempfile::tempdir().unwrap();
-        // Three half-hour items: [12:00,12:30) covered by a span, [12:30,13:00)
-        // covered by a span that draws nothing, [13:00,13:30) uncovered.
-        write_chunk(dir.path(), datetime!(2026-04-20 12:00 UTC), 3, no_audit).await;
-
-        let base = overlay_spec_fixture(30);
-        let covering = overlay_spec_fixture(31);
-        let timeline = OverlayTimeline {
-            base: base.clone(),
-            spans: vec![
-                OverlaySpan {
-                    start: datetime!(2026-04-20 12:00 UTC),
-                    finish: datetime!(2026-04-20 12:30 UTC),
-                    spec: Some(covering.clone()),
-                },
-                OverlaySpan {
-                    start: datetime!(2026-04-20 12:30 UTC),
-                    finish: datetime!(2026-04-20 13:00 UTC),
-                    spec: None,
-                },
-            ],
-        };
-        write_overlay_timeline(dir.path(), &timeline);
-
-        let now = datetime!(2026-04-20 12:00 UTC);
-        let items = upcoming(dir.path(), now, 10).await.unwrap();
-        assert_eq!(items.len(), 3);
-        assert_eq!(
-            items[0].overlay_spec,
-            Some(covering),
-            "a covered instant reads its span's spec"
-        );
-        assert_eq!(
-            items[1].overlay_spec, None,
-            "a span that explicitly draws nothing must not fall back to base"
-        );
-        assert_eq!(
-            items[2].overlay_spec,
-            Some(base),
-            "an uncovered instant falls back to base"
-        );
-    }
-
-    /// A channel with no `overlay.json` on disk at all is not an error — every
-    /// item's `overlay_spec` is simply `null`.
-    #[tokio::test]
-    async fn no_overlay_json_yields_null_overlay_spec_for_every_item() {
-        let dir = tempfile::tempdir().unwrap();
-        write_chunk(dir.path(), datetime!(2026-04-20 12:00 UTC), 2, no_audit).await;
-
-        let now = datetime!(2026-04-20 12:00 UTC);
-        let items = upcoming(dir.path(), now, 10).await.unwrap();
-        assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|i| i.overlay_spec.is_none()));
     }
 }

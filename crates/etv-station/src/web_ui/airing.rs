@@ -94,23 +94,7 @@ pub(super) fn api_airing_audit(state: &AppState, airing: &str) -> Result<(u16, V
 
     let (audit, _) = crate::audit_report::split_audit(item.metadata.as_ref());
     let entry = state.catalog.entry(&item.id).ok().flatten();
-    let near_miss_ids: Vec<String> = audit
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|stage| stage["detail"]["near_misses"].as_array())
-        .flatten()
-        .filter_map(|m| m["id"].as_str().map(str::to_string))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let titles: HashMap<String, String> = state
-        .catalog
-        .entries_for(&near_miss_ids)
-        .map_err(|e| e.to_string())?
-        .iter()
-        .map(|(id, e)| (id.clone(), channel::airing_label(e)))
-        .collect();
+    let titles = channel::near_miss_titles(&state.catalog, std::slice::from_ref(&audit), |_| true)?;
     let stages = audit.as_array().map(Vec::len).unwrap_or(0);
     tracing::info!(
         event = "ui.airing_audit",
