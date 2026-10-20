@@ -139,3 +139,11 @@ How long a channel runs, at its own pace, before something airs again. It is mea
 ## Tune-in sample
 
 A random moment in a channel's simulated schedule: what is playing, how far in, the next two items, and the frame a viewer would see. It stands in for landing on the channel while flipping.
+
+## Draft
+
+A set of profile edits for one channel, held in server memory under an id the dashboard page keeps in its URL; nothing writes a file and two drafts never share edits.
+
+## Dashboard
+
+The single web page at `/` served by `etv-station --serve-ui`: tabs (Channels, Guide, Health) and, on Channels, a lineup rail with Schedule, Pattern, Pools and Graphics views.
