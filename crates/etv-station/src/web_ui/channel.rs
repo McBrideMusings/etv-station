@@ -678,24 +678,7 @@ fn channel_review(
     let audits: Vec<Value> = (0..airings.len())
         .map(|i| crate::audit_report::split_audit(simulated[i].metadata.as_ref()).0)
         .collect();
-    let passed_over: Vec<String> = audits
-        .iter()
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|stage| stage["detail"]["near_misses"].as_array())
-        .flatten()
-        .filter_map(|m| m["id"].as_str().map(str::to_string))
-        .filter(|id| !entries.contains_key(id))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let titles: HashMap<String, String> = state
-        .catalog
-        .entries_for(&passed_over)
-        .map_err(|e| e.to_string())?
-        .iter()
-        .map(|(id, e)| (id.clone(), airing_label(e)))
-        .collect();
+    let titles = near_miss_titles(&state.catalog, &audits, |id| !entries.contains_key(id))?;
 
     // Fields that belong to the item, not the airing: one copy per entry id,
     // however many times it airs. The page merges them back onto each airing.
@@ -803,6 +786,33 @@ fn channel_review(
         ),
     );
     Ok((if pending { 202 } else { 200 }, out))
+}
+
+/// A label for every item the audit trails in `audits` name as passed over
+/// (`detail.near_misses[].id`) and `wanted` accepts, keyed by entry id.
+pub(super) fn near_miss_titles(
+    catalog: &Catalog,
+    audits: &[Value],
+    wanted: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, String>, String> {
+    let ids: Vec<String> = audits
+        .iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|stage| stage["detail"]["near_misses"].as_array())
+        .flatten()
+        .filter_map(|m| m["id"].as_str())
+        .filter(|id| wanted(id))
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(catalog
+        .entries_for(&ids)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|(id, e)| (id.clone(), airing_label(e)))
+        .collect())
 }
 
 /// A movie as `Title (Year)`, an episode as `Show S01E02 · Title`.

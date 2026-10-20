@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use ersatztv_playout::playout::Playout;
+use ersatztv_playout::playout::{Playout, PlayoutItem};
 use time::OffsetDateTime;
 
 use crate::errors::StationError;
@@ -33,6 +33,24 @@ pub struct ReportItem {
     pub finish: OffsetDateTime,
     pub title: Option<String>,
     pub metadata: Option<serde_json::Value>,
+}
+
+impl From<PlayoutItem> for ReportItem {
+    /// The one place a chunk-file item becomes a report item: its title is the
+    /// program's title, else its sub-title.
+    fn from(item: PlayoutItem) -> Self {
+        let title = item
+            .program
+            .as_ref()
+            .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
+        ReportItem {
+            id: item.id,
+            start: item.start,
+            finish: item.finish,
+            title,
+            metadata: item.metadata,
+        }
+    }
 }
 
 /// Read `output_folder`'s chunk files, discard chunks that have already
@@ -69,17 +87,7 @@ pub async fn upcoming(
             if item.finish <= now {
                 continue;
             }
-            let title = item
-                .program
-                .as_ref()
-                .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
-            items.push(ReportItem {
-                id: item.id,
-                start: item.start,
-                finish: item.finish,
-                title,
-                metadata: item.metadata,
-            });
+            items.push(item.into());
         }
     }
 
@@ -114,17 +122,7 @@ pub async fn item_at(
             if item.start < second || item.start >= next {
                 continue;
             }
-            let title = item
-                .program
-                .as_ref()
-                .and_then(|p| p.title.clone().or_else(|| p.sub_title.clone()));
-            return Ok(Some(ReportItem {
-                id: item.id,
-                start: item.start,
-                finish: item.finish,
-                title,
-                metadata: item.metadata,
-            }));
+            return Ok(Some(item.into()));
         }
     }
     Ok(None)
