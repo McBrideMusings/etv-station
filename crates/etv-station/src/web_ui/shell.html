@@ -370,6 +370,8 @@ function fmt(ts, tz, opts) {
 }
 const timeOf = (ts, tz) => fmt(ts, tz, { hour: 'numeric', minute: '2-digit' });
 const dayOf = (ts, tz) => fmt(ts, tz, { weekday: 'short', month: 'short', day: 'numeric' });
+// A fixed seed is its number, a rotating seed is `{rotate}`, no seed is null.
+const seedLabel = (seed) => (seed == null ? 'none' : typeof seed === 'object' ? `rotates every ${seed.rotate}` : String(seed));
 const days1 = (d) => (Math.round(d * 10) / 10).toFixed(1);
 const hourLabel = (h) => (h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p');
 
@@ -844,7 +846,7 @@ function render(d) {
     <div class="bug">${esc(d.number)}</div>
     <div>
       <h1>${esc(d.display_name || d.name)}</h1>
-      <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${esc(covers)} (${esc(tz)}) · seed ${esc(d.seed ?? 'none')} · ${esc(d.config_path)}</div>
+      <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${esc(covers)} (${esc(tz)}) · seed ${esc(seedLabel(d.seed))} · ${esc(d.config_path)}</div>
       <div class="pattern"><button type="button" class="linkish" id="patternBtn">Pattern</button><span class="pstub" title="${esc(patternWords(d.blocks))}">${esc(patternWords(d.blocks))}</span></div>
     </div>
     <dl class="facts">
@@ -887,7 +889,7 @@ function render(d) {
       <ol>${next}</ol></div>`;
   }).join('');
   const samplesSection = `<section><h2>Tune-in samples</h2>
-    <p class="muted">${d.samples.length} moments drawn from seed ${esc(d.seed ?? 0)}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
+    <p class="muted">${d.samples.length} moments drawn from seed ${esc(seedLabel(d.seed))}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
     <div class="samples">${samples}</div></section>`;
 
   // 3. Principles: graded where the schedule measures them, listed with the reason where it cannot.
