@@ -47,8 +47,8 @@ The script finds symptoms. Each pass below explains them.
 
 ## Step 2 — schedule pass
 
-1. **Why each flagged item is there.** `tools/audit-report.sh <folder> --next 40
-   --format json` (what `admin audit` runs) gives every upcoming item's audit
+1. **Why each flagged item is there.** `tools/audit-report.sh <folder> --next 40`
+   (what `admin audit` runs) gives every upcoming item's audit
    trail: pool, `rank`, `score`, `recency_factor`, `near_misses`, `guide`
    line. A repeat with `recency_factor 1.0` was ranked as if its earlier
    airing did not exist.

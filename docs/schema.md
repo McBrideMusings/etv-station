@@ -1116,7 +1116,7 @@ member's, so the Review labels it with the member.
 member each will draw are read from the sidecar without running a generation.
 The Review JSON carries them under `rotations` (14 placements per rotation), and
 `etv-station --audit <channel> --next N` prints N placements per rotation after
-the schedule, or adds a `rotations` array to `--format json`. Each row is
+the schedule. Each row is
 `{rotation, schedule, start, member, airs, reason}`; `airs` differs from `member`
 when the member is itself a rotation.
 

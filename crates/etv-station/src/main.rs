@@ -170,13 +170,6 @@ struct Cli {
     #[arg(long, value_name = "N", requires = "audit", default_value_t = 10)]
     next: usize,
 
-    /// With `--audit`, output format for the report: `text` (default, the
-    /// existing human-readable rendering, byte-identical to before this
-    /// flag existed) or `json` (the EPG TUI's shape — see
-    /// `audit_report::render_json`).
-    #[arg(long, value_enum, requires = "audit", default_value_t = ReportFormat::Text)]
-    format: ReportFormat,
-
     /// With `--audit` and no channel name, list every channel in the station
     /// config instead of reporting one: its declared name, its declared dial
     /// number (the same one ETV-next writes into `channelN.json` and the
@@ -309,14 +302,6 @@ enum LogFormat {
     Json,
 }
 
-/// `--audit`'s output format. Distinct from [`LogFormat`] — one names how the
-/// process logs, the other names how the report it writes is shaped.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-enum ReportFormat {
-    Text,
-    Json,
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -397,15 +382,9 @@ fn main() -> ExitCode {
 
     if let Some(target) = cli.audit.as_deref() {
         if cli.list {
-            return list_channels(config, cli.format);
+            return list_channels(config);
         }
-        return audit(
-            config,
-            target,
-            cli.next,
-            cli.format,
-            cli.audit_out.as_deref(),
-        );
+        return audit(config, target, cli.next, cli.audit_out.as_deref());
     }
 
     init_tracing(cli.log_format);
@@ -1132,13 +1111,7 @@ fn resolve_channels<'a>(
 /// plugin runs on this path, which is the whole point (ADR 0011) — the
 /// report describes what will actually air, not what a re-simulation of a
 /// plugin's `pick()` believes would air.
-fn audit(
-    config_path: &Path,
-    target: &str,
-    next: usize,
-    format: ReportFormat,
-    audit_out: Option<&Path>,
-) -> ExitCode {
+fn audit(config_path: &Path, target: &str, next: usize, audit_out: Option<&Path>) -> ExitCode {
     let station = match load_for("audit", config_path) {
         Ok(s) => s,
         Err(code) => return code,
@@ -1215,22 +1188,8 @@ fn audit(
         ),
         Err(_) => Vec::new(),
     };
-    let (report, extension) = match format {
-        ReportFormat::Text => (
-            audit_report::render(&channel.name, now, &items)
-                + etv_station::rotation::render_text(&rotations).as_str(),
-            "txt",
-        ),
-        ReportFormat::Json => (
-            audit_report::render_json_with(
-                &channel.name,
-                now,
-                &items,
-                etv_station::rotation::rows_json(&rotations),
-            ),
-            "json",
-        ),
-    };
+    let report = audit_report::render(&channel.name, now, &items)
+        + etv_station::rotation::render_text(&rotations).as_str();
     match audit_out {
         Some(path) if path == Path::new("-") => {
             print!("{report}");
@@ -1242,8 +1201,7 @@ fn audit(
             }
         }
         None => {
-            let path = std::env::temp_dir()
-                .join(format!("etv-station-audit-{}.{extension}", channel.name));
+            let path = std::env::temp_dir().join(format!("etv-station-audit-{}.txt", channel.name));
             if let Err(err) = std::fs::write(&path, report) {
                 eprintln!("audit: writing {}: {err}", path.display());
                 return ExitCode::from(1);
@@ -1283,45 +1241,18 @@ fn channel_listing(station: &config::Station) -> Vec<ChannelListing> {
         .collect()
 }
 
-/// Load the station config and print `--audit --list`'s channel listing,
-/// text or JSON per `format`.
-fn list_channels(config_path: &Path, format: ReportFormat) -> ExitCode {
+/// Load the station config and print `--audit --list`'s channel listing, one
+/// `number<TAB>name<TAB>display name` line per channel.
+fn list_channels(config_path: &Path) -> ExitCode {
     let station = match load_for("audit", config_path) {
         Ok(s) => s,
         Err(code) => return code,
     };
 
-    let listing = channel_listing(&station);
-    match format {
-        ReportFormat::Json => {
-            let listed: Vec<serde_json::Value> = listing
-                .iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "name": c.name,
-                        "number": c.number,
-                        "display_name": c.display_name,
-                    })
-                })
-                .collect();
-            match serde_json::to_string_pretty(&listed) {
-                Ok(json) => {
-                    println!("{json}");
-                    ExitCode::SUCCESS
-                }
-                Err(err) => {
-                    eprintln!("audit: serializing channel list: {err}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        ReportFormat::Text => {
-            for c in &listing {
-                println!("{}\t{}\t{}", c.number, c.name, c.display_name);
-            }
-            ExitCode::SUCCESS
-        }
+    for c in &channel_listing(&station) {
+        println!("{}\t{}\t{}", c.number, c.name, c.display_name);
     }
+    ExitCode::SUCCESS
 }
 
 /// Extract divergence messages from a determinism report.
@@ -1651,7 +1582,7 @@ mod tests {
         .unwrap();
     }
 
-    /// `--list --format json`'s `number` for each channel must be exactly the
+    /// `--list`'s `number` for each channel must be exactly the
     /// declared `number:` — the same field `etv_next.rs`'s `ChannelRender`
     /// reads (`ch.config.number`) to write `channelN.json`. Two channels with
     /// non-sequential numbers proves this isn't secretly positional.

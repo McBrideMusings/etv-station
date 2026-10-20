@@ -439,7 +439,7 @@ pub fn read_rotations(output_folder: &std::path::Path) -> BTreeMap<String, Rotat
         .unwrap_or_default()
 }
 
-/// The preview as the JSON the Review view and `--audit --format json` carry.
+/// The preview as the JSON the Review view carries.
 pub fn rows_json(rows: &[PreviewRow]) -> serde_json::Value {
     let rfc3339 = |t: OffsetDateTime| {
         t.format(&time::format_description::well_known::Rfc3339)

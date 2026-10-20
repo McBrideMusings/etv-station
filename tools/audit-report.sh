@@ -24,11 +24,8 @@
 # Usage:
 #   tools/audit-report.sh                             # list channels, exit 0
 #   tools/audit-report.sh --list                      # name<TAB>chunk-count list (admin.toml picker)
-#   tools/audit-report.sh --list --format json        # name/number/display_name map, from the binary
 #   tools/audit-report.sh for-pierce                  # report for one channel
 #   tools/audit-report.sh for-pierce --next 25        # extra flags reach the binary
-#   tools/audit-report.sh for-pierce --format json    # JSON report (per-item
-#                                                      # audit trail + overlay_spec)
 #
 # Env (from .env, gitignored — no fallbacks, these name a specific machine):
 #   UNRAID_HOST, UNRAID_USER, ETV_STATION_DATA
@@ -59,19 +56,6 @@ target="$user@$UNRAID_HOST"
 #
 # A folder the station config no longer names is labelled "unconfigured" in
 # the second column; `--audit <name>` only resolves configured channels.
-#
-# `--list --format json` is a different machine form entirely: the number ->
-# name map the EPG TUI needs, which only the binary's own `--audit --list
-# --format json` can produce. Route that one straight to the container over
-# the same docker-exec path the per-channel report uses below, and print its
-# stdout as-is — unlike the per-channel report, list mode prints the JSON
-# array directly instead of writing a file and printing its path, so this is
-# one remote call, not the file-read-back pattern.
-if [[ ${1:-} == "--list" && "$*" == *"--format"* ]]; then
-  ssh "$target" "docker exec etv-station etv-station --config '$config' --audit $*" || exit 1
-  exit 0
-fi
-
 if [[ $# -eq 0 || ${1:-} == "--list" ]]; then
   channels=$(ssh "$target" "find '$ETV_STATION_DATA/playout' -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort") || {
     echo "audit: cannot read $ETV_STATION_DATA/playout on $target" >&2
@@ -88,7 +72,7 @@ if [[ $# -eq 0 || ${1:-} == "--list" ]]; then
     # A folder with chunks in it is listed whether or not the station config
     # still names it, but `admin audit <name>` resolves names against the
     # config only. So the label says which folders the config no longer has —
-    # the same roster `--list --format json` prints — and a retired folder
+    # the roster `etv-station --audit --list` prints — and a retired folder
     # still consuming the data volume stays visible.
     configured=$(ssh "$target" "docker exec etv-station etv-station --config '$config' --audit --list" | cut -f2) || {
       echo "audit: cannot read the configured channels from $target" >&2
