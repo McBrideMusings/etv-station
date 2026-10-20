@@ -130,7 +130,7 @@ The two halves of a netted taste profile. Every entry's weight is summed per (na
 
 ## Channel review
 
-One sitting with one channel: its simulated schedule, the numbers drawn from it and its on-screen graphics, judged against the programming principles in `docs/programming.md`. A review ends in keep, rework, merge (the channel's content becomes a block on another channel) or cut. Feedback is given in conversation, and the review is re-run after each edit.
+One sitting with one channel: its real schedule (published playout and aired history), optionally projected further ahead, the numbers drawn from what is on screen and its on-screen graphics, judged against the programming principles in `docs/programming.md`. A review ends in keep, rework, merge (the channel's content becomes a block on another channel) or cut. Feedback is given in conversation, and the review is re-run after each edit.
 
 ## Depth
 
