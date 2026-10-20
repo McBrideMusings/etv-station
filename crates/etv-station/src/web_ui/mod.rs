@@ -888,6 +888,26 @@ mod tests {
     }
 
     #[test]
+    fn touching_a_file_beside_the_script_changes_the_render_id() {
+        let mut f = graphics_fixture();
+        let dir = f.dir.path().join("channels/a");
+        let script = dir.join("card.rhai");
+        let module = dir.join("lib").join("helpers.rhai");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "fn x() { 1 }").unwrap();
+        let ask = json!({"kind": "still", "script": script.display().to_string(), "at": 2.0});
+        let (_, first) = post_render(&mut f.state, ask.clone());
+        let (_, same) = post_render(&mut f.state, ask.clone());
+        assert_eq!(first["render"], same["render"]);
+
+        let file = std::fs::File::options().write(true).open(&module).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        let (_, after) = post_render(&mut f.state, ask);
+        assert_ne!(first["render"], after["render"]);
+    }
+
+    #[test]
     fn an_unknown_or_path_shaped_render_id_is_a_404() {
         let mut f = graphics_fixture();
         for id in ["still-0000", "..%2Fx"] {
