@@ -54,19 +54,12 @@ fn nonempty_sorted(mut found: Vec<PathBuf>, dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Every git-tracked config directly inside `dir`. Not recursive: each
-/// directory under `examples/` holds one kind of config and gets its own
-/// assertion.
+/// Every git-tracked file under `dir`, recursively, as absolute paths.
 ///
-/// Asks git rather than reading the directory because `examples/channels/`
-/// mixes one tracked channel with gitignored personal ones the dev station
-/// globs. Reading the directory made a hand-written personal config turn this
-/// test red in the one checkout that had it, while every worktree and fresh
-/// clone stayed green.
-fn configs_in(dir: &Path) -> Vec<PathBuf> {
-    // Without `--full-name`, paths come back relative to `dir` itself, so
-    // nothing here assumes where the git toplevel is. A hook's `GIT_DIR` or
-    // `GIT_INDEX_FILE` would point the listing at another repo or index.
+// Without `--full-name`, paths come back relative to `dir` itself, so nothing
+// here assumes where the git toplevel is. A hook's `GIT_DIR` or `GIT_INDEX_FILE`
+// would point the listing at another repo or index.
+fn tracked_files_under(dir: &Path) -> Vec<PathBuf> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -81,11 +74,26 @@ fn configs_in(dir: &Path) -> Vec<PathBuf> {
         dir.display(),
         String::from_utf8_lossy(&output.stderr)
     );
-    let found = output
+    output
         .stdout
         .split(|&b| b == 0)
         .filter(|name| !name.is_empty())
         .map(|name| dir.join(String::from_utf8_lossy(name).as_ref()))
+        .collect()
+}
+
+/// Every git-tracked config directly inside `dir`. Not recursive: each
+/// directory under `examples/` holds one kind of config and gets its own
+/// assertion.
+///
+/// Asks git rather than reading the directory because `examples/channels/`
+/// mixes one tracked channel with gitignored personal ones the dev station
+/// globs. Reading the directory made a hand-written personal config turn this
+/// test red in the one checkout that had it, while every worktree and fresh
+/// clone stayed green.
+fn configs_in(dir: &Path) -> Vec<PathBuf> {
+    let found = tracked_files_under(dir)
+        .into_iter()
         .filter(|path| path.parent() == Some(dir) && is_config(path))
         .collect();
     nonempty_sorted(found, dir)
@@ -158,30 +166,6 @@ fn every_example_block_file_parses() {
     for path in configs_in(&root.join("samples").join("blocks")) {
         assert_parses_as_block_file(&path);
     }
-}
-
-/// Every git-tracked file under `dir`, recursively, as absolute paths.
-fn tracked_files_under(dir: &Path) -> Vec<PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .args(["ls-files", "-z", "--", "."])
-        .output()
-        .unwrap_or_else(|e| panic!("run git ls-files in {}: {e}", dir.display()));
-    assert!(
-        output.status.success(),
-        "git ls-files in {} failed: {}",
-        dir.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-        .stdout
-        .split(|&b| b == 0)
-        .filter(|name| !name.is_empty())
-        .map(|name| dir.join(String::from_utf8_lossy(name).as_ref()))
-        .collect()
 }
 
 /// `examples/station.yaml` loads both `channels/*.yaml` and `samples/*.yaml`
