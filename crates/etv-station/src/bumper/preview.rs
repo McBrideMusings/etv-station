@@ -79,11 +79,17 @@ pub fn preview(req: &PreviewRequest<'_>) -> Result<Preview, String> {
         .date()
         .format(&time::macros::format_description!("[year]-[month]-[day]"))
         .map_err(|e| e.to_string())?;
+    // The programme after the gap begins when the gap ends.
+    let next = req.next.clone().map(|mut m| {
+        let start = req.start + time::Duration::milliseconds(req.gap_ms as i64);
+        m.insert("start".into(), start.unix_timestamp().into());
+        m
+    });
     let built = hook::build(
         req.script,
         &BumperInput {
             gap_ms: req.gap_ms,
-            next: req.next.clone(),
+            next,
             prev: None,
             upcoming: req.upcoming.clone(),
             config: req.config.clone(),
