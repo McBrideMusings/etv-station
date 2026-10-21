@@ -322,6 +322,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
 /// logic.
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
+        ffmpeg_profile: None,
         logo: None,
         temperature: None,
         subtitle: None,

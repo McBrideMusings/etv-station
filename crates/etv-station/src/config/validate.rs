@@ -22,6 +22,16 @@ use crate::pattern::{MAX_CYCLES, MAX_TAKE};
 /// looking" (#256).
 const DATASTORE_STALE_AFTER: Duration = Duration::from_secs(48 * 60 * 60);
 
+/// The keys of `ffmpeg_profiles`, for an error that names what is available.
+pub(super) fn profile_keys(station: &StationConfig) -> String {
+    let keys: Vec<&str> = station.ffmpeg_profiles.keys().map(String::as_str).collect();
+    if keys.is_empty() {
+        "none".to_string()
+    } else {
+        keys.join(", ")
+    }
+}
+
 pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(), ConfigError> {
     if station.channels.is_empty() {
         return Err(ConfigError::Validation {
@@ -37,6 +47,24 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
                 message: "channel entry is empty".into(),
             });
         }
+    }
+
+    for (key, profile) in &station.ffmpeg_profiles {
+        profile.validate().map_err(|e| ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!("ffmpeg_profiles.{key}: {e}"),
+        })?;
+    }
+    if let Some(active) = &station.active_profile
+        && !station.ffmpeg_profiles.contains_key(active)
+    {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            message: format!(
+                "active_profile {active:?} is not a key of ffmpeg_profiles (have: {})",
+                profile_keys(station)
+            ),
+        });
     }
 
     validate_hooks(path, "station", &station.hooks)?;
@@ -1694,6 +1722,7 @@ mod tests {
 
     fn channel_with(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            ffmpeg_profile: None,
             logo: None,
             temperature: None,
             subtitle: None,
@@ -1910,6 +1939,8 @@ mod tests {
     #[test]
     fn rejects_empty_channels() {
         let s = StationConfig {
+            active_profile: None,
+            ffmpeg_profiles: Default::default(),
             temperature: None,
             tracks: None,
             overlay: None,
@@ -1941,6 +1972,8 @@ mod tests {
     #[test]
     fn rejects_empty_output_base() {
         let s = StationConfig {
+            active_profile: None,
+            ffmpeg_profiles: Default::default(),
             temperature: None,
             tracks: None,
             overlay: None,
@@ -1973,6 +2006,8 @@ mod tests {
     #[test]
     fn rejects_an_unknown_tz() {
         let s = StationConfig {
+            active_profile: None,
+            ffmpeg_profiles: Default::default(),
             temperature: None,
             tracks: None,
             overlay: None,
@@ -2003,6 +2038,8 @@ mod tests {
     #[test]
     fn rejects_empty_channel_entry() {
         let s = StationConfig {
+            active_profile: None,
+            ffmpeg_profiles: Default::default(),
             temperature: None,
             tracks: None,
             overlay: None,

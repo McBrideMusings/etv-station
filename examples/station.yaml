@@ -76,3 +76,11 @@ normalization:
     accel: videotoolbox
   subtitle:
     mode: convert
+
+# Named encoding pictures (see docs/schema.md, FFmpeg profiles). A channel's
+# `ffmpeg_profile:` picks one; `active_profile` is the default for the rest.
+ffmpeg_profiles:
+  quality: { resolution: 1920x1080, video_bitrate: 6000, video_codec: h264, bit_depth: 8 }
+  max:     { resolution: 1920x1080, video_bitrate: 10000, video_codec: h264, bit_depth: 8 }
+  light:   { resolution: 1280x720,  video_bitrate: 4000,  video_codec: h264, bit_depth: 8 }
+active_profile: quality

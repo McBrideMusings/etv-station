@@ -116,6 +116,14 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<ChannelSubtitle>,
 
+    /// A key of the station's `ffmpeg_profiles` (#260): the encoding picture
+    /// this channel uses instead of the station's `active_profile`. ETV-next
+    /// encodes one HLS session per channel, so the picture is a property of
+    /// the channel, never of a block inside it. An unknown key fails this
+    /// channel's load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_profile: Option<String>,
+
     /// How far ahead of live the schedule is materialized. This is also what
     /// bounds a single generation, whichever shape the channel is: a pattern
     /// whose pools would take years to drain stops at the visit boundary that

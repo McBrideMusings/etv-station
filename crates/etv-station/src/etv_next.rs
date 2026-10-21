@@ -247,6 +247,11 @@ pub struct ChannelRender {
     /// The channel's `logo:` image (#342), already resolved against its
     /// config file's directory. `None` publishes no logo.
     pub logo: Option<PathBuf>,
+    /// The channel's own `ffmpeg_profile` (#260), already looked up. Written
+    /// over the station's picture in this channel's `normalization.video`.
+    /// `None` leaves the station's picture (which `render_with` has already
+    /// set from `active_profile`).
+    pub profile: Option<crate::config::FfmpegProfile>,
 }
 
 /// Where [`render_with`] gets the tuner identity it publishes.
@@ -293,6 +298,16 @@ pub fn render_with(
                 .logo
                 .as_ref()
                 .map(|l| config_dir(&ch.config_path).join(l)),
+            // The channel's own profile replaces the station's `active_profile`
+            // outright; a field the channel's profile omits keeps the
+            // station's `normalization.video`, not the active profile's.
+            profile: ch
+                .config
+                .ffmpeg_profile
+                .as_ref()
+                .or(station.station.active_profile.as_ref())
+                .and_then(|key| station.station.ffmpeg_profiles.get(key))
+                .cloned(),
         })
         .collect();
     // The station config is the only place the tuner identity can come from,
@@ -506,6 +521,25 @@ pub fn render_channels(
                     subtitle.insert("default_on".to_string(), Value::Bool(default_on));
                 }
             }
+        }
+
+        // A channel's own `ffmpeg_profile` (#260) lands in `normalization.video`
+        // after the merge, so it beats the station's `active_profile`.
+        if let Some(profile) = channel_render.profile.as_ref()
+            && let Some(video) = channel
+                .get_mut("normalization")
+                .and_then(|n| n.get_mut("video"))
+        {
+            let mut picture: VideoNormalizationConfig = serde_json::from_value(video.clone())
+                .map_err(|source| RenderError::Json {
+                    path: opts.out_dir.join(format!("channel{number}.json")),
+                    source,
+                })?;
+            profile.apply(&mut picture);
+            *video = serde_json::to_value(&picture).map_err(|source| RenderError::Json {
+                path: opts.out_dir.join(format!("channel{number}.json")),
+                source,
+            })?;
         }
 
         // The XMLTV route reads this to decide whether a bumper gets its own
@@ -827,6 +861,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, folder)| ChannelRender {
+                profile: None,
                 subtitle_default_on: None,
                 show_bumpers: false,
                 logo: None,
@@ -845,6 +880,7 @@ mod tests {
             .zip(names)
             .enumerate()
             .map(|(i, (folder, display_name))| ChannelRender {
+                profile: None,
                 subtitle_default_on: None,
                 show_bumpers: false,
                 logo: None,
@@ -1006,6 +1042,7 @@ mod tests {
         fs::create_dir_all(stale.parent().unwrap()).unwrap();
         fs::write(&stale, b"old").unwrap();
         let channel = |number: i64, logo: Option<PathBuf>| ChannelRender {
+            profile: None,
             number,
             folder: PathBuf::from(format!("out/ch{number}")),
             display_name: None,
@@ -1179,6 +1216,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let channels = vec![
             ChannelRender {
+                profile: None,
                 subtitle_default_on: None,
                 show_bumpers: false,
                 logo: None,
@@ -1196,6 +1234,7 @@ mod tests {
                 }),
             },
             ChannelRender {
+                profile: None,
                 subtitle_default_on: None,
                 show_bumpers: false,
                 logo: None,
@@ -1236,6 +1275,7 @@ mod tests {
         }))
         .unwrap();
         let channel = |number: i64, subtitle_default_on: Option<bool>| ChannelRender {
+            profile: None,
             number,
             folder: PathBuf::from(format!("out/ch{number}")),
             display_name: None,
@@ -1277,6 +1317,7 @@ mod tests {
     fn show_bumpers_lands_in_each_channel_json() {
         let dir = tempfile::tempdir().unwrap();
         let channel = |number: i64, show_bumpers: bool| ChannelRender {
+            profile: None,
             number,
             folder: PathBuf::from(format!("out/ch{number}")),
             display_name: None,
@@ -1302,6 +1343,7 @@ mod tests {
     fn default_on_is_off_unless_someone_sets_it() {
         let dir = tempfile::tempdir().unwrap();
         let channels = vec![ChannelRender {
+            profile: None,
             number: 1,
             folder: PathBuf::from("out/ch1"),
             display_name: None,
@@ -1321,4 +1363,151 @@ mod tests {
     // `NormalizationConfig`/`FfmpegConfig` have no such field — so the seam the
     // first test guarded is closed, not merely tested; and there is no longer a
     // defaults file that can be missing, so the second test's premise is gone.
+
+    const PROFILE_CHANNEL: &str = "number: {n}\nname: ch{n}\n{extra}roll_interval: 60s\nrule:\n  blocks:\n    - mode: all\n      order: manual\n      entries:\n        - kind: item\n          id: x\n          out_point: 30s\n          source:\n            kind: lavfi\n            params: testsrc\n";
+
+    /// A station dir with channel 1 (no override) and channel 2 (`channel_extra`
+    /// in its YAML), and the profile block `profiles` appended to the station.
+    fn profile_station(dir: &Path, profiles: &str, channel_extra: &str) -> PathBuf {
+        for (n, extra) in [(1, ""), (2, channel_extra)] {
+            let body = PROFILE_CHANNEL
+                .replace("{n}", &n.to_string())
+                .replace("{extra}", extra);
+            fs::write(dir.join(format!("ch{n}.yaml")), body).unwrap();
+        }
+        let station = dir.join("station.yaml");
+        fs::write(
+            &station,
+            format!(
+                "output_base: {out}\nchannels: [ch1.yaml, ch2.yaml]\nnormalization:\n  audio: {{}}\n  video: {{}}\n{profiles}",
+                out = dir.join("out").display()
+            ),
+        )
+        .unwrap();
+        station
+    }
+
+    const PROFILES: &str = "ffmpeg_profiles:\n  quality: {resolution: 1920x1080, video_bitrate: 6000, video_codec: h264, bit_depth: 8}\n  light: {resolution: 1280x720, video_bitrate: 4000}\n";
+
+    fn rendered_video(dir: &Path, station: &Path, n: u32) -> Value {
+        let out = dir.join("render");
+        fs::create_dir_all(&out).unwrap();
+        render_with(station, &opts(&out), DeviceIdSource::Fixed("id")).unwrap();
+        read(&out.join(format!("channel{n}.json")))["normalization"]["video"].clone()
+    }
+
+    /// Flipping `active_profile` from quality to light is the whole edit, and
+    /// every channel's rendered picture follows it.
+    #[test]
+    fn active_profile_sets_every_channels_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = format!("{PROFILES}active_profile: quality\n");
+        let station = profile_station(dir.path(), &profiles, "");
+        for n in [1, 2] {
+            let v = rendered_video(dir.path(), &station, n);
+            assert_eq!(
+                (v["width"].clone(), v["height"].clone()),
+                (1920.into(), 1080.into())
+            );
+            assert_eq!(v["bitrate_kbps"], 6000);
+        }
+
+        let profiles = format!("{PROFILES}active_profile: light\n");
+        let station = profile_station(dir.path(), &profiles, "");
+        for n in [1, 2] {
+            let v = rendered_video(dir.path(), &station, n);
+            assert_eq!(
+                (v["width"].clone(), v["height"].clone()),
+                (1280.into(), 720.into())
+            );
+            assert_eq!(v["bitrate_kbps"], 4000);
+            assert_eq!(v["buffer_kbps"], 8000);
+        }
+    }
+
+    /// A channel's profile replaces `active_profile` rather than layering on
+    /// it: a field the channel's profile omits falls back to the station's
+    /// `normalization.video`.
+    #[test]
+    fn a_channels_profile_does_not_inherit_the_active_profiles_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = "ffmpeg_profiles:\n  hi: {resolution: 1920x1080, video_codec: hevc, bit_depth: 10}\n  lo: {resolution: 1280x720}\nactive_profile: hi\n";
+        let station = profile_station(dir.path(), profiles, "ffmpeg_profile: lo\n");
+        let hi = rendered_video(dir.path(), &station, 1);
+        assert_eq!(
+            (hi["format"].clone(), hi["bit_depth"].clone()),
+            ("hevc".into(), 10.into())
+        );
+        let lo = rendered_video(dir.path(), &station, 2);
+        assert_eq!(lo["width"], 1280);
+        assert_eq!(
+            (lo["format"].clone(), lo["bit_depth"].clone()),
+            ("h264".into(), 8.into())
+        );
+    }
+
+    /// A `bit_depth` other than 8 or 10 and a `video_codec` ETV-next lacks fail
+    /// the load.
+    #[test]
+    fn a_bad_bit_depth_or_codec_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["bit_depth: 12", "video_codec: vp9"] {
+            let profiles = format!("ffmpeg_profiles:\n  bad: {{{bad}}}\n");
+            let station = profile_station(dir.path(), &profiles, "");
+            let err = config::load(&station).unwrap_err().to_string();
+            assert!(err.contains("ffmpeg_profiles.bad"), "{bad}: {err}");
+        }
+    }
+
+    /// A channel's own `ffmpeg_profile` beats `active_profile` for that channel
+    /// alone.
+    #[test]
+    fn a_channels_profile_beats_the_active_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = format!("{PROFILES}active_profile: quality\n");
+        let station = profile_station(dir.path(), &profiles, "ffmpeg_profile: light\n");
+        assert_eq!(rendered_video(dir.path(), &station, 1)["width"], 1920);
+        let v = rendered_video(dir.path(), &station, 2);
+        assert_eq!(
+            (v["width"].clone(), v["bitrate_kbps"].clone()),
+            (1280.into(), 4000.into())
+        );
+    }
+
+    /// An `active_profile` that names nothing fails the station load, naming
+    /// the key.
+    #[test]
+    fn an_unknown_active_profile_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = format!("{PROFILES}active_profile: ultra\n");
+        let station = profile_station(dir.path(), &profiles, "");
+        let err = config::load(&station).unwrap_err().to_string();
+        assert!(err.contains("\"ultra\""), "{err}");
+    }
+
+    /// A channel naming an unknown profile does not load, and the reason names
+    /// the key and the channel's file.
+    #[test]
+    fn a_channel_naming_an_unknown_profile_is_dropped_with_the_key_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let station = profile_station(dir.path(), PROFILES, "ffmpeg_profile: ultra\n");
+        let loaded = config::load(&station).unwrap();
+        assert_eq!(loaded.channels.len(), 1);
+        let dropped = &loaded.dropped[0];
+        assert!(dropped.config_path.ends_with("ch2.yaml"));
+        assert!(dropped.reason.contains("\"ultra\""), "{}", dropped.reason);
+    }
+
+    /// A profile whose resolution is not `WxH` fails the station load.
+    #[test]
+    fn a_malformed_resolution_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let station = profile_station(
+            dir.path(),
+            "ffmpeg_profiles:\n  bad: {resolution: big}\n",
+            "",
+        );
+        let err = config::load(&station).unwrap_err().to_string();
+        assert!(err.contains("ffmpeg_profiles.bad"), "{err}");
+    }
 }

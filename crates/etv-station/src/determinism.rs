@@ -280,6 +280,7 @@ mod tests {
 
     fn base_channel(rule: RuleConfig, scoring: Option<ScoringConfig>) -> ChannelConfig {
         ChannelConfig {
+            ffmpeg_profile: None,
             logo: None,
             temperature: None,
             subtitle: None,
@@ -307,6 +308,8 @@ mod tests {
         Station {
             config_path: PathBuf::from("/tmp/station.toml"),
             station: crate::config::StationConfig {
+                active_profile: None,
+                ffmpeg_profiles: Default::default(),
                 temperature: None,
                 tracks: None,
                 overlay: None,
