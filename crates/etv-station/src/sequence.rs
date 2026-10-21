@@ -568,6 +568,7 @@ mod tests {
 
     fn pool(name: &str, expr: &str) -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,

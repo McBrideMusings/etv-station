@@ -1,0 +1,38 @@
+# Sample — Arcs: air one story arc of a long show per visit (#163).
+#
+# Black Clover is 170 episodes in a single Plex season, so `group_by: season`
+# alone would air one 170-episode run. `examples/arcs/black-clover.yaml` cuts it
+# into named absolute-episode ranges, and a season-grouped pool buckets an arc'd
+# show by arc instead. With `take: all` one visit airs one arc end to end, and
+# `advance: resume` moves the next visit on to the following arc.
+#
+# `filter.seasons` accepts an arc's name beside season numbers, for an
+# `entries` block: `filter: { seasons: ["Dungeon"] }`.
+#
+# Registered in examples/station.yaml via the `samples/*.yaml` glob; the arcs
+# file via `arcs:`. Being catalog-backed it resolves to nothing unless the
+# station's `catalog_path` points at a populated catalog. Its behavior is
+# proven by the `arcs_sample` acceptance test.
+number: 12
+name: black-clover-arcs
+display_name: "Black Clover, By Arc"
+window_days: 1
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      program:
+        title: "Black Clover"
+        categories: ["Anime"]
+      pools:
+        - name: arcs
+          expr: 'item.show == "Black Clover"'
+          order: "season:asc,episode:asc"
+          group_by: season
+          select: round_robin
+          advance: resume
+      pattern:
+        - pool: arcs
+          take: all

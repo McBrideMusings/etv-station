@@ -593,7 +593,7 @@ ignored and warned about; see [Unknown keys](#unknown-keys).
 
 | Field | Type |
 |---|---|
-| `seasons` | list of ints |
+| `seasons` | list of ints and/or [arc](#show-arcs) names |
 | `episode_ids` | list of strings |
 
 ```yaml
@@ -601,6 +601,12 @@ filter:
   seasons: [1, 2]
   episode_ids: ["star-trek-s01e01", "star-trek-s01e02"]
 ```
+
+A string in `seasons` names a [show arc](#show-arcs) and keeps the episodes in
+that arc's range of the show that declares it: `seasons: [1, "Dungeon"]` keeps
+season 1 plus the Dungeon arc. A name no arcs file declares fails the load,
+naming it and the arcs that exist. A filter selects only named arcs; the episodes past a
+show's last arc (the trailing bucket `group_by: season` forms) have no name to select.
 
 ### Duplicates
 
@@ -696,6 +702,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
 | `chronologies` | no — default empty | list of chronology files, literal or glob like `channels`; each declares one named, ordered list of item references a block plays with [`kind: chronology`](#kind-chronology-play-a-standalone-chronology-164) |
+| `arcs` | no — default empty | list of show arc files, literal or glob like `channels`; each declares one show's named absolute-episode ranges, which `group_by: season` and `filter.seasons` treat as pseudo-seasons (see [Show arcs](#show-arcs)) |
 | `categories` | no — default empty | list of category files, literal or glob like `channels`; each declares named keyword sets pools reference as `category("name")` (see [`category`](#category-name-a-keyword-set-defined-once-170)) |
 | `source_roots` | no — default empty | list of directories the daemon walks to populate the catalog when `catalog_path` is set — an operational choice about what this deployment scans, not used for identity. Empty skips the filesystem scan entirely. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime. |
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
@@ -2383,6 +2390,62 @@ the things called once, like reading a tunable out of `ctx.config`.
 `examples/plugins/taste-cosine.rhai` is written to both rules and says so in its
 comments.
 
+### Show arcs
+
+Anime and long-running shows rarely cut by Plex's season: *Black Clover* is 171
+episodes with 170 of them in season 1, so `group_by: season` plus `take: all`
+airs one 170-episode run, and *JoJo's Bizarre Adventure* season 1 holds two
+stories. An **arc** is a named range of a show's absolute episode numbers that
+stands in for a season wherever seasons group or filter.
+
+Arcs live one file per show, registered from the station config. Source:
+`config/arcs.rs`.
+
+```yaml
+# station.yaml
+arcs:
+  - arcs/*.yaml          # literal paths or globs, like channels:
+
+# arcs/black-clover.yaml
+show: "Black Clover"     # exact Plex title, matched against the catalog's `show` column
+arcs:
+  - { name: "Dungeon",       episodes: "1-51" }     # absolute numbering, inclusive
+  - { name: "Royal Knights", episodes: "52-102" }
+  - { name: "Witch Queen",   episodes: "103-154" }
+```
+
+`episodes` is `"first-last"`, or one number for a one-episode arc. Arcs are
+station-wide: every channel carrying the show sees them.
+
+- **`group_by: season`** buckets an arc'd show by arc, so a `take: all` visit
+  airs one arc end to end and the next visit moves on to the next arc. Episodes
+  past the last arc form one trailing bucket (a newly ingested episode joins
+  it; the load never fails for it). An episode with no absolute number, such as
+  a special, stays in its catalog season. A show with no arcs file buckets by
+  season as before.
+- **`filter.seasons`** accepts an arc name beside season numbers; see
+  [Filter](#filter). The filter applies to a flat `entries` list, as it always
+  has.
+
+The numbers come from the catalog's `absolute_episode`: Plex's own when it
+numbered every regular episode of the show, otherwise computed 1..N by season
+then episode.
+
+**Load errors**, naming the show:
+
+| Mistake | Error |
+|---|---|
+| overlapping ranges (`1-20`, `18-30`) | names both arcs and both ranges |
+| a gap (`1-20`, `41-60`) | names the missing range (`21-40`) |
+| arcs that do not start at episode 1 | names the missing range (`1-4`) |
+| two files for one show | names both files |
+| a repeated arc name within a show | names the arc |
+| `filter.seasons` naming no arc of any show | drops the channel, naming the arc |
+
+A range reaching past the show's last episode is fine; it just holds fewer
+episodes. The worked sample is `examples/samples/black-clover-arcs.yaml` with
+`examples/arcs/black-clover.yaml`.
+
 ### Named show groups — `groups:` on the channel and on a pool
 
 Plex stores a franchise's spin-offs as unrelated shows — *RuPaul's Drag Race*
@@ -2410,7 +2473,8 @@ rule:
           take: all
 ```
 
-`group_by: season` still cuts at each member show's own season boundaries —
+`group_by: season` still cuts at each member show's own season boundaries (or
+its [arcs](#show-arcs), when it has them) —
 `take: all` on the pattern step airs whichever season a visit picked, end to
 end — but the series it produces now come from every member show, so
 `rotate: visit` (the default) cycles the franchise: Drag Race season 9, then

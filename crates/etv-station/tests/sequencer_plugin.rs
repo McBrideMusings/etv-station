@@ -70,6 +70,7 @@ fn catalog() -> Catalog {
 
 fn discovery_pool() -> Pool {
     Pool {
+        arcs: None,
         seed: None,
         temperature: None,
         tracks: None,
@@ -103,6 +104,7 @@ fn discovery_pool() -> Pool {
 
 fn spotlight_pool() -> Pool {
     Pool {
+        arcs: None,
         seed: None,
         temperature: None,
         tracks: None,
@@ -285,6 +287,7 @@ async fn assert_one_file_across_the_chunk(
 /// instead of a `pattern:` template.
 fn foryou_pool(plugin: &Path) -> Pool {
     Pool {
+        arcs: None,
         seed: None,
         temperature: None,
         tracks: None,

@@ -710,6 +710,10 @@ whole deployed tree: copy `deploy/appdata/{channels,shared,station.yaml}` aside,
 run the migration, and `etv-station --config <copy>/station.yaml --dump-overlay
 <name>` for every channel `name:` (62 of 62 load).
 
+## Verifying show arcs (#163)
+
+`cargo test -p etv-station --test arcs_sample` loads the committed `examples/arcs/black-clover.yaml` through a station, simulates 7 days of `examples/samples/black-clover-arcs.yaml` over a 160-episode catalog and asserts the air order is Dungeon 51, Royal Knights 51, Witch Queen 52, trailing 6, with no run past one arc. Against prod data: `ssh` read-only `select count(*), count(absolute_episode) from entries where show='Black Clover'` must show equal counts (173/173 on 2026-10-21); a local `tmp/catalog.db` ingested before #105 shows 0 and needs a re-ingest.
+
 ## Three blockers you will hit, and how to get past them
 
 **1. `PLEXDB_SNAPSHOT_PATH` is not in `.env`.** `examples/samples/foryou.yaml` references

@@ -3012,7 +3012,15 @@ async fn pattern_catch_up(
             progress,
             show_ids,
             ..
-        } = generate(&env, catalog.as_ref(), &ledger, &resume, from, target)?;
+        } = generate(
+            &env,
+            catalog.as_ref(),
+            &ledger,
+            &resume,
+            from,
+            target,
+            &mut crate::score::ScoreCache::default(),
+        )?;
 
         // No "the channel ran out" branch: every series loops, so a pattern
         // channel cannot play itself empty. An empty resolve means an empty

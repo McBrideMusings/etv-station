@@ -85,8 +85,8 @@ use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{
-    Advance, Constraints, CursorScope, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate,
-    Select, ShowGroup, Take, TakeFrom,
+    Advance, ArcBucket, Constraints, CursorScope, GroupBy, NoRepeatWithin, OnShort, PatternStep,
+    Pool, Rotate, Select, ShowGroup, Take, TakeFrom,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
 use crate::guide::GuideConfig;
@@ -135,8 +135,9 @@ const TAKE_STRIDE: u64 = 1 << 56;
 pub(crate) struct Series {
     /// What this series is called in the rotation and in the `.resume` sidecar.
     /// `show_id` under `group_by = "show"`, `"{show_id}|S{season}"` under
-    /// `group_by = "season"`, and the item's own `entry_id` when it has no
-    /// `show_id` at all.
+    /// `group_by = "season"` (`"{show_id}|A:{arc}"` for a show with arcs, and
+    /// `"{show_id}|A+"` for its episodes past the last arc), and the item's own
+    /// `entry_id` when it has no `show_id` at all.
     pub(crate) key: String,
     /// The key the play-history ledger files this series' airings under —
     /// always the `show_id`, never the season. Equal to [`Self::key`] except
@@ -1197,6 +1198,44 @@ pub fn build(
     fill: Option<Duration>,
     channel_rule: Option<ChannelRule<'_>>,
 ) -> Result<BlockBuild, String> {
+    build_with_cache(
+        catalog,
+        pools,
+        groups,
+        pattern,
+        cycles,
+        block_constraints,
+        state,
+        variety,
+        window_start,
+        score_env,
+        fill,
+        channel_rule,
+        &mut crate::score::ScoreCache::default(),
+    )
+}
+
+/// [`build`] against a caller-held [`crate::score::ScoreCache`], so compiled
+/// plugins and resolved sources survive from one generation to the next. A
+/// caller reusing a cache must hold the catalog and the plugin files fixed
+/// between calls; the per-call `picked_extras` are cleared here.
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_cache(
+    catalog: &Catalog,
+    pools: &[Pool],
+    groups: &[ShowGroup],
+    pattern: &[PatternStep],
+    cycles: Option<usize>,
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    variety: &crate::variety::Variety,
+    window_start: time::OffsetDateTime,
+    score_env: crate::score::ScoreEnv<'_>,
+    fill: Option<Duration>,
+    channel_rule: Option<ChannelRule<'_>>,
+    score_cache: &mut crate::score::ScoreCache,
+) -> Result<BlockBuild, String> {
+    score_cache.picked_extras.clear();
     // An authored `cycles` is the author saying how long a pass runs, and the
     // window does not get to argue with it. Only a derived count is bounded.
     let budget = fill.filter(|_| cycles.is_none());
@@ -1219,12 +1258,11 @@ pub fn build(
 
     // Two passes, split by whether they read the database — see
     // [`resolve_pool_sources`], which does both.
-    let mut score_cache = crate::score::ScoreCache::default();
     let pool_id_lists = resolve_pool_sources(
         catalog,
         pools,
         groups,
-        &mut score_cache,
+        score_cache,
         &opening,
         score_env,
         &mut lists,
@@ -1374,7 +1412,7 @@ pub fn build(
                     groups,
                     block_constraints,
                     state,
-                    &mut score_cache,
+                    &mut *score_cache,
                     dice,
                     score_env,
                     measure,
@@ -1403,7 +1441,7 @@ pub fn build(
                     &mut runtimes[idx],
                     block_constraints,
                     state,
-                    &mut score_cache,
+                    &mut *score_cache,
                     dice,
                     score_env,
                     measure,
@@ -2401,6 +2439,13 @@ pub(crate) fn resolve_pool_series(
         GroupBy::Show => HashMap::new(),
         GroupBy::Season => catalog.seasons_for(&ids).map_err(|e| e.to_string())?,
     };
+    // A show with arcs (#163) is cut by arc instead of by catalog season: each
+    // arc is a pseudo-season. Only a season-grouped pool on a station with arcs
+    // asks the catalog for the placements.
+    let arc_positions = match (&cfg.arcs, cfg.group_by) {
+        (Some(_), GroupBy::Season) => catalog.arc_positions_for(&ids).map_err(|e| e.to_string())?,
+        _ => HashMap::new(),
+    };
     let mut series: Vec<Series> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     // Which series each id landed in, so a `bucket_order` pass can read the
@@ -2413,9 +2458,18 @@ pub(crate) fn resolve_pool_series(
         // An episode the catalog never recorded a season for stays with its
         // show rather than becoming a series of one, which would scatter the
         // very episodes a season-grouped pool is trying to keep together.
-        let key = match seasons.get(&id) {
-            Some(season) => format!("{show_key}|S{season}"),
-            None => show_key.clone(),
+        // An arc'd show's episodes without an absolute number (specials) fall
+        // back to the catalog season like any other.
+        let arc_bucket = cfg
+            .arcs
+            .as_deref()
+            .zip(arc_positions.get(&id))
+            .and_then(|(arcs, (show, absolute))| arcs.bucket(show, *absolute));
+        let key = match (arc_bucket, seasons.get(&id)) {
+            (Some(ArcBucket::Named(arc)), _) => format!("{show_key}|A:{arc}"),
+            (Some(ArcBucket::Trailing), _) => format!("{show_key}|A+"),
+            (None, Some(season)) => format!("{show_key}|S{season}"),
+            (None, None) => show_key.clone(),
         };
         match index.get(&key) {
             Some(&i) => {
@@ -2809,6 +2863,7 @@ mod tests {
 
     fn movies_pool() -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -2840,6 +2895,7 @@ mod tests {
 
     fn shows_pool() -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -2875,6 +2931,7 @@ mod tests {
     /// that check), so this leaves both unset.
     fn plugin_pool(script: &std::path::Path) -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -2974,6 +3031,7 @@ mod tests {
 
     fn episodes_pool(group_by: GroupBy) -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -3286,6 +3344,7 @@ mod tests {
 
     fn rupaul_pool() -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -5205,6 +5264,7 @@ fn audit(ctx, picks, workspace) { #{} }
         let cat = catalog();
         // The script reads `ctx.sets`, so this pool has to grant what it uses.
         let pool = Pool {
+            arcs: None,
             capabilities: vec!["catalog_read".into()],
             ..plugin_pool(&script)
         };
@@ -5285,6 +5345,70 @@ fn audit(ctx, picks, workspace) { #{} }
             ids,
             vec!["mov-1", "mov-2", "mov-1", "mov-2"],
             "the pool should wrap its two films, not stall or error: {ids:?}",
+        );
+    }
+
+    /// A cache handed to a second `build_with_cache` keeps the plugin it
+    /// compiled for the first: rewriting the script on disk between the two
+    /// builds changes nothing, where a fresh cache would rank by the new file.
+    #[test]
+    fn a_held_score_cache_compiles_the_plugin_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fixed.rhai");
+        let write = |first: &str| {
+            std::fs::write(
+                &script,
+                format!(
+                    "fn sources() {{ #{{ movies: `item.type == \"movie\"` }} }}\n\
+                     fn pick(ctx) {{ #{{ picks: [\"{first}\", \"mov-3\"], workspace: () }} }}\n\
+                     fn audit(ctx, picks, workspace) {{ #{{}} }}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let cat = catalog();
+        let pool = plugin_pool(&script);
+        let inputs = crate::score::ScoreInputs {
+            target_count: 2,
+            ..Default::default()
+        };
+        let run = |cache: &mut crate::score::ScoreCache| {
+            build_with_cache(
+                &cat,
+                std::slice::from_ref(&pool),
+                &[],
+                &[step("movies", 1)],
+                Some(2),
+                None,
+                &GenerationState::empty(),
+                &crate::variety::Variety::fixed(0),
+                time::OffsetDateTime::UNIX_EPOCH,
+                crate::score::ScoreEnv {
+                    inputs: &inputs,
+                    base_dir: std::path::Path::new("."),
+                },
+                None,
+                None,
+                cache,
+            )
+            .expect("pattern builds")
+            .ids
+        };
+
+        write("mov-1");
+        let mut held = crate::score::ScoreCache::default();
+        assert_eq!(run(&mut held), vec!["mov-1", "mov-3"]);
+
+        write("mov-2");
+        assert_eq!(
+            run(&mut held),
+            vec!["mov-1", "mov-3"],
+            "held cache reuses the compile"
+        );
+        assert_eq!(
+            run(&mut crate::score::ScoreCache::default()),
+            vec!["mov-2", "mov-3"],
+            "a fresh cache reads the new file"
         );
     }
 

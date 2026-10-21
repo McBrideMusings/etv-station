@@ -231,8 +231,11 @@ type CacheKey = (PathBuf, Option<PoolSources>, crate::profile::Narrowing);
 /// share sets with a sibling that does not. Pools narrowing nothing still
 /// share.
 ///
-/// Scoped to a single generation and dropped with it, so a catalog that changes
-/// between generations is picked up on the next one.
+/// The daemon scopes one to a single generation and drops it with it, so a
+/// catalog that changes between generations is picked up on the next one. The
+/// simulator holds one across a whole replay, which is only sound because the
+/// catalog and the plugin files are fixed for that replay: a cache outlives
+/// neither a catalog change nor an edit to a script on disk.
 #[derive(Debug, Default)]
 pub struct ScoreCache {
     entries: HashMap<CacheKey, CachedScript>,
