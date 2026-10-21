@@ -34,8 +34,8 @@ pub use fill::{Align, DEFAULT_MIN_FILL, FillEntry};
 pub use filter::{Filter, SeasonSel};
 pub use hooks::{HookDecl, HookGrant, HookTrigger};
 pub use load::{
-    DroppedChannel, LoadedChannel, Station, expand_process_env, load, load_for_inspection,
-    read_channel, read_station,
+    DropCause, DroppedChannel, LoadedChannel, Station, expand_process_env, load,
+    load_for_inspection, read_channel, read_station,
 };
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};

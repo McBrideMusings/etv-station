@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use etv_station::config::{BlockFile, read_channel, read_station};
+use etv_station::config::{BlockFile, DropCause, read_channel, read_station};
 
 /// The repo root, from this crate's manifest directory.
 fn examples_dir() -> PathBuf {
@@ -236,11 +236,10 @@ fn the_example_station_drops_no_tracked_channel() {
     let dropped: Vec<String> = station
         .dropped
         .iter()
-        // `load_for_inspection` stands in `/nonexistent/unset-env/<VAR>` for a
-        // `${VAR}` the host never set (a Plex snapshot path, a media root). A
-        // channel that fails on that placeholder is missing host environment,
-        // not colliding or malformed, and the check is about the latter.
-        .filter(|d| !d.reason.contains("/nonexistent/unset-env/"))
+        // A channel that failed after reading a `${VAR}` the host never set (a
+        // Plex snapshot path, a media root) is missing host environment, not
+        // colliding or malformed, and the check is about the latter.
+        .filter(|d| !matches!(d.cause, DropCause::UnsetEnv { .. }))
         .map(|d| format!("{}: {}", d.config_path.display(), d.reason))
         .collect();
     assert!(

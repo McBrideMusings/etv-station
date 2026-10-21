@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,21 @@ pub struct Station {
 pub struct DroppedChannel {
     pub config_path: PathBuf,
     pub reason: String,
+    pub cause: DropCause,
+}
+
+/// Why a channel config was left out of the lineup, for a caller that must
+/// tell the causes apart without reading `reason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropCause {
+    /// The load failed on a `${VAR}` placeholder that [`load_for_inspection`]
+    /// substituted because the host never set it. Names every such variable
+    /// the failure quotes.
+    UnsetEnv { vars: Vec<String> },
+    /// The channel's own config failed to load for any other reason.
+    Invalid,
+    /// The channel shares its number or name with another channel.
+    Collision,
 }
 
 #[derive(Debug)]
@@ -95,21 +111,43 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
 /// The `ETV_STATION_*` overrides read the plain environment: an unset one
 /// leaves the station file's own value, never the placeholder.
 pub fn load_for_inspection(station_path: &Path) -> Result<Station, ConfigError> {
-    load_with(station_path, &process_env, &|var| {
-        Some(process_env(var).unwrap_or_else(|| format!("/nonexistent/unset-env/{var}")))
-    })
+    let unset = RefCell::new(Vec::new());
+    load_with(
+        station_path,
+        &process_env,
+        &|var| {
+            Some(process_env(var).unwrap_or_else(|| {
+                let mut seen = unset.borrow_mut();
+                if !seen.iter().any(|v| v == var) {
+                    seen.push(var.to_string());
+                }
+                unset_placeholder(var)
+            }))
+        },
+        &unset,
+    )
+}
+
+/// What [`load_for_inspection`] stands in for an unset `${var}`. Deliberately
+/// not a valid path, so an error that quotes it is an error caused by the
+/// variable being unset.
+fn unset_placeholder(var: &str) -> String {
+    format!("/nonexistent/unset-env/{var}")
 }
 
 fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, ConfigError> {
-    load_with(station_path, env, env)
+    load_with(station_path, env, env, &RefCell::new(Vec::new()))
 }
 
 /// `overrides` answers the `ETV_STATION_*` variables that replace station
 /// fields; `refs` answers the `${VAR}` references inside channel configs.
+/// `unset` collects the variables `refs` answered with a placeholder; the
+/// loader empties it before each channel to attribute them to that channel.
 fn load_with(
     station_path: &Path,
     overrides: EnvLookup<'_>,
     refs: EnvLookup<'_>,
+    unset: &RefCell<Vec<String>>,
 ) -> Result<Station, ConfigError> {
     let mut station: StationConfig = read_config_file(station_path)?;
     apply_env_overrides(
@@ -143,6 +181,7 @@ fn load_with(
     let mut channels = Vec::with_capacity(channel_paths.len());
     let mut dropped = Vec::new();
     for channel_path in channel_paths {
+        unset.borrow_mut().clear();
         match load_one_channel(
             &station,
             &base,
@@ -161,9 +200,24 @@ fn load_with(
                     "channel config failed to load and will not appear in the lineup; \
                      every other channel still serves"
                 );
+                // Only a variable whose placeholder is in the error caused the
+                // drop; one read harmlessly before an unrelated defect did not.
+                let message = e.to_string();
+                let vars: Vec<String> = unset
+                    .borrow()
+                    .iter()
+                    .filter(|v| message.contains(&unset_placeholder(v)))
+                    .cloned()
+                    .collect();
+                let cause = if vars.is_empty() {
+                    DropCause::Invalid
+                } else {
+                    DropCause::UnsetEnv { vars }
+                };
                 dropped.push(DroppedChannel {
                     config_path: channel_path,
                     reason: e.to_string(),
+                    cause,
                 });
             }
         }
@@ -491,6 +545,7 @@ fn reject_collisions(channels: &mut Vec<LoadedChannel>) -> Vec<DroppedChannel> {
                 dropped.push(DroppedChannel {
                     config_path: channel.config_path.clone(),
                     reason,
+                    cause: DropCause::Collision,
                 });
                 false
             }
@@ -1919,9 +1974,65 @@ mod tests {
             write_min_station(dir.path(), &[("a.yaml", &channel_body(Some(1), Some("a")))]);
         let placeholder = |var: &str| Some(format!("/nonexistent/unset-env/{var}"));
 
-        let station = load_with(&station_path, &no_env, &placeholder).expect("station loads");
+        let station = load_with(
+            &station_path,
+            &no_env,
+            &placeholder,
+            &RefCell::new(Vec::new()),
+        )
+        .expect("station loads");
         assert_eq!(station.station.tz, "UTC");
         assert_eq!(station.channels.len(), 1);
+    }
+
+    /// Under the inspection loader a channel whose failure quotes an unset
+    /// `${VAR}`'s placeholder is dropped as `UnsetEnv` naming it; one that read
+    /// the variable but failed for another reason, or read none, is `Invalid`.
+    #[test]
+    fn a_drop_after_an_unset_env_read_is_typed_unset_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = |number: i64, name: &str, plugin: &str| {
+            format!(
+                "number: {number}\nname: {name}\nrule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          plugin: \"{plugin}\"\n          datastores:\n            - name: \"taste_db\"\n              path: \"${{ETV_TEST_NEVER_SET_VAR}}\"\n      pattern:\n        - pool: \"shows\"\n          take: 1\n"
+            )
+        };
+        let unset_body = body(2, "unset", "scorer.rhai");
+        let harmless_body = body(3, "harmless", "missing.rhai");
+        let station_path = write_min_station(
+            dir.path(),
+            &[
+                ("a.yaml", &channel_body(Some(1), Some("a"))),
+                ("b.yaml", &unset_body),
+                ("e.yaml", &harmless_body),
+                ("c.yaml", &channel_body(None, Some("c"))),
+            ],
+        );
+
+        std::fs::write(
+            dir.path().join("channels/scorer.rhai"),
+            r#"fn hooks() { ["pool_provider"] }
+fn capabilities() { [#{ datastore: "taste_db" }] }
+fn audit(ctx, picks, workspace) { #{} }"#,
+        )
+        .unwrap();
+        let station = load_for_inspection(&station_path).expect("station loads");
+        let cause = |file: &str| {
+            station
+                .dropped
+                .iter()
+                .find(|d| d.config_path.ends_with(file))
+                .unwrap_or_else(|| panic!("{file} not dropped: {:?}", station.dropped))
+                .cause
+                .clone()
+        };
+        assert_eq!(
+            cause("b.yaml"),
+            DropCause::UnsetEnv {
+                vars: vec!["ETV_TEST_NEVER_SET_VAR".to_string()]
+            }
+        );
+        assert_eq!(cause("e.yaml"), DropCause::Invalid);
+        assert_eq!(cause("c.yaml"), DropCause::Invalid);
     }
 
     /// A `fonts:` entry naming a file that is not there fails the load,
