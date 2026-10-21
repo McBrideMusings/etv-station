@@ -88,10 +88,12 @@ const INITIAL_BURST: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as
 ///
 /// `-readrate 1.0` asks ffmpeg for exactly wall-clock speed, and ffmpeg delivers
 /// a few percent under whatever it is asked for — measured at 0.958x on an idle
-/// machine and 0.69x on a busy one. Because readrate only ever slows the read
-/// down, a shortfall is never repaid, so the lead from [`TARGET_BUFFER`] drains
-/// at the deficit rate and the session eventually cannot produce a segment
-/// before the viewer needs it.
+/// machine and 0.69x on a busy one. `-readrate_catchup` lets the read run up to
+/// 1.05x while it is behind, which repays a small shortfall; a deficit larger
+/// than that headroom still drains the lead from [`TARGET_BUFFER`] until the
+/// session cannot produce a segment before the viewer needs it. Each restart
+/// logs at info with the prefix `reburst: lead exhausted`, so a log count shows
+/// whether the catch-up is enough.
 ///
 /// The lead used to be topped up only between items, which is fine for a
 /// half-hour episode and useless for a feature film: one item can run for hours
@@ -583,7 +585,10 @@ impl ChannelSession {
                 let resumed_at = *self.playlist_manager.lock().await.last_segment_end();
                 self.transcoded_until = resumed_at;
                 self.state = ChannelSessionState::Seek;
-                log::debug!("resuming the same item from {}", resumed_at);
+                log::info!(
+                    "reburst: lead exhausted, resuming the same item from {}",
+                    resumed_at
+                );
                 return Ok(());
             }
             Err(e) if troubleshoot => return Err(e),

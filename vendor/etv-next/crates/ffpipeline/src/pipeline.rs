@@ -74,8 +74,16 @@ pub enum ReadRate {
     Unthrottled,
     /// Wall-clock speed, after reading `initial_burst` at full speed to fill the
     /// segment buffer. A zero burst throttles from the first frame.
+    ///
+    /// ffmpeg delivers a few percent under the rate it is asked for, so the read
+    /// also carries `-readrate_catchup`: while it is behind wall clock it may read
+    /// up to [`READRATE_CATCHUP`]x until the shortfall is repaid, then returns
+    /// to 1.0.
     Realtime { initial_burst: Duration },
 }
+
+/// Fastest a realtime read may go while it is behind wall clock.
+const READRATE_CATCHUP: &str = "1.05";
 
 impl ReadRate {
     /// The ffmpeg input arguments for this rate, in order.
@@ -83,7 +91,7 @@ impl ReadRate {
         match self {
             ReadRate::Unthrottled => ArgVec::new(),
             ReadRate::Realtime { initial_burst } => {
-                let mut result = args!["-readrate", "1.0"];
+                let mut result = args!["-readrate", "1.0", "-readrate_catchup", READRATE_CATCHUP];
                 if !initial_burst.is_zero() {
                     result.extend(args![
                         "-readrate_initial_burst",
@@ -578,7 +586,13 @@ impl Pipeline {
                 // in the pipe by the time ffmpeg reads it. Without this, ffmpeg
                 // drains the pipe as fast as it can loop, outrunning the writer
                 // and handing the rawvideo demuxer a partial frame — which it
-                // treats as fatal rather than retrying.
+                // treats as fatal rather than retrying. The rate carries the
+                // same catch-up as the main input: the overlay filter emits a
+                // frame only once both inputs have one, so an overlay held at
+                // 1.0 would hold the whole transcode to it and the main input
+                // could never repay a shortfall. The writer can keep up, because
+                // it paces to its own wall-clock schedule and writes without
+                // sleeping whenever a slow reader has put it behind.
                 read_rate: ReadRate::Realtime {
                     initial_burst: Duration::ZERO,
                 },
@@ -1095,7 +1109,14 @@ mod tests {
 
         assert_eq!(
             args,
-            vec!["-readrate", "1.0", "-readrate_initial_burst", "44"]
+            vec![
+                "-readrate",
+                "1.0",
+                "-readrate_catchup",
+                "1.05",
+                "-readrate_initial_burst",
+                "44"
+            ]
         );
     }
 
@@ -1106,7 +1127,7 @@ mod tests {
         }
         .as_args();
 
-        assert_eq!(args, vec!["-readrate", "1.0"]);
+        assert_eq!(args, vec!["-readrate", "1.0", "-readrate_catchup", "1.05"]);
     }
 
     #[test]
@@ -1406,16 +1427,19 @@ mod tests {
             .iter()
             .position(|a| a == "pipe:10")
             .expect("overlay input path pipe:10 should appear in the ffmpeg args");
-        let readrate_immediately_precedes_pipe = args.get(..pipe_index).is_some_and(|before| {
-            before
-                .windows(2)
-                .rev()
-                .take(10)
-                .any(|pair| pair == ["-readrate", "1.0"])
-        });
+        // The overlay's own input block runs from just past the previous
+        // input's `-i <path>` up to its `-i pipe:10`.
+        let before_pipe = &args[..pipe_index - 1];
+        let block_start = before_pipe
+            .iter()
+            .rposition(|a| a == "-i")
+            .map_or(0, |i| i + 2);
+        let overlay_block = &before_pipe[block_start..];
         assert!(
-            readrate_immediately_precedes_pipe,
-            "expected -readrate 1.0 in the overlay input's own arg block, right before pipe:10; args: {args:?}"
+            overlay_block
+                .windows(4)
+                .any(|w| w == ["-readrate", "1.0", "-readrate_catchup", "1.05"]),
+            "expected -readrate 1.0 -readrate_catchup 1.05 in the overlay input's own arg block; args: {args:?}"
         );
     }
 
