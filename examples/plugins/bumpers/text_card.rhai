@@ -244,11 +244,12 @@ fn build(ctx) {
     let target_max = (config.max_secs ?? 15.0).to_float();
     let gap = ctx.gap_ms.to_float() / 1000.0;
     // A gap longer than the cap runs the cap and leaves the rest to the next
-    // draw, but never strands a remainder too short for another card.
+    // draw, but a remainder too short for another card is absorbed by this one
+    // (up to 6s past the cap) rather than left as black.
     let target = gap;
     if gap > target_max {
         target = target_max;
-        if gap - target < 6.0 { target = gap - 6.0; }
+        if gap - target < 6.0 { target = gap; }
     }
 
     let slots = #{
