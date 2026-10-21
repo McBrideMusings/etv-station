@@ -70,7 +70,7 @@ flat list of entries. Source: `config/block.rs` (`BlockFile`).
 
 | `align` | no — default `none` | `none` \| a duration (`30m`, `1h`): the local-clock grid this block's programmes end on |
 | `min_fill` | no — default `2s` | a gap shorter than this is black with the channel logo, not a bumper |
-| `fill` | when `align` is set | list of [fill entries](#align-and-fill--bumpers-up-to-the-grid), the bumper scripts that fill a gap |
+| `fill` | when `align` is set | list of [fill entries](#align-and-fill-—-bumpers-up-to-the-grid), the bumper scripts that fill a gap |
 
 ```yaml
 # blocks/starwars-timeline.yaml
@@ -701,9 +701,9 @@ temperature: 0                 # optional — every channel with no temperature:
 | `tz` | no — default `UTC` | IANA time zone string; `ETV_STATION_TZ` overrides at runtime |
 | `output_base` | **yes** | path — base directory every channel writes under; `ETV_STATION_OUTPUT_BASE` overrides at runtime |
 | `channels` | **yes** | list of path strings; each is a literal path or a glob (`*`, `?`, `[`) |
-| `chronologies` | no — default empty | list of chronology files, literal or glob like `channels`; each declares one named, ordered list of item references a block plays with [`kind: chronology`](#kind-chronology-play-a-standalone-chronology-164) |
+| `chronologies` | no — default empty | list of chronology files, literal or glob like `channels`; each declares one named, ordered list of item references a block plays with [`kind: chronology`](#kind-chronology-—-play-a-standalone-chronology-164) |
 | `arcs` | no — default empty | list of show arc files, literal or glob like `channels`; each declares one show's named absolute-episode ranges, which `group_by: season` and `filter.seasons` treat as pseudo-seasons (see [Show arcs](#show-arcs)) |
-| `categories` | no — default empty | list of category files, literal or glob like `channels`; each declares named keyword sets pools reference as `category("name")` (see [`category`](#category-name-a-keyword-set-defined-once-170)) |
+| `categories` | no — default empty | list of category files, literal or glob like `channels`; each declares named keyword sets pools reference as `category("name")` (see [`category`](#category-name-—-a-keyword-set-defined-once-170)) |
 | `source_roots` | no — default empty | list of directories the daemon walks to populate the catalog when `catalog_path` is set — an operational choice about what this deployment scans, not used for identity. Empty skips the filesystem scan entirely. `ETV_STATION_SOURCE_ROOTS` (colon-separated) overrides at runtime. |
 | `identity_roots` | no — default empty | list of media mount roots (the daemon's filesystem view) used to canonicalise a local item's path when deriving its identity, so the same file under different mounts — or a different store reading the same library — is one identity. Empty skips root-stripping. Pure string manipulation; touches no disk. `ETV_STATION_IDENTITY_ROOTS` (colon-separated) overrides at runtime — the intended way to supply it, since mount paths are host-specific and do not belong in a committed config. Deliberately not defaulted from `source_roots` (#243): one is an operational choice, the other a property of the media layout. |
 | `catalog_path` | no — default unset | path to the sqlite catalog the daemon opens and ingests (local-FS over `source_roots`, plus Plex when `PLEX_URL`/`PLEX_TOKEN` are set) at startup. Enables `query` entries and non-`manual` order, and lets a manual `local` item path-match onto a catalog identity (so it collapses with a query for the same file). Unset keeps the catalog-free behavior — only inline-item `manual` channels resolve. `ETV_STATION_CATALOG` overrides at runtime. |
@@ -1872,7 +1872,7 @@ it does not score, so #254's rule that Plex watch state never lowers a score
 is untouched.
 
 This is what makes two movie pools legal in one block. [Pools are blind to
-each other](#pool-constraints-spacing-counted-in-a-pools-own-draw-order), so
+each other](#pool-constraints-—-spacing-counted-in-a-pool-s-own-draw-order), so
 two that can resolve the same `entry_id` may both air it in one day and
 neither one's `no_repeat_within` will notice. `only` and `exclude` cannot
 overlap, so the two are disjoint by construction.
@@ -2050,7 +2050,7 @@ unchanged since #74 — or a record naming one plus two optional extras:
 #{ entry_id: "ghost", metadata: #{ reason: "won an Oscar" }, take: 3 }
 ```
 
-`metadata` is opaque, exactly like [`Pool::config`](#pool-config-—-the-scripts-own-tunables-authored-in-yaml):
+`metadata` is opaque, exactly like [`Pool::config`](#pool-config-—-the-script-s-own-tunables-authored-in-yaml):
 the station converts it and carries it untouched to that airing's entry in
 the emitted playout JSON (`PlayoutItem::metadata`), reading nothing out of
 it. A non-finite float anywhere inside — `.inf`, `-.inf`, `.nan` — fails the
@@ -2167,7 +2167,7 @@ A plugin declares its hooks and the station wires only the declared ones
 | Hook | What a script implementing it does |
 |---|---|
 | `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
-| `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-a-plugin-arranges-the-block-itself). |
+| `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-—-a-plugin-arranges-the-block-itself). |
 | `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps, each with the catalog columns such as `content_rating`, `source_ids`, a map from source (`plex`, `local_fs`) to that source's id for the entry, and `path` when the item plays a local file; `next` also carries `start`, the unix seconds the programme begins, and is `()` at the generation frontier), `upcoming` (item maps of the programmes after `next` in the schedule being laid, nearest first, at most 12; `[]` at the frontier), `config` (the fill entry's `config:`, or `#{}`), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `pending(path, stand_in)` (a render that has not landed: the file at `stand_in` airs, and the daemon, every 30 seconds, replaces the segment in the unaired playout with `path` once ffprobe reads it and the segment is more than 30 seconds from airtime; a file shorter than the slot repeats when the segment is `looped()` and otherwise is followed by black, and the swap is logged as `bumper.pending_swapped`; a segment already airing or within 30 seconds keeps its stand-in), `http(url, in_ms, out_ms)` (a remote file ETV-next fetches; `{{VAR}}` in the url is expanded by ETV-next at play time, so a token stays out of the playout file), `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`), `read` (`ctx.read(path)`, a file in its own folder), `http` (`ctx.http(url, method, body)` or `ctx.http(url, method, body, #{ Accept: "application/json" })`, the same call and 10-second limit a pool's `http` has; `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the url are filled from the station's environment, so a script reaches Plex without holding the token) and `exec` (`ctx.exec(program, args)` -> `#{ code, stdout, stderr }`, no stdin, killed and an error after 10 seconds; a nonzero `code` is the script's to read); `ctx.http` and `ctx.exec` together may spend 30 seconds per `build()` call, after which each further call errors at once, naming the budget; each must be both declared and granted. `parse_json(text)` needs no grant. `local_time(unix_secs)` -> `#{ weekday, hour, minute }` in the station's time zone needs no grant either, and with `ctx.next.start` words "Tonight" or "Tomorrow". `examples/plugins/bumpers/up_next.rhai` is an up-next promo: it plays a hand-picked window of the next film (`picks`), else the top Shot a plex-db-ex explorer's `POST /api/search/run` finds for `phrase` in that film (`plexdb_url`, needs `http`), else a `broll_generic` clip, skipping a picked or searched window whose `content_rating` exceeds `slot_rating`. |
 
 A script may declare any of them. The declaration lives in the script, not in
@@ -3185,7 +3185,7 @@ picture.
 The choice is made per channel, never per block: ETV-next encodes one HLS
 session per channel from `channelN.json`, and a playout item carries no
 encoding field, so a block cannot change the picture mid-session (the same
-reason [`subtitle.default_on`](#subtitle-default_on) is a channel setting).
+reason [`subtitle.default_on`](#subtitle-default-on) is a channel setting).
 There is no h264 `profile` key because ETV-next has no setting for it.
 
 ### Subtitle `default_on`
