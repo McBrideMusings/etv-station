@@ -1,0 +1,61 @@
+number: 3
+name: up-next-test
+# Exercises the up_next.rhai promo bumper: three lavfi programmes on a 30-minute
+# grid, each gap filled with a clip of the generic b-roll under an "Up next"
+# card. The lavfi programmes carry no file or Plex id, so no pick or search can
+# apply, and the explorer URL answers nothing; the bumper draws broll_generic.
+# Run it with
+# `STATION_CONFIG=examples/station-up-next.yaml ./tools/dev-run.sh`.
+display_name: "Up Next Test Channel"
+window_days: 1
+chunk_hours: 1
+roll_interval: "60s"
+retention_days: 1
+
+overlay:
+  file: "../../crates/etv-overlay/fixtures/channel_watermark.yaml"
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "manual"
+      align: 30m
+      fill:
+        - script: ../plugins/bumpers/up_next.rhai
+          capabilities: [http]
+          config:
+            plexdb_url: "http://127.0.0.1:9"
+            phrase: "a quiet street at night"
+            broll_generic:
+              - { path: "crates/etv-query-test/fixtures/bumpers/promo-22s.mp4", in: 0, out: 22 }
+              - { path: "crates/etv-query-test/fixtures/bumpers/ident-45s.mp4", in: 5, out: 40 }
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "7m"
+          source:
+            kind: lavfi
+            params: "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+          program:
+            title: "Seven Minutes"
+            categories: ["Test"]
+
+        - kind: item
+          in_point: "0s"
+          out_point: "11m"
+          source:
+            kind: lavfi
+            params: "smptebars=size=1280x720:rate=30 [out0]; sine=frequency=880 [out1]"
+          program:
+            title: "Eleven Minutes"
+            categories: ["Test"]
+
+        - kind: item
+          in_point: "0s"
+          out_point: "17m"
+          source:
+            kind: lavfi
+            params: "mandelbrot=size=1280x720:rate=30 [out0]; sine=frequency=220 [out1]"
+          program:
+            title: "Seventeen Minutes"
+            categories: ["Test"]

@@ -273,7 +273,7 @@ if [ ! -x "$ersatztv_bin" ]; then
 fi
 
 (
-  "$ersatztv_bin" examples/etv-next/lineup.json 2>&1 \
+  "$ersatztv_bin" "$etv_next_dir/lineup.json" 2>&1 \
     | while IFS= read -r l; do printf '[etv] %s\n' "$l"; done
 ) &
 

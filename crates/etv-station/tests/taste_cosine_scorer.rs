@@ -541,6 +541,7 @@ fn a_pool_worded_why_reaches_each_picks_metadata() {
             .and_then(|v| v.as_str())
             .map(str::to_owned)
     };
+    let reasons = |p: &PickedItem| p.metadata.as_ref().unwrap().get("why_reasons").cloned();
 
     let ranked = scorer.pick_for(
         "movies",
@@ -555,7 +556,7 @@ fn a_pool_worded_why_reaches_each_picks_metadata() {
         meta(mov_d, "why").as_deref(),
         Some("Nobody here has seen it")
     );
-    assert_eq!(meta(mov_d, "why_detail").as_deref(), Some("time"));
+    assert_eq!(reasons(mov_d), Some(serde_json::json!(["time"])));
 
     let random = scorer.pick_for(
         "movies",
@@ -582,8 +583,8 @@ fn a_pool_worded_why_reaches_each_picks_metadata() {
             p.id
         );
         assert_eq!(
-            meta(p, "why_detail").as_deref(),
-            Some("picked at random"),
+            reasons(p),
+            Some(serde_json::json!(["picked at random"])),
             "{}",
             p.id
         );
@@ -593,7 +594,7 @@ fn a_pool_worded_why_reaches_each_picks_metadata() {
     assert!(
         unworded
             .iter()
-            .all(|p| meta(p, "why").is_none() && meta(p, "why_detail").is_none())
+            .all(|p| meta(p, "why").is_none() && reasons(p).is_none())
     );
 }
 
@@ -2625,8 +2626,8 @@ fn a_why_line_can_name_a_title_watched_inside_the_window() {
     let picks = pick_with_history(&scorer, config.clone(), vec![watched("mov-a", 2, "pat")]);
     let mov_c = find(&picks, "mov-c");
     assert_eq!(
-        field(&mov_c, "why_detail"),
-        Some(serde_json::json!("mov-a · contact"))
+        field(&mov_c, "why_reasons"),
+        Some(serde_json::json!(["mov-a", "contact"]))
     );
     let bridge = field(&mov_c, "why_bridge").unwrap();
     assert_eq!(bridge["title"], "mov-a");
@@ -2648,16 +2649,16 @@ fn a_why_line_can_name_a_title_watched_inside_the_window() {
     let stale = pick_with_history(&scorer, config.clone(), vec![watched("mov-a", 100, "pat")]);
     let mov_c = find(&stale, "mov-c");
     assert_eq!(
-        field(&mov_c, "why_detail"),
-        Some(serde_json::json!("contact"))
+        field(&mov_c, "why_reasons"),
+        Some(serde_json::json!(["contact"]))
     );
     assert!(field(&mov_c, "why_bridge").is_none());
 
     // No history at all reads exactly as before.
     let none = pick_with_history(&scorer, config, vec![]);
     assert_eq!(
-        field(&find(&none, "mov-c"), "why_detail"),
-        Some(serde_json::json!("contact"))
+        field(&find(&none, "mov-c"), "why_reasons"),
+        Some(serde_json::json!(["contact"]))
     );
 }
 
@@ -2707,7 +2708,10 @@ fn a_tautulli_error_reply_keeps_the_keyword_reasons() {
     let (picks, _) = pick_with_body(&scorer, config, body, None);
     let mov_c = picks.iter().find(|p| p.id == "mov-c").unwrap();
     let meta = mov_c.metadata.as_ref().unwrap();
-    assert_eq!(meta.get("why_detail"), Some(&serde_json::json!("contact")));
+    assert_eq!(
+        meta.get("why_reasons"),
+        Some(&serde_json::json!(["contact"]))
+    );
     assert!(meta.get("why_bridge").is_none());
 }
 
@@ -2724,8 +2728,99 @@ fn an_unreachable_tautulli_keeps_the_keyword_reasons() {
     let picks = pick_against_tautulli(&scorer, config, &closed, None);
     let mov_c = picks.iter().find(|p| p.id == "mov-c").unwrap();
     let meta = mov_c.metadata.as_ref().unwrap();
-    assert_eq!(meta.get("why_detail"), Some(&serde_json::json!("contact")));
+    assert_eq!(
+        meta.get("why_reasons"),
+        Some(&serde_json::json!(["contact"]))
+    );
     assert!(meta.get("why_bridge").is_none());
+}
+
+/// A store where `seen` carries k1..k5 (so each is an equal-weight taste
+/// keyword) and `multi` carries all five, `single` carries k1 and one keyword
+/// the taste vector has never met.
+fn write_multi_reason_fixture(path: &Path) {
+    let mut sql = String::from(
+        "INSERT INTO items (item_id, type) VALUES ('seen', 'movie'), ('multi', 'movie'), ('single', 'movie');
+         INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES ('h1', 'seen', 42, 1700000000);
+         INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+             ('single', 'keywords', 'keyword', 'unrelated', '2026-01-01T00:00:00+00:00')",
+    );
+    for k in 1..=5 {
+        for item in ["seen", "multi"] {
+            sql.push_str(&format!(
+                ",\n ('{item}', 'keywords', 'keyword', 'k{k}', '2026-01-01T00:00:00+00:00')"
+            ));
+        }
+    }
+    sql.push_str(",\n ('single', 'keywords', 'keyword', 'k1', '2026-01-01T00:00:00+00:00');");
+    empty_store(path).execute_batch(&sql).unwrap();
+}
+
+/// #320: a why line names every reason with a big enough share of the pick's
+/// own matched weight, up to a maximum, chosen once by the seed; the full
+/// qualifying set is recorded; a thin score shows no line.
+#[test]
+fn a_why_line_can_name_several_reasons_chosen_by_seed() {
+    let scorer = Scorer::new(
+        &catalog_of(["seen", "multi", "single"]),
+        write_multi_reason_fixture,
+    );
+    let run = |seed: u64, extra: serde_json::Value| {
+        let mut config = serde_json::json!({ "exploration_fraction": 0.0, "why": "Because" });
+        for (k, v) in extra.as_object().unwrap() {
+            config[k] = v.clone();
+        }
+        scorer.pick_for("movies", seed, 3, Some(config), None, &[])
+    };
+    let field = |picks: &[PickedItem], id: &str, key: &str| {
+        picks
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get(key)
+            .cloned()
+    };
+    let len = |v: Option<serde_json::Value>| v.map_or(0, |v| v.as_array().unwrap().len());
+
+    // Five evenly-matched keywords: all five qualify at the default share,
+    // three are shown, and the unchosen two are still on the record.
+    let picks = run(7, serde_json::json!({}));
+    assert_eq!(len(field(&picks, "multi", "why_reasons")), 3);
+    let cands = field(&picks, "multi", "why_candidates").unwrap();
+    assert_eq!(cands.as_array().unwrap().len(), 5);
+    for c in cands.as_array().unwrap() {
+        assert!(c["share"].as_f64().unwrap() >= 0.10, "{c}");
+        assert_eq!(c["kind"], "keyword");
+    }
+    // A film matching one front names one.
+    assert_eq!(
+        field(&picks, "single", "why_reasons"),
+        Some(serde_json::json!(["k1"]))
+    );
+
+    // The same seed reads the same; the maximum is a config key, not code.
+    let again = run(7, serde_json::json!({}));
+    assert_eq!(
+        field(&again, "multi", "why_reasons"),
+        field(&picks, "multi", "why_reasons")
+    );
+    let wide = run(7, serde_json::json!({ "why_max_reasons": 5 }));
+    assert_eq!(len(field(&wide, "multi", "why_reasons")), 5);
+
+    // A different minimum share changes the count, with no script change.
+    let strict = run(7, serde_json::json!({ "why_min_share": 0.9 }));
+    assert_eq!(len(field(&strict, "multi", "why_candidates")), 0);
+    assert!(field(&strict, "multi", "why").is_none());
+    assert!(field(&strict, "multi", "why_reasons").is_none());
+
+    // Below the score floor there is no line, but the evidence stays.
+    let thin = run(7, serde_json::json!({ "why_min_score": 1000.0 }));
+    assert!(field(&thin, "multi", "why").is_none());
+    assert!(field(&thin, "multi", "why_reasons").is_none());
+    assert_eq!(len(field(&thin, "multi", "why_candidates")), 5);
 }
 
 // ---------------------------------------------------------------------------

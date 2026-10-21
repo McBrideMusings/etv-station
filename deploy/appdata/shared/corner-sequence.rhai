@@ -16,13 +16,15 @@
 //   title, sub_title, season, episode, year      the item's program fields
 //   next_title, next_sub_title, next_season, …   the next item's
 //   metadata.pool_label                           the pool's `label:`
-//   metadata.why, metadata.why_detail             a pool plugin's reason
+//   metadata.why, metadata.why_reasons            a pool plugin's reason: the
+//                                                 lead phrase, and the bare
+//                                                 labels it follows with
 //                                                 (taste-cosine.rhai writes
 //                                                 them from the pool's
 //                                                 `config: { why: … }`)
 //
 // The station carries `metadata` to this script untouched and never reads
-// it, so a plugin and this overlay agree on `why`/`why_detail` between
+// it, so a plugin and this overlay agree on `why`/`why_reasons` between
 // themselves. An item without a `why` skips beat 2; one without a label shows
 // `fallback_eyebrow` over its title.
 //
@@ -55,6 +57,7 @@
 //   row_gap_px          — extra space above lines 2 and 3 (default 6); `below:`
 //                          alone sets each line flush on the box above it
 //   up_next_lead_secs   — beat 3 starts this long before the end (default 180)
+//   why_joiner          — between the labels in beat 2's detail (default " · ")
 //   why_eyebrow         — beat 2's heading (default "WHY IT'S ON")
 //   next_eyebrow        — beat 3's heading (default "UP NEXT")
 //   fallback_eyebrow    — beat 1's heading when the item has no label
@@ -89,6 +92,21 @@ fn text_of(blob, key) {
     } else {
         ""
     }
+}
+
+// The labels of a string-array field of a metadata blob joined with `sep`, or
+// "" when the blob or field is absent or holds anything else. The labels
+// are never inspected: a title and a keyword read the same here.
+fn joined_list(blob, key, sep) {
+    let out = "";
+    if type_of(blob) == "map" && blob.contains(key) && type_of(blob[key]) == "array" {
+        for v in blob[key] {
+            if type_of(v) != "string" { continue; }
+            if out != "" { out += sep; }
+            out += v;
+        }
+    }
+    out
 }
 
 // "S3 E12", or "" when either number is unknown.
@@ -136,6 +154,7 @@ let lead = num(config.up_next_lead_secs, 180.0);
 let why_eyebrow = if config.why_eyebrow == () { "WHY IT'S ON" } else { config.why_eyebrow };
 let next_eyebrow = if config.next_eyebrow == () { "UP NEXT" } else { config.next_eyebrow };
 let fallback_eyebrow = if config.fallback_eyebrow == () { "NOW" } else { config.fallback_eyebrow };
+let why_joiner = if config.why_joiner == () { " · " } else { config.why_joiner };
 let max_chars = if config.max_chars == () { 48 } else { config.max_chars };
 
 let beat_len = slide + hold + slide;
@@ -191,7 +210,7 @@ if next_title != "" && item_remaining >= 0.0 && item_remaining <= lead && item_r
             beat = what;
             lt = pt;
         } else if why != "" && pt >= beat_len + gap {
-            beat = #{ eyebrow: why_eyebrow, line: why, detail: text_of(metadata, "why_detail") };
+            beat = #{ eyebrow: why_eyebrow, line: why, detail: joined_list(metadata, "why_reasons", why_joiner) };
             lt = pt - beat_len - gap;
         }
     }

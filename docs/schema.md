@@ -1960,28 +1960,49 @@ The wording lives in the channel file, so each block says it its own way:
     why_random_detail: "picked at random" # under it (this is the default)
 ```
 
-A pool that sets `why` writes two keys into each pick's playout `metadata`:
-`why`, the line, and `why_detail`, the text under it. A ranked pick's detail
-is its two heaviest matching keywords joined with ` · `, with ` film` and
-` television series` trimmed off and any keyword over three words skipped
-(`comedy · drama`); an exploration draw's is `why_random_detail`. A pool that
-sets no `why` writes neither. The station carries both keys through untouched
-and never reads them; `deploy/appdata/shared/corner-sequence.rhai` is one
-overlay that draws them.
+A pool that sets `why` writes these keys into each pick's playout `metadata`
+(a pool that sets no `why` writes none). The station carries them through
+untouched and never reads them:
+
+| Key | Holds |
+|---|---|
+| `why` | the lead phrase |
+| `why_reasons` | the bare labels chosen to follow it, largest share first |
+| `why_candidates` | every reason that qualified, chosen or not: `{ label, kind, share }` |
+| `why_bridge` | `{ title, year, watcher, via }`, only when the watched title is among the chosen reasons |
+
+`deploy/appdata/shared/corner-sequence.rhai` is one overlay that draws them: it
+joins `why_reasons` with its `why_joiner` config (default ` · `) and never
+inspects a kind. An exploration draw's `why_reasons` is
+`[why_random_detail]` and it has no `why_candidates`.
+
+**Which reasons qualify.** A ranked pick's reasons are its matching keywords
+(` film` and ` television series` trimmed off, any keyword over three words
+skipped) and, on a movies pool, one watched title (below). Each reason's
+**share** is its part of the pick's own matched weight, never a raw weight:
+the taste vector is an unnormalised running total that grows with watch
+history, so a share is the only scale-free test. Three pool `config:` keys:
+
+- `why_min_share` (default `0.10`): the smallest share a reason needs. 0.10 is
+  the highest value at which the three For You pools still agree; from 0.15 up
+  one pool goes silent on a quarter of its picks.
+- `why_max_reasons` (default `3`): the most reasons shown. When more qualify,
+  a weighted draw seeded by `ctx.seed`, the pick's unit id (the film, or the show on a shows pool) and the labels keeps
+  that many, so regenerating a window with the same seed reads the same.
+- `why_min_score` (default `0`, off): a pick whose base score is below this has
+  no `why` or `why_reasons` at all (an exploration draw is not scored by taste, so the floor does not apply to it) (`why_candidates` stays as evidence). A pick
+  with no qualifying reason is silent the same way.
 
 **A reason can be a watched title.** On a movies pool that sets `why`, the
 scorer also looks, once per generation, for the most recently watched movie in
 Tautulli's history (fetched through `ctx.http`, see `http` below) that carries
 one of the pick's matched keywords (heaviest first).
-When one exists, `why_detail` leads with that title and follows with the
-keyword that linked them (`Blade Runner · neo-noir`), and the pick's metadata gains
-`why_bridge`: `{ title, year, watcher, via }`, where `watcher` is who watched
-it (empty on a pooled history row that names nobody) and `via` the shared
-keyword. A channel that wants to say the name reads `why_bridge.watcher`; one
-that doesn't ignores it. A watch qualifies only inside `bridge_window_days`
-(pool `config:`, default `30`). A pick with no qualifying title, an
-exploration draw, and a title that would cite itself keep the keyword detail
-and carry no `why_bridge`. The overlay is unchanged.
+That title competes as a reason on the share of the keyword that linked them
+(`Blade Runner`, then `neo-noir`), and `why_bridge` records who watched it
+(`watcher` is empty on a pooled history row that names nobody; `via` is the
+shared keyword). A watch qualifies only inside `bridge_window_days` (pool
+`config:`, default `30`). An exploration draw and a title that would cite
+itself carry no bridge.
 
 #### `ignore_keywords` — tags that describe packaging, not subject
 
@@ -2134,7 +2155,7 @@ A plugin declares its hooks and the station wires only the declared ones
 |---|---|
 | `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
 | `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-a-plugin-arranges-the-block-itself). |
-| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps, each with `source_ids`, a map from source (`plex`, `local_fs`) to that source's id for the entry; `next` is `()` at the generation frontier), `upcoming` (item maps of the programmes after `next` in the schedule being laid, nearest first, at most 12; `[]` at the frontier), `config` (the fill entry's `config:`, or `#{}`), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `pending(path, stand_in)` (a render that has not landed: the file at `stand_in` airs, and the daemon, every 30 seconds, replaces the segment in the unaired playout with `path` once ffprobe reads it and the segment is more than 30 seconds from airtime; a file shorter than the slot repeats when the segment is `looped()` and otherwise is followed by black, and the swap is logged as `bumper.pending_swapped`; a segment already airing or within 30 seconds keeps its stand-in), `http(url, in_ms, out_ms)` (a remote file ETV-next fetches; `{{VAR}}` in the url is expanded by ETV-next at play time, so a token stays out of the playout file), `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`), `read` (`ctx.read(path)`, a file in its own folder), `http` (`ctx.http(url, method, body)` or `ctx.http(url, method, body, #{ Accept: "application/json" })`, the same call and 10-second limit a pool's `http` has; `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the url are filled from the station's environment, so a script reaches Plex without holding the token) and `exec` (`ctx.exec(program, args)` -> `#{ code, stdout, stderr }`, no stdin, killed and an error after 10 seconds; a nonzero `code` is the script's to read); `ctx.http` and `ctx.exec` together may spend 30 seconds per `build()` call, after which each further call errors at once, naming the budget; each must be both declared and granted. `parse_json(text)` needs no grant. |
+| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps, each with the catalog columns such as `content_rating`, `source_ids`, a map from source (`plex`, `local_fs`) to that source's id for the entry, and `path` when the item plays a local file; `next` also carries `start`, the unix seconds the programme begins, and is `()` at the generation frontier), `upcoming` (item maps of the programmes after `next` in the schedule being laid, nearest first, at most 12; `[]` at the frontier), `config` (the fill entry's `config:`, or `#{}`), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `pending(path, stand_in)` (a render that has not landed: the file at `stand_in` airs, and the daemon, every 30 seconds, replaces the segment in the unaired playout with `path` once ffprobe reads it and the segment is more than 30 seconds from airtime; a file shorter than the slot repeats when the segment is `looped()` and otherwise is followed by black, and the swap is logged as `bumper.pending_swapped`; a segment already airing or within 30 seconds keeps its stand-in), `http(url, in_ms, out_ms)` (a remote file ETV-next fetches; `{{VAR}}` in the url is expanded by ETV-next at play time, so a token stays out of the playout file), `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`; a timeline takes `push(segment)` and `audio_bed(source, opts)`. `ducked_bed()` errors until implemented. No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`), `read` (`ctx.read(path)`, a file in its own folder), `http` (`ctx.http(url, method, body)` or `ctx.http(url, method, body, #{ Accept: "application/json" })`, the same call and 10-second limit a pool's `http` has; `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the url are filled from the station's environment, so a script reaches Plex without holding the token) and `exec` (`ctx.exec(program, args)` -> `#{ code, stdout, stderr }`, no stdin, killed and an error after 10 seconds; a nonzero `code` is the script's to read); `ctx.http` and `ctx.exec` together may spend 30 seconds per `build()` call, after which each further call errors at once, naming the budget; each must be both declared and granted. `parse_json(text)` needs no grant. `local_time(unix_secs)` -> `#{ weekday, hour, minute }` in the station's time zone needs no grant either, and with `ctx.next.start` words "Tonight" or "Tomorrow". `examples/plugins/bumpers/up_next.rhai` is an up-next promo: it plays a hand-picked window of the next film (`picks`), else the top Shot a plex-db-ex explorer's `POST /api/search/run` finds for `phrase` in that film (`plexdb_url`, needs `http`), else a `broll_generic` clip, skipping a picked or searched window whose `content_rating` exceeds `slot_rating`. |
 
 A script may declare any of them. The declaration lives in the script, not in
 the channel config, so swapping one scorer for another needs no YAML edit.

@@ -84,6 +84,27 @@ const TARGET_BUFFER: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as
 /// rebuild, which needs the larger number.
 const INITIAL_BURST: time::Duration = time::Duration::seconds(SEGMENT_SECONDS as i64 * 7);
 
+/// The first tune-in burst: [`INITIAL_BURST`], unless `ETV_INITIAL_BURST_SECS`
+/// names a whole number of seconds. Only `tools/verify-reburst.sh` sets it. At
+/// the default the lead peaks at `INITIAL_BURST` minus the seconds ffmpeg takes
+/// to produce its first segment, and a loaded machine leaves that under
+/// [`REBURST_ARM_AT_LEAD`], so a stalled ffmpeg never arms a reburst; a larger
+/// burst lets the check drive one on any machine.
+fn initial_burst() -> time::Duration {
+    let Ok(raw) = std::env::var("ETV_INITIAL_BURST_SECS") else {
+        return INITIAL_BURST;
+    };
+    match raw.parse::<i64>() {
+        Ok(secs) if secs >= 1 => time::Duration::seconds(secs),
+        _ => {
+            log::warn!(
+                "ignoring ETV_INITIAL_BURST_SECS={raw:?}: not a whole number of seconds >= 1"
+            );
+            INITIAL_BURST
+        }
+    }
+}
+
 /// Lead at which a still-playing item is restarted to rebuild its buffer.
 ///
 /// `-readrate 1.0` asks ffmpeg for exactly wall-clock speed, and ffmpeg delivers
@@ -412,7 +433,7 @@ impl ChannelSession {
 
         // nothing is on disk yet, so the first process bursts INITIAL_BURST —
         // deliberately smaller than TARGET_BUFFER; see that constant's doc.
-        self.transcode(INITIAL_BURST, troubleshoot).await?;
+        self.transcode(initial_burst(), troubleshoot).await?;
 
         if troubleshoot {
             log::debug!("troubleshooting complete; terminating.");
@@ -1079,8 +1100,16 @@ impl ChannelSession {
                         // What a restart would actually be assigned: the item
                         // from the frontier it would resume at to its finish.
                         let remaining = current_item.finish - segment_frontier;
+                        let was_armed = armed;
                         let fire;
                         (armed, fire) = reburst_decision(armed, lead, remaining);
+                        if armed != was_armed || fire {
+                            log::debug!(
+                                "reburst check: lead {}s, remaining {}s, armed {armed}, fire {fire}",
+                                lead.whole_seconds(),
+                                remaining.whole_seconds()
+                            );
+                        }
                         if fire {
                             break lead;
                         }

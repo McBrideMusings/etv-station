@@ -282,7 +282,11 @@ fn fill_gap(
     }
     let air_date = at.to_timezone(env.tz).date().to_string();
     let prev_map = prev.map(env.item_map);
-    let next_map = ahead.first().map(env.item_map);
+    // `start` is when the programme after the gap begins: the grid line.
+    let next_map = ahead.first().map(env.item_map).map(|mut m| {
+        m.insert("start".into(), boundary.unix_timestamp().into());
+        m
+    });
     let upcoming: Vec<Map> = ahead
         .iter()
         .skip(1)

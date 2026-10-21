@@ -448,7 +448,7 @@ fn call_arrange(
 /// visibly wrong to whoever reads the script's output, which is a better
 /// failure than crashing the generation over an integer a script built by
 /// arithmetic.
-fn local_time_map(secs: i64, tz: &'static Tz) -> Map {
+pub(crate) fn local_time_map(secs: i64, tz: &'static Tz) -> Map {
     let utc = OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
     let local = utc.to_timezone(tz);
     let weekday = match local.weekday() {
