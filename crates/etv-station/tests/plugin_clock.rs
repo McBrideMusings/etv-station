@@ -134,6 +134,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
                 mode: Mode::All,
                 order: Default::default(),
                 pools: vec![Pool {
+                    arcs: None,
                     seed: None,
                     temperature: None,
                     tracks: None,

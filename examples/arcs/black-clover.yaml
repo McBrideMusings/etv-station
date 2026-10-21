@@ -1,0 +1,13 @@
+# Arcs for one show (#163): named ranges of ABSOLUTE episode numbers, so a
+# 170-episode season 1 can be played, or filtered, by the story it is telling.
+#
+# `show:` is the exact Plex title, matched against the catalog's `show` column.
+# The ranges are inclusive, must start at episode 1, and may neither overlap nor
+# leave a gap. Episodes past the last range join one trailing bucket, so a newly
+# ingested episode never fails the load. These ranges are samples: replace them
+# with the show's real story breaks.
+show: "Black Clover"
+arcs:
+  - { name: "Dungeon",       episodes: "1-51" }
+  - { name: "Royal Knights", episodes: "52-102" }
+  - { name: "Witch Queen",   episodes: "103-154" }

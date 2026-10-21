@@ -85,8 +85,8 @@ use std::time::Duration;
 
 use crate::catalog::{Catalog, TagNs};
 use crate::config::{
-    Advance, Constraints, CursorScope, GroupBy, NoRepeatWithin, OnShort, PatternStep, Pool, Rotate,
-    Select, ShowGroup, Take, TakeFrom,
+    Advance, ArcBucket, Constraints, CursorScope, GroupBy, NoRepeatWithin, OnShort, PatternStep,
+    Pool, Rotate, Select, ShowGroup, Take, TakeFrom,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
 use crate::guide::GuideConfig;
@@ -135,8 +135,9 @@ const TAKE_STRIDE: u64 = 1 << 56;
 pub(crate) struct Series {
     /// What this series is called in the rotation and in the `.resume` sidecar.
     /// `show_id` under `group_by = "show"`, `"{show_id}|S{season}"` under
-    /// `group_by = "season"`, and the item's own `entry_id` when it has no
-    /// `show_id` at all.
+    /// `group_by = "season"` (`"{show_id}|A:{arc}"` for a show with arcs, and
+    /// `"{show_id}|A+"` for its episodes past the last arc), and the item's own
+    /// `entry_id` when it has no `show_id` at all.
     pub(crate) key: String,
     /// The key the play-history ledger files this series' airings under —
     /// always the `show_id`, never the season. Equal to [`Self::key`] except
@@ -2401,6 +2402,13 @@ pub(crate) fn resolve_pool_series(
         GroupBy::Show => HashMap::new(),
         GroupBy::Season => catalog.seasons_for(&ids).map_err(|e| e.to_string())?,
     };
+    // A show with arcs (#163) is cut by arc instead of by catalog season: each
+    // arc is a pseudo-season. Only a season-grouped pool on a station with arcs
+    // asks the catalog for the placements.
+    let arc_positions = match (&cfg.arcs, cfg.group_by) {
+        (Some(_), GroupBy::Season) => catalog.arc_positions_for(&ids).map_err(|e| e.to_string())?,
+        _ => HashMap::new(),
+    };
     let mut series: Vec<Series> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     // Which series each id landed in, so a `bucket_order` pass can read the
@@ -2413,9 +2421,18 @@ pub(crate) fn resolve_pool_series(
         // An episode the catalog never recorded a season for stays with its
         // show rather than becoming a series of one, which would scatter the
         // very episodes a season-grouped pool is trying to keep together.
-        let key = match seasons.get(&id) {
-            Some(season) => format!("{show_key}|S{season}"),
-            None => show_key.clone(),
+        // An arc'd show's episodes without an absolute number (specials) fall
+        // back to the catalog season like any other.
+        let arc_bucket = cfg
+            .arcs
+            .as_deref()
+            .zip(arc_positions.get(&id))
+            .and_then(|(arcs, (show, absolute))| arcs.bucket(show, *absolute));
+        let key = match (arc_bucket, seasons.get(&id)) {
+            (Some(ArcBucket::Named(arc)), _) => format!("{show_key}|A:{arc}"),
+            (Some(ArcBucket::Trailing), _) => format!("{show_key}|A+"),
+            (None, Some(season)) => format!("{show_key}|S{season}"),
+            (None, None) => show_key.clone(),
         };
         match index.get(&key) {
             Some(&i) => {
@@ -2809,6 +2826,7 @@ mod tests {
 
     fn movies_pool() -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -2840,6 +2858,7 @@ mod tests {
 
     fn shows_pool() -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -2875,6 +2894,7 @@ mod tests {
     /// that check), so this leaves both unset.
     fn plugin_pool(script: &std::path::Path) -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -2974,6 +2994,7 @@ mod tests {
 
     fn episodes_pool(group_by: GroupBy) -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -3286,6 +3307,7 @@ mod tests {
 
     fn rupaul_pool() -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -5205,6 +5227,7 @@ fn audit(ctx, picks, workspace) { #{} }
         let cat = catalog();
         // The script reads `ctx.sets`, so this pool has to grant what it uses.
         let pool = Pool {
+            arcs: None,
             capabilities: vec!["catalog_read".into()],
             ..plugin_pool(&script)
         };

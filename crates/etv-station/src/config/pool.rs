@@ -67,6 +67,7 @@ pub enum GroupBy {
     Show,
     /// One bucket per season of a show. An episode the catalog has no season
     /// number for stays with its show rather than becoming a bucket of one.
+    /// A show with arcs (#163) is cut by arc instead, each arc a pseudo-season.
     Season,
 }
 
@@ -484,6 +485,20 @@ pub struct Pool {
     /// is what every channel written before #155 means.
     #[serde(default)]
     pub group_by: GroupBy,
+
+    /// The station's show arcs (#163), attached by the load to a pool that
+    /// sets `group_by: season`: an arc'd show is then bucketed by arc instead
+    /// of by catalog season. `None` on any other pool, on a station with no
+    /// arcs, and on a channel read outside a station — all of which bucket
+    /// exactly as before. Serialized so a fingerprint of the loaded config
+    /// changes when an arcs file does.
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "super::filter::serialize_arcs"
+    )]
+    pub arcs: Option<std::sync::Arc<super::arcs::Arcs>>,
 
     #[serde(default)]
     pub select: Select,

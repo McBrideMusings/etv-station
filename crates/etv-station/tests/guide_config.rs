@@ -127,6 +127,7 @@ fn pattern_block(
 /// (#289) — the rung between the block and the item.
 fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
     Pool {
+        arcs: None,
         seed: None,
         temperature: None,
         tracks: None,

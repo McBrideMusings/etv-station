@@ -27,6 +27,11 @@ channels:
 chronologies:
   - chronologies/*.yaml
 
+# Show arcs (#163): one file per show, naming absolute-episode ranges that a
+# `group_by: season` pool buckets by and `filter.seasons` can select by name.
+arcs:
+  - arcs/*.yaml
+
 # Sqlite catalog the daemon opens and ingests at startup: the local filesystem
 # roots first, then Plex when PLEX_URL and PLEX_TOKEN are both in the
 # environment. Without it only inline-item, manual-order channels resolve, which

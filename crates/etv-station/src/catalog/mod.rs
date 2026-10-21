@@ -1106,6 +1106,40 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Each entry's show title and absolute episode number, for the ids that
+    /// have both — what a show arc (#163) is matched on. An id with no show
+    /// (a movie) or no absolute number (a special, or a show nothing has
+    /// numbered) is absent from the map.
+    pub fn arc_positions_for(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, i64)>, CatalogError> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in entry_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT entry_id, show, absolute_episode FROM entries \
+                 WHERE show IS NOT NULL AND absolute_episode IS NOT NULL \
+                 AND entry_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, show, absolute) = row?;
+                out.insert(id, (show, absolute));
+            }
+        }
+        Ok(out)
+    }
+
     /// Every episode `entry_id` belonging to each of the given show titles, one
     /// round trip, keyed by the title exactly as passed in.
     ///

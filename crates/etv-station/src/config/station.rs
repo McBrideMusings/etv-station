@@ -57,6 +57,15 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chronologies: Vec<String>,
 
+    /// Show arc files (#163): literal paths or globs, resolved like
+    /// `channels`. Each file declares one show's named absolute-episode
+    /// ranges; `group_by: season` buckets that show by arc and
+    /// `filter.seasons` accepts an arc's name. Arcs are station-wide: every
+    /// channel carrying the show sees them. An overlap, an interior gap, or
+    /// two files for one show fails the load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arcs: Vec<String>,
+
     /// Filesystem directories the daemon walks to populate the catalog when
     /// `catalog_path` is set — an operational choice about which parts of this
     /// deployment's disk the daemon is allowed to read. Empty (the default)

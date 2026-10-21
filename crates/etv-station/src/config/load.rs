@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::arcs::{self, Arcs};
 use super::block::BlockFile;
 use super::categories::{self, Categories};
 use super::channel::ChannelConfig;
@@ -9,6 +10,7 @@ use super::entry::{
     ChronologyEntry, CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry,
 };
 use super::overlay::{self, ChannelOverlays};
+use super::pool::GroupBy;
 use super::source::SourceConfig;
 use super::station::{self, StationConfig};
 use super::validate;
@@ -130,6 +132,7 @@ fn load_with(
 
     let categories = load_categories(station_path, &base, &station.categories)?;
     let chronologies = load_chronologies(station_path, &base, &station.chronologies)?;
+    let arcs = std::sync::Arc::new(load_arcs(station_path, &base, &station.arcs)?);
     let channel_paths = expand_channel_patterns(station_path, &base, &station.channels)?;
     let lineup = channel_paths.clone();
 
@@ -146,6 +149,7 @@ fn load_with(
             &channel_path,
             &categories,
             &chronologies,
+            &arcs,
             refs,
         ) {
             Ok(channel) => channels.push(channel),
@@ -205,12 +209,14 @@ fn load_one_channel(
     channel_path: &Path,
     categories: &Categories,
     chronologies: &Chronologies,
+    arcs: &std::sync::Arc<Arcs>,
     env: EnvLookup<'_>,
 ) -> Result<LoadedChannel, ConfigError> {
     let mut config: ChannelConfig = read_config_file(channel_path)?;
     resolve_blocks(&mut config, channel_path, env)?;
     expand_categories(&mut config, channel_path, categories)?;
     attach_chronologies(&mut config, channel_path, chronologies)?;
+    attach_arcs(&mut config, channel_path, arcs)?;
     validate::validate_channel(channel_path, &config)?;
     let name = resolve_identity(channel_path, &config)?;
     apply_station_variety(&mut config, station, &name);
@@ -277,6 +283,74 @@ fn load_chronologies(
         files.push((path, parsed));
     }
     Chronologies::from_files(files).map_err(invalid)
+}
+
+/// Read every arcs file the station's `arcs:` patterns name. A bad range, an
+/// overlap, a gap, or two files for one show fails the whole station load:
+/// arcs are station-wide, so there is no single channel to drop for it.
+fn load_arcs(station_path: &Path, base: &Path, patterns: &[String]) -> Result<Arcs, ConfigError> {
+    let invalid = |message: String| ConfigError::Validation {
+        path: station_path.to_path_buf(),
+        message,
+    };
+    let mut files = Vec::new();
+    for path in expand_channel_patterns(station_path, base, patterns)? {
+        let parsed = arcs::read_arc_file(&path).map_err(invalid)?;
+        files.push((path, parsed));
+    }
+    Arcs::from_files(files).map_err(invalid)
+}
+
+/// Hand the station's arcs (#163) to the places that read them, before the
+/// channel validates: every `group_by: season` pool, and every block filter
+/// whose `seasons` names an arc. An arc name no file declares drops the
+/// channel naming it. A station with no arcs attaches nothing, so every pool
+/// and filter behaves, and fingerprints, exactly as before arcs existed.
+fn attach_arcs(
+    config: &mut ChannelConfig,
+    channel_path: &Path,
+    arcs: &std::sync::Arc<Arcs>,
+) -> Result<(), ConfigError> {
+    let labels: Vec<String> = (0..config.rule.all_blocks().count())
+        .map(|idx| config.rule.block_label(idx))
+        .collect();
+    for (label, include) in labels.iter().zip(config.rule.all_blocks_mut()) {
+        if !arcs.is_empty() {
+            for pool in &mut include.pools {
+                if pool.group_by == GroupBy::Season {
+                    pool.arcs = Some(arcs.clone());
+                }
+            }
+        }
+        let Some(filter) = &mut include.filter else {
+            continue;
+        };
+        let wanted: Vec<String> = filter.arc_names().map(str::to_string).collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        for name in &wanted {
+            if !arcs.has_arc_named(name) {
+                let known = arcs.arc_names();
+                return Err(ConfigError::Validation {
+                    path: channel_path.to_path_buf(),
+                    message: if known.is_empty() {
+                        format!(
+                            "{label}: filter.seasons names the arc {name:?}, but no arcs are defined"
+                        )
+                    } else {
+                        format!(
+                            "{label}: filter.seasons names the arc {name:?}, which no show \
+                             declares; defined arcs: {}",
+                            known.join(", ")
+                        )
+                    },
+                });
+            }
+        }
+        filter.arcs = Some(arcs.clone());
+    }
+    Ok(())
 }
 
 /// Attach the named chronology to every `kind: chronology` entry of one
@@ -1397,6 +1471,7 @@ mod tests {
             channels: vec!["channels/a.yaml".into()],
             categories: Vec::new(),
             chronologies: Vec::new(),
+            arcs: Vec::new(),
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,
