@@ -25,8 +25,6 @@
 fn hooks() { ["bumper"] }
 fn capabilities() { ["probe", "read"] }
 
-fn trim_frames() { 2 }
-
 fn load_clips(ctx) {
     let name = ctx.config.manifest ?? "archival.json";
     let text = ctx.read(name);
@@ -45,6 +43,12 @@ fn load_clips(ctx) {
         if type_of(c) != "map" || type_of(c.path) != "string" || type_of(c.tags) != "array"
             || type_of(c.burned_in_text) != "bool" {
             throw "archival: manifest " + name + " clip " + n + " needs a string path, a tags array and a boolean burned_in_text";
+        }
+        for tag in c.tags {
+            if type_of(tag) != "string" { throw "archival: manifest " + name + " clip " + n + " has a tag that is not a string"; }
+        }
+        if c.minutes != () && type_of(c.minutes) != "i64" {
+            throw "archival: manifest " + name + " clip " + n + " has minutes that is not a whole number";
         }
         n += 1;
     }
@@ -92,12 +96,16 @@ fn build(ctx) {
     let c = ties.random(ctx.rng);
     if c == () { return t; }
 
+    let fps = ctx.config.fps ?? 30;
+    if (type_of(fps) != "i64" && type_of(fps) != "f64") || fps <= 0 {
+        throw "archival: config.fps must be a number above 0";
+    }
     let probed = ctx.probe(c.path);
     if probed == () || probed.duration_ms == () {
         log("archival: path=" + c.path + " skipped=unprobeable");
         return t;
     }
-    let trim = ((trim_frames() * 1000.0) / ((ctx.config.fps ?? 30) * 1.0)).round().to_int();
+    let trim = (2000.0 / (fps * 1.0)).round().to_int();
     let in_ms = trim;
     let out_ms = probed.duration_ms - trim;
     if out_ms - in_ms > ctx.gap_ms { out_ms = in_ms + ctx.gap_ms; }

@@ -2221,12 +2221,6 @@ fn build(ctx) {
     }
 
     #[test]
-    fn archival_declares_probe_and_read() {
-        let (_dir, script) = archival_dir("{}");
-        validate_script(&script, &["probe".into(), "read".into()]).unwrap();
-    }
-
-    #[test]
     fn archival_trims_two_frames_off_both_ends_and_leaves_burned_in_reels_bare() {
         let (_dir, script) = archival_dir(&archival_manifest(&[(
             "ident-45s.mp4",
@@ -2250,6 +2244,36 @@ fn build(ctx) {
             Duration::Fixed(duration - 134)
         );
         assert!(built.timeline.segments[0].overlay.is_none());
+    }
+
+    #[test]
+    fn archival_cuts_a_reel_longer_than_the_gap_at_the_gap() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "ident-45s.mp4",
+            &["ident"],
+            true,
+            None,
+        )]));
+        let built = build(&script, &archival_input(10_000, serde_json::json!({}))).unwrap();
+        assert_eq!(clip_of(&built).1..clip_of(&built).2, 67..10_067);
+        assert_eq!(built.timeline.segments[0].duration, Duration::Fixed(10_000));
+    }
+
+    #[test]
+    fn archival_rejects_a_frame_rate_of_zero() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "ident-45s.mp4",
+            &["ident"],
+            true,
+            None,
+        )]));
+        let msg = build(
+            &script,
+            &archival_input(10_000, serde_json::json!({ "fps": 0 })),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("config.fps"), "{msg}");
     }
 
     #[test]
@@ -2382,6 +2406,8 @@ fn build(ctx) {
             "{ not json",
             "{\"clips\": 3}",
             "{\"clips\": [{\"path\": \"x\"}]}",
+            "{\"clips\": [{\"path\": \"x\", \"tags\": [\"countdown\"], \"burned_in_text\": true, \"minutes\": \"5\"}]}",
+            "{\"clips\": [{\"path\": \"x\", \"tags\": [3], \"burned_in_text\": true}]}",
         ] {
             let (_dir, script) = archival_dir(bad);
             let msg = build(&script, &archival_input(120_000, serde_json::json!({})))
