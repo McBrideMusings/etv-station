@@ -2078,7 +2078,10 @@ fn build_error_card_item(
                         )],
                         audio: Vec::new(),
                         subtitle: Vec::new(),
-                        format_name: Some(String::from("mpegts")),
+                        // `ProbeResult::is_still_image` needs an image
+                        // container; "mpegts" here made the pipeline treat the
+                        // PNG as a video, skip `-loop 1`, and encode one frame.
+                        format_name: Some(String::from("png_pipe")),
                         duration_ms: Some(duration.whole_milliseconds() as u64),
                     }),
                 }),
@@ -2521,6 +2524,14 @@ mod error_card_tests {
                 assert_eq!(hint.video[0].codec, "png");
                 assert_eq!(hint.video[0].width, 1920);
                 assert_eq!(hint.video[0].height, 1080);
+                // The pipeline loops the card for the whole slot only when
+                // the probe it builds from this hint reads as a still image.
+                let probe = probe_hint_to_result(hint, path.clone());
+                assert!(
+                    probe.is_still_image(),
+                    "card hint must probe as a still image, got {:?}",
+                    probe.format_name
+                );
             }
             other => panic!("expected a Local card source, got {other:?}"),
         }
