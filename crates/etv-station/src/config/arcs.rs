@@ -202,6 +202,8 @@ fn parse_show(file: &ArcFile) -> Result<ShowArcs, String> {
 const MAX_EPISODE: i64 = 1_000_000;
 
 /// `"21-40"` or `"7"` to an inclusive `(first, last)`, both at least 1.
+/// `"21-"` runs to the end of the show, the way anibridge-mappings writes a
+/// show's last season.
 fn parse_range(text: &str) -> Result<(i64, i64), String> {
     let num = |s: &str| -> Result<i64, String> {
         s.trim()
@@ -213,6 +215,7 @@ fn parse_range(text: &str) -> Result<(i64, i64), String> {
             })
     };
     let (first, last) = match text.split_once('-') {
+        Some((a, b)) if b.trim().is_empty() => (num(a)?, MAX_EPISODE),
         Some((a, b)) => (num(a)?, num(b)?),
         None => {
             let n = num(text)?;
@@ -323,6 +326,15 @@ mod tests {
     }
 
     #[test]
+    fn an_open_ended_range_runs_to_the_end_of_the_show() {
+        let arcs = one(&[("A", "1-20"), ("B", "21-")]).unwrap();
+        assert_eq!(
+            arcs.bucket("Black Clover", 5000),
+            Some(ArcBucket::Named("B"))
+        );
+    }
+
+    #[test]
     fn a_repeated_arc_name_fails() {
         let err = one(&[("A", "1-5"), ("A", "6-9")]).unwrap_err();
         assert!(err.contains("used twice"), "{err}");
@@ -330,7 +342,7 @@ mod tests {
 
     #[test]
     fn a_malformed_range_fails_naming_the_arc() {
-        for bad in ["", "x", "0-5", "9-3", "1-", "1-9223372036854775807"] {
+        for bad in ["", "x", "0-5", "9-3", "-", "x-", "1-9223372036854775807"] {
             let err = one(&[("A", bad)]).unwrap_err();
             assert!(err.contains("arc \"A\""), "{bad:?}: {err}");
         }

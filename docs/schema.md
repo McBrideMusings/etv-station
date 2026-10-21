@@ -2439,8 +2439,22 @@ arcs:
   - { name: "Witch Queen",   episodes: "103-154" }
 ```
 
-`episodes` is `"first-last"`, or one number for a one-episode arc. Arcs are
-station-wide: every channel carrying the show sees them.
+`episodes` is `"first-last"`, or one number for a one-episode arc, or `"first-"`
+for an arc that runs to the end of the show. Arcs are station-wide: every
+channel carrying the show sees them.
+
+**Importing the ranges.** `etv-station import-arcs "Black Clover" --key
+anilist:97940 --out arcs/black-clover.yaml` writes the file from
+[anibridge/anibridge-mappings](https://github.com/anibridge/anibridge-mappings)
+(`--mappings <path>` reads a local `mappings.min.json` instead of downloading
+the published one). Each tvdb season (tmdb when the entry has no tvdb) becomes
+one arc, and the source has boundaries but no names, so every arc is called
+`Season N`: a placeholder to rename before committing. The header records the
+source, its schema version and its own `generated_on` date, so the same upstream
+data always writes the same file. A key the source does not know fails naming
+the show and the source. Overlaps and gaps in the source are written as
+published, with a warning in the header and on stderr, and the load rejects the
+file until a person fixes them.
 
 - **`group_by: season`** buckets an arc'd show by arc, so a `take: all` visit
   airs one arc end to end and the next visit moves on to the next arc. Episodes

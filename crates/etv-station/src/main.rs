@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -262,6 +263,31 @@ enum Command {
     /// query unreviewed, matched most of a curated set at 14-15% precision.
     /// One seed set per run — infer each distinct group separately.
     SuggestCategory(SuggestCategoryArgs),
+
+    /// Write a show's arc ranges (#163) from anibridge/anibridge-mappings (#171).
+    ///
+    /// The source has season boundaries and no names, so each arc is named
+    /// `Season N` as a placeholder for a person to replace before committing.
+    /// Overlaps and gaps in the source are written as published and reported.
+    ImportArcs(ImportArcsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ImportArcsArgs {
+    /// The show's exact Plex title, written as the file's `show:`.
+    show: String,
+
+    /// The upstream entry to read, as keyed in the source: `anilist:97940`.
+    #[arg(long, value_name = "KEY")]
+    key: String,
+
+    /// A local `mappings.min.json`, instead of downloading the published one.
+    #[arg(long, value_name = "PATH")]
+    mappings: Option<PathBuf>,
+
+    /// Write the arcs file here, instead of printing it.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -345,6 +371,10 @@ fn main() -> ExitCode {
 
     if let Some(Command::SuggestCategory(args)) = &cli.command {
         return suggest_category(cli.config.as_deref(), args);
+    }
+
+    if let Some(Command::ImportArcs(args)) = &cli.command {
+        return import_arcs(args);
     }
 
     // First, and before `--config` is even resolved: this is the one mode that
@@ -1608,6 +1638,71 @@ fn suggest_category(config_path: Option<&Path>, args: &SuggestCategoryArgs) -> E
         }
         Err(e) => fail(e.to_string()),
     }
+}
+
+fn import_arcs(args: &ImportArcsArgs) -> ExitCode {
+    let fail = |msg: String| {
+        eprintln!("import-arcs: {msg}");
+        ExitCode::from(1)
+    };
+    let (source, bytes) = match &args.mappings {
+        Some(path) => match std::fs::read(path) {
+            Ok(b) => (path.display().to_string(), b),
+            Err(e) => return fail(format!("reading {}: {e}", path.display())),
+        },
+        None => {
+            let url = etv_station::arcs_import::DEFAULT_SOURCE_URL;
+            let mut bytes = Vec::new();
+            let got = ureq::get(url)
+                .call()
+                .map_err(|e| e.to_string())
+                .and_then(|r| {
+                    r.into_reader()
+                        .take(256 << 20)
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| e.to_string())
+                });
+            if let Err(e) = got {
+                return fail(format!("downloading {url}: {e}"));
+            }
+            (url.to_string(), bytes)
+        }
+    };
+    let mappings: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("{source} is not JSON: {e}")),
+    };
+    if let Some(path) = &args.out {
+        let yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
+        if !yaml {
+            return fail(format!(
+                "--out {} must end in .yaml or .yml",
+                path.display()
+            ));
+        }
+    }
+    let imp = match etv_station::arcs_import::import(&args.show, &args.key, &source, &mappings) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    if let Some(err) = &imp.load_error {
+        eprintln!(
+            "import-arcs: wrote the source's ranges as published; the arcs loader rejects them: {err}"
+        );
+    }
+    match &args.out {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &imp.text) {
+                return fail(format!("writing {}: {e}", path.display()));
+            }
+            eprintln!("import-arcs: wrote {}", path.display());
+        }
+        None => print!("{}", imp.text),
+    }
+    ExitCode::SUCCESS
 }
 
 fn init_tracing(format: LogFormat) {
