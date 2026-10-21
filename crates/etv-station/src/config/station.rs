@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use ersatztv_channel::config::{FfmpegConfig, NormalizationConfig, VideoFormat};
@@ -200,6 +201,17 @@ pub struct StationConfig {
     #[serde(deserialize_with = "deserialize_normalization")]
     pub normalization: NormalizationConfig,
 
+    /// Named encoding pictures (#260). `active_profile` picks the one every
+    /// channel gets unless its own `ffmpeg_profile` names another. Empty means
+    /// `normalization.video` is used as written.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ffmpeg_profiles: BTreeMap<String, FfmpegProfile>,
+
+    /// The key of `ffmpeg_profiles` every channel encodes with by default.
+    /// Unset applies no profile. A key `ffmpeg_profiles` lacks fails the load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_profile: Option<String>,
+
     /// Station-wide guide settings; a channel's `guide:` overrides them.
     #[serde(default)]
     pub guide: StationGuide,
@@ -219,6 +231,82 @@ pub struct StationConfig {
     /// not a font fails the load. No font ships in the binary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fonts: Vec<PathBuf>,
+}
+
+/// One named encoding picture from `ffmpeg_profiles`. Each field set replaces
+/// the matching `normalization.video` field of every channel using the profile;
+/// a field left unset keeps the station's value.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FfmpegProfile {
+    /// `WIDTHxHEIGHT`, e.g. `1920x1080`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// Target video bitrate in kbps; the buffer is set to twice this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_bitrate: Option<u32>,
+    /// `h264` or `hevc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+}
+
+impl FfmpegProfile {
+    /// Checks every field parses; the error names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        self.parsed_resolution()?;
+        self.parsed_codec()?;
+        if let Some(depth) = self.bit_depth
+            && depth != 8
+            && depth != 10
+        {
+            return Err(format!("bit_depth {depth} must be 8 or 10"));
+        }
+        Ok(())
+    }
+
+    fn parsed_resolution(&self) -> Result<Option<(u32, u32)>, String> {
+        let Some(raw) = self.resolution.as_deref() else {
+            return Ok(None);
+        };
+        let bad = || format!("resolution {raw:?} must look like 1920x1080");
+        let (w, h) = raw.split_once('x').ok_or_else(bad)?;
+        let w: u32 = w.trim().parse().map_err(|_| bad())?;
+        let h: u32 = h.trim().parse().map_err(|_| bad())?;
+        if w == 0 || h == 0 {
+            return Err(bad());
+        }
+        Ok(Some((w, h)))
+    }
+
+    fn parsed_codec(&self) -> Result<Option<VideoFormat>, String> {
+        match self.video_codec.as_deref() {
+            None => Ok(None),
+            Some("h264") => Ok(Some(VideoFormat::H264)),
+            Some("hevc") => Ok(Some(VideoFormat::Hevc)),
+            Some(other) => Err(format!("video_codec {other:?} must be h264 or hevc")),
+        }
+    }
+
+    /// Writes this profile's fields over a `video` block. A profile that
+    /// failed [`Self::validate`] changes nothing it could not parse.
+    pub fn apply(&self, video: &mut ersatztv_channel::config::VideoNormalizationConfig) {
+        if let Ok(Some((w, h))) = self.parsed_resolution() {
+            video.width = Some(w);
+            video.height = Some(h);
+        }
+        if let Some(kbps) = self.video_bitrate {
+            video.bitrate_kbps = Some(kbps);
+            video.buffer_kbps = Some(kbps.saturating_mul(2));
+        }
+        if let Ok(Some(format)) = self.parsed_codec() {
+            video.format = Some(format);
+        }
+        if let Some(depth) = self.bit_depth {
+            video.bit_depth = Some(depth);
+        }
+    }
 }
 
 /// The station-level `guide:` block.

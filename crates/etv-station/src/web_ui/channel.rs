@@ -816,7 +816,7 @@ fn steps_json(steps: &[config::PatternStep]) -> Vec<Value> {
         .collect()
 }
 
-/// The channel's candidate set (entry ids and durations) as one digest. Not
+/// The channel's candidate set (entry ids with the item map a scorer reads) as one digest. Not
 /// the `channel_fingerprint` cache: that one is keyed on the channel file's
 /// mtime and would hide a catalog change; this one recomputes after
 /// [`CANDIDATE_DIGEST_LIFE`].
@@ -840,20 +840,27 @@ fn candidates_digest(
         Some(catalog),
     )
     .map_err(|e| e.to_string())?;
-    let entries = catalog.entries_for(&ids).map_err(|e| e.to_string())?;
-    let digest = projection::candidates_digest(
-        ids.into_iter()
-            .map(|id| {
-                let ms = entries.get(&id).and_then(|e| e.duration_ms);
-                (id, ms)
-            })
-            .collect(),
-    );
+    let digest = projection::candidates_digest(candidate_contents(catalog, ids)?);
     review.candidate_digests.insert(
         lc.config_path.clone(),
         (mtime, std::time::Instant::now(), digest.clone()),
     );
     Ok(digest)
+}
+
+/// Each id with the item map a scorer receives for it (`load_items`: every
+/// `entries` column and exposed tag namespace). Sharing that function means a
+/// column or namespace added to the scorer's view reaches the digest too.
+fn candidate_contents(
+    catalog: &Catalog,
+    ids: Vec<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let items = crate::score::load_items(catalog, &ids)?;
+    Ok(ids
+        .into_iter()
+        .zip(items)
+        .map(|(id, item)| (id, format!("{item:?}")))
+        .collect())
 }
 
 /// Whether a channel's candidates hold every movie or every episode in the
@@ -1375,6 +1382,30 @@ fn comparable_numbers(review: &Value) -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tag_change_changes_the_candidate_digest() {
+        use crate::catalog::{Entry, Source, TagNs};
+        let catalog = Catalog::open_in_memory().unwrap();
+        catalog
+            .upsert_entry(&Entry::new("m1", "movie", "Alien", Source::Plex))
+            .unwrap();
+        let ids = || vec!["m1".to_string()];
+        let digest =
+            |c: &Catalog| projection::candidates_digest(candidate_contents(c, ids()).unwrap());
+        let before = digest(&catalog);
+        assert_eq!(before, digest(&catalog));
+        catalog.add_tag("m1", TagNs::Genre, "Horror").unwrap();
+        let tagged = digest(&catalog);
+        assert_ne!(before, tagged);
+        catalog
+            .upsert_entry(&Entry {
+                year: Some(1979),
+                ..Entry::new("m1", "movie", "Alien", Source::Plex)
+            })
+            .unwrap();
+        assert_ne!(tagged, digest(&catalog));
+    }
 
     #[test]
     fn near_miss_series_id_is_labelled_with_the_show_name() {

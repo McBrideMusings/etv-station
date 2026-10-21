@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use super::overlay::OverlayDecl;
 use super::pool::ShowGroup;
 use super::rule::RuleConfig;
+use crate::account::AccountScope;
 use crate::guide::GuideConfig;
-use crate::tautulli::HistoryScope;
 
 /// The per-channel subtitle settings ETV-next reads from `channelN.json`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -115,6 +115,14 @@ pub struct ChannelConfig {
     /// that belong to one channel appear here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<ChannelSubtitle>,
+
+    /// A key of the station's `ffmpeg_profiles` (#260): the encoding picture
+    /// this channel uses instead of the station's `active_profile`. ETV-next
+    /// encodes one HLS session per channel, so the picture is a property of
+    /// the channel, never of a block inside it. An unknown key fails this
+    /// channel's load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_profile: Option<String>,
 
     /// How far ahead of live the schedule is materialized. This is also what
     /// bounds a single generation, whichever shape the channel is: a pattern
@@ -228,11 +236,8 @@ impl ChannelConfig {
     /// Whether any pool on this channel draws its items from a scorer plugin
     /// (#74) rather than from a CEL expression.
     ///
-    /// A `plugin:` is the only path by which anything reads the server's watch
-    /// history: the station hands it to a script as `ctx.history` and nothing
-    /// else consumes it. So a station of channels that all answer `false` here
-    /// has no reader for a watch history at all, and the daemon skips fetching
-    /// one (#131).
+    /// A `plugin:` is the only path by which anything reads `ctx.account_id`,
+    /// so a channel answering `false` here never resolves an account.
     pub fn uses_scorer_plugin(&self) -> bool {
         self.rule
             .all_blocks()
@@ -245,33 +250,25 @@ impl ChannelConfig {
         self.scoring.as_ref().is_some_and(|s| s.explain)
     }
 
-    /// Whose watch history this channel ranks against (#112).
+    /// Whose taste this channel ranks against (#112).
     ///
-    /// Also the key its history is cached under for the tick, so two channels
-    /// naming the same person share one `get_history` call and one catalog join
-    /// rather than each paying for their own — the same sharing #126 gave the
-    /// server-wide history, now per distinct scope instead of per station.
-    ///
-    /// A channel with no `scoring:` block at all is [`HistoryScope::AllUsers`]:
-    /// saying nothing has always meant the server-wide pool, and #112 does not
-    /// change what an existing config means.
-    pub fn history_scope(&self) -> HistoryScope {
+    /// A channel with no `scoring:` block at all is [`AccountScope::AllUsers`]:
+    /// saying nothing has always meant the server-wide pool.
+    pub fn account_scope(&self) -> AccountScope {
         match self.scoring.as_ref() {
             Some(s) => match (s.taste_scope, s.user.as_deref()) {
                 // Trimmed, because the surrounding whitespace would otherwise be
-                // sent as part of the name: `user: " carol "` reaches Tautulli
-                // as `user=+carol+`, matches no account, and returns an empty
-                // history that is indistinguishable from a quiet week.
+                // part of the name: `user: " carol "` matches no Plex account.
                 // `validate_taste_scope` only rejects an *entirely* blank value,
                 // so trimming has to happen here too.
-                (TasteScope::SingleUser, Some(u)) => HistoryScope::User(u.trim().to_string()),
+                (TasteScope::SingleUser, Some(u)) => AccountScope::User(u.trim().to_string()),
                 // `single_user` with no `user` is rejected by `config::validate`,
                 // so this arm is unreachable through a loaded config. Falling
                 // back to the server-wide pool rather than panicking keeps a
                 // hand-built `ScoringConfig` in a test from being a crash.
-                _ => HistoryScope::AllUsers,
+                _ => AccountScope::AllUsers,
             },
-            None => HistoryScope::AllUsers,
+            None => AccountScope::AllUsers,
         }
     }
 
@@ -321,30 +318,28 @@ pub struct ScoringConfig {
     #[serde(default = "default_nominal_item_secs")]
     pub nominal_item_secs: u32,
 
-    /// Whose watch history this channel's scorer ranks against (#112).
+    /// Whose taste this channel's scorer ranks against (#112).
     ///
     /// Defaults to [`TasteScope::AllUsers`], the server-wide aggregate #74
-    /// shipped: every Tautulli user's recent history pooled with no user
-    /// dimension. `single_user` narrows it to the one account named in
-    /// [`user`](Self::user).
+    /// shipped: every account pooled with no user dimension. `single_user`
+    /// narrows it to the one account named in [`user`](Self::user), which the
+    /// scorer receives as `ctx.account_id`.
     #[serde(default)]
     pub taste_scope: TasteScope,
 
-    /// The one account `taste_scope: single_user` ranks against — a Tautulli
-    /// username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is
-    /// is inferred, not configured: a value that parses as an integer is sent as
-    /// `user_id`, anything else as `user`.
+    /// The one account `taste_scope: single_user` ranks against — a Plex account
+    /// name (`"bob"`) or a Plex account id (`"1234567"`). Which one it is is
+    /// inferred, not configured: a value made only of digits is an id, anything
+    /// else a name.
     ///
     /// Required when `taste_scope` is `single_user` and rejected otherwise; both
     /// halves are enforced in `config::validate` so a typo fails at load rather
     /// than silently ranking against the whole server.
     ///
     /// `single_user` also requires `PLEX_URL` and `PLEX_TOKEN` on the daemon,
-    /// independently of how the catalog is ingested and of any scorer plugin's
-    /// `plexdb_reader` datastore: Tautulli's user id must be translated to a
-    /// Plex account id, and only Plex can confirm that mapping (the two ids
-    /// differ for the server owner and nobody else). `config::validate`
-    /// rejects the channel at load when either variable is missing.
+    /// independently of how the catalog is ingested: the account is looked up in
+    /// Plex's own `/accounts`. `config::validate` rejects the channel at load
+    /// when either variable is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
@@ -360,7 +355,7 @@ pub struct ScoringConfig {
     pub explain: bool,
 }
 
-/// Whose watch history a channel's scorer plugin sees (#112).
+/// Whose taste a channel's scorer plugin ranks against (#112).
 ///
 /// This is a property of the *channel*, not of the station: two channels on one
 /// station can rank against different people, which is the whole point of a
@@ -368,11 +363,11 @@ pub struct ScoringConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TasteScope {
-    /// Every user's history, pooled with no user dimension (#74). The default,
+    /// Every account, pooled with no user dimension (#74). The default,
     /// because it is what a station gets without saying anything.
     #[default]
     AllUsers,
-    /// One named account's history, and nobody else's.
+    /// One named account, and nobody else.
     SingleUser,
 }
 

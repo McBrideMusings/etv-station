@@ -311,7 +311,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
         on_short: Default::default(),
         constraints: None,
         config: None,
-        // The fixture scripts below never read `ctx.sets`/`ctx.history`, so no
+        // The fixture scripts below never read `ctx.sets`, so no
         // capability grant is needed (#167).
         capabilities: Vec::new(),
         datastores: Vec::new(),
@@ -325,6 +325,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
 /// logic.
 fn forwarding_sequencer_channel(sequencer: &Path, pool: Pool) -> ChannelConfig {
     ChannelConfig {
+        ffmpeg_profile: None,
         logo: None,
         temperature: None,
         subtitle: None,

@@ -715,6 +715,8 @@ temperature: 0                 # optional — every channel with no temperature:
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
 | `idle_grace_seconds` | no — default `90` | seconds a channel's worker stays warm after its last viewer leaves, so surfing back to it skips the cold start. Written into every `channelN.json`; ETV-next's worker reads it. `90` is also the floor — a smaller value is raised to it, because the overlay renderer exits after 60s without a reader and must stay under the worker's lifetime. A warm channel keeps its ffmpeg encoding for nobody, so raise it only as far as the encoder has headroom. |
+| `ffmpeg_profiles` | no | map of name → encoding picture — see [FFmpeg profiles](#ffmpeg-profiles) |
+| `active_profile` | no | the `ffmpeg_profiles` key every channel encodes with unless its own `ffmpeg_profile` names another; a key the map lacks fails the load |
 | `fonts` | no — default empty | font files, or directories whose `.ttf`, `.otf` and `.ttc` files all count, relative to this file's directory. Every overlay process registers every listed font, so a text layer's `font_family` can name any family they provide. A family no listed font provides renders in the OS sans-serif (resolved through fontconfig; the container's base image has Noto Sans and DejaVu). No font ships in the binary. A path that does not exist, or a file that is not a font, fails the station load with an error naming the path. |
 
 **How the three ingest modes are chosen.** At startup the daemon compares the
@@ -757,6 +759,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `tracks` | no | the channel level of the [track-selection](#track-selection) rules; blocks, pools and items refine it |
 | `subtitle` | no | `{ default_on: true \| false }` — announce this channel's subtitle track as `DEFAULT=YES`; unset leaves the station's `normalization.subtitle.default_on` |
+| `ffmpeg_profile` | no — inherits the station `active_profile` | a key of the station's `ffmpeg_profiles`; this channel encodes with that picture. A key the station lacks drops this channel from the lineup, with the key and this file named in the reason |
 | `hooks` | no — default empty | list of [event hooks](#event-hooks) scoped to this channel |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
 
@@ -1596,7 +1599,7 @@ fn hooks() { ["pool_provider"] }
 
 // Which host capabilities this script needs (#167). Read at the same time,
 // alongside hooks(). Omitting capabilities() declares none.
-fn capabilities() { ["catalog_read", "watch_history"] }
+fn capabilities() { ["catalog_read", "http"] }
 
 // Every catalog query this plugin reads, named. Run once, up front, so a
 // malformed expression fails before any ranking work.
@@ -1636,7 +1639,7 @@ pools:
     plugin: "../plugins/taste-cosine.rhai"
     sources:
       movies: 'item.type == "movie" && item.library == "4K Movies"'
-    capabilities: [catalog_read, watch_history]
+    capabilities: [catalog_read, http]
 ```
 
 Each key is a set name the script reads back as `ctx.sets.<name>`; each value is
@@ -1874,8 +1877,8 @@ neither one's `no_repeat_within` will notice. `only` and `exclude` cannot
 overlap, so the two are disjoint by construction.
 
 Watch state comes from the granted datastore's whole `plays` table
-(`watched_units_for`, plex-db-ex#60), not from `ctx.history`, which is the
-newest 1000 Tautulli rows and would call a film watched two years ago unseen.
+(`watched_units_for`, plex-db-ex#60), not from a Tautulli fetch, which is
+bounded to the newest 1000 rows and would call a film watched two years ago unseen.
 A pool with no `ctx.account_id` — a pooled channel — partitions on what the
 *house* has played, which is the closest true answer available to it; the
 script logs a `score.log` line saying so each generation. On a
@@ -2004,7 +2007,8 @@ history, so a share is the only scale-free test. Three pool `config:` keys:
 
 **A reason can be a watched title.** On a movies pool that sets `why`, the
 scorer also looks, once per generation, for the most recently watched movie in
-`ctx.history` that carries one of the pick's matched keywords (heaviest first).
+Tautulli's history (fetched through `ctx.http`, see `http` below) that carries
+one of the pick's matched keywords (heaviest first).
 That title competes as a reason on the share of the keyword that linked them
 (`Blade Runner`, then `neo-noir`), and `why_bridge` records who watched it
 (`watcher` is empty on a pooled history row that names nobody; `via` is the
@@ -2233,13 +2237,12 @@ Nothing is available to a script ambiently beyond `ctx.pool`, `ctx.config`,
 `ctx.target_count`, `ctx.now`, `ctx.recent`, `ctx.seed`, and `ctx.account_id`
 — the inputs every plugin pool receives with no declaration at all, plus the
 global `parse_json(text)`, which turns JSON text into maps and arrays (`null`
-becomes `()`). Three more are gated behind a declaration, and a fourth is
+becomes `()`). Two more are gated behind a declaration, and a third is
 opened only by name:
 
 | Capability | Gates | Declared as |
 |---|---|---|
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched; `ctx.entry_id_for(source, id)` — the `entry_id` the catalog filed under that `(source, source_id)` provenance row (`source` is `"plex"` or `"local_fs"`), or `()` when none matches, so a script joining its own external history (a Tautulli `rating_key`) resolves it without the daemon owning the join (ADR 0014) | `"catalog_read"` |
-| `watch_history` | `ctx.history` — recent server-wide watch events | `"watch_history"` |
 | `http` | `ctx.http(url, method, body)` — one HTTP call returning the response body as text; a 4xx/5xx, a transport failure or 10 seconds without a response is an error; one `pick()` call's `ctx.http` calls together may spend 30 seconds, after which each further call errors at once, naming the budget (ADR 0014) | `"http"` |
 | a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `tag_neighbours`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411; `tag_neighbours(kind, tag)` returns `[#{ tag, shared, df }]` — the tags co-occurring with `tag` on the plex-db-ex tag network, ordered by `shared` descending; read `shared` as `n["shared"]`, since `shared` is a reserved word in Rhai; etv-station-xm8p.2); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
 
@@ -2259,7 +2262,7 @@ below. The two sides must agree exactly:
 - A pool granting a capability the script never declares is refused at load,
   the other way round — a grant nobody asked for is a typo or a stale config,
   and silently ignoring it would hide either.
-- A script that reaches for `ctx.sets` or `ctx.history` without the matching
+- A script that reaches for `ctx.sets` or `ctx.http` without the matching
   capability declared and granted fails the `pick()` call the moment it reads
   the field, naming the capability. This is the one check that can only happen
   at run time, because the reach is a script call — `capabilities()` and
@@ -2269,17 +2272,16 @@ below. The two sides must agree exactly:
 
 `examples/plugins/taste-cosine.rhai` reads `ctx.sets` and reaches for a named
 datastore, so it declares
-`["catalog_read", "watch_history", #{ datastore: "taste" }]` (#254's interface
-list — `pick()` reads `ctx.history` only to name a watched title as a
-pick's reason, see `why` above); `examples/samples/foryou.yaml` grants
+`["catalog_read", "http", #{ datastore: "taste" }]` (#254's interface
+list — `pick()` reaches Tautulli through `ctx.http` only to name a watched
+title as a pick's reason, see `why` above); `examples/samples/foryou.yaml` grants
 all three on the one pool that points at it.
 
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
 `entries` plus genres / cast / labels / … as arrays; requires `catalog_read`),
 `ctx.pool` (the name of the pool asking, so one script can serve several pools
 of a channel with different judgment per pool), `ctx.target_count` (how many
-items the generation needs), `ctx.history` (recent server-wide watch events,
-`#{entry_id, watched_at}`; requires `watch_history`), `ctx.recent` (what this
+items the generation needs), `ctx.recent` (what this
 channel aired most recently, oldest first), `ctx.now` (unix seconds at
 generation time), `ctx.config` (this pool's `config:` block — see below),
 `ctx.seed` (the channel's resolved seed mixed with this pool's name — see
@@ -2336,12 +2338,11 @@ resolved to that generation, or unit `()` on a pooled (`all_users`) channel. A
 script tests presence with `ctx.account_id != ()`, the same idiom `ctx.config`
 lookups already use for an absent key.
 
-The plugin never resolves a username to an id itself — it has no Tautulli
-access and no accessor for the store's account table. The station already
-does: it narrows the same Tautulli fetch `ctx.history` comes from by exactly
-this account (`taste_scope: single_user`, `user:`), so handing the resolved id
-across is a value the station already holds, not work done on the script's
-behalf (ADR 0005's own test).
+The plugin never resolves a username to an id itself — it has no accessor for
+Plex's account list. The station does: it looks `user:` up in Plex's own
+`/accounts` (`taste_scope: single_user`), so handing the resolved id across is
+a value the station already holds, not work done on the script's behalf
+(ADR 0005's own test).
 
 `examples/plugins/taste-cosine.rhai` is what this exists for: it ranks against
 `ds.taste_vector_for(ctx.account_id)` when the id is present and
@@ -2353,7 +2354,7 @@ script receives it, whether or not the channel is `single_user`-scoped.
 
 ### The determinism contract
 
-A plugin must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — the same inputs the station itself is pure over. Nothing in `ctx` is optional to use instead of an ambient read: `ctx.now` is unix seconds at generation time, handed in precisely so a script never has to call the clock itself, and `ctx.history` / `ctx.recent` are the only watch/replay state a script sees. Rhai's own `timestamp()`/`elapsed()` are pure too as of #357 — they read a clock fixed to this generation's `window_start`, not the real wall clock, so two generations of the same channel see the same value and a script reading either produces the same schedule both times. A script ranking by anything else not reachable through `ctx` — an unordered iteration whose order Rhai does not guarantee, for instance — can still produce a different schedule from the same inputs, and the schedule still looks completely valid, so nothing errors and nothing on screen says which run is "right".
+A plugin must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)` — the same inputs the station itself is pure over. Nothing in `ctx` is optional to use instead of an ambient read: `ctx.now` is unix seconds at generation time, handed in precisely so a script never has to call the clock itself, and `ctx.recent` is the only replay state a script sees besides what it fetches through `ctx.http`. Rhai's own `timestamp()`/`elapsed()` are pure too as of #357 — they read a clock fixed to this generation's `window_start`, not the real wall clock, so two generations of the same channel see the same value and a script reading either produces the same schedule both times. A script ranking by anything else not reachable through `ctx` — an unordered iteration whose order Rhai does not guarantee, for instance — can still produce a different schedule from the same inputs, and the schedule still looks completely valid, so nothing errors and nothing on screen says which run is "right".
 
 `etv-station --check-determinism <channel>` generates the named channel twice from identical inputs (config, catalog snapshot, seed, and — the empty, stateless kind — resume state) and diffs the two resulting schedules. It reports identical, or the first airing position where they disagree and both entry ids there, so the failure names a place to start rather than a bare "not reproducible". It is a debug check, not part of normal generation.
 
@@ -2366,7 +2367,7 @@ language:
 
 **Search once, not once per item.** A loop over `ctx.sets.<name>` runs its body
 for every item in the set — on a real library that is tens of thousands of times.
-Anything inside it that walks `ctx.history` or `ctx.recent` looking for a match
+Anything inside it that walks a fetched history or `ctx.recent` looking for a match
 multiplies the two: 84,722 items against 1,000 watch rows and a 200-deep aired
 tail is about 101 million interpreted steps to choose four things, which measured
 at 6 minutes 34 seconds. Build a map keyed by `entry_id` **before** the loop and
@@ -2374,7 +2375,7 @@ read it inside:
 
 ```rhai
 let watched = #{};
-for event in ctx.history { watched[event.entry_id] = event.watched_at; }
+for event in history { watched[event.entry_id] = event.watched_at; }
 // …then inside the item loop: `let last = watched[item.entry_id];`
 ```
 
@@ -2619,19 +2620,22 @@ Five knobs sit on the channel, under `scoring:`, all optional:
 |---|---|---|
 | `recent_depth` | `200` | How many recently-aired entries reach `ctx.recent`. A channel with a deep library wants a long memory; a narrow one would starve on the same setting. `taste-cosine.rhai` damps a candidate against its position in this tail, so raising it lengthens how long an aired title stays suppressed and lowering it shortens that. |
 | `nominal_item_secs` | `1800` | Nominal seconds per item, used only to size `ctx.target_count`. A channel of half-hour episodes and one of three-hour films need different numbers to ask for a sensible amount. |
-| `taste_scope` | `all_users` | Whose watch history `ctx.history` carries. `all_users` pools every Tautulli account with no user dimension; `single_user` narrows it to the one account named in `user`. |
-| `user` | — | The account `single_user` follows: a Tautulli username (`"bob"`) or a numeric user id (`"1234567"`). Which one it is is inferred — a value made entirely of digits is sent as `user_id`, anything else as `user`. |
+| `taste_scope` | `all_users` | Whose taste the scorer ranks against. `all_users` pools every account with no user dimension; `single_user` narrows it to the one account named in `user`, which the scorer receives as `ctx.account_id`. |
+| `user` | — | The account `single_user` follows: a Plex account name (`"bob"`) or a Plex account id (`"1234567"`). Which one it is is inferred — a value made entirely of digits is an id, anything else a name; either must match an account in Plex's own `/accounts` listing exactly. |
 | `explain` | `false` | Show a one-line "why this was picked" explanation in the guide, built from each item's `metadata.audit` trail. Off by default; see below. |
 
 `target_count` is sized to **one chunk** (`chunk_hours`), not to the whole
 window — a generation lays the returned list end-to-end, so a hint covering 30
 days would push a single generation to materialize the whole month at once.
 
-Watch history comes from Tautulli, configured by the `TAUTULLI_URL` and
-`TAUTULLI_API_KEY` environment variables and never by tracked config. When
-either is unset or Tautulli is unreachable, `ctx.history` arrives empty and the
-generation proceeds — a script still has release dates, tags, and `ctx.recent`
-to rank on, so an outage degrades the ranking rather than stopping the channel.
+The station reads no watch history. A scorer that wants one fetches it itself
+through `ctx.http` (ADR 0014): a url may name `{{TAUTULLI_URL}}` and
+`{{TAUTULLI_API_KEY}}`, which the station fills from the environment so the
+script never holds the key, and the key goes only to the `TAUTULLI_URL` host
+(`{{PLEX_URL}}` and `{{PLEX_TOKEN}}` work the same way for Plex). When the
+variables are unset or Tautulli is unreachable the call errors, and
+`taste-cosine.rhai` logs that and ranks without the watched titles it would
+have cited.
 
 #### `taste_scope` — one channel per audience, not per user
 
@@ -2643,27 +2647,21 @@ to one `output_folder`. Two people means two channel files.
 `single_user` requires `user`, and `user` is rejected under `all_users` — both
 directions fail at load rather than at air, because both mistakes are silent
 otherwise. A `single_user` channel with nobody named would quietly fall back to
-the pooled history and rank a personal channel against everyone's viewing while
+the pooled taste and rank a personal channel against everyone's viewing while
 looking perfectly healthy.
 
 `single_user` also requires `PLEX_URL` and `PLEX_TOKEN` in the daemon's
 environment, whatever the catalog ingests from and whatever datastores a scorer
-plugin is granted. Tautulli's user id is translated to a Plex account id through
-Plex, because the two differ only for the server owner and only Plex can say
-which account that is. A missing variable fails at load.
+plugin is granted: `user` is looked up in Plex's own `/accounts` listing. A
+missing variable fails at load.
 
 What is *not* checked at load is whether the named account exists — that needs
-the network, and this is a config pass. Tautulli answers an unknown user with an
-empty history, which shows up at runtime as `rows=0` on that scope's
-`tautulli.history` log line.
-
-A channel with no scorer plugin stops there — `ctx.history` just arrives empty
-and the generation proceeds, same as an unreachable Tautulli (#74). A channel
-that names a scorer plugin goes further (#278): resolving `user` to the
-numeric id `ctx.account_id` carries needs that same live fetch, and a name
-that resolves to nobody fails that channel's generation loudly, naming the
-user, every tick until it is fixed — never a silent fall back to the pooled
-vector, which would make a channel called "For Pierce" rank against everyone's
+the network, and this is a config pass. A channel that names a scorer plugin
+resolves `user` to the numeric id `ctx.account_id` carries with a live Plex
+`/accounts` fetch at generation time (#278), and a `user` that matches no
+account's id or name fails that channel's generation loudly, naming the user,
+every tick until it is fixed — never a silent fall back to the pooled vector,
+which would make a channel called "For Pierce" rank against everyone's
 viewing while looking perfectly healthy. See `ctx.account_id` above.
 
 #### `explain` — why each item was picked
@@ -2712,18 +2710,18 @@ channel refreshing does not drag the pooled one along with it.
 A plugin declares the host inputs it needs with `capabilities()`; the channel
 config grants exactly that set on the pool that names the script (#167).
 Nothing is ambient — a pool that grants nothing gets a script with no
-`ctx.sets` and no `ctx.history`.
+`ctx.sets` and no `ctx.http`.
 
 ```yaml
 pools:
   - name: movies
     plugin: "../plugins/taste-cosine.rhai"
-    capabilities: [catalog_read, watch_history]
+    capabilities: [catalog_read, http]
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
-| `capabilities` | list of strings | the simple capabilities granted — `catalog_read`, `watch_history`, `http` |
+| `capabilities` | list of strings | the simple capabilities granted — `catalog_read`, `http` |
 | `datastores` | list of `{ name, path }` | named external stores granted, one entry per `#{ datastore: "name" }` the script declares |
 
 The check is **symmetric, and both directions fail the load**: a capability the
@@ -2747,7 +2745,7 @@ opened fails the load naming the datastore and the underlying error, rather
 than producing an empty pool that looks like a scheduling result. A station
 whose channels grant no datastore never opens one at all.
 
-Reaching for `ctx.sets` or `ctx.history` without the grant fails the `pick()`
+Reaching for `ctx.sets` or `ctx.http` without the grant fails the `pick()`
 call the moment the script reads the field, naming the capability — that one
 can only be caught at run time, because the reach is a script call.
 
@@ -3153,6 +3151,41 @@ List the `image: false` entry first. A block's entries go ahead of the inherited
 ones, so a block that lists only the `image: true` entry would burn a picture
 subtitle even in a file that also carries a text track the viewer could have
 switched off.
+
+### FFmpeg profiles
+
+```yaml
+# station.yaml
+ffmpeg_profiles:
+  quality: { resolution: 1920x1080, video_bitrate: 6000, video_codec: h264, bit_depth: 8 }
+  max:     { resolution: 1920x1080, video_bitrate: 10000 }
+  light:   { resolution: 1280x720,  video_bitrate: 4000 }
+active_profile: quality
+
+# a channel.yaml
+ffmpeg_profile: light      # this channel only
+```
+
+A profile is a named picture. Every field it sets replaces the same field of
+`normalization.video`; a field it leaves out keeps the station's value.
+
+| Profile key | Writes | Form |
+|---|---|---|
+| `resolution` | `video.width`, `video.height` | `WIDTHxHEIGHT` |
+| `video_bitrate` | `video.bitrate_kbps`, and `video.buffer_kbps` at twice it | kbps |
+| `video_codec` | `video.format` | `h264` or `hevc` |
+| `bit_depth` | `video.bit_depth` | `8` or `10` |
+
+A channel gets its own `ffmpeg_profile` if it names one, else the station's
+`active_profile`, else `normalization.video` as written. Flipping
+`active_profile` and restarting re-renders every `channelN.json` with the new
+picture.
+
+The choice is made per channel, never per block: ETV-next encodes one HLS
+session per channel from `channelN.json`, and a playout item carries no
+encoding field, so a block cannot change the picture mid-session (the same
+reason [`subtitle.default_on`](#subtitle-default_on) is a channel setting).
+There is no h264 `profile` key because ETV-next has no setting for it.
 
 ### Subtitle `default_on`
 

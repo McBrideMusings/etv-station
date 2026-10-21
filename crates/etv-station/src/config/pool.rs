@@ -623,7 +623,7 @@ pub struct Pool {
     pub config: Option<serde_json::Value>,
 
     /// Simple capabilities (#167) granted to this pool's `plugin` — currently
-    /// `"catalog_read"` and `"watch_history"`. Every capability the script's
+    /// `"catalog_read"`, `"http"` and `"entry_ids"`. Every capability the script's
     /// `capabilities()` declares must appear here (else the load fails,
     /// naming the plugin and the capability), and every name listed here must
     /// be one the script declares (else the load fails the other way,
@@ -975,9 +975,9 @@ sources:
 
     #[test]
     fn parses_capabilities_and_datastores() {
-        let yaml = "name: taste\nplugin: taste.rhai\ncapabilities: [catalog_read, watch_history]\ndatastores:\n  - name: taste_db\n    path: \"${TASTE_DB_PATH}\"\n";
+        let yaml = "name: taste\nplugin: taste.rhai\ncapabilities: [catalog_read, http]\ndatastores:\n  - name: taste_db\n    path: \"${TASTE_DB_PATH}\"\n";
         let pool: Pool = serde_norway::from_str(yaml).unwrap();
-        assert_eq!(pool.capabilities, vec!["catalog_read", "watch_history"]);
+        assert_eq!(pool.capabilities, vec!["catalog_read", "http"]);
         assert_eq!(pool.datastores.len(), 1);
         assert_eq!(pool.datastores[0].name, "taste_db");
         assert_eq!(pool.datastores[0].path, "${TASTE_DB_PATH}");

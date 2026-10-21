@@ -117,9 +117,9 @@ pub struct ResumeMap {
     /// has nothing to do with what anybody configured. A new title reaches the
     /// screen as the window extends, which is soon enough.
     ///
-    /// **Nor the watch history or the clock.** Generation is a pure function of
-    /// its inputs, but two of those inputs move on their own: a scorer plugin
-    /// reads `ctx.history` and `ctx.now`. So "nothing changed, therefore
+    /// **Nor the outside world or the clock.** Generation is a pure function of
+    /// its inputs, but some of those inputs move on their own: a scorer plugin
+    /// reads `ctx.now` and whatever it fetches through `ctx.http`. So "nothing changed, therefore
     /// regenerating is a no-op" holds for a plain query channel and does not
     /// hold for a taste-scored one, which is exactly why this gate is narrow.
     ///

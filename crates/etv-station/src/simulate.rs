@@ -13,8 +13,8 @@
 //! production, and the pattern engine's `advance: resume` and drained-pool
 //! refill run as they do on air. What is not modelled: file
 //! probing (an item's length is the catalog's `duration_ms`, or the channel's
-//! `nominal_item_secs` when the catalog has none), error cards, the Tautulli
-//! feed behind `ctx.history`, the station's identity roots and path index (a manual `local`
+//! `nominal_item_secs` when the catalog has none), error cards, the
+//! station's identity roots and path index (a manual `local`
 //! item keeps its own id), and a channel's `anchor` join on the first
 //! generation.
 //!
@@ -208,7 +208,6 @@ pub fn simulate_from(
             config_path,
             identity_roots: &[],
             path_index: None,
-            history: Default::default(),
             account_id,
             tz,
             now,

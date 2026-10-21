@@ -100,7 +100,7 @@ rule:
           plugin: "../plugins/taste-cosine.rhai"
           # taste-cosine.rhai declares all three (#167) — the pool must
           # grant exactly what it declares, or the channel fails to load.
-          capabilities: [catalog_read, watch_history]
+          capabilities: [catalog_read, http]
           datastores:
             - name: taste
               # Never a literal path in a committed config — expanded from

@@ -319,13 +319,14 @@ pub fn frontier_digest(
     ])
 }
 
-/// The channel's resolved candidate set as one digest: entry ids with their
-/// durations, in id order.
-pub fn candidates_digest(mut candidates: Vec<(String, Option<i64>)>) -> String {
+/// The channel's resolved candidate set as one digest: each entry id with
+/// the content a scorer reads off it (see `channel::candidates_digest`), in
+/// id order.
+pub fn candidates_digest(mut candidates: Vec<(String, String)>) -> String {
     candidates.sort();
     let text: String = candidates
         .iter()
-        .map(|(id, ms)| format!("{id}:{}\n", ms.map(|m| m.to_string()).unwrap_or_default()))
+        .map(|(id, content)| format!("{id}:{content}\n"))
         .collect();
     sha_hex(&[text.as_bytes()])
 }

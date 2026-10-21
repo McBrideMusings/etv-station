@@ -623,8 +623,11 @@ async function loadHealth() {
 }
 
 function drawHealth(d) {
-  const upstream = d.upstream
-    ? `<div class="error">ETV-next is unreachable or answered badly, so failure state is missing below.\nTried ${esc(d.upstream.url)}\n${esc(d.upstream.error)}</div>` : '';
+  const u = d.upstream;
+  const upstream = !u ? ''
+    : u.pending ? `<div class="muted">Reading ETV-next's failure state; the Failures column is blank until it answers. Reload in a moment.</div>`
+    : u.stale_secs != null ? `<div class="muted">ETV-next is slow to answer; the Failures column shows a reading ${esc(u.stale_secs)}s old.</div>`
+    : `<div class="error">ETV-next is unreachable or answered badly, so failure state is missing below.\nTried ${esc(u.url)}\n${esc(u.error)}</div>`;
   const expected = d.expected && d.expected.encoder
     ? `<p class="muted">Expected encoder: ${esc(d.expected.encoder)}${d.expected.vaapi_device ? ` on ${esc(d.expected.vaapi_device)}` : ''}.</p>`
     : `<p class="muted">No hardware encoder is configured (ETV_ACCEL), so every transcode counts as software.</p>`;
@@ -747,7 +750,7 @@ async function requestRender(channel, body, name) {
   panel.innerHTML = `${title}<div class="muted"><span class="spinner"></span>Queuing…</div>`;
   let id;
   try {
-    const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/graphics/render`, { method: 'POST', body: JSON.stringify(body) });
+    const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/graphics/render`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const data = await res.json();
     if (!res.ok && res.status !== 202) { fail(`HTTP ${res.status}: ${data.error || 'no error message'}`); return; }
     id = data.render;
@@ -1419,7 +1422,7 @@ const enc = encodeURIComponent;
 let poolsCtx = null;     // { channel, draft, data } for the Pools page on screen
 let poolsSeq = 0;        // a newer load supersedes an older one still waiting
 let poolsNotice = '';    // one line shown above the pools after a draft expired
-let accountsLoaded = null;  // GET /api/tautulli/users: the list, or null when Tautulli is not configured
+let accountsLoaded = null;  // GET /api/plex/accounts: the list, or null when Plex is not configured
 
 // A failed request is { error: 'HTTP <status>: <the server's error>', status }; anything else is the body.
 async function apiJson(method, path, body) {
@@ -1475,7 +1478,7 @@ async function loadPools(channel, draft) {
 
 async function loadAccounts() {
   if (accountsLoaded !== null) return accountsLoaded;
-  const data = await apiJson('GET', '/api/tautulli/users');
+  const data = await apiJson('GET', '/api/plex/accounts');
   accountsLoaded = data.error ? [] : data.results;
   return accountsLoaded;
 }
@@ -1570,7 +1573,7 @@ async function populateAccounts() {
   const users = await loadAccounts();
   const sel = $('acctSel');
   if (!sel) return;
-  for (const u of users) sel.insertAdjacentHTML('beforeend', `<option value="${esc(u.user_id)}">${esc(u.display_name)} (${esc(u.user_id)})</option>`);
+  for (const u of users) sel.insertAdjacentHTML('beforeend', `<option value="${esc(u.id)}">${esc(u.name)} (${esc(u.id)})</option>`);
 }
 
 function wirePools() {

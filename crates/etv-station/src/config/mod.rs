@@ -50,6 +50,6 @@ pub use pool::{
 pub use rule::{BlockInclude, RuleConfig};
 pub use schedule::{ClockRange, DateSpan, DayName, Schedule};
 pub use source::SourceConfig;
-pub use station::{StationConfig, StationGuide, derive_channel_seed};
+pub use station::{FfmpegProfile, StationConfig, StationGuide, derive_channel_seed};
 pub use tracks::TrackRules;
 pub use variety::{SeedSpec, TemperatureSpec};
