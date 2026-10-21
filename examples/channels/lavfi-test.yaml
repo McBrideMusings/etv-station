@@ -45,12 +45,16 @@ rule:
             description: "Standard SMPTE pattern for one minute with 880 Hz tone."
             categories: ["Test"]
 
+        # Small size and a low maxiter on purpose: ETV-next seeks into a lavfi
+        # source with -ss, which makes ffmpeg render every frame up to the seek
+        # point. At 1280x720 and the default maxiter that took 58s for an 84s seek,
+        # long enough to time out the first playlist request on a loaded machine.
         - kind: item
           in_point: "0s"
           out_point: "90s"
           source:
             kind: lavfi
-            params: "mandelbrot=size=1280x720:rate=30 [out0]; sine=frequency=220 [out1]"
+            params: "mandelbrot=size=320x180:rate=30:maxiter=200 [out0]; sine=frequency=220 [out1]"
           program:
             title: "Mandelbrot"
             description: "Animated mandelbrot zoom for 90 seconds with low tone."
