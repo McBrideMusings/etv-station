@@ -1,0 +1,34 @@
+# Config for tools/verify-reburst.sh: one channel (reburst/channel.yaml) looping a
+# 300s lavfi item, so a reburst can fire mid-item with no media or Plex. Output and
+# catalog sit beside, not on, station-test.yaml's, so the two never share state.
+# Run from the repo root: `output_base` resolves against the cwd, each `channels:`
+# entry against this file's directory.
+tz: "America/Chicago"
+
+output_base: examples/output-reburst
+
+channels:
+  - reburst/channel.yaml
+
+# Required key; lavfi needs no catalog contents.
+catalog_path: tmp/catalog-reburst.db
+
+catalog_refresh_secs: 86400
+
+normalization:
+  audio:
+    format: aac
+    bitrate_kbps: 192
+    buffer_kbps: 384
+    channels: 2
+    sample_rate_hz: 48000
+    normalize_loudness: false
+  video:
+    format: h264
+    bit_depth: 8
+    width: 1280
+    height: 720
+    bitrate_kbps: 2000
+    buffer_kbps: 4000
+  subtitle:
+    mode: convert

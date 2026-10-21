@@ -1,0 +1,23 @@
+number: 1
+name: reburst
+display_name: "Reburst Check"
+window_days: 1
+chunk_hours: 1
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "manual"
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "300s"
+          source:
+            kind: lavfi
+            params: "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+          program:
+            title: "Long Test Pattern"
+            description: "Five minutes of test pattern, long enough for a reburst to fire mid-item."
+            categories: ["Test"]

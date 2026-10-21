@@ -16,6 +16,7 @@ examples/etv-next/channel*.json
 # old checkout keeps showing up as untracked cruft if it isn't ignored too.
 examples/etv-next/presentation.json
 examples/output/
+examples/output-reburst/
 # Minted on first run beside the station config. Per-install, and the one value
 # a fresh clone must not inherit — a shared tuner id makes two people's servers
 # look like the same box to Plex.
