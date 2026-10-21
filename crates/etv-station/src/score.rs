@@ -500,12 +500,26 @@ pub fn missing_required_fns_from_ast(
     ast: &rhai::AST,
     hooks: &[String],
 ) -> Vec<&'static RequiredFn> {
-    let defined: Vec<&str> = ast.iter_functions().map(|f| f.name).collect();
     REQUIRED_HOOK_FNS
         .iter()
         .filter(|req| hooks.iter().any(|h| h == req.hook))
-        .filter(|req| !defined.contains(&req.name))
+        .filter(|req| !defines_required_fn(ast, req))
         .collect()
+}
+
+/// The first of [`REQUIRED_HOOK_FNS`] owed for the single hook `hook` that
+/// `ast` does not implement. Allocation-free sibling of
+/// [`missing_required_fns_from_ast`] for [`pick`], which runs once per pool per
+/// generation; both read the same table through [`defines_required_fn`].
+pub fn missing_required_fn_for(ast: &rhai::AST, hook: &str) -> Option<&'static RequiredFn> {
+    REQUIRED_HOOK_FNS
+        .iter()
+        .filter(|req| req.hook == hook)
+        .find(|req| !defines_required_fn(ast, req))
+}
+
+fn defines_required_fn(ast: &rhai::AST, req: &RequiredFn) -> bool {
+    ast.iter_functions().any(|f| f.name == req.name)
 }
 
 /// What walking one plugin script found: the hooks it declares, or the reason
@@ -665,13 +679,23 @@ pub fn join_offered(offered: &[&str]) -> String {
 /// throwing `capabilities()`, an entry that is neither a string nor a
 /// `#{ datastore: "name" }` map, an unknown string capability, a capability
 /// another hook offers, or a datastore entry with an empty or non-string name.
+///
+/// A convenience wrapper over [`compile_plugin`] +
+/// [`declared_capabilities_from_ast`]; a caller that already compiled the
+/// script for another inspection should call the latter with that `AST`.
 pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capability>, String> {
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
+    let ast = compile_plugin(script_path)?;
+    declared_capabilities_from_ast(&ast, script_path, hook)
+}
+
+/// [`declared_capabilities`], given a script already compiled by
+/// [`compile_plugin`] — `script_path` only names the script in errors.
+pub fn declared_capabilities_from_ast(
+    ast: &rhai::AST,
+    script_path: &Path,
+    hook: &str,
+) -> Result<Vec<Capability>, String> {
     let engine = engine();
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
 
     if !ast.iter_functions().any(|f| f.name == "capabilities") {
         return Ok(Vec::new());
@@ -679,7 +703,7 @@ pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capab
 
     let mut scope = Scope::new();
     let declared: Array = engine
-        .call_fn(&mut scope, &ast, "capabilities", ())
+        .call_fn(&mut scope, ast, "capabilities", ())
         .map_err(|e| format!("plugin {}: capabilities(): {e}", script_path.display()))?;
 
     let mut out = Vec::with_capacity(declared.len());
@@ -1733,14 +1757,13 @@ pub fn pick(
     }
 
     // The `pool_provider` contract functions (#389, ADR 0011, ADR 0013): read
-    // from `REQUIRED_HOOK_FNS` (via the shared `missing_required_fns_from_ast`,
+    // from `REQUIRED_HOOK_FNS` (via the shared `missing_required_fn_for`,
     // #408) so this and config-load validation can never disagree about what
     // is required. Checked here too, not only at config load
     // (`crate::config::validate`), because a unit fixture driving `pick`
     // directly bypasses load-time validation entirely. `ast` is already
     // compiled (from `cache`), so this adds no extra compile.
-    if let Some(req) = missing_required_fns_from_ast(ast, &[String::from("pool_provider")]).first()
-    {
+    if let Some(req) = missing_required_fn_for(ast, "pool_provider") {
         return Err(format!(
             "scorer plugin {} declares pool_provider but implements no \
              {} — {}",

@@ -916,8 +916,8 @@ fn validate_block_pools<'a>(
             // Checked last among this pool's plugin checks — it is the one
             // that reads the script off disk, so the cheaper structural checks
             // above get to report first when more than one thing is wrong.
-            validate_plugin_declares_pool_provider(pool, plugin, base_dir, bad)?;
-            validate_plugin_capabilities(pool, plugin, base_dir, bad)?;
+            let ast = validate_plugin_declares_pool_provider(pool, plugin, base_dir, bad)?;
+            validate_plugin_capabilities(pool, plugin, &ast, base_dir, bad)?;
         }
         // Refused rather than ignored: an `expr` or `groups` pool has no script
         // to hand sets to, so these expressions would never run, and a table of
@@ -993,11 +993,10 @@ fn validate_plugin_declares_pool_provider(
     plugin: &Path,
     base_dir: &Path,
     bad: &impl Fn(String) -> ConfigError,
-) -> Result<(), ConfigError> {
+) -> Result<rhai::AST, ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, plugin);
-    // One compile, shared by both inspections below (#408) — this used to
-    // compile the script once for `declared_hooks` and again for
-    // `missing_required_fns`.
+    // One compile, shared by both inspections below (#408) and handed back so
+    // the pool's capability check reads the same `AST`.
     let ast = crate::score::compile_plugin(&script_path)
         .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
     let hooks = crate::score::declared_hooks_from_ast(&ast, &script_path)
@@ -1031,7 +1030,7 @@ fn validate_plugin_declares_pool_provider(
             req.why
         )));
     }
-    Ok(())
+    Ok(ast)
 }
 
 /// A block's `align:` / `min_fill:` / `fill:` (the align/fill pass): the grid
@@ -1108,12 +1107,14 @@ fn validate_fill(
 fn validate_plugin_capabilities(
     pool: &Pool,
     plugin: &Path,
+    ast: &rhai::AST,
     base_dir: &Path,
     bad: &impl Fn(String) -> ConfigError,
 ) -> Result<(), ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, plugin);
-    let capabilities = crate::score::declared_capabilities(&script_path, "pool_provider")
-        .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
+    let capabilities =
+        crate::score::declared_capabilities_from_ast(ast, &script_path, "pool_provider")
+            .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
 
     for cap in &pool.capabilities {
         let offered = crate::score::offered_capabilities("pool_provider");
@@ -2766,15 +2767,9 @@ fn audit(ctx, picks, workspace) { #{} }"#,
         .unwrap();
     }
 
-    /// #408: `validate_plugin_declares_pool_provider` used to compile the
-    /// script twice — once inside `declared_hooks`, again inside
-    /// `missing_required_fns` — because it ran the hook check and the
-    /// required-function check as two separate calls each reading and
-    /// compiling the file. It now compiles once and shares the `AST` between
-    /// both. (Not routed through the whole-channel `validate_plugin_script`
-    /// helper — `validate_plugin_capabilities`, the pool's other plugin
-    /// check, does its own separate compile via `declared_capabilities` and
-    /// is out of this fix's scope, so it would inflate the count here.)
+    /// #408: validating a pool's plugin compiles its script once, not once per
+    /// inspection (hooks, required functions, capabilities). Driven through
+    /// the whole-channel path so every plugin check the pool runs is counted.
     #[test]
     fn validating_one_plugin_script_compiles_it_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -2782,17 +2777,16 @@ fn audit(ctx, picks, workspace) { #{} }"#,
         std::fs::write(
             &script,
             r#"fn hooks() { ["pool_provider"] }
+fn capabilities() { ["catalog_read"] }
 fn audit(ctx, picks, workspace) { #{} }"#,
         )
         .unwrap();
-        let pool = plugin_pool("shows", script.clone());
-        let bad = |message: String| ConfigError::Validation {
-            path: dir.path().join("channel.yaml"),
-            message,
-        };
+        let mut pool = plugin_pool("shows", script);
+        pool.capabilities = vec!["catalog_read".to_string()];
+        let channel = channel_with(vec![pattern_block(vec![pool], vec![step("shows", 1)])]);
 
         let compiles = crate::score::test_support::count_compiles(|| {
-            validate_plugin_declares_pool_provider(&pool, &script, dir.path(), &bad).unwrap();
+            validate_channel(&dir.path().join("channel.yaml"), &channel).unwrap();
         });
         assert_eq!(
             compiles, 1,
