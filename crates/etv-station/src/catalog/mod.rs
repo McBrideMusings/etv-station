@@ -845,6 +845,43 @@ impl Catalog {
         Ok(ids)
     }
 
+    /// Every non-episode entry whose title is `title`, case-insensitively, in
+    /// id order — the year-less counterpart of [`Self::entry_ids_by_title_year`].
+    pub fn entry_ids_by_title(&self, title: &str) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT entry_id FROM entries
+              WHERE title = ?1 COLLATE NOCASE AND type != 'episode'
+              ORDER BY entry_id",
+            params![title],
+        )
+    }
+
+    /// How many non-episode entries the catalog holds — the corpus a tag's
+    /// frequency is measured against.
+    pub fn non_episode_count(&self) -> Result<i64, CatalogError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE type != 'episode'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// How many non-episode entries carry `value` in tag namespace
+    /// `namespace`, matched ASCII-case-insensitively.
+    pub fn non_episode_count_with_tag(
+        &self,
+        namespace: TagNs,
+        value: &str,
+    ) -> Result<i64, CatalogError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(DISTINCT t.entry_id) FROM tags t
+               JOIN entries e ON e.entry_id = t.entry_id
+              WHERE t.namespace = ?1 AND t.value = ?2 COLLATE NOCASE AND e.type != 'episode'",
+            params![namespace.as_str(), value],
+            |r| r.get(0),
+        )?)
+    }
+
     /// The `entry_id` a `(source, source_id)` provenance row resolves to, if any.
     /// Used to map a Plex `ratingKey` back to its catalog entry — e.g. resolving
     /// a collection's members to entry ids.

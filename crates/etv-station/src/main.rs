@@ -254,6 +254,33 @@ enum Command {
     /// A script that fails is an error here, not the black card the generator
     /// substitutes: a preview exists to show the author what went wrong.
     BumperPreview(BumperPreviewArgs),
+
+    /// Rank the catalog tags a set of example titles share and print them as a
+    /// category file (#175), for a person to read, cut and freeze.
+    ///
+    /// A suggestion, never a finished category: the same output, built into a
+    /// query unreviewed, matched most of a curated set at 14-15% precision.
+    /// One seed set per run — infer each distinct group separately.
+    SuggestCategory(SuggestCategoryArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct SuggestCategoryArgs {
+    /// Example titles, each `Title` or `Title (Year)`. At least two.
+    #[arg(required = true, num_args = 1..)]
+    seeds: Vec<String>,
+
+    /// Name written into the emitted category.
+    #[arg(long, default_value = "suggested")]
+    name: String,
+
+    /// Candidates kept per tag namespace.
+    #[arg(long, value_name = "N", default_value_t = 15)]
+    top: usize,
+
+    /// Catalog database to read, instead of the station config's `catalog_path`.
+    #[arg(long, value_name = "PATH")]
+    catalog: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -314,6 +341,10 @@ fn main() -> ExitCode {
 
     if let Some(Command::BumperPreview(args)) = &cli.command {
         return bumper_preview(cli.config.as_deref(), args);
+    }
+
+    if let Some(Command::SuggestCategory(args)) = &cli.command {
+        return suggest_category(cli.config.as_deref(), args);
     }
 
     // First, and before `--config` is even resolved: this is the one mode that
@@ -1553,6 +1584,30 @@ fn open_preview_catalog(config_path: &Path) -> Result<Catalog, String> {
         )
     })?;
     Catalog::open_readonly(&path).map_err(|e| format!("opening catalog {path}: {e}"))
+}
+
+fn suggest_category(config_path: Option<&Path>, args: &SuggestCategoryArgs) -> ExitCode {
+    let fail = |msg: String| {
+        eprintln!("suggest-category: {msg}");
+        ExitCode::from(1)
+    };
+    let catalog = match (&args.catalog, config_path) {
+        (Some(path), _) => Catalog::open_readonly(path)
+            .map_err(|e| format!("opening catalog {}: {e}", path.display())),
+        (None, Some(config)) => open_preview_catalog(config),
+        (None, None) => Err("pass --catalog or --config".to_string()),
+    };
+    let catalog = match catalog {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    match etv_station::suggest::suggest(&catalog, &args.seeds, args.top) {
+        Ok(s) => {
+            print!("{}", etv_station::suggest::render(&s, &args.name));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e.to_string()),
+    }
 }
 
 fn init_tracing(format: LogFormat) {
