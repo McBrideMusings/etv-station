@@ -14,6 +14,11 @@
 # every pool's own `datastores: [{ path: "${PLEXDB_SNAPSHOT_PATH}" }]` resolve to
 # it instead of the production mount .env normally points it at.
 #
+# --ui-private-catalog makes the UI serve a migrated copy (catalog.db.ui-copy)
+# of that cache, so a checkout whose schema is ahead of prod's still answers;
+# the cache itself stays at the host's schema, which is what taste-cache.sh
+# compares.
+#
 # STATION_UI_CONFIG picks another lineup (default deploy/appdata/station.yaml,
 # e.g. `STATION_UI_CONFIG=examples/station.yaml`). Extra arguments pass through,
 # e.g. `--ui-port N` for another port.
@@ -38,4 +43,5 @@ export PLEXDB_SNAPSHOT_PATH="$CACHE_DIR/plexdb.snapshot.db"
 # "Compiling ..." lines are the only sign in the task log that it isn't hung.
 echo "station-ui: building release binary (minutes on a cold target/, seconds after)..." >&2
 exec cargo run --release --bin etv-station -- \
-  --config "${STATION_UI_CONFIG:-deploy/appdata/station.yaml}" --serve-ui --ui-plugins-dir examples/plugins "$@"
+  --config "${STATION_UI_CONFIG:-deploy/appdata/station.yaml}" --serve-ui --ui-private-catalog \
+  --ui-plugins-dir examples/plugins "$@"

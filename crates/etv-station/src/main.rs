@@ -235,6 +235,13 @@ struct Cli {
     /// at this checkout's `examples/plugins/` to tune an in-development script.
     #[arg(long, requires = "serve_ui", value_name = "DIR")]
     ui_plugins_dir: Option<PathBuf>,
+
+    /// Serve a private, migrated copy of the catalog (`<catalog>.ui-copy`)
+    /// instead of the file itself, so a catalog fetched from a host running an
+    /// older release still answers. `tools/station-ui.sh` sets it; the
+    /// container, whose daemon owns and migrates its catalog, does not.
+    #[arg(long, requires = "serve_ui")]
+    ui_private_catalog: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -361,7 +368,13 @@ fn main() -> ExitCode {
 
     if cli.serve_ui {
         init_tracing(cli.log_format);
-        return serve_ui(config, cli.ui_bind, cli.ui_port, cli.ui_plugins_dir);
+        return serve_ui(
+            config,
+            cli.ui_bind,
+            cli.ui_port,
+            cli.ui_plugins_dir,
+            cli.ui_private_catalog,
+        );
     }
 
     if let Some(channel) = cli.check_determinism.as_deref() {
@@ -671,6 +684,7 @@ fn serve_ui(
     bind: std::net::IpAddr,
     port: u16,
     plugins_dir: Option<PathBuf>,
+    private_catalog: bool,
 ) -> ExitCode {
     let station = match config::load_for_inspection(config_path) {
         Ok(s) => s,
@@ -687,9 +701,27 @@ fn serve_ui(
         );
         return ExitCode::FAILURE;
     };
+    let mut catalog = PathBuf::from(catalog);
+    if private_catalog {
+        match etv_station::catalog::Catalog::migrated_copy(&catalog) {
+            Ok(copy) => {
+                tracing::info!(
+                    event = "ui.private_catalog",
+                    source = %catalog.display(),
+                    copy = %copy.display(),
+                    "serving a migrated private copy of the catalog"
+                );
+                catalog = copy;
+            }
+            Err(err) => {
+                tracing::error!(event = "ui.config_error", error = %err, "failed to copy and migrate the catalog");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let options = etv_station::web_ui::Options {
         station: config_path.to_path_buf(),
-        catalog: PathBuf::from(catalog),
+        catalog,
         plugins_dir,
         bind,
         port,
