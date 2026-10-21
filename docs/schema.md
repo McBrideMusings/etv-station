@@ -1960,27 +1960,48 @@ The wording lives in the channel file, so each block says it its own way:
     why_random_detail: "picked at random" # under it (this is the default)
 ```
 
-A pool that sets `why` writes two keys into each pick's playout `metadata`:
-`why`, the line, and `why_detail`, the text under it. A ranked pick's detail
-is its two heaviest matching keywords joined with ` · `, with ` film` and
-` television series` trimmed off and any keyword over three words skipped
-(`comedy · drama`); an exploration draw's is `why_random_detail`. A pool that
-sets no `why` writes neither. The station carries both keys through untouched
-and never reads them; `deploy/appdata/shared/corner-sequence.rhai` is one
-overlay that draws them.
+A pool that sets `why` writes these keys into each pick's playout `metadata`
+(a pool that sets no `why` writes none). The station carries them through
+untouched and never reads them:
+
+| Key | Holds |
+|---|---|
+| `why` | the lead phrase |
+| `why_reasons` | the bare labels chosen to follow it, largest share first |
+| `why_candidates` | every reason that qualified, chosen or not: `{ label, kind, share }` |
+| `why_bridge` | `{ title, year, watcher, via }`, only when the watched title is among the chosen reasons |
+
+`deploy/appdata/shared/corner-sequence.rhai` is one overlay that draws them: it
+joins `why_reasons` with its `why_joiner` config (default ` · `) and never
+inspects a kind. An exploration draw's `why_reasons` is
+`[why_random_detail]` and it has no `why_candidates`.
+
+**Which reasons qualify.** A ranked pick's reasons are its matching keywords
+(` film` and ` television series` trimmed off, any keyword over three words
+skipped) and, on a movies pool, one watched title (below). Each reason's
+**share** is its part of the pick's own matched weight, never a raw weight:
+the taste vector is an unnormalised running total that grows with watch
+history, so a share is the only scale-free test. Three pool `config:` keys:
+
+- `why_min_share` (default `0.10`): the smallest share a reason needs. 0.10 is
+  the highest value at which the three For You pools still agree; from 0.15 up
+  one pool goes silent on a quarter of its picks.
+- `why_max_reasons` (default `3`): the most reasons shown. When more qualify,
+  a weighted draw seeded by `ctx.seed`, the pick's id and the labels keeps
+  that many, so regenerating a window with the same seed reads the same.
+- `why_min_score` (default `0`, off): a pick whose base score is below this has
+  no `why` or `why_reasons` at all (`why_candidates` stays as evidence). A pick
+  with no qualifying reason is silent the same way.
 
 **A reason can be a watched title.** On a movies pool that sets `why`, the
 scorer also looks, once per generation, for the most recently watched movie in
 `ctx.history` that carries one of the pick's matched keywords (heaviest first).
-When one exists, `why_detail` leads with that title and follows with the
-keyword that linked them (`Blade Runner · neo-noir`), and the pick's metadata gains
-`why_bridge`: `{ title, year, watcher, via }`, where `watcher` is who watched
-it (empty on a pooled history row that names nobody) and `via` the shared
-keyword. A channel that wants to say the name reads `why_bridge.watcher`; one
-that doesn't ignores it. A watch qualifies only inside `bridge_window_days`
-(pool `config:`, default `30`). A pick with no qualifying title, an
-exploration draw, and a title that would cite itself keep the keyword detail
-and carry no `why_bridge`. The overlay is unchanged.
+That title competes as a reason on the share of the keyword that linked them
+(`Blade Runner`, then `neo-noir`), and `why_bridge` records who watched it
+(`watcher` is empty on a pooled history row that names nobody; `via` is the
+shared keyword). A watch qualifies only inside `bridge_window_days` (pool
+`config:`, default `30`). An exploration draw and a title that would cite
+itself carry no bridge.
 
 #### `ignore_keywords` — tags that describe packaging, not subject
 

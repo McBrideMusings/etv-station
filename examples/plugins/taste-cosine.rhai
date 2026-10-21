@@ -1447,7 +1447,7 @@ fn pick(ctx) {
 
     for b in blocks {
         let stage = stages[b.uid];
-        let why = on_screen_why(ctx, stage);
+        let why = on_screen_why(ctx, b.uid, stage);
         for id in b.ids {
             // The score, the specific on-profile keywords behind it, and
             // whether this slot came from the ranking or the seeded surprise
@@ -1468,9 +1468,12 @@ fn pick(ctx) {
                 source: stage.source,
             };
             if why != () {
-                metadata.why = why.line;
-                metadata.why_detail = why.detail;
-                if why.bridge != () { metadata.why_bridge = why.bridge; }
+                if why.candidates.len > 0 { metadata.why_candidates = why.candidates; }
+                if why.line != () {
+                    metadata.why = why.line;
+                    metadata.why_reasons = why.reasons;
+                    if why.bridge != () { metadata.why_bridge = why.bridge; }
+                }
             }
             out.push(#{ entry_id: id, metadata: metadata });
             // Keyed by the EMITTED entry_id, since audit() is handed the
@@ -1504,37 +1507,39 @@ fn top_keywords(words, weights, n) {
     out
 }
 
-// A short on-screen reason for a pick, for an overlay to draw — or () when
-// the pool asks for none. Written into the pick's metadata as `why` (the
-// line) and `why_detail` (the keywords under it); the station carries both
-// to the playout JSON untouched and never reads them.
-//
-// The wording is the pool's, from its `config:` block, so a channel phrases
-// each block its own way and this script holds no viewer-facing copy:
-//
-//   why                 the line for a ranked pick ("Nobody here has seen it")
-//   why_random          the line for an exploration draw (default: `why`)
-//   why_random_detail   what sits under it (default "picked at random")
-//
-// A ranked pick's detail is its two heaviest matching keywords, shortened:
-// " film" and " television series" come off the end, and a keyword longer
-// than three words is skipped — the long TMDB phrases ("laugh out loud
-// relationship entanglement") read as noise at a glance.
-//
-// When a watched title bridges to the pick (#319), the detail is that title
-// then the keyword that linked them (`via`), and the pick also carries
-// `why_bridge` (title, year, watcher, via) for a channel that names who watched.
-fn on_screen_why(ctx, stage) {
-    let line = ctx.config["why"];
-    if line == () { return (); }
-    if stage.draw == "exploration" {
-        let random = ctx.config["why_random"];
-        let detail = ctx.config["why_random_detail"];
-        return #{
-            line: if random == () { line } else { random },
-            detail: if detail == () { "picked at random" } else { detail },
-        };
+// The smallest share of a pick's own matched weight a reason needs to be
+// shown (#320). A share, never a raw weight: the taste vector is an
+// unnormalised running total that grows with how much an account has
+// watched, so any absolute threshold would drift as history accumulates.
+// 0.10 is the highest value at which the three For You pools still agree
+// (measured on the live catalog); from 0.15 up, one pool goes silent on a
+// quarter of its picks while another stays at 0.2%.
+fn why_min_share(ctx) { tunable(ctx, "why_min_share", 0.10).to_float() }
+
+// The most reasons one why line names.
+fn why_max_reasons(ctx) { tunable(ctx, "why_max_reasons", 3).to_int() }
+
+// A pick whose base score is below this shows no why line at all: a single
+// weak match takes 100% of a thin score, so the share test alone would let a
+// barely-related pick state a confident reason. Zero disables the floor.
+fn why_min_score(ctx) { tunable(ctx, "why_min_score", 0.0).to_float() }
+
+// A keyword shortened for the screen: " film" and " television series" come
+// off the end, and a keyword longer than three words comes back as ().
+fn short_label(k) {
+    let k = k;
+    for suffix in [" television series", " tv series", " film"] {
+        if k.ends_with(suffix) { k = k.sub_string(0, k.len - suffix.len); }
     }
+    if k.split(" ").len > 3 || k == "" { () } else { k }
+}
+
+// Every reason that clears `why_min_share` of the pick's matched weight,
+// largest share first, a title before a keyword and then by label on a tie: `#{ label, kind, share }`. Keywords and
+// a bridging watched title compete on the same footing; a title takes the
+// share of the keyword that linked it. Pure arithmetic on the stage — no
+// randomness — so the same stage always yields the same set.
+fn why_candidates(ctx, stage) {
     let words = [];
     let weights = [];
     for i in 0..stage.on_profile.len {
@@ -1545,37 +1550,118 @@ fn on_screen_why(ctx, stage) {
         words.push(stage.on_favor[i].split("\x01")[1]);
         weights.push(stage.on_favor_w[i]);
     }
-    let short = [];
-    for k in top_keywords(words, weights, words.len) {
-        if short.len >= 2 { break; }
-        let k = k;
-        for suffix in [" television series", " tv series", " film"] {
-            if k.ends_with(suffix) { k = k.sub_string(0, k.len - suffix.len); }
-        }
-        if k.split(" ").len > 3 || k == "" || short.contains(k) { continue; }
-        short.push(k);
-    }
-    // A watched title, when one bridges to this pick, leads the detail and
-    // the heaviest keyword follows: still two reasons on screen, and the
-    // overlay joins them without asking which is which. `why_bridge` carries
-    // who watched it for a channel that wants to say so.
+    let total = 0.0;
+    for w in weights { total += w; }
+    if total <= 0.0 { return []; }
+    let min_share = why_min_share(ctx);
+    let found = [];
+    let seen = #{};
+    let via_share = 0.0;
     let bridge = stage.bridge;
-    let shown = [];
-    if bridge != () { shown.push(bridge.title); }
-    if bridge != () {
-        if bridge.via.split(" ").len <= 3 { shown.push(bridge.via); }
-    } else {
-        for k in short {
-            if shown.len >= 2 { break; }
-            shown.push(k);
+    for k in top_keywords(words, weights, words.len) {
+        let share = 0.0;
+        for i in 0..words.len {
+            if words[i] == k { share += weights[i] / total; }
         }
+        if bridge != () && bridge.via == k { via_share = share; }
+        let label = short_label(k);
+        if label == () || seen.contains(label) || share < min_share { continue; }
+        seen[label] = true;
+        found.push(#{ label: label, kind: "keyword", share: share });
     }
-    let detail = "";
-    for i in 0..shown.len {
-        if i > 0 { detail += " · "; }
-        detail += shown[i];
+    if bridge != () && via_share >= min_share && !seen.contains(bridge.title) {
+        found.push(#{ label: bridge.title, kind: "title", share: via_share });
     }
-    #{ line: line, detail: detail, bridge: bridge }
+    found.sort(|a, b| {
+        if a.share > b.share { -1 } else if a.share < b.share { 1 }
+        else if a.kind != b.kind { if a.kind == "title" { -1 } else { 1 } }
+        else if a.label < b.label { -1 } else if a.label > b.label { 1 }
+        else { 0 }
+    });
+    found
+}
+
+// Which of the qualifying reasons are shown: all of them up to the maximum,
+// else a seeded weighted draw without replacement (each reason keyed by
+// ln(u)/share, the largest keys win), shown in share order. The draw depends
+// on the channel seed and the pick's own id and labels only, so a window
+// regenerated with the same seed reads the same, and it is made here, once,
+// at pick time — the overlay script runs every frame with no seed.
+fn why_choose(ctx, uid, found) {
+    let max = why_max_reasons(ctx);
+    if found.len <= max { return found; }
+    let keyed = [];
+    for r in found {
+        let u = unit_at(ctx.seed, hash_str(uid + "\x01" + r.label));
+        if u < 0.000001 { u = 0.000001; }
+        keyed.push(#{ key: u.ln() / r.share, reason: r });
+    }
+    keyed.sort(|a, b| {
+        if a.key > b.key { -1 } else if a.key < b.key { 1 }
+        else if a.reason.label < b.reason.label { -1 } else { 1 }
+    });
+    let chosen = [];
+    for i in 0..max { chosen.push(keyed[i].reason); }
+    chosen.sort(|a, b| {
+        if a.share > b.share { -1 } else if a.share < b.share { 1 }
+        else if a.kind != b.kind { if a.kind == "title" { -1 } else { 1 } }
+        else if a.label < b.label { -1 } else if a.label > b.label { 1 }
+        else { 0 }
+    });
+    chosen
+}
+
+// A short on-screen reason for a pick, for an overlay to draw — or () when
+// the pool asks for none. Written into the pick's metadata as `why` (the
+// lead phrase), `why_reasons` (the bare labels chosen, in share order) and
+// `why_candidates` (every reason that qualified, chosen or not, with its
+// kind and share); the station carries them to the playout JSON untouched
+// and never reads them. The overlay joins `why_reasons` with its own joiner
+// and never inspects a kind.
+//
+// The wording is the pool's, from its `config:` block, so a channel phrases
+// each block its own way and this script holds no viewer-facing copy:
+//
+//   why                 the line for a ranked pick ("Nobody here has seen it")
+//   why_random          the line for an exploration draw (default: `why`)
+//   why_random_detail   what sits under it (default "picked at random")
+//
+// A ranked pick's reasons are the matching keywords (shortened by
+// short_label) and, when one bridges (#319), the recently watched title that
+// shares a keyword with it; `why_min_share`, `why_max_reasons` and
+// `why_min_score` decide which are shown. A pick with no reason left has no
+// why line at all. `why_bridge` (title, year, watcher, via) rides along when
+// the title is among the chosen reasons.
+fn on_screen_why(ctx, uid, stage) {
+    let line = ctx.config["why"];
+    if line == () { return (); }
+    if stage.draw == "exploration" {
+        let random = ctx.config["why_random"];
+        let detail = ctx.config["why_random_detail"];
+        return #{
+            line: if random == () { line } else { random },
+            reasons: [if detail == () { "picked at random" } else { detail }],
+            candidates: [],
+            bridge: (),
+        };
+    }
+    let found = why_candidates(ctx, stage);
+    if stage.base_score < why_min_score(ctx) {
+        return #{ line: (), reasons: [], candidates: found, bridge: () };
+    }
+    let chosen = why_choose(ctx, uid, found);
+    let reasons = [];
+    let bridge = ();
+    for r in chosen {
+        reasons.push(r.label);
+        if r.kind == "title" { bridge = stage.bridge; }
+    }
+    #{
+        line: if reasons.len == 0 { () } else { line },
+        reasons: reasons,
+        candidates: found,
+        bridge: bridge,
+    }
 }
 
 // The one sentence a viewer reads in the guide (etv-station-puhx): the
