@@ -996,9 +996,7 @@ fn validate_plugin_declares_pool_provider(
 ) -> Result<rhai::AST, ConfigError> {
     let script_path = crate::score::resolve_plugin_path(base_dir, plugin);
     // One compile, shared by both inspections below (#408) and handed back so
-    // the pool's capability check reads the same `AST` — this used to
-    // compile the script once for `declared_hooks` and again for
-    // `missing_required_fns`.
+    // the pool's capability check reads the same `AST`.
     let ast = crate::score::compile_plugin(&script_path)
         .map_err(|e| bad(format!("pool {:?}: {e}", pool.name)))?;
     let hooks = crate::score::declared_hooks_from_ast(&ast, &script_path)
