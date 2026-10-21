@@ -969,7 +969,8 @@ function render(d) {
   renderGuide(d, colors);
   $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'pattern', parseRoute().project); });
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
-  $('gwrap').scrollTop = GUIDE_OPEN_HOUR * 60 * ppm;
+  // The hour label is centred on its line, so land 10px above the line: the whole label clears the sticky day header.
+  $('gwrap').scrollTop = GUIDE_OPEN_HOUR * 60 * ppm - 10;
 }
 
 // The channel's blocks in one line: what the masthead stub shows, in full on hover.
