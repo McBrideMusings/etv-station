@@ -15,6 +15,9 @@ hero:
     - theme: alt
       text: Architecture
       link: /architecture
+    - theme: alt
+      text: Writing a plugin
+      link: /plugins
 
 features:
   - title: Filesystem-only contract
