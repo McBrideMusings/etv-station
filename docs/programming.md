@@ -60,7 +60,7 @@ rule:
 
 A daypart boundary lands late by the overrun of whatever is airing across it,
 the item or the rest of its pattern cycle, rather than cutting it
-([schema, Schedules](/schema#schedules-rule-slots-and-rule-schedules)). A slot
+([schema, Schedules](/schema#schedules-—-rule-slots-and-rule-schedules)). A slot
 continues where it stopped the night before: its pool rotation and list
 position are kept while other blocks air. The sample is
 `examples/samples/adult-swim.yaml`.
@@ -124,7 +124,7 @@ asks for the same sequence of sizes every time. A series that runs short follows
 `on_short`, as it does for a fixed count. Unlike a second step with `chance`,
 the visit always happens and the next show in the rotation is not pulled in;
 only the length changes. Field rules are in the
-[schema](./schema.md#pattern-step-take-how-many-items-one-visit-draws).
+[schema](./schema.md#pattern-step-take-—-how-many-items-one-visit-draws).
 
 **Grade.** Applies when a series airs. The measure is the mean number of
 episodes of one show per visit, ignoring interstitials between them. 2 to 4

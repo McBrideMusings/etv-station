@@ -189,7 +189,7 @@ Configurable station-wide via `tz` in the station config (or `ETV_STATION_TZ` at
 
 ## v2+ additions (planned, not yet implemented)
 
-The shape of the v2+ work is locked in [PRD §Scope evolution beyond v1](/PRD#scope-evolution-beyond-v1) and phased in [Roadmap §Next](/roadmap#next-three-sequential-phases-of-v2-scope-expansion). Three architectural additions land in order:
+The shape of the v2+ work is locked in [PRD §Scope evolution beyond v1](/PRD#scope-evolution-beyond-v1) and phased in [Roadmap §Next](/roadmap#next-—-three-sequential-phases-of-v2-scope-expansion). Three architectural additions land in order:
 
 ### Unified catalog (Phase C)
 
