@@ -23,7 +23,7 @@ about = "The etv-station daemon's lifecycle: config load and reload, history.db,
 about = "Channel configs under deploy/appdata/channels and examples/channels, and the programming review of them."
 
 [labels.tooling]
-about = "Developer tools: the web UI, taste-debug, admin.toml tasks, tools/ scripts, tests, verify-project."
+about = "Developer tools: the web UI and its pool-draft API, admin.toml tasks, tools/ scripts, tests, verify-project."
 
 [labels.ops]
 about = "Deploying and running it: Dockerfile, the Unraid container, backups, host config, remote diagnostics."
