@@ -575,7 +575,7 @@ without the page through `tools/ui-get.sh`:
 
 ```sh
 tools/ui-get.sh /api/channels/<ch>/graphics
-curl -s -XPOST localhost:4747/api/channels/<ch>/graphics/render -d '{"kind":"still","script":"<abs path from the list>","at":2}'
+tools/ui-get.sh -X POST -d '{"kind":"still","script":"<abs path from the list>","at":2}' /api/channels/<ch>/graphics/render
 tools/ui-get.sh /api/renders/<render>
 ```
 
