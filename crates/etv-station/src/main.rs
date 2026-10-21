@@ -270,6 +270,11 @@ struct SuggestCategoryArgs {
     #[arg(required = true, num_args = 1..)]
     seeds: Vec<String>,
 
+    /// A title the category must not resemble, same forms as the seeds. Repeat
+    /// the flag for several. A tag every counter-example carries is dropped.
+    #[arg(long = "not", value_name = "TITLE")]
+    counter_seeds: Vec<String>,
+
     /// Name written into the emitted category.
     #[arg(long, default_value = "suggested")]
     name: String,
@@ -1601,7 +1606,7 @@ fn suggest_category(config_path: Option<&Path>, args: &SuggestCategoryArgs) -> E
         Ok(c) => c,
         Err(e) => return fail(e),
     };
-    match etv_station::suggest::suggest(&catalog, &args.seeds, args.top) {
+    match etv_station::suggest::suggest(&catalog, &args.seeds, &args.counter_seeds, args.top) {
         Ok(s) => {
             print!("{}", etv_station::suggest::render(&s, &args.name));
             ExitCode::SUCCESS
