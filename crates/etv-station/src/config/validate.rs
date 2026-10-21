@@ -1947,6 +1947,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            prewarm: false,
             fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
@@ -1980,6 +1981,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            prewarm: false,
             fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
@@ -2014,6 +2016,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            prewarm: false,
             fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
@@ -2046,6 +2049,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            prewarm: false,
             fonts: vec![],
         };
         assert!(validate_station(&dummy_path(), &s).is_err());

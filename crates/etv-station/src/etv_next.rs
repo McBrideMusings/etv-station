@@ -82,6 +82,11 @@ fn parse_vaapi_driver(raw: &str) -> Result<VaapiDriver, RenderError> {
         .map_err(|_| RenderError::UnknownVaapiDriver(raw.to_string()))
 }
 
+/// `idle_grace_seconds` written when pre-warm is on: a worker that outlives
+/// any gap between viewers (ten years), so it never idles out and the first
+/// tune finds it running. Overrides a configured `idle_grace_seconds`.
+const PREWARM_IDLE_GRACE_SECONDS: u64 = 315_360_000;
+
 /// Where the generated files go and what the lineup server is told to do.
 #[derive(Debug, Clone)]
 pub struct RenderOptions {
@@ -109,6 +114,9 @@ pub struct RenderOptions {
     /// station config, not the environment, so [`RenderOptions::from_env`]
     /// leaves it `None` and [`render_with`] fills it in.
     pub idle_grace_seconds: Option<u64>,
+    /// `server.prewarm` in the emitted lineup. Comes from the station config,
+    /// like `idle_grace_seconds`.
+    pub prewarm: bool,
 }
 
 impl RenderOptions {
@@ -159,6 +167,7 @@ impl RenderOptions {
             accel,
             artwork_dir: var("ETV_STATION_ARTWORK_CACHE"),
             idle_grace_seconds: None,
+            prewarm: false,
         })
     }
 }
@@ -322,6 +331,7 @@ pub fn render_with(
     };
     let opts = RenderOptions {
         idle_grace_seconds: station.station.idle_grace_seconds,
+        prewarm: station.station.prewarm,
         ..opts.clone()
     };
     let rendered = render_channels(
@@ -550,7 +560,12 @@ pub fn render_channels(
             serde_json::json!({"show_bumpers": channel_render.show_bumpers}),
         );
 
-        if let Some(secs) = opts.idle_grace_seconds {
+        let idle_grace = if opts.prewarm {
+            Some(PREWARM_IDLE_GRACE_SECONDS)
+        } else {
+            opts.idle_grace_seconds
+        };
+        if let Some(secs) = idle_grace {
             channel.insert("idle_grace_seconds".to_string(), Value::from(secs));
         }
 
@@ -581,6 +596,10 @@ pub fn render_channels(
         "output": {"folder": opts.hls_output},
         "channels": lineup_channels,
     });
+    // Written only when on, so an unset station leaves the lineup as it was.
+    if opts.prewarm {
+        lineup["server"]["prewarm"] = serde_json::json!(true);
+    }
     // Mounted at ETV-next's `/artwork` (#187) only when the station has
     // artwork caching turned on — unset leaves the lineup exactly as it was
     // before this existed, and ETV-next mounts nothing there.
@@ -760,6 +779,7 @@ mod tests {
             accel: None,
             artwork_dir: None,
             idle_grace_seconds: None,
+            prewarm: false,
         }
     }
 
@@ -988,6 +1008,26 @@ mod tests {
             "playout folder must be absolute, got {folder}"
         );
         assert!(folder.ends_with("out/star-trek"));
+    }
+
+    #[test]
+    fn prewarm_lands_in_the_lineup_server_block_only_when_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let folders = vec![dir.path().join("a")];
+        let off =
+            render_with_defaults(&chans(&folders), &opts(dir.path()), "test-device-id").unwrap();
+        assert!(read(&off.lineup_path)["server"].get("prewarm").is_none());
+        let on_opts = RenderOptions {
+            prewarm: true,
+            ..opts(dir.path())
+        };
+        let on = render_with_defaults(&chans(&folders), &on_opts, "test-device-id").unwrap();
+        assert_eq!(read(&on.lineup_path)["server"]["prewarm"], true);
+        let body = read(&dir.path().join("channel1.json"));
+        assert_eq!(
+            body["idle_grace_seconds"], PREWARM_IDLE_GRACE_SECONDS,
+            "{body}"
+        );
     }
 
     #[test]

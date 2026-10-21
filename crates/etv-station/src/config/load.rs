@@ -1422,6 +1422,7 @@ mod tests {
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
             idle_grace_seconds: None,
+            prewarm: false,
             fonts: vec![],
         }
     }
