@@ -16,7 +16,7 @@ Every one of these runs through `H`:
   root workspace).
 - Any `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `cargo run`, in either
   workspace (`cargo --manifest-path vendor/etv-next/Cargo.toml ...` for the vendored one).
-- `./tools/dev-run.sh`, `./tools/verify-integration.sh` — they build both etv-next binaries and
+- `./tools/dev-run.sh`, `./tools/verify-integration.sh`, `./tools/verify-reburst.sh` — they build both etv-next binaries and
   the daemon, and run ffmpeg.
 - `./tools/dev-station.sh` — builds and runs only the station daemon.
 - `bun install`, `bun run docs:build`.

@@ -1129,3 +1129,32 @@ the real side needs only the chunk files.
 ## Verifying the channel-wide repeat rule (`rule.no_repeat_within`)
 
 `cargo test -p etv-station --lib a_channel_rule` covers spacing across pools, the ledger-tail seam, and the forced fallback. At the surface, run the web UI's Review on a scratch channel whose pools overlap — three `select: random` pools over one expression — once without the key and once with `rule: { no_repeat_within: "7d" }`, then compare `first_repeat.days` and the smallest gap between two airings of the same `entry_id` in `airings`. Observed 2026-10-17 on 14 days of Animation films: 0.15 days without the rule, 7.0 days with it. At the daemon, `event="channel_repeat.applied"` logs `blocked`/`forced` per generation, and `constraints.unsatisfied scope=channel` means the rule could not hold.
+
+## Verifying a reburst (`tools/verify-reburst.sh`)
+
+A reburst is ETV-next restarting a channel's ffmpeg mid-item when the segment lead falls
+to 20s after having reached 24s (`reburst_decision`,
+`vendor/etv-next/crates/ersatztv-channel/src/channel_session.rs`). It logs
+`reburst: lead exhausted, resuming the same item from …` at info. Nothing in ordinary
+local playback drains the lead that far, so the script does it:
+
+```bash
+ETV_PORT=<free port> tools/verify-reburst.sh
+```
+
+It starts the dev stack on `examples/station-reburst.yaml` (one looping 300s lavfi item),
+tunes channel 1, polls the worker's `reburst check: lead Ns, remaining Ns, armed B` debug
+line until one reads armed with at least 100s of item left, then `SIGSTOP`s that channel's
+ffmpeg until the log gains a reburst line, `SIGCONT`s it, and checks the live playlist's
+newest segment advances over the next 15s. Pass line: `OK reburst verification passed`,
+exit 0. Any failure exits 1 and names the check.
+
+A freeze alone cannot fire a reburst because the first burst is 28s (`INITIAL_BURST`): the
+lead peaks at 28 minus the seconds ffmpeg takes to emit its first segment, under the 24s arm
+point. The script sets `ETV_INITIAL_BURST_SECS=60`, which the channel worker reads in
+`initial_burst()`, so the lead arms at 25-33s. `ETV_INITIAL_BURST_SECS=28 ARMED_WAIT_SECS=90
+tools/verify-reburst.sh` shows the unarmed failure: the lead tops out at 23s and the script
+exits 1 with "no armed reburst check".
+
+Run it through the swarm lock in a worker (`swarm heavy -- tools/verify-reburst.sh`): like
+`dev-run.sh` it refuses beside another dev stack. The log is `tmp/verify-reburst.log`.
